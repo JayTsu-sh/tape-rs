@@ -20,10 +20,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// 查询设备信息（INQUIRY）
+    /// 查询设备信息（INQUIRY）：自动扫描 /dev/sg*，按 LU NAA 合并控制路径
     Inquiry {
-        /// SCSI 通用设备路径 (如 /dev/sg2)
-        device: String,
+        /// 以 JSON 格式输出（便于程序解析）
+        #[arg(long)]
+        json: bool,
     },
     /// 显示带库库存状态
     Inventory {
@@ -377,7 +378,7 @@ fn main() {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Commands::Inquiry { device } => inquiry::cmd_inquiry(&device),
+        Commands::Inquiry { json } => inquiry::cmd_inquiry(json),
         Commands::Inventory { device, catalog, no_drive_scan } => {
             changer::cmd_inventory(&device, catalog.as_deref(), no_drive_scan)
         }

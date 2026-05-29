@@ -88,15 +88,18 @@ pub fn mode_sense_10(page_code: u8, alloc_len: u16) -> [u8; 10] {
 /// start_addr: 起始 element 地址
 /// count: 要查询的 element 数量
 /// alloc_len: 分配的缓冲区长度
-/// voltag: 是否返回 volume tag
+/// voltag: 是否返回 volume tag (PVOLTAG/AVOLTAG)
+/// dvcid: 是否返回 device identifier（DTE 下追加 drive 序列号）
 pub fn read_element_status(
     element_type: u8,
     start_addr: u16,
     count: u16,
     alloc_len: u32,
     voltag: bool,
+    dvcid: bool,
 ) -> [u8; 12] {
     let byte1 = (element_type & 0x0F) | if voltag { 0x10 } else { 0x00 };
+    let byte6 = if dvcid { 0x01 } else { 0x00 };
     [
         opcode::READ_ELEMENT_STATUS,
         byte1,
@@ -104,7 +107,7 @@ pub fn read_element_status(
         (start_addr & 0xFF) as u8,
         (count >> 8) as u8,
         (count & 0xFF) as u8,
-        0x00, // CURDATA=0, DVCID=0
+        byte6,
         (alloc_len >> 16) as u8,
         (alloc_len >> 8) as u8,
         (alloc_len & 0xFF) as u8,

@@ -24,14 +24,6 @@ impl ElementType {
         }
     }
 
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Transport => "Transport",
-            Self::Storage => "Storage",
-            Self::ImportExport => "I/E",
-            Self::DataTransfer => "Drive",
-        }
-    }
 }
 
 /// Element 地址映射（通过 MODE SENSE page 0x1D 获取）
@@ -60,12 +52,7 @@ pub struct ElementStatus {
     pub volume_tag: Option<String>,
     /// 源 element 地址（如果介质被移入）
     pub source_address: Option<u16>,
+    /// DTE 元素返回的 device identifier（DVCID 位启用时），通常是驱动器序列号。
+    pub drive_id: Option<String>,
 }
 
-impl std::fmt::Display for ElementStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let state = if self.full { "Full" } else { "Empty" };
-        let tag = self.volume_tag.as_deref().unwrap_or("-");
-        write!(f, "{} {:>4} [{}]: {}", self.element_type.label(), self.address, state, tag)
-    }
-}

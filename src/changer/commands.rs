@@ -91,12 +91,27 @@ impl<'a> MediumChanger<'a> {
             .min(map.dt_start);
 
         // 分配足够大的缓冲区: header(8) + 每种类型的 element page header(8) + 每个 element 的描述符
-        // 每个 element 描述符: 12 bytes (无 voltag) 或 48 bytes (有 voltag)
-        let alloc_len: u32 = 8 + total_u32 * 72 + 64;
-        let cdb_bytes = cdb::read_element_status(0, start, total, alloc_len, true);
+        // 描述符大小：PVolTag(12+36=48) + AVolTag(36) + DVCID 扩展(4+ID长度) → 余量到 192。
+        let alloc_len: u32 = 8 + total_u32 * 192 + 64;
+        let cdb_bytes = cdb::read_element_status(0, start, total, alloc_len, true, true);
 
         let mut buf = BytesMut::zeroed(alloc_len as usize);
         let result = self.device.execute_read(&cdb_bytes, &mut buf, 60_000)?;
+
+        // 检测 kernel 是否把响应截断（用户态 buffer 不够装下 device 想发的所有 element）。
+        // 截断时 data 头里的 Byte Count of Report Available 大于实际传回字节数，
+        // 部分末尾 element 会被静默丢弃，导致 inventory 少行。
+        if result.transferred >= 8 {
+            let advertised =
+                u32::from_be_bytes([0, buf[5], buf[6], buf[7]]) as usize + 8;
+            if advertised > result.transferred {
+                log::warn!(
+                    "READ ELEMENT STATUS 截断：device 想发 {} 字节，只收到 {}（alloc_len={}），\
+                     末尾 element 可能丢失",
+                    advertised, result.transferred, alloc_len
+                );
+            }
+        }
 
         // 解析返回数据（parser 只需 &[u8]，通过 BytesMut 的 Deref 传入）
         parse_element_status_data(&buf[..result.transferred])
@@ -244,11 +259,12 @@ fn parse_element_status_data(data: &[u8]) -> Result<Vec<ElementStatus>> {
         }
 
         let has_pvoltag = (voltag_flags & 0x80) != 0;
+        let has_avoltag = (voltag_flags & 0x40) != 0;
         let page_end = (offset + desc_byte_count).min(data_end);
 
         while offset + desc_len <= page_end {
             let desc = &data[offset..offset + desc_len];
-            elements.push(parse_descriptor(desc, elem_type_code, has_pvoltag));
+            elements.push(parse_descriptor(desc, elem_type_code, has_pvoltag, has_avoltag));
             offset += desc_len;
         }
     }
@@ -257,7 +273,12 @@ fn parse_element_status_data(data: &[u8]) -> Result<Vec<ElementStatus>> {
 }
 
 /// 解析单个 Element Descriptor。descriptor 最低 4 字节已由调用方保证存在。
-fn parse_descriptor(desc: &[u8], elem_type_code: u8, has_pvoltag: bool) -> ElementStatus {
+fn parse_descriptor(
+    desc: &[u8],
+    elem_type_code: u8,
+    has_pvoltag: bool,
+    has_avoltag: bool,
+) -> ElementStatus {
     let address = u16::from_be_bytes([desc[0], desc[1]]);
     let full = (desc[2] & 0x01) != 0;
 
@@ -270,7 +291,40 @@ fn parse_descriptor(desc: &[u8], elem_type_code: u8, has_pvoltag: bool) -> Eleme
     let volume_tag = if has_pvoltag { extract_volume_tag(desc) } else { None };
     let element_type = ElementType::from_u8(elem_type_code).unwrap_or(ElementType::Storage);
 
-    ElementStatus { address, element_type, full, volume_tag, source_address }
+    // DVCID 扩展位于 PVolTag/AVolTag 之后。仅 DTE 元素带有意义的 device identifier。
+    // PVolTag/AVolTag 各 36 字节（SMC-3 §6.10.1：32 字节 Volume Identification + 4 字节 Sequence Number）。
+    let drive_id = if element_type == ElementType::DataTransfer {
+        let mut id_off = 12;
+        if has_pvoltag { id_off += 36; }
+        if has_avoltag { id_off += 36; }
+        extract_drive_id(desc, id_off)
+    } else {
+        None
+    };
+
+    ElementStatus { address, element_type, full, volume_tag, source_address, drive_id }
+}
+
+/// DVCID 扩展（SMC-3）：
+///   off+0: Code Set (低 4 bit)；2=ASCII, 3=UTF-8
+///   off+1: Identifier Type
+///   off+2: Reserved
+///   off+3: Identifier Length (N)
+///   off+4..off+4+N: Identifier
+fn extract_drive_id(desc: &[u8], off: usize) -> Option<String> {
+    if off + 4 > desc.len() {
+        return None;
+    }
+    let id_len = desc[off + 3] as usize;
+    let start = off + 4;
+    let end = start + id_len;
+    if end > desc.len() || id_len == 0 {
+        return None;
+    }
+    let id = String::from_utf8_lossy(&desc[start..end])
+        .trim_matches(|c: char| c == '\0' || c.is_whitespace())
+        .to_string();
+    if id.is_empty() { None } else { Some(id) }
 }
 
 /// PVolTag 位于 descriptor byte 12..44，32 字节 ASCII。

@@ -7,8 +7,8 @@ use tape_rs::changer::commands::MediumChanger;
 use tape_rs::changer::element::{ElementAddressMap, ElementStatus, ElementType};
 use tape_rs::error::{Result, TapeError};
 use tape_rs::ltfs::mam;
-use tape_rs::scsi::cdb;
 use tape_rs::scsi::device::ScsiDevice;
+use tape_rs::scsi::inquiry::{read_unit_serial, standard_inquiry};
 
 use super::format_util::format_size;
 
@@ -22,27 +22,29 @@ pub fn cmd_inventory(path: &str, catalog_path: Option<&str>, no_drive_scan: bool
     let elements = changer.read_all_status()?;
 
     // A: 自动扫 /dev/sg*，对有磁带的 tape drive 读 MAM barcode + 容量；key = barcode serial。
-    let realtime_capacity = if no_drive_scan {
-        HashMap::new()
+    // 同时拿到 drive 序列号 → sg 路径映射，用于把 changer DTE 关联到 inquiry 视角。
+    let (realtime_capacity, drive_sg_map) = if no_drive_scan {
+        (HashMap::new(), HashMap::new())
     } else {
-        scan_drive_capacities(path)
+        scan_drive_capacities_and_sg(path)
     };
     // C: catalog 缓存；允许不存在或为空。
     let cached_capacity = load_cached_capacity(catalog_path);
 
-    print_drive_section(&elements, &map, &realtime_capacity, &cached_capacity);
-    print_storage_section(&elements, &realtime_capacity, &cached_capacity);
-    print_ie_section(&elements, &realtime_capacity, &cached_capacity);
+    print_drive_section(&elements, &map, &realtime_capacity, &cached_capacity, &drive_sg_map);
+    print_storage_section(&elements, &map, &realtime_capacity, &cached_capacity);
+    print_ie_section(&elements, &map, &realtime_capacity, &cached_capacity);
 
     Ok(())
 }
 
+/// 一行总结库的元素组成。SCSI 内部 element 起始地址只在 MOVE MEDIUM 等
+/// 底层命令里有用，对用户屏蔽。
 fn print_address_map(map: &ElementAddressMap) {
-    println!("=== Element Address Map ===");
-    println!("  Transport:    start={:#06x}, count={}", map.transport_start, map.transport_count);
-    println!("  Storage:      start={:#06x}, count={}", map.storage_start, map.storage_count);
-    println!("  I/E:          start={:#06x}, count={}", map.ie_start, map.ie_count);
-    println!("  Data Transfer:start={:#06x}, count={}", map.dt_start, map.dt_count);
+    println!(
+        "库布局：{} 机械手 · {} 驱动器 · {} 存储槽 · {} I/E 口",
+        map.transport_count, map.dt_count, map.storage_count, map.ie_count
+    );
     println!();
 }
 
@@ -51,12 +53,20 @@ fn print_drive_section(
     map: &ElementAddressMap,
     realtime: &HashMap<String, CapacitySnapshot>,
     cached: &HashMap<String, CapacitySnapshot>,
+    drive_sg_map: &HashMap<String, String>,
 ) {
-    println!("=== Drive Status ===");
+    println!("=== 驱动器 ===");
     for elem in elements.iter().filter(|e| e.element_type == ElementType::DataTransfer) {
-        print!("  {}", elem);
+        print!("  {}", format_elem_head(elem, map));
         if let Some(src) = elem.source_address {
             print!("  <- {}", describe_source(map, src));
+        }
+        if let Some(id) = &elem.drive_id {
+            // DVCID 返回的字符串通常是 "VENDOR  PRODUCT  SERIAL" 等空格分隔的定长字段，
+            // 末尾 token 就是 VPD 0x80 那个 serial，用它去查 sg。
+            let serial = id.split_whitespace().last().unwrap_or(id.as_str());
+            let sg = drive_sg_map.get(serial).map(|s| s.as_str()).unwrap_or("?");
+            print!("   [serial {}, 设备 {}]", serial, sg);
         }
         if elem.full {
             print_capacity(elem.volume_tag.as_deref(), realtime, cached);
@@ -68,12 +78,13 @@ fn print_drive_section(
 
 fn print_storage_section(
     elements: &[ElementStatus],
+    map: &ElementAddressMap,
     realtime: &HashMap<String, CapacitySnapshot>,
     cached: &HashMap<String, CapacitySnapshot>,
 ) {
-    println!("=== Storage Slots ===");
+    println!("=== 存储槽 ===");
     for elem in elements.iter().filter(|e| e.element_type == ElementType::Storage) {
-        print!("  {}", elem);
+        print!("  {}", format_elem_head(elem, map));
         if elem.full {
             print_capacity(elem.volume_tag.as_deref(), realtime, cached);
         }
@@ -84,17 +95,43 @@ fn print_storage_section(
 
 fn print_ie_section(
     elements: &[ElementStatus],
+    map: &ElementAddressMap,
     realtime: &HashMap<String, CapacitySnapshot>,
     cached: &HashMap<String, CapacitySnapshot>,
 ) {
-    println!("=== I/E Slots ===");
+    println!("=== I/E 口 ===");
     for elem in elements.iter().filter(|e| e.element_type == ElementType::ImportExport) {
-        print!("  {}", elem);
+        print!("  {}", format_elem_head(elem, map));
         if elem.full {
             print_capacity(elem.volume_tag.as_deref(), realtime, cached);
         }
         println!();
     }
+}
+
+/// 元素头部："存储槽 1 [载带]: 8A0042L8"。
+/// 用 1-based 编号代替原始 SCSI 地址。
+fn format_elem_head(elem: &ElementStatus, map: &ElementAddressMap) -> String {
+    let label = match elem.element_type {
+        ElementType::Transport => "机械手",
+        ElementType::Storage => "存储槽",
+        ElementType::ImportExport => "I/E 口",
+        ElementType::DataTransfer => "驱动器",
+    };
+    let state = if elem.full { "载带" } else { "空" };
+    let tag = elem.volume_tag.as_deref().unwrap_or("-");
+    format!("{} {:>3} [{}]: {}", label, friendly_index(elem, map), state, tag)
+}
+
+/// 把 SCSI element 绝对地址翻成 1-based 用户编号。
+fn friendly_index(elem: &ElementStatus, map: &ElementAddressMap) -> u16 {
+    let start = match elem.element_type {
+        ElementType::Transport => map.transport_start,
+        ElementType::Storage => map.storage_start,
+        ElementType::ImportExport => map.ie_start,
+        ElementType::DataTransfer => map.dt_start,
+    };
+    elem.address.saturating_sub(start) + 1
 }
 
 /// realtime 优先，miss 回落 cached；都 miss 不输出容量列。
@@ -141,29 +178,22 @@ fn format_capacity(cap: CapacitySnapshot, source: &str) -> String {
     )
 }
 
-/// 扫 `/dev/sg*`，跳过 changer 本身，对每个 sg 节点尝试 `probe_tape_drive`。
-/// 返回 `barcode → CapacitySnapshot` 映射；任一节点失败只记 debug 并跳过。
-fn scan_drive_capacities(changer_path: &str) -> HashMap<String, CapacitySnapshot> {
-    let mut out = HashMap::new();
-    let dir = match std::fs::read_dir("/dev") {
-        Ok(d) => d,
+/// 扫 `/dev/sg*`，跳过 changer 本身，对每个 sg 节点同时收集：
+///   1. `barcode → CapacitySnapshot`（仅载带的 drive）
+///   2. `drive_serial → sg_path`（所有探测到的 tape drive，不论是否载带）
+/// 后者用来把 changer DTE 元素返回的 drive_id 关联回 inquiry 视角的 sg 设备。
+fn scan_drive_capacities_and_sg(
+    changer_path: &str,
+) -> (HashMap<String, CapacitySnapshot>, HashMap<String, String>) {
+    let mut cap_map = HashMap::new();
+    let mut sg_map = HashMap::new();
+    let sg_nodes = match tape_rs::scsi::inquiry::enumerate_sg_nodes() {
+        Ok(n) => n,
         Err(e) => {
             log::debug!("无法枚举 /dev 寻找 sg 节点: {}", e);
-            return out;
+            return (cap_map, sg_map);
         }
     };
-
-    let mut sg_nodes: Vec<std::path::PathBuf> = dir
-        .filter_map(|r| r.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|s| s.to_str())
-                .map(|n| n.starts_with("sg") && n.len() > 2 && n[2..].chars().all(|c| c.is_ascii_digit()))
-                .unwrap_or(false)
-        })
-        .collect();
-    sg_nodes.sort();
 
     let canon_changer = std::fs::canonicalize(changer_path).ok();
     for path in sg_nodes {
@@ -175,50 +205,62 @@ fn scan_drive_capacities(changer_path: &str) -> HashMap<String, CapacitySnapshot
             None => continue,
         };
         match probe_tape_drive(s) {
-            Ok(Some((barcode, cap))) => {
-                log::debug!("drive {} barcode={} total={} remaining={}", s, barcode, cap.total, cap.remaining);
-                out.insert(barcode, cap);
+            Ok(Some(probe)) => {
+                if let Some(serial) = probe.serial {
+                    sg_map.insert(serial, s.to_string());
+                }
+                if let (Some(barcode), Some(cap)) = (probe.barcode, probe.capacity) {
+                    log::debug!("drive {} barcode={} total={} remaining={}", s, barcode, cap.total, cap.remaining);
+                    cap_map.insert(barcode, cap);
+                }
             }
-            Ok(None) => log::debug!("{} 非磁带机或未载带，跳过", s),
+            Ok(None) => log::debug!("{} 非磁带机，跳过", s),
             Err(e) => log::debug!("{} 探测失败: {}", s, e),
         }
     }
-    out
+    (cap_map, sg_map)
 }
 
-/// 打开 sg 节点，通过 INQUIRY 过滤磁带机（peripheral_device_type=0x01），
-/// 读 MAM 0x0806 barcode + 容量。非磁带机或未载带时返回 `Ok(None)`。
-fn probe_tape_drive(path: &str) -> Result<Option<(String, CapacitySnapshot)>> {
+struct DriveProbe {
+    serial: Option<String>,
+    barcode: Option<String>,
+    capacity: Option<CapacitySnapshot>,
+}
+
+/// 打开 sg 节点；非 tape drive 返回 `Ok(None)`。
+/// tape drive 一律返回 serial（来自 VPD 0x80）；MAM barcode + 容量仅当载带且可读时填充。
+fn probe_tape_drive(path: &str) -> Result<Option<DriveProbe>> {
     let dev = ScsiDevice::open(path)?;
 
-    let cdb_bytes = cdb::inquiry(96);
-    let mut buf = [0u8; 96];
-    dev.execute_read(&cdb_bytes, &mut buf, 10_000)?;
-    let ptype = buf[0] & 0x1F;
-    if ptype != 0x01 {
+    let inq = standard_inquiry(&dev)?;
+    if inq.peripheral_type != 0x01 {
         return Ok(None);
     }
+
+    let serial = read_unit_serial(&dev);
 
     let mam_dev = mam::Mam::new(&dev);
-    let barcode = match mam_dev.read_attribute(mam::ATTR_BARCODE)? {
-        Some(a) => std::str::from_utf8(&a.value)
+    let barcode = mam_dev.read_attribute(mam::ATTR_BARCODE).ok().flatten().and_then(|a| {
+        let b = std::str::from_utf8(&a.value)
             .unwrap_or("")
             .trim_matches(|c: char| c == '\0' || c == ' ')
-            .to_string(),
-        None => return Ok(None),
-    };
-    if barcode.is_empty() {
-        return Ok(None);
-    }
+            .to_string();
+        if b.is_empty() { None } else { Some(b) }
+    });
 
-    let cap = mam::read_volume_capacity(&dev)?;
-    if cap.total == 0 {
-        return Ok(None);
-    }
-    Ok(Some((
-        barcode,
-        CapacitySnapshot { total: cap.total, remaining: cap.remaining },
-    )))
+    let capacity = if barcode.is_some() {
+        mam::read_volume_capacity(&dev).ok().and_then(|c| {
+            if c.total == 0 {
+                None
+            } else {
+                Some(CapacitySnapshot { total: c.total, remaining: c.remaining })
+            }
+        })
+    } else {
+        None
+    };
+
+    Ok(Some(DriveProbe { serial, barcode, capacity }))
 }
 
 /// 容忍 catalog 缺失：打不开 / 查不到就返回空 map，不中断 inventory。
@@ -243,16 +285,16 @@ fn load_cached_capacity(catalog_path: Option<&str>) -> HashMap<String, CapacityS
     }
 }
 
-/// 把 element 地址翻成人看得懂的来源描述，和 ElementStatus::Display 用同一套编号（原始地址）。
+/// 把 SCSI 绝对地址翻成 "存储槽 3" 这类 1-based 描述。
 fn describe_source(map: &ElementAddressMap, addr: u16) -> String {
     if addr >= map.storage_start && addr < map.storage_start + map.storage_count {
-        format!("Storage {}", addr)
+        format!("存储槽 {}", addr - map.storage_start + 1)
     } else if addr >= map.ie_start && addr < map.ie_start + map.ie_count {
-        format!("I/E {}", addr)
+        format!("I/E 口 {}", addr - map.ie_start + 1)
     } else if addr >= map.dt_start && addr < map.dt_start + map.dt_count {
-        format!("Drive {}", addr)
+        format!("驱动器 {}", addr - map.dt_start + 1)
     } else if addr >= map.transport_start && addr < map.transport_start + map.transport_count {
-        format!("Transport {}", addr)
+        format!("机械手 {}", addr - map.transport_start + 1)
     } else {
         format!("addr={:#06x}", addr)
     }
@@ -459,6 +501,7 @@ mod tests {
             full,
             volume_tag: tag.map(String::from),
             source_address: None,
+            drive_id: None,
         }
     }
 
