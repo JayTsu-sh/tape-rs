@@ -445,3 +445,48 @@ fn volume_with_file_data_on_index_partition_mounts_read_only() {
     assert!(!vol.writable());
     assert!(vol.recovery().notes.iter().any(|n| n.contains("位于 IP")), "{:?}", vol.recovery().notes);
 }
+
+/// IBM LTFS 的 <volumelockstate>：locked / permlocked 的卷不得写入，解锁后保留该元素。
+#[test]
+fn locked_volume_mounts_read_only() {
+    use tape_rs::scsi::sim::LogicalObject;
+
+    let (lib, dev) = formatted_drive();
+    let set_state = |state: &str| {
+        lib.with_cartridge_mut(BARCODE, |c| {
+            for p in c.partitions.iter_mut() {
+                for o in p.objects.iter_mut() {
+                    if let LogicalObject::Record(d) = o {
+                        let t = String::from_utf8_lossy(d).to_string();
+                        if t.contains("<ltfsindex") {
+                            let t = match (t.find("<volumelockstate>"), t.find("</volumelockstate>")) {
+                                (Some(a), Some(b)) => format!("{}{}", &t[..a], &t[b + 18..]),
+                                _ => t,
+                            };
+                            *d = t
+                                .replace(
+                                    "<highestfileuid>",
+                                    &format!("<volumelockstate>{state}</volumelockstate><highestfileuid>"),
+                                )
+                                .into_bytes();
+                        }
+                    }
+                }
+            }
+        });
+    };
+    for state in ["locked", "permlocked", "something-new"] {
+        set_state(state);
+        let mut vol = LtfsVolume::mount(&dev).unwrap();
+        assert!(!vol.writable(), "{state}");
+        assert!(vol.restricted_reason().unwrap().contains(state));
+        let err = vol.append_file("/x", &mut Cursor::new(vec![1u8])).unwrap_err();
+        assert!(matches!(err, TapeError::RecoveryRestricted { .. }));
+    }
+    set_state("unlocked");
+    let mut vol = LtfsVolume::mount(&dev).unwrap();
+    assert!(vol.writable(), "{:?}", vol.restricted_reason());
+    vol.append_file("/x", &mut Cursor::new(vec![1u8])).unwrap();
+    vol.commit().unwrap();
+    assert_eq!(vol.index().volume_lock_state.as_deref(), Some("unlocked"));
+}

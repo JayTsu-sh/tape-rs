@@ -120,9 +120,20 @@ impl<'a> LtfsVolume<'a> {
             debug!("恢复备注: {}", note);
         }
         let lossy = !index.unknown_elements.is_empty();
-        let writable = report.append_ok && !lossy;
+        // <volumelockstate>：unlocked / locked / permlocked（IBM LTFS 的取值）。
+        // 除 unlocked 外一律不写；不认识的取值也按锁定处理。
+        let locked = index
+            .volume_lock_state
+            .as_deref()
+            .is_some_and(|v| v != "unlocked");
+        let writable = report.append_ok && !lossy && !locked;
         let restricted_reason = if writable {
             None
+        } else if locked {
+            Some(format!(
+                "卷已锁定 (volumelockstate={})，只读挂载",
+                index.volume_lock_state.as_deref().unwrap_or("")
+            ))
         } else if lossy {
             // 重写索引会丢掉这些元素，所以不允许写入。
             Some(format!(
