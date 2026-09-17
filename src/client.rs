@@ -6,8 +6,8 @@
 //! - **结果未定的判定与安全重试**：上传途中连接断开，或服务端明确答"结果未定"时，
 //!   库到（新的）Leader 上查询该路径：已提交则视为成功，否则重传。归档成功始终以卷提交为准。
 //!
-//! 判定"已提交的就是我这次上传的"目前只比长度。要更强的保证，调用方应在路径里带上自己的
-//! 版本标识，或在上传后用 `get` 校验内容；服务端按内容哈希判定是后续工作。
+//! 判定"已提交的就是我这次上传的"靠内容哈希：服务端写带时算出 sha256 并记在索引和目录里，
+//! 库把它与本地算出的值比对。
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -53,6 +53,10 @@ pub struct FileStat {
     pub generation: u64,
     /// 回答这次查询的执行轮次
     pub round: u64,
+    /// 所在磁带的条码
+    pub barcode: String,
+    /// 服务端写带时算出的内容 sha256（十六进制小写）
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,6 +223,8 @@ impl Client {
                     length: j["length"].as_u64().unwrap_or(0),
                     generation: j["generation"].as_u64().unwrap_or(0),
                     round: j["round"].as_u64().unwrap_or(0),
+                    barcode: j["barcode"].as_str().unwrap_or("").to_string(),
+                    sha256: j["sha256"].as_str().unwrap_or("").to_string(),
                 }))
             }
             404 => Ok(None),
@@ -229,6 +235,10 @@ impl Client {
     /// 上传并等到落带。返回即表示已随卷提交；出错表示确定没有成功或无法判定。
     pub fn put(&mut self, path: &str, data: &[u8]) -> Result<PutOutcome> {
         let route = format!("/files/{}?wait=1", path.trim_start_matches('/'));
+        let digest: String = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(data).iter().map(|b| format!("{:02x}", b)).collect()
+        };
         let deadline = Instant::now() + self.retry_for;
         let mut attempts = 0;
         loop {
@@ -249,8 +259,8 @@ impl Client {
                 Err(e) => return Err(e),
             };
             if uncertain {
-                // 结果未定：到当前 Leader 上查这个路径。已提交且长度相符即视为成功。
-                if let Some(st) = self.stat(path)?.filter(|s| s.length == data.len() as u64) {
+                // 结果未定：到当前 Leader 上查这个路径。已提交且内容哈希与本次上传相同即视为成功。
+                if let Some(st) = self.stat(path)?.filter(|s| s.length == data.len() as u64 && s.sha256 == digest) {
                     return Ok(PutOutcome { generation: st.generation, attempts, resolved_by_query: true });
                 }
             }

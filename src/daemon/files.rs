@@ -17,7 +17,35 @@ use std::time::{Duration, Instant};
 use crate::core::volume_state::{DirNode, FileVersion, FrozenBatch, S4Evidence, StateError, VolumeState};
 use crate::ltfs::index::{DirectoryNode, LtfsIndex};
 
+use super::directory::Directory;
 use super::executor::ExecRequest;
+
+/// 合批策略：四个触发条件任一满足就提交一批。推导见研究笔记 pooling-slice-plan.md。
+/// 字节数和文件数是触发阈值，不是硬上限：到达阈值就提交，取队列时把已到齐的全部带走。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchPolicy {
+    /// 队列里累计的字节数
+    pub max_bytes: u64,
+    /// 队列里累计的文件数
+    pub max_files: usize,
+    /// 这么久没有新的上传完成就提交（负载轻时延迟低）
+    pub idle: Duration,
+    /// 队列里最早的文件最多等这么久（带 wait 的上传的延迟上界）
+    pub max_wait: Duration,
+}
+
+impl Default for BatchPolicy {
+    fn default() -> Self {
+        Self { max_bytes: 8 << 30, max_files: 20_000, idle: Duration::from_secs(2), max_wait: Duration::from_secs(60) }
+    }
+}
+
+/// 当前服务的这盘带。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TapeIdent {
+    pub barcode: String,
+    pub pool_uuid: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskStatus {
@@ -76,17 +104,28 @@ pub struct UploadHandle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stat {
     pub len: u64,
-    pub version: u64,
     pub generation: u64,
     pub round: u64,
+    /// 所在磁带的条码
+    pub barcode: String,
+    /// 内容的 sha256（十六进制小写）；文件没有哈希属性时为空串
+    pub sha256: String,
 }
 
 struct Serving {
     round: u64,
     state: Arc<VolumeState>,
     queue: VecDeque<Upload>,
+    queue_bytes: u64,
+    /// 队列里最早一个文件的入队时刻、最近一次入队的时刻
+    oldest: Option<Instant>,
+    newest: Option<Instant>,
     in_batch: Vec<u64>,
     opened: Instant,
+    tape: TapeIdent,
+    /// 当前这盘带上的文件：开放服务时取自刚读到的索引，之后每次卷提交追加。
+    /// 目录条目经 Raft 应用有延迟（也可能因换届而缺失，要等对账），当前带的查询不依赖它。
+    recent: HashMap<String, Stat>,
 }
 
 struct Inner {
@@ -101,6 +140,9 @@ pub struct FileService {
     changed: Condvar,
     spool_dir: PathBuf,
     exec: Mutex<Option<Sender<ExecRequest>>>,
+    policy: BatchPolicy,
+    directory_path: Option<PathBuf>,
+    reader: Mutex<Option<Directory>>,
 }
 
 fn norm(path: &str) -> Result<String, ServiceError> {
@@ -139,6 +181,11 @@ pub fn committed_view(index: &LtfsIndex) -> Arc<DirNode> {
 
 impl FileService {
     pub fn new(spool_dir: PathBuf) -> std::io::Result<Arc<Self>> {
+        Self::with_options(spool_dir, BatchPolicy::default(), None)
+    }
+
+    /// `directory_path` 是本节点目录库的文件；给了之后 `stat`/`list` 能回答本轮之前提交的文件。
+    pub fn with_options(spool_dir: PathBuf, policy: BatchPolicy, directory_path: Option<PathBuf>) -> std::io::Result<Arc<Self>> {
         // 暂存区不跨进程保留：上一次运行留下的都是未落带的残留
         let _ = std::fs::remove_dir_all(&spool_dir);
         std::fs::create_dir_all(&spool_dir)?;
@@ -147,6 +194,9 @@ impl FileService {
             changed: Condvar::new(),
             spool_dir,
             exec: Mutex::new(None),
+            policy,
+            directory_path,
+            reader: Mutex::new(None),
         }))
     }
 
@@ -167,10 +217,37 @@ impl FileService {
     // ---------- 执行线程一侧 ----------
 
     /// 接管完成：以恢复得到的视图开放服务。
-    pub fn open(&self, round: u64, index: &LtfsIndex, free_bytes: u64, writable: bool) {
+    pub fn open(&self, round: u64, tape: TapeIdent, index: &LtfsIndex, free_bytes: u64, writable: bool) {
         let state = Arc::new(VolumeState::new(round, committed_view(index), index.generation, free_bytes, writable));
         let mut g = self.lock();
-        g.serving = Some(Serving { round, state, queue: VecDeque::new(), in_batch: Vec::new(), opened: Instant::now() });
+        g.serving = Some(Serving {
+            round,
+            state,
+            queue: VecDeque::new(),
+            queue_bytes: 0,
+            oldest: None,
+            newest: None,
+            in_batch: Vec::new(),
+            opened: Instant::now(),
+            recent: {
+                // 当前装着的这盘带以刚读到的索引为准，不必等目录经 Raft 对账
+                let mut m = HashMap::new();
+                index.walk_files(|p, f| {
+                    m.insert(
+                        format!("/{}", p),
+                        Stat {
+                            len: f.length,
+                            generation: index.generation,
+                            round,
+                            barcode: tape.barcode.clone(),
+                            sha256: f.xattr(crate::ltfs::index::XATTR_SHA256).unwrap_or("").to_string(),
+                        },
+                    );
+                });
+                m
+            },
+            tape,
+        });
         g.why_not.clear();
         self.changed.notify_all();
     }
@@ -197,31 +274,73 @@ impl FileService {
         self.lock().serving.as_ref().map(|s| s.round)
     }
 
-    /// 取出全部已完成的上传并冻结批次。两件事在同一把锁下完成。
+    /// 距离下一批到期还有多久。`None` 表示队列为空或已有一批在写。
+    pub fn due_in(&self, round: u64) -> Option<Duration> {
+        let g = self.lock();
+        let s = g.serving.as_ref().filter(|s| s.round == round)?;
+        Self::due(&self.policy, s)
+    }
+
+    fn due(p: &BatchPolicy, s: &Serving) -> Option<Duration> {
+        if s.queue.is_empty() || !s.in_batch.is_empty() {
+            return None;
+        }
+        if s.queue_bytes >= p.max_bytes || s.queue.len() >= p.max_files {
+            return Some(Duration::ZERO);
+        }
+        let now = Instant::now();
+        let by_wait = s.oldest.map(|t| (t + p.max_wait).saturating_duration_since(now));
+        let by_idle = s.newest.map(|t| (t + p.idle).saturating_duration_since(now));
+        by_wait.into_iter().chain(by_idle).min()
+    }
+
+    /// 合批条件满足时，取出全部已完成的上传并冻结批次。两件事在同一把锁下完成。
     pub fn take_batch(&self, round: u64) -> Option<(Arc<FrozenBatch>, Vec<Upload>)> {
         let mut g = self.lock();
         let s = g.serving.as_mut().filter(|s| s.round == round)?;
-        if s.queue.is_empty() || !s.in_batch.is_empty() {
+        if Self::due(&self.policy, s)? > Duration::ZERO {
             return None;
         }
         let batch = s.state.freeze(&[]).ok()?;
         let uploads: Vec<Upload> = s.queue.drain(..).collect();
+        s.queue_bytes = 0;
+        s.oldest = None;
+        s.newest = None;
         debug_assert!(uploads.iter().all(|u| batch.cover.contains_key(&u.path)));
         s.in_batch = uploads.iter().map(|u| u.task).collect();
         Some((batch, uploads))
     }
 
     /// 批次落带结果。成功则发布到已提交视图；失败则这些任务结果未定，由调用方决定是否停止服务。
-    pub fn batch_done(&self, round: u64, batch: &FrozenBatch, uploads: &[Upload], result: Result<u64, String>) {
+    /// `result` 成功时带索引代数，以及每个文件由写带过程算出的 sha256（路径 → 十六进制）。
+    pub fn batch_done(
+        &self,
+        round: u64,
+        batch: &FrozenBatch,
+        uploads: &[Upload],
+        result: Result<(u64, HashMap<String, String>), String>,
+    ) {
         let mut g = self.lock();
         let Some(s) = g.serving.as_mut().filter(|s| s.round == round) else {
             return;
         };
         s.in_batch.clear();
         let outcome = match result {
-            Ok(tape_generation) => {
+            Ok((tape_generation, hashes)) => {
                 match s.state.publish(batch, S4Evidence { batch_id: batch.batch_id, generation: batch.generation }) {
-                    Ok(_) => Ok(tape_generation),
+                    Ok(_) => {
+                        for u in uploads {
+                            let st = Stat {
+                                len: u.len,
+                                generation: tape_generation,
+                                round,
+                                barcode: s.tape.barcode.clone(),
+                                sha256: hashes.get(&u.path).cloned().unwrap_or_default(),
+                            };
+                            s.recent.insert(u.path.clone(), st);
+                        }
+                        Ok(tape_generation)
+                    }
                     Err(e) => Err(format!("已落带但发布失败: {:?}", e)),
                 }
             }
@@ -269,6 +388,10 @@ impl FileService {
             let s = g.serving.as_mut().filter(|s| s.round == h.round).ok_or(ServiceError::NotServing(why))?;
             s.state.complete(&h.path).map_err(map_state)?;
             s.queue.push_back(Upload { task: h.task, path: h.path.clone(), spool: h.spool.clone(), len });
+            s.queue_bytes += len;
+            let now = Instant::now();
+            s.oldest.get_or_insert(now);
+            s.newest = Some(now);
             g.tasks.insert(h.task, TaskStatus::Staged);
         }
         self.kick();
@@ -305,29 +428,50 @@ impl FileService {
         }
     }
 
-    /// 已提交视图里的文件。只反映已落带的内容。
+    fn with_reader<T>(&self, f: impl FnOnce(&Directory) -> Option<T>) -> Option<T> {
+        let path = self.directory_path.as_ref()?;
+        let mut g = self.reader.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            *g = Directory::open_reader(path).ok();
+        }
+        f(g.as_ref()?)
+    }
+
+    /// 已提交的文件。先看本轮刚落带的，再看目录库（池内全部磁带、之前各轮提交的）。
     pub fn stat(&self, path: &str) -> Result<Option<Stat>, ServiceError> {
         let path = norm(path)?;
-        let g = self.lock();
-        let s = g.serving.as_ref().ok_or(ServiceError::NotServing(g.why_not.clone()))?;
-        let root = s.state.load();
-        Ok(root.committed.get(&path).map(|f| Stat { len: f.len, version: f.version, generation: root.generation, round: s.round }))
+        let (round, pool) = {
+            let g = self.lock();
+            let s = g.serving.as_ref().ok_or(ServiceError::NotServing(g.why_not.clone()))?;
+            if let Some(st) = s.recent.get(&path) {
+                return Ok(Some(st.clone()));
+            }
+            (s.round, s.tape.pool_uuid.clone())
+        };
+        Ok(self.with_reader(|d| d.stat(&pool, &path).ok().flatten()).map(|f| Stat {
+            len: f.length,
+            generation: f.generation,
+            round,
+            barcode: f.barcode,
+            sha256: f.sha256,
+        }))
     }
 
     pub fn list(&self) -> Result<BTreeMap<String, u64>, ServiceError> {
-        let g = self.lock();
-        let s = g.serving.as_ref().ok_or(ServiceError::NotServing(g.why_not.clone()))?;
-        let root = s.state.load();
-        let mut out = BTreeMap::new();
-        fn walk(d: &DirNode, prefix: &str, out: &mut BTreeMap<String, u64>) {
-            for (n, f) in &d.files {
-                out.insert(format!("{}/{}", prefix, n), f.len);
-            }
-            for (n, s) in &d.subdirs {
-                walk(s, &format!("{}/{}", prefix, n), out);
-            }
+        let (pool, mut out) = {
+            let g = self.lock();
+            let s = g.serving.as_ref().ok_or(ServiceError::NotServing(g.why_not.clone()))?;
+            (s.tape.pool_uuid.clone(), s.recent.iter().map(|(p, st)| (p.clone(), st.len)).collect::<BTreeMap<_, _>>())
+        };
+        for (p, n) in self.with_reader(|d| d.list(&pool).ok()).unwrap_or_default() {
+            out.entry(p).or_insert(n);
         }
-        walk(&root.committed, "", &mut out);
         Ok(out)
     }
+
+    /// 当前服务的磁带。
+    pub fn tape(&self) -> Option<TapeIdent> {
+        self.lock().serving.as_ref().map(|s| s.tape.clone())
+    }
+
 }

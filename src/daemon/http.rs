@@ -220,7 +220,7 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                 &mut conn,
                 200,
                 "OK",
-                json!({"path": &p[5..], "committed": true, "length": s.len, "generation": s.generation, "round": s.round}),
+                json!({"path": &p[5..], "committed": true, "length": s.len, "generation": s.generation, "round": s.round, "barcode": s.barcode, "sha256": s.sha256}),
             ),
             Ok(None) => respond_json(&mut conn, 404, "Not Found", json!({"path": &p[5..], "committed": false})),
             Err(e) => service_error(&mut conn, ctx, e),

@@ -15,7 +15,7 @@ use slog::Drain;
 use super::executor::{ExecEvent, ExecRequest};
 use super::directory::{Directory, PoolRow};
 use super::net::{AdminReply, Network, NodeInput};
-use super::state::{Applied, Command, ControlState, Executor};
+use super::state::{Applied, Command, ControlState, Executor, split_catalog};
 use super::store::RaftStore;
 use crate::error::{Result, TapeError};
 
@@ -132,6 +132,28 @@ pub fn run(
                     ExecEvent::Fenced { round } => {
                         info!("轮次 {} 的隔离结果已过时，忽略", round);
                         let _ = exec.send(ExecRequest::Stop { round: Some(round), reason: "隔离完成时已不是该轮的执行者".into() });
+                    }
+                    ExecEvent::Committed { round, barcode, volume_uuid, generation, files_total, bytes_used, files, full } => {
+                        // 目录记录在卷提交成功之后才进日志。这里失败（不再是 Leader 等）没关系：
+                        // 目录会落后于磁带，下次装载该带时按磁带对账补齐。
+                        let known = ctl.tape_summary.get(&barcode).map(|t| t.generation).unwrap_or(0);
+                        if my_round != Some(round) || !is_leader {
+                            info!("{} 第 {} 代的目录记录未写入日志：已不是执行者", barcode, generation);
+                        } else if full && known == generation {
+                            // 接管时的完整列表：目录已经是这一代，不用重写
+                        } else {
+                            if full {
+                                info!("{} 目录停在第 {} 代，磁带是第 {} 代：以磁带为准重写该带的目录", barcode, known, generation);
+                            }
+                            let parts = split_catalog(&files);
+                            for (i, part) in parts.iter().enumerate() {
+                                propose(&mut node, &Command::CatalogPart { barcode: barcode.clone(), generation, part: i as u32, files: part.clone() });
+                            }
+                            propose(
+                                &mut node,
+                                &Command::TapeCommitted { barcode, volume_uuid, generation, files: files_total, bytes_used, parts: parts.len() as u32, full },
+                            );
+                        }
                     }
                     ExecEvent::Serving { round, summary } => {
                         info!("轮次 {} 开始服务：{}", round, summary);

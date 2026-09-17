@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use tape_rs::daemon::executor::{self, ExecOptions, SgProvider};
-use tape_rs::daemon::files::FileService;
+use tape_rs::daemon::files::{BatchPolicy, FileService};
 use tape_rs::daemon::http::{self, HttpContext};
 use tape_rs::daemon::net::{NodeInput, TcpNet};
 use tape_rs::daemon::node::{self, NodeConfig, NodeStatus};
@@ -51,6 +51,18 @@ struct Args {
     /// 自动收尾时打捞未索引数据（默认放弃）
     #[arg(long)]
     salvage: bool,
+    /// 合批：队列累计字节数达到即提交（MiB）
+    #[arg(long, default_value_t = 8192)]
+    batch_mib: u64,
+    /// 合批：队列累计文件数达到即提交
+    #[arg(long, default_value_t = 20_000)]
+    batch_files: usize,
+    /// 合批：这么久没有新的上传完成即提交（毫秒）
+    #[arg(long, default_value_t = 2000)]
+    batch_idle_ms: u64,
+    /// 合批：队列里最早的文件最多等这么久（毫秒）。带 wait 的上传的延迟上界
+    #[arg(long, default_value_t = 60_000)]
+    batch_max_wait_ms: u64,
     /// 客户端接口（HTTP）的监听地址。不给则不开
     #[arg(long)]
     client_listen: Option<String>,
@@ -95,12 +107,21 @@ fn main() {
         demo_write: args.demo_write,
         salvage: args.salvage,
     };
-    let files = FileService::new(args.data_dir.join("spool")).expect("创建暂存区");
+    let policy = BatchPolicy {
+        max_bytes: args.batch_mib << 20,
+        max_files: args.batch_files,
+        idle: Duration::from_millis(args.batch_idle_ms),
+        max_wait: Duration::from_millis(args.batch_max_wait_ms),
+    };
+    let files = FileService::with_options(args.data_dir.join("spool"), policy, Some(args.data_dir.join("directory.db")))
+        .expect("创建暂存区");
+    let status = Arc::new(Mutex::new(NodeStatus::default()));
+    let status_for_exec = status.clone();
     files.set_executor(exec_tx.clone());
     let files_for_exec = files.clone();
     thread::Builder::new()
         .name("ltfsd-exec".into())
-        .spawn(move || executor::run(provider, eopts, exec_rx, ev_tx, files_for_exec))
+        .spawn(move || executor::run(provider, eopts, exec_rx, ev_tx, files_for_exec, status_for_exec))
         .expect("执行线程");
     let inbox_for_events = inbox_tx.clone();
     thread::Builder::new()
@@ -125,7 +146,6 @@ fn main() {
         directory_file: Some(args.data_dir.join("directory.db")),
         cooldown: Duration::from_secs(20),
     };
-    let status = Arc::new(Mutex::new(NodeStatus::default()));
     if let Some(listen) = &args.client_listen {
         let client_addrs = peers
             .iter()

@@ -10,7 +10,11 @@ use std::time::{Duration, Instant};
 
 use log::{error, info, warn};
 
-use super::files::FileService;
+use super::files::{FileService, TapeIdent};
+use super::node::SharedStatus;
+use super::state::FileRec;
+use crate::changer::commands::MediumChanger;
+use crate::changer::element::ElementType;
 use crate::error::{Result, TapeError};
 use crate::ltfs::recovery::TailKind;
 use crate::ltfs::volume::{LtfsVolume, TailPolicy};
@@ -27,6 +31,8 @@ pub enum DeviceKind {
 
 pub struct ManagedDevice {
     pub name: String,
+    /// VPD 0x80 序列号。换带器用它把驱动器元素和设备对应起来
+    pub serial: String,
     pub kind: DeviceKind,
     pub dev: Box<dyn TapeTransport + Send>,
 }
@@ -57,7 +63,7 @@ impl DeviceProvider for SgProvider {
             let Some(serial) = read_unit_serial(&dev) else { continue };
             if let Some(i) = wanted.iter().position(|(s, _)| *s == serial) {
                 let (s, kind) = wanted.remove(i);
-                found.push(ManagedDevice { name: format!("{} ({})", s, p), kind, dev: Box::new(dev) });
+                found.push(ManagedDevice { name: format!("{} ({})", s, p), serial: s, kind, dev: Box::new(dev) });
             }
         }
         if let Some((s, _)) = wanted.first() {
@@ -88,6 +94,9 @@ pub enum ExecEvent {
     Fenced { round: u64 },
     FenceFailed { round: u64, reason: String },
     Serving { round: u64, summary: String },
+    /// 一次卷提交已经落带（或接管时读到了该带的完整列表，`full` 为真）。
+    /// Raft 层据此把目录记录写进日志。
+    Committed { round: u64, barcode: String, volume_uuid: String, generation: u64, files_total: u64, bytes_used: u64, files: Vec<FileRec>, full: bool },
     /// 持有期间失去资格（预留被抢占、设备复位、自检失败）。执行线程已停手。
     Lost { round: u64, reason: String },
 }
@@ -118,11 +127,16 @@ pub fn run(
     rx: Receiver<ExecRequest>,
     tx: Sender<ExecEvent>,
     files: Arc<FileService>,
+    status: SharedStatus,
 ) {
     let mut active: Option<Active> = None;
     let mut next_work = Instant::now() + opts.interval;
     loop {
-        let wait = next_work.saturating_duration_since(Instant::now());
+        let mut wait = next_work.saturating_duration_since(Instant::now());
+        // 有一批上传快到期时提前醒来
+        if let Some(due) = active.as_ref().filter(|a| a.serving).and_then(|a| files.due_in(a.round)) {
+            wait = wait.min(due);
+        }
         match rx.recv_timeout(wait) {
             Ok(ExecRequest::Shutdown) | Err(RecvTimeoutError::Disconnected) => return,
             Ok(ExecRequest::Stop { round, reason }) => {
@@ -157,7 +171,7 @@ pub fn run(
                     let _ = tx.send(ExecEvent::Lost { round, reason });
                     continue;
                 };
-                match recover(a, &opts, &files) {
+                match recover(a, &opts, &files, &status, &tx) {
                     Ok(summary) => {
                         a.serving = true;
                         next_work = Instant::now() + opts.interval;
@@ -175,7 +189,7 @@ pub fn run(
                 let Some(a) = active.as_mut().filter(|a| a.serving) else {
                     continue;
                 };
-                if let Err(reason) = process_uploads(a, &files) {
+                if let Err(reason) = process_uploads(a, &files, &tx) {
                     let round = a.round;
                     error!("执行线程: 轮次 {} 落带失败，放弃本轮: {}", round, reason);
                     files.close(&reason);
@@ -191,11 +205,27 @@ pub fn run(
                 let _ = reply.send(res);
             }
             Err(RecvTimeoutError::Timeout) => {
-                next_work = Instant::now() + opts.interval;
                 let Some(a) = active.as_mut().filter(|a| a.serving) else {
+                    next_work = Instant::now() + opts.interval;
                     continue;
                 };
-                let worked = process_uploads(a, &files).and_then(|_| periodic(a, &opts));
+                // 提前醒来只为落带；周期工作（自检、演示写入、重试选带）仍按原节奏
+                let periodic_due = Instant::now() >= next_work;
+                if periodic_due {
+                    next_work = Instant::now() + opts.interval;
+                }
+                let mut worked = process_uploads(a, &files, &tx);
+                if periodic_due && worked.is_ok() {
+                    if a.drive.is_none() {
+                        // 还没有可服务的带（例如装着的带刚被归入池）：再试一次
+                        if let Ok(summary) = recover(a, &opts, &files, &status, &tx) {
+                            if a.drive.is_some() {
+                                let _ = tx.send(ExecEvent::Serving { round: a.round, summary });
+                            }
+                        }
+                    }
+                    worked = periodic(a, &opts);
+                }
                 if let Err(reason) = worked {
                     let round = a.round;
                     error!("执行线程: 轮次 {} 失去执行资格: {}", round, reason);
@@ -238,20 +268,62 @@ fn takeover(provider: &dyn DeviceProvider, opts: &ExecOptions, round: u64) -> Re
     Ok(Active { round, key, devices, serving: false, drive: None, seq: 0 })
 }
 
-/// 挂载第一个装有 LTFS 卷的驱动器；尾部不完整时自动收尾。
-fn recover(a: &mut Active, opts: &ExecOptions, files: &FileService) -> Result<String> {
+/// 换带器报告的"这个驱动器里装的是哪盘带"。
+fn loaded_barcode(devices: &[ManagedDevice], drive_serial: &str) -> Option<String> {
+    let changer = devices.iter().find(|d| d.kind == DeviceKind::Changer)?;
+    let mut mc = MediumChanger::new(changer.dev.as_ref());
+    mc.load_address_map().ok()?;
+    let elems = mc.read_all_status().ok()?;
+    elems
+        .iter()
+        .filter(|e| e.element_type == ElementType::DataTransfer && e.full)
+        .find(|e| e.drive_id.as_deref().is_some_and(|id| id.contains(drive_serial) || drive_serial.contains(id.trim())))
+        .and_then(|e| e.volume_tag.clone())
+        .map(|b| b.trim().to_string())
+        .filter(|b| !b.is_empty())
+}
+
+fn catalog_of(index: &crate::ltfs::index::LtfsIndex) -> (Vec<FileRec>, u64) {
+    let mut files = Vec::new();
+    let mut bytes = 0u64;
+    index.walk_files(|p, f| {
+        bytes += f.length;
+        files.push(FileRec {
+            path: format!("/{}", p),
+            length: f.length,
+            sha256: f.xattr(crate::ltfs::index::XATTR_SHA256).unwrap_or("").to_string(),
+        });
+    });
+    (files, bytes)
+}
+
+/// 找一个装着**已归属**磁带的驱动器并开始服务；尾部不完整时自动收尾。
+/// 未归属任何池的磁带只做只读识别，绝不写入（包括收尾）。
+fn recover(a: &mut Active, opts: &ExecOptions, files: &FileService, status: &SharedStatus, tx: &Sender<ExecEvent>) -> Result<String> {
+    let mut notes = Vec::new();
     for (i, d) in a.devices.iter().enumerate().filter(|(_, d)| d.kind == DeviceKind::Drive) {
+        let Some(barcode) = loaded_barcode(&a.devices, &d.serial) else {
+            continue;
+        };
+        let pool_uuid = {
+            let st = status.lock().unwrap_or_else(|e| e.into_inner());
+            st.pools.iter().find(|p| p.tapes.iter().any(|t| *t == barcode)).map(|p| p.uuid.clone())
+        };
+        let Some(pool_uuid) = pool_uuid else {
+            notes.push(format!("{} 里的 {} 未归属任何池，不触碰", d.name, barcode));
+            continue;
+        };
         let mut vol = match LtfsVolume::mount(d.dev.as_ref()) {
             Ok(v) => v,
             Err(e) if ownership_lost(&e) => return Err(e),
             Err(e) => {
-                info!("执行线程: {} 上没有可用的卷: {}", d.name, e);
+                notes.push(format!("{} ({}) 无法挂载: {}", d.name, barcode, e));
                 continue;
             }
         };
         vol.set_reservation_guard(Some(a.key));
         let tail = vol.recovery().dp.tail;
-        let mut summary = format!("{}: gen={} 文件 {} 个 尾部 {:?}", d.name, vol.index().generation, vol.list().len(), tail);
+        let mut summary = format!("{} [{}]: gen={} 文件 {} 个 尾部 {:?}", d.name, barcode, vol.index().generation, vol.list().len(), tail);
         if !vol.writable() && matches!(tail, TailKind::UnindexedData | TailKind::TruncatedIndex) {
             let policy = if opts.salvage { TailPolicy::Salvage } else { TailPolicy::Discard };
             let rep = vol.close_tail(policy)?;
@@ -268,22 +340,37 @@ fn recover(a: &mut Active, opts: &ExecOptions, files: &FileService) -> Result<St
         let free = crate::ltfs::mam::read_volume_capacity(d.dev.as_ref())
             .map(|c| c.remaining.saturating_mul(1 << 20))
             .unwrap_or(1 << 50);
-        files.open(a.round, vol.index(), free, vol.writable());
+        files.open(a.round, TapeIdent { barcode: barcode.clone(), pool_uuid }, vol.index(), free, vol.writable());
+        // 把这盘带的完整列表交给 Raft 层：目录落后于磁带时据此对账（以磁带为准）
+        let (list, bytes_used) = catalog_of(vol.index());
+        let _ = tx.send(ExecEvent::Committed {
+            round: a.round,
+            barcode,
+            volume_uuid: vol.label().volume_uuid.to_string(),
+            generation: vol.index().generation,
+            files_total: list.len() as u64,
+            bytes_used,
+            files: list,
+            full: true,
+        });
         a.drive = Some(i);
         return Ok(summary);
     }
-    Ok("没有装载 LTFS 卷的驱动器，仅持有预留".to_string())
+    if notes.is_empty() {
+        notes.push("没有装着磁带的驱动器".to_string());
+    }
+    Ok(format!("仅持有预留：{}", notes.join("；")))
 }
 
 /// 把文件服务里已完成的上传成批落带：一次挂载、逐个追加、一次提交，然后发布。
 /// 返回 `Err(原因)` 表示本轮不能再继续（失去资格，或提交结果未定需要重新恢复）。
-fn process_uploads(a: &mut Active, files: &FileService) -> std::result::Result<(), String> {
+fn process_uploads(a: &mut Active, files: &FileService, tx: &Sender<ExecEvent>) -> std::result::Result<(), String> {
     let Some(i) = a.drive else {
         return Ok(());
     };
     while let Some((batch, uploads)) = files.take_batch(a.round) {
         let dev = a.devices[i].dev.as_ref();
-        let result = (|| -> Result<u64> {
+        let result = (|| -> Result<ExecEvent> {
             let mut vol = LtfsVolume::mount(dev)?;
             vol.set_reservation_guard(Some(a.key));
             for u in &uploads {
@@ -291,12 +378,28 @@ fn process_uploads(a: &mut Active, files: &FileService) -> std::result::Result<(
                 vol.append_file(&u.path, &mut f)?;
             }
             vol.commit()?;
-            Ok(vol.index().generation)
+            let (all, bytes_used) = catalog_of(vol.index());
+            let written: Vec<FileRec> =
+                all.iter().filter(|r| uploads.iter().any(|u| u.path == r.path)).cloned().collect();
+            Ok(ExecEvent::Committed {
+                round: a.round,
+                barcode: files.tape().map(|t| t.barcode).unwrap_or_default(),
+                volume_uuid: vol.label().volume_uuid.to_string(),
+                generation: vol.index().generation,
+                files_total: all.len() as u64,
+                bytes_used,
+                files: written,
+                full: false,
+            })
         })();
         match result {
-            Ok(generation) => {
-                info!("执行线程: 已提交 {} 个文件，索引 gen={}", uploads.len(), generation);
-                files.batch_done(a.round, &batch, &uploads, Ok(generation));
+            Ok(ev) => {
+                if let ExecEvent::Committed { generation, files: written, .. } = &ev {
+                    info!("执行线程: 已提交 {} 个文件，索引 gen={}", uploads.len(), generation);
+                    let hashes = written.iter().map(|r| (r.path.clone(), r.sha256.clone())).collect();
+                    files.batch_done(a.round, &batch, &uploads, Ok((*generation, hashes)));
+                }
+                let _ = tx.send(ev);
             }
             Err(e) => {
                 // 提交没有得到确认：这些文件结果未定。本轮到此为止，由下一次接管的恢复协议判定。

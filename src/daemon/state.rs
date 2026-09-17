@@ -18,6 +18,39 @@ pub enum Command {
     TapeAssign { barcode: String, pool: String },
     /// 解除归属。
     TapeUnassign { barcode: String },
+    /// 一次卷提交的目录记录的一片。先进暂存，等同一批的 `TapeCommitted` 到达才可见。
+    CatalogPart { barcode: String, generation: u64, part: u32, files: Vec<FileRec> },
+    /// 一次卷提交的摘要。应用它时，若 `parts` 片齐全，该批目录记录原子地并入目录。
+    /// `full` 为真表示这批是该带的完整列表（接管时对账用），并入前先清掉该带的旧记录。
+    TapeCommitted { barcode: String, volume_uuid: String, generation: u64, files: u64, bytes_used: u64, parts: u32, full: bool },
+}
+
+/// 目录里的一条文件记录。它只是"该带第 G 代索引里有这个文件"的缓存，磁带才是权威。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRec {
+    pub path: String,
+    pub length: u64,
+    /// 十六进制小写；没有哈希属性的文件为空串
+    pub sha256: String,
+}
+
+/// 目录条目单片的大小上限（字节，按 JSON 编码后估算）。
+pub const CATALOG_PART_BYTES: usize = 1 << 20;
+
+/// 把一批文件记录切成若干片，每片编码后不超过约 1 MiB。
+pub fn split_catalog(files: &[FileRec]) -> Vec<Vec<FileRec>> {
+    let mut out = vec![Vec::new()];
+    let mut size = 0usize;
+    for f in files {
+        let cost = f.path.len() + f.sha256.len() + 48;
+        if size + cost > CATALOG_PART_BYTES && !out.last().is_some_and(Vec::is_empty) {
+            out.push(Vec::new());
+            size = 0;
+        }
+        size += cost;
+        out.last_mut().expect("非空").push(f.clone());
+    }
+    out
 }
 
 impl Command {
@@ -33,6 +66,14 @@ impl Command {
             }
             Command::TapeAssign { barcode, pool } => json!({"op": "tape_assign", "barcode": barcode, "pool": pool}),
             Command::TapeUnassign { barcode } => json!({"op": "tape_unassign", "barcode": barcode}),
+            Command::CatalogPart { barcode, generation, part, files } => json!({
+                "op": "catalog_part", "barcode": barcode, "generation": generation, "part": part,
+                "files": files.iter().map(|f| json!([f.path, f.length, f.sha256])).collect::<Vec<_>>(),
+            }),
+            Command::TapeCommitted { barcode, volume_uuid, generation, files, bytes_used, parts, full } => json!({
+                "op": "tape_committed", "barcode": barcode, "volume_uuid": volume_uuid, "generation": generation,
+                "files": files, "bytes_used": bytes_used, "parts": parts, "full": full,
+            }),
         };
         v.to_string().into_bytes()
     }
@@ -50,6 +91,33 @@ impl Command {
             }
             "tape_assign" => return Some(Command::TapeAssign { barcode: text("barcode")?, pool: text("pool")? }),
             "tape_unassign" => return Some(Command::TapeUnassign { barcode: text("barcode")? }),
+            "catalog_part" => {
+                let files = v
+                    .get("files")?
+                    .as_array()?
+                    .iter()
+                    .map(|f| {
+                        Some(FileRec { path: f.get(0)?.as_str()?.to_string(), length: f.get(1)?.as_u64()?, sha256: f.get(2)?.as_str()?.to_string() })
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                return Some(Command::CatalogPart {
+                    barcode: text("barcode")?,
+                    generation: v.get("generation")?.as_u64()?,
+                    part: v.get("part")?.as_u64()? as u32,
+                    files,
+                });
+            }
+            "tape_committed" => {
+                return Some(Command::TapeCommitted {
+                    barcode: text("barcode")?,
+                    volume_uuid: text("volume_uuid")?,
+                    generation: v.get("generation")?.as_u64()?,
+                    files: v.get("files")?.as_u64()?,
+                    bytes_used: v.get("bytes_used")?.as_u64()?,
+                    parts: v.get("parts")?.as_u64()? as u32,
+                    full: v.get("full")?.as_bool()?,
+                });
+            }
             _ => {}
         }
         let node = v.get("node")?.as_u64()?;
@@ -88,6 +156,8 @@ pub enum Applied {
     FenceSuperseded { node: u64, round: u64 },
     /// 当前执行者放弃。
     ExecutorGone { node: u64, round: u64 },
+    /// 一次卷提交的摘要被接受：目录库应当把对应的暂存记录并入目录。
+    CatalogCommitted,
     /// 管理命令的结论。`Err` 表示被状态机拒绝（所有节点结论相同），状态未变。
     Admin(std::result::Result<String, String>),
     Nothing,
@@ -112,6 +182,16 @@ pub struct ControlState {
     pub pools: std::collections::BTreeMap<String, Pool>,
     /// 条码 → 所属池的 UUID。不在这里的磁带即未归属，系统绝不触碰。
     pub tapes: std::collections::BTreeMap<String, String>,
+    /// 条码 → 最近一次卷提交的摘要。文件记录本身只在目录库里，不放内存。
+    pub tape_summary: std::collections::BTreeMap<String, TapeSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TapeSummary {
+    pub volume_uuid: String,
+    pub generation: u64,
+    pub files: u64,
+    pub bytes_used: u64,
 }
 
 impl ControlState {
@@ -140,10 +220,22 @@ impl ControlState {
             },
             Command::PoolCreate { uuid, name, file_limit } => Applied::Admin(self.pool_create(uuid, name, *file_limit)),
             Command::TapeAssign { barcode, pool } => Applied::Admin(self.tape_assign(barcode, pool)),
-            Command::TapeUnassign { barcode } => Applied::Admin(match self.tapes.remove(barcode) {
-                Some(_) => Ok(format!("{} 已解除归属", barcode)),
-                None => Err(format!("{} 未归属任何池", barcode)),
-            }),
+            Command::TapeUnassign { barcode } => Applied::Admin(self.tape_unassign(barcode)),
+            // 文件记录进目录库的暂存表，这里不处理
+            Command::CatalogPart { .. } => Applied::Nothing,
+            Command::TapeCommitted { barcode, volume_uuid, generation, files, bytes_used, .. } => {
+                // 只接受已归属的带，且代数不回退：迟到的旧批次不能把摘要改回去
+                let newer = self.tape_summary.get(barcode).is_none_or(|s| *generation >= s.generation);
+                if self.tapes.contains_key(barcode) && newer {
+                    self.tape_summary.insert(
+                        barcode.clone(),
+                        TapeSummary { volume_uuid: volume_uuid.clone(), generation: *generation, files: *files, bytes_used: *bytes_used },
+                    );
+                    Applied::CatalogCommitted
+                } else {
+                    Applied::Nothing
+                }
+            }
         }
     }
 }
@@ -164,6 +256,19 @@ impl ControlState {
         }
         self.pools.insert(uuid.to_string(), Pool { name: name.to_string(), file_limit });
         Ok(uuid.to_string())
+    }
+
+    fn tape_unassign(&mut self, barcode: &str) -> std::result::Result<String, String> {
+        if !self.tapes.contains_key(barcode) {
+            return Err(format!("{} 未归属任何池", barcode));
+        }
+        // 37 的前提：带上还有目录记录的文件时不能解除归属（否则这些文件从池里消失）
+        if let Some(s) = self.tape_summary.get(barcode).filter(|s| s.files > 0) {
+            return Err(format!("{} 上还有 {} 个文件，不能解除归属", barcode, s.files));
+        }
+        self.tapes.remove(barcode);
+        self.tape_summary.remove(barcode);
+        Ok(format!("{} 已解除归属", barcode))
     }
 
     /// `pool` 可以是池名或 UUID。
@@ -253,5 +358,39 @@ mod tests {
         assert_eq!(s.tapes.keys().collect::<Vec<_>>(), vec!["T2"]);
         // 被拒绝的命令不改变状态
         assert_eq!(s.pools.len(), 1);
+    }
+
+    #[test]
+    fn catalog_commands_roundtrip_and_split() {
+        let files: Vec<FileRec> = (0..10_000)
+            .map(|i| FileRec { path: format!("/dir/sub/object-{:08}.bin", i), length: i, sha256: "ab".repeat(32) })
+            .collect();
+        let parts = split_catalog(&files);
+        assert!(parts.len() >= 2, "一万条记录超过 1 MiB，应当分片");
+        assert_eq!(parts.iter().map(Vec::len).sum::<usize>(), files.len());
+        for (i, p) in parts.iter().enumerate() {
+            let c = Command::CatalogPart { barcode: "T1".into(), generation: 7, part: i as u32, files: p.clone() };
+            let enc = c.encode();
+            assert!(enc.len() < 2 * CATALOG_PART_BYTES, "{}", enc.len());
+            assert_eq!(Command::decode(&enc), Some(c));
+        }
+        assert_eq!(split_catalog(&[]), vec![Vec::<FileRec>::new()]);
+        let t = Command::TapeCommitted { barcode: "T1".into(), volume_uuid: "v".into(), generation: 7, files: 3, bytes_used: 9, parts: 2, full: true };
+        assert_eq!(Command::decode(&t.encode()), Some(t));
+    }
+
+    #[test]
+    fn summaries_only_move_forward_and_block_unassign() {
+        let mut s = ControlState::default();
+        s.apply(1, &Command::PoolCreate { uuid: "u".into(), name: "p".into(), file_limit: 10 });
+        let commit = |g: u64, files: u64| Command::TapeCommitted { barcode: "T1".into(), volume_uuid: "v".into(), generation: g, files, bytes_used: 1, parts: 1, full: false };
+        assert_eq!(s.apply(2, &commit(5, 1)), Applied::Nothing, "未归属的带不接受");
+        s.apply(3, &Command::TapeAssign { barcode: "T1".into(), pool: "p".into() });
+        assert_eq!(s.apply(4, &commit(5, 2)), Applied::CatalogCommitted);
+        assert_eq!(s.apply(5, &commit(4, 1)), Applied::Nothing, "代数回退的迟到批次被忽略");
+        assert_eq!(s.tape_summary["T1"].generation, 5);
+        assert!(matches!(s.apply(6, &Command::TapeUnassign { barcode: "T1".into() }), Applied::Admin(Err(_))));
+        assert_eq!(s.apply(7, &commit(6, 0)), Applied::CatalogCommitted);
+        assert!(matches!(s.apply(8, &Command::TapeUnassign { barcode: "T1".into() }), Applied::Admin(Ok(_))));
     }
 }

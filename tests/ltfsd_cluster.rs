@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use raft::eraftpb::Message;
 use tape_rs::daemon::executor::{self, DeviceKind, DeviceProvider, ExecOptions, ManagedDevice};
-use tape_rs::daemon::net::{Network, NodeInput};
+use tape_rs::daemon::net::{AdminReply, Network, NodeInput};
+use tape_rs::daemon::state::Command;
 use tape_rs::daemon::node::{self, NodeConfig, NodeStatus, SharedStatus};
 use tape_rs::daemon::store::RaftStore;
 use tape_rs::error::Result;
@@ -19,6 +20,7 @@ use tape_rs::scsi::reservation::{ReservationKey, fence, read_status, release_and
 use tape_rs::scsi::sim::{SimCartridge, SimLibrary};
 
 const BARCODE: &str = "LTFSD1L8";
+const POOL: &str = "00000000-0000-4000-8000-000000000001";
 
 #[derive(Clone)]
 struct ChannelNet {
@@ -48,8 +50,8 @@ struct SimProvider {
 impl DeviceProvider for SimProvider {
     fn open_all(&self) -> Result<Vec<ManagedDevice>> {
         Ok(vec![
-            ManagedDevice { name: "drive0".into(), kind: DeviceKind::Drive, dev: Box::new(self.lib.drive_as(0, self.initiator)) },
-            ManagedDevice { name: "changer".into(), kind: DeviceKind::Changer, dev: Box::new(self.lib.changer()) },
+            ManagedDevice { name: "drive0".into(), serial: "SIMDRV0000".into(), kind: DeviceKind::Drive, dev: Box::new(self.lib.drive_as(0, self.initiator)) },
+            ManagedDevice { name: "changer".into(), serial: "SIMLIB0000000001".into(), kind: DeviceKind::Changer, dev: Box::new(self.lib.changer()) },
         ])
     }
 }
@@ -100,11 +102,13 @@ impl Cluster {
             let (ev_tx, ev_rx) = channel();
             let provider = Box::new(SimProvider { lib: lib.clone(), initiator: id as u32 });
             let eopts = ExecOptions { node_id: id as u8, interval: Duration::from_millis(40), demo_write, salvage: false };
-            let files = tape_rs::daemon::files::FileService::new(dir.join(format!("spool-{}", id))).unwrap();
+            let policy = tape_rs::daemon::files::BatchPolicy { max_bytes: 4 << 20, max_files: 50, idle: Duration::from_millis(25), max_wait: Duration::from_millis(400) };
+            let files = tape_rs::daemon::files::FileService::with_options(dir.join(format!("spool-{}", id)), policy, Some(dir.join(format!("directory-{}.db", id)))).unwrap();
+            let status_for_exec = shared.clone();
             files.set_executor(exec_tx.clone());
             services.insert(id, files.clone());
             execs.insert(id, exec_tx.clone());
-            thread::spawn(move || executor::run(provider, eopts, exec_rx, ev_tx, files));
+            thread::spawn(move || executor::run(provider, eopts, exec_rx, ev_tx, files, status_for_exec));
             let inbox_tx = inboxes[&id].clone();
             thread::spawn(move || {
                 for ev in ev_rx {
@@ -128,7 +132,30 @@ impl Cluster {
             let rx = rxs.remove(&id).unwrap();
             thread::spawn(move || node::run(cfg, store, net, rx, exec_tx, shared).unwrap());
         }
-        Cluster { lib, status, services, execs, inboxes, isolated, dir }
+        let c = Cluster { lib, status, services, execs, inboxes, isolated, dir };
+        // 未归属的磁带系统绝不触碰：先建池并把模拟库里的这盘带归进去
+        c.admin(Command::PoolCreate { uuid: POOL.into(), name: "pool".into(), file_limit: 200_000 });
+        c.admin(Command::TapeAssign { barcode: BARCODE.into(), pool: POOL.into() });
+        c
+    }
+
+    /// 向当前 Leader 提交一条管理命令并等它应用。
+    fn admin(&self, cmd: Command) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            for id in 1..=3u64 {
+                let (tx, rx) = channel();
+                let _ = self.inboxes[&id].send(NodeInput::Admin { cmd: cmd.clone(), reply: tx });
+                match rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(AdminReply::Ok(_)) => return,
+                    // 上一次尝试其实已经成功、只是回复来晚了：重发会被状态机以"已存在/已归属"拒绝
+                    Ok(AdminReply::Rejected(why)) if why.contains("已存在") || why.contains("已归属") => return,
+                    _ => {}
+                }
+            }
+            assert!(Instant::now() < deadline, "管理命令没有被受理: {:?}", cmd);
+            thread::sleep(Duration::from_millis(30));
+        }
     }
 
     fn st(&self, id: u64) -> NodeStatus {
@@ -385,6 +412,18 @@ fn committed_uploads_survive_failover_and_unconfirmed_ones_never_corrupt() {
     println!("竞争上传 {} 个：确认提交 {}，新 Leader 上可见 {}，未确认 {:?}", raced.len(), confirmed, visible_n, unconfirmed);
     assert!(!unconfirmed.is_empty(), "至少最后一个请求应当撞上停止服务");
 
+    // PN06：旧 Leader 被隔开期间落带的文件，它们的目录记录没能进日志。新 Leader 接管时按磁带重写
+    // 该带的目录；网络恢复后三个节点的目录库都应包含新 Leader 上可见的全部文件。
+    c.isolated.lock().unwrap().clear();
+    let visible: Vec<String> = raced.iter().map(|(i, _)| format!("/race/{}.bin", i)).filter(|p| svc_new.stat(p).unwrap().is_some()).collect();
+    for id in 1..=3u64 {
+        let db = c.dir.join(format!("directory-{}.db", id));
+        c.wait("目录按磁带对账补齐", || {
+            let d = tape_rs::daemon::directory::Directory::open_reader(&db).unwrap();
+            d.stat(POOL, "/f1.bin").unwrap().is_some() && visible.iter().all(|p| d.stat(POOL, p).unwrap().is_some())
+        });
+    }
+
     // 旧 Leader 最终停止服务，新 Leader 正常接受上传
     c.wait("旧 Leader 停止服务", || svc_old.serving_round().is_none());
     assert!(matches!(upload(&svc_new, "/after.bin", &body(1000, 9)).unwrap(), TaskStatus::Committed { .. }));
@@ -405,7 +444,8 @@ fn lone_executor(name: &str) -> (Sender<ExecRequest>, std::sync::mpsc::Receiver<
     let dir = std::env::temp_dir().join(format!("ltfsd-exec-{}-{}", name, std::process::id()));
     let files = FileService::new(dir).unwrap();
     let opts = ExecOptions { node_id: 1, interval: Duration::from_secs(3600), demo_write: false, salvage: false };
-    thread::spawn(move || executor::run(Box::new(SimProvider { lib, initiator: 1 }), opts, rx, ev_tx, files));
+    let status: SharedStatus = Arc::new(Mutex::new(NodeStatus::default()));
+    thread::spawn(move || executor::run(Box::new(SimProvider { lib, initiator: 1 }), opts, rx, ev_tx, files, status));
     (tx, ev_rx)
 }
 
@@ -545,7 +585,7 @@ fn pools_and_tape_assignments_are_replicated_to_every_node() {
     assert!(cl.tape_unassign("TR8002L08").is_err());
 
     let want = |pools: &[tape_rs::client::PoolInfo]| {
-        pools.len() == 2
+        pools.len() == 3
             && pools.iter().any(|p| p.name == "archive" && p.uuid == uuid && p.file_limit == 50_000 && p.tapes == ["TR8000L08", "TR8001L08"])
             && pools.iter().any(|p| p.name == "scratch" && p.file_limit == 200_000 && p.tapes.is_empty())
     };
@@ -561,5 +601,84 @@ fn pools_and_tape_assignments_are_replicated_to_every_node() {
         assert_eq!(rows.iter().find(|p| p.name == "archive").unwrap().tapes, ["TR8000L08", "TR8001L08"]);
         assert!(d.applied_index() > 0);
     }
+    c.shutdown();
+}
+
+// ---------- 合批与目录（P2）----------
+
+/// PN01：并发上传被合成少数几次卷提交；目录记录带着写带时算出的
+/// sha256 复制到每个节点；带上有文件时不能解除归属。
+#[test]
+fn uploads_are_batched_and_catalogued_on_every_node() {
+    use sha2::{Digest, Sha256};
+    let c = Cluster::start_with("batching", false);
+    let (leader, round) = c.wait_serving(None, 0);
+    let svc = &c.services[&leader];
+    c.wait("文件服务开放", || svc.serving_round() == Some(round));
+    let base = svc.stat("/nothing").map(|_| ()).is_ok();
+    assert!(base);
+
+    // 测试用的策略：每批最多 50 个文件、空闲 25 ms、最长等待 400 ms
+    let n = 130usize;
+    let gens: Vec<u64> = thread::scope(|sc| {
+        (0..n)
+            .map(|i| sc.spawn(move || match upload(svc, &format!("/b/{:03}.bin", i), &body(3000 + i, i as u8)).unwrap() {
+                TaskStatus::Committed { generation } => generation,
+                other => panic!("{other:?}"),
+            }))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect()
+    });
+    let mut per_gen: HashMap<u64, usize> = HashMap::new();
+    for g in &gens {
+        *per_gen.entry(*g).or_default() += 1;
+    }
+    println!("{} 个并发上传 -> {} 次卷提交，每批 {:?}", n, per_gen.len(), { let mut v: Vec<_> = per_gen.values().copied().collect(); v.sort(); v });
+    assert!(per_gen.len() <= n / 5, "应当合批，而不是每个文件提交一次: {}", per_gen.len());
+    // 文件数与字节数是**触发阈值**而不是硬上限：队列达到阈值就提交，取队列时把已到齐的全部带走
+    // （VolumeState 的冻结一次覆盖所有已完成的上传）。所以一批可以超过阈值，但阈值保证了不会无限攒着。
+    assert!(per_gen.values().any(|&k| k >= 50), "突发上传应当凑出达到阈值的批: {per_gen:?}");
+
+    // 一个慢速上传者：每个文件都在空闲触发之内到达，靠"最长等待"封顶
+    let t0 = Instant::now();
+    let slow: Vec<u64> = thread::scope(|sc| {
+        let hs: Vec<_> = (0..40usize)
+            .map(|i| {
+                let h = sc.spawn(move || match upload(svc, &format!("/slow/{:02}.bin", i), &body(500, i as u8)).unwrap() {
+                    TaskStatus::Committed { generation } => generation,
+                    other => panic!("{other:?}"),
+                });
+                thread::sleep(Duration::from_millis(12));
+                h
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let distinct: std::collections::BTreeSet<u64> = slow.iter().copied().collect();
+    println!("慢速上传 40 个，历时 {:?} -> {} 次卷提交", t0.elapsed(), distinct.len());
+    assert!(distinct.len() >= 2, "最长等待到期应当切出一批，而不是无限等下去");
+    assert!(distinct.len() <= 8);
+
+    // 目录记录（路径、长度、sha256、条码、代数）经 Raft 到达每个节点
+    let want = Sha256::digest(body(3000 + 7, 7)).iter().map(|b| format!("{:02x}", b)).collect::<String>();
+    for id in 1..=3u64 {
+        let db = c.dir.join(format!("directory-{}.db", id));
+        c.wait("目录复制到每个节点", || {
+            let d = tape_rs::daemon::directory::Directory::open_reader(&db).unwrap();
+            d.list(POOL).map(|l| l.len()).unwrap_or(0) == n + 40
+        });
+        let d = tape_rs::daemon::directory::Directory::open_reader(&db).unwrap();
+        let row = d.stat(POOL, "/b/007.bin").unwrap().unwrap();
+        assert_eq!((row.barcode.as_str(), row.length, row.sha256.as_str()), (BARCODE, 3007, want.as_str()));
+        assert!(d.tape_generation(BARCODE).unwrap() >= *gens.iter().max().unwrap());
+    }
+    assert_eq!(svc.stat("/b/007.bin").unwrap().unwrap().sha256, want);
+
+    // 带上有文件：不能解除归属
+    let (tx, rx) = channel();
+    c.inboxes[&leader].send(NodeInput::Admin { cmd: Command::TapeUnassign { barcode: BARCODE.into() }, reply: tx }).unwrap();
+    assert!(matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), AdminReply::Rejected(_)));
     c.shutdown();
 }
