@@ -5,7 +5,8 @@ use std::io::{BufReader, BufWriter};
 
 use tape_rs::error::{Result, TapeError};
 use tape_rs::ltfs::mkltfs::{self, MkltfsOptions};
-use tape_rs::ltfs::volume::{HashPolicy, HashVerdict, LtfsVolume};
+use tape_rs::ltfs::recovery::TailKind;
+use tape_rs::ltfs::volume::{HashPolicy, HashVerdict, LtfsVolume, TailPolicy};
 use tape_rs::scsi::device::ScsiDevice;
 use tape_rs::scsi::reservation::{self, FenceOutcome, PrStatus, ReservationKey};
 
@@ -210,5 +211,63 @@ pub fn cmd_pr_release(path: &str, node: u8, round: u64) -> Result<()> {
     let dev = ScsiDevice::open(path)?;
     reservation::release_and_unregister(&dev, ReservationKey::new(node, round))?;
     print_pr_status(&reservation::read_status(&dev)?);
+    Ok(())
+}
+
+pub fn cmd_ltfs_takeover(path: &str, node: u8, round: u64, salvage: bool, report_only: bool) -> Result<()> {
+    let dev = ScsiDevice::open(path)?;
+    let key = ReservationKey::new(node, round);
+    println!("[1/3] 设备层隔离 (节点 {} 轮次 {})", node, round);
+    match reservation::fence(&dev, key)? {
+        FenceOutcome::Fenced { before, .. } => match before.holder {
+            Some((k, _)) if k != key.0 => println!("      已抢占原持有者 {:#018x}，回读确认", k),
+            _ => println!("      设备原先无人持有，已取得预留，回读确认"),
+        },
+        FenceOutcome::Unsupported => {
+            return Err(TapeError::Ltfs("设备不支持持久预留，不能自动接管".into()));
+        }
+        FenceOutcome::Unconfirmed { reason, .. } => {
+            return Err(TapeError::Ltfs(format!("隔离未能确认，不得接管: {}", reason)));
+        }
+    }
+
+    println!("[2/3] 挂载并执行恢复协议");
+    let mut vol = LtfsVolume::mount(&dev)?;
+    vol.set_reservation_guard(Some(key));
+    let (tail, eod, last_end) = {
+        let r = vol.recovery();
+        (r.dp.tail, r.dp.eod, r.dp.last_index.as_ref().map(|c| c.end_block))
+    };
+    println!(
+        "      视图 gen={}  文件 {} 个  DP 尾部 {:?}  末索引结束于块 {:?}  EOD {}",
+        vol.index().generation,
+        vol.list().len(),
+        tail,
+        last_end,
+        eod
+    );
+    if vol.writable() {
+        println!("[3/3] 尾部完整，无需收尾。卷可写");
+        return Ok(());
+    }
+    println!("      只读原因: {}", vol.restricted_reason().unwrap_or("-"));
+    if !matches!(tail, TailKind::UnindexedData | TailKind::TruncatedIndex) || report_only {
+        println!("[3/3] 不自动收尾，卷保持只读");
+        return Ok(());
+    }
+
+    println!("[3/3] 收尾：在 EOD 追加索引（{}）", if salvage { "打捞未索引数据" } else { "放弃未索引数据" });
+    let policy = if salvage { TailPolicy::Salvage } else { TailPolicy::Discard };
+    let rep = vol.close_tail(policy)?;
+    println!(
+        "      放弃块 {}..{}  新索引 gen={}  卷可写={}",
+        rep.abandoned_first_block,
+        rep.abandoned_end_block - 1,
+        rep.generation,
+        vol.writable()
+    );
+    if let Some((p, n)) = rep.salvaged {
+        println!("      打捞: {} ({} 字节)", p, n);
+    }
     Ok(())
 }

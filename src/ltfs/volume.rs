@@ -335,6 +335,162 @@ impl<'a> LtfsVolume<'a> {
         Ok(())
     }
 
+    /// 接管后的收尾：卷因尾部不完整（T1 未索引数据、T2 索引写了一半）而只读时，
+    /// 在 EOD 追加一份新索引使卷重新一致、可写。不覆盖任何已有块。
+    ///
+    /// 只有在能证明独占时才允许：必须已设置预留自检键，且设备回读确认持有者是该键。
+    /// 其他只读原因（回指链断、两分区冲突、索引含未知元素、卷已锁、视图含 IP 数据、
+    /// T3 假索引、T4 未知尾部）一律拒绝，仍由人工处理。
+    pub fn close_tail(&mut self, policy: TailPolicy) -> Result<CloseTailReport> {
+        let key = self.reservation_guard.ok_or_else(|| TapeError::RecoveryRestricted {
+            reason: "收尾要求先完成设备层隔离并设置预留自检键".to_string(),
+        })?;
+        crate::scsi::reservation::verify_holder(self.device, key)?;
+
+        let refuse = |why: String| Err(TapeError::RecoveryRestricted { reason: format!("不能自动收尾: {}", why) });
+        let tail = self.recovery.dp.tail;
+        if !matches!(tail, recovery::TailKind::UnindexedData | recovery::TailKind::TruncatedIndex) {
+            return refuse(format!("DP 尾部为 {:?}", tail));
+        }
+        if let Some(r) = self.recovery.restricted_reason() {
+            return refuse(r);
+        }
+        if !self.recovery.chain_ok {
+            return refuse("DP 回指链未通过".to_string());
+        }
+        let Some(last) = self.recovery.dp.last_index.as_ref() else {
+            return refuse("DP 上没有有效索引".to_string());
+        };
+        if self.recovery.ip_ahead() {
+            return refuse("视图来自 IP，DP 尾部另有内容".to_string());
+        }
+        if !self.index.unknown_elements.is_empty() {
+            return refuse("索引含不会回写的元素".to_string());
+        }
+        if self.index.volume_lock_state.as_deref().is_some_and(|v| v != "unlocked") {
+            return refuse("卷已锁定".to_string());
+        }
+        let ip_char = self.label.index_partition;
+        let mut ip_data = false;
+        self.index.walk_files(|_, f| ip_data |= f.extents.iter().any(|e| e.partition == ip_char));
+        if ip_data {
+            return refuse("视图含位于 IP 的文件数据".to_string());
+        }
+
+        let first = last.end_block + 1;
+        let eod = self.recovery.dp.eod;
+        // 追加位置复核：LOCATE 到 EOD 后 READ POSITION 必须一致
+        self.drive.locate(1, eod, true)?;
+        let pos = self.drive.read_position()?;
+        if pos.partition != 1 || pos.block_number != eod {
+            return refuse(format!("LOCATE {} 后位置为 {}@{}", eod, pos.partition, pos.block_number));
+        }
+
+        let mut report = CloseTailReport {
+            tail,
+            abandoned_first_block: first,
+            abandoned_end_block: eod,
+            salvaged: None,
+            generation: 0,
+        };
+        if policy == TailPolicy::Salvage {
+            report.salvaged = self.salvage_tail(first, eod)?;
+        }
+        // 被放弃的块范围记在卷根，事后可查
+        let range = format!("{}:{}-{}", self.label.data_partition, first, eod.saturating_sub(1));
+        let prev = self
+            .working
+            .root
+            .xattrs
+            .iter()
+            .find(|x| x.key == XATTR_ABANDONED)
+            .map(|x| format!("{};", x.value))
+            .unwrap_or_default();
+        self.working.root.xattrs.retain(|x| x.key != XATTR_ABANDONED);
+        self.working.root.xattrs.push(super::index::Xattr {
+            key: XATTR_ABANDONED.to_string(),
+            value: format!("{prev}{range}"),
+            base64: false,
+        });
+
+        info!("收尾: DP 尾部 {:?}，放弃块 {}..{}，在 EOD {} 追加索引", tail, first, eod, eod);
+        self.p1_write_head = eod;
+        self.writable = true;
+        self.restricted_reason = None;
+        self.dirty = true;
+        self.commit()?;
+        self.recovery.dp.tail = recovery::TailKind::Complete;
+        self.recovery.append_ok = true;
+        report.generation = self.index.generation;
+        Ok(report)
+    }
+
+    /// 把 `[first, eod)` 里文件标记之前的数据块登记为 `_ltfs_lostandfound/` 下的一个文件。
+    fn salvage_tail(&mut self, first: u64, eod: u64) -> Result<Option<(String, u64)>> {
+        let bs = self.block_size as u64;
+        let mut buf = vec![0u8; self.block_size as usize];
+        self.drive.locate(1, first, true)?;
+        let mut extents: Vec<Extent> = Vec::new();
+        let mut total = 0u64;
+        let mut open: Option<Extent> = None;
+        for blk in first..eod {
+            let n = match self.drive.read_block(&mut buf) {
+                Ok(0) => break, // 文件标记：后面是写了一半的索引
+                Ok(n) => n as u64,
+                Err(TapeError::ScsiCommand { sense_key: 0x08, .. }) => break,
+                Err(e) => return Err(e),
+            };
+            match open.as_mut() {
+                Some(e) => e.byte_count += n,
+                None => {
+                    open = Some(Extent {
+                        partition: self.label.data_partition,
+                        start_block: blk,
+                        byte_offset: 0,
+                        byte_count: n,
+                        file_offset: total,
+                    })
+                }
+            }
+            total += n;
+            // extent 内只有最后一块可以不满；遇到短块就结束当前 extent
+            if n < bs {
+                extents.extend(open.take());
+            }
+        }
+        extents.extend(open.take());
+        if total == 0 {
+            return Ok(None);
+        }
+        let name = format!("tail-gen{}-block{}", self.index.generation, first);
+        let path = format!("{}/{}", LOST_AND_FOUND, name);
+        let now = crate::ltfs::label::ltfs_time_now();
+        self.working.highest_file_uid += 1;
+        let uid = self.working.highest_file_uid;
+        let dir = ensure_dir(
+            &mut self.working.root,
+            &mut self.working.highest_file_uid,
+            &[LOST_AND_FOUND],
+        );
+        dir.files.retain(|f| f.name != name);
+        dir.files.push(FileNode {
+            name,
+            length: total,
+            meta: NodeMeta {
+                readonly: true,
+                creation_time: now.clone(),
+                change_time: now.clone(),
+                modify_time: now.clone(),
+                access_time: now.clone(),
+                backup_time: now,
+                file_uid: uid,
+            },
+            extents,
+            ..Default::default()
+        });
+        Ok(Some((path, total)))
+    }
+
     /// 启用提交前的预留持有者自检（设备层隔离协议）。`None` 关闭。
     pub fn set_reservation_guard(&mut self, key: Option<crate::scsi::reservation::ReservationKey>) {
         self.reservation_guard = key;
@@ -664,6 +820,33 @@ impl Default for HashPolicy {
     fn default() -> Self {
         Self { md5: false, sha256: true }
     }
+}
+
+/// 收尾时对未索引数据的处置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TailPolicy {
+    /// 放弃：数据块留在带上但不被任何文件引用，块范围记在卷根的扩展属性里。
+    #[default]
+    Discard,
+    /// 打捞：读一遍这段数据，登记为 `_ltfs_lostandfound/` 下的只读文件。耗时与数据量成正比。
+    Salvage,
+}
+
+/// 卷根扩展属性：历次收尾放弃的块范围，形如 `b:20-37;b:51-60`。
+pub const XATTR_ABANDONED: &str = "tapers.abandonedBlocks";
+/// 与 IBM LTFS 的 lost+found 目录同名。
+pub const LOST_AND_FOUND: &str = "_ltfs_lostandfound";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseTailReport {
+    pub tail: recovery::TailKind,
+    /// 被放弃（或打捞）的块范围 `[first, end)`
+    pub abandoned_first_block: u64,
+    pub abandoned_end_block: u64,
+    /// 打捞出的文件路径与字节数
+    pub salvaged: Option<(String, u64)>,
+    /// 收尾后的索引代数
+    pub generation: u64,
 }
 
 /// `verify_file` 的结论。

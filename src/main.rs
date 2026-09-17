@@ -326,6 +326,22 @@ enum Commands {
         #[arg(long)]
         round: u64,
     },
+    /// ltfs-takeover：新执行者接管一个驱动器里的卷。隔离并回读确认 → 挂载（恢复协议）→
+    /// 尾部不完整（写到一半的数据或索引）时自动收尾，使卷重新可写
+    LtfsTakeover {
+        #[arg(short, long, default_value = "/dev/sg1")]
+        device: String,
+        #[arg(long)]
+        node: u8,
+        #[arg(long)]
+        round: u64,
+        /// 把未索引的数据打捞到 _ltfs_lostandfound/（默认放弃，只记录块范围）
+        #[arg(long)]
+        salvage: bool,
+        /// 只报告，不收尾
+        #[arg(long)]
+        report_only: bool,
+    },
     /// pr-release：释放预留并注销本轮键（计划移交）
     PrRelease {
         #[arg(short, long, default_value = "/dev/sg1")]
@@ -466,6 +482,9 @@ fn run(cli: Cli) -> Result<()> {
         Commands::LtfsList { device } => ltfs_cli::cmd_ltfs_list(&device),
         Commands::PrStatus { device } => ltfs_cli::cmd_pr_status(&device),
         Commands::PrFence { device, node, round } => ltfs_cli::cmd_pr_fence(&device, node, round),
+        Commands::LtfsTakeover { device, node, round, salvage, report_only } => {
+            ltfs_cli::cmd_ltfs_takeover(&device, node, round, salvage, report_only)
+        }
         Commands::PrRelease { device, node, round } => ltfs_cli::cmd_pr_release(&device, node, round),
         Commands::LtfsVerify { device, name, xattrs } => ltfs_cli::cmd_ltfs_verify(&device, name.as_deref(), xattrs),
         Commands::LtfsRead { device, name, output } => ltfs_cli::cmd_ltfs_read(&device, &name, &output),
