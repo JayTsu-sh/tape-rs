@@ -57,6 +57,8 @@ impl DeviceProvider for SimProvider {
 struct Cluster {
     lib: SimLibrary,
     status: HashMap<u64, SharedStatus>,
+    services: HashMap<u64, Arc<tape_rs::daemon::files::FileService>>,
+    execs: HashMap<u64, Sender<tape_rs::daemon::executor::ExecRequest>>,
     inboxes: Arc<HashMap<u64, Sender<NodeInput>>>,
     isolated: Arc<Mutex<HashSet<u64>>>,
     dir: PathBuf,
@@ -64,6 +66,10 @@ struct Cluster {
 
 impl Cluster {
     fn start(name: &str) -> Self {
+        Self::start_with(name, true)
+    }
+
+    fn start_with(name: &str, demo_write: bool) -> Self {
         let lib = SimLibrary::new(1, 4, 1);
         lib.insert_cartridge(SimCartridge::blank(BARCODE, 256 << 20), 0).unwrap();
         lib.load_into_drive(BARCODE, 0).unwrap();
@@ -85,14 +91,20 @@ impl Cluster {
         let inboxes = Arc::new(txs);
         let isolated = Arc::new(Mutex::new(HashSet::new()));
         let mut status = HashMap::new();
+        let mut services = HashMap::new();
+        let mut execs = HashMap::new();
         for id in ids {
             let shared: SharedStatus = Arc::new(Mutex::new(NodeStatus::default()));
             status.insert(id, shared.clone());
             let (exec_tx, exec_rx) = channel();
             let (ev_tx, ev_rx) = channel();
             let provider = Box::new(SimProvider { lib: lib.clone(), initiator: id as u32 });
-            let eopts = ExecOptions { node_id: id as u8, interval: Duration::from_millis(40), demo_write: true, salvage: false };
-            thread::spawn(move || executor::run(provider, eopts, exec_rx, ev_tx));
+            let eopts = ExecOptions { node_id: id as u8, interval: Duration::from_millis(40), demo_write, salvage: false };
+            let files = tape_rs::daemon::files::FileService::new(dir.join(format!("spool-{}", id))).unwrap();
+            files.set_executor(exec_tx.clone());
+            services.insert(id, files.clone());
+            execs.insert(id, exec_tx.clone());
+            thread::spawn(move || executor::run(provider, eopts, exec_rx, ev_tx, files));
             let inbox_tx = inboxes[&id].clone();
             thread::spawn(move || {
                 for ev in ev_rx {
@@ -115,7 +127,7 @@ impl Cluster {
             let rx = rxs.remove(&id).unwrap();
             thread::spawn(move || node::run(cfg, store, net, rx, exec_tx, shared).unwrap());
         }
-        Cluster { lib, status, inboxes, isolated, dir }
+        Cluster { lib, status, services, execs, inboxes, isolated, dir }
     }
 
     fn st(&self, id: u64) -> NodeStatus {
@@ -244,5 +256,136 @@ fn leader_that_loses_its_reservation_yields_and_another_node_takes_over() {
     c.wait("新执行者写入", || c.demo_files().iter().any(|f| f.contains(&format!("round{:06}", r2))));
     // 新执行者自己挂载：尾部完整、可写
     let _ = release_and_unregister(&intruder, foreign);
+    c.shutdown();
+}
+
+// ---------- 文件服务 ----------
+
+use tape_rs::daemon::executor::ExecRequest;
+use tape_rs::daemon::files::{FileService, ServiceError, TaskStatus};
+
+fn body(len: usize, seed: u8) -> Vec<u8> {
+    (0..len).map(|i| (i as u8).wrapping_mul(17).wrapping_add(seed)).collect()
+}
+
+/// 走与 HTTP 处理相同的调用序列：准入 → 写暂存并 ingest → finish → 等结论。
+fn upload(svc: &FileService, path: &str, data: &[u8]) -> std::result::Result<TaskStatus, ServiceError> {
+    let h = svc.begin(path, data.len() as u64)?;
+    std::fs::write(&h.spool, data).unwrap();
+    svc.ingest(&h, data.len() as u64)?;
+    let task = svc.finish(h, data.len() as u64)?;
+    Ok(svc.wait_task(task, Duration::from_secs(15)).unwrap())
+}
+
+impl Cluster {
+    fn read_via(&self, node: u64, path: &str) -> std::result::Result<Vec<u8>, String> {
+        let (tx, rx) = channel();
+        self.execs[&node].send(ExecRequest::Read { path: path.to_string(), reply: tx }).unwrap();
+        rx.recv_timeout(Duration::from_secs(15)).map_err(|e| e.to_string())?
+    }
+}
+
+#[test]
+fn upload_is_committed_to_tape_and_only_the_executor_serves() {
+    let c = Cluster::start_with("files", false);
+    let (leader, round) = c.wait_serving(None, 0);
+    let svc = &c.services[&leader];
+    c.wait("文件服务开放", || svc.serving_round() == Some(round));
+
+    let data = body(300_000, 5);
+    assert!(svc.stat("/docs/a.bin").unwrap().is_none(), "提交前不可见");
+    match upload(svc, "/docs/a.bin", &data).unwrap() {
+        TaskStatus::Committed { generation } => assert!(generation >= 2),
+        other => panic!("{other:?}"),
+    }
+    let st = svc.stat("/docs/a.bin").unwrap().unwrap();
+    assert_eq!((st.len, st.round), (data.len() as u64, round));
+    assert_eq!(c.read_via(leader, "/docs/a.bin").unwrap(), data, "读回的内容来自磁带");
+    assert_eq!(svc.list().unwrap().get("/docs/a.bin"), Some(&(data.len() as u64)));
+
+    // 其他节点不服务
+    let follower = (1..=3).find(|i| *i != leader).unwrap();
+    assert!(matches!(c.services[&follower].begin("/x", 1), Err(ServiceError::NotServing(_))));
+    assert!(matches!(c.services[&follower].stat("/docs/a.bin"), Err(ServiceError::NotServing(_))));
+
+    // 并发上传合批落带
+    let results: Vec<_> = thread::scope(|sc| {
+        (0..6)
+            .map(|i| sc.spawn(move || upload(svc, &format!("/batch/f{}.bin", i), &body(20_000 + i, i as u8)).unwrap()))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect()
+    });
+    assert!(results.iter().all(|r| matches!(r, TaskStatus::Committed { .. })), "{results:?}");
+    for i in 0..6 {
+        assert_eq!(c.read_via(leader, &format!("/batch/f{}.bin", i)).unwrap(), body(20_000 + i, i as u8));
+    }
+    // 同一路径正在上传时再次准入被拒
+    let h = svc.begin("/busy.bin", 10).unwrap();
+    assert!(matches!(svc.begin("/busy.bin", 10), Err(ServiceError::PathBusy(_))));
+    svc.abort(h);
+    c.shutdown();
+}
+
+/// 跨故障切换的不变量：对客户端报告过"已提交"的文件，新 Leader 上一定可见且内容正确；
+/// 没报告成功的上传可以丢，但不能以损坏的形式出现。
+#[test]
+fn committed_uploads_survive_failover_and_unconfirmed_ones_never_corrupt() {
+    let c = Cluster::start_with("files-failover", false);
+    let (old, r1) = c.wait_serving(None, 0);
+    let svc_old = c.services[&old].clone();
+    c.wait("文件服务开放", || svc_old.serving_round() == Some(r1));
+    let f1 = body(120_000, 1);
+    assert!(matches!(upload(&svc_old, "/f1.bin", &f1).unwrap(), TaskStatus::Committed { .. }));
+
+    // 隔开旧 Leader，同时持续向它上传，直到它不再接受：保证有请求撞上隔离的那一刻
+    c.isolated.lock().unwrap().insert(old);
+    let svc2 = svc_old.clone();
+    let racing = thread::spawn(move || {
+        let mut out = Vec::new();
+        for i in 0..400usize {
+            let r = upload(&svc2, &format!("/race/{}.bin", i), &body(50_000, (i % 200) as u8));
+            let stop = matches!(r, Err(ServiceError::NotServing(_)));
+            out.push((i, r));
+            if stop {
+                break;
+            }
+        }
+        out
+    });
+
+    let (new, r2) = c.wait_serving(Some(old), r1 + 1);
+    let svc_new = c.services[&new].clone();
+    c.wait("新 Leader 的文件服务开放", || svc_new.serving_round() == Some(r2));
+    let raced = racing.join().unwrap();
+
+    assert_eq!(svc_new.stat("/f1.bin").unwrap().map(|s| s.len), Some(f1.len() as u64));
+    assert_eq!(c.read_via(new, "/f1.bin").unwrap(), f1);
+    let (mut confirmed, mut visible_n, mut unconfirmed) = (0, 0, Vec::new());
+    for (i, outcome) in &raced {
+        let path = format!("/race/{}.bin", i);
+        let visible = svc_new.stat(&path).unwrap();
+        match outcome {
+            Ok(TaskStatus::Committed { .. }) => {
+                confirmed += 1;
+                assert!(visible.is_some(), "{path} 报告过已提交，新 Leader 上必须可见");
+            }
+            Ok(TaskStatus::Failed { .. }) => unconfirmed.push(format!("{i}:failed")),
+            Ok(TaskStatus::Indeterminate { .. }) => unconfirmed.push(format!("{i}:indeterminate")),
+            Ok(TaskStatus::Staged) => unconfirmed.push(format!("{i}:staged")),
+            Err(_) => unconfirmed.push(format!("{i}:rejected")),
+        }
+        if visible.is_some() {
+            visible_n += 1;
+            assert_eq!(c.read_via(new, &path).unwrap(), body(50_000, (*i % 200) as u8), "{path} 可见则内容必须完整正确");
+        }
+    }
+    println!("竞争上传 {} 个：确认提交 {}，新 Leader 上可见 {}，未确认 {:?}", raced.len(), confirmed, visible_n, unconfirmed);
+    assert!(!unconfirmed.is_empty(), "至少最后一个请求应当撞上停止服务");
+
+    // 旧 Leader 最终停止服务，新 Leader 正常接受上传
+    c.wait("旧 Leader 停止服务", || svc_old.serving_round().is_none());
+    assert!(matches!(upload(&svc_new, "/after.bin", &body(1000, 9)).unwrap(), TaskStatus::Committed { .. }));
     c.shutdown();
 }

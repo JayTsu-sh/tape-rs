@@ -15,6 +15,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use tape_rs::daemon::executor::{self, ExecOptions, SgProvider};
+use tape_rs::daemon::files::FileService;
+use tape_rs::daemon::http::{self, HttpContext};
 use tape_rs::daemon::net::{NodeInput, TcpNet};
 use tape_rs::daemon::node::{self, NodeConfig, NodeStatus};
 use tape_rs::daemon::store::RaftStore;
@@ -49,6 +51,12 @@ struct Args {
     /// 自动收尾时打捞未索引数据（默认放弃）
     #[arg(long)]
     salvage: bool,
+    /// 客户端接口（HTTP）的监听地址。不给则不开
+    #[arg(long)]
+    client_listen: Option<String>,
+    /// 各节点客户端接口的端口，用来在 503 里给出 Leader 地址（主机取自 --peer）
+    #[arg(long, default_value_t = 7401)]
+    client_port: u16,
     /// Raft 逻辑时钟周期（毫秒）
     #[arg(long, default_value_t = 100)]
     tick_ms: u64,
@@ -87,7 +95,13 @@ fn main() {
         demo_write: args.demo_write,
         salvage: args.salvage,
     };
-    thread::Builder::new().name("ltfsd-exec".into()).spawn(move || executor::run(provider, eopts, exec_rx, ev_tx)).expect("执行线程");
+    let files = FileService::new(args.data_dir.join("spool")).expect("创建暂存区");
+    files.set_executor(exec_tx.clone());
+    let files_for_exec = files.clone();
+    thread::Builder::new()
+        .name("ltfsd-exec".into())
+        .spawn(move || executor::run(provider, eopts, exec_rx, ev_tx, files_for_exec))
+        .expect("执行线程");
     thread::Builder::new()
         .name("ltfsd-exec-events".into())
         .spawn(move || {
@@ -110,6 +124,20 @@ fn main() {
         cooldown: Duration::from_secs(20),
     };
     let status = Arc::new(Mutex::new(NodeStatus::default()));
+    if let Some(listen) = &args.client_listen {
+        let client_addrs = peers
+            .iter()
+            .map(|(id, addr)| (*id, format!("{}:{}", addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr), args.client_port)))
+            .collect();
+        let ctx = Arc::new(HttpContext {
+            files: files.clone(),
+            status: status.clone(),
+            exec: Mutex::new(exec_tx.clone()),
+            client_addrs,
+            wait_timeout: Duration::from_secs(600),
+        });
+        http::serve(listen, ctx).expect("启动客户端接口");
+    }
     if let Err(e) = node::run(cfg, store, Box::new(net), inbox_rx, exec_tx, status) {
         eprintln!("ltfsd 退出: {}", e);
         std::process::exit(1);

@@ -9,6 +9,8 @@
 //! 提交 `Fenced`（应用时若已有更新的 `Takeover` 则本轮作废）→ 恢复、收尾 → 服务。
 
 pub mod executor;
+pub mod files;
+pub mod http;
 pub mod net;
 pub mod node;
 pub mod state;

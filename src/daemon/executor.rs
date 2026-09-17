@@ -4,11 +4,13 @@
 //! 绝不自行重新预留。是否再次接管由 Raft 层在重新当选、取得新轮次之后决定。
 
 use std::io::Cursor;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use log::{error, info, warn};
 
+use super::files::FileService;
 use crate::error::{Result, TapeError};
 use crate::ltfs::recovery::TailKind;
 use crate::ltfs::volume::{LtfsVolume, TailPolicy};
@@ -73,6 +75,10 @@ pub enum ExecRequest {
     Recover { round: u64 },
     /// 不再是执行者（换届、作废）：立即停手，不做任何设备操作。
     Stop { reason: String },
+    /// 文件服务有已完成的上传等待落带。
+    Work,
+    /// 读出一个已提交文件的内容。
+    Read { path: String, reply: Sender<std::result::Result<Vec<u8>, String>> },
     Shutdown,
 }
 
@@ -110,6 +116,7 @@ pub fn run(
     opts: ExecOptions,
     rx: Receiver<ExecRequest>,
     tx: Sender<ExecEvent>,
+    files: Arc<FileService>,
 ) {
     let mut active: Option<Active> = None;
     let mut next_work = Instant::now() + opts.interval;
@@ -118,11 +125,13 @@ pub fn run(
         match rx.recv_timeout(wait) {
             Ok(ExecRequest::Shutdown) | Err(RecvTimeoutError::Disconnected) => return,
             Ok(ExecRequest::Stop { reason }) => {
+                files.close(&reason);
                 if let Some(a) = active.take() {
                     info!("执行线程: 停手（轮次 {}）: {}", a.round, reason);
                 }
             }
             Ok(ExecRequest::Takeover { round }) => {
+                files.close("正在接管");
                 active = None;
                 match takeover(provider.as_ref(), &opts, round) {
                     Ok(a) => {
@@ -139,7 +148,7 @@ pub fn run(
                 let Some(a) = active.as_mut().filter(|a| a.round == round) else {
                     continue;
                 };
-                match recover(a, &opts) {
+                match recover(a, &opts, &files) {
                     Ok(summary) => {
                         a.serving = true;
                         next_work = Instant::now() + opts.interval;
@@ -147,19 +156,41 @@ pub fn run(
                     }
                     Err(e) => {
                         let reason = format!("恢复失败: {}", e);
+                        files.close(&reason);
                         active = None;
                         let _ = tx.send(ExecEvent::Lost { round, reason });
                     }
                 }
+            }
+            Ok(ExecRequest::Work) => {
+                let Some(a) = active.as_mut().filter(|a| a.serving) else {
+                    continue;
+                };
+                if let Err(reason) = process_uploads(a, &files) {
+                    let round = a.round;
+                    error!("执行线程: 轮次 {} 落带失败，放弃本轮: {}", round, reason);
+                    files.close(&reason);
+                    active = None;
+                    let _ = tx.send(ExecEvent::Lost { round, reason });
+                }
+            }
+            Ok(ExecRequest::Read { path, reply }) => {
+                let res = match active.as_ref().filter(|a| a.serving).and_then(|a| a.drive.map(|i| (a, i))) {
+                    Some((a, i)) => read_file(a.devices[i].dev.as_ref(), &path).map_err(|e| e.to_string()),
+                    None => Err("本节点不在服务".to_string()),
+                };
+                let _ = reply.send(res);
             }
             Err(RecvTimeoutError::Timeout) => {
                 next_work = Instant::now() + opts.interval;
                 let Some(a) = active.as_mut().filter(|a| a.serving) else {
                     continue;
                 };
-                if let Err(reason) = periodic(a, &opts) {
+                let worked = process_uploads(a, &files).and_then(|_| periodic(a, &opts));
+                if let Err(reason) = worked {
                     let round = a.round;
                     error!("执行线程: 轮次 {} 失去执行资格: {}", round, reason);
+                    files.close(&reason);
                     active = None;
                     let _ = tx.send(ExecEvent::Lost { round, reason });
                 }
@@ -199,7 +230,7 @@ fn takeover(provider: &dyn DeviceProvider, opts: &ExecOptions, round: u64) -> Re
 }
 
 /// 挂载第一个装有 LTFS 卷的驱动器；尾部不完整时自动收尾。
-fn recover(a: &mut Active, opts: &ExecOptions) -> Result<String> {
+fn recover(a: &mut Active, opts: &ExecOptions, files: &FileService) -> Result<String> {
     for (i, d) in a.devices.iter().enumerate().filter(|(_, d)| d.kind == DeviceKind::Drive) {
         let mut vol = match LtfsVolume::mount(d.dev.as_ref()) {
             Ok(v) => v,
@@ -224,10 +255,61 @@ fn recover(a: &mut Active, opts: &ExecOptions) -> Result<String> {
         } else if !vol.writable() {
             summary.push_str(&format!("；只读：{}", vol.restricted_reason().unwrap_or("-")));
         }
+        // 容量属性的单位是 MiB；读不到时不设上限，由写带时的真实错误兜底
+        let free = crate::ltfs::mam::read_volume_capacity(d.dev.as_ref())
+            .map(|c| c.remaining.saturating_mul(1 << 20))
+            .unwrap_or(1 << 50);
+        files.open(a.round, vol.index(), free, vol.writable());
         a.drive = Some(i);
         return Ok(summary);
     }
     Ok("没有装载 LTFS 卷的驱动器，仅持有预留".to_string())
+}
+
+/// 把文件服务里已完成的上传成批落带：一次挂载、逐个追加、一次提交，然后发布。
+/// 返回 `Err(原因)` 表示本轮不能再继续（失去资格，或提交结果未定需要重新恢复）。
+fn process_uploads(a: &mut Active, files: &FileService) -> std::result::Result<(), String> {
+    let Some(i) = a.drive else {
+        return Ok(());
+    };
+    while let Some((batch, uploads)) = files.take_batch(a.round) {
+        let dev = a.devices[i].dev.as_ref();
+        let result = (|| -> Result<u64> {
+            let mut vol = LtfsVolume::mount(dev)?;
+            vol.set_reservation_guard(Some(a.key));
+            for u in &uploads {
+                let mut f = std::io::BufReader::new(std::fs::File::open(&u.spool)?);
+                vol.append_file(&u.path, &mut f)?;
+            }
+            vol.commit()?;
+            Ok(vol.index().generation)
+        })();
+        match result {
+            Ok(generation) => {
+                info!("执行线程: 已提交 {} 个文件，索引 gen={}", uploads.len(), generation);
+                files.batch_done(a.round, &batch, &uploads, Ok(generation));
+            }
+            Err(e) => {
+                // 提交没有得到确认：这些文件结果未定。本轮到此为止，由下一次接管的恢复协议判定。
+                files.batch_done(a.round, &batch, &uploads, Err(e.to_string()));
+                return Err(e.to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_file(dev: &dyn TapeTransport, path: &str) -> Result<Vec<u8>> {
+    const MAX: u64 = 256 << 20;
+    let vol = LtfsVolume::mount(dev)?;
+    let p = path.trim_start_matches('/');
+    let len = vol.index().find_file(p).map(|f| f.length).ok_or_else(|| TapeError::Ltfs(format!("文件不存在: {}", path)))?;
+    if len > MAX {
+        return Err(TapeError::Ltfs(format!("文件 {} 字节，超过骨架读接口的上限", len)));
+    }
+    let mut out = Vec::with_capacity(len as usize);
+    vol.read_file_to_writer(p, &mut out)?;
+    Ok(out)
 }
 
 /// 服务期间的周期工作。返回 `Err(原因)` 表示已失去执行资格。
