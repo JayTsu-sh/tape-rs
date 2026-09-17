@@ -1,6 +1,7 @@
 pub mod catalog;
 pub mod changer;
 pub mod core;
+pub mod daemon;
 pub mod error;
 pub mod ltfs;
 pub mod scsi;
