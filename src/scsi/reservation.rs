@@ -10,7 +10,7 @@ use log::{info, warn};
 
 use crate::error::{Result, TapeError};
 use crate::scsi::cdb;
-use crate::scsi::transport::{TapeTransport, retry_unit_attention};
+use crate::scsi::transport::TapeTransport;
 
 /// Exclusive Access：非持有者的介质命令全部被拒绝（Write Exclusive 仍允许读和定位）。
 pub const PR_TYPE_EXCLUSIVE_ACCESS: u8 = 0x03;
@@ -24,6 +24,22 @@ const SA_OUT_PREEMPT_ABORT: u8 = 0x05;
 const SA_OUT_REGISTER_IGNORE: u8 = 0x06;
 
 const PR_TIMEOUT_MS: u32 = 30_000;
+
+/// PR 命令自己的 UNIT ATTENTION 处理：全部越过，包括 2A/03—05。
+/// 这些信号在这里是历史（上一次被抢占时留下的），而本模块接下来读到的注册表才是现状；
+/// `verify_holder` 读到的现状不对就会报失去资格，所以越过它们不会掩盖问题。
+fn through_unit_attention<T>(what: &str, dev: &dyn TapeTransport, mut f: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut seen = 0;
+    loop {
+        match f() {
+            Err(TapeError::ScsiCommand { sense_key: 0x06, asc, ascq, .. }) if seen < 8 => {
+                seen += 1;
+                info!("{}: {} 前越过 UNIT ATTENTION {:02x}/{:02x}", dev.identity(), what, asc, ascq);
+            }
+            other => return other,
+        }
+    }
+}
 /// 键的首字节。区别于 IBM LTFS 的 0x10/0x40/0x60，现场一眼能认出是谁的键。
 pub const KEY_PREFIX: u8 = 0x4C;
 
@@ -59,7 +75,7 @@ pub struct PrStatus {
 fn pr_in(dev: &dyn TapeTransport, service_action: u8) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; 1024];
     let c = cdb::persistent_reserve_in(service_action, buf.len() as u16);
-    let r = retry_unit_attention("PERSISTENT RESERVE IN", || {
+    let r = through_unit_attention("PERSISTENT RESERVE IN", dev, || {
         dev.execute_read(&c, &mut buf, PR_TIMEOUT_MS)
     })?;
     buf.truncate(r.transferred);
@@ -71,7 +87,7 @@ fn pr_out(dev: &dyn TapeTransport, sa: u8, pr_type: u8, key: u64, sa_key: u64) -
     param[0..8].copy_from_slice(&key.to_be_bytes());
     param[8..16].copy_from_slice(&sa_key.to_be_bytes());
     let c = cdb::persistent_reserve_out(sa, pr_type, param.len() as u32);
-    retry_unit_attention("PERSISTENT RESERVE OUT", || {
+    through_unit_attention("PERSISTENT RESERVE OUT", dev, || {
         dev.execute_write(&c, &param, PR_TIMEOUT_MS)
     })?;
     Ok(())

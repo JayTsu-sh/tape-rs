@@ -190,3 +190,17 @@ fn planned_handover_releases_but_successor_still_confirms() {
     assert!(st.keys.is_empty() && st.holder.is_none());
     assert!(matches!(fence(&b, kb).unwrap(), FenceOutcome::Fenced { .. }));
 }
+
+/// 三节点演练里发现的缺陷：被抢占后一直没碰过该设备的节点，重新隔离时第一条命令
+/// 会先收到历史遗留的 2A/03；隔离流程必须越过它，按读到的现状行事。
+#[test]
+fn fence_works_through_a_stale_preempted_unit_attention() {
+    let lib = setup();
+    let (a, b) = (lib.drive_as(0, NODE_A), lib.drive_as(0, NODE_B));
+    fence(&a, ReservationKey::new(1, 1)).unwrap();
+    fence(&b, ReservationKey::new(2, 2)).unwrap();
+    // A 此后没有发过任何命令，2A/03 仍在排队
+    let k = ReservationKey::new(1, 3);
+    assert!(matches!(fence(&a, k).unwrap(), FenceOutcome::Fenced { .. }));
+    verify_holder(&a, k).unwrap();
+}

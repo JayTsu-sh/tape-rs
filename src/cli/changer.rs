@@ -26,7 +26,14 @@ pub fn cmd_inventory(path: &str, catalog_path: Option<&str>, no_drive_scan: bool
     let (realtime_capacity, drive_sg_map) = if no_drive_scan {
         (HashMap::new(), HashMap::new())
     } else {
-        scan_drive_capacities_and_sg(path)
+        // 只对属于本逻辑库的驱动器做 MAM/容量读取。同一主机上可能还连着别的库
+        // （例如由 IBM LTFS 占用的驱动器），对它们只做无害的 INQUIRY，不发介质相关命令。
+        let library_drives: Vec<String> = elements
+            .iter()
+            .filter(|e| e.element_type == ElementType::DataTransfer)
+            .filter_map(|e| e.drive_id.clone())
+            .collect();
+        scan_drive_capacities_and_sg(path, &library_drives)
     };
     // C: catalog 缓存；允许不存在或为空。
     let cached_capacity = load_cached_capacity(catalog_path);
@@ -184,6 +191,7 @@ fn format_capacity(cap: CapacitySnapshot, source: &str) -> String {
 /// 后者用来把 changer DTE 元素返回的 drive_id 关联回 inquiry 视角的 sg 设备。
 fn scan_drive_capacities_and_sg(
     changer_path: &str,
+    library_drives: &[String],
 ) -> (HashMap<String, CapacitySnapshot>, HashMap<String, String>) {
     let mut cap_map = HashMap::new();
     let mut sg_map = HashMap::new();
@@ -204,7 +212,7 @@ fn scan_drive_capacities_and_sg(
             Some(s) => s,
             None => continue,
         };
-        match probe_tape_drive(s) {
+        match probe_tape_drive(s, library_drives) {
             Ok(Some(probe)) => {
                 if let Some(serial) = probe.serial {
                     sg_map.insert(serial, s.to_string());
@@ -229,7 +237,9 @@ struct DriveProbe {
 
 /// 打开 sg 节点；非 tape drive 返回 `Ok(None)`。
 /// tape drive 一律返回 serial（来自 VPD 0x80）；MAM barcode + 容量仅当载带且可读时填充。
-fn probe_tape_drive(path: &str) -> Result<Option<DriveProbe>> {
+/// `library_drives` 是换带器报告的本库驱动器标识（含序列号）；非空时，序列号不在其中的
+/// 驱动器只返回 `Ok(None)`，不读 MAM。
+fn probe_tape_drive(path: &str, library_drives: &[String]) -> Result<Option<DriveProbe>> {
     let dev = ScsiDevice::open(path)?;
 
     let inq = standard_inquiry(&dev)?;
@@ -238,6 +248,15 @@ fn probe_tape_drive(path: &str) -> Result<Option<DriveProbe>> {
     }
 
     let serial = read_unit_serial(&dev);
+    if !library_drives.is_empty() {
+        let ours = serial
+            .as_deref()
+            .is_some_and(|sn| library_drives.iter().any(|id| id.contains(sn)));
+        if !ours {
+            log::debug!("{} (serial {:?}) 不属于本逻辑库，跳过", path, serial);
+            return Ok(None);
+        }
+    }
 
     let mam_dev = mam::Mam::new(&dev);
     let barcode = mam_dev.read_attribute(mam::ATTR_BARCODE).ok().flatten().and_then(|a| {

@@ -46,12 +46,20 @@ pub struct ScsiDevice {
 impl ScsiDevice {
     /// 打开 SCSI 通用设备（/dev/sg*）
     pub fn open(path: &str) -> Result<Self> {
+        // 非阻塞打开：别的进程以 O_EXCL 持有该 sg 节点时（IBM LTFS 对它自己的驱动器就是这样），
+        // 阻塞式 open 会在内核 sg_open/open_wait 里无限等待。O_NONBLOCK 下立即得到 EBUSY。
+        // 打开后清掉该标志，保持 SG_IO 的同步语义。
+        use std::os::unix::fs::OpenOptionsExt;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(nix::libc::O_NONBLOCK)
             .open(path)?;
 
         let fd = OwnedFd::from(file);
+        let flags = nix::fcntl::fcntl(fd.as_raw_fd(), nix::fcntl::FcntlArg::F_GETFL)?;
+        let flags = nix::fcntl::OFlag::from_bits_truncate(flags) & !nix::fcntl::OFlag::O_NONBLOCK;
+        nix::fcntl::fcntl(fd.as_raw_fd(), nix::fcntl::FcntlArg::F_SETFL(flags))?;
         debug!("打开 SCSI 设备: {}", path);
 
         Ok(Self {
