@@ -389,3 +389,50 @@ fn committed_uploads_survive_failover_and_unconfirmed_ones_never_corrupt() {
     assert!(matches!(upload(&svc_new, "/after.bin", &body(1000, 9)).unwrap(), TaskStatus::Committed { .. }));
     c.shutdown();
 }
+
+// ---------- 执行线程的消息次序 ----------
+
+use tape_rs::daemon::executor::ExecEvent;
+
+fn lone_executor(name: &str) -> (Sender<ExecRequest>, std::sync::mpsc::Receiver<ExecEvent>) {
+    let lib = SimLibrary::new(1, 4, 1);
+    lib.insert_cartridge(SimCartridge::blank(BARCODE, 64 << 20), 0).unwrap();
+    lib.load_into_drive(BARCODE, 0).unwrap();
+    mkltfs(&lib.drive_as(0, 50), &MkltfsOptions { volume_id: "LTFSD1".into(), block_size: 64 * 1024, ..Default::default() }).unwrap();
+    let (tx, rx) = channel();
+    let (ev_tx, ev_rx) = channel();
+    let dir = std::env::temp_dir().join(format!("ltfsd-exec-{}-{}", name, std::process::id()));
+    let files = FileService::new(dir).unwrap();
+    let opts = ExecOptions { node_id: 1, interval: Duration::from_secs(3600), demo_write: false, salvage: false };
+    thread::spawn(move || executor::run(Box::new(SimProvider { lib, initiator: 1 }), opts, rx, ev_tx, files));
+    (tx, ev_rx)
+}
+
+/// 压力下复现过的竞态：同一节点先后有轮次 2、3；针对轮次 2 的停手请求在轮次 3 的接管之后才到。
+/// 它不能把轮次 3 的状态清掉，否则随后的恢复请求无人响应，节点永远停在"正在恢复卷"。
+#[test]
+fn a_late_stop_for_an_older_round_does_not_cancel_the_newer_round() {
+    let (tx, ev) = lone_executor("late-stop");
+    tx.send(ExecRequest::Takeover { round: 2 }).unwrap();
+    tx.send(ExecRequest::Takeover { round: 3 }).unwrap();
+    tx.send(ExecRequest::Stop { round: Some(2), reason: "过时".into() }).unwrap();
+    tx.send(ExecRequest::Recover { round: 3 }).unwrap();
+    let got: Vec<ExecEvent> = (0..3).map(|_| ev.recv_timeout(Duration::from_secs(10)).unwrap()).collect();
+    assert_eq!(got[0], ExecEvent::Fenced { round: 2 });
+    assert_eq!(got[1], ExecEvent::Fenced { round: 3 });
+    assert!(matches!(&got[2], ExecEvent::Serving { round: 3, .. }), "{:?}", got[2]);
+}
+
+/// 执行线程对没有对应状态的恢复请求必须给出结论，不能悄悄忽略。
+#[test]
+fn recover_for_an_unknown_round_is_reported_not_ignored() {
+    let (tx, ev) = lone_executor("unknown-round");
+    tx.send(ExecRequest::Recover { round: 9 }).unwrap();
+    assert!(matches!(ev.recv_timeout(Duration::from_secs(10)).unwrap(), ExecEvent::Lost { round: 9, .. }));
+    // 无条件停手之后同样如此
+    tx.send(ExecRequest::Takeover { round: 4 }).unwrap();
+    assert_eq!(ev.recv_timeout(Duration::from_secs(10)).unwrap(), ExecEvent::Fenced { round: 4 });
+    tx.send(ExecRequest::Stop { round: None, reason: "停".into() }).unwrap();
+    tx.send(ExecRequest::Recover { round: 4 }).unwrap();
+    assert!(matches!(ev.recv_timeout(Duration::from_secs(10)).unwrap(), ExecEvent::Lost { round: 4, .. }));
+}

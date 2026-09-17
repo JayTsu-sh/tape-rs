@@ -74,7 +74,8 @@ pub enum ExecRequest {
     /// `Fenced` 已被多数派确认：恢复卷、需要时收尾，然后开始服务。
     Recover { round: u64 },
     /// 不再是执行者（换届、作废）：立即停手，不做任何设备操作。
-    Stop { reason: String },
+    /// `round` 指明要停的是哪一轮；执行线程若已在处理更新的一轮则忽略。`None` 表示无条件停。
+    Stop { round: Option<u64>, reason: String },
     /// 文件服务有已完成的上传等待落带。
     Work,
     /// 读出一个已提交文件的内容。
@@ -124,7 +125,11 @@ pub fn run(
         let wait = next_work.saturating_duration_since(Instant::now());
         match rx.recv_timeout(wait) {
             Ok(ExecRequest::Shutdown) | Err(RecvTimeoutError::Disconnected) => return,
-            Ok(ExecRequest::Stop { reason }) => {
+            Ok(ExecRequest::Stop { round, reason }) => {
+                // 停手请求可能晚于更新一轮的接管请求到达：只停它指明的那一轮
+                if round.is_some() && active.as_ref().map(|a| a.round) != round {
+                    continue;
+                }
                 files.close(&reason);
                 if let Some(a) = active.take() {
                     info!("执行线程: 停手（轮次 {}）: {}", a.round, reason);
@@ -146,6 +151,10 @@ pub fn run(
             }
             Ok(ExecRequest::Recover { round }) => {
                 let Some(a) = active.as_mut().filter(|a| a.round == round) else {
+                    // 不能悄悄忽略：Raft 层正等着这一轮的结论
+                    let reason = "执行线程没有该轮次的隔离状态".to_string();
+                    warn!("执行线程: 轮次 {} 的恢复请求无法执行: {}", round, reason);
+                    let _ = tx.send(ExecEvent::Lost { round, reason });
                     continue;
                 };
                 match recover(a, &opts, &files) {

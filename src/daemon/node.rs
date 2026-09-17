@@ -74,7 +74,9 @@ pub fn run(
     // 本节点在哪个任期已经提交过 Takeover；以及当前作为执行者的轮次
     let mut claimed_term: Option<u64> = None;
     let mut my_round: Option<u64> = None;
-    let mut last_propose = Instant::now() - Duration::from_secs(3600);
+    // 不能用"现在减去一个大数"表示很久以前：单调时钟从开机算起，刚开机的机器上会下溢 panic
+    let mut last_propose: Option<Instant> = None;
+    let mut proposed_term: Option<u64> = None;
     let mut cooldown_until = Instant::now();
     let mut local = String::from("空闲");
     let mut next_tick = Instant::now() + cfg.tick;
@@ -101,7 +103,7 @@ pub fn run(
                     }
                     ExecEvent::Fenced { round } => {
                         info!("轮次 {} 的隔离结果已过时，忽略", round);
-                        let _ = exec.send(ExecRequest::Stop { reason: "隔离完成时已不是执行者".into() });
+                        let _ = exec.send(ExecRequest::Stop { round: Some(round), reason: "隔离完成时已不是该轮的执行者".into() });
                     }
                     ExecEvent::Serving { round, summary } => {
                         info!("轮次 {} 开始服务：{}", round, summary);
@@ -130,18 +132,25 @@ pub fn run(
 
         let is_leader = node.raft.state == StateRole::Leader;
         let term = node.raft.term;
-        if !is_leader && my_round.take().is_some() {
+        if !is_leader {
+            proposed_term = None;
+        }
+        if let Some(r) = my_round.take_if(|_| !is_leader) {
             // 尽早停手。安全性不靠这一步：设备会拒绝陈旧的执行者。
-            let _ = exec.send(ExecRequest::Stop { reason: "不再是 Leader".into() });
+            let _ = exec.send(ExecRequest::Stop { round: Some(r), reason: "不再是 Leader".into() });
             local = "已停手：不再是 Leader".into();
         }
-        if is_leader && claimed_term != Some(term) && last_propose.elapsed() > cfg.tick * 5 {
+        // 每个任期只提交一次 Takeover。Leader 身份不变时已追加的条目终会提交，重复提交只会
+        // 制造多余的轮次；proposed_term 在失去 Leader 身份时清零。
+        if is_leader && claimed_term != Some(term) {
             if Instant::now() < cooldown_until {
-                yield_leadership(&mut node, &cfg);
-            } else {
-                propose(&mut node, &Command::Takeover { node: cfg.id, term });
+                if last_propose.is_none_or(|t| t.elapsed() > cfg.tick * 5) {
+                    yield_leadership(&mut node, &cfg);
+                    last_propose = Some(Instant::now());
+                }
+            } else if proposed_term != Some(term) && propose(&mut node, &Command::Takeover { node: cfg.id, term }) {
+                proposed_term = Some(term);
             }
-            last_propose = Instant::now();
         }
 
         let committed = on_ready(&mut node, &mut store, net.as_ref())?;
@@ -167,8 +176,8 @@ pub fn run(
                     if e.node != cfg.id {
                         info!("节点 {} 成为执行者，轮次 {}", e.node, e.round);
                     }
-                    if my_round.take().is_some() {
-                        let _ = exec.send(ExecRequest::Stop { reason: format!("被轮次 {} 取代", e.round) });
+                    if let Some(r) = my_round.take() {
+                        let _ = exec.send(ExecRequest::Stop { round: Some(r), reason: format!("被轮次 {} 取代", e.round) });
                         local = format!("已停手：被节点 {} 轮次 {} 取代", e.node, e.round);
                     }
                 }
@@ -181,7 +190,7 @@ pub fn run(
                     if my_round == Some(round) {
                         my_round = None;
                     }
-                    let _ = exec.send(ExecRequest::Stop { reason: "本轮在确认前已被取代".into() });
+                    let _ = exec.send(ExecRequest::Stop { round: Some(round), reason: "本轮在确认前已被取代".into() });
                 }
                 _ => {}
             }
@@ -191,9 +200,13 @@ pub fn run(
     }
 }
 
-fn propose(node: &mut RawNode<MemStorage>, cmd: &Command) {
-    if let Err(e) = node.propose(vec![], cmd.encode()) {
-        warn!("提交 {:?} 失败: {}", cmd, e);
+fn propose(node: &mut RawNode<MemStorage>, cmd: &Command) -> bool {
+    match node.propose(vec![], cmd.encode()) {
+        Ok(()) => true,
+        Err(e) => {
+            warn!("提交 {:?} 失败: {}", cmd, e);
+            false
+        }
     }
 }
 
