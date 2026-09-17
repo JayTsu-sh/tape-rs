@@ -198,6 +198,11 @@ pub fn cmd_pr_fence(path: &str, node: u8, round: u64) -> Result<()> {
             println!("设备不支持持久预留");
             Ok(())
         }
+        FenceOutcome::Superseded { holder } => Err(TapeError::Ltfs(format!(
+            "本轮已被取代：持有者是节点 {} 轮次 {}，未做任何改动",
+            holder.node(),
+            holder.round()
+        ))),
         FenceOutcome::Unconfirmed { reason, status } => {
             if let Some(st) = status {
                 print_pr_status(&st);
@@ -225,6 +230,13 @@ pub fn cmd_ltfs_takeover(path: &str, node: u8, round: u64, salvage: bool, report
         },
         FenceOutcome::Unsupported => {
             return Err(TapeError::Ltfs("设备不支持持久预留，不能自动接管".into()));
+        }
+        FenceOutcome::Superseded { holder } => {
+            return Err(TapeError::Ltfs(format!(
+                "本轮已被取代：持有者是节点 {} 轮次 {}，不得接管",
+                holder.node(),
+                holder.round()
+            )));
         }
         FenceOutcome::Unconfirmed { reason, .. } => {
             return Err(TapeError::Ltfs(format!("隔离未能确认，不得接管: {}", reason)));

@@ -130,10 +130,19 @@ pub enum FenceOutcome {
     Unsupported,
     /// 回读与预期不符。不得据此接管。
     Unconfirmed { reason: String, status: Option<PrStatus> },
+    /// 持有者是本系统的键且轮次比本轮高：本轮已被取代，什么也没改。
+    /// 轮次来自 Raft，单调递增，所以迟到的旧一轮隔离不会把预留从新一轮手里抢走。
+    Superseded { holder: ReservationKey },
 }
 
 fn is_unsupported(e: &TapeError) -> bool {
     matches!(e, TapeError::ScsiCommand { sense_key: 0x05, asc: 0x20 | 0x24, .. })
+}
+
+fn newer_round_holder(st: &PrStatus, key: ReservationKey) -> Option<ReservationKey> {
+    let (h, _) = st.holder?;
+    let h = ReservationKey(h);
+    (h.is_ours() && h.round() > key.round()).then_some(h)
 }
 
 /// 接管时对单个设备执行：读现状 → 注册本轮键 → 抢占或预留 → 回读确认。
@@ -149,9 +158,19 @@ pub fn fence(dev: &dyn TapeTransport, key: ReservationKey) -> Result<FenceOutcom
         dev.identity(), before.generation, before.keys, before.holder
     );
 
+    if let Some(newer) = newer_round_holder(&before, key) {
+        warn!("{}: 持有者轮次 {} 高于本轮 {}，放弃隔离", dev.identity(), newer.round(), key.round());
+        return Ok(FenceOutcome::Superseded { holder: newer });
+    }
+
     pr_out(dev, SA_OUT_REGISTER_IGNORE, 0, 0, key.0)?;
     // 注册之后重新读：若持有者就是本发起方（同节点新一轮），预留已跟随新键，不需要也不能抢占自己。
     let mid = read_status(dev)?;
+    if let Some(newer) = newer_round_holder(&mid, key) {
+        // 两次读之间被更新的轮次抢先：撤回刚才的注册，不抢占
+        pr_out(dev, SA_OUT_REGISTER_IGNORE, 0, 0, 0)?;
+        return Ok(FenceOutcome::Superseded { holder: newer });
+    }
     match mid.holder {
         Some((h, _)) if h != key.0 => {
             pr_out(dev, SA_OUT_PREEMPT_ABORT, PR_TYPE_EXCLUSIVE_ACCESS, key.0, h)?;

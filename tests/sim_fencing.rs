@@ -204,3 +204,22 @@ fn fence_works_through_a_stale_preempted_unit_attention() {
     assert!(matches!(fence(&a, k).unwrap(), FenceOutcome::Fenced { .. }));
     verify_holder(&a, k).unwrap();
 }
+
+/// B（轮次 2）开始接管后 C（轮次 3）当选并完成隔离；B 迟到的隔离不能把预留抢走。
+#[test]
+fn late_fence_from_an_older_round_cannot_steal_from_a_newer_round() {
+    let lib = setup();
+    let (a, b, c) = (lib.drive_as(0, NODE_A), lib.drive_as(0, NODE_B), lib.drive_as(0, 3));
+    let kc = ReservationKey::new(3, 3);
+    fence(&a, ReservationKey::new(1, 1)).unwrap();
+    assert!(matches!(fence(&c, kc).unwrap(), FenceOutcome::Fenced { .. }));
+    let before = read_status(&c).unwrap();
+    assert_eq!(fence(&b, ReservationKey::new(2, 2)).unwrap(), FenceOutcome::Superseded { holder: kc });
+    assert_eq!(read_status(&c).unwrap(), before, "B 什么也没改");
+    verify_holder(&c, kc).unwrap();
+    write_file(&c, kc, "/c.bin").unwrap();
+    // 非本系统的键（例如 IBM LTFS 的）不受轮次规则保护，照常抢占
+    release_and_unregister(&c, kc).unwrap();
+    fence(&a, ReservationKey(0x4000_0000_0a83_0948)).unwrap();
+    assert!(matches!(fence(&b, ReservationKey::new(2, 2)).unwrap(), FenceOutcome::Fenced { .. }));
+}
