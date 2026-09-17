@@ -10,7 +10,6 @@
 use std::fmt::Write as _;
 
 use bytes::Bytes;
-use chrono::Utc;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::reader::Reader;
 use quick_xml::writer::Writer;
@@ -50,12 +49,42 @@ pub struct NodeMeta {
     pub file_uid: u64,
 }
 
-#[derive(Debug, Clone)]
+/// 扩展属性（LTFS 2.5.1 §9.2.13）。`value` 原样保存索引里的文本；
+/// `base64 == true` 表示索引里带 `type="base64"`，`value` 是编码后的文本。
+/// 原样保存是为了回写时逐字节不变。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Xattr {
+    pub key: String,
+    pub value: String,
+    pub base64: bool,
+}
+
+/// 文件内容哈希（LTFS 2.5.1 附录 F.3，十六进制小写）。一个文件可以同时带多种。
+/// IBM LTFS 写的是 md5sum；本实现两个都写，校验时优先 sha256sum。
+pub const XATTR_MD5: &str = "ltfs.hash.md5sum";
+pub const XATTR_SHA256: &str = "ltfs.hash.sha256sum";
+
+#[derive(Debug, Clone, Default)]
 pub struct FileNode {
     pub name: String,
     pub length: u64,
     pub meta: NodeMeta,
     pub extents: Vec<Extent>,
+    pub xattrs: Vec<Xattr>,
+    /// 符号链接目标。有值时文件没有 extent（§9.2.9）。
+    pub symlink: Option<String>,
+}
+
+impl FileNode {
+    pub fn xattr(&self, key: &str) -> Option<&str> {
+        self.xattrs.iter().find(|x| x.key == key).map(|x| x.value.as_str())
+    }
+
+    /// 设置文本型扩展属性，同名覆盖。
+    pub fn set_xattr(&mut self, key: &str, value: &str) {
+        self.xattrs.retain(|x| x.key != key);
+        self.xattrs.push(Xattr { key: key.to_string(), value: value.to_string(), base64: false });
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -64,6 +93,7 @@ pub struct DirectoryNode {
     pub meta: NodeMeta,
     pub files: Vec<FileNode>,
     pub subdirs: Vec<DirectoryNode>,
+    pub xattrs: Vec<Xattr>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,13 +109,18 @@ pub struct LtfsIndex {
     pub previous_location: Option<IndexLocation>,
     pub allow_policy_update: bool,
     pub highest_file_uid: u64,
+    /// `<volumelockstate>`（IBM LTFS 会写）。None 时不写出。
+    pub volume_lock_state: Option<String>,
+    /// 解析时遇到、本实现不会回写的元素名（去重）。非空表示重写索引会丢信息，
+    /// 挂载层据此拒绝写入。
+    pub unknown_elements: Vec<String>,
     pub root: DirectoryNode,
 }
 
 impl LtfsIndex {
     /// 新建一个空索引（首代）。
     pub fn empty(volume_uuid: Uuid, creator: String, data_partition: char) -> Self {
-        let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let now = crate::ltfs::label::ltfs_time_now();
         Self {
             version: LTFS_VERSION.to_string(),
             creator,
@@ -96,6 +131,8 @@ impl LtfsIndex {
             previous_location: None,
             allow_policy_update: true,
             highest_file_uid: 1,
+            volume_lock_state: None,
+            unknown_elements: Vec::new(),
             root: DirectoryNode {
                 name: String::new(),
                 meta: NodeMeta {
@@ -109,6 +146,7 @@ impl LtfsIndex {
                 },
                 files: Vec::new(),
                 subdirs: Vec::new(),
+                xattrs: Vec::new(),
             },
         }
     }
@@ -143,6 +181,11 @@ impl LtfsIndex {
             match reader.read_event_into(&mut bufv)? {
                 Event::Eof => break,
                 Event::Start(e) => p.on_start(e)?,
+                Event::Empty(e) => {
+                    let end = e.to_end().into_owned();
+                    p.on_start(e)?;
+                    p.on_end(end)?;
+                }
                 Event::End(e) => p.on_end(e)?,
                 Event::Text(t) => p.on_text(&t.unescape()?),
                 _ => {}
@@ -175,6 +218,9 @@ impl LtfsIndex {
             "allowpolicyupdate",
             if self.allow_policy_update { "true" } else { "false" },
         )?;
+        if let Some(state) = &self.volume_lock_state {
+            write_text(&mut w, "volumelockstate", state)?;
+        }
         write_u64(&mut w, "highestfileuid", self.highest_file_uid)?;
 
         write_directory(&mut w, &self.root, /*is_root=*/ true)?;
@@ -235,11 +281,38 @@ fn write_meta<W: std::io::Write>(w: &mut Writer<W>, meta: &NodeMeta) -> Result<(
     Ok(())
 }
 
+fn write_xattrs<W: std::io::Write>(w: &mut Writer<W>, xattrs: &[Xattr]) -> Result<()> {
+    if xattrs.is_empty() {
+        return Ok(());
+    }
+    w.write_event(Event::Start(BytesStart::new("extendedattributes")))?;
+    for x in xattrs {
+        w.write_event(Event::Start(BytesStart::new("xattr")))?;
+        write_text(w, "key", &x.key)?;
+        let mut value = BytesStart::new("value");
+        if x.base64 {
+            value.push_attribute(("type", "base64"));
+        }
+        w.write_event(Event::Start(value))?;
+        w.write_event(Event::Text(BytesText::new(&x.value)))?;
+        w.write_event(Event::End(BytesEnd::new("value")))?;
+        w.write_event(Event::End(BytesEnd::new("xattr")))?;
+    }
+    w.write_event(Event::End(BytesEnd::new("extendedattributes")))?;
+    Ok(())
+}
+
 fn write_file<W: std::io::Write>(w: &mut Writer<W>, f: &FileNode) -> Result<()> {
     w.write_event(Event::Start(BytesStart::new("file")))?;
     write_text(w, "name", &f.name)?;
     write_u64(w, "length", f.length)?;
     write_meta(w, &f.meta)?;
+    write_xattrs(w, &f.xattrs)?;
+    if let Some(target) = &f.symlink {
+        write_text(w, "symlink", target)?;
+        w.write_event(Event::End(BytesEnd::new("file")))?;
+        return Ok(());
+    }
     w.write_event(Event::Start(BytesStart::new("extentinfo")))?;
     for ext in &f.extents {
         w.write_event(Event::Start(BytesStart::new("extent")))?;
@@ -268,6 +341,7 @@ fn write_directory<W: std::io::Write>(
         write_text(w, "name", "")?;
     }
     write_meta(w, &d.meta)?;
+    write_xattrs(w, &d.xattrs)?;
     w.write_event(Event::Start(BytesStart::new("contents")))?;
     for f in &d.files {
         write_file(w, f)?;
@@ -306,7 +380,21 @@ struct IndexParser {
     /// 正在构造的 location（<location> / <previousgenerationlocation>）。
     cur_location: Option<IndexLocation>,
     cur_location_tag: Option<String>,
+    /// 正在解析的 xattr。
+    cur_xattr: Option<Xattr>,
+    volume_lock_state: Option<String>,
+    unknown_elements: Vec<String>,
 }
+
+/// 本实现能解析并原样回写的元素。其余的记入 `unknown_elements`。
+const KNOWN_ELEMENTS: &[&str] = &[
+    "ltfsindex", "creator", "volumeuuid", "generationnumber", "updatetime", "location",
+    "previousgenerationlocation", "allowpolicyupdate", "volumelockstate", "highestfileuid",
+    "directory", "contents", "file", "name", "length", "readonly", "creationtime", "changetime",
+    "modifytime", "accesstime", "backuptime", "fileuid", "extendedattributes", "xattr", "key",
+    "value", "symlink", "extentinfo", "extent", "partition", "startblock", "byteoffset",
+    "bytecount", "fileoffset",
+];
 
 impl IndexParser {
     fn new() -> Self {
@@ -327,12 +415,19 @@ impl IndexParser {
             cur_extent: None,
             cur_location: None,
             cur_location_tag: None,
+            cur_xattr: None,
+            volume_lock_state: None,
+            unknown_elements: Vec::new(),
         }
     }
 
     fn on_start(&mut self, e: BytesStart<'_>) -> Result<()> {
         let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
         self.text.clear();
+
+        if !KNOWN_ELEMENTS.contains(&name.as_str()) && !self.unknown_elements.contains(&name) {
+            self.unknown_elements.push(name.clone());
+        }
 
         match name.as_str() {
             "ltfsindex" => {
@@ -346,12 +441,18 @@ impl IndexParser {
                 self.dir_stack.push(DirectoryNode::default());
             }
             "file" => {
-                self.file_stack.push(FileNode {
-                    name: String::new(),
-                    length: 0,
-                    meta: NodeMeta::default(),
-                    extents: Vec::new(),
-                });
+                self.file_stack.push(FileNode::default());
+            }
+            "xattr" => {
+                self.cur_xattr = Some(Xattr { key: String::new(), value: String::new(), base64: false });
+            }
+            "value" => {
+                if let Some(x) = self.cur_xattr.as_mut() {
+                    x.base64 = e
+                        .attributes()
+                        .flatten()
+                        .any(|a| a.key.as_ref() == b"type" && a.value.as_ref() == b"base64");
+                }
             }
             "extent" => {
                 self.cur_extent = Some(Extent {
@@ -423,12 +524,35 @@ impl IndexParser {
             return Ok(());
         }
 
+        // xattr 字段：属于最近的 file，没有 file 在解析时属于当前目录
+        if parent == "xattr" {
+            if let Some(x) = self.cur_xattr.as_mut() {
+                match name.as_str() {
+                    "key" => x.key = text.clone(),
+                    "value" => x.value = text.clone(),
+                    _ => {}
+                }
+            }
+            return Ok(());
+        }
+        if name == "xattr" {
+            if let Some(x) = self.cur_xattr.take() {
+                if let Some(file) = self.file_stack.last_mut() {
+                    file.xattrs.push(x);
+                } else if let Some(dir) = self.dir_stack.last_mut() {
+                    dir.xattrs.push(x);
+                }
+            }
+            return Ok(());
+        }
+
         // file 的标量字段
         if parent == "file" {
             if let Some(file) = self.file_stack.last_mut() {
                 match name.as_str() {
                     "name" => file.name = trimmed.to_string(),
                     "length" => file.length = trimmed.parse().unwrap_or(0),
+                    "symlink" => file.symlink = Some(text.clone()),
                     _ => apply_meta(&mut file.meta, &name, trimmed),
                 }
             }
@@ -453,6 +577,7 @@ impl IndexParser {
                 "updatetime" => self.update_time = trimmed.to_string(),
                 "allowpolicyupdate" => self.allow_policy_update = matches!(trimmed, "true" | "1" | "yes"),
                 "highestfileuid" => self.highest_file_uid = trimmed.parse().unwrap_or(0),
+                "volumelockstate" => self.volume_lock_state = Some(trimmed.to_string()),
                 _ => {}
             }
         }
@@ -502,6 +627,8 @@ impl IndexParser {
             previous_location: self.previous_location,
             allow_policy_update: self.allow_policy_update,
             highest_file_uid: self.highest_file_uid,
+            volume_lock_state: self.volume_lock_state,
+            unknown_elements: self.unknown_elements,
             root,
         })
     }
@@ -549,6 +676,7 @@ mod tests {
                 byte_count: 5,
                 file_offset: 0,
             }],
+            ..Default::default()
         });
         let xml = idx.to_xml().unwrap();
         let back = LtfsIndex::parse(&xml).unwrap();
@@ -568,6 +696,7 @@ mod tests {
             length: 1,
             meta: NodeMeta::default(),
             extents: vec![],
+            ..Default::default()
         });
         idx.root.subdirs.push(sub);
         idx.root.files.push(FileNode {
@@ -575,11 +704,77 @@ mod tests {
             length: 1,
             meta: NodeMeta::default(),
             extents: vec![],
+            ..Default::default()
         });
 
         let mut paths = Vec::new();
         idx.walk_files(|p, _| paths.push(p.to_string()));
         paths.sort();
         assert_eq!(paths, vec!["sub/deep.bin".to_string(), "top.txt".to_string()]);
+    }
+
+    /// IBM LTFS 2.4.8.3 在 EE 下写出的索引形状（取自实验室克隆带，内容已缩短）。
+    const IBM_STYLE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ltfsindex version="2.4.0">
+<creator>IBM LTFS 2.4.8.3 (10521) - Linux - ltfs</creator>
+<volumeuuid>c0cb5ba8-0000-0000-0000-000000000000</volumeuuid>
+<generationnumber>3</generationnumber>
+<updatetime>2026-09-15T00:00:00.000000000Z</updatetime>
+<location><partition>b</partition><startblock>35</startblock></location>
+<previousgenerationlocation><partition>b</partition><startblock>24</startblock></previousgenerationlocation>
+<allowpolicyupdate>true</allowpolicyupdate>
+<volumelockstate>unlocked</volumelockstate>
+<highestfileuid>8</highestfileuid>
+<directory><name></name><fileuid>1</fileuid>
+<extendedattributes><xattr><key>user.note</key><value type="base64">AAEC</value></xattr></extendedattributes>
+<contents>
+<directory><name>.LTFSEE_DATA</name><fileuid>2</fileuid><contents>
+<file><name>obj-1</name><length>5</length><fileuid>3</fileuid>
+<extendedattributes>
+<xattr><key>ltfs.hash.md5sum</key><value>94f70734e5e5561dd811a3453404ef44</value></xattr>
+<xattr><key>ibm.ltfsee.gpfs.path</key><value>/gpfs/a &amp; b.bin</value></xattr>
+<xattr><key>user.empty</key><value/></xattr>
+</extendedattributes>
+<extentinfo><extent><partition>b</partition><startblock>5</startblock><byteoffset>0</byteoffset><bytecount>5</bytecount><fileoffset>0</fileoffset></extent></extentinfo>
+</file>
+</contents></directory>
+<directory><name>gpfs</name><fileuid>4</fileuid><contents>
+<file><name>a.bin</name><length>0</length><fileuid>5</fileuid><symlink>../.LTFSEE_DATA/obj-1</symlink></file>
+</contents></directory>
+</contents></directory>
+</ltfsindex>"#;
+
+    #[test]
+    fn ibm_style_index_roundtrips_xattrs_symlink_and_lockstate() {
+        let first = LtfsIndex::parse(IBM_STYLE.as_bytes()).unwrap();
+        // 再走一遍写出和解析，两次的结论必须相同
+        let second = LtfsIndex::parse(&first.to_xml().unwrap()).unwrap();
+        for idx in [&first, &second] {
+            assert!(idx.unknown_elements.is_empty(), "{:?}", idx.unknown_elements);
+            assert_eq!(idx.volume_lock_state.as_deref(), Some("unlocked"));
+            let f = idx.find_file(".LTFSEE_DATA/obj-1").unwrap();
+            assert_eq!(f.xattr(XATTR_MD5), Some("94f70734e5e5561dd811a3453404ef44"));
+            assert_eq!(f.xattr("ibm.ltfsee.gpfs.path"), Some("/gpfs/a & b.bin"));
+            assert_eq!(f.xattr("user.empty"), Some(""));
+            assert_eq!(f.xattrs.len(), 3);
+            assert_eq!(f.extents.len(), 1);
+            let link = idx.find_file("gpfs/a.bin").unwrap();
+            assert_eq!(link.symlink.as_deref(), Some("../.LTFSEE_DATA/obj-1"));
+            assert!(link.extents.is_empty());
+            assert_eq!(
+                idx.root.xattrs,
+                vec![Xattr { key: "user.note".into(), value: "AAEC".into(), base64: true }]
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_elements_are_reported_once() {
+        let xml = IBM_STYLE.replace(
+            "<highestfileuid>8</highestfileuid>",
+            "<highestfileuid>8</highestfileuid><dataplacementpolicy><x/><x/></dataplacementpolicy>",
+        );
+        let idx = LtfsIndex::parse(xml.as_bytes()).unwrap();
+        assert_eq!(idx.unknown_elements, vec!["dataplacementpolicy".to_string(), "x".to_string()]);
     }
 }

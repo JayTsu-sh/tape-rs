@@ -5,18 +5,18 @@ use log::{debug, info};
 
 use crate::error::{TapeError, Result};
 use crate::scsi::cdb;
-use crate::scsi::device::ScsiDevice;
+use crate::scsi::transport::{TapeTransport, retry_unit_attention};
 
 use super::element::{ElementAddressMap, ElementStatus, ElementType};
 
 /// Medium Changer 高层封装
 pub struct MediumChanger<'a> {
-    device: &'a ScsiDevice,
+    device: &'a dyn TapeTransport,
     address_map: Option<ElementAddressMap>,
 }
 
 impl<'a> MediumChanger<'a> {
-    pub fn new(device: &'a ScsiDevice) -> Self {
+    pub fn new(device: &'a dyn TapeTransport) -> Self {
         Self { device, address_map: None }
     }
 
@@ -24,7 +24,7 @@ impl<'a> MediumChanger<'a> {
     pub fn load_address_map(&mut self) -> Result<&ElementAddressMap> {
         let cdb_bytes = cdb::mode_sense_10(0x1D, 255);
         let mut buf = [0u8; 255];
-        let result = self.device.execute_read(&cdb_bytes, &mut buf, 30_000)?;
+        let result = retry_unit_attention("changer", || self.device.execute_read(&cdb_bytes, &mut buf, 30_000))?;
 
         // 解析 Mode Parameter Header (10-byte 版本: 8 字节 header)
         // 然后是 Block Descriptor（如果有），然后是 Page 数据
@@ -96,7 +96,7 @@ impl<'a> MediumChanger<'a> {
         let cdb_bytes = cdb::read_element_status(0, start, total, alloc_len, true, true);
 
         let mut buf = BytesMut::zeroed(alloc_len as usize);
-        let result = self.device.execute_read(&cdb_bytes, &mut buf, 60_000)?;
+        let result = retry_unit_attention("changer", || self.device.execute_read(&cdb_bytes, &mut buf, 60_000))?;
 
         // 检测 kernel 是否把响应截断（用户态 buffer 不够装下 device 想发的所有 element）。
         // 截断时 data 头里的 Byte Count of Report Available 大于实际传回字节数，
@@ -126,7 +126,7 @@ impl<'a> MediumChanger<'a> {
 
         let cdb_bytes = cdb::move_medium(map.transport_start, source_addr, dest_addr);
         // MOVE MEDIUM 可能需要较长时间（机械操作）
-        self.device.execute_no_data(&cdb_bytes, 300_000)?;
+        retry_unit_attention("changer", || self.device.execute_no_data(&cdb_bytes, 300_000))?;
 
         info!("移动完成");
         Ok(())
@@ -137,7 +137,7 @@ impl<'a> MediumChanger<'a> {
         info!("初始化 element 状态...");
         let cdb_bytes = cdb::initialize_element_status();
         // 初始化可能非常耗时
-        self.device.execute_no_data(&cdb_bytes, 600_000)?;
+        retry_unit_attention("changer", || self.device.execute_no_data(&cdb_bytes, 600_000))?;
         info!("Element 状态初始化完成");
         Ok(())
     }
@@ -164,7 +164,7 @@ impl<'a> MediumChanger<'a> {
             false,
             false,
         );
-        self.device.execute_no_data(&cdb_bytes, 600_000)?;
+        retry_unit_attention("changer", || self.device.execute_no_data(&cdb_bytes, 600_000))?;
         info!("交换完成");
         Ok(())
     }
@@ -176,7 +176,7 @@ impl<'a> MediumChanger<'a> {
 
         info!("机械臂定位到 {:#06x}", dest_addr);
         let cdb_bytes = cdb::position_to_element(map.transport_start, dest_addr, false);
-        self.device.execute_no_data(&cdb_bytes, 120_000)?;
+        retry_unit_attention("changer", || self.device.execute_no_data(&cdb_bytes, 120_000))?;
         Ok(())
     }
 
@@ -184,7 +184,7 @@ impl<'a> MediumChanger<'a> {
     pub fn prevent_medium_removal(&self, prevent: bool) -> Result<()> {
         info!("{} 介质移除", if prevent { "禁止" } else { "允许" });
         let cdb_bytes = cdb::prevent_allow_medium_removal(prevent);
-        self.device.execute_no_data(&cdb_bytes, 10_000)?;
+        retry_unit_attention("changer", || self.device.execute_no_data(&cdb_bytes, 10_000))?;
         Ok(())
     }
 

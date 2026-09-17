@@ -17,4 +17,5 @@ pub mod index;
 pub mod label;
 pub mod mam;
 pub mod mkltfs;
+pub mod recovery;
 pub mod volume;

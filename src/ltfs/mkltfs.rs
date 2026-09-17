@@ -18,16 +18,18 @@ use log::info;
 use uuid::Uuid;
 
 use crate::error::{Result, TapeError};
-use crate::scsi::device::ScsiDevice;
+use crate::scsi::transport::TapeTransport;
 use crate::tape::commands::TapeDrive;
 
 use super::index::{IndexLocation, LtfsIndex};
-use super::label::{LtfsLabel, Vol1Label, PART_DATA, PART_INDEX};
+use super::label::{LtfsLabel, PART_DATA, PART_INDEX, Vol1Label};
 use super::mam::{
-    Mam, VolumeCoherencyInfo, ATTR_APP_FORMAT_VERSION, ATTR_APP_NAME, ATTR_APP_VENDOR,
-    ATTR_APP_VERSION, ATTR_BARCODE,
+    ATTR_APP_FORMAT_VERSION, ATTR_APP_NAME, ATTR_APP_VENDOR, ATTR_APP_VERSION, ATTR_BARCODE, Mam,
+    VolumeCoherencyInfo,
 };
-use super::volume::{DEFAULT_BLOCK_SIZE, P0_INDEX_BLOCK, VOL1_BLOCK};
+use super::volume::{
+    DEFAULT_BLOCK_SIZE, FIRST_INDEX_BLOCK, P0_INDEX_BLOCK, P1_DATA_START, VOL1_BLOCK,
+};
 
 /// 应用端标识。写入 MAM 的 Application Vendor / Name / Version 字段。
 pub const APP_VENDOR: &str = "tape-rs";
@@ -66,7 +68,7 @@ impl Default for MkltfsOptions {
 }
 
 /// 主入口。**破坏性操作**——会抹掉整盘磁带的内容。
-pub fn mkltfs(device: &ScsiDevice, opts: &MkltfsOptions) -> Result<Uuid> {
+pub fn mkltfs(device: &dyn TapeTransport, opts: &MkltfsOptions) -> Result<Uuid> {
     if opts.volume_id.is_empty() || opts.volume_id.len() > 6 {
         return Err(TapeError::Ltfs(format!(
             "volume_id 长度非法: {}（必须 1..=6）",
@@ -74,14 +76,20 @@ pub fn mkltfs(device: &ScsiDevice, opts: &MkltfsOptions) -> Result<Uuid> {
         )));
     }
     if opts.block_size < 4096 || opts.block_size > 16 * 1024 * 1024 {
-        return Err(TapeError::Ltfs(format!("block_size {} 超出合理范围 [4KiB, 16MiB]", opts.block_size)));
+        return Err(TapeError::Ltfs(format!(
+            "block_size {} 超出合理范围 [4KiB, 16MiB]",
+            opts.block_size
+        )));
     }
 
     let drive = TapeDrive::new(device);
     let mam = Mam::new(device);
     let volume_uuid = opts.volume_uuid.unwrap_or_else(Uuid::new_v4);
 
-    info!("mkltfs 开始: volume_id={} uuid={}", opts.volume_id, volume_uuid);
+    info!(
+        "mkltfs 开始: volume_id={} uuid={}",
+        opts.volume_id, volume_uuid
+    );
 
     // 1. TUR + REWIND
     drive.test_unit_ready()?;
@@ -99,19 +107,59 @@ pub fn mkltfs(device: &ScsiDevice, opts: &MkltfsOptions) -> Result<Uuid> {
         drive.format(1, /*verify=*/ false)?;
     }
 
+    // 两个分区的卷标除 <location> 外必须逐字段相同（LTFS 2.5.1 §8.1.2），formattime 只取一次。
+    // IBM LTFS 会比较两份卷标，不同则拒绝加载（LTFS11184E）。
+    let format_time = crate::ltfs::label::ltfs_time_now();
+
     // 4. 写 P0 labels + 空 index
-    write_partition_prologue(&drive, /*partition=*/ 0, &opts, volume_uuid, PART_INDEX)?;
+    write_partition_prologue(
+        &drive,
+        /*partition=*/ 0,
+        &opts,
+        volume_uuid,
+        PART_INDEX,
+        &format_time,
+    )?;
 
     // P0 的 index XML
     let mut p0_index = LtfsIndex::empty(volume_uuid, APP_NAME.to_string(), PART_DATA);
-    p0_index.self_location = IndexLocation { partition: PART_INDEX, start_block: P0_INDEX_BLOCK };
-    let p0_xml = p0_index.to_xml()?;
-    drive.locate(0, P0_INDEX_BLOCK, true)?;
+    p0_index.self_location = IndexLocation {
+        partition: PART_INDEX,
+        start_block: P0_INDEX_BLOCK,
+    };
+    // IP 索引回指 DP 上同代的那份（一致卷的定义）；DP 首代没有回指针。
+    let dp_first = IndexLocation {
+        partition: PART_DATA,
+        start_block: FIRST_INDEX_BLOCK,
+    };
+    let mut p0_written = p0_index.clone();
+    p0_written.previous_location = Some(dp_first);
+    let p0_xml = p0_written.to_xml()?;
+    // Index Construct = FM + 索引 + FM（§5.2.3）
+    drive.locate(0, P1_DATA_START, true)?;
+    drive.write_filemark(1)?;
     write_blocks(&drive, &p0_xml, opts.block_size as usize)?;
     drive.write_filemark(1)?;
 
-    // 5. 写 P1 labels（数据区不写 index，首次 commit 才写）
-    write_partition_prologue(&drive, /*partition=*/ 1, &opts, volume_uuid, PART_DATA)?;
+    // 5. 写 P1 labels + 同代空 index（LTFS 2.5.1 §5.3：完整分区的最后构造必须是 index）
+    write_partition_prologue(
+        &drive,
+        /*partition=*/ 1,
+        &opts,
+        volume_uuid,
+        PART_DATA,
+        &format_time,
+    )?;
+    let mut p1_index = p0_index.clone();
+    p1_index.self_location = IndexLocation {
+        partition: PART_DATA,
+        start_block: FIRST_INDEX_BLOCK,
+    };
+    let p1_xml = p1_index.to_xml()?;
+    drive.locate(1, P1_DATA_START, true)?;
+    drive.write_filemark(1)?;
+    write_blocks(&drive, &p1_xml, opts.block_size as usize)?;
+    drive.write_filemark(1)?;
 
     // 6. 写 MAM
     mam.write_ascii(ATTR_APP_VENDOR, APP_VENDOR, 8)?;
@@ -120,14 +168,22 @@ pub fn mkltfs(device: &ScsiDevice, opts: &MkltfsOptions) -> Result<Uuid> {
     mam.write_ascii(ATTR_BARCODE, &opts.volume_id, 32)?;
     // 0x080B: LTFS Application Format Version（ASCII 16 bytes，LTFS 2.4 Annex B.3.1）
     mam.write_ascii(ATTR_APP_FORMAT_VERSION, super::label::LTFS_VERSION, 16)?;
-    // 0x080C: Volume Coherency Information（Binary 66 bytes，LTFS 2.4 Annex B.3.2）
-    let vci = VolumeCoherencyInfo {
-        vcr: 1,
-        count: 0,
-        generation: p0_index.generation,
-        volume_uuid,
-    };
-    mam.write_vci(&vci)?;
+    // 0x080C: Volume Coherency Information（LTFS 2.5.1 §10.3）：刷缓冲 → 读 VCR → 写两分区 VCI
+    drive.write_filemark(0)?;
+    match mam.read_vcr()? {
+        Some(vcr) if super::mam::vcr_is_valid(&vcr) => {
+            for (partition, block) in [(0u8, P0_INDEX_BLOCK), (1u8, FIRST_INDEX_BLOCK)] {
+                let vci = VolumeCoherencyInfo {
+                    vcr: vcr.to_vec(),
+                    generation: p0_index.generation,
+                    block,
+                    volume_uuid,
+                };
+                Mam::with_partition(device, partition).write_vci(&vci)?;
+            }
+        }
+        _ => info!("驱动器未提供有效 VCR，跳过 VCI"),
+    }
 
     drive.rewind()?;
     info!("mkltfs 完成: {}", volume_uuid);
@@ -141,6 +197,7 @@ fn write_partition_prologue(
     opts: &MkltfsOptions,
     volume_uuid: Uuid,
     location: char,
+    format_time: &str,
 ) -> Result<()> {
     drive.locate(partition, VOL1_BLOCK, true)?;
     let vol1 = Vol1Label::encode(&opts.volume_id, &opts.owner);
@@ -151,7 +208,7 @@ fn write_partition_prologue(
     let label = LtfsLabel {
         version: super::label::LTFS_VERSION.into(),
         creator: APP_NAME.into(),
-        format_time: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        format_time: format_time.to_string(),
         volume_uuid,
         location,
         index_partition: PART_INDEX,
@@ -193,8 +250,7 @@ fn write_partition_prologue(
 /// 总长 24 字节。
 fn apply_two_partition_mode(drive: &TapeDrive<'_>) -> Result<()> {
     let params: [u8; 24] = [
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x11, // page code
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, // page code
         0x0E, // page length = 14
         0x00, // max additional (RO)
         0x01, // additional defined → 2 total

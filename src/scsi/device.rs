@@ -126,42 +126,7 @@ impl ScsiDevice {
             hdr.status, transferred, hdr.duration, sense
         );
 
-        // status != GOOD 要分门别类报错，而不是当成功返回 — 否则像 0x18
-        // (RESERVATION CONFLICT)、0x08 (BUSY) 这类不带 sense 的状态会被吞掉，
-        // 上层会以为命令成功执行（实际上 target 根本没动）。
-        match hdr.status {
-            SCSI_STATUS_GOOD => {}
-            SCSI_STATUS_CHECK_CONDITION if !sense.is_ok() => {
-                return Err(TapeError::ScsiCommand {
-                    status: hdr.status,
-                    sense_key: sense.sense_key,
-                    asc: sense.asc,
-                    ascq: sense.ascq,
-                });
-            }
-            SCSI_STATUS_CHECK_CONDITION => {
-                // sense 显示 NO SENSE（极少见），仍按成功对待但保留 status。
-            }
-            SCSI_STATUS_RESERVATION_CONFLICT => {
-                return Err(TapeError::ReservationConflict { device: self.path.clone() });
-            }
-            SCSI_STATUS_BUSY => {
-                return Err(TapeError::Busy { device: self.path.clone() });
-            }
-            SCSI_STATUS_TASK_SET_FULL => {
-                return Err(TapeError::ScsiStatus { device: self.path.clone(), status: hdr.status });
-            }
-            _ => {
-                return Err(TapeError::ScsiStatus { device: self.path.clone(), status: hdr.status });
-            }
-        }
-
-        Ok(ScsiResult {
-            status: hdr.status,
-            sense,
-            transferred,
-            duration_ms: hdr.duration,
-        })
+        finish_command(hdr.status, sense, transferred, hdr.duration, &self.path)
     }
 
     /// 执行 SCSI 命令（兼容旧接口，保留可变缓冲区签名）
@@ -204,4 +169,48 @@ impl std::fmt::Display for ScsiDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "ScsiDevice({})", self.path)
     }
+}
+
+/// 把一次命令的 SCSI 状态、sense 与传输结果归类为 `Result`。
+///
+/// `ScsiDevice` 与 `SimTransport` 共用这一逻辑，保证模拟器与真实设备对
+/// CHECK CONDITION / RESERVATION CONFLICT / BUSY 等状态的处理完全一致：
+/// status != GOOD 要分门别类报错，而不是当成功返回 — 否则像 0x18
+/// (RESERVATION CONFLICT)、0x08 (BUSY) 这类不带 sense 的状态会被吞掉，
+/// 上层会以为命令成功执行（实际上 target 根本没动）。
+pub(crate) fn finish_command(
+    status: u8,
+    sense: SenseInfo,
+    transferred: usize,
+    duration_ms: u32,
+    device: &str,
+) -> Result<ScsiResult> {
+    match status {
+        SCSI_STATUS_GOOD => {}
+        SCSI_STATUS_CHECK_CONDITION if !sense.is_ok() => {
+            return Err(TapeError::ScsiCommand {
+                status,
+                sense_key: sense.sense_key,
+                asc: sense.asc,
+                ascq: sense.ascq,
+            });
+        }
+        SCSI_STATUS_CHECK_CONDITION => {
+            // sense 显示 NO SENSE（filemark / BOP / ILI 等提示），仍按成功对待但保留 status。
+        }
+        SCSI_STATUS_RESERVATION_CONFLICT => {
+            return Err(TapeError::ReservationConflict { device: device.to_string() });
+        }
+        SCSI_STATUS_BUSY => {
+            return Err(TapeError::Busy { device: device.to_string() });
+        }
+        SCSI_STATUS_TASK_SET_FULL => {
+            return Err(TapeError::ScsiStatus { device: device.to_string(), status });
+        }
+        _ => {
+            return Err(TapeError::ScsiStatus { device: device.to_string(), status });
+        }
+    }
+
+    Ok(ScsiResult { status, sense, transferred, duration_ms })
 }

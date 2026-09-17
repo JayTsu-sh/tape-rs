@@ -7,7 +7,7 @@ use log::{debug, info};
 
 use crate::error::{TapeError, Result};
 use crate::scsi::cdb;
-use crate::scsi::device::ScsiDevice;
+use crate::scsi::transport::{TapeTransport, retry_unit_attention};
 
 /// LOG SENSE 响应缓冲区长度（大多数 log page ≤ 8 KiB）。
 const LOG_SENSE_BUF_LEN: usize = 8 * 1024;
@@ -46,11 +46,11 @@ pub struct TapePosition {
 
 /// 磁带机高层封装
 pub struct TapeDrive<'a> {
-    device: &'a ScsiDevice,
+    device: &'a dyn TapeTransport,
 }
 
 impl<'a> TapeDrive<'a> {
-    pub fn new(device: &'a ScsiDevice) -> Self {
+    pub fn new(device: &'a dyn TapeTransport) -> Self {
         Self { device }
     }
 
@@ -61,16 +61,9 @@ impl<'a> TapeDrive<'a> {
     /// 因此收到 UA 后重发一次 TUR 再判定 ready 状态。
     pub fn test_unit_ready(&self) -> Result<bool> {
         let cdb_bytes = cdb::test_unit_ready();
-        match self.device.execute_no_data(&cdb_bytes, 10_000) {
+        match retry_unit_attention("TEST UNIT READY", || self.device.execute_no_data(&cdb_bytes, 10_000)) {
             Ok(_) => Ok(true),
             Err(TapeError::ScsiCommand { sense_key: 0x02, .. }) => Ok(false),
-            Err(TapeError::ScsiCommand { sense_key: 0x06, .. }) => {
-                match self.device.execute_no_data(&cdb_bytes, 10_000) {
-                    Ok(_) => Ok(true),
-                    Err(TapeError::ScsiCommand { sense_key: 0x02, .. }) => Ok(false),
-                    Err(e) => Err(e),
-                }
-            }
             Err(e) => Err(e),
         }
     }
@@ -79,7 +72,7 @@ impl<'a> TapeDrive<'a> {
     pub fn rewind(&self) -> Result<()> {
         info!("倒带...");
         let cdb_bytes = cdb::rewind();
-        self.device.execute_no_data(&cdb_bytes, 300_000)?;
+        retry_unit_attention("REWIND", || self.device.execute_no_data(&cdb_bytes, 300_000))?;
         info!("倒带完成");
         Ok(())
     }
@@ -88,7 +81,7 @@ impl<'a> TapeDrive<'a> {
     pub fn read_position(&self) -> Result<TapePosition> {
         let cdb_bytes = cdb::read_position();
         let mut buf = [0u8; 20];
-        let result = self.device.execute_read(&cdb_bytes, &mut buf, 10_000)?;
+        let result = retry_unit_attention("READ POSITION", || self.device.execute_read(&cdb_bytes, &mut buf, 10_000))?;
 
         if result.transferred < 20 {
             return Err(TapeError::InvalidResponse { expected: 20, actual: result.transferred });
@@ -110,7 +103,7 @@ impl<'a> TapeDrive<'a> {
     pub fn load(&self) -> Result<()> {
         info!("装载磁带...");
         let cdb_bytes = cdb::load_unload(true);
-        self.device.execute_no_data(&cdb_bytes, 300_000)?;
+        retry_unit_attention("LOAD", || self.device.execute_no_data(&cdb_bytes, 300_000))?;
         info!("装载完成");
         Ok(())
     }
@@ -119,7 +112,7 @@ impl<'a> TapeDrive<'a> {
     pub fn unload(&self) -> Result<()> {
         info!("弹出磁带...");
         let cdb_bytes = cdb::load_unload(false);
-        self.device.execute_no_data(&cdb_bytes, 300_000)?;
+        retry_unit_attention("UNLOAD", || self.device.execute_no_data(&cdb_bytes, 300_000))?;
         info!("弹出完成");
         Ok(())
     }
@@ -144,10 +137,26 @@ impl<'a> TapeDrive<'a> {
                 reason: format!("READ(6) 块大小 {} 超过 24-bit 上限 {}", buf.len(), SCSI_6_TRANSFER_MAX),
             });
         }
-        let cdb_bytes = cdb::read_6(false, buf.len() as u32);
+        let requested = buf.len();
+        let cdb_bytes = cdb::read_6(false, requested as u32);
         let result = self.device.execute_read(&cdb_bytes, buf, 120_000)?;
-        debug!("读取 {} 字节, 耗时 {}ms", result.transferred, result.duration_ms);
-        Ok(result.transferred)
+        // 以 sense 标志为准（st 驱动与 IBM LTFS 的做法），不单靠 residual：
+        // - FILEMARK 位：读到文件标记，返回 0 字节。Holo-VTL 此时不报 residual
+        //   （sg 层看起来"传输了整个缓冲区"）且 ASC/ASCQ 为 00/00，只能靠 FM 位识别。
+        // - ILI + 有效的 INFORMATION：实际记录长度 = 请求长度 − INFORMATION。
+        let n = if result.sense.filemark {
+            0
+        } else if result.sense.ili
+            && let Some(info) = result.sense.information
+            && info > 0
+            && (info as usize) <= requested
+        {
+            requested - info as usize
+        } else {
+            result.transferred
+        };
+        debug!("读取 {} 字节 (sg transferred={}), 耗时 {}ms", n, result.transferred, result.duration_ms);
+        Ok(n)
     }
 
     /// WRITE FILEMARKS: 写入文件标记
@@ -228,7 +237,7 @@ impl<'a> TapeDrive<'a> {
         info!("定位到 partition={}, block={}", partition, block);
         let cdb_bytes = cdb::locate_16(partition, block, change_partition, false);
         // 大容量带上 LOCATE 可能较慢
-        self.device.execute_no_data(&cdb_bytes, 600_000)?;
+        retry_unit_attention("LOCATE", || self.device.execute_no_data(&cdb_bytes, 600_000))?;
         Ok(())
     }
 
@@ -249,7 +258,7 @@ impl<'a> TapeDrive<'a> {
     pub fn format(&self, format: u8, verify: bool) -> Result<()> {
         info!("格式化介质（format={}, verify={}）...", format, verify);
         let cdb_bytes = cdb::format_medium(format, false, verify);
-        self.device.execute_no_data(&cdb_bytes, 28_800_000)?;
+        retry_unit_attention("FORMAT MEDIUM", || self.device.execute_no_data(&cdb_bytes, 28_800_000))?;
         info!("格式化完成");
         Ok(())
     }
@@ -301,7 +310,7 @@ impl<'a> TapeDrive<'a> {
         })?;
         debug!("MODE SELECT(10): {} bytes", param_len);
         let cdb_bytes = cdb::mode_select_10(true, save, param_len);
-        self.device.execute_write(&cdb_bytes, parameters, 30_000)?;
+        retry_unit_attention("MODE SELECT", || self.device.execute_write(&cdb_bytes, parameters, 30_000))?;
         Ok(())
     }
 

@@ -18,6 +18,12 @@ use uuid::Uuid;
 use crate::error::{Result, TapeError};
 
 /// LTFS 协议版本。写入端固定使用该字符串。
+/// LTFS 时间戳（LTFS 2.5.1 §7.1）：`YYYY-MM-DDThh:mm:ss.nnnnnnnnnZ`，9 位小数必填。
+/// IBM LTFS 2.4.8.3 遇到不带小数的时间会拒读卷标（LTFS17034E），整卷无法加载。
+pub fn ltfs_time_now() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string()
+}
+
 pub const LTFS_VERSION: &str = "2.4.0";
 /// Implementation Identifier（VOL1 byte 24..37，13 字节，"LTFS" + 9 空格）。
 pub const VOL1_IMPL_ID: &[u8; 13] = b"LTFS         ";
@@ -94,7 +100,7 @@ impl LtfsLabel {
         Self {
             version: LTFS_VERSION.to_string(),
             creator,
-            format_time: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            format_time: ltfs_time_now(),
             volume_uuid,
             location,
             index_partition: PART_INDEX,

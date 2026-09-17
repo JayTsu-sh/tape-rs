@@ -310,6 +310,17 @@ enum Commands {
         #[arg(short, long)]
         output: String,
     },
+    /// ltfs-verify：读出文件并与索引里的哈希扩展属性比对
+    LtfsVerify {
+        #[arg(short, long, default_value = "/dev/sg1")]
+        device: String,
+        /// 磁带上的文件路径；不给则校验全部文件
+        #[arg(long)]
+        name: Option<String>,
+        /// 同时打印每个文件的扩展属性
+        #[arg(long)]
+        xattrs: bool,
+    },
     /// ltfs-write：把本地文件追加写入 LTFS 卷
     LtfsWrite {
         #[arg(short, long, default_value = "/dev/sg1")]
@@ -320,6 +331,13 @@ enum Commands {
         /// 磁带上的目标路径（'/' 分隔）
         #[arg(long)]
         name: String,
+        /// 附带的文本扩展属性 key=value，可重复。key 是索引里的原始名字
+        /// （IBM LTFS 在 Linux 上会显示成 user.<key>）
+        #[arg(long = "xattr", value_name = "KEY=VALUE")]
+        xattrs: Vec<String>,
+        /// 同时记录 ltfs.hash.md5sum（默认只记 sha256sum）
+        #[arg(long)]
+        md5: bool,
     },
     /// 跨盘 catalog（SQLite）：sync / list / find / show
     Catalog {
@@ -418,8 +436,11 @@ fn run(cli: Cli) -> Result<()> {
             ltfs_cli::cmd_mkltfs(&device, &volume_id, &owner, block_size, compression, yes_destroy, quick)
         }
         Commands::LtfsList { device } => ltfs_cli::cmd_ltfs_list(&device),
+        Commands::LtfsVerify { device, name, xattrs } => ltfs_cli::cmd_ltfs_verify(&device, name.as_deref(), xattrs),
         Commands::LtfsRead { device, name, output } => ltfs_cli::cmd_ltfs_read(&device, &name, &output),
-        Commands::LtfsWrite { device, file, name } => ltfs_cli::cmd_ltfs_write(&device, &file, &name),
+        Commands::LtfsWrite { device, file, name, xattrs, md5 } => {
+            ltfs_cli::cmd_ltfs_write(&device, &file, &name, &xattrs, md5)
+        }
         Commands::Catalog { cmd } => run_catalog(cmd),
     }
 }

@@ -10,7 +10,8 @@
 //! - 0x0802 Application Version        (TEXT, 8)
 //! - 0x0806 Barcode                    (ASCII, 32)
 //! - 0x080B Application Format Version (ASCII, 16, "2.4.0")
-//! - 0x080C Volume Coherency Info      (BINARY, variable)
+//! - 0x080C Volume Coherency Info      (BINARY, variable, LTFS 2.5.1 §10.2)
+//! - 0x0009 Volume Change Reference    (BINARY, 只读, 驱动器维护)
 
 use bytes::Bytes;
 use log::debug;
@@ -18,7 +19,7 @@ use uuid::Uuid;
 
 use crate::error::{Result, TapeError};
 use crate::scsi::cdb;
-use crate::scsi::device::ScsiDevice;
+use crate::scsi::transport::{TapeTransport, retry_unit_attention};
 
 /// MAM attribute format code（SPC-5 Table 395）。
 #[repr(u8)]
@@ -77,93 +78,143 @@ impl VolumeCapacity {
     }
 }
 
-/// LTFS 2.4 Annex B.3.2 Volume Coherency Information。
+/// 0x0009 = VOLUME CHANGE REFERENCE（SSC 设备属性，二进制、变长，驱动器维护、只读）。
+/// 介质每次被写入后变化；LTFS 2.5.1 §10.3 用它判断 VCI 是否仍然新鲜。
+pub const ATTR_VCR: u16 = 0x0009;
+
+/// LTFS 2.5.1 §10.2 Table 17 / §10.3 Table 18 的 Volume Coherency Information。
 ///
-/// 二进制布局（66 字节）：
+/// 二进制布局：
 /// ```text
-/// 0..8    VCR (Volume Change Reference, u64 BE)
-/// 8..16   Count (Volume Coherency Count, u64 BE; 通常为 0)
-/// 16..24  Set Identifier (generation number, u64 BE)
-/// 24      Application Client Specific Information Length = 41
-/// 25..30  "LTFS\0" (5 bytes)
-/// 30..66  Volume UUID canonical ASCII ("xxxxxxxx-xxxx-...-xxxxxxxxxxxx", 36 bytes)
+/// 0            VCR Length (1 byte)
+/// 1..1+L       VCR（写 VCI 时读到的介质 VCR 原样）
+/// +0..+8       generation number（VOLUME COHERENCY COUNT，u64 BE）
+/// +8..+16      block number（VOLUME COHERENCY SET IDENTIFIER，u64 BE；该分区上最新索引的起始块，0 非法）
+/// +16..+18     ACSI Length (u16 BE) = 43
+/// +18..+61     ACSI: "LTFS" 0x00 <UUID 36 字节> 0x00 0x01
 /// ```
 ///
-/// `generation` 与 P0/P1 上 index XML 中的 `<generationnumber>` 对齐；读端读到 VCI 后，
-/// 如果与扫描到的 latest index 不一致，则以 index XML 为准（on-tape source of truth）。
-pub const VCI_APP_ID: &[u8; 5] = b"LTFS\0";
-pub const VCI_ACSI_LEN: u8 = 41; // "LTFS\0" (5) + UUID ASCII (36)
-pub const VCI_LEN: usize = 25 + VCI_ACSI_LEN as usize; // 66
+/// 每个分区各有一份 VCI，`block` 指向该分区自己的最新索引。读端只有在 VCI 里的 VCR
+/// 与当前介质 VCR 相等时才把 `block` 当作定位提示，且仍要读取并核验实际索引。
+pub const VCI_ACSI_LEN: u16 = 43;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VolumeCoherencyInfo {
-    /// Volume Change Reference：每次更新 VCI 递增一次。
-    pub vcr: u64,
-    /// Volume Coherency Count / Ordinal。LTFS 2.4 里一般保持 0。
-    pub count: u64,
-    /// Set Identifier = index XML 的 generationnumber。
+    pub vcr: Vec<u8>,
     pub generation: u64,
+    pub block: u64,
     pub volume_uuid: Uuid,
 }
 
+/// VCR 全 0 或全 1 视为无效（§10.3 第 4 步）。
+/// VCR 按数值比较。MAM 0x0009 是 4 字节，而 IBM LTFS 在 VCI 里把它存成 8 字节
+/// （实测 IBM LTFS 2.4.8.3：`08 00 00 00 00 00 00 00 33`），所以不能按字节串比。
+pub fn vcr_matches(a: &[u8], b: &[u8]) -> bool {
+    fn strip(v: &[u8]) -> &[u8] {
+        let n = v.iter().take_while(|&&x| x == 0).count();
+        &v[n..]
+    }
+    strip(a) == strip(b)
+}
+
+/// VCI 里 VCR 的写出形式：与 IBM LTFS 相同，零扩展到 8 字节。更长的原样保留。
+pub fn vcr_for_vci(vcr: &[u8]) -> Vec<u8> {
+    if vcr.len() >= 8 {
+        return vcr.to_vec();
+    }
+    let mut out = vec![0u8; 8 - vcr.len()];
+    out.extend_from_slice(vcr);
+    out
+}
+
+pub fn vcr_is_valid(vcr: &[u8]) -> bool {
+    !vcr.is_empty() && !vcr.iter().all(|&b| b == 0) && !vcr.iter().all(|&b| b == 0xFF)
+}
+
 impl VolumeCoherencyInfo {
-    pub fn encode(&self) -> [u8; VCI_LEN] {
-        let mut b = [0u8; VCI_LEN];
-        b[0..8].copy_from_slice(&self.vcr.to_be_bytes());
-        b[8..16].copy_from_slice(&self.count.to_be_bytes());
-        b[16..24].copy_from_slice(&self.generation.to_be_bytes());
-        b[24] = VCI_ACSI_LEN;
-        b[25..30].copy_from_slice(VCI_APP_ID);
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let vcr = vcr_for_vci(&self.vcr);
+        let vcr_len = u8::try_from(vcr.len())
+            .map_err(|_| TapeError::Ltfs(format!("VCR 长度 {} 超过 255", vcr.len())))?;
+        let mut b = Vec::with_capacity(1 + vcr.len() + 8 + 8 + 2 + VCI_ACSI_LEN as usize);
+        b.push(vcr_len);
+        b.extend_from_slice(&vcr);
+        b.extend_from_slice(&self.generation.to_be_bytes());
+        b.extend_from_slice(&self.block.to_be_bytes());
+        b.extend_from_slice(&VCI_ACSI_LEN.to_be_bytes());
+        b.extend_from_slice(b"LTFS\0");
         let uuid_str = self.volume_uuid.as_hyphenated().to_string();
         debug_assert_eq!(uuid_str.len(), 36);
-        b[30..66].copy_from_slice(uuid_str.as_bytes());
-        b
+        b.extend_from_slice(uuid_str.as_bytes());
+        b.push(0x00);
+        b.push(0x01);
+        Ok(b)
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self> {
-        if buf.len() < 25 {
-            return Err(TapeError::Ltfs(format!("VCI 长度 {} < 25 (header)", buf.len())));
-        }
-        let vcr = u64::from_be_bytes(buf[0..8].try_into().unwrap());
-        let count = u64::from_be_bytes(buf[8..16].try_into().unwrap());
-        let generation = u64::from_be_bytes(buf[16..24].try_into().unwrap());
-        let acsi_len = buf[24] as usize;
-        if buf.len() < 25 + acsi_len {
-            return Err(TapeError::Ltfs(format!(
-                "VCI ACSI 截断: len={} 需要 {}",
-                buf.len(),
-                25 + acsi_len
-            )));
-        }
-        let acsi = &buf[25..25 + acsi_len];
-        // ACSI 至少包含 "LTFS\0" + 36 字节 UUID
-        if acsi.len() < 5 + 36 || &acsi[0..5] != VCI_APP_ID {
+        let need = |n: usize| -> Result<()> {
+            if buf.len() < n {
+                Err(TapeError::Ltfs(format!(
+                    "VCI 截断: len={} 需要 {}",
+                    buf.len(),
+                    n
+                )))
+            } else {
+                Ok(())
+            }
+        };
+        need(1)?;
+        let vcr_len = buf[0] as usize;
+        let mut off = 1;
+        need(off + vcr_len + 8 + 8 + 2)?;
+        let vcr = buf[off..off + vcr_len].to_vec();
+        off += vcr_len;
+        let generation = u64::from_be_bytes(buf[off..off + 8].try_into().unwrap());
+        off += 8;
+        let block = u64::from_be_bytes(buf[off..off + 8].try_into().unwrap());
+        off += 8;
+        let acsi_len = u16::from_be_bytes([buf[off], buf[off + 1]]) as usize;
+        off += 2;
+        need(off + acsi_len)?;
+        let acsi = &buf[off..off + acsi_len];
+        if acsi.len() < 41 || &acsi[0..5] != b"LTFS\0" {
             return Err(TapeError::Ltfs(format!(
                 "VCI ACSI 不是 LTFS 格式: {:02x?}",
                 &acsi[..acsi.len().min(8)]
             )));
         }
-        let uuid_str = std::str::from_utf8(&acsi[5..5 + 36])
+        let uuid_str = std::str::from_utf8(&acsi[5..41])
             .map_err(|e| TapeError::Ltfs(format!("VCI UUID 非 UTF-8: {}", e)))?;
         let volume_uuid = Uuid::parse_str(uuid_str)
             .map_err(|e| TapeError::Ltfs(format!("VCI UUID 解析失败 {:?}: {}", uuid_str, e)))?;
-        Ok(Self { vcr, count, generation, volume_uuid })
+        if block == 0 {
+            return Err(TapeError::Ltfs("VCI block number 为 0（非法）".into()));
+        }
+        Ok(Self {
+            vcr,
+            generation,
+            block,
+            volume_uuid,
+        })
     }
 }
 
 /// MAM 访问封装。固定操作 partition 0（LTFS 中 VCI 写在两个 partition 都行，我们
 /// 只用 P0 保持一致）。
 pub struct Mam<'a> {
-    device: &'a ScsiDevice,
+    device: &'a dyn TapeTransport,
     partition: u8,
 }
 
 impl<'a> Mam<'a> {
-    pub fn new(device: &'a ScsiDevice) -> Self {
-        Self { device, partition: 0 }
+    pub fn new(device: &'a dyn TapeTransport) -> Self {
+        Self {
+            device,
+            partition: 0,
+        }
     }
 
-    pub fn with_partition(device: &'a ScsiDevice, partition: u8) -> Self {
+    pub fn with_partition(device: &'a dyn TapeTransport, partition: u8) -> Self {
         Self { device, partition }
     }
 
@@ -175,7 +226,7 @@ impl<'a> Mam<'a> {
         const ALLOC: u32 = 512;
         let cdb_bytes = cdb::read_attribute(0x00, self.partition, attr_id, ALLOC);
         let mut buf = [0u8; ALLOC as usize];
-        let result = self.device.execute_read(&cdb_bytes, &mut buf, 30_000)?;
+        let result = retry_unit_attention("READ ATTRIBUTE", || self.device.execute_read(&cdb_bytes, &mut buf, 30_000))?;
 
         if result.transferred < 4 {
             return Ok(None);
@@ -208,8 +259,9 @@ impl<'a> Mam<'a> {
 
     /// WRITE ATTRIBUTE 写入单个属性。
     pub fn write_attribute(&self, attr: &MamAttribute) -> Result<()> {
-        let value_len = u16::try_from(attr.value.len())
-            .map_err(|_| TapeError::Ltfs(format!("attribute 值 {} 字节超 u16", attr.value.len())))?;
+        let value_len = u16::try_from(attr.value.len()).map_err(|_| {
+            TapeError::Ltfs(format!("attribute 值 {} 字节超 u16", attr.value.len()))
+        })?;
         // parameter list = 4-byte total length header + entry (id 2 + fmt 1 + len 2 + value)
         let entry_len = 5 + value_len as usize;
         let total_len = entry_len; // total length field covers attribute entries only
@@ -223,7 +275,7 @@ impl<'a> Mam<'a> {
         buf[9..9 + attr.value.len()].copy_from_slice(&attr.value);
 
         let cdb_bytes = cdb::write_attribute(true, self.partition, param_len as u32);
-        self.device.execute_write(&cdb_bytes, &buf, 30_000)?;
+        retry_unit_attention("WRITE ATTRIBUTE", || self.device.execute_write(&cdb_bytes, &buf, 30_000))?;
         debug!("MAM write attr {:#06x} {} bytes", attr.id, attr.value.len());
         Ok(())
     }
@@ -256,6 +308,11 @@ impl<'a> Mam<'a> {
         }
     }
 
+    /// 读取介质 VCR（0x0009）。驱动器不支持或属性缺失时返回 `None`。
+    pub fn read_vcr(&self) -> Result<Option<Bytes>> {
+        Ok(self.read_attribute(ATTR_VCR)?.map(|a| a.value))
+    }
+
     pub fn read_vci(&self) -> Result<Option<VolumeCoherencyInfo>> {
         match self.read_attribute(ATTR_VCI)? {
             Some(a) => Ok(Some(VolumeCoherencyInfo::decode(&a.value)?)),
@@ -267,7 +324,7 @@ impl<'a> Mam<'a> {
         let attr = MamAttribute {
             id: ATTR_VCI,
             format: AttributeFormat::Binary as u8,
-            value: Bytes::copy_from_slice(&vci.encode()),
+            value: Bytes::from(vci.encode()?),
         };
         self.write_attribute(&attr)
     }
@@ -306,7 +363,7 @@ impl<'a> Mam<'a> {
 ///
 /// 单 partition 磁带（裸带或只用 P0）读 P1 会失败，这里把单个 partition 的错误
 /// 降级为 "该 partition 不可用"，只要至少有一个读到就返回 Ok；全部失败才报错。
-pub fn read_volume_capacity(device: &ScsiDevice) -> Result<VolumeCapacity> {
+pub fn read_volume_capacity(device: &dyn TapeTransport) -> Result<VolumeCapacity> {
     let mut cap = VolumeCapacity::default();
     let mut any_ok = false;
     let mut last_err: Option<TapeError> = None;
@@ -342,23 +399,51 @@ pub fn read_volume_capacity(device: &ScsiDevice) -> Result<VolumeCapacity> {
 mod tests {
     use super::*;
 
+    /// IBM LTFS 2.4.8.3 在 EE 下写出的 DP VCI，取自实验室克隆带的 MAM 0x080C。
+    #[test]
+    fn decodes_vci_written_by_ibm_ltfs() {
+        let hex = "08000000000000003300000000000000030000000000000023002B4C54465300\
+                   63306362356261382D376565342D343666652D383864312D376136363234306230363535\
+                   0001";
+        let hex: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
+        let raw: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let v = VolumeCoherencyInfo::decode(&raw).unwrap();
+        assert_eq!((v.generation, v.block), (3, 0x23));
+        assert_eq!(v.volume_uuid.to_string(), "c0cb5ba8-7ee4-46fe-88d1-7a66240b0655");
+        // 驱动器的 MAM 0x0009 是 4 字节
+        assert!(vcr_matches(&v.vcr, &[0, 0, 0, 0x33]));
+        assert!(!vcr_matches(&v.vcr, &[0, 0, 0, 0x34]));
+        // tape-rs 对同一内容的编码与 IBM 逐字节相同
+        assert_eq!(v.encode().unwrap(), raw);
+    }
+
     #[test]
     fn vci_roundtrip() {
         let uuid = Uuid::parse_str("b321d431-ad2e-469d-bb6e-30d8e2a42f08").unwrap();
         let v = VolumeCoherencyInfo {
-            vcr: 7,
-            count: 0,
+            vcr: vec![0, 0, 1, 7],
             generation: 42,
+            block: 1632,
             volume_uuid: uuid,
         };
-        let b = v.encode();
-        assert_eq!(b.len(), VCI_LEN);
-        assert_eq!(b[24], VCI_ACSI_LEN);
-        assert_eq!(&b[25..30], VCI_APP_ID);
-        let v2 = VolumeCoherencyInfo::decode(&b).unwrap();
-        assert_eq!(v.vcr, v2.vcr);
-        assert_eq!(v.count, v2.count);
-        assert_eq!(v.generation, v2.generation);
-        assert_eq!(v.volume_uuid, v2.volume_uuid);
+        let b = v.encode().unwrap();
+        // 与 IBM LTFS 相同：VCR 零扩展到 8 字节
+        assert_eq!(b.len(), 1 + 8 + 8 + 8 + 2 + 43);
+        assert_eq!(&b[..9], &[8, 0, 0, 0, 0, 0, 0, 1, 7]);
+        assert_eq!(&b[25..27], &43u16.to_be_bytes());
+        assert_eq!(&b[27..32], b"LTFS\0");
+        assert_eq!(&b[b.len() - 2..], &[0x00, 0x01]);
+        let back = VolumeCoherencyInfo::decode(&b).unwrap();
+        assert!(vcr_matches(&back.vcr, &v.vcr));
+        assert_eq!((back.generation, back.block, back.volume_uuid), (42, 1632, uuid));
+        assert!(VolumeCoherencyInfo::decode(&b[..20]).is_err());
+        assert!(
+            !vcr_is_valid(&[0, 0, 0, 0])
+                && !vcr_is_valid(&[0xFF; 4])
+                && vcr_is_valid(&[0, 0, 1, 7])
+        );
     }
 }

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use crate::error::Result;
 use crate::scsi::cdb;
-use crate::scsi::device::ScsiDevice;
+use crate::scsi::transport::TapeTransport;
 
 /// 标准 INQUIRY 返回的基础字段。
 #[derive(Debug, Clone)]
@@ -16,7 +16,7 @@ pub struct InquiryStandard {
 }
 
 /// 跑标准 INQUIRY (96 字节)，解析 peripheral type + vendor/product/revision。
-pub fn standard_inquiry(dev: &ScsiDevice) -> Result<InquiryStandard> {
+pub fn standard_inquiry(dev: &dyn TapeTransport) -> Result<InquiryStandard> {
     let cdb_bytes = cdb::inquiry(96);
     let mut buf = [0u8; 96];
     dev.execute_read(&cdb_bytes, &mut buf, 10_000)?;
@@ -54,7 +54,7 @@ fn sg_index(p: &std::path::Path) -> Option<u32> {
 }
 
 /// 读 VPD page 0x80 (Unit Serial Number)，返回 trim 后的非空字符串；失败或为空返回 None。
-pub fn read_unit_serial(dev: &ScsiDevice) -> Option<String> {
+pub fn read_unit_serial(dev: &dyn TapeTransport) -> Option<String> {
     let cdb_bytes = cdb::inquiry_vpd(0x80, 252);
     let mut buf = [0u8; 252];
     let result = dev.execute_read(&cdb_bytes, &mut buf, 10_000).ok()?;
