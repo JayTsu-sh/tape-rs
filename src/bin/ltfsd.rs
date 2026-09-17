@@ -102,11 +102,12 @@ fn main() {
         .name("ltfsd-exec".into())
         .spawn(move || executor::run(provider, eopts, exec_rx, ev_tx, files_for_exec))
         .expect("执行线程");
+    let inbox_for_events = inbox_tx.clone();
     thread::Builder::new()
         .name("ltfsd-exec-events".into())
         .spawn(move || {
             for ev in ev_rx {
-                if inbox_tx.send(NodeInput::Exec(ev)).is_err() {
+                if inbox_for_events.send(NodeInput::Exec(ev)).is_err() {
                     break;
                 }
             }
@@ -121,6 +122,7 @@ fn main() {
         election_ticks: 10,
         heartbeat_ticks: 3,
         status_file: Some(args.data_dir.join("status.json")),
+        directory_file: Some(args.data_dir.join("directory.db")),
         cooldown: Duration::from_secs(20),
     };
     let status = Arc::new(Mutex::new(NodeStatus::default()));
@@ -133,6 +135,7 @@ fn main() {
             files: files.clone(),
             status: status.clone(),
             exec: Mutex::new(exec_tx.clone()),
+            node: Mutex::new(inbox_tx.clone()),
             client_addrs,
             wait_timeout: Duration::from_secs(600),
         });

@@ -8,6 +8,7 @@
 //! 当选 → 提交 `Takeover`，它的日志索引就是执行轮次 → 隔离全部设备并回读 →
 //! 提交 `Fenced`（应用时若已有更新的 `Takeover` 则本轮作废）→ 恢复、收尾 → 服务。
 
+pub mod directory;
 pub mod executor;
 pub mod files;
 pub mod http;

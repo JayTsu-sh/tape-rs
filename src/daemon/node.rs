@@ -13,7 +13,8 @@ use serde_json::json;
 use slog::Drain;
 
 use super::executor::{ExecEvent, ExecRequest};
-use super::net::{Network, NodeInput};
+use super::directory::{Directory, PoolRow};
+use super::net::{AdminReply, Network, NodeInput};
 use super::state::{Applied, Command, ControlState, Executor};
 use super::store::RaftStore;
 use crate::error::{Result, TapeError};
@@ -27,6 +28,8 @@ pub struct NodeConfig {
     pub heartbeat_ticks: usize,
     /// 状态文件写到哪里；`None` 不写
     pub status_file: Option<PathBuf>,
+    /// 本地目录库文件；`None` 不落库（测试里用）
+    pub directory_file: Option<PathBuf>,
     /// 隔离失败或失去预留后，多久之内即使再次当选也不接管（直接让出领导权）
     pub cooldown: Duration,
 }
@@ -42,6 +45,8 @@ pub struct NodeStatus {
     /// 本节点执行线程的最新状态
     pub local: String,
     pub applied_index: u64,
+    /// 池与磁带归属（来自已应用的日志；任何节点都可读，有界陈旧）
+    pub pools: Vec<PoolRow>,
 }
 
 pub type SharedStatus = Arc<Mutex<NodeStatus>>;
@@ -71,6 +76,13 @@ pub fn run(
     let mut node: RawNode<MemStorage> = RawNode::new(&raft_cfg, store.raft_storage(), &logger).map_err(raft_err)?;
 
     let mut ctl = ControlState::default();
+    let mut directory = match &cfg.directory_file {
+        Some(p) => Some(Directory::open(p)?),
+        None => None,
+    };
+    // 本节点提交的管理命令：请求号 → 回复通道。请求号放在日志条目的 context 里。
+    let mut pending_admin: std::collections::HashMap<u64, std::sync::mpsc::Sender<AdminReply>> = Default::default();
+    let mut next_admin: u64 = 1;
     // 本节点在哪个任期已经提交过 Takeover；以及当前作为执行者的轮次
     let mut claimed_term: Option<u64> = None;
     let mut my_round: Option<u64> = None;
@@ -92,6 +104,22 @@ pub fn run(
             Ok(NodeInput::Raft(m)) => {
                 if let Err(e) = node.step(*m) {
                     warn!("raft step: {}", e);
+                }
+            }
+            Ok(NodeInput::Admin { cmd, reply }) => {
+                if node.raft.state != StateRole::Leader {
+                    let _ = reply.send(AdminReply::NotLeader(node.raft.leader_id));
+                } else {
+                    let id = next_admin;
+                    next_admin += 1;
+                    match node.propose(id.to_be_bytes().to_vec(), cmd.encode()) {
+                        Ok(()) => {
+                            pending_admin.insert(id, reply);
+                        }
+                        Err(e) => {
+                            let _ = reply.send(AdminReply::Rejected(format!("提交失败: {}", e)));
+                        }
+                    }
                 }
             }
             Ok(NodeInput::Exec(ev)) => {
@@ -134,6 +162,8 @@ pub fn run(
         let term = node.raft.term;
         if !is_leader {
             proposed_term = None;
+            // 不再是 Leader：这些命令也许会被新 Leader 提交，也许不会。让请求方自己查询后决定。
+            pending_admin.clear();
         }
         if let Some(r) = my_round.take_if(|_| !is_leader) {
             // 尽早停手。安全性不靠这一步：设备会拒绝陈旧的执行者。
@@ -164,7 +194,20 @@ pub fn run(
             };
             let is_leader = node.raft.state == StateRole::Leader;
             let term = node.raft.term;
-            match ctl.apply(entry.index, &cmd) {
+            let applied = ctl.apply(entry.index, &cmd);
+            if let Some(d) = directory.as_mut() {
+                d.apply(entry.index, &cmd, &applied)?;
+            }
+            if let Applied::Admin(result) = &applied {
+                let waiter = <[u8; 8]>::try_from(entry.context.as_ref()).ok().and_then(|b| pending_admin.remove(&u64::from_be_bytes(b)));
+                if let Some(tx) = waiter {
+                    let _ = tx.send(match result {
+                        Ok(s) => AdminReply::Ok(s.clone()),
+                        Err(e) => AdminReply::Rejected(e.clone()),
+                    });
+                }
+            }
+            match applied {
                 Applied::NewExecutor(e) if e.node == cfg.id && is_leader && e.term == term => {
                     info!("本节点成为执行者，轮次 {}（任期 {}）", e.round, e.term);
                     claimed_term = Some(term);
@@ -265,11 +308,22 @@ fn publish_status(
         executor: ctl.executor.clone(),
         local: local.to_string(),
         applied_index: ctl.applied_index,
+        pools: ctl
+            .pools
+            .iter()
+            .map(|(uuid, p)| PoolRow {
+                uuid: uuid.clone(),
+                name: p.name.clone(),
+                file_limit: p.file_limit,
+                tapes: ctl.tapes.iter().filter(|(_, u)| *u == uuid).map(|(b, _)| b.clone()).collect(),
+            })
+            .collect(),
     };
     let text = json!({
         "id": st.id, "role": st.role, "term": st.term, "leader": st.leader,
         "executor": st.executor.as_ref().map(|e| json!({"node": e.node, "round": e.round, "term": e.term, "fenced": e.fenced})),
         "local": st.local, "applied_index": st.applied_index,
+        "pools": st.pools.iter().map(|p| json!({"uuid": p.uuid, "name": p.name, "file_limit": p.file_limit, "tapes": p.tapes})).collect::<Vec<_>>(),
     })
     .to_string();
     if text == *last {

@@ -25,6 +25,40 @@ enum Cmd {
     List,
     /// 各节点的自述
     Cluster,
+    /// 池管理
+    Pool {
+        #[command(subcommand)]
+        cmd: PoolCmd,
+    },
+    /// 磁带归属
+    Tape {
+        #[command(subcommand)]
+        cmd: TapeCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum PoolCmd {
+    /// 新建池
+    Create {
+        name: String,
+        /// 每盘带的文件数软上限（默认 200000）
+        #[arg(long)]
+        file_limit: Option<u64>,
+    },
+    /// 列出池与各池的磁带。加 --all-nodes 时逐个节点询问，用来核对三个节点是否一致
+    List {
+        #[arg(long)]
+        all_nodes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum TapeCmd {
+    /// 把磁带（条码）归入池（名称或 UUID）
+    Assign { barcode: String, pool: String },
+    /// 解除归属
+    Unassign { barcode: String },
 }
 
 fn main() {
@@ -58,6 +92,29 @@ fn main() {
                     println!("{:>12}  {}", n, p);
                 }
             }
+            Cmd::Pool { cmd: PoolCmd::Create { name, file_limit } } => {
+                println!("已创建池 {}  UUID {}", name, c.pool_create(&name, file_limit)?);
+            }
+            Cmd::Pool { cmd: PoolCmd::List { all_nodes } } => {
+                let targets: Vec<Option<String>> =
+                    if all_nodes { args.endpoints.iter().cloned().map(Some).collect() } else { vec![None] };
+                for t in targets {
+                    if let Some(a) = &t {
+                        println!("== {}", a);
+                    }
+                    match c.pools(t.as_deref()) {
+                        Ok(pools) if pools.is_empty() => println!("  (没有池)"),
+                        Ok(pools) => {
+                            for p in pools {
+                                println!("  {}  {}  文件数上限 {}  磁带 [{}]", p.name, p.uuid, p.file_limit, p.tapes.join(", "));
+                            }
+                        }
+                        Err(e) => println!("  不可达: {}", e),
+                    }
+                }
+            }
+            Cmd::Tape { cmd: TapeCmd::Assign { barcode, pool } } => println!("{}", c.tape_assign(&barcode, &pool)?),
+            Cmd::Tape { cmd: TapeCmd::Unassign { barcode } } => println!("{}", c.tape_unassign(&barcode)?),
             Cmd::Cluster => {
                 for e in &args.endpoints {
                     match c.node_status(e) {

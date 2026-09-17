@@ -56,6 +56,14 @@ pub struct FileStat {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolInfo {
+    pub uuid: String,
+    pub name: String,
+    pub file_limit: u64,
+    pub tapes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PutOutcome {
     pub generation: u64,
     /// 总共发了几次上传请求（1 = 一次成功）
@@ -270,6 +278,54 @@ impl Client {
             .unwrap_or_default();
         out.sort();
         Ok(out)
+    }
+
+    // ---------- 管理 ----------
+
+    fn admin(&mut self, method: &str, route: &str) -> Result<String> {
+        // 带一个空内容：管理命令和上传一样，一旦可能已送达就不能悄悄换节点重发
+        let r = self.to_leader(method, route, Some(b""))?;
+        let j = r.json();
+        match r.status {
+            200 => Ok(j["result"].as_str().unwrap_or("").to_string()),
+            s => Err(ClientError::Rejected { status: s, body: j["detail"].as_str().map(str::to_string).unwrap_or_else(|| String::from_utf8_lossy(&r.body).into_owned()) }),
+        }
+    }
+
+    /// 新建池，返回池 UUID。`file_limit` 为每盘带的文件数软上限，`None` 用默认值。
+    pub fn pool_create(&mut self, name: &str, file_limit: Option<u64>) -> Result<String> {
+        let q = file_limit.map(|n| format!("?file_limit={}", n)).unwrap_or_default();
+        self.admin("POST", &format!("/admin/pools/{}{}", name, q))
+    }
+
+    /// 把一盘带归入池。`pool` 可以是池名或 UUID。
+    pub fn tape_assign(&mut self, barcode: &str, pool: &str) -> Result<String> {
+        self.admin("POST", &format!("/admin/tapes/{}?pool={}", barcode, pool))
+    }
+
+    pub fn tape_unassign(&mut self, barcode: &str) -> Result<String> {
+        self.admin("DELETE", &format!("/admin/tapes/{}", barcode))
+    }
+
+    /// 池与磁带归属。由 `addr` 指定的节点用它已应用的日志回答；`None` 时问 Leader。
+    pub fn pools(&mut self, addr: Option<&str>) -> Result<Vec<PoolInfo>> {
+        let j = match addr {
+            Some(a) => self.request(a, "GET", "/admin/pools", None).map_err(|(_, e)| e)?.json(),
+            None => self.to_leader("GET", "/admin/pools", None)?.json(),
+        };
+        Ok(j["pools"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|p| PoolInfo {
+                        uuid: p["uuid"].as_str().unwrap_or("").to_string(),
+                        name: p["name"].as_str().unwrap_or("").to_string(),
+                        file_limit: p["file_limit"].as_u64().unwrap_or(0),
+                        tapes: p["tapes"].as_array().map(|t| t.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     /// 某个节点的自述（不跟随 Leader）。

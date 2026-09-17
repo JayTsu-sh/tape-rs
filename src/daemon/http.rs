@@ -6,6 +6,10 @@
 //! GET  /tasks/<id>[?wait=1]     上传任务的状态
 //! GET  /list                    已提交视图的全部文件
 //! GET  /cluster                 本节点对集群的自述
+//! GET  /admin/pools             池与磁带归属（任何节点可答，来自已应用的日志）
+//! POST /admin/pools/<name>[?file_limit=N]      新建池（只有 Raft Leader 受理）
+//! POST /admin/tapes/<barcode>?pool=<名称或UUID>  磁带归入池
+//! DELETE /admin/tapes/<barcode>                 解除归属
 //!
 //! 不在服务的节点一律返回 503，并在 JSON 里给出它所知的 Leader 地址。
 
@@ -22,12 +26,16 @@ use serde_json::{Value, json};
 
 use super::executor::ExecRequest;
 use super::files::{FileService, ServiceError, TaskStatus};
+use super::net::{AdminReply, NodeInput};
 use super::node::SharedStatus;
+use super::state::{Command, DEFAULT_FILE_LIMIT};
 
 pub struct HttpContext {
     pub files: Arc<FileService>,
     pub status: SharedStatus,
     pub exec: Mutex<Sender<ExecRequest>>,
+    /// 通往 Raft 循环，用来提交管理命令
+    pub node: Mutex<Sender<NodeInput>>,
     /// 节点编号 → 客户端接口地址，用来给出 Leader 提示
     pub client_addrs: HashMap<u64, String>,
     pub wait_timeout: Duration,
@@ -105,6 +113,28 @@ fn service_error(conn: &mut TcpStream, ctx: &HttpContext, e: ServiceError) -> st
     }
 }
 
+fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query.split('&').find_map(|kv| kv.split_once('=').filter(|(k, _)| *k == key).map(|(_, v)| v))
+}
+
+/// 把管理命令交给 Raft 循环并等结论。只有 Raft Leader 受理；不是 Leader 时答 503 并指出 Leader。
+fn admin(conn: &mut TcpStream, ctx: &HttpContext, cmd: Command) -> std::io::Result<()> {
+    let (tx, rx) = channel();
+    if ctx.node.lock().unwrap_or_else(|e| e.into_inner()).send(NodeInput::Admin { cmd, reply: tx }).is_err() {
+        return respond_json(conn, 503, "Service Unavailable", json!({"error": "node_gone"}));
+    }
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(AdminReply::Ok(result)) => respond_json(conn, 200, "OK", json!({"result": result})),
+        Ok(AdminReply::Rejected(why)) => respond_json(conn, 409, "Conflict", json!({"error": "rejected", "detail": why})),
+        Ok(AdminReply::NotLeader(leader)) => {
+            let url = ctx.client_addrs.get(&leader).map(|a| format!("http://{}", a));
+            respond_json(conn, 503, "Service Unavailable", json!({"error": "not_leader", "detail": "管理命令只由 Raft Leader 受理", "leader": leader, "leader_url": url}))
+        }
+        // 超时或 Leader 身份中途丢失：命令可能已提交也可能没有，请调用方查询 /admin/pools 后决定
+        Err(_) => respond_json(conn, 504, "Gateway Timeout", json!({"error": "indeterminate", "detail": "命令结论未知，请查询后决定是否重发"})),
+    }
+}
+
 fn task_json(id: u64, st: &TaskStatus) -> (u16, &'static str, Value) {
     match st {
         TaskStatus::Staged => (202, "Accepted", json!({"task": id, "status": "staged"})),
@@ -159,6 +189,27 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                     "serving_round": ctx.files.serving_round(),
                 }),
             )
+        }
+        ("GET", "/admin/pools") => {
+            let s = ctx.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let pools: Vec<Value> = s
+                .pools
+                .iter()
+                .map(|p| json!({"uuid": p.uuid, "name": p.name, "file_limit": p.file_limit, "tapes": p.tapes}))
+                .collect();
+            respond_json(&mut conn, 200, "OK", json!({"pools": pools, "applied_index": s.applied_index, "answered_by": s.id}))
+        }
+        ("POST", p) if p.starts_with("/admin/pools/") => {
+            let file_limit = query_param(query, "file_limit").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_FILE_LIMIT);
+            let cmd = Command::PoolCreate { uuid: uuid::Uuid::new_v4().to_string(), name: p[13..].to_string(), file_limit };
+            admin(&mut conn, ctx, cmd)
+        }
+        ("POST", p) if p.starts_with("/admin/tapes/") => match query_param(query, "pool") {
+            Some(pool) => admin(&mut conn, ctx, Command::TapeAssign { barcode: p[13..].to_string(), pool: percent_decode(pool) }),
+            None => respond_json(&mut conn, 400, "Bad Request", json!({"error": "pool_required"})),
+        },
+        ("DELETE", p) if p.starts_with("/admin/tapes/") => {
+            admin(&mut conn, ctx, Command::TapeUnassign { barcode: p[13..].to_string() })
         }
         ("GET", "/list") => match ctx.files.list() {
             Ok(m) => respond_json(&mut conn, 200, "OK", json!({"files": m})),

@@ -120,6 +120,7 @@ impl Cluster {
                 election_ticks: 10,
                 heartbeat_ticks: 2,
                 status_file: None,
+                directory_file: Some(dir.join(format!("directory-{}.db", id))),
                 cooldown: Duration::from_millis(1500),
             };
             let store = RaftStore::open(&dir.join(format!("raft-{}.db", id)), &ids).unwrap();
@@ -454,6 +455,7 @@ impl Cluster {
                 files: self.services[&id].clone(),
                 status: self.status[&id].clone(),
                 exec: Mutex::new(self.execs[&id].clone()),
+                node: Mutex::new(self.inboxes[&id].clone()),
                 client_addrs: addrs.clone(),
                 wait_timeout: Duration::from_secs(15),
             });
@@ -511,5 +513,53 @@ fn client_library_hides_failover_from_the_application() {
     }
     assert_eq!(fresh.get("/app/first.bin").unwrap(), body(70_000, 3));
     assert!(fresh.list().unwrap().len() >= outcomes.len() + 1);
+    c.shutdown();
+}
+
+// ---------- 池与磁带归属（P1）----------
+
+/// 管理命令经 Raft 提交：只有 Leader 受理（客户端库自动找到它），被状态机拒绝的命令不改变状态，
+/// 三个节点从各自已应用的日志给出相同的答案。
+#[test]
+fn pools_and_tape_assignments_are_replicated_to_every_node() {
+    let c = Cluster::start_with("pools", false);
+    c.wait_serving(None, 0);
+    let endpoints = c.start_http();
+    // 故意把一个 Follower 放在最前面：库要靠 503 里的提示找到 Leader
+    let leader = (1..=3u64).find(|i| c.st(*i).role == "Leader").unwrap();
+    let mut order = endpoints.clone();
+    order.rotate_left(leader as usize % 3);
+    let mut cl = Client::new(order);
+
+    let uuid = cl.pool_create("archive", Some(50_000)).unwrap();
+    assert_eq!(uuid.len(), 36);
+    let dup = cl.pool_create("archive", None).unwrap_err();
+    assert!(matches!(dup, tape_rs::client::ClientError::Rejected { status: 409, .. }), "{dup}");
+    cl.pool_create("scratch", None).unwrap();
+    cl.tape_assign("TR8000L08", "archive").unwrap();
+    cl.tape_assign("TR8001L08", &uuid).unwrap();
+    assert!(cl.tape_assign("TR8000L08", "scratch").is_err(), "已归属的带不能再归入别的池");
+    assert!(cl.tape_assign("TR8002L08", "no-such-pool").is_err());
+    cl.tape_assign("TR8002L08", "scratch").unwrap();
+    cl.tape_unassign("TR8002L08").unwrap();
+    assert!(cl.tape_unassign("TR8002L08").is_err());
+
+    let want = |pools: &[tape_rs::client::PoolInfo]| {
+        pools.len() == 2
+            && pools.iter().any(|p| p.name == "archive" && p.uuid == uuid && p.file_limit == 50_000 && p.tapes == ["TR8000L08", "TR8001L08"])
+            && pools.iter().any(|p| p.name == "scratch" && p.file_limit == 200_000 && p.tapes.is_empty())
+    };
+    assert!(want(&cl.pools(None).unwrap()));
+    for e in &endpoints {
+        let e = e.clone();
+        c.wait("每个节点都应用到同样的池状态", || Client::new([e.clone()]).pools(Some(&e)).map(|p| want(&p)).unwrap_or(false));
+    }
+    // 每个节点的目录库与它的状态机一致
+    for id in 1..=3u64 {
+        let d = tape_rs::daemon::directory::Directory::open(&c.dir.join(format!("directory-{}.db", id))).unwrap();
+        let rows = d.pools().unwrap();
+        assert_eq!(rows.iter().find(|p| p.name == "archive").unwrap().tapes, ["TR8000L08", "TR8001L08"]);
+        assert!(d.applied_index() > 0);
+    }
     c.shutdown();
 }

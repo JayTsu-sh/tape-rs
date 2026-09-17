@@ -19,7 +19,18 @@ use super::executor::ExecEvent;
 pub enum NodeInput {
     Raft(Box<Message>),
     Exec(ExecEvent),
+    /// 管理命令：由 Leader 提交到日志，应用后经 `reply` 回结论。
+    Admin { cmd: super::state::Command, reply: std::sync::mpsc::Sender<AdminReply> },
     Shutdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminReply {
+    Ok(String),
+    /// 被状态机拒绝（例如重名、已归属）。状态未变。
+    Rejected(String),
+    /// 本节点不是 Leader。带上它所知的 Leader 编号。
+    NotLeader(u64),
 }
 
 pub trait Network: Send {
