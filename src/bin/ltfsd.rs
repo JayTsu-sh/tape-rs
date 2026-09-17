@@ -48,6 +48,9 @@ struct Args {
     /// 周期性向卷里追加一个小文件，用于故障演练
     #[arg(long)]
     demo_write: bool,
+    /// 自动格式化空白带时用的块大小（字节）
+    #[arg(long, default_value_t = 524_288)]
+    block_size: u32,
     /// 自动收尾时打捞未索引数据（默认放弃）
     #[arg(long)]
     salvage: bool,
@@ -106,6 +109,7 @@ fn main() {
         interval: Duration::from_millis(args.interval_ms),
         demo_write: args.demo_write,
         salvage: args.salvage,
+        block_size: args.block_size,
     };
     let policy = BatchPolicy {
         max_bytes: args.batch_mib << 20,

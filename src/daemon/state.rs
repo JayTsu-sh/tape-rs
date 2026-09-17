@@ -18,6 +18,8 @@ pub enum Command {
     TapeAssign { barcode: String, pool: String },
     /// 解除归属。
     TapeUnassign { barcode: String },
+    /// 磁带的追加资格或健康发生变化（执行者在写满、到文件数上限、池标记不符等时上报）。
+    TapeState { barcode: String, state: String },
     /// 一次卷提交的目录记录的一片。先进暂存，等同一批的 `TapeCommitted` 到达才可见。
     CatalogPart { barcode: String, generation: u64, part: u32, files: Vec<FileRec> },
     /// 一次卷提交的摘要。应用它时，若 `parts` 片齐全，该批目录记录原子地并入目录。
@@ -66,6 +68,7 @@ impl Command {
             }
             Command::TapeAssign { barcode, pool } => json!({"op": "tape_assign", "barcode": barcode, "pool": pool}),
             Command::TapeUnassign { barcode } => json!({"op": "tape_unassign", "barcode": barcode}),
+            Command::TapeState { barcode, state } => json!({"op": "tape_state", "barcode": barcode, "state": state}),
             Command::CatalogPart { barcode, generation, part, files } => json!({
                 "op": "catalog_part", "barcode": barcode, "generation": generation, "part": part,
                 "files": files.iter().map(|f| json!([f.path, f.length, f.sha256])).collect::<Vec<_>>(),
@@ -91,6 +94,7 @@ impl Command {
             }
             "tape_assign" => return Some(Command::TapeAssign { barcode: text("barcode")?, pool: text("pool")? }),
             "tape_unassign" => return Some(Command::TapeUnassign { barcode: text("barcode")? }),
+            "tape_state" => return Some(Command::TapeState { barcode: text("barcode")?, state: text("state")? }),
             "catalog_part" => {
                 let files = v
                     .get("files")?
@@ -163,6 +167,21 @@ pub enum Applied {
     Nothing,
 }
 
+/// 磁带状态的取值。追加资格与健康合在一个字段里，首版够用（37 的四个维度里的两个）。
+pub mod tape_state {
+    /// 可以继续写
+    pub const APPENDABLE: &str = "appendable";
+    /// 文件数到上限：还有空间，但不再接收新文件
+    pub const DATA_FULL: &str = "data_full";
+    /// 空间用尽（扣除保留空间）
+    pub const FULL: &str = "full";
+    /// 卷根的池标记与归属不符，或带上是别的数据：不使用，等人处理
+    pub const LABEL_MISMATCH: &str = "label_mismatch";
+    /// 装载、挂载或格式化失败
+    pub const CHECK: &str = "check";
+    pub const ALL: &[&str] = &[APPENDABLE, DATA_FULL, FULL, LABEL_MISMATCH, CHECK];
+}
+
 /// 默认的每盘带文件数软上限。推导见研究笔记 pooling-slice-plan.md。
 pub const DEFAULT_FILE_LIMIT: u64 = 200_000;
 
@@ -182,6 +201,8 @@ pub struct ControlState {
     pub pools: std::collections::BTreeMap<String, Pool>,
     /// 条码 → 所属池的 UUID。不在这里的磁带即未归属，系统绝不触碰。
     pub tapes: std::collections::BTreeMap<String, String>,
+    /// 条码 → 磁带状态。缺省即 appendable。取值见 `tape_state` 模块。
+    pub tape_state: std::collections::BTreeMap<String, String>,
     /// 条码 → 最近一次卷提交的摘要。文件记录本身只在目录库里，不放内存。
     pub tape_summary: std::collections::BTreeMap<String, TapeSummary>,
 }
@@ -221,6 +242,12 @@ impl ControlState {
             Command::PoolCreate { uuid, name, file_limit } => Applied::Admin(self.pool_create(uuid, name, *file_limit)),
             Command::TapeAssign { barcode, pool } => Applied::Admin(self.tape_assign(barcode, pool)),
             Command::TapeUnassign { barcode } => Applied::Admin(self.tape_unassign(barcode)),
+            Command::TapeState { barcode, state } => {
+                if self.tapes.contains_key(barcode) && tape_state::ALL.contains(&state.as_str()) {
+                    self.tape_state.insert(barcode.clone(), state.clone());
+                }
+                Applied::Nothing
+            }
             // 文件记录进目录库的暂存表，这里不处理
             Command::CatalogPart { .. } => Applied::Nothing,
             Command::TapeCommitted { barcode, volume_uuid, generation, files, bytes_used, .. } => {
@@ -268,6 +295,7 @@ impl ControlState {
         }
         self.tapes.remove(barcode);
         self.tape_summary.remove(barcode);
+        self.tape_state.remove(barcode);
         Ok(format!("{} 已解除归属", barcode))
     }
 

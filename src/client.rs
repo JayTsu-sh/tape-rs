@@ -123,16 +123,29 @@ impl Client {
         conn.set_write_timeout(Some(self.io_timeout))?;
         let _ = conn.set_nodelay(true);
         write!(conn, "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n", method, encode_path(path), addr)?;
+        // 大的内容先问一声：服务端准入成功才回 100，被拒绝就直接给最终结论，内容不必发
+        let ask_first = body.is_some_and(|b| b.len() >= 64 * 1024);
         if let Some(b) = body {
             write!(conn, "Content-Length: {}\r\n", b.len())?;
         }
+        if ask_first {
+            conn.write_all(b"Expect: 100-continue\r\n")?;
+        }
         conn.write_all(b"\r\n")?;
-        if let Some(b) = body {
+        if let (Some(b), false) = (body, ask_first) {
             conn.write_all(b)?;
         }
-        let mut reader = BufReader::new(conn);
+        let mut reader = BufReader::new(conn.try_clone()?);
         let mut line = String::new();
         reader.read_line(&mut line)?;
+        if ask_first && line.split_whitespace().nth(1) == Some("100") {
+            // 跳过 100 响应的空行，发内容，再读最终响应
+            let mut blank = String::new();
+            reader.read_line(&mut blank)?;
+            conn.write_all(body.unwrap_or_default())?;
+            line.clear();
+            reader.read_line(&mut line)?;
+        }
         let status: u16 = line
             .split_whitespace()
             .nth(1)

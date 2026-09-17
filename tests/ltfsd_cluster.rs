@@ -77,6 +77,11 @@ impl Cluster {
         lib.load_into_drive(BARCODE, 0).unwrap();
         let opts = MkltfsOptions { volume_id: "LTFSD1".into(), block_size: 64 * 1024, ..Default::default() };
         mkltfs(&lib.drive_as(0, 50), &opts).unwrap();
+        Self::start_lib(name, demo_write, lib, 200_000, &[BARCODE])
+    }
+
+    /// 用准备好的模拟库启动三节点集群，建一个池并把 `assign` 里的条码归进去。
+    fn start_lib(name: &str, demo_write: bool, lib: SimLibrary, file_limit: u64, assign: &[&str]) -> Self {
 
         let dir = std::env::temp_dir().join(format!("ltfsd-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -101,7 +106,7 @@ impl Cluster {
             let (exec_tx, exec_rx) = channel();
             let (ev_tx, ev_rx) = channel();
             let provider = Box::new(SimProvider { lib: lib.clone(), initiator: id as u32 });
-            let eopts = ExecOptions { node_id: id as u8, interval: Duration::from_millis(40), demo_write, salvage: false };
+            let eopts = ExecOptions { node_id: id as u8, interval: Duration::from_millis(40), demo_write, salvage: false, block_size: 64 * 1024 };
             let policy = tape_rs::daemon::files::BatchPolicy { max_bytes: 4 << 20, max_files: 50, idle: Duration::from_millis(25), max_wait: Duration::from_millis(400) };
             let files = tape_rs::daemon::files::FileService::with_options(dir.join(format!("spool-{}", id)), policy, Some(dir.join(format!("directory-{}.db", id)))).unwrap();
             let status_for_exec = shared.clone();
@@ -134,8 +139,10 @@ impl Cluster {
         }
         let c = Cluster { lib, status, services, execs, inboxes, isolated, dir };
         // 未归属的磁带系统绝不触碰：先建池并把模拟库里的这盘带归进去
-        c.admin(Command::PoolCreate { uuid: POOL.into(), name: "pool".into(), file_limit: 200_000 });
-        c.admin(Command::TapeAssign { barcode: BARCODE.into(), pool: POOL.into() });
+        c.admin(Command::PoolCreate { uuid: POOL.into(), name: "pool".into(), file_limit });
+        for b in assign {
+            c.admin(Command::TapeAssign { barcode: (*b).into(), pool: POOL.into() });
+        }
         c
     }
 
@@ -443,7 +450,7 @@ fn lone_executor(name: &str) -> (Sender<ExecRequest>, std::sync::mpsc::Receiver<
     let (ev_tx, ev_rx) = channel();
     let dir = std::env::temp_dir().join(format!("ltfsd-exec-{}-{}", name, std::process::id()));
     let files = FileService::new(dir).unwrap();
-    let opts = ExecOptions { node_id: 1, interval: Duration::from_secs(3600), demo_write: false, salvage: false };
+    let opts = ExecOptions { node_id: 1, interval: Duration::from_secs(3600), demo_write: false, salvage: false, block_size: 64 * 1024 };
     let status: SharedStatus = Arc::new(Mutex::new(NodeStatus::default()));
     thread::spawn(move || executor::run(Box::new(SimProvider { lib, initiator: 1 }), opts, rx, ev_tx, files, status));
     (tx, ev_rx)
@@ -680,5 +687,179 @@ fn uploads_are_batched_and_catalogued_on_every_node() {
     let (tx, rx) = channel();
     c.inboxes[&leader].send(NodeInput::Admin { cmd: Command::TapeUnassign { barcode: BARCODE.into() }, reply: tx }).unwrap();
     assert!(matches!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), AdminReply::Rejected(_)));
+    c.shutdown();
+}
+
+// ---------- 选带、装载、格式化、换带（P3）----------
+
+const MIB: usize = 1 << 20;
+
+/// 三盘很小的空白带都在槽位里，第四盘不归属。
+fn small_tape_library(tape_mib: u64) -> SimLibrary {
+    let lib = SimLibrary::new(1, 6, 1);
+    for (i, b) in ["PA0001L8", "PA0002L8", "PA0003L8", "ZZ0009L8"].iter().enumerate() {
+        lib.insert_cartridge(SimCartridge::blank(b, tape_mib << 20), i).unwrap();
+    }
+    lib
+}
+
+fn put_until<F: Fn(&std::result::Result<TaskStatus, ServiceError>) -> bool>(svc: &FileService, prefix: &str, size: usize, max: usize, stop: F) -> Vec<(String, std::result::Result<TaskStatus, ServiceError>)> {
+    let mut out = Vec::new();
+    for i in 0..max {
+        let path = format!("/{}/{:03}.bin", prefix, i);
+        // 换带期间服务端答"稍后重试"，这里就重试（客户端库也是这么做的）
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let r = loop {
+            match upload(svc, &path, &body(size, i as u8)) {
+                Err(ServiceError::SwitchingTape(_)) | Err(ServiceError::NotServing(_)) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+                other => break other,
+            }
+        };
+        let done = stop(&r);
+        out.push((path, r));
+        if done {
+            break;
+        }
+    }
+    out
+}
+
+/// PN03、PN04：空白的已归属磁带被自动装载、格式化并写上池标记；一盘写满就卸回槽位换下一盘；
+/// 三盘都满之后上传以确定的"没有可写的磁带"拒绝；未归属的那盘始终没被碰过。
+#[test]
+fn blank_tapes_are_formatted_on_first_use_and_full_tapes_are_switched() {
+    let lib = small_tape_library(12);
+    let c = Cluster::start_lib("switch", false, lib, 200_000, &["PA0001L8", "PA0002L8", "PA0003L8"]);
+    let (leader, round) = c.wait_serving(None, 0);
+    let svc = c.services[&leader].clone();
+    c.wait("文件服务开放", || svc.serving_round() == Some(round));
+    assert_eq!(svc.tape().unwrap().barcode, "PA0001L8", "按条码顺序取第一盘空白带");
+
+    // 比单盘还大的文件：确定的拒绝，不触发换带
+    let huge = svc.begin("/huge.bin", 64 << 20).map(|h| h.task);
+    assert!(matches!(huge, Err(ServiceError::TooLarge { .. })), "{huge:?}；{}", c.st(leader).local);
+    assert_eq!(svc.tape().unwrap().barcode, "PA0001L8");
+
+    let results = put_until(&svc, "data", MIB, 60, |r| matches!(r, Err(ServiceError::NoTape(_))));
+    let committed: Vec<&String> = results.iter().filter(|(_, r)| matches!(r, Ok(TaskStatus::Committed { .. }))).map(|(p, _)| p).collect();
+    let (last_path, last) = results.last().unwrap();
+    assert!(matches!(last, Err(ServiceError::NoTape(_))), "{last_path}: {last:?}");
+    assert_eq!(committed.len(), results.len() - 1, "除最后一个外全部提交: {:?}", results.iter().map(|(_, r)| r.is_ok()).collect::<Vec<_>>());
+
+    // 文件分布在三盘带上，目录知道每个文件在哪一盘
+    let db = c.dir.join(format!("directory-{}.db", leader));
+    c.wait("目录追上", || tape_rs::daemon::directory::Directory::open_reader(&db).unwrap().list(POOL).map(|l| l.len()).unwrap_or(0) == committed.len());
+    let d = tape_rs::daemon::directory::Directory::open_reader(&db).unwrap();
+    let mut per_tape: HashMap<String, usize> = HashMap::new();
+    for p in &committed {
+        *per_tape.entry(d.stat(POOL, p).unwrap().unwrap().barcode).or_default() += 1;
+    }
+    println!("{} 个 1 MiB 文件分布: {:?}", committed.len(), per_tape);
+    assert_eq!(per_tape.len(), 3);
+    assert!(per_tape.values().all(|&n| n >= 3));
+
+    // 三盘都标为已满；未归属的那盘仍是空白、仍在原槽位
+    c.wait("三盘都标为 full", || {
+        let st = c.st(leader);
+        ["PA0001L8", "PA0002L8", "PA0003L8"].iter().all(|b| st.tapes.get(*b).is_some_and(|t| t.0 == "full"))
+    });
+    let untouched = c.lib.cartridge("ZZ0009L8").unwrap();
+    assert_eq!(untouched.partitions.len(), 1);
+    assert!(untouched.partitions[0].objects.is_empty(), "未归属的带不得被格式化或写入");
+    // 每盘用过的带都带着池标记
+    for b in ["PA0001L8", "PA0002L8", "PA0003L8"] {
+        let cart = c.lib.cartridge(b).unwrap();
+        let xml = cart.partitions[1].objects.iter().rev().find_map(|o| match o {
+            tape_rs::scsi::sim::LogicalObject::Record(r) if r.windows(10).any(|w| w == b"<ltfsindex") => Some(String::from_utf8_lossy(r).to_string()),
+            _ => None,
+        }).unwrap();
+        assert!(xml.contains("ltfs.mediaPool.uuid") && xml.contains(POOL), "{b} 缺池标记");
+    }
+    // 池满了只是写不了：三盘带上的文件 stat 和 list 仍然答得出（来自目录）
+    for p in [committed[0], committed[committed.len() / 2], committed[committed.len() - 1]] {
+        assert!(svc.stat(p).unwrap().is_some(), "{p}");
+    }
+    assert_eq!(svc.list().unwrap().len(), committed.len());
+    c.shutdown();
+}
+
+/// PN02：文件数到上限的带转 data_full，即使还有空间；新上传落到下一盘。
+#[test]
+fn file_count_limit_switches_to_the_next_tape() {
+    let lib = small_tape_library(64);
+    let c = Cluster::start_lib("filelimit", false, lib, 5, &["PA0001L8", "PA0002L8"]);
+    let (leader, round) = c.wait_serving(None, 0);
+    let svc = c.services[&leader].clone();
+    c.wait("文件服务开放", || svc.serving_round() == Some(round));
+    let results = put_until(&svc, "small", 2000, 8, |_| false);
+    assert!(results.iter().all(|(_, r)| matches!(r, Ok(TaskStatus::Committed { .. }))), "{:?}", results);
+    c.wait("第一盘转 data_full", || c.st(leader).tapes.get("PA0001L8").is_some_and(|t| t.0 == "data_full"));
+    assert_eq!(svc.tape().unwrap().barcode, "PA0002L8");
+    let db = c.dir.join(format!("directory-{}.db", leader));
+    c.wait("目录追上", || tape_rs::daemon::directory::Directory::open_reader(&db).unwrap().list(POOL).map(|l| l.len()).unwrap_or(0) == 8);
+    let d = tape_rs::daemon::directory::Directory::open_reader(&db).unwrap();
+    let on_first = results.iter().filter(|(p, _)| d.stat(POOL, p).unwrap().unwrap().barcode == "PA0001L8").count();
+    assert_eq!(on_first, 5, "第一盘正好放到上限");
+    // 第一盘已卸回槽位，驱动器里是第二盘
+    assert_eq!(c.st(leader).tapes["PA0002L8"].0, "appendable");
+    // 两盘带上的文件 stat 都答得出：第二盘来自当前索引，第一盘来自目录
+    assert!(svc.stat(&results[0].0).unwrap().is_some());
+    assert!(svc.stat(&results[7].0).unwrap().is_some());
+    assert_eq!(svc.stat(&results[0].0).unwrap().unwrap().barcode, "PA0001L8");
+    c.shutdown();
+}
+
+/// 带上已有别的数据（不是 LTFS）：不自动覆盖，标为 label_mismatch 后跳过，用下一盘。
+#[test]
+fn a_tape_holding_foreign_data_is_never_formatted() {
+    let lib = small_tape_library(16);
+    lib.with_cartridge_mut("PA0001L8", |c| {
+        let p = &mut c.partitions[0];
+        p.objects.push(tape_rs::scsi::sim::LogicalObject::Record(b"TAR ARCHIVE written by another product".to_vec()));
+        p.objects.push(tape_rs::scsi::sim::LogicalObject::Filemark);
+        p.flushed = p.objects.len();
+    });
+    let c = Cluster::start_lib("foreign", false, lib, 200_000, &["PA0001L8", "PA0002L8"]);
+    let (leader, round) = c.wait_serving(None, 0);
+    let svc = c.services[&leader].clone();
+    c.wait("文件服务开放", || svc.serving_round() == Some(round));
+    assert_eq!(svc.tape().unwrap().barcode, "PA0002L8");
+    c.wait("第一盘标为 label_mismatch", || c.st(leader).tapes.get("PA0001L8").is_some_and(|t| t.0 == "label_mismatch"));
+    let foreign = c.lib.cartridge("PA0001L8").unwrap();
+    assert_eq!(foreign.partitions.len(), 1, "没有被重新分区");
+    assert!(matches!(&foreign.partitions[0].objects[0], tape_rs::scsi::sim::LogicalObject::Record(r) if r.starts_with(b"TAR ARCHIVE")));
+    assert!(matches!(upload(&svc, "/ok.bin", &body(1000, 1)).unwrap(), TaskStatus::Committed { .. }));
+    c.shutdown();
+}
+
+/// 被拒绝的大上传必须让客户端看到那条错误，而不是连接重置：用了 Expect 的客户端不必发内容，
+/// 没用的客户端由服务端把内容读掉再回应。
+#[test]
+fn rejected_large_uploads_get_a_clean_answer_over_http() {
+    use std::io::{Read, Write};
+    let lib = small_tape_library(12);
+    let c = Cluster::start_lib("reject-http", false, lib, 200_000, &["PA0001L8"]);
+    let (leader, round) = c.wait_serving(None, 0);
+    c.wait("文件服务开放", || c.services[&leader].serving_round() == Some(round));
+    let endpoints = c.start_http();
+
+    // 客户端库（大内容走 Expect: 100-continue）
+    let mut cl = Client::new(endpoints.clone());
+    let big = vec![7u8; 40 << 20];
+    match cl.put("/too-big.bin", &big) {
+        Err(tape_rs::client::ClientError::Rejected { status: 507, body }) => assert!(body.contains("too_large") || !body.is_empty(), "{body}"),
+        other => panic!("{other:?}"),
+    }
+    // 不用 Expect、闷头发内容的客户端
+    let addr = &endpoints[leader as usize - 1];
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    write!(s, "PUT /files/too-big-2.bin HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n", big.len()).unwrap();
+    s.write_all(&big).expect("服务端应当把内容读掉，而不是重置连接");
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).unwrap();
+    assert!(resp.starts_with("HTTP/1.1 507"), "{}", &resp[..resp.len().min(120)]);
+    assert!(resp.contains("too_large"));
+    // 正常大小的照常成功
+    assert_eq!(cl.put("/ok.bin", &vec![1u8; 300_000]).unwrap().attempts, 1);
     c.shutdown();
 }

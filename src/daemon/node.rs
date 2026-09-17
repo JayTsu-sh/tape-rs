@@ -47,6 +47,8 @@ pub struct NodeStatus {
     pub applied_index: u64,
     /// 池与磁带归属（来自已应用的日志；任何节点都可读，有界陈旧）
     pub pools: Vec<PoolRow>,
+    /// 条码 → (状态, 索引代数, 文件数, 已用字节)
+    pub tapes: std::collections::BTreeMap<String, (String, u64, u64, u64)>,
 }
 
 pub type SharedStatus = Arc<Mutex<NodeStatus>>;
@@ -153,6 +155,12 @@ pub fn run(
                                 &mut node,
                                 &Command::TapeCommitted { barcode, volume_uuid, generation, files: files_total, bytes_used, parts: parts.len() as u32, full },
                             );
+                        }
+                    }
+                    ExecEvent::TapeState { round, barcode, state } => {
+                        if my_round == Some(round) && is_leader {
+                            info!("磁带 {} 状态变为 {}", barcode, state);
+                            propose(&mut node, &Command::TapeState { barcode, state });
                         }
                     }
                     ExecEvent::Serving { round, summary } => {
@@ -340,11 +348,21 @@ fn publish_status(
                 tapes: ctl.tapes.iter().filter(|(_, u)| *u == uuid).map(|(b, _)| b.clone()).collect(),
             })
             .collect(),
+        tapes: ctl
+            .tapes
+            .keys()
+            .map(|b| {
+                let st = ctl.tape_state.get(b).cloned().unwrap_or_else(|| super::state::tape_state::APPENDABLE.to_string());
+                let su = ctl.tape_summary.get(b).cloned().unwrap_or_default();
+                (b.clone(), (st, su.generation, su.files, su.bytes_used))
+            })
+            .collect(),
     };
     let text = json!({
         "id": st.id, "role": st.role, "term": st.term, "leader": st.leader,
         "executor": st.executor.as_ref().map(|e| json!({"node": e.node, "round": e.round, "term": e.term, "fenced": e.fenced})),
         "local": st.local, "applied_index": st.applied_index,
+        "tapes": st.tapes.iter().map(|(b, t)| json!({"barcode": b, "state": t.0, "generation": t.1, "files": t.2, "bytes_used": t.3})).collect::<Vec<_>>(),
         "pools": st.pools.iter().map(|p| json!({"uuid": p.uuid, "name": p.name, "file_limit": p.file_limit, "tapes": p.tapes})).collect::<Vec<_>>(),
     })
     .to_string();

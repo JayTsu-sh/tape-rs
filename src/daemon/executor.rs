@@ -10,14 +10,17 @@ use std::time::{Duration, Instant};
 
 use log::{error, info, warn};
 
-use super::files::{FileService, TapeIdent};
+use super::files::{FileService, TapeIdent, TapeLimits};
+use super::state::tape_state;
 use super::node::SharedStatus;
 use super::state::FileRec;
 use crate::changer::commands::MediumChanger;
 use crate::changer::element::ElementType;
 use crate::error::{Result, TapeError};
 use crate::ltfs::recovery::TailKind;
-use crate::ltfs::volume::{LtfsVolume, TailPolicy};
+use crate::ltfs::mkltfs::{MkltfsOptions, mkltfs};
+use crate::ltfs::volume::{FormatProbe, LtfsVolume, TailPolicy, XATTR_POOL_NAME, XATTR_POOL_UUID, probe_format};
+use crate::tape::commands::TapeDrive;
 use crate::scsi::device::ScsiDevice;
 use crate::scsi::inquiry::{enumerate_sg_nodes, read_unit_serial};
 use crate::scsi::reservation::{self, FenceOutcome, ReservationKey, ownership_lost};
@@ -94,6 +97,8 @@ pub enum ExecEvent {
     Fenced { round: u64 },
     FenceFailed { round: u64, reason: String },
     Serving { round: u64, summary: String },
+    /// 磁带状态变化（写满、到文件数上限、池标记不符、装载或格式化失败）。
+    TapeState { round: u64, barcode: String, state: String },
     /// 一次卷提交已经落带（或接管时读到了该带的完整列表，`full` 为真）。
     /// Raft 层据此把目录记录写进日志。
     Committed { round: u64, barcode: String, volume_uuid: String, generation: u64, files_total: u64, bytes_used: u64, files: Vec<FileRec>, full: bool },
@@ -109,6 +114,8 @@ pub struct ExecOptions {
     /// 为真时周期性向卷里追加一个小文件，用来在故障切换时制造真实的写入活动。
     pub demo_write: bool,
     pub salvage: bool,
+    /// 自动格式化空白带时用的块大小
+    pub block_size: u32,
 }
 
 struct Active {
@@ -171,7 +178,7 @@ pub fn run(
                     let _ = tx.send(ExecEvent::Lost { round, reason });
                     continue;
                 };
-                match recover(a, &opts, &files, &status, &tx) {
+                match ensure_write_tape(a, &opts, &files, &status, &tx) {
                     Ok(summary) => {
                         a.serving = true;
                         next_work = Instant::now() + opts.interval;
@@ -189,7 +196,13 @@ pub fn run(
                 let Some(a) = active.as_mut().filter(|a| a.serving) else {
                     continue;
                 };
-                if let Err(reason) = process_uploads(a, &files, &tx) {
+                let mut worked = process_uploads(a, &files, &tx, false);
+                if let (Ok(()), Some(new_state)) = (&worked, files.switch_requested(a.round)) {
+                    worked = switch_tape(a, &opts, &files, &status, &tx, new_state).map(|summary| {
+                        let _ = tx.send(ExecEvent::Serving { round: a.round, summary });
+                    });
+                }
+                if let Err(reason) = worked {
                     let round = a.round;
                     error!("执行线程: 轮次 {} 落带失败，放弃本轮: {}", round, reason);
                     files.close(&reason);
@@ -214,14 +227,21 @@ pub fn run(
                 if periodic_due {
                     next_work = Instant::now() + opts.interval;
                 }
-                let mut worked = process_uploads(a, &files, &tx);
+                let mut worked = process_uploads(a, &files, &tx, false);
+                if let (Ok(()), Some(new_state)) = (&worked, files.switch_requested(a.round)) {
+                    worked = switch_tape(a, &opts, &files, &status, &tx, new_state).map(|summary| {
+                        let _ = tx.send(ExecEvent::Serving { round: a.round, summary });
+                    });
+                }
                 if periodic_due && worked.is_ok() {
                     if a.drive.is_none() {
                         // 还没有可服务的带（例如装着的带刚被归入池）：再试一次
-                        if let Ok(summary) = recover(a, &opts, &files, &status, &tx) {
-                            if a.drive.is_some() {
+                        match ensure_write_tape(a, &opts, &files, &status, &tx) {
+                            Ok(summary) if a.drive.is_some() => {
                                 let _ = tx.send(ExecEvent::Serving { round: a.round, summary });
                             }
+                            Ok(_) => {}
+                            Err(e) => worked = Err(e.to_string()),
                         }
                     }
                     worked = periodic(a, &opts);
@@ -268,21 +288,6 @@ fn takeover(provider: &dyn DeviceProvider, opts: &ExecOptions, round: u64) -> Re
     Ok(Active { round, key, devices, serving: false, drive: None, seq: 0 })
 }
 
-/// 换带器报告的"这个驱动器里装的是哪盘带"。
-fn loaded_barcode(devices: &[ManagedDevice], drive_serial: &str) -> Option<String> {
-    let changer = devices.iter().find(|d| d.kind == DeviceKind::Changer)?;
-    let mut mc = MediumChanger::new(changer.dev.as_ref());
-    mc.load_address_map().ok()?;
-    let elems = mc.read_all_status().ok()?;
-    elems
-        .iter()
-        .filter(|e| e.element_type == ElementType::DataTransfer && e.full)
-        .find(|e| e.drive_id.as_deref().is_some_and(|id| id.contains(drive_serial) || drive_serial.contains(id.trim())))
-        .and_then(|e| e.volume_tag.clone())
-        .map(|b| b.trim().to_string())
-        .filter(|b| !b.is_empty())
-}
-
 fn catalog_of(index: &crate::ltfs::index::LtfsIndex) -> (Vec<FileRec>, u64) {
     let mut files = Vec::new();
     let mut bytes = 0u64;
@@ -297,78 +302,329 @@ fn catalog_of(index: &crate::ltfs::index::LtfsIndex) -> (Vec<FileRec>, u64) {
     (files, bytes)
 }
 
-/// 找一个装着**已归属**磁带的驱动器并开始服务；尾部不完整时自动收尾。
-/// 未归属任何池的磁带只做只读识别，绝不写入（包括收尾）。
-fn recover(a: &mut Active, opts: &ExecOptions, files: &FileService, status: &SharedStatus, tx: &Sender<ExecEvent>) -> Result<String> {
+/// 换带器视角下的一个驱动器。
+struct DriveSlot {
+    /// 在 `Active::devices` 里的下标
+    dev: usize,
+    /// 换带器里的元素地址
+    addr: u16,
+    /// 里面装着的磁带与它原来的槽位
+    loaded: Option<(String, Option<u16>)>,
+}
+
+struct Inventory {
+    drives: Vec<DriveSlot>,
+    /// 条码 → 存储槽地址（不含已在驱动器里的）
+    slots: std::collections::BTreeMap<String, u16>,
+    empty_slots: Vec<u16>,
+}
+
+fn inventory(devices: &[ManagedDevice]) -> Result<Inventory> {
+    let changer = devices
+        .iter()
+        .find(|d| d.kind == DeviceKind::Changer)
+        .ok_or_else(|| TapeError::NotReady("逻辑库没有配置换带器".into()))?;
+    let mut mc = MediumChanger::new(changer.dev.as_ref());
+    mc.load_address_map()?;
+    let elems = mc.read_all_status()?;
+    let tag = |e: &crate::changer::element::ElementStatus| e.volume_tag.as_deref().map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
+    let mut inv = Inventory { drives: Vec::new(), slots: Default::default(), empty_slots: Vec::new() };
+    for e in &elems {
+        match e.element_type {
+            ElementType::DataTransfer => {
+                let Some(id) = e.drive_id.as_deref().map(str::trim) else { continue };
+                let hit = devices.iter().position(|d| d.kind == DeviceKind::Drive && (id.contains(&d.serial) || d.serial.contains(id)));
+                if let Some(dev) = hit {
+                    inv.drives.push(DriveSlot { dev, addr: e.address, loaded: if e.full { tag(e).map(|b| (b, e.source_address)) } else { None } });
+                }
+            }
+            ElementType::Storage if e.full => {
+                if let Some(b) = tag(e) {
+                    inv.slots.insert(b, e.address);
+                }
+            }
+            ElementType::Storage => inv.empty_slots.push(e.address),
+            _ => {}
+        }
+    }
+    Ok(inv)
+}
+
+fn move_medium(devices: &[ManagedDevice], from: u16, to: u16) -> Result<()> {
+    let changer = devices.iter().find(|d| d.kind == DeviceKind::Changer).ok_or_else(|| TapeError::NotReady("没有换带器".into()))?;
+    let mut mc = MediumChanger::new(changer.dev.as_ref());
+    mc.load_address_map()?;
+    mc.move_medium(from, to)
+}
+
+/// 把驱动器里的带卸回原槽位（原槽位被占则用第一个空槽）。
+fn unload_drive(devices: &[ManagedDevice], inv: &Inventory, drive: &DriveSlot) -> Result<()> {
+    let Some((barcode, home)) = &drive.loaded else { return Ok(()) };
+    let dest = home.filter(|h| inv.empty_slots.contains(h)).or(inv.empty_slots.first().copied()).ok_or_else(|| TapeError::NotReady("没有空槽位可卸带".into()))?;
+    // 先让驱动器退带；有的库要求这样，模拟设备上是空操作
+    let _ = TapeDrive::new(devices[drive.dev].dev.as_ref()).unload();
+    info!("执行线程: 卸带 {} -> 槽位 {:#06x}", barcode, dest);
+    move_medium(devices, drive.addr, dest)
+}
+
+fn wait_ready(dev: &dyn TapeTransport) -> Result<()> {
+    let drive = TapeDrive::new(dev);
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        match drive.test_unit_ready() {
+            Ok(true) => return Ok(()),
+            Ok(false) | Err(TapeError::ScsiCommand { sense_key: 0x02, .. }) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Ok(false) => return Err(TapeError::NotReady("装载后驱动器一直未就绪".into())),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+struct Candidate {
+    barcode: String,
+    pool_uuid: String,
+    pool_name: String,
+    file_limit: u64,
+    bytes_used: u64,
+}
+
+/// 选一盘可写的带并开始服务：优先已在驱动器里的，其次已用得最多的（写满一盘再开下一盘，
+/// 而不是把数据摊到所有带上），再其次按条码。需要时装载；空白带首次使用时格式化并写池标记。
+/// 未归属的磁带绝不触碰；带上是别的数据、或池标记不符的，标记后跳过，等人处理。
+fn ensure_write_tape(a: &mut Active, opts: &ExecOptions, files: &FileService, status: &SharedStatus, tx: &Sender<ExecEvent>) -> Result<String> {
+    a.drive = None;
+    let mut inv = inventory(&a.devices)?;
+    let mut cands: Vec<Candidate> = {
+        let st = status.lock().unwrap_or_else(|e| e.into_inner());
+        st.pools
+            .iter()
+            .flat_map(|p| p.tapes.iter().map(move |b| (p, b)))
+            .filter(|(_, b)| st.tapes.get(*b).is_none_or(|t| t.0 == tape_state::APPENDABLE))
+            .map(|(p, b)| Candidate {
+                barcode: b.clone(),
+                pool_uuid: p.uuid.clone(),
+                pool_name: p.name.clone(),
+                file_limit: p.file_limit,
+                bytes_used: st.tapes.get(b).map(|t| t.3).unwrap_or(0),
+            })
+            .collect()
+    };
+    let in_drive = |inv: &Inventory, b: &str| inv.drives.iter().any(|d| d.loaded.as_ref().is_some_and(|(x, _)| x == b));
+    cands.retain(|c| in_drive(&inv, &c.barcode) || inv.slots.contains_key(&c.barcode));
+    cands.sort_by(|x, y| {
+        in_drive(&inv, &y.barcode).cmp(&in_drive(&inv, &x.barcode)).then(y.bytes_used.cmp(&x.bytes_used)).then(x.barcode.cmp(&y.barcode))
+    });
     let mut notes = Vec::new();
-    for (i, d) in a.devices.iter().enumerate().filter(|(_, d)| d.kind == DeviceKind::Drive) {
-        let Some(barcode) = loaded_barcode(&a.devices, &d.serial) else {
-            continue;
-        };
-        let pool_uuid = {
-            let st = status.lock().unwrap_or_else(|e| e.into_inner());
-            st.pools.iter().find(|p| p.tapes.iter().any(|t| *t == barcode)).map(|p| p.uuid.clone())
-        };
-        let Some(pool_uuid) = pool_uuid else {
-            notes.push(format!("{} 里的 {} 未归属任何池，不触碰", d.name, barcode));
-            continue;
-        };
-        let mut vol = match LtfsVolume::mount(d.dev.as_ref()) {
-            Ok(v) => v,
-            Err(e) if ownership_lost(&e) => return Err(e),
-            Err(e) => {
-                notes.push(format!("{} ({}) 无法挂载: {}", d.name, barcode, e));
-                continue;
+    let round = a.round;
+    let mark = |barcode: &str, state: &str| {
+        let _ = tx.send(ExecEvent::TapeState { round, barcode: barcode.to_string(), state: state.to_string() });
+    };
+
+    for c in &cands {
+        // 1. 确保它在某个驱动器里
+        let slot = match inv.drives.iter().position(|d| d.loaded.as_ref().is_some_and(|(b, _)| *b == c.barcode)) {
+            Some(i) => i,
+            None => {
+                let Some(i) = inv.drives.iter().position(|d| d.loaded.is_none()) else {
+                    notes.push("没有空闲的驱动器".to_string());
+                    break;
+                };
+                let from = inv.slots[&c.barcode];
+                info!("执行线程: 装载 {} (槽位 {:#06x}) -> 驱动器 {}", c.barcode, from, a.devices[inv.drives[i].dev].name);
+                if let Err(e) = move_medium(&a.devices, from, inv.drives[i].addr).and_then(|_| wait_ready(a.devices[inv.drives[i].dev].dev.as_ref())) {
+                    notes.push(format!("{} 装载失败: {}", c.barcode, e));
+                    mark(&c.barcode, tape_state::CHECK);
+                    continue;
+                }
+                inv.drives[i].loaded = Some((c.barcode.clone(), Some(from)));
+                inv.slots.remove(&c.barcode);
+                inv.empty_slots.retain(|s| *s != from);
+                inv.empty_slots.insert(0, from);
+                i
             }
         };
-        vol.set_reservation_guard(Some(a.key));
-        let tail = vol.recovery().dp.tail;
-        let mut summary = format!("{} [{}]: gen={} 文件 {} 个 尾部 {:?}", d.name, barcode, vol.index().generation, vol.list().len(), tail);
-        if !vol.writable() && matches!(tail, TailKind::UnindexedData | TailKind::TruncatedIndex) {
-            let policy = if opts.salvage { TailPolicy::Salvage } else { TailPolicy::Discard };
-            let rep = vol.close_tail(policy)?;
-            summary.push_str(&format!(
-                "；已收尾：放弃块 {}..{}，新索引 gen={}",
-                rep.abandoned_first_block,
-                rep.abandoned_end_block.saturating_sub(1),
-                rep.generation
-            ));
-        } else if !vol.writable() {
-            summary.push_str(&format!("；只读：{}", vol.restricted_reason().unwrap_or("-")));
+        let di = inv.drives[slot].dev;
+        match open_candidate(a, opts, files, tx, c, di)? {
+            Ok(mut summary) => {
+                a.drive = Some(di);
+                if !notes.is_empty() {
+                    summary.push_str(&format!("（跳过：{}）", notes.join("；")));
+                }
+                return Ok(summary);
+            }
+            Err((note, state)) => {
+                // 这盘不能用：记下原因，把它卸回槽位，驱动器留给下一盘候选
+                notes.push(note);
+                mark(&c.barcode, state);
+                if let Err(e) = unload_drive(&a.devices, &inv, &inv.drives[slot]) {
+                    warn!("执行线程: 卸带 {} 失败: {}", c.barcode, e);
+                } else if let Some((b, home)) = inv.drives[slot].loaded.take() {
+                    let dest = home.filter(|h| inv.empty_slots.contains(h)).or(inv.empty_slots.first().copied());
+                    if let Some(dest) = dest {
+                        inv.empty_slots.retain(|s| *s != dest);
+                        inv.slots.insert(b, dest);
+                    }
+                }
+            }
         }
-        // 容量属性的单位是 MiB；读不到时不设上限，由写带时的真实错误兜底
-        let free = crate::ltfs::mam::read_volume_capacity(d.dev.as_ref())
-            .map(|c| c.remaining.saturating_mul(1 << 20))
-            .unwrap_or(1 << 50);
-        files.open(a.round, TapeIdent { barcode: barcode.clone(), pool_uuid }, vol.index(), free, vol.writable());
-        // 把这盘带的完整列表交给 Raft 层：目录落后于磁带时据此对账（以磁带为准）
-        let (list, bytes_used) = catalog_of(vol.index());
-        let _ = tx.send(ExecEvent::Committed {
-            round: a.round,
-            barcode,
-            volume_uuid: vol.label().volume_uuid.to_string(),
-            generation: vol.index().generation,
-            files_total: list.len() as u64,
-            bytes_used,
-            files: list,
-            full: true,
-        });
-        a.drive = Some(i);
-        return Ok(summary);
     }
-    if notes.is_empty() {
-        notes.push("没有装着磁带的驱动器".to_string());
+
+    // 没有可写的带。报告驱动器里那些我们不会碰的带，便于运维判断
+    for d in &inv.drives {
+        if let Some((b, _)) = &d.loaded {
+            if !cands.iter().any(|c| c.barcode == *b) {
+                notes.push(format!("{} 里的 {} 未归属或不可写，不触碰", a.devices[d.dev].name, b));
+            }
+        }
     }
-    Ok(format!("仅持有预留：{}", notes.join("；")))
+    let why = if notes.is_empty() { "池里没有已归属且可写的磁带".to_string() } else { notes.join("；") };
+    // 写不了不影响查：首版一个逻辑库一个池，查询落在这个池的目录上
+    let pool = status.lock().unwrap_or_else(|e| e.into_inner()).pools.first().map(|p| p.uuid.clone());
+    files.close_no_tape(a.round, pool, &why);
+    Ok(format!("仅持有预留：{}", why))
+}
+
+/// 识别、（需要时）格式化、挂载并开放一盘已在驱动器里的候选带。
+/// 外层 `Err` 是失去执行资格之类必须中止的错误；内层 `Err` 是"这盘不能用"及应标记的状态。
+#[allow(clippy::type_complexity)]
+fn open_candidate(
+    a: &Active,
+    opts: &ExecOptions,
+    files: &FileService,
+    tx: &Sender<ExecEvent>,
+    c: &Candidate,
+    di: usize,
+) -> Result<std::result::Result<String, (String, &'static str)>> {
+    let dev = a.devices[di].dev.as_ref();
+    // 2. 带上是什么
+    match probe_format(dev) {
+        Ok(FormatProbe::Ltfs) => {}
+        Ok(FormatProbe::Blank) => {
+            info!("执行线程: {} 是空白带，归属池 {}，首次使用前格式化", c.barcode, c.pool_name);
+            let mk = MkltfsOptions { volume_id: c.barcode.chars().take(6).collect(), block_size: opts.block_size, ..Default::default() };
+            if let Err(e) = mkltfs(dev, &mk) {
+                if ownership_lost(&e) {
+                    return Err(e);
+                }
+                return Ok(Err((format!("{} 格式化失败: {}", c.barcode, e), tape_state::CHECK)));
+            }
+        }
+        Ok(FormatProbe::Foreign(what)) => {
+            return Ok(Err((format!("{} 上是别的数据（{}），不自动覆盖", c.barcode, what), tape_state::LABEL_MISMATCH)));
+        }
+        Err(e) if ownership_lost(&e) => return Err(e),
+        Err(e) => {
+            return Ok(Err((format!("{} 无法识别: {}", c.barcode, e), tape_state::CHECK)));
+        }
+    }
+
+    // 3. 挂载（恢复协议），需要时收尾
+    let mut vol = match LtfsVolume::mount(dev) {
+        Ok(v) => v,
+        Err(e) if ownership_lost(&e) => return Err(e),
+        Err(e) => {
+            return Ok(Err((format!("{} 无法挂载: {}", c.barcode, e), tape_state::CHECK)));
+        }
+    };
+    vol.set_reservation_guard(Some(a.key));
+    let tail = vol.recovery().dp.tail;
+    let mut summary = format!("{} [{}]: gen={} 文件 {} 个 尾部 {:?}", a.devices[di].name, c.barcode, vol.index().generation, vol.list().len(), tail);
+    if !vol.writable() && matches!(tail, TailKind::UnindexedData | TailKind::TruncatedIndex) {
+        let policy = if opts.salvage { TailPolicy::Salvage } else { TailPolicy::Discard };
+        let rep = vol.close_tail(policy)?;
+        summary.push_str(&format!("；已收尾：放弃块 {}..{}，新索引 gen={}", rep.abandoned_first_block, rep.abandoned_end_block.saturating_sub(1), rep.generation));
+    }
+    if !vol.writable() {
+        return Ok(Err((format!("{} 只读: {}", c.barcode, vol.restricted_reason().unwrap_or("-")), tape_state::CHECK)));
+    }
+
+    // 4. 池标记（LTFS 2.5.1 F.4）：没有就写上，不符就不用
+    match vol.root_xattr(XATTR_POOL_UUID).map(str::to_string) {
+        Some(u) if u == c.pool_uuid => {}
+        Some(u) => {
+            return Ok(Err((format!("{} 的池标记是 {}，与归属 {} 不符", c.barcode, u, c.pool_uuid), tape_state::LABEL_MISMATCH)));
+        }
+        None => {
+            vol.set_root_xattr(XATTR_POOL_UUID, &c.pool_uuid)?;
+            vol.set_root_xattr(XATTR_POOL_NAME, &c.pool_name)?;
+            vol.commit()?;
+            summary.push_str("；已写入池标记");
+        }
+    }
+
+    // 5. 还写得下吗
+    let files_now = vol.list().len() as u64;
+    let (total, remaining) = crate::ltfs::mam::Mam::with_partition(dev, 1)
+        .read_partition_capacity()
+        .ok()
+        .flatten()
+        .map(|pc| (pc.maximum, pc.remaining)) // 已经是字节
+        .unwrap_or((1 << 50, 1 << 50));
+    // 保留空间：任何时候都要写得下收尾所需的索引
+    let index_bytes = (files_now + 1) * 1100;
+    let reserve = (total / 50).max(4 * index_bytes) + (total / 20).min(1 << 30);
+    if files_now >= c.file_limit {
+        return Ok(Err((format!("{} 文件数 {} 已到上限", c.barcode, files_now), tape_state::DATA_FULL)));
+    }
+    if remaining <= reserve {
+        return Ok(Err((format!("{} 已满（剩余 {} MiB）", c.barcode, remaining >> 20), tape_state::FULL)));
+    }
+
+    files.open(
+        a.round,
+        TapeIdent { barcode: c.barcode.clone(), pool_uuid: c.pool_uuid.clone() },
+        TapeLimits { file_limit: c.file_limit, usable_capacity: total.saturating_sub(reserve) },
+        vol.index(),
+        remaining - reserve,
+        true,
+    );
+    // 把这盘带的完整列表交给 Raft 层：目录落后于磁带时据此对账（以磁带为准）
+    let (list, bytes_used) = catalog_of(vol.index());
+    let _ = tx.send(ExecEvent::Committed {
+        round: a.round,
+        barcode: c.barcode.clone(),
+        volume_uuid: vol.label().volume_uuid.to_string(),
+        generation: vol.index().generation,
+        files_total: list.len() as u64,
+        bytes_used,
+        files: list,
+        full: true,
+    });
+    summary.push_str(&format!("；可用 {} MiB", (remaining - reserve) >> 20));
+    Ok(Ok(summary))
+}
+
+/// 当前带写满或到文件数上限：把队列里剩下的落带，标记状态，卸回槽位，换下一盘。
+fn switch_tape(a: &mut Active, opts: &ExecOptions, files: &FileService, status: &SharedStatus, tx: &Sender<ExecEvent>, new_state: &str) -> std::result::Result<String, String> {
+    process_uploads(a, files, tx, true)?;
+    let barcode = files.tape().map(|t| t.barcode).unwrap_or_default();
+    info!("执行线程: {} 转为 {}，换下一盘", barcode, new_state);
+    files.close(&format!("{} 已 {}，正在换带", barcode, new_state));
+    let _ = tx.send(ExecEvent::TapeState { round: a.round, barcode: barcode.clone(), state: new_state.to_string() });
+    // 状态经 Raft 应用有延迟；本地先记住，免得马上又选中它
+    {
+        let mut st = status.lock().unwrap_or_else(|e| e.into_inner());
+        st.tapes.entry(barcode.clone()).or_insert_with(|| (String::new(), 0, 0, 0)).0 = new_state.to_string();
+    }
+    if let Ok(inv) = inventory(&a.devices) {
+        if let Some(d) = inv.drives.iter().find(|d| d.loaded.as_ref().is_some_and(|(b, _)| *b == barcode)) {
+            if let Err(e) = unload_drive(&a.devices, &inv, d) {
+                warn!("执行线程: 卸带 {} 失败: {}", barcode, e);
+            }
+        }
+    }
+    ensure_write_tape(a, opts, files, status, tx).map_err(|e| e.to_string())
 }
 
 /// 把文件服务里已完成的上传成批落带：一次挂载、逐个追加、一次提交，然后发布。
 /// 返回 `Err(原因)` 表示本轮不能再继续（失去资格，或提交结果未定需要重新恢复）。
-fn process_uploads(a: &mut Active, files: &FileService, tx: &Sender<ExecEvent>) -> std::result::Result<(), String> {
+fn process_uploads(a: &mut Active, files: &FileService, tx: &Sender<ExecEvent>, flush: bool) -> std::result::Result<(), String> {
     let Some(i) = a.drive else {
         return Ok(());
     };
-    while let Some((batch, uploads)) = files.take_batch(a.round) {
+    while let Some((batch, uploads)) = if flush { files.take_batch_now(a.round) } else { files.take_batch(a.round) } {
         let dev = a.devices[i].dev.as_ref();
         let result = (|| -> Result<ExecEvent> {
             let mut vol = LtfsVolume::mount(dev)?;

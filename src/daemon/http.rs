@@ -100,6 +100,17 @@ fn service_error(conn: &mut TcpStream, ctx: &HttpContext, e: ServiceError) -> st
             let url = ctx.client_addrs.get(&leader).map(|a| format!("http://{}", a));
             respond_json(conn, 503, "Service Unavailable", json!({"error": "not_serving", "detail": why, "leader": leader, "leader_url": url}))
         }
+        ServiceError::SwitchingTape(why) => {
+            // 503 且不给 Leader 提示：客户端库会稍后向同一个节点重试
+            respond_json(conn, 503, "Service Unavailable", json!({"error": "switching_tape", "detail": why}))
+        }
+        ServiceError::NoTape(why) => respond_json(conn, 507, "Insufficient Storage", json!({"error": "no_tape", "detail": why})),
+        ServiceError::TooLarge { requested, tape_capacity } => respond_json(
+            conn,
+            507,
+            "Insufficient Storage",
+            json!({"error": "too_large", "requested": requested, "tape_capacity": tape_capacity}),
+        ),
         ServiceError::PathBusy(p) => respond_json(conn, 409, "Conflict", json!({"error": "path_busy", "path": p})),
         ServiceError::InsufficientCapacity { requested, available } => respond_json(
             conn,
@@ -161,6 +172,7 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
     let wait = query.split('&').any(|kv| kv == "wait=1");
     let path = percent_decode(raw_path);
     let mut content_length: Option<u64> = None;
+    let mut expects_continue = false;
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h)? == 0 || h == "\r\n" || h == "\n" {
@@ -171,7 +183,8 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                 content_length = v.trim().parse().ok();
             }
             if k.eq_ignore_ascii_case("expect") && v.trim().eq_ignore_ascii_case("100-continue") {
-                conn.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+                // 先不回：等准入成功再让客户端发内容；被拒绝就直接回最终结论
+                expects_continue = true;
             }
         }
     }
@@ -195,7 +208,17 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
             let pools: Vec<Value> = s
                 .pools
                 .iter()
-                .map(|p| json!({"uuid": p.uuid, "name": p.name, "file_limit": p.file_limit, "tapes": p.tapes}))
+                .map(|p| {
+                    let tapes: Vec<Value> = p
+                        .tapes
+                        .iter()
+                        .map(|b| match s.tapes.get(b) {
+                            Some(t) => json!({"barcode": b, "state": t.0, "generation": t.1, "files": t.2, "bytes_used": t.3}),
+                            None => json!({"barcode": b}),
+                        })
+                        .collect();
+                    json!({"uuid": p.uuid, "name": p.name, "file_limit": p.file_limit, "tapes": p.tapes, "tape_details": tapes})
+                })
                 .collect();
             respond_json(&mut conn, 200, "OK", json!({"pools": pools, "applied_index": s.applied_index, "answered_by": s.id}))
         }
@@ -257,8 +280,19 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
             };
             let h = match ctx.files.begin(&p[6..], len) {
                 Ok(h) => h,
-                Err(e) => return service_error(&mut conn, ctx, e),
+                Err(e) => {
+                    // 没有用 Expect 的客户端此刻正在发内容。不读掉就关连接，对方收到的是连接重置，
+                    // 而不是这条错误。
+                    // 内容太大就不读了：读完之前对方一直收不到错误，不如让它尽早失败。
+                    if !expects_continue && len <= 256 << 20 {
+                        let _ = std::io::copy(&mut (&mut reader).take(len), &mut std::io::sink());
+                    }
+                    return service_error(&mut conn, ctx, e);
+                }
             };
+            if expects_continue {
+                conn.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+            }
             let spooled = (|| -> Result<(), ServiceError> {
                 let mut f = std::fs::File::create(&h.spool).map_err(|e| ServiceError::Io(e.to_string()))?;
                 let mut left = len;

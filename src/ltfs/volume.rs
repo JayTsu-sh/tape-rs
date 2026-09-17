@@ -491,6 +491,20 @@ impl<'a> LtfsVolume<'a> {
         Ok(Some((path, total)))
     }
 
+    /// 卷根目录上的扩展属性（已提交视图）。
+    pub fn root_xattr(&self, key: &str) -> Option<&str> {
+        self.index.root.xattrs.iter().find(|x| x.key == key).map(|x| x.value.as_str())
+    }
+
+    /// 设置卷根目录的文本型扩展属性。下次提交时写入索引。
+    pub fn set_root_xattr(&mut self, key: &str, value: &str) -> Result<()> {
+        self.ensure_writable()?;
+        self.working.root.xattrs.retain(|x| x.key != key);
+        self.working.root.xattrs.push(super::index::Xattr { key: key.to_string(), value: value.to_string(), base64: false });
+        self.dirty = true;
+        Ok(())
+    }
+
     /// 启用提交前的预留持有者自检（设备层隔离协议）。`None` 关闭。
     pub fn set_reservation_guard(&mut self, key: Option<crate::scsi::reservation::ReservationKey>) {
         self.reservation_guard = key;
@@ -821,6 +835,35 @@ impl Default for HashPolicy {
         Self { md5: false, sha256: true }
     }
 }
+
+/// 磁带上现在是什么。用来决定能不能自动格式化：只有空白带可以，别的数据绝不自动覆盖。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FormatProbe {
+    /// 第一块是带 LTFS 标识的 VOL1 卷标
+    Ltfs,
+    /// 从带首就读到空白（从未写过，或已被整盘擦除）
+    Blank,
+    /// 有数据但不是 LTFS。附带看到了什么
+    Foreign(String),
+}
+
+/// 只读探测：定位到带首读一块。不写任何东西。
+pub fn probe_format(device: &dyn crate::scsi::transport::TapeTransport) -> Result<FormatProbe> {
+    let drive = TapeDrive::new(device);
+    drive.locate(0, VOL1_BLOCK, true)?;
+    let mut buf = vec![0u8; DEFAULT_BLOCK_SIZE as usize];
+    match drive.read_block(&mut buf) {
+        Err(TapeError::ScsiCommand { sense_key: 0x08, .. }) => Ok(FormatProbe::Blank),
+        Err(e) => Err(e),
+        Ok(0) => Ok(FormatProbe::Foreign("带首是文件标记".to_string())),
+        Ok(n) if n >= 28 && &buf[0..4] == b"VOL1" && &buf[24..28] == b"LTFS" => Ok(FormatProbe::Ltfs),
+        Ok(n) => Ok(FormatProbe::Foreign(format!("带首 {} 字节，开头 {:02x?}", n, &buf[..n.min(8)]))),
+    }
+}
+
+/// 池成员标记的键（LTFS 2.5.1 F.4）。写在卷根目录的扩展属性里，UUID 是身份，名称只是标签。
+pub const XATTR_POOL_UUID: &str = "ltfs.mediaPool.uuid";
+pub const XATTR_POOL_NAME: &str = "ltfs.mediaPool.name";
 
 /// 收尾时对未索引数据的处置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

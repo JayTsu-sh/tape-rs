@@ -47,6 +47,15 @@ pub struct TapeIdent {
     pub pool_uuid: String,
 }
 
+/// 这盘带的限制，开放服务时给出。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TapeLimits {
+    /// 文件数软上限（来自池）
+    pub file_limit: u64,
+    /// 扣除保留空间后，一盘空带最多能放多少字节。用来判定"比单盘还大"
+    pub usable_capacity: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskStatus {
     /// 已完整暂存在本节点，等待落带。不是持久化确认。
@@ -68,6 +77,12 @@ pub enum ServiceError {
     NotWritable(String),
     BadPath(String),
     Io(String),
+    /// 当前磁带不能再接收这个文件，正在换下一盘。稍后重试即可。
+    SwitchingTape(String),
+    /// 池里没有可写的磁带了。确定的失败，重试无益，需要运维加带。
+    NoTape(String),
+    /// 文件比单盘磁带还大。确定的失败。
+    TooLarge { requested: u64, tape_capacity: u64 },
 }
 
 impl std::fmt::Display for ServiceError {
@@ -81,6 +96,11 @@ impl std::fmt::Display for ServiceError {
             ServiceError::NotWritable(s) => write!(f, "卷只读: {}", s),
             ServiceError::BadPath(p) => write!(f, "非法路径: {}", p),
             ServiceError::Io(e) => write!(f, "暂存区 I/O: {}", e),
+            ServiceError::SwitchingTape(s) => write!(f, "正在换带: {}", s),
+            ServiceError::NoTape(s) => write!(f, "池里没有可写的磁带: {}", s),
+            ServiceError::TooLarge { requested, tape_capacity } => {
+                write!(f, "文件 {} 字节，超过单盘可用容量 {} 字节", requested, tape_capacity)
+            }
         }
     }
 }
@@ -123,6 +143,11 @@ struct Serving {
     in_batch: Vec<u64>,
     opened: Instant,
     tape: TapeIdent,
+    limits: TapeLimits,
+    /// 已准入的上传数（含尚未完成的），与带上已有文件数一起对照文件数上限
+    admitted: u64,
+    /// 需要换带：新状态（data_full / full）。置位后不再准入，等执行线程把队列落带后换带
+    switch: Option<&'static str>,
     /// 当前这盘带上的文件：开放服务时取自刚读到的索引，之后每次卷提交追加。
     /// 目录条目经 Raft 应用有延迟（也可能因换届而缺失，要等对账），当前带的查询不依赖它。
     recent: HashMap<String, Stat>,
@@ -131,6 +156,10 @@ struct Serving {
 struct Inner {
     serving: Option<Serving>,
     why_not: String,
+    /// 不在服务的原因是"池里没有可写的带"（确定的失败），而不是"还没接管"（可重试）
+    no_tape: bool,
+    /// 没有可写的带时仍然可以回答查询：执行轮次与要查的池
+    read_only: Option<(u64, String)>,
     tasks: HashMap<u64, TaskStatus>,
     next_task: u64,
 }
@@ -190,7 +219,7 @@ impl FileService {
         let _ = std::fs::remove_dir_all(&spool_dir);
         std::fs::create_dir_all(&spool_dir)?;
         Ok(Arc::new(Self {
-            inner: Mutex::new(Inner { serving: None, why_not: "尚未接管".into(), tasks: HashMap::new(), next_task: 1 }),
+            inner: Mutex::new(Inner { serving: None, why_not: "尚未接管".into(), no_tape: false, read_only: None, tasks: HashMap::new(), next_task: 1 }),
             changed: Condvar::new(),
             spool_dir,
             exec: Mutex::new(None),
@@ -217,7 +246,7 @@ impl FileService {
     // ---------- 执行线程一侧 ----------
 
     /// 接管完成：以恢复得到的视图开放服务。
-    pub fn open(&self, round: u64, tape: TapeIdent, index: &LtfsIndex, free_bytes: u64, writable: bool) {
+    pub fn open(&self, round: u64, tape: TapeIdent, limits: TapeLimits, index: &LtfsIndex, free_bytes: u64, writable: bool) {
         let state = Arc::new(VolumeState::new(round, committed_view(index), index.generation, free_bytes, writable));
         let mut g = self.lock();
         g.serving = Some(Serving {
@@ -229,6 +258,9 @@ impl FileService {
             newest: None,
             in_batch: Vec::new(),
             opened: Instant::now(),
+            limits,
+            admitted: 0,
+            switch: None,
             recent: {
                 // 当前装着的这盘带以刚读到的索引为准，不必等目录经 Raft 对账
                 let mut m = HashMap::new();
@@ -249,7 +281,22 @@ impl FileService {
             tape,
         });
         g.why_not.clear();
+        g.no_tape = false;
         self.changed.notify_all();
+    }
+
+    /// 池里没有可写的磁带：上传以确定的失败拒绝，直到有带可用。
+    /// 写不了不影响查：`pool_uuid` 给出时，`stat`/`list` 继续由目录库回答。
+    pub fn close_no_tape(&self, round: u64, pool_uuid: Option<String>, reason: &str) {
+        self.close(reason);
+        let mut g = self.lock();
+        g.no_tape = true;
+        g.read_only = pool_uuid.map(|p| (round, p));
+    }
+
+    /// 执行线程询问：当前这盘带是否需要换掉，换成什么状态。
+    pub fn switch_requested(&self, round: u64) -> Option<&'static str> {
+        self.lock().serving.as_ref().filter(|s| s.round == round).and_then(|s| s.switch)
     }
 
     /// 停止服务。仅暂存的任务判失败，已进入提交批次的判结果未定。
@@ -257,6 +304,8 @@ impl FileService {
         let mut g = self.lock();
         let Some(s) = g.serving.take() else {
             g.why_not = reason.to_string();
+            g.no_tape = false;
+            g.read_only = None;
             return;
         };
         for u in &s.queue {
@@ -267,11 +316,18 @@ impl FileService {
             g.tasks.insert(*t, TaskStatus::Indeterminate { reason: format!("提交未确认：{}。请向新 Leader 查询该路径", reason) });
         }
         g.why_not = reason.to_string();
+        g.no_tape = false;
+        g.read_only = None;
         self.changed.notify_all();
     }
 
     pub fn serving_round(&self) -> Option<u64> {
         self.lock().serving.as_ref().map(|s| s.round)
+    }
+
+    /// 换带前把队列里剩下的全部落带，不等合批条件。
+    pub fn take_batch_now(&self, round: u64) -> Option<(Arc<FrozenBatch>, Vec<Upload>)> {
+        self.take(round, true)
     }
 
     /// 距离下一批到期还有多久。`None` 表示队列为空或已有一批在写。
@@ -296,9 +352,14 @@ impl FileService {
 
     /// 合批条件满足时，取出全部已完成的上传并冻结批次。两件事在同一把锁下完成。
     pub fn take_batch(&self, round: u64) -> Option<(Arc<FrozenBatch>, Vec<Upload>)> {
+        self.take(round, false)
+    }
+
+    fn take(&self, round: u64, now: bool) -> Option<(Arc<FrozenBatch>, Vec<Upload>)> {
         let mut g = self.lock();
         let s = g.serving.as_mut().filter(|s| s.round == round)?;
-        if Self::due(&self.policy, s)? > Duration::ZERO {
+        // 需要换带时也不再等：尽快把已收到的落带
+        if Self::due(&self.policy, s)? > Duration::ZERO && !now && s.switch.is_none() {
             return None;
         }
         let batch = s.state.freeze(&[]).ok()?;
@@ -325,6 +386,8 @@ impl FileService {
             return;
         };
         s.in_batch.clear();
+        // 这些上传离开了流水线：成功的从此计入"带上已有文件"，不能再算在已准入里
+        s.admitted = s.admitted.saturating_sub(uploads.len() as u64);
         let outcome = match result {
             Ok((tape_generation, hashes)) => {
                 match s.state.publish(batch, S4Evidence { batch_id: batch.batch_id, generation: batch.generation }) {
@@ -365,10 +428,38 @@ impl FileService {
         let mut g = self.lock();
         let task = g.next_task;
         let why = g.why_not.clone();
+        if g.serving.is_none() && g.no_tape {
+            return Err(ServiceError::NoTape(why));
+        }
         let s = g.serving.as_mut().ok_or(ServiceError::NotServing(why))?;
+        if len > s.limits.usable_capacity {
+            return Err(ServiceError::TooLarge { requested: len, tape_capacity: s.limits.usable_capacity });
+        }
+        if let Some(state) = s.switch {
+            return Err(ServiceError::SwitchingTape(format!("{} 已 {}", s.tape.barcode, state)));
+        }
+        if s.recent.len() as u64 + s.admitted >= s.limits.file_limit {
+            s.switch = Some(super::state::tape_state::DATA_FULL);
+            let msg = format!("{} 的文件数已到上限 {}", s.tape.barcode, s.limits.file_limit);
+            drop(g);
+            self.kick();
+            return Err(ServiceError::SwitchingTape(msg));
+        }
         let now = s.opened.elapsed().as_secs();
         s.state.open_session(task, u64::MAX);
-        s.state.admit(task, &path, len, now).map_err(map_state)?;
+        match s.state.admit(task, &path, len, now) {
+            Ok(_) => {}
+            Err(StateError::InsufficientCapacity { requested, available }) => {
+                // 这盘带放不下，但文件并不比单盘大：换下一盘，让调用方稍后重试
+                s.switch = Some(super::state::tape_state::FULL);
+                let msg = format!("{} 剩余 {} 字节，放不下 {} 字节", s.tape.barcode, available, requested);
+                drop(g);
+                self.kick();
+                return Err(ServiceError::SwitchingTape(msg));
+            }
+            Err(e) => return Err(map_state(e)),
+        }
+        s.admitted += 1;
         let round = s.round;
         g.next_task += 1;
         Ok(UploadHandle { task, spool: self.spool_dir.join(format!("task-{}.part", task)), path, round })
@@ -400,9 +491,10 @@ impl FileService {
 
     pub fn abort(&self, h: UploadHandle) {
         let _ = std::fs::remove_file(&h.spool);
-        let g = self.lock();
-        if let Some(s) = g.serving.as_ref().filter(|s| s.round == h.round) {
+        let mut g = self.lock();
+        if let Some(s) = g.serving.as_mut().filter(|s| s.round == h.round) {
             let _ = s.state.cancel(h.task);
+            s.admitted = s.admitted.saturating_sub(1);
         }
     }
 
@@ -442,11 +534,16 @@ impl FileService {
         let path = norm(path)?;
         let (round, pool) = {
             let g = self.lock();
-            let s = g.serving.as_ref().ok_or(ServiceError::NotServing(g.why_not.clone()))?;
-            if let Some(st) = s.recent.get(&path) {
-                return Ok(Some(st.clone()));
+            match (&g.serving, &g.read_only) {
+                (Some(s), _) => {
+                    if let Some(st) = s.recent.get(&path) {
+                        return Ok(Some(st.clone()));
+                    }
+                    (s.round, s.tape.pool_uuid.clone())
+                }
+                (None, Some((round, pool))) => (*round, pool.clone()),
+                (None, None) => return Err(ServiceError::NotServing(g.why_not.clone())),
             }
-            (s.round, s.tape.pool_uuid.clone())
         };
         Ok(self.with_reader(|d| d.stat(&pool, &path).ok().flatten()).map(|f| Stat {
             len: f.length,
@@ -460,8 +557,11 @@ impl FileService {
     pub fn list(&self) -> Result<BTreeMap<String, u64>, ServiceError> {
         let (pool, mut out) = {
             let g = self.lock();
-            let s = g.serving.as_ref().ok_or(ServiceError::NotServing(g.why_not.clone()))?;
-            (s.tape.pool_uuid.clone(), s.recent.iter().map(|(p, st)| (p.clone(), st.len)).collect::<BTreeMap<_, _>>())
+            match (&g.serving, &g.read_only) {
+                (Some(s), _) => (s.tape.pool_uuid.clone(), s.recent.iter().map(|(p, st)| (p.clone(), st.len)).collect::<BTreeMap<_, _>>()),
+                (None, Some((_, pool))) => (pool.clone(), BTreeMap::new()),
+                (None, None) => return Err(ServiceError::NotServing(g.why_not.clone())),
+            }
         };
         for (p, n) in self.with_reader(|d| d.list(&pool).ok()).unwrap_or_default() {
             out.entry(p).or_insert(n);
