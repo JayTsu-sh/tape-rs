@@ -310,6 +310,31 @@ enum Commands {
         #[arg(short, long)]
         output: String,
     },
+    /// pr-status：读设备的持久预留注册表与持有者（只读）
+    PrStatus {
+        #[arg(short, long, default_value = "/dev/sg1")]
+        device: String,
+    },
+    /// pr-fence：设备层隔离。注册本轮键、抢占现有持有者并回读确认
+    PrFence {
+        #[arg(short, long, default_value = "/dev/sg1")]
+        device: String,
+        /// 节点号
+        #[arg(long)]
+        node: u8,
+        /// 执行轮次
+        #[arg(long)]
+        round: u64,
+    },
+    /// pr-release：释放预留并注销本轮键（计划移交）
+    PrRelease {
+        #[arg(short, long, default_value = "/dev/sg1")]
+        device: String,
+        #[arg(long)]
+        node: u8,
+        #[arg(long)]
+        round: u64,
+    },
     /// ltfs-verify：读出文件并与索引里的哈希扩展属性比对
     LtfsVerify {
         #[arg(short, long, default_value = "/dev/sg1")]
@@ -338,6 +363,9 @@ enum Commands {
         /// 同时记录 ltfs.hash.md5sum（默认只记 sha256sum）
         #[arg(long)]
         md5: bool,
+        /// 提交前核对预留持有者是不是 (节点号, 轮次) 对应的键，形如 1:7
+        #[arg(long, value_name = "NODE:ROUND")]
+        guard: Option<String>,
     },
     /// 跨盘 catalog（SQLite）：sync / list / find / show
     Catalog {
@@ -436,10 +464,13 @@ fn run(cli: Cli) -> Result<()> {
             ltfs_cli::cmd_mkltfs(&device, &volume_id, &owner, block_size, compression, yes_destroy, quick)
         }
         Commands::LtfsList { device } => ltfs_cli::cmd_ltfs_list(&device),
+        Commands::PrStatus { device } => ltfs_cli::cmd_pr_status(&device),
+        Commands::PrFence { device, node, round } => ltfs_cli::cmd_pr_fence(&device, node, round),
+        Commands::PrRelease { device, node, round } => ltfs_cli::cmd_pr_release(&device, node, round),
         Commands::LtfsVerify { device, name, xattrs } => ltfs_cli::cmd_ltfs_verify(&device, name.as_deref(), xattrs),
         Commands::LtfsRead { device, name, output } => ltfs_cli::cmd_ltfs_read(&device, &name, &output),
-        Commands::LtfsWrite { device, file, name, xattrs, md5 } => {
-            ltfs_cli::cmd_ltfs_write(&device, &file, &name, &xattrs, md5)
+        Commands::LtfsWrite { device, file, name, xattrs, md5, guard } => {
+            ltfs_cli::cmd_ltfs_write(&device, &file, &name, &xattrs, md5, guard.as_deref())
         }
         Commands::Catalog { cmd } => run_catalog(cmd),
     }

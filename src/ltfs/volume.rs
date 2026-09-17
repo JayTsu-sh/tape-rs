@@ -69,6 +69,8 @@ pub struct LtfsVolume<'a> {
     /// 只读原因：恢复受限或提交失败后的"结果未定"。
     restricted_reason: Option<String>,
     hash_policy: HashPolicy,
+    /// 设了之后，每次提交在屏障前核对预留持有者是不是这个键。
+    reservation_guard: Option<crate::scsi::reservation::ReservationKey>,
 }
 
 impl<'a> LtfsVolume<'a> {
@@ -163,6 +165,7 @@ impl<'a> LtfsVolume<'a> {
             writable,
             restricted_reason,
             hash_policy: HashPolicy::default(),
+            reservation_guard: None,
         })
     }
 
@@ -319,6 +322,24 @@ impl<'a> LtfsVolume<'a> {
         self.append_file_with_xattrs(path, r, &[])
     }
 
+    fn check_reservation_guard(&mut self) -> Result<()> {
+        let Some(key) = self.reservation_guard else {
+            return Ok(());
+        };
+        if let Err(e) = crate::scsi::reservation::verify_holder(self.device, key) {
+            // 失去资格后不再允许任何写入，包括 unmount 时的自动提交
+            self.writable = false;
+            self.restricted_reason = Some(format!("执行资格已失去: {}", e));
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// 启用提交前的预留持有者自检（设备层隔离协议）。`None` 关闭。
+    pub fn set_reservation_guard(&mut self, key: Option<crate::scsi::reservation::ReservationKey>) {
+        self.reservation_guard = key;
+    }
+
     pub fn set_hash_policy(&mut self, policy: HashPolicy) {
         self.hash_policy = policy;
     }
@@ -391,6 +412,8 @@ impl<'a> LtfsVolume<'a> {
         if path.is_empty() || path.ends_with('/') {
             return Err(TapeError::Ltfs(format!("非法文件路径: {}", path)));
         }
+        // 写第一个字节之前先确认自己仍是预留持有者：陈旧轮次的实例在这里就停下，什么也不落带。
+        self.check_reservation_guard()?;
 
         // 1. LOCATE P1 write head
         self.drive.locate(1, self.p1_write_head, true)?;
@@ -527,6 +550,11 @@ impl<'a> LtfsVolume<'a> {
     /// `index_partition` / `barrier` / `vci`（DP 索引可能已完整，结果未定）。
     fn commit_inner(&mut self) -> std::result::Result<(), (&'static str, TapeError)> {
         // 回指指向 DP 上的前一份 Full（LTFS 2.5.1 §5.4.3）；旧版本曾误指向 IP。
+        // 动带之前先自检；失败时介质未被触碰，但为了语义统一仍按提交失败冻结。
+        if let Some(key) = self.reservation_guard {
+            crate::scsi::reservation::verify_holder(self.device, key)
+                .map_err(|e| ("guard_pre", e))?;
+        }
         let prev = self.last_dp_index;
         self.working.generation += 1;
         self.working.update_time = crate::ltfs::label::ltfs_time_now();
@@ -576,6 +604,12 @@ impl<'a> LtfsVolume<'a> {
         self.drive
             .write_filemark(1)
             .map_err(|e| ("index_partition", e))?;
+
+        // —— 屏障前自检：设备报告的预留持有者必须仍是本轮的键 —— //
+        // 预留可能在不知情时丢失（驱动器复位且未启用跨断电保持）；把这个窗口限制在一次提交之内。
+        if let Some(key) = self.reservation_guard {
+            crate::scsi::reservation::verify_holder(self.device, key).map_err(|e| ("guard", e))?;
+        }
 
         // —— S4：最终屏障（D01 保守候选）；§10.3：读 VCR → 写全部分区 VCI —— //
         self.drive.write_filemark(0).map_err(|e| ("barrier", e))?;

@@ -19,6 +19,10 @@ pub enum TapeError {
              (run `sg_persist --in -r {device}` to see holder key, then coordinate release)")]
     ReservationConflict { device: String },
 
+    /// 持有者自检失败：设备报告的预留持有者不是本轮的键。必须停止，不得自动恢复预留。
+    #[error("执行资格已失去 ({device}): {detail}")]
+    OwnershipLost { device: String, detail: String },
+
     /// SCSI status 0x08: 目标暂忙（例如机械手或 drive 正在执行其它命令）。
     #[error("SCSI target busy on {device}")]
     Busy { device: String },

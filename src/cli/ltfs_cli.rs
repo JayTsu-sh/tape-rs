@@ -7,6 +7,7 @@ use tape_rs::error::{Result, TapeError};
 use tape_rs::ltfs::mkltfs::{self, MkltfsOptions};
 use tape_rs::ltfs::volume::{HashPolicy, HashVerdict, LtfsVolume};
 use tape_rs::scsi::device::ScsiDevice;
+use tape_rs::scsi::reservation::{self, FenceOutcome, PrStatus, ReservationKey};
 
 pub fn cmd_mkltfs(
     path: &str,
@@ -124,6 +125,7 @@ pub fn cmd_ltfs_write(
     name: &str,
     xattrs: &[String],
     md5: bool,
+    guard: Option<&str>,
 ) -> Result<()> {
     let pairs: Vec<(&str, &str)> = xattrs
         .iter()
@@ -141,9 +143,72 @@ pub fn cmd_ltfs_write(
     let mut r = BufReader::with_capacity(bs.max(64 * 1024), f);
     println!("写入 {} ({} 字节) → tape:{}", file_path, size, name);
     vol.set_hash_policy(HashPolicy { md5, sha256: true });
+    if let Some(g) = guard {
+        let key = g
+            .split_once(':')
+            .and_then(|(n, r)| Some(ReservationKey::new(n.parse().ok()?, r.parse().ok()?)))
+            .ok_or_else(|| TapeError::Ltfs(format!("--guard 需要 NODE:ROUND 形式: {}", g)))?;
+        vol.set_reservation_guard(Some(key));
+    }
     let n = vol.append_file_with_xattrs(name, &mut r, &pairs)?;
     println!("已追加 {} 字节，执行 commit 写回 index...", n);
     vol.unmount()?;
     println!("完成");
+    Ok(())
+}
+
+fn print_pr_status(st: &PrStatus) {
+    println!("  generation: {}", st.generation);
+    if st.keys.is_empty() {
+        println!("  注册表:     (空)");
+    }
+    for k in &st.keys {
+        let key = ReservationKey(*k);
+        if key.is_ours() {
+            println!("  注册键:     {:#018x}  (本系统: 节点 {} 轮次 {})", k, key.node(), key.round());
+        } else {
+            println!("  注册键:     {:#018x}  (非本系统)", k);
+        }
+    }
+    match st.holder {
+        Some((k, t)) => println!("  持有者:     {:#018x}  类型 {:#x}", k, t),
+        None => println!("  持有者:     (无)"),
+    }
+}
+
+pub fn cmd_pr_status(path: &str) -> Result<()> {
+    let dev = ScsiDevice::open(path)?;
+    print_pr_status(&reservation::read_status(&dev)?);
+    Ok(())
+}
+
+pub fn cmd_pr_fence(path: &str, node: u8, round: u64) -> Result<()> {
+    let dev = ScsiDevice::open(path)?;
+    let key = ReservationKey::new(node, round);
+    match reservation::fence(&dev, key)? {
+        FenceOutcome::Fenced { before, after } => {
+            println!("隔离前:");
+            print_pr_status(&before);
+            println!("隔离后（已回读确认）:");
+            print_pr_status(&after);
+            Ok(())
+        }
+        FenceOutcome::Unsupported => {
+            println!("设备不支持持久预留");
+            Ok(())
+        }
+        FenceOutcome::Unconfirmed { reason, status } => {
+            if let Some(st) = status {
+                print_pr_status(&st);
+            }
+            Err(TapeError::Ltfs(format!("隔离未能确认，不得接管: {}", reason)))
+        }
+    }
+}
+
+pub fn cmd_pr_release(path: &str, node: u8, round: u64) -> Result<()> {
+    let dev = ScsiDevice::open(path)?;
+    reservation::release_and_unregister(&dev, ReservationKey::new(node, round))?;
+    print_pr_status(&reservation::read_status(&dev)?);
     Ok(())
 }

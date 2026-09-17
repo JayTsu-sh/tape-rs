@@ -14,6 +14,8 @@ pub mod opcode {
     pub const RECEIVE_DIAGNOSTIC_RESULTS: u8 = 0x1C;
     pub const PREVENT_ALLOW_MEDIUM_REMOVAL: u8 = 0x1E;
     pub const LOG_SENSE: u8 = 0x4D;
+    pub const PERSISTENT_RESERVE_IN: u8 = 0x5E;
+    pub const PERSISTENT_RESERVE_OUT: u8 = 0x5F;
 
     // 磁带机命令
     pub const REWIND: u8 = 0x01;
@@ -462,4 +464,23 @@ pub fn receive_diagnostic_results(pcv: bool, page_code: u8, alloc_len: u16) -> [
         (alloc_len & 0xFF) as u8,
         0x00,
     ]
+}
+
+/// PERSISTENT RESERVE IN (SPC-4 6.13)。`service_action`：0 READ KEYS，1 READ RESERVATION。
+pub fn persistent_reserve_in(service_action: u8, alloc_len: u16) -> [u8; 10] {
+    let mut cdb = [0u8; 10];
+    cdb[0] = opcode::PERSISTENT_RESERVE_IN;
+    cdb[1] = service_action & 0x1F;
+    cdb[7..9].copy_from_slice(&alloc_len.to_be_bytes());
+    cdb
+}
+
+/// PERSISTENT RESERVE OUT (SPC-4 6.14)。作用域固定 LU_SCOPE；参数表 24 字节由调用方给出。
+pub fn persistent_reserve_out(service_action: u8, pr_type: u8, param_len: u32) -> [u8; 10] {
+    let mut cdb = [0u8; 10];
+    cdb[0] = opcode::PERSISTENT_RESERVE_OUT;
+    cdb[1] = service_action & 0x1F;
+    cdb[2] = pr_type & 0x0F;
+    cdb[5..9].copy_from_slice(&param_len.to_be_bytes());
+    cdb
 }

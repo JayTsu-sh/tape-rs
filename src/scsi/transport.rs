@@ -64,7 +64,9 @@ pub fn retry_unit_attention<T>(what: &str, mut f: impl FnMut() -> Result<T>) -> 
                 asc,
                 ascq,
                 ..
-            }) if seen < MAX_UNIT_ATTENTIONS => {
+            }) if seen < MAX_UNIT_ATTENTIONS && !(asc == 0x2A && matches!(ascq, 0x03..=0x05)) => {
+                // 2A/03..05（注册被抢占、预留被释放/抢占）是失去执行资格的信号，
+                // 不能当普通 UNIT ATTENTION 吞掉，原样上报。
                 seen += 1;
                 warn!(
                     "{}: UNIT ATTENTION asc={:#04x} ascq={:#04x}，重发（第 {} 次）",

@@ -121,6 +121,20 @@ struct DriveState {
     pending_partitions: usize,
     /// 待上报的 UNIT ATTENTION (asc, ascq)：下一条非 INQUIRY 命令不执行、先返回它。
     pending_ua: Vec<(u8, u8)>,
+    /// 持久预留状态，按发起方区分。
+    pr: PrState,
+}
+
+/// 持久预留的最小模型：LU 作用域、Exclusive Access 语义，不跨断电保持。
+#[derive(Debug, Clone, Default)]
+struct PrState {
+    generation: u32,
+    /// 发起方 → 注册的键
+    registrations: std::collections::BTreeMap<u32, u64>,
+    /// 持有者发起方与预留类型
+    holder: Option<(u32, u8)>,
+    /// 只发给某个发起方的 UNIT ATTENTION
+    ua: std::collections::BTreeMap<u32, Vec<(u8, u8)>>,
 }
 
 /// 已知设备偏差的模拟开关（用于回归：上层必须在这些偏差下仍然正确）。
@@ -246,6 +260,7 @@ impl SimLibrary {
                 pos: 0,
                 pending_partitions: 1,
                 pending_ua: Vec::new(),
+                pr: PrState::default(),
             })
             .collect();
         Self {
@@ -323,6 +338,7 @@ impl SimLibrary {
         SimTransport {
             lib: Arc::clone(&self.state),
             target: Target::Changer,
+            initiator: 0,
             faults: Mutex::new(Vec::new()),
             log: Mutex::new(Vec::new()),
             identity: "sim:changer".to_string(),
@@ -330,13 +346,37 @@ impl SimLibrary {
     }
 
     pub fn drive(&self, idx: usize) -> SimTransport {
+        self.drive_as(idx, 0)
+    }
+
+    /// 以指定发起方身份访问驱动器。不同发起方对应不同节点（不同的 I_T nexus），
+    /// 持久预留按发起方区分。
+    pub fn drive_as(&self, idx: usize, initiator: u32) -> SimTransport {
         SimTransport {
             lib: Arc::clone(&self.state),
             target: Target::Drive(idx),
+            initiator,
             faults: Mutex::new(Vec::new()),
             log: Mutex::new(Vec::new()),
-            identity: format!("sim:drive{}", idx),
+            identity: format!("sim:drive{}@i{}", idx, initiator),
         }
+    }
+
+    /// 驱动器复位：预留与注册全部丢失（未启用跨断电保持），未刷缓冲丢弃，
+    /// 位置回到 (0, 0)，所有发起方的下一条命令先收到 29/00。
+    pub fn reset_drive(&self, idx: usize) {
+        let mut st = lock(&self.state);
+        let barcode = st.drives[idx].cartridge.clone();
+        if let Some(c) = barcode.and_then(|b| st.cartridges.get_mut(&b)) {
+            for p in c.partitions.iter_mut() {
+                p.objects.truncate(p.flushed);
+            }
+        }
+        let d = &mut st.drives[idx];
+        d.partition = 0;
+        d.pos = 0;
+        d.pr = PrState::default();
+        d.pending_ua.push((0x29, 0x00));
     }
 
     /// 整库掉电：所有驱动器丢弃未刷缓冲，位置回到 (0, 0)，介质保持装载。
@@ -385,6 +425,7 @@ enum Target {
 pub struct SimTransport {
     lib: Arc<Mutex<LibState>>,
     target: Target,
+    initiator: u32,
     faults: Mutex<Vec<Fault>>,
     log: Mutex<Vec<u8>>,
     identity: String,
@@ -459,7 +500,7 @@ impl SimTransport {
         let mut st = lock(&self.lib);
         let outcome = match self.target {
             Target::Changer => changer_command(&mut st, cdb, data_out),
-            Target::Drive(i) => drive_command(&mut st, i, cdb, data_in, data_out),
+            Target::Drive(i) => drive_command(&mut st, i, self.initiator, cdb, data_in, data_out),
         };
         match outcome {
             Ok(Completion {
@@ -784,11 +825,112 @@ fn read_element_status(st: &LibState, cdb: &[u8], out: Option<&mut [u8]>) -> Res
     good(n)
 }
 
+// ---------- 持久预留 ----------
+
+fn pr_in(pr: &PrState, cdb: &[u8], out: Option<&mut [u8]>) -> Result<Completion> {
+    let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as usize;
+    let mut d = pr.generation.to_be_bytes().to_vec();
+    match cdb[1] & 0x1F {
+        0x00 => {
+            d.extend_from_slice(&((pr.registrations.len() * 8) as u32).to_be_bytes());
+            for k in pr.registrations.values() {
+                d.extend_from_slice(&k.to_be_bytes());
+            }
+        }
+        0x01 => match pr.holder {
+            Some((h, t)) => {
+                d.extend_from_slice(&16u32.to_be_bytes());
+                d.extend_from_slice(&pr.registrations.get(&h).copied().unwrap_or(0).to_be_bytes());
+                d.extend_from_slice(&[0, 0, 0, 0, 0, t & 0x0F, 0, 0]);
+            }
+            None => d.extend_from_slice(&0u32.to_be_bytes()),
+        },
+        _ => return illegal_request(),
+    }
+    let n = copy_out(out, &d, alloc);
+    good(n)
+}
+
+fn pr_out(pr: &mut PrState, me: u32, cdb: &[u8], data: Option<&[u8]>) -> Result<Completion> {
+    let conflict = || {
+        Ok(Completion { status: 0x18, sense: SenseInfo::from_bytes(&[]), transferred: 0 })
+    };
+    let Some(p) = data.filter(|p| p.len() >= 24) else {
+        return illegal_request();
+    };
+    let rk = u64::from_be_bytes(p[0..8].try_into().expect("8 bytes"));
+    let sark = u64::from_be_bytes(p[8..16].try_into().expect("8 bytes"));
+    let sa = cdb[1] & 0x1F;
+    let typ = cdb[2] & 0x0F;
+    let mine = pr.registrations.get(&me).copied();
+    // 除注册类动作外，发起方必须已注册且 rk 等于自己的键
+    if !matches!(sa, 0x00 | 0x06) && mine != Some(rk) {
+        return conflict();
+    }
+    match sa {
+        0x00 | 0x06 => {
+            if sa == 0x00 && mine.is_some() && mine != Some(rk) {
+                return conflict();
+            }
+            if sark == 0 {
+                pr.registrations.remove(&me);
+                if pr.holder.map(|(h, _)| h) == Some(me) {
+                    pr.holder = None;
+                }
+            } else {
+                pr.registrations.insert(me, sark);
+            }
+            pr.generation += 1;
+        }
+        0x01 => match pr.holder {
+            Some((h, _)) if h != me => return conflict(),
+            _ => pr.holder = Some((me, typ)),
+        },
+        0x02 => {
+            if pr.holder.map(|(h, _)| h) == Some(me) {
+                pr.holder = None;
+            }
+        }
+        0x03 => {
+            let others: Vec<u32> = pr.registrations.keys().copied().filter(|&i| i != me).collect();
+            for i in others {
+                pr.ua.entry(i).or_default().push((0x2A, 0x03));
+            }
+            pr.registrations.clear();
+            pr.holder = None;
+            pr.generation += 1;
+        }
+        0x04 | 0x05 => {
+            let victims: Vec<u32> = pr
+                .registrations
+                .iter()
+                .filter(|&(&i, &k)| k == sark && i != me)
+                .map(|(&i, _)| i)
+                .collect();
+            if victims.is_empty() {
+                return conflict();
+            }
+            let holder_preempted = pr.holder.is_some_and(|(h, _)| victims.contains(&h));
+            for v in &victims {
+                pr.registrations.remove(v);
+                pr.ua.entry(*v).or_default().push((0x2A, 0x03));
+            }
+            if holder_preempted {
+                pr.holder = Some((me, typ));
+            }
+            pr.generation += 1;
+        }
+        _ => return illegal_request(),
+    }
+    good(p.len())
+}
+
 // ---------- 驱动器 ----------
 
 fn drive_command(
     st: &mut LibState,
     idx: usize,
+    initiator: u32,
     cdb: &[u8],
     data_in: Option<&[u8]>,
     out: Option<&mut [u8]>,
@@ -801,6 +943,31 @@ fn drive_command(
     {
         let (asc, ascq) = st.drives[idx].pending_ua.remove(0);
         return check(0x06, asc, ascq);
+    }
+    if op != opcode::INQUIRY && op != opcode::REQUEST_SENSE {
+        if let Some(q) = st.drives[idx].pr.ua.get_mut(&initiator) {
+            if !q.is_empty() {
+                let (asc, ascq) = q.remove(0);
+                return check(0x06, asc, ascq);
+            }
+        }
+    }
+    match op {
+        opcode::PERSISTENT_RESERVE_IN => return pr_in(&st.drives[idx].pr, cdb, out),
+        opcode::PERSISTENT_RESERVE_OUT => {
+            return pr_out(&mut st.drives[idx].pr, initiator, cdb, data_in);
+        }
+        _ => {}
+    }
+    // Exclusive Access：非持有者的其余命令一律 RESERVATION CONFLICT（INQUIRY 等已在上面放行）
+    if let Some((h, _)) = st.drives[idx].pr.holder {
+        if h != initiator && op != opcode::INQUIRY && op != opcode::REQUEST_SENSE {
+            return Ok(Completion {
+                status: 0x18,
+                sense: SenseInfo::from_bytes(&[]),
+                transferred: 0,
+            });
+        }
     }
     match op {
         opcode::INQUIRY => {
