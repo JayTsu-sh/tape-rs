@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 CLI tool that controls an IBM TS4300 (labelled `IBM 3573-TL`) tape library by sending raw SCSI CDBs through the Linux `SG_IO` ioctl — **not** via LTFS mount. The target hardware is attached to a remote dev VM `10.128.54.118` (via an Emulex LPe16002B FC HBA); on that box the changer is `/dev/sg2`, the LTO-8 drives are `/dev/sg1` (ULT3580-TD8) and `/dev/sg3` (ULT3580-HH8).
 
+**Hardware availability (2026-09-17).** The TS4300 above is currently not available. The only device is the Holo-VTL simulator in the PVE lab, where tape-rs has its own logical library (TAPERS) reached from the `tsclient` VM over iSCSI. "Hardware" results in this file and in the tests mean Holo unless stated otherwise. Holo has had several SSC/MAM deviations that were fixed in its source; treat anything that depends on drive firmware as unverified. IBM reference LTFS 2.4.8.3 (built on `tsclient` under `/opt/ltfs-ref`) and the lab's Spectrum Archive EE cluster are the oracles for checking both tape-rs and Holo.
+
 **Linux-only by design.** `scsi/device.rs` uses `std::os::unix::io` and `nix::ioctl_readwrite_bad!`; it will not compile on Windows/macOS. The local checkout on Windows is for editing only — all builds and all hardware verification happen on the remote VM.
 
 ## Remote dev workflow
