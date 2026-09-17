@@ -436,3 +436,80 @@ fn recover_for_an_unknown_round_is_reported_not_ignored() {
     tx.send(ExecRequest::Recover { round: 4 }).unwrap();
     assert!(matches!(ev.recv_timeout(Duration::from_secs(10)).unwrap(), ExecEvent::Lost { round: 4, .. }));
 }
+
+// ---------- 经客户端库（真实 HTTP）----------
+
+use tape_rs::client::Client;
+use tape_rs::daemon::http::{self, HttpContext};
+
+impl Cluster {
+    /// 给三个节点各开一个本机 HTTP 接口，返回地址列表。
+    fn start_http(&self) -> Vec<String> {
+        let ports: Vec<u16> = (0..3)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port())
+            .collect();
+        let addrs: HashMap<u64, String> = (1..=3u64).map(|id| (id, format!("127.0.0.1:{}", ports[id as usize - 1]))).collect();
+        for id in 1..=3u64 {
+            let ctx = Arc::new(HttpContext {
+                files: self.services[&id].clone(),
+                status: self.status[&id].clone(),
+                exec: Mutex::new(self.execs[&id].clone()),
+                client_addrs: addrs.clone(),
+                wait_timeout: Duration::from_secs(15),
+            });
+            http::serve(&addrs[&id], ctx).unwrap();
+        }
+        (1..=3u64).map(|id| addrs[&id].clone()).collect()
+    }
+}
+
+/// 应用只管连续 put。中途 Leader 被隔开：客户端库自己等待、找新 Leader、判定结果未定并重传，
+/// 应用一次错误都不该看到；事后每个文件都已提交且内容正确。
+#[test]
+fn client_library_hides_failover_from_the_application() {
+    let c = Cluster::start_with("client", false);
+    let (old, r1) = c.wait_serving(None, 0);
+    c.wait("文件服务开放", || c.services[&old].serving_round() == Some(r1));
+    let endpoints = c.start_http();
+
+    let mut cl = Client::new(endpoints.clone());
+    cl.retry_for = Duration::from_secs(30);
+    let first = cl.put("/app/first.bin", &body(70_000, 3)).unwrap();
+    assert_eq!((first.attempts, first.resolved_by_query), (1, false));
+    assert_eq!(cl.get("/app/first.bin").unwrap(), body(70_000, 3));
+    assert_eq!(cl.stat("/app/none.bin").unwrap(), None);
+
+    let isolated = c.isolated.clone();
+    let cutter = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(250));
+        isolated.lock().unwrap().insert(old);
+    });
+    let mut outcomes = Vec::new();
+    let started = Instant::now();
+    let mut i = 0usize;
+    // 至少持续到新 Leader 接管之后再多传几个
+    while i < 12 || started.elapsed() < Duration::from_secs(3) {
+        let o = cl.put(&format!("/app/{:03}.bin", i), &body(40_000 + i, i as u8)).unwrap_or_else(|e| panic!("put {i}: {e}"));
+        outcomes.push(o);
+        i += 1;
+    }
+    cutter.join().unwrap();
+
+    let (new, r2) = c.wait_serving(Some(old), r1 + 1);
+    assert_ne!(new, old);
+    let retried = outcomes.iter().filter(|o| o.attempts > 1).count();
+    let by_query = outcomes.iter().filter(|o| o.resolved_by_query).count();
+    println!("经客户端库上传 {} 个：重传过 {} 个，经查询判定 {} 个；执行轮次 {} -> {}", outcomes.len(), retried, by_query, r1, r2);
+
+    let mut fresh = Client::new(endpoints);
+    for k in 0..outcomes.len() {
+        let st = fresh.stat(&format!("/app/{:03}.bin", k)).unwrap().unwrap_or_else(|| panic!("{k} 未提交"));
+        assert_eq!(st.length, (40_000 + k) as u64);
+    }
+    for k in [0, outcomes.len() / 2, outcomes.len() - 1] {
+        assert_eq!(fresh.get(&format!("/app/{:03}.bin", k)).unwrap(), body(40_000 + k, k as u8));
+    }
+    assert_eq!(fresh.get("/app/first.bin").unwrap(), body(70_000, 3));
+    assert!(fresh.list().unwrap().len() >= outcomes.len() + 1);
+    c.shutdown();
+}
