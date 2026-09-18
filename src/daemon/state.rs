@@ -138,6 +138,78 @@ impl Command {
     }
 }
 
+/// 快照里的内容：整份控制状态，加上"目录库到哪里去拉"。
+///
+/// 目录库（文件记录）可以到几百 MB，塞不进 Raft 消息，所以快照里只放一个指针：
+/// 生成这份快照的节点编号，以及它的目录库快照覆盖到的日志索引。接收方经节点间通道
+/// 另行拉取那个文件（`net::DirectoryFetch`）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ControlSnapshot {
+    pub control: ControlState,
+    /// 生成这份快照的节点：目录库要从它那里拉
+    pub source: u64,
+    /// 它的目录库快照覆盖到哪个日志索引；0 表示该节点没有目录库
+    pub directory_index: u64,
+}
+
+impl ControlSnapshot {
+    pub fn encode(&self) -> Vec<u8> {
+        let c = &self.control;
+        json!({
+            "source": self.source,
+            "directory_index": self.directory_index,
+            "applied_index": c.applied_index,
+            "executor": c.executor.as_ref().map(|e| json!([e.node, e.term, e.round, e.fenced])),
+            "history": c.history.iter().map(|(r, n)| json!([r, n])).collect::<Vec<_>>(),
+            "pools": c.pools.iter().map(|(u, p)| json!([u, p.name, p.file_limit])).collect::<Vec<_>>(),
+            "tapes": c.tapes.iter().map(|(b, u)| json!([b, u])).collect::<Vec<_>>(),
+            "tape_state": c.tape_state.iter().map(|(b, s)| json!([b, s])).collect::<Vec<_>>(),
+            "tape_summary": c
+                .tape_summary
+                .iter()
+                .map(|(b, s)| json!([b, s.volume_uuid, s.generation, s.files, s.bytes_used]))
+                .collect::<Vec<_>>(),
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        let v: Value = serde_json::from_slice(data).ok()?;
+        let rows = |k: &str| -> Option<&Vec<Value>> { v.get(k)?.as_array() };
+        let s = |x: Option<&Value>| -> Option<String> { Some(x?.as_str()?.to_string()) };
+        let n = |x: Option<&Value>| -> Option<u64> { x?.as_u64() };
+        let mut c = ControlState { applied_index: n(v.get("applied_index"))?, ..Default::default() };
+        if let Some(e) = v.get("executor").filter(|e| !e.is_null()) {
+            c.executor = Some(Executor {
+                node: n(e.get(0))?,
+                term: n(e.get(1))?,
+                round: n(e.get(2))?,
+                fenced: e.get(3)?.as_bool()?,
+            });
+        }
+        for r in rows("history")? {
+            c.history.push((n(r.get(0))?, n(r.get(1))?));
+        }
+        for r in rows("pools")? {
+            c.pools.insert(s(r.get(0))?, Pool { name: s(r.get(1))?, file_limit: n(r.get(2))? });
+        }
+        for r in rows("tapes")? {
+            c.tapes.insert(s(r.get(0))?, s(r.get(1))?);
+        }
+        for r in rows("tape_state")? {
+            c.tape_state.insert(s(r.get(0))?, s(r.get(1))?);
+        }
+        for r in rows("tape_summary")? {
+            c.tape_summary.insert(
+                s(r.get(0))?,
+                TapeSummary { volume_uuid: s(r.get(1))?, generation: n(r.get(2))?, files: n(r.get(3))?, bytes_used: n(r.get(4))? },
+            );
+        }
+        Some(Self { control: c, source: n(v.get("source"))?, directory_index: n(v.get("directory_index"))? })
+    }
+}
+
 /// 当前执行者。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Executor {
@@ -191,11 +263,15 @@ pub struct Pool {
     pub file_limit: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+/// 接管历史在内存里只留最近这么多条。它只是给人看的，留全份会随运行时间无界增长，
+/// 也会让每份快照变大。
+pub const HISTORY_KEPT: usize = 64;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ControlState {
     pub executor: Option<Executor>,
     pub applied_index: u64,
-    /// 历次接管的简要记录：(轮次, 节点)
+    /// 历次接管的简要记录：(轮次, 节点)，只留最近 `HISTORY_KEPT` 条
     pub history: Vec<(u64, u64)>,
     /// 池 UUID → 池
     pub pools: std::collections::BTreeMap<String, Pool>,
@@ -222,6 +298,10 @@ impl ControlState {
             Command::Takeover { node, term } => {
                 let e = Executor { node: *node, term: *term, round: index, fenced: false };
                 self.history.push((index, *node));
+                if self.history.len() > HISTORY_KEPT {
+                    let drop = self.history.len() - HISTORY_KEPT;
+                    self.history.drain(..drop);
+                }
                 self.executor = Some(e.clone());
                 Applied::NewExecutor(e)
             }
@@ -405,6 +485,48 @@ mod tests {
         assert_eq!(split_catalog(&[]), vec![Vec::<FileRec>::new()]);
         let t = Command::TapeCommitted { barcode: "T1".into(), volume_uuid: "v".into(), generation: 7, files: 3, bytes_used: 9, parts: 2, full: true };
         assert_eq!(Command::decode(&t.encode()), Some(t));
+    }
+
+    /// 快照要能原样装回来：压缩之后节点就是从它恢复的，丢什么都等于丢状态。
+    #[test]
+    fn a_snapshot_restores_the_whole_control_state() {
+        let mut s = ControlState::default();
+        s.apply(1, &Command::PoolCreate { uuid: "u-1".into(), name: "archive".into(), file_limit: 100 });
+        s.apply(2, &Command::TapeAssign { barcode: "T1".into(), pool: "archive".into() });
+        s.apply(3, &Command::TapeAssign { barcode: "T2".into(), pool: "archive".into() });
+        s.apply(4, &Command::Takeover { node: 2, term: 3 });
+        s.apply(5, &Command::Fenced { node: 2, round: 4 });
+        s.apply(6, &Command::TapeState { barcode: "T2".into(), state: tape_state::FULL.into() });
+        s.apply(
+            7,
+            &Command::TapeCommitted {
+                barcode: "T1".into(), volume_uuid: "v-9".into(), generation: 12, files: 40, bytes_used: 900, parts: 1, full: false,
+            },
+        );
+        let snap = ControlSnapshot { control: s.clone(), source: 2, directory_index: 7 };
+        let back = ControlSnapshot::decode(&snap.encode()).expect("能解回来");
+        assert_eq!(back, snap);
+        assert_eq!(back.control.executor.unwrap(), Executor { node: 2, term: 3, round: 4, fenced: true });
+        assert_eq!(back.control.tape_summary["T1"].generation, 12);
+        assert_eq!(back.control.tape_state["T2"], tape_state::FULL);
+        assert_eq!(ControlSnapshot::decode(b"{}"), None);
+        // 从快照恢复之后接着应用，结论与一路应用下来的一致
+        let mut restored = ControlSnapshot::decode(&snap.encode()).unwrap().control;
+        let next = Command::TapeUnassign { barcode: "T2".into() };
+        assert_eq!(restored.apply(8, &next), s.apply(8, &next));
+        assert_eq!(restored, s);
+    }
+
+    /// 接管历史不能无界增长：它每换一次届就加一条，还要进每一份快照。
+    #[test]
+    fn takeover_history_is_bounded() {
+        let mut s = ControlState::default();
+        for i in 1..=(HISTORY_KEPT as u64 * 3) {
+            s.apply(i, &Command::Takeover { node: 1, term: i });
+        }
+        assert_eq!(s.history.len(), HISTORY_KEPT);
+        assert_eq!(s.history[0].0, HISTORY_KEPT as u64 * 2 + 1, "留的是最近的");
+        assert_eq!(s.executor.unwrap().round, HISTORY_KEPT as u64 * 3);
     }
 
     #[test]

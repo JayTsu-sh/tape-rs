@@ -171,7 +171,8 @@ pub struct FileService {
     exec: Mutex<Option<Sender<ExecRequest>>>,
     policy: BatchPolicy,
     directory_path: Option<PathBuf>,
-    reader: Mutex<Option<Directory>>,
+    /// 只读连接，以及打开时该文件的 (设备号, inode)：文件被换掉就重开
+    reader: Mutex<Option<(Directory, Option<(u64, u64)>)>>,
 }
 
 fn norm(path: &str) -> Result<String, ServiceError> {
@@ -529,11 +530,17 @@ impl FileService {
 
     fn with_reader<T>(&self, f: impl FnOnce(&Directory) -> Option<T>) -> Option<T> {
         let path = self.directory_path.as_ref()?;
+        // 目录库文件可能被整份换掉（收到 Raft 快照后从 Leader 拉回来）。缓存的连接还捏着
+        // 旧的 inode，会一直读到旧内容，所以每次查询前看一眼文件还是不是同一个。
+        let id = std::fs::metadata(path).ok().map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            (m.dev(), m.ino())
+        });
         let mut g = self.reader.lock().unwrap_or_else(|e| e.into_inner());
-        if g.is_none() {
-            *g = Directory::open_reader(path).ok();
+        if g.as_ref().is_none_or(|(_, seen)| *seen != id) {
+            *g = Directory::open_reader(path).ok().map(|d| (d, id));
         }
-        f(g.as_ref()?)
+        f(&g.as_ref()?.0)
     }
 
     /// 已提交的文件。先看本轮刚落带的，再看目录库（池内全部磁带、之前各轮提交的）。

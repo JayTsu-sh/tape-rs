@@ -78,6 +78,12 @@ struct Args {
     /// Raft 逻辑时钟周期（毫秒）
     #[arg(long, default_value_t = 100)]
     tick_ms: u64,
+    /// 日志压缩：距上次快照累积这么多条目即做一次快照
+    #[arg(long, default_value_t = 2000)]
+    snapshot_entries: u64,
+    /// 日志压缩：距上次快照累积这么多字节即做一次快照（MiB）
+    #[arg(long, default_value_t = 256)]
+    snapshot_mib: u64,
 }
 
 fn main() {
@@ -102,7 +108,15 @@ fn main() {
 
     let (inbox_tx, inbox_rx) = channel::<NodeInput>();
     let others: HashMap<u64, String> = peers.iter().filter(|(id, _)| **id != me).map(|(i, a)| (*i, a.clone())).collect();
-    let net = TcpNet::start(&args.listen, &others, inbox_tx.clone()).expect("启动节点间通信");
+    let directory_file = args.data_dir.join("directory.db");
+    let net = TcpNet::start(
+        &args.listen,
+        &others,
+        inbox_tx.clone(),
+        Some(tape_rs::daemon::directory::Directory::snapshot_path(&directory_file)),
+    )
+    .expect("启动节点间通信");
+    let fetcher = net.fetcher();
 
     let (exec_tx, exec_rx) = channel();
     let (ev_tx, ev_rx) = channel();
@@ -121,7 +135,7 @@ fn main() {
         idle: Duration::from_millis(args.batch_idle_ms),
         max_wait: Duration::from_millis(args.batch_max_wait_ms),
     };
-    let files = FileService::with_options(args.data_dir.join("spool"), policy, Some(args.data_dir.join("directory.db")))
+    let files = FileService::with_options(args.data_dir.join("spool"), policy, Some(directory_file.clone()))
         .expect("创建暂存区");
     let status = Arc::new(Mutex::new(NodeStatus::default()));
     let status_for_exec = status.clone();
@@ -151,8 +165,12 @@ fn main() {
         election_ticks: 10,
         heartbeat_ticks: 3,
         status_file: Some(args.data_dir.join("status.json")),
-        directory_file: Some(args.data_dir.join("directory.db")),
+        directory_file: Some(directory_file),
         cooldown: Duration::from_secs(20),
+        snapshot: tape_rs::daemon::store::SnapshotPolicy {
+            entries: args.snapshot_entries,
+            bytes: args.snapshot_mib << 20,
+        },
     };
     if let Some(listen) = &args.client_listen {
         let client_addrs = peers
@@ -169,7 +187,9 @@ fn main() {
         });
         http::serve(listen, ctx).expect("启动客户端接口");
     }
-    if let Err(e) = node::run(cfg, store, Box::new(net), inbox_rx, exec_tx, status) {
+    if let Err(e) =
+        node::run_with(cfg, store, Box::new(net), Some(fetcher), Some(inbox_tx.clone()), inbox_rx, exec_tx, status)
+    {
         eprintln!("ltfsd 退出: {}", e);
         std::process::exit(1);
     }

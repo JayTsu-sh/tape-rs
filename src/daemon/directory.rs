@@ -72,6 +72,59 @@ impl Directory {
         self.applied
     }
 
+    /// 目录库快照文件放在实况库旁边：`directory.db` → `directory.snap.db`。
+    pub fn snapshot_path(live: &Path) -> std::path::PathBuf {
+        live.with_extension("snap.db")
+    }
+
+    /// 从别的节点拉回来的目录库先落在这里。不能用 `snapshot_path`：那是本节点自己要对外
+    /// 提供的那一份，两边同时写会互相盖掉。
+    pub fn incoming_path(live: &Path) -> std::path::PathBuf {
+        live.with_extension("incoming.db")
+    }
+
+    /// 只读地看一个目录库文件应用到了哪个日志索引（网络线程给落后节点送快照时用）。
+    pub fn applied_index_of(path: &Path) -> Result<u64> {
+        let v: Option<i64> = Self::open_reader(path)?
+            .db
+            .query_row("SELECT v FROM meta WHERE k = 'applied_index'", [], |r| r.get(0))
+            .optional()
+            .map_err(db_err)?;
+        Ok(v.unwrap_or(0) as u64)
+    }
+
+    /// 把当前内容整份复制成一个独立的库文件（`VACUUM INTO`，读到的是一个一致的时点）。
+    /// 先写临时文件再改名，所以拉取方要么看到旧的一份，要么看到新的一份。
+    ///
+    /// 这一步在 Raft 循环线程上做。实验室规模的目录库只有几 MB，耗时可以忽略；
+    /// 库大到复制要以秒计时，得挪到别的线程上去。
+    pub fn write_snapshot(&self, dest: &Path) -> Result<()> {
+        let tmp = dest.with_extension("tmp");
+        let _ = std::fs::remove_file(&tmp);
+        self.db.execute("VACUUM INTO ?1", params![tmp.to_string_lossy()]).map_err(db_err)?;
+        std::fs::rename(&tmp, dest)?;
+        Ok(())
+    }
+
+    /// 用拉来的快照文件替换本地目录库。调用前必须先放掉本地库的连接，否则换的是同一个 inode
+    /// 之外的东西，旧连接还会继续读到旧内容。
+    pub fn install(live: &Path, fetched: &Path, at_least: u64) -> Result<Self> {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", live.display(), suffix));
+        }
+        std::fs::rename(fetched, live)?;
+        let mut d = Self::open(live)?;
+        if d.applied < at_least {
+            d.db.execute(
+                "INSERT INTO meta (k, v) VALUES ('applied_index', ?1) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                params![at_least as i64],
+            )
+            .map_err(db_err)?;
+            d.applied = at_least;
+        }
+        Ok(d)
+    }
+
     /// 把一条已应用的命令落库。`outcome` 是状态机给出的结论：被拒绝的命令不改变任何东西。
     /// 索引不大于 `applied_index` 的条目（重放）直接跳过。
     pub fn apply(&mut self, index: u64, cmd: &Command, outcome: &Applied) -> Result<()> {

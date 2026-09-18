@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use raft::eraftpb::Message;
 use tape_rs::daemon::executor::{self, DeviceKind, DeviceProvider, ExecOptions, ManagedDevice};
-use tape_rs::daemon::net::{AdminReply, Network, NodeInput};
+use tape_rs::daemon::net::{AdminReply, DirectoryFetch, Network, NodeInput};
 use tape_rs::daemon::state::Command;
 use tape_rs::daemon::node::{self, NodeConfig, NodeStatus, SharedStatus};
 use tape_rs::daemon::store::RaftStore;
@@ -39,6 +39,35 @@ impl Network for ChannelNet {
         if let Some(tx) = self.peers.get(&msg.to) {
             let _ = tx.send(NodeInput::Raft(Box::new(msg)));
         }
+    }
+}
+
+/// 进程内的"节点间通道"：直接复制对端的目录库快照文件。
+struct FileFetch {
+    dir: PathBuf,
+    isolated: Arc<Mutex<HashSet<u64>>>,
+    me: u64,
+}
+
+impl DirectoryFetch for FileFetch {
+    fn fetch(&self, from: u64, min_index: u64, dest: &std::path::Path) -> Result<u64> {
+        let err = |s: String| tape_rs::error::TapeError::Ltfs(s);
+        {
+            let iso = self.isolated.lock().unwrap();
+            if iso.contains(&self.me) || iso.contains(&from) {
+                return Err(err(format!("与节点 {} 不通", from)));
+            }
+        }
+        let src = tape_rs::daemon::directory::Directory::snapshot_path(&self.dir.join(format!("directory-{}.db", from)));
+        if !src.exists() {
+            return Err(err(format!("节点 {} 还没有目录库快照", from)));
+        }
+        let index = tape_rs::daemon::directory::Directory::applied_index_of(&src)?;
+        if index < min_index {
+            return Err(err(format!("节点 {} 的目录库快照只到 {}", from, index)));
+        }
+        std::fs::copy(&src, dest).map_err(|e| err(e.to_string()))?;
+        Ok(index)
     }
 }
 
@@ -134,11 +163,17 @@ impl Cluster {
                 status_file: None,
                 directory_file: Some(dir.join(format!("directory-{}.db", id))),
                 cooldown: Duration::from_millis(1500),
+                // 压得很紧：每个用例都会走一遍快照与日志压缩
+                snapshot: tape_rs::daemon::store::SnapshotPolicy { entries: 32, bytes: 8 << 20 },
             };
             let store = RaftStore::open(&dir.join(format!("raft-{}.db", id)), &ids).unwrap();
             let net = Box::new(ChannelNet { me: id, peers: inboxes.clone(), isolated: isolated.clone() });
+            let fetch = Arc::new(FileFetch { dir: dir.clone(), isolated: isolated.clone(), me: id });
+            let self_tx = inboxes[&id].clone();
             let rx = rxs.remove(&id).unwrap();
-            thread::spawn(move || node::run(cfg, store, net, rx, exec_tx, shared).unwrap());
+            thread::spawn(move || {
+                node::run_with(cfg, store, net, Some(fetch), Some(self_tx), rx, exec_tx, shared).unwrap()
+            });
         }
         let c = Cluster { lib, status, services, execs, inboxes, isolated, dir };
         // 未归属的磁带系统绝不触碰：先建池并把模拟库里的这盘带归进去
@@ -957,7 +992,10 @@ fn a_directory_ahead_of_the_tape_marks_the_tape_for_checking() {
     let svc = c.services[&leader].clone();
     c.wait("文件服务开放", || svc.serving_round() == Some(round));
     let results = put_until(&svc, "r", 3000, 4, |_| false);
-    c.wait("第一盘转 data_full", || c.st(leader).tapes.get("PA0001L8").is_some_and(|t| t.0 == "data_full"));
+    // 代数也要等：换带时执行线程会先往状态里塞一条占位记录，代数是 0
+    c.wait("第一盘转 data_full", || {
+        c.st(leader).tapes.get("PA0001L8").is_some_and(|t| t.0 == "data_full" && t.1 > 0)
+    });
     let real_gen = c.st(leader).tapes["PA0001L8"].1;
     // 伪造一条比磁带更新的目录批次
     use tape_rs::daemon::state::FileRec;
@@ -969,5 +1007,75 @@ fn a_directory_ahead_of_the_tape_marks_the_tape_for_checking() {
     assert_eq!(c.read_via(leader, &results[0].0).unwrap(), body(3000, 0));
     c.wait("标为 check", || c.st(leader).tapes["PA0001L8"].0 == "check");
     assert!(svc.stat("/ghost.bin").unwrap().is_some(), "不自动改目录，等人核验");
+    c.shutdown();
+}
+
+// ---------- 快照与日志压缩（P5）----------
+
+/// 控制存储里还剩多少条日志、最小的那条是哪个索引。
+fn log_range(dir: &std::path::Path, id: u64) -> (u64, u64, u64) {
+    let db = rusqlite::Connection::open_with_flags(
+        dir.join(format!("raft-{}.db", id)),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let count: i64 = db.query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0)).unwrap();
+    let min: i64 = db.query_row("SELECT COALESCE(MIN(idx), 0) FROM entries", [], |r| r.get(0)).unwrap();
+    let max: i64 = db.query_row("SELECT COALESCE(MAX(idx), 0) FROM entries", [], |r| r.get(0)).unwrap();
+    (count as u64, min as u64, max as u64)
+}
+
+/// P5：一个节点掉线期间 Leader 做了快照并压缩掉它还需要的日志；它回来后靠快照追赶，
+/// 目录库经节点间通道整份拉回来，之后 stat/list 与 Leader 一致。
+#[test]
+fn a_lagging_node_catches_up_from_a_snapshot_and_pulls_the_directory() {
+    let lib = small_tape_library(64);
+    let c = Cluster::start_lib("snapshot", false, lib, 200_000, &["PA0001L8", "PA0002L8"]);
+    let (leader, round) = c.wait_serving(None, 0);
+    let svc = c.services[&leader].clone();
+    c.wait("文件服务开放", || svc.serving_round() == Some(round));
+    let lagging = (1..=3u64).find(|id| *id != leader).unwrap();
+
+    // 先上传几个，确认落后节点此刻是跟上的
+    let before = put_until(&svc, "before", 2000, 3, |_| false);
+    c.wait("落后节点先跟上", || c.st(lagging).applied_index >= c.st(leader).applied_index);
+    let stalled_at = c.st(lagging).applied_index;
+
+    // 断开它，再上传足够多的文件把 Leader 的日志推过快照阈值（32 条）
+    c.isolated.lock().unwrap().insert(lagging);
+    let after = put_until(&svc, "after", 2000, 30, |_| false);
+    assert!(after.iter().all(|(_, r)| matches!(r, Ok(TaskStatus::Committed { .. }))), "{:?}", after);
+    c.wait("Leader 压缩掉落后节点还需要的日志", || log_range(&c.dir, leader).1 > stalled_at + 2);
+    let (kept, first, last) = log_range(&c.dir, leader);
+    let stalled = c.st(lagging).applied_index;
+    println!("Leader 日志：{} 条，索引 {}..={}；落后节点停在 {}", kept, first, last, stalled);
+    assert!(kept < last, "日志有界：{} 条 < 总索引 {}", kept, last);
+    // 它要的下一条已经不在 Leader 的日志里了：接不上，只能靠快照
+    assert!(stalled + 1 < first, "落后节点停在 {}，Leader 的日志从 {} 起", stalled, first);
+
+    // 放回来：日志已经接不上了，只能靠快照
+    c.isolated.lock().unwrap().clear();
+    let all: Vec<&String> = before.iter().chain(after.iter()).map(|(p, _)| p).collect();
+    let db = c.dir.join(format!("directory-{}.db", lagging));
+    c.wait("落后节点靠快照追上", || c.st(lagging).applied_index >= last);
+    c.wait("目录库拉回来了", || {
+        tape_rs::daemon::directory::Directory::open_reader(&db).unwrap().list(POOL).map(|l| l.len()).unwrap_or(0) == all.len()
+    });
+
+    // 它的目录与 Leader 的逐条一致，而这些记录对应的日志条目它从来没收到过
+    let mine = tape_rs::daemon::directory::Directory::open_reader(&db).unwrap();
+    let theirs =
+        tape_rs::daemon::directory::Directory::open_reader(&c.dir.join(format!("directory-{}.db", leader))).unwrap();
+    for p in &all {
+        assert_eq!(mine.stat(POOL, p).unwrap(), theirs.stat(POOL, p).unwrap(), "{p}");
+    }
+    assert_eq!(mine.list(POOL).unwrap(), theirs.list(POOL).unwrap());
+    // 池与磁带归属也从快照恢复了
+    let st = c.st(lagging);
+    assert_eq!(st.pools.len(), 1);
+    assert_eq!(st.tapes.len(), 2);
+    assert_eq!(st.tapes["PA0001L8"].1, c.st(leader).tapes["PA0001L8"].1, "磁带代数一致");
+    // 它自己的日志也已经压缩过：重启不必从头重放
+    assert!(log_range(&c.dir, lagging).1 > 1, "落后节点的日志也从快照点开始");
     c.shutdown();
 }
