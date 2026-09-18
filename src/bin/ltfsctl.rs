@@ -59,6 +59,9 @@ enum TapeCmd {
     Assign { barcode: String, pool: String },
     /// 解除归属
     Unassign { barcode: String },
+    /// 回收：把带上还活着的文件搬到同池的其他带上，然后重新格式化这盘带。
+    /// 需要两台驱动器；命令立即返回，搬迁在后台进行，进度看 `pool list`
+    Reclaim { barcode: String },
 }
 
 fn main() {
@@ -107,6 +110,18 @@ fn main() {
                         Ok(pools) => {
                             for p in pools {
                                 println!("  {}  {}  文件数上限 {}  磁带 [{}]", p.name, p.uuid, p.file_limit, p.tapes.join(", "));
+                                for t in &p.tape_details {
+                                    println!(
+                                        "    {:<10} {:<14} gen={:<5} 文件 {}/{}  已用 {} MiB  可回收 {} MiB",
+                                        t.barcode,
+                                        t.state,
+                                        t.generation,
+                                        t.live_files,
+                                        t.files,
+                                        t.bytes_used >> 20,
+                                        t.reclaimable >> 20
+                                    );
+                                }
                             }
                         }
                         Err(e) => println!("  不可达: {}", e),
@@ -115,6 +130,7 @@ fn main() {
             }
             Cmd::Tape { cmd: TapeCmd::Assign { barcode, pool } } => println!("{}", c.tape_assign(&barcode, &pool)?),
             Cmd::Tape { cmd: TapeCmd::Unassign { barcode } } => println!("{}", c.tape_unassign(&barcode)?),
+            Cmd::Tape { cmd: TapeCmd::Reclaim { barcode } } => println!("{}", c.tape_reclaim(&barcode)?),
             Cmd::Cluster => {
                 for e in &args.endpoints {
                     match c.node_status(e) {

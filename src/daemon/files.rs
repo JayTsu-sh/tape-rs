@@ -302,6 +302,23 @@ impl FileService {
         g.serving.as_ref().filter(|s| s.round == round).is_some_and(|s| s.queue.is_empty() && s.in_batch.is_empty() && s.admitted == 0 && s.switch.is_none())
     }
 
+    /// 合批策略。回收按它的阈值切分搬迁的批次，与客户端上传共用同一个队列。
+    pub fn policy(&self) -> BatchPolicy {
+        self.policy
+    }
+
+    /// 队列里已完成、等着落带的 (文件数, 字节数)。
+    pub fn queued(&self, round: u64) -> Option<(usize, u64)> {
+        let g = self.lock();
+        g.serving.as_ref().filter(|s| s.round == round).map(|s| (s.queue.len(), s.queue_bytes))
+    }
+
+    /// 目录里还指向这盘带的 (文件数, 字节数)。回收在格式化源带之前拿它做最后一道核对；
+    /// 减去它就是这盘带上的可回收空间。
+    pub fn live_on(&self, barcode: &str) -> Option<(u64, u64)> {
+        self.with_reader(|d| d.live_on(barcode).ok())
+    }
+
     /// 执行线程询问：当前这盘带是否需要换掉，换成什么状态。
     pub fn switch_requested(&self, round: u64) -> Option<&'static str> {
         self.lock().serving.as_ref().filter(|s| s.round == round).and_then(|s| s.switch)

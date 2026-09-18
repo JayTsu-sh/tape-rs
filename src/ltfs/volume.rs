@@ -877,6 +877,13 @@ pub enum TailPolicy {
 
 /// 卷根扩展属性：历次收尾放弃的块范围，形如 `b:20-37;b:51-60`。
 pub const XATTR_ABANDONED: &str = "tapers.abandonedBlocks";
+/// 文件扩展属性：这一份内容的版本，形如 `轮次.序号`。
+///
+/// 同一路径可以同时存在于多盘带上（重写、回收搬迁），目录必须能判断哪一份是当前版本。
+/// 轮次是 `Takeover` 条目的日志索引（全局单调），一轮之内只有一个执行者在串行写入，
+/// 所以 (轮次, 序号) 是整个集群范围内的全序。没有这个属性的文件（EE 写的、打捞出来的）
+/// 记为 (0, 0)。
+pub const XATTR_VERSION: &str = "tapers.version";
 /// 与 IBM LTFS 的 lost+found 目录同名。
 pub const LOST_AND_FOUND: &str = "_ltfs_lostandfound";
 

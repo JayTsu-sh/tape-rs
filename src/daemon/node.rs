@@ -50,8 +50,22 @@ pub struct NodeStatus {
     pub applied_index: u64,
     /// 池与磁带归属（来自已应用的日志；任何节点都可读，有界陈旧）
     pub pools: Vec<PoolRow>,
-    /// 条码 → (状态, 索引代数, 文件数, 已用字节)
-    pub tapes: std::collections::BTreeMap<String, (String, u64, u64, u64)>,
+    /// 条码 → 概况
+    pub tapes: std::collections::BTreeMap<String, TapeRow>,
+}
+
+/// 一盘带在控制状态里的概况。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TapeRow {
+    pub state: String,
+    pub generation: u64,
+    /// 索引里的文件数
+    pub files: u64,
+    /// 索引里这些文件的字节数（只算活着的）
+    pub bytes_used: u64,
+    /// 带上实际写掉的字节（容量读数）。减去 `bytes_used` 就是同一盘带上被重写的旧副本
+    /// 和收尾放弃的块；再减去目录里还指向它的字节，才是完整的可回收空间。
+    pub bytes_written: u64,
 }
 
 pub type SharedStatus = Arc<Mutex<NodeStatus>>;
@@ -220,7 +234,7 @@ pub fn run_with(
                         info!("轮次 {} 的隔离结果已过时，忽略", round);
                         let _ = exec.send(ExecRequest::Stop { round: Some(round), reason: "隔离完成时已不是该轮的执行者".into() });
                     }
-                    ExecEvent::Committed { round, barcode, volume_uuid, generation, files_total, bytes_used, files, full } => {
+                    ExecEvent::Committed { round, barcode, volume_uuid, generation, files_total, bytes_used, bytes_written, files, full } => {
                         // 目录记录在卷提交成功之后才进日志。这里失败（不再是 Leader 等）没关系：
                         // 目录会落后于磁带，下次装载该带时按磁带对账补齐。
                         let known = ctl.tape_summary.get(&barcode).map(|t| t.generation).unwrap_or(0);
@@ -242,8 +256,18 @@ pub fn run_with(
                             }
                             propose(
                                 &mut node,
-                                &Command::TapeCommitted { barcode, volume_uuid, generation, files: files_total, bytes_used, parts: parts.len() as u32, full },
+                                &Command::TapeCommitted { barcode, volume_uuid, generation, files: files_total, bytes_used, bytes_written, parts: parts.len() as u32, full },
                             );
+                        }
+                    }
+                    ExecEvent::Reclaimed { round, barcode, volume_uuid, files, bytes } => {
+                        if my_round == Some(round) && is_leader {
+                            info!("磁带 {} 回收完毕：搬走 {} 个文件 / {} MiB，已重新格式化", barcode, files, bytes >> 20);
+                            propose(&mut node, &Command::TapeReclaimed { barcode, volume_uuid });
+                        } else {
+                            // 状态还是 reclaiming，新执行者会重新走一遍：这时源带已经是空的，
+                            // 核对通过、再格式化一次、重新上报。
+                            warn!("{} 的回收结果未写入日志：已不是执行者，由下一任重做收尾", barcode);
                         }
                     }
                     ExecEvent::TapeState { round, barcode, state } => {
@@ -555,9 +579,18 @@ fn publish_status(
             .tapes
             .keys()
             .map(|b| {
-                let st = ctl.tape_state.get(b).cloned().unwrap_or_else(|| super::state::tape_state::APPENDABLE.to_string());
+                let state = ctl.tape_state.get(b).cloned().unwrap_or_else(|| super::state::tape_state::APPENDABLE.to_string());
                 let su = ctl.tape_summary.get(b).cloned().unwrap_or_default();
-                (b.clone(), (st, su.generation, su.files, su.bytes_used))
+                (
+                    b.clone(),
+                    TapeRow {
+                        state,
+                        generation: su.generation,
+                        files: su.files,
+                        bytes_used: su.bytes_used,
+                        bytes_written: su.bytes_written,
+                    },
+                )
             })
             .collect(),
     };
@@ -565,7 +598,7 @@ fn publish_status(
         "id": st.id, "role": st.role, "term": st.term, "leader": st.leader,
         "executor": st.executor.as_ref().map(|e| json!({"node": e.node, "round": e.round, "term": e.term, "fenced": e.fenced})),
         "local": st.local, "applied_index": st.applied_index,
-        "tapes": st.tapes.iter().map(|(b, t)| json!({"barcode": b, "state": t.0, "generation": t.1, "files": t.2, "bytes_used": t.3})).collect::<Vec<_>>(),
+        "tapes": st.tapes.iter().map(|(b, t)| json!({"barcode": b, "state": t.state, "generation": t.generation, "files": t.files, "bytes_used": t.bytes_used, "bytes_written": t.bytes_written})).collect::<Vec<_>>(),
         "pools": st.pools.iter().map(|p| json!({"uuid": p.uuid, "name": p.name, "file_limit": p.file_limit, "tapes": p.tapes})).collect::<Vec<_>>(),
     })
     .to_string();

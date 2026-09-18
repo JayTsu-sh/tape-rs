@@ -3,12 +3,13 @@
 //! 纪律：抢占预留只发生在收到 `Takeover` 时；持有期间一旦发现失去资格就停下并上报，
 //! 绝不自行重新预留。是否再次接管由 Raft 层在重新当选、取得新轮次之后决定。
 
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use log::{error, info, warn};
+use sha2::{Digest, Sha256};
 
 use super::files::{FileService, TapeIdent, TapeLimits};
 use super::state::tape_state;
@@ -19,7 +20,7 @@ use crate::changer::element::ElementType;
 use crate::error::{Result, TapeError};
 use crate::ltfs::recovery::TailKind;
 use crate::ltfs::mkltfs::{MkltfsOptions, mkltfs};
-use crate::ltfs::volume::{FormatProbe, LtfsVolume, TailPolicy, XATTR_POOL_NAME, XATTR_POOL_UUID, probe_format};
+use crate::ltfs::volume::{FormatProbe, LtfsVolume, TailPolicy, XATTR_POOL_NAME, XATTR_POOL_UUID, XATTR_VERSION, probe_format};
 use crate::tape::commands::TapeDrive;
 use crate::scsi::device::ScsiDevice;
 use crate::scsi::inquiry::{enumerate_sg_nodes, read_unit_serial};
@@ -118,9 +119,23 @@ pub enum ExecEvent {
     TapeState { round: u64, barcode: String, state: String },
     /// 一次卷提交已经落带（或接管时读到了该带的完整列表，`full` 为真）。
     /// Raft 层据此把目录记录写进日志。
-    Committed { round: u64, barcode: String, volume_uuid: String, generation: u64, files_total: u64, bytes_used: u64, files: Vec<FileRec>, full: bool },
+    Committed {
+        round: u64,
+        barcode: String,
+        volume_uuid: String,
+        generation: u64,
+        files_total: u64,
+        /// 索引里活着的字节
+        bytes_used: u64,
+        /// 带上实际写掉的字节（容量读数）；读不到时为 0
+        bytes_written: u64,
+        files: Vec<FileRec>,
+        full: bool,
+    },
     /// 持有期间失去资格（预留被抢占、设备复位、自检失败）。执行线程已停手。
     Lost { round: u64, reason: String },
+    /// 一盘带回收完毕：内容已全部搬到同池的其他带上，源带已重新格式化并写好池标记。
+    Reclaimed { round: u64, barcode: String, volume_uuid: String, files: u64, bytes: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -146,8 +161,34 @@ struct Active {
     drive: Option<usize>,
     /// 为读请求装载的带：驱动器下标、条码、最近一次使用
     read: Option<(usize, String, Instant)>,
+    /// 本轮已写下的文件数，同时是版本号里的序号
     seq: u64,
+    reclaim: Option<Reclaim>,
 }
+
+/// 正在进行的回收。状态在 Raft 里（磁带状态 `reclaiming`），这里只是本轮的工作现场：
+/// 中途换届的话新执行者从状态里看到那盘带仍在回收，重新建一份工作现场接着干。
+struct Reclaim {
+    barcode: String,
+    /// 源带所在驱动器在 `devices` 里的下标
+    drive: usize,
+    /// 还没处理的路径，从末尾取
+    todo: Vec<String>,
+    /// 这一遍先跳过的（客户端正在重写同一个路径）
+    retry: Vec<String>,
+    passes: u32,
+    /// 等目录把搬迁记录应用上来的周期数
+    waits: u32,
+    copied: u64,
+    bytes: u64,
+    /// 当前版本已经不在源带上、不用搬的
+    superseded: u64,
+}
+
+/// 同一个路径反复被客户端重写时，回收最多让路这么多遍。
+const RECLAIM_MAX_PASSES: u32 = 20;
+/// 搬完之后最多等目录应用这么多个工作周期（默认 3 秒一个，约 5 分钟）。
+const RECLAIM_MAX_WAITS: u32 = 100;
 
 pub fn run(
     provider: Box<dyn DeviceProvider>,
@@ -275,7 +316,18 @@ pub fn run(
                             Err(e) => worked = Err(e.to_string()),
                         }
                     }
-                    worked = periodic(a, &opts);
+                    // 重新选带失败说明已经不能再服务了，这时不该再去做周期自检把结论盖掉
+                    if worked.is_ok() {
+                        worked = periodic(a, &opts);
+                    }
+                }
+                // 回收：一次搬一个批次就回到这里，读请求和客户端上传不会被长时间的回收饿死
+                if worked.is_ok() && (a.reclaim.is_some() || periodic_due) {
+                    match drive_reclaim(a, &opts, &files, &status, &tx) {
+                        Ok(true) => next_work = Instant::now(),
+                        Ok(false) => {}
+                        Err(e) => worked = Err(e),
+                    }
                 }
                 if let Err(reason) = worked {
                     let round = a.round;
@@ -305,7 +357,9 @@ fn shut_down(mut a: Active, files: &FileService, tx: &Sender<ExecEvent>) {
     if a.serving && let Err(e) = process_uploads(&mut a, files, tx, true) {
         warn!("执行线程: 停机前落带失败: {}；卷留给下一个执行者收尾", e);
     }
-    let mut drives: Vec<usize> = [a.drive, a.read.as_ref().map(|(i, ..)| *i)].into_iter().flatten().collect();
+    let mut drives: Vec<usize> =
+        [a.drive, a.read.as_ref().map(|(i, ..)| *i), a.reclaim.as_ref().map(|r| r.drive)].into_iter().flatten().collect();
+    drives.sort_unstable();
     drives.dedup();
     for i in drives {
         if let Err(e) = TapeDrive::new(a.devices[i].dev.as_ref()).unload() {
@@ -348,7 +402,7 @@ fn takeover(provider: &dyn DeviceProvider, opts: &ExecOptions, round: u64) -> Re
             }
         }
     }
-    Ok(Active { round, key, devices, serving: false, drive: None, read: None, seq: 0 })
+    Ok(Active { round, key, devices, serving: false, drive: None, read: None, seq: 0, reclaim: None })
 }
 
 fn catalog_of(index: &crate::ltfs::index::LtfsIndex) -> (Vec<FileRec>, u64) {
@@ -360,9 +414,33 @@ fn catalog_of(index: &crate::ltfs::index::LtfsIndex) -> (Vec<FileRec>, u64) {
             path: format!("/{}", p),
             length: f.length,
             sha256: f.xattr(crate::ltfs::index::XATTR_SHA256).unwrap_or("").to_string(),
+            version: f.xattr(XATTR_VERSION).and_then(parse_version).unwrap_or((0, 0)),
         });
     });
     (files, bytes)
+}
+
+/// 带上实际写掉的字节：数据分区的最大容量减去剩余容量。读不到就返回 0。
+/// 它与索引里活着的字节之差，就是被重写的旧副本和收尾放弃的块占的空间。
+fn bytes_written_on(dev: &dyn TapeTransport) -> u64 {
+    crate::ltfs::mam::Mam::with_partition(dev, 1)
+        .read_partition_capacity()
+        .ok()
+        .flatten()
+        .map(|pc| pc.maximum.saturating_sub(pc.remaining))
+        .unwrap_or(0)
+}
+
+/// 版本属性的文本形式是 `轮次.序号`。认不出来的按 (0, 0) 处理：它抢不走任何路径。
+fn parse_version(s: &str) -> Option<(u64, u64)> {
+    let (round, seq) = s.split_once('.')?;
+    Some((round.parse().ok()?, seq.parse().ok()?))
+}
+
+/// 本轮写下的下一个版本号。轮次全局单调，一轮之内只有这一个执行者在串行写入。
+fn next_version(a: &mut Active) -> String {
+    a.seq += 1;
+    format!("{}.{}", a.round, a.seq)
 }
 
 /// 换带器视角下的一个驱动器。
@@ -464,13 +542,13 @@ fn ensure_write_tape(a: &mut Active, opts: &ExecOptions, files: &FileService, st
         st.pools
             .iter()
             .flat_map(|p| p.tapes.iter().map(move |b| (p, b)))
-            .filter(|(_, b)| st.tapes.get(*b).is_none_or(|t| t.0 == tape_state::APPENDABLE))
+            .filter(|(_, b)| st.tapes.get(*b).is_none_or(|t| t.state == tape_state::APPENDABLE))
             .map(|(p, b)| Candidate {
                 barcode: b.clone(),
                 pool_uuid: p.uuid.clone(),
                 pool_name: p.name.clone(),
                 file_limit: p.file_limit,
-                bytes_used: st.tapes.get(b).map(|t| t.3).unwrap_or(0),
+                bytes_used: st.tapes.get(b).map(|t| t.bytes_used).unwrap_or(0),
             })
             .collect()
     };
@@ -652,6 +730,7 @@ fn open_candidate(
         generation: vol.index().generation,
         files_total: list.len() as u64,
         bytes_used,
+        bytes_written: total.saturating_sub(remaining),
         files: list,
         full: true,
     });
@@ -669,7 +748,7 @@ fn switch_tape(a: &mut Active, opts: &ExecOptions, files: &FileService, status: 
     // 状态经 Raft 应用有延迟；本地先记住，免得马上又选中它
     {
         let mut st = status.lock().unwrap_or_else(|e| e.into_inner());
-        st.tapes.entry(barcode.clone()).or_insert_with(|| (String::new(), 0, 0, 0)).0 = new_state.to_string();
+        st.tapes.entry(barcode.clone()).or_default().state = new_state.to_string();
     }
     if let Ok(inv) = inventory(&a.devices) {
         if let Some(d) = inv.drives.iter().find(|d| d.loaded.as_ref().is_some_and(|(b, _)| *b == barcode)) {
@@ -689,12 +768,15 @@ fn process_uploads(a: &mut Active, files: &FileService, tx: &Sender<ExecEvent>, 
     };
     while let Some((batch, uploads)) = if flush { files.take_batch_now(a.round) } else { files.take_batch(a.round) } {
         let dev = a.devices[i].dev.as_ref();
+        let (round, key) = (a.round, a.key);
+        let mut seq = a.seq;
         let result = (|| -> Result<ExecEvent> {
             let mut vol = LtfsVolume::mount(dev)?;
-            vol.set_reservation_guard(Some(a.key));
+            vol.set_reservation_guard(Some(key));
             for u in &uploads {
                 let mut f = std::io::BufReader::new(std::fs::File::open(&u.spool)?);
-                vol.append_file(&u.path, &mut f)?;
+                seq += 1;
+                vol.append_file_with_xattrs(&u.path, &mut f, &[(XATTR_VERSION, &format!("{}.{}", round, seq))])?;
             }
             vol.commit()?;
             let (all, bytes_used) = catalog_of(vol.index());
@@ -707,10 +789,13 @@ fn process_uploads(a: &mut Active, files: &FileService, tx: &Sender<ExecEvent>, 
                 generation: vol.index().generation,
                 files_total: all.len() as u64,
                 bytes_used,
+                // 一次 MAM 读，不动磁带：可回收空间要靠它才算得准
+                bytes_written: bytes_written_on(dev),
                 files: written,
                 full: false,
             })
         })();
+        a.seq = seq;
         match result {
             Ok(ev) => {
                 if let ExecEvent::Committed { generation, files: written, .. } = &ev {
@@ -813,7 +898,7 @@ fn read_any_inner(a: &mut Active, opts: &ExecOptions, files: &FileService, statu
     let result = match loaded {
         Ok(vol) => {
             // 装载了就对账：目录若落后于磁带，以磁带为准
-            let known = status.lock().unwrap_or_else(|e| e.into_inner()).tapes.get(&barcode).map(|t| t.1).unwrap_or(0);
+            let known = status.lock().unwrap_or_else(|e| e.into_inner()).tapes.get(&barcode).map(|t| t.generation).unwrap_or(0);
             if known != vol.index().generation {
                 let (list, bytes_used) = catalog_of(vol.index());
                 let _ = tx.send(ExecEvent::Committed {
@@ -823,6 +908,7 @@ fn read_any_inner(a: &mut Active, opts: &ExecOptions, files: &FileService, statu
                     generation: vol.index().generation,
                     files_total: list.len() as u64,
                     bytes_used,
+                    bytes_written: bytes_written_on(a.devices[i].dev.as_ref()),
                     files: list,
                     full: true,
                 });
@@ -851,6 +937,392 @@ fn read_any_inner(a: &mut Active, opts: &ExecOptions, files: &FileService, statu
     result
 }
 
+// ---------- 回收（reclaim） ----------
+//
+// 一盘带上被重写、被替换的旧副本，以及历次收尾放弃的块，都是再也不会被读到的字节。
+// 回收把带上**还活着**的文件搬到同池的其他带上，然后重新格式化源带，把这些字节要回来。
+//
+// 三条纪律：
+//
+// 1. **搬迁走的是普通上传那条路**（暂存区 → 文件服务 → 合批落带 → CatalogPart/TapeCommitted）。
+//    这样目录的更新与卷提交是同一件事，不需要为回收另写一条容易走偏的目录路径；
+//    客户端同时在写同一个路径时，`VolumeState` 的路径占用就是天然的互锁。
+// 2. **读源带时重算 sha256 与索引里的对照**。这是在销毁这一份副本之前、对它的端到端验证。
+// 3. **格式化前必须证明源带上没有任何还活着的内容**：源带索引里的每个路径，目录给出的
+//    当前位置都不在源带上；而且目录里没有任何一条记录还指向源带。任何一条对不上就不格式化。
+//    这是整个流程里唯一一次销毁数据，闸门只有这一道。
+
+/// 状态里有没有一盘等着回收的带。
+fn pending_reclaim(status: &SharedStatus) -> Option<String> {
+    let st = status.lock().unwrap_or_else(|e| e.into_inner());
+    st.tapes.iter().find(|(_, t)| t.state == tape_state::RECLAIMING).map(|(b, _)| b.clone())
+}
+
+fn pool_of(status: &SharedStatus, barcode: &str) -> Option<(String, String)> {
+    let st = status.lock().unwrap_or_else(|e| e.into_inner());
+    st.pools.iter().find(|p| p.tapes.iter().any(|b| b == barcode)).map(|p| (p.uuid.clone(), p.name.clone()))
+}
+
+/// 推进回收。返回 `Ok(true)` 表示还有活要干、应当立刻再来一轮。
+/// 返回 `Err` 只用于必须结束本轮的情况（失去资格、落带结果未定）。
+fn drive_reclaim(
+    a: &mut Active,
+    opts: &ExecOptions,
+    files: &FileService,
+    status: &SharedStatus,
+    tx: &Sender<ExecEvent>,
+) -> std::result::Result<bool, String> {
+    if a.reclaim.is_none() {
+        let Some(barcode) = pending_reclaim(status) else { return Ok(false) };
+        match start_reclaim(a, opts, files, status, tx, &barcode) {
+            Ok(()) => {}
+            Err(e) if ownership_lost(&e) => return Err(e.to_string()),
+            Err(e) => {
+                // 暂时干不了（没有空驱动器、带不在库里）：状态留着，下个周期再试
+                warn!("执行线程: 暂时无法回收 {}: {}", barcode, e);
+                return Ok(false);
+            }
+        }
+    }
+    reclaim_step(a, opts, files, status, tx)
+}
+
+/// 准备工作现场：必要时先换掉写入带，再把源带装进另一台驱动器，读出它的工作单。
+fn start_reclaim(
+    a: &mut Active,
+    opts: &ExecOptions,
+    files: &FileService,
+    status: &SharedStatus,
+    tx: &Sender<ExecEvent>,
+    barcode: &str,
+) -> Result<()> {
+    if a.devices.iter().filter(|d| d.kind == DeviceKind::Drive).count() < 2 {
+        return Err(TapeError::NotReady("回收需要两台驱动器：一台放写入带，一台放源带".into()));
+    }
+    // 源带正好是当前写入带：先把队列落带，换一盘写入带，再来搬它
+    if files.tape().is_some_and(|t| t.barcode == barcode) {
+        let summary = switch_tape(a, opts, files, status, tx, tape_state::RECLAIMING).map_err(TapeError::Ltfs)?;
+        let _ = tx.send(ExecEvent::Serving { round: a.round, summary });
+    }
+    let drive = load_aside(a, barcode)?;
+    let vol = LtfsVolume::mount(a.devices[drive].dev.as_ref())?;
+    let mut todo = Vec::new();
+    vol.index().walk_files(|p, _| todo.push(format!("/{}", p)));
+    // 字典序搬，从末尾取，所以倒过来放。顺序固定便于换届之后接着看日志
+    todo.sort();
+    todo.reverse();
+    info!(
+        "执行线程: 开始回收 {}（第 {} 代，带上 {} 个文件）→ 搬到 {}",
+        barcode,
+        vol.index().generation,
+        todo.len(),
+        files.tape().map(|t| t.barcode).unwrap_or_else(|| "当前写入带".into())
+    );
+    a.reclaim = Some(Reclaim {
+        barcode: barcode.to_string(),
+        drive,
+        todo,
+        retry: Vec::new(),
+        passes: 0,
+        waits: 0,
+        copied: 0,
+        bytes: 0,
+        superseded: 0,
+    });
+    Ok(())
+}
+
+/// 把一盘带装进一台**不是写入带**的驱动器。必要时把读带卸回槽位腾地方。
+fn load_aside(a: &mut Active, barcode: &str) -> Result<usize> {
+    {
+        let inv = inventory(&a.devices)?;
+        if let Some(d) = inv.drives.iter().find(|d| d.loaded.as_ref().is_some_and(|(b, _)| b == barcode)) {
+            return if Some(d.dev) == a.drive {
+                Err(TapeError::NotReady(format!("{} 还在写入驱动器里", barcode)))
+            } else {
+                Ok(d.dev)
+            };
+        }
+        let free = inv.drives.iter().any(|d| d.loaded.is_none() && Some(d.dev) != a.drive);
+        if !free
+            && let Some((i, b, _)) = a.read.take()
+            && let Some(d) = inv.drives.iter().find(|d| d.dev == i)
+        {
+            unload_drive(&a.devices, &inv, d)?;
+            info!("执行线程: 为回收腾出驱动器，读带 {} 已卸回槽位", b);
+        }
+    }
+    // 卸带改变了库存，重新读一遍再决定去哪台驱动器
+    let inv = inventory(&a.devices)?;
+    let from = *inv.slots.get(barcode).ok_or_else(|| TapeError::NotReady(format!("{} 不在库里的存储槽位中", barcode)))?;
+    let d = inv
+        .drives
+        .iter()
+        .find(|d| d.loaded.is_none() && Some(d.dev) != a.drive)
+        .ok_or_else(|| TapeError::NotReady("没有空闲的驱动器".into()))?;
+    let (i, addr) = (d.dev, d.addr);
+    info!("执行线程: 为回收装载 {} -> {}", barcode, a.devices[i].name);
+    move_medium(&a.devices, from, addr)?;
+    wait_ready(a.devices[i].dev.as_ref())?;
+    Ok(i)
+}
+
+/// 搬一批、落一批；搬完之后核对并格式化源带。
+fn reclaim_step(
+    a: &mut Active,
+    opts: &ExecOptions,
+    files: &FileService,
+    status: &SharedStatus,
+    tx: &Sender<ExecEvent>,
+) -> std::result::Result<bool, String> {
+    let chunk = match copy_chunk(a, files) {
+        Ok(c) => c,
+        Err(e) if ownership_lost(&e) => return Err(e.to_string()),
+        Err(e) => {
+            abort_reclaim(a, tx, &e.to_string(), true);
+            return Ok(false);
+        }
+    };
+    // 落带失败意味着提交结果未定，本轮到此为止（与普通上传一样）
+    process_uploads(a, files, tx, true)?;
+    match chunk {
+        Chunk::More => return Ok(true),
+        // 只剩被客户端占着的路径了：按正常节奏回来，不要贴着它空转
+        Chunk::Yield => return Ok(false),
+        Chunk::Done => {}
+    }
+    match finish_reclaim(a, opts, files, status, tx) {
+        // 干完了，或者还在等目录把搬迁记录应用上来。两种情况都按正常节奏回来
+        Ok(_) => Ok(false),
+        Err(e) if ownership_lost(&e) => Err(e.to_string()),
+        Err(e) => {
+            abort_reclaim(a, tx, &e.to_string(), true);
+            Ok(false)
+        }
+    }
+}
+
+enum Chunk {
+    /// 攒够一个批次了，落带之后马上接着搬
+    More,
+    /// 这一遍能搬的都搬了，只剩正被客户端重写的路径，下个周期再看
+    Yield,
+    /// 工作单空了
+    Done,
+}
+
+/// 搬一个批次的量就返回，让主循环有机会处理读请求和客户端上传。
+fn copy_chunk(a: &mut Active, files: &FileService) -> Result<Chunk> {
+    let policy = files.policy();
+    let round = a.round;
+    let (di, source) = {
+        let r = a.reclaim.as_ref().expect("回收进行中");
+        (r.drive, r.barcode.clone())
+    };
+    let vol = LtfsVolume::mount(a.devices[di].dev.as_ref())?;
+    loop {
+        // 攒够一个批次就回去落带：暂存区同时只放得下一批
+        if files.queued(round).is_some_and(|(n, b)| b >= policy.max_bytes || n >= policy.max_files) {
+            return Ok(Chunk::More);
+        }
+        let Some(path) = a.reclaim.as_mut().expect("回收进行中").todo.pop() else { break };
+        let outcome = copy_one(&vol, &source, &path, files)?;
+        let r = a.reclaim.as_mut().expect("回收进行中");
+        match outcome {
+            Copied::Moved(n) => {
+                r.copied += 1;
+                r.bytes += n;
+            }
+            Copied::Superseded => r.superseded += 1,
+            Copied::Retry => r.retry.push(path),
+            Copied::Halt(why) => {
+                // 池里暂时没有能收下它的带。源带毫发无损，等运维加带之后接着搬；
+                // 这不是源带的毛病，所以既不标 check，也不消耗"让路"的次数。
+                warn!("执行线程: 回收 {} 暂停：{}", r.barcode, why);
+                r.todo.push(path);
+                return Ok(Chunk::Yield);
+            }
+        }
+    }
+    let r = a.reclaim.as_mut().expect("回收进行中");
+    if r.retry.is_empty() {
+        return Ok(Chunk::Done);
+    }
+    r.passes += 1;
+    if r.passes > RECLAIM_MAX_PASSES {
+        return Err(TapeError::Ltfs(format!(
+            "{} 上有 {} 个路径一直被客户端占用（例如 {}），放弃这次回收",
+            r.barcode,
+            r.retry.len(),
+            r.retry[0]
+        )));
+    }
+    r.todo = std::mem::take(&mut r.retry);
+    Ok(Chunk::Yield)
+}
+
+enum Copied {
+    Moved(u64),
+    /// 这个路径的当前版本已经不在源带上了，不用搬
+    Superseded,
+    /// 这一遍先让开，下一遍再看
+    Retry,
+    /// 现在搬不了，但不是这盘带的错（池里没有可写的带）：整个搬迁暂停
+    Halt(String),
+}
+
+/// 搬一个文件。读源带的同时重算 sha256 与索引里的对照——销毁源带之前，这是对这一份副本的
+/// 端到端验证；对不上宁可整次回收作废，也不能把读坏的内容写到新带上再把源带格式化掉。
+fn copy_one(vol: &LtfsVolume, source: &str, path: &str, files: &FileService) -> Result<Copied> {
+    let p = path.trim_start_matches('/');
+    let Some(node) = vol.index().find_file(p) else { return Ok(Copied::Superseded) };
+    let len = node.length;
+    let want = node.xattr(crate::ltfs::index::XATTR_SHA256).unwrap_or("").to_string();
+    // 目录说这个路径的当前版本在别的带上：源带上这一份是被重写掉的旧副本，不用搬。
+    // 查不到的（目录还没经 Raft 应用到本地）照搬不误：多一份总比留在要被格式化的带上强。
+    if files.stat(path).map_err(|e| TapeError::Ltfs(e.to_string()))?.is_some_and(|st| st.barcode != source) {
+        return Ok(Copied::Superseded);
+    }
+    let h = match files.begin(path, len) {
+        Ok(h) => h,
+        // 客户端正在重写同一个路径：它写的是更新的版本，让它先走
+        Err(super::files::ServiceError::PathBusy(_)) | Err(super::files::ServiceError::SwitchingTape(_)) => {
+            return Ok(Copied::Retry);
+        }
+        // 池里已经没有可写的带了：加带是运维动作，等它，别把源带标成有问题
+        Err(e @ (super::files::ServiceError::NoTape(_) | super::files::ServiceError::NotServing(_))) => {
+            return Ok(Copied::Halt(e.to_string()));
+        }
+        Err(e) => return Err(TapeError::Ltfs(format!("回收 {} 准入失败: {}", path, e))),
+    };
+    let read = (|| -> Result<String> {
+        let mut w = HashingWriter { inner: std::io::BufWriter::new(std::fs::File::create(&h.spool)?), hash: Sha256::new() };
+        vol.read_file_to_writer(p, &mut w)?;
+        w.inner.flush()?;
+        Ok(w.hash.finalize().iter().map(|b| format!("{:02x}", b)).collect())
+    })();
+    match read {
+        Ok(got) if want.is_empty() || got == want => {
+            files.ingest(&h, len).map_err(|e| TapeError::Ltfs(e.to_string()))?;
+            files.finish(h, len).map_err(|e| TapeError::Ltfs(e.to_string()))?;
+            Ok(Copied::Moved(len))
+        }
+        Ok(got) => {
+            files.abort(h);
+            Err(TapeError::Ltfs(format!("{} 上的 {} 读出来是 {}，索引里记的是 {}", source, path, got, want)))
+        }
+        Err(e) => {
+            files.abort(h);
+            Err(e)
+        }
+    }
+}
+
+struct HashingWriter<W: std::io::Write> {
+    inner: W,
+    hash: Sha256,
+}
+
+impl<W: std::io::Write> std::io::Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hash.update(&buf[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// 全部搬完了。格式化之前先证明源带上没有任何还活着的内容，然后才重新格式化并写回池标记。
+/// 返回 `false` 表示还要等目录把搬迁记录应用上来。
+fn finish_reclaim(
+    a: &mut Active,
+    opts: &ExecOptions,
+    files: &FileService,
+    status: &SharedStatus,
+    tx: &Sender<ExecEvent>,
+) -> Result<bool> {
+    let (di, source) = {
+        let r = a.reclaim.as_ref().expect("回收进行中");
+        (r.drive, r.barcode.clone())
+    };
+    // 闸门一：目录里不能还有任何一条记录指向源带。目录经 Raft 应用有延迟，等它跟上来
+    if let Some((n, _)) = files.live_on(&source).filter(|(n, _)| *n > 0) {
+        let r = a.reclaim.as_mut().expect("回收进行中");
+        r.waits += 1;
+        if r.waits > RECLAIM_MAX_WAITS {
+            return Err(TapeError::Ltfs(format!("等了很久，目录里仍有 {} 条记录指向 {}", n, source)));
+        }
+        return Ok(false);
+    }
+    // 闸门二：源带索引里的每个路径，目录给出的当前位置都不在源带上。
+    // 闸门一只看目录有什么，这一条还看带上有什么——带上有、目录压根不知道的文件也拦得住。
+    let dev = a.devices[di].dev.as_ref();
+    let mut orphans = Vec::new();
+    {
+        let vol = LtfsVolume::mount(dev)?;
+        let mut paths = Vec::new();
+        vol.index().walk_files(|p, _| paths.push(format!("/{}", p)));
+        for path in paths {
+            match files.stat(&path) {
+                Ok(Some(st)) if st.barcode != source => {}
+                _ => orphans.push(path),
+            }
+        }
+    }
+    if let Some(first) = orphans.first() {
+        return Err(TapeError::Ltfs(format!("{} 上还有 {} 个路径没有着落（例如 {}）", source, orphans.len(), first)));
+    }
+
+    let (pool_uuid, pool_name) =
+        pool_of(status, &source).ok_or_else(|| TapeError::NotReady(format!("{} 已不在任何池里", source)))?;
+    let (copied, bytes, superseded) = {
+        let r = a.reclaim.as_ref().expect("回收进行中");
+        (r.copied, r.bytes, r.superseded)
+    };
+    info!("执行线程: {} 上的内容已全部有着落（搬走 {} 个 / {} MiB，跳过旧副本 {} 个），重新格式化", source, copied, bytes >> 20, superseded);
+    let mk = MkltfsOptions { volume_id: source.chars().take(6).collect(), block_size: opts.block_size, ..Default::default() };
+    mkltfs(dev, &mk)?;
+    let volume_uuid = {
+        let mut vol = LtfsVolume::mount(dev)?;
+        vol.set_reservation_guard(Some(a.key));
+        vol.set_root_xattr(XATTR_POOL_UUID, &pool_uuid)?;
+        vol.set_root_xattr(XATTR_POOL_NAME, &pool_name)?;
+        vol.commit()?;
+        vol.label().volume_uuid.to_string()
+    };
+    let _ = tx.send(ExecEvent::Reclaimed { round: a.round, barcode: source.clone(), volume_uuid, files: copied, bytes });
+    a.reclaim = None;
+    // 空出驱动器：这盘带现在是池里一盘干净的可写带，下次需要时再装
+    unload_reclaim_drive(a, di, &source);
+    Ok(true)
+}
+
+fn unload_reclaim_drive(a: &Active, di: usize, barcode: &str) {
+    match inventory(&a.devices) {
+        Ok(inv) => {
+            if let Some(d) = inv.drives.iter().find(|d| d.dev == di)
+                && let Err(e) = unload_drive(&a.devices, &inv, d)
+            {
+                warn!("执行线程: 卸下 {} 失败: {}", barcode, e);
+            }
+        }
+        Err(e) => warn!("执行线程: 回收后读库存失败: {}", e),
+    }
+}
+
+/// 放弃这次回收。`needs_attention` 为真时把带标成待核验：数据对不上、读不出来这类问题
+/// 必须有人来看，绝不能让它继续留在回收队列里被反复重试。
+fn abort_reclaim(a: &mut Active, tx: &Sender<ExecEvent>, reason: &str, needs_attention: bool) {
+    let Some(r) = a.reclaim.take() else { return };
+    error!("执行线程: 放弃回收 {}：{}", r.barcode, reason);
+    if needs_attention {
+        let _ = tx.send(ExecEvent::TapeState { round: a.round, barcode: r.barcode.clone(), state: tape_state::CHECK.to_string() });
+    }
+    unload_reclaim_drive(a, r.drive, &r.barcode);
+}
+
 /// 读带空闲太久：卸回槽位，把驱动器腾出来。
 fn unload_idle_read_tape(a: &mut Active, opts: &ExecOptions) {
     let Some((i, b, last)) = &a.read else { return };
@@ -873,14 +1345,14 @@ fn unload_idle_read_tape(a: &mut Active, opts: &ExecOptions) {
 fn periodic(a: &mut Active, opts: &ExecOptions) -> std::result::Result<(), String> {
     unload_idle_read_tape(a, opts);
     if let (true, Some(i)) = (opts.demo_write, a.drive) {
+        let ver = next_version(a);
         let dev = a.devices[i].dev.as_ref();
-        a.seq += 1;
         let name = format!("/ltfsd-demo/round{:06}-{:04}.txt", a.round, a.seq);
         let body = format!("node={} round={} seq={}\n", opts.node_id, a.round, a.seq);
         let wrote = (|| -> Result<()> {
             let mut vol = LtfsVolume::mount(dev)?;
             vol.set_reservation_guard(Some(a.key));
-            vol.append_file(&name, &mut Cursor::new(body.into_bytes()))?;
+            vol.append_file_with_xattrs(&name, &mut Cursor::new(body.into_bytes()), &[(XATTR_VERSION, &ver)])?;
             vol.commit()
         })();
         match wrote {

@@ -20,11 +20,26 @@ pub enum Command {
     TapeUnassign { barcode: String },
     /// 磁带的追加资格或健康发生变化（执行者在写满、到文件数上限、池标记不符等时上报）。
     TapeState { barcode: String, state: String },
+    /// 开始回收一盘带：把它上面还活着的文件搬到同池的其他带上，然后重新格式化它。
+    /// 只改状态；真正的搬迁由执行者做，中途换届也能从状态里接着干。
+    TapeReclaim { barcode: String },
+    /// 回收完成：源带已重新格式化。这是唯一允许摘要代数回退的地方（带真的被重写了）。
+    TapeReclaimed { barcode: String, volume_uuid: String },
     /// 一次卷提交的目录记录的一片。先进暂存，等同一批的 `TapeCommitted` 到达才可见。
     CatalogPart { barcode: String, generation: u64, part: u32, files: Vec<FileRec> },
     /// 一次卷提交的摘要。应用它时，若 `parts` 片齐全，该批目录记录原子地并入目录。
     /// `full` 为真表示这批是该带的完整列表（接管时对账用），并入前先清掉该带的旧记录。
-    TapeCommitted { barcode: String, volume_uuid: String, generation: u64, files: u64, bytes_used: u64, parts: u32, full: bool },
+    TapeCommitted {
+        barcode: String,
+        volume_uuid: String,
+        generation: u64,
+        files: u64,
+        bytes_used: u64,
+        /// 带上实际写掉的字节；读不到容量时为 0
+        bytes_written: u64,
+        parts: u32,
+        full: bool,
+    },
 }
 
 /// 目录里的一条文件记录。它只是"该带第 G 代索引里有这个文件"的缓存，磁带才是权威。
@@ -34,6 +49,9 @@ pub struct FileRec {
     pub length: u64,
     /// 十六进制小写；没有哈希属性的文件为空串
     pub sha256: String,
+    /// 这一份内容的版本 (轮次, 序号)，取自带上的 `tapers.version`。见 `ltfs::volume::XATTR_VERSION`。
+    /// 目录按它取大者：同一路径的多份物理副本（重写、回收搬迁）里只有最新的一份算数。
+    pub version: (u64, u64),
 }
 
 /// 目录条目单片的大小上限（字节，按 JSON 编码后估算）。
@@ -44,7 +62,7 @@ pub fn split_catalog(files: &[FileRec]) -> Vec<Vec<FileRec>> {
     let mut out = vec![Vec::new()];
     let mut size = 0usize;
     for f in files {
-        let cost = f.path.len() + f.sha256.len() + 48;
+        let cost = f.path.len() + f.sha256.len() + 72;
         if size + cost > CATALOG_PART_BYTES && !out.last().is_some_and(Vec::is_empty) {
             out.push(Vec::new());
             size = 0;
@@ -69,13 +87,17 @@ impl Command {
             Command::TapeAssign { barcode, pool } => json!({"op": "tape_assign", "barcode": barcode, "pool": pool}),
             Command::TapeUnassign { barcode } => json!({"op": "tape_unassign", "barcode": barcode}),
             Command::TapeState { barcode, state } => json!({"op": "tape_state", "barcode": barcode, "state": state}),
+            Command::TapeReclaim { barcode } => json!({"op": "tape_reclaim", "barcode": barcode}),
+            Command::TapeReclaimed { barcode, volume_uuid } => {
+                json!({"op": "tape_reclaimed", "barcode": barcode, "volume_uuid": volume_uuid})
+            }
             Command::CatalogPart { barcode, generation, part, files } => json!({
                 "op": "catalog_part", "barcode": barcode, "generation": generation, "part": part,
-                "files": files.iter().map(|f| json!([f.path, f.length, f.sha256])).collect::<Vec<_>>(),
+                "files": files.iter().map(|f| json!([f.path, f.length, f.sha256, f.version.0, f.version.1])).collect::<Vec<_>>(),
             }),
-            Command::TapeCommitted { barcode, volume_uuid, generation, files, bytes_used, parts, full } => json!({
+            Command::TapeCommitted { barcode, volume_uuid, generation, files, bytes_used, bytes_written, parts, full } => json!({
                 "op": "tape_committed", "barcode": barcode, "volume_uuid": volume_uuid, "generation": generation,
-                "files": files, "bytes_used": bytes_used, "parts": parts, "full": full,
+                "files": files, "bytes_used": bytes_used, "bytes_written": bytes_written, "parts": parts, "full": full,
             }),
         };
         v.to_string().into_bytes()
@@ -95,13 +117,22 @@ impl Command {
             "tape_assign" => return Some(Command::TapeAssign { barcode: text("barcode")?, pool: text("pool")? }),
             "tape_unassign" => return Some(Command::TapeUnassign { barcode: text("barcode")? }),
             "tape_state" => return Some(Command::TapeState { barcode: text("barcode")?, state: text("state")? }),
+            "tape_reclaim" => return Some(Command::TapeReclaim { barcode: text("barcode")? }),
+            "tape_reclaimed" => {
+                return Some(Command::TapeReclaimed { barcode: text("barcode")?, volume_uuid: text("volume_uuid")? });
+            }
             "catalog_part" => {
                 let files = v
                     .get("files")?
                     .as_array()?
                     .iter()
                     .map(|f| {
-                        Some(FileRec { path: f.get(0)?.as_str()?.to_string(), length: f.get(1)?.as_u64()?, sha256: f.get(2)?.as_str()?.to_string() })
+                        Some(FileRec {
+                            path: f.get(0)?.as_str()?.to_string(),
+                            length: f.get(1)?.as_u64()?,
+                            sha256: f.get(2)?.as_str()?.to_string(),
+                            version: (f.get(3).and_then(Value::as_u64).unwrap_or(0), f.get(4).and_then(Value::as_u64).unwrap_or(0)),
+                        })
                     })
                     .collect::<Option<Vec<_>>>()?;
                 return Some(Command::CatalogPart {
@@ -118,6 +149,7 @@ impl Command {
                     generation: v.get("generation")?.as_u64()?,
                     files: v.get("files")?.as_u64()?,
                     bytes_used: v.get("bytes_used")?.as_u64()?,
+                    bytes_written: v.get("bytes_written").and_then(Value::as_u64).unwrap_or(0),
                     parts: v.get("parts")?.as_u64()? as u32,
                     full: v.get("full")?.as_bool()?,
                 });
@@ -167,7 +199,7 @@ impl ControlSnapshot {
             "tape_summary": c
                 .tape_summary
                 .iter()
-                .map(|(b, s)| json!([b, s.volume_uuid, s.generation, s.files, s.bytes_used]))
+                .map(|(b, s)| json!([b, s.volume_uuid, s.generation, s.files, s.bytes_used, s.bytes_written]))
                 .collect::<Vec<_>>(),
         })
         .to_string()
@@ -203,7 +235,13 @@ impl ControlSnapshot {
         for r in rows("tape_summary")? {
             c.tape_summary.insert(
                 s(r.get(0))?,
-                TapeSummary { volume_uuid: s(r.get(1))?, generation: n(r.get(2))?, files: n(r.get(3))?, bytes_used: n(r.get(4))? },
+                TapeSummary {
+                    volume_uuid: s(r.get(1))?,
+                    generation: n(r.get(2))?,
+                    files: n(r.get(3))?,
+                    bytes_used: n(r.get(4))?,
+                    bytes_written: n(r.get(5)).unwrap_or(0),
+                },
             );
         }
         Some(Self { control: c, source: n(v.get("source"))?, directory_index: n(v.get("directory_index"))? })
@@ -234,6 +272,8 @@ pub enum Applied {
     ExecutorGone { node: u64, round: u64 },
     /// 一次卷提交的摘要被接受：目录库应当把对应的暂存记录并入目录。
     CatalogCommitted,
+    /// 一盘带回收完毕、已重新格式化：目录库应当清掉它名下的全部记录。
+    Reclaimed,
     /// 管理命令的结论。`Err` 表示被状态机拒绝（所有节点结论相同），状态未变。
     Admin(std::result::Result<String, String>),
     Nothing,
@@ -251,7 +291,9 @@ pub mod tape_state {
     pub const LABEL_MISMATCH: &str = "label_mismatch";
     /// 装载、挂载或格式化失败
     pub const CHECK: &str = "check";
-    pub const ALL: &[&str] = &[APPENDABLE, DATA_FULL, FULL, LABEL_MISMATCH, CHECK];
+    /// 正在回收：不再作为写入带候选，带上还活着的文件正在搬到同池的其他带上
+    pub const RECLAIMING: &str = "reclaiming";
+    pub const ALL: &[&str] = &[APPENDABLE, DATA_FULL, FULL, LABEL_MISMATCH, CHECK, RECLAIMING];
 }
 
 /// 默认的每盘带文件数软上限。推导见研究笔记 pooling-slice-plan.md。
@@ -288,7 +330,10 @@ pub struct TapeSummary {
     pub volume_uuid: String,
     pub generation: u64,
     pub files: u64,
+    /// 索引里这些文件的字节数（只算活着的）
     pub bytes_used: u64,
+    /// 带上实际写掉的字节（容量读数）。与 `bytes_used` 的差额是被重写的旧副本和放弃的块
+    pub bytes_written: u64,
 }
 
 impl ControlState {
@@ -328,15 +373,36 @@ impl ControlState {
                 }
                 Applied::Nothing
             }
+            Command::TapeReclaim { barcode } => Applied::Admin(self.tape_reclaim(barcode)),
+            Command::TapeReclaimed { barcode, volume_uuid } => {
+                // 只认"确实在回收中"的带：迟到的重复上报不能把一盘已经重新写入的带清空
+                if self.tape_state.get(barcode).is_some_and(|s| s == tape_state::RECLAIMING) {
+                    // 带被重新格式化了，摘要必须跟着回到第 1 代——这是唯一允许代数回退的地方
+                    self.tape_summary.insert(
+                        barcode.clone(),
+                        TapeSummary { volume_uuid: volume_uuid.clone(), generation: 1, files: 0, bytes_used: 0, bytes_written: 0 },
+                    );
+                    self.tape_state.insert(barcode.clone(), tape_state::APPENDABLE.to_string());
+                    Applied::Reclaimed
+                } else {
+                    Applied::Nothing
+                }
+            }
             // 文件记录进目录库的暂存表，这里不处理
             Command::CatalogPart { .. } => Applied::Nothing,
-            Command::TapeCommitted { barcode, volume_uuid, generation, files, bytes_used, .. } => {
+            Command::TapeCommitted { barcode, volume_uuid, generation, files, bytes_used, bytes_written, .. } => {
                 // 只接受已归属的带，且代数不回退：迟到的旧批次不能把摘要改回去
                 let newer = self.tape_summary.get(barcode).is_none_or(|s| *generation >= s.generation);
                 if self.tapes.contains_key(barcode) && newer {
                     self.tape_summary.insert(
                         barcode.clone(),
-                        TapeSummary { volume_uuid: volume_uuid.clone(), generation: *generation, files: *files, bytes_used: *bytes_used },
+                        TapeSummary {
+                            volume_uuid: volume_uuid.clone(),
+                            generation: *generation,
+                            files: *files,
+                            bytes_used: *bytes_used,
+                            bytes_written: *bytes_written,
+                        },
                     );
                     Applied::CatalogCommitted
                 } else {
@@ -377,6 +443,24 @@ impl ControlState {
         self.tape_summary.remove(barcode);
         self.tape_state.remove(barcode);
         Ok(format!("{} 已解除归属", barcode))
+    }
+
+    /// 开始回收。只改状态：执行者按状态自己去干，中途换届后新执行者接着干。
+    fn tape_reclaim(&mut self, barcode: &str) -> std::result::Result<String, String> {
+        if !self.tapes.contains_key(barcode) {
+            return Err(format!("{} 未归属任何池", barcode));
+        }
+        let state = self.tape_state.get(barcode).map(String::as_str).unwrap_or(tape_state::APPENDABLE);
+        match state {
+            tape_state::RECLAIMING => return Err(format!("{} 已在回收中", barcode)),
+            // 这两种状态说明带本身有问题：回收要读它的全部内容再格式化，先人工弄清楚
+            tape_state::LABEL_MISMATCH | tape_state::CHECK => {
+                return Err(format!("{} 当前状态是 {}，先人工处理再回收", barcode, state));
+            }
+            _ => {}
+        }
+        self.tape_state.insert(barcode.to_string(), tape_state::RECLAIMING.to_string());
+        Ok(format!("{} 开始回收", barcode))
     }
 
     /// `pool` 可以是池名或 UUID。
@@ -471,7 +555,7 @@ mod tests {
     #[test]
     fn catalog_commands_roundtrip_and_split() {
         let files: Vec<FileRec> = (0..10_000)
-            .map(|i| FileRec { path: format!("/dir/sub/object-{:08}.bin", i), length: i, sha256: "ab".repeat(32) })
+            .map(|i| FileRec { path: format!("/dir/sub/object-{:08}.bin", i), length: i, sha256: "ab".repeat(32), version: (7, i) })
             .collect();
         let parts = split_catalog(&files);
         assert!(parts.len() >= 2, "一万条记录超过 1 MiB，应当分片");
@@ -483,7 +567,7 @@ mod tests {
             assert_eq!(Command::decode(&enc), Some(c));
         }
         assert_eq!(split_catalog(&[]), vec![Vec::<FileRec>::new()]);
-        let t = Command::TapeCommitted { barcode: "T1".into(), volume_uuid: "v".into(), generation: 7, files: 3, bytes_used: 9, parts: 2, full: true };
+        let t = Command::TapeCommitted { barcode: "T1".into(), volume_uuid: "v".into(), generation: 7, files: 3, bytes_used: 9, bytes_written: 12, parts: 2, full: true };
         assert_eq!(Command::decode(&t.encode()), Some(t));
     }
 
@@ -500,7 +584,7 @@ mod tests {
         s.apply(
             7,
             &Command::TapeCommitted {
-                barcode: "T1".into(), volume_uuid: "v-9".into(), generation: 12, files: 40, bytes_used: 900, parts: 1, full: false,
+                barcode: "T1".into(), volume_uuid: "v-9".into(), generation: 12, files: 40, bytes_used: 900, bytes_written: 1200, parts: 1, full: false,
             },
         );
         let snap = ControlSnapshot { control: s.clone(), source: 2, directory_index: 7 };
@@ -515,6 +599,49 @@ mod tests {
         let next = Command::TapeUnassign { barcode: "T2".into() };
         assert_eq!(restored.apply(8, &next), s.apply(8, &next));
         assert_eq!(restored, s);
+    }
+
+    /// 回收会格式化源带，所以入口的校验要严：只对已归属、且状态说明带本身没问题的带受理。
+    #[test]
+    fn reclaim_is_only_accepted_for_an_assigned_healthy_tape() {
+        let mut s = ControlState::default();
+        s.apply(1, &Command::PoolCreate { uuid: "u".into(), name: "p".into(), file_limit: 10 });
+        let reclaim = |b: &str| Command::TapeReclaim { barcode: b.into() };
+        assert!(matches!(s.apply(2, &reclaim("T1")), Applied::Admin(Err(_))), "未归属的带不受理");
+        s.apply(3, &Command::TapeAssign { barcode: "T1".into(), pool: "p".into() });
+        assert!(matches!(s.apply(4, &reclaim("T1")), Applied::Admin(Ok(_))));
+        assert_eq!(s.tape_state["T1"], tape_state::RECLAIMING);
+        assert!(matches!(s.apply(5, &reclaim("T1")), Applied::Admin(Err(_))), "重复下发不受理");
+
+        // 带本身有问题的，先人工处理
+        s.apply(6, &Command::TapeState { barcode: "T1".into(), state: tape_state::CHECK.into() });
+        assert!(matches!(s.apply(7, &reclaim("T1")), Applied::Admin(Err(_))));
+
+        // 完成：摘要回到第 1 代（唯一允许代数回退的地方），状态恢复可写
+        s.apply(8, &Command::TapeState { barcode: "T1".into(), state: tape_state::FULL.into() });
+        s.apply(
+            9,
+            &Command::TapeCommitted {
+                barcode: "T1".into(), volume_uuid: "old".into(), generation: 40, files: 7, bytes_used: 90,
+                bytes_written: 100, parts: 1, full: false,
+            },
+        );
+        let done = Command::TapeReclaimed { barcode: "T1".into(), volume_uuid: "new".into() };
+        assert_eq!(s.apply(10, &done), Applied::Nothing, "不在回收中的带不接受完成上报");
+        assert_eq!(s.tape_summary["T1"].generation, 40);
+        assert!(matches!(s.apply(11, &reclaim("T1")), Applied::Admin(Ok(_))));
+        assert_eq!(s.apply(12, &done), Applied::Reclaimed);
+        assert_eq!(s.tape_summary["T1"], TapeSummary { volume_uuid: "new".into(), generation: 1, files: 0, bytes_used: 0, bytes_written: 0 });
+        assert_eq!(s.tape_state["T1"], tape_state::APPENDABLE);
+        // 迟到的重复上报不能把一盘已经重新写入的带清空
+        s.apply(13, &Command::TapeCommitted {
+            barcode: "T1".into(), volume_uuid: "new".into(), generation: 2, files: 3, bytes_used: 30,
+            bytes_written: 30, parts: 1, full: false,
+        });
+        assert_eq!(s.apply(14, &done), Applied::Nothing);
+        assert_eq!(s.tape_summary["T1"].files, 3);
+        assert_eq!(Command::decode(&reclaim("T1").encode()), Some(reclaim("T1")));
+        assert_eq!(Command::decode(&done.encode()), Some(done));
     }
 
     /// 接管历史不能无界增长：它每换一次届就加一条，还要进每一份快照。
@@ -533,7 +660,7 @@ mod tests {
     fn summaries_only_move_forward_and_block_unassign() {
         let mut s = ControlState::default();
         s.apply(1, &Command::PoolCreate { uuid: "u".into(), name: "p".into(), file_limit: 10 });
-        let commit = |g: u64, files: u64| Command::TapeCommitted { barcode: "T1".into(), volume_uuid: "v".into(), generation: g, files, bytes_used: 1, parts: 1, full: false };
+        let commit = |g: u64, files: u64| Command::TapeCommitted { barcode: "T1".into(), volume_uuid: "v".into(), generation: g, files, bytes_used: 1, bytes_written: 1, parts: 1, full: false };
         assert_eq!(s.apply(2, &commit(5, 1)), Applied::Nothing, "未归属的带不接受");
         s.apply(3, &Command::TapeAssign { barcode: "T1".into(), pool: "p".into() });
         assert_eq!(s.apply(4, &commit(5, 2)), Applied::CatalogCommitted);

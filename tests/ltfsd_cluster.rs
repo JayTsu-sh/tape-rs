@@ -157,8 +157,9 @@ impl Cluster {
                 id,
                 peers: ids.to_vec(),
                 tick: Duration::from_millis(15),
-                // 选举超时 300 ms：并行加压时调度抖动不至于让 Leader 误判失去多数派。生产配置是 1 秒
-                election_ticks: 20,
+                // 选举超时 510–1020 ms（raft-rs 在 [n, 2n) 里随机），已经接近生产的 1 秒。
+                // 压到 300 ms 时，并行跑十几份、每份二十个用例的调度抖动足以让 Leader 误判失去多数派
+                election_ticks: 34,
                 heartbeat_ticks: 3,
                 status_file: None,
                 directory_file: Some(dir.join(format!("directory-{}.db", id))),
@@ -543,23 +544,36 @@ use tape_rs::daemon::http::{self, HttpContext};
 
 impl Cluster {
     /// 给三个节点各开一个本机 HTTP 接口，返回地址列表。
+    ///
+    /// 取端口的办法是 bind 0、记下端口、放开、再 bind，中间有个窗口；并行跑十几份时
+    /// 内核会把同一个临时端口发给两份，于是第二份 `AddrInUse`。拿不到就换一组重来。
     fn start_http(&self) -> Vec<String> {
-        let ports: Vec<u16> = (0..3)
-            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port())
-            .collect();
-        let addrs: HashMap<u64, String> = (1..=3u64).map(|id| (id, format!("127.0.0.1:{}", ports[id as usize - 1]))).collect();
-        for id in 1..=3u64 {
-            let ctx = Arc::new(HttpContext {
-                files: self.services[&id].clone(),
-                status: self.status[&id].clone(),
-                exec: Mutex::new(self.execs[&id].clone()),
-                node: Mutex::new(self.inboxes[&id].clone()),
-                client_addrs: addrs.clone(),
-                wait_timeout: Duration::from_secs(15),
-            });
-            http::serve(&addrs[&id], ctx).unwrap();
+        for _ in 0..20 {
+            let ports: Vec<u16> = (0..3)
+                .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port())
+                .collect();
+            let addrs: HashMap<u64, String> =
+                (1..=3u64).map(|id| (id, format!("127.0.0.1:{}", ports[id as usize - 1]))).collect();
+            let mut bound = true;
+            for id in 1..=3u64 {
+                let ctx = Arc::new(HttpContext {
+                    files: self.services[&id].clone(),
+                    status: self.status[&id].clone(),
+                    exec: Mutex::new(self.execs[&id].clone()),
+                    node: Mutex::new(self.inboxes[&id].clone()),
+                    client_addrs: addrs.clone(),
+                    wait_timeout: Duration::from_secs(15),
+                });
+                if http::serve(&addrs[&id], ctx).is_err() {
+                    bound = false;
+                    break;
+                }
+            }
+            if bound {
+                return (1..=3u64).map(|id| addrs[&id].clone()).collect();
+            }
         }
-        (1..=3u64).map(|id| addrs[&id].clone()).collect()
+        panic!("找不到三个可用的本机端口");
     }
 }
 
@@ -812,7 +826,7 @@ fn blank_tapes_are_formatted_on_first_use_and_full_tapes_are_switched() {
     // 三盘都标为已满；未归属的那盘仍是空白、仍在原槽位
     c.wait("三盘都标为 full", || {
         let st = c.st(leader);
-        ["PA0001L8", "PA0002L8", "PA0003L8"].iter().all(|b| st.tapes.get(*b).is_some_and(|t| t.0 == "full"))
+        ["PA0001L8", "PA0002L8", "PA0003L8"].iter().all(|b| st.tapes.get(*b).is_some_and(|t| t.state == "full"))
     });
     let untouched = c.lib.cartridge("ZZ0009L8").unwrap();
     assert_eq!(untouched.partitions.len(), 1);
@@ -844,7 +858,7 @@ fn file_count_limit_switches_to_the_next_tape() {
     c.wait("文件服务开放", || svc.serving_round() == Some(round));
     let results = put_until(&svc, "small", 2000, 8, |_| false);
     assert!(results.iter().all(|(_, r)| matches!(r, Ok(TaskStatus::Committed { .. }))), "{:?}", results);
-    c.wait("第一盘转 data_full", || c.st(leader).tapes.get("PA0001L8").is_some_and(|t| t.0 == "data_full"));
+    c.wait("第一盘转 data_full", || c.st(leader).tapes.get("PA0001L8").is_some_and(|t| t.state == "data_full"));
     assert_eq!(svc.tape().unwrap().barcode, "PA0002L8");
     let db = c.dir.join(format!("directory-{}.db", leader));
     c.wait("目录追上", || tape_rs::daemon::directory::Directory::open_reader(&db).unwrap().list(POOL).map(|l| l.len()).unwrap_or(0) == 8);
@@ -852,7 +866,7 @@ fn file_count_limit_switches_to_the_next_tape() {
     let on_first = results.iter().filter(|(p, _)| d.stat(POOL, p).unwrap().unwrap().barcode == "PA0001L8").count();
     assert_eq!(on_first, 5, "第一盘正好放到上限");
     // 第一盘已卸回槽位，驱动器里是第二盘
-    assert_eq!(c.st(leader).tapes["PA0002L8"].0, "appendable");
+    assert_eq!(c.st(leader).tapes["PA0002L8"].state, "appendable");
     // 两盘带上的文件 stat 都答得出：第二盘来自当前索引，第一盘来自目录
     assert!(svc.stat(&results[0].0).unwrap().is_some());
     assert!(svc.stat(&results[7].0).unwrap().is_some());
@@ -875,7 +889,7 @@ fn a_tape_holding_foreign_data_is_never_formatted() {
     let svc = c.services[&leader].clone();
     c.wait("文件服务开放", || svc.serving_round() == Some(round));
     assert_eq!(svc.tape().unwrap().barcode, "PA0002L8");
-    c.wait("第一盘标为 label_mismatch", || c.st(leader).tapes.get("PA0001L8").is_some_and(|t| t.0 == "label_mismatch"));
+    c.wait("第一盘标为 label_mismatch", || c.st(leader).tapes.get("PA0001L8").is_some_and(|t| t.state == "label_mismatch"));
     let foreign = c.lib.cartridge("PA0001L8").unwrap();
     assert_eq!(foreign.partitions.len(), 1, "没有被重新分区");
     assert!(matches!(&foreign.partitions[0].objects[0], tape_rs::scsi::sim::LogicalObject::Record(r) if r.starts_with(b"TAR ARCHIVE")));
@@ -927,7 +941,7 @@ fn reading_from_another_tape_with_a_single_drive_swaps_and_swaps_back() {
     c.wait("文件服务开放", || svc.serving_round() == Some(round));
     let results = put_until(&svc, "r", 4000, 6, |_| false);
     assert!(results.iter().all(|(_, r)| r.is_ok()));
-    c.wait("第一盘转 data_full", || c.st(leader).tapes.get("PA0001L8").is_some_and(|t| t.0 == "data_full"));
+    c.wait("第一盘转 data_full", || c.st(leader).tapes.get("PA0001L8").is_some_and(|t| t.state == "data_full"));
     assert_eq!(svc.tape().unwrap().barcode, "PA0002L8");
     let db = c.dir.join(format!("directory-{}.db", leader));
     c.wait("目录追上", || tape_rs::daemon::directory::Directory::open_reader(&db).unwrap().list(POOL).map(|l| l.len()).unwrap_or(0) == 6);
@@ -964,7 +978,7 @@ fn a_second_drive_serves_reads_and_idle_read_tapes_are_unloaded() {
     let svc = c.services[&leader].clone();
     c.wait("文件服务开放", || svc.serving_round() == Some(round));
     let results = put_until(&svc, "r", 3000, 5, |_| false);
-    c.wait("第一盘转 data_full", || c.st(leader).tapes.get("PA0001L8").is_some_and(|t| t.0 == "data_full"));
+    c.wait("第一盘转 data_full", || c.st(leader).tapes.get("PA0001L8").is_some_and(|t| t.state == "data_full"));
     let db = c.dir.join(format!("directory-{}.db", leader));
     c.wait("目录追上", || tape_rs::daemon::directory::Directory::open_reader(&db).unwrap().list(POOL).map(|l| l.len()).unwrap_or(0) == 5);
 
@@ -985,6 +999,89 @@ fn a_second_drive_serves_reads_and_idle_read_tapes_are_unloaded() {
     c.shutdown();
 }
 
+/// 回收：把一盘带上还活着的文件搬到同池的另一盘带上，然后重新格式化源带。
+///
+/// 这是整个系统里唯一一条会主动销毁数据的路径，所以断言分两部分：搬走的必须一个不少
+/// （内容逐字节对得上，被重写过的路径拿到的是新版本），源带必须真的被格式化干净。
+#[test]
+fn reclaiming_a_tape_moves_the_live_files_away_and_reformats_it() {
+    let lib = SimLibrary::new(2, 6, 1);
+    for (i, b) in ["PA0001L8", "PA0002L8"].iter().enumerate() {
+        lib.insert_cartridge(SimCartridge::blank(b, 64 << 20), i).unwrap();
+    }
+    let c = Cluster::start_lib("reclaim", false, lib, 10, &["PA0001L8", "PA0002L8"]);
+    let (leader, round) = c.wait_serving(None, 0);
+    let svc = c.services[&leader].clone();
+    c.wait("文件服务开放", || svc.serving_round() == Some(round));
+    assert_eq!(svc.tape().unwrap().barcode, "PA0001L8");
+
+    // 三个文件都落在第一盘上，其中 /r/b.bin 再写一次：旧的那一份成了这盘带上的死字节
+    for (i, p) in ["/r/a.bin", "/r/b.bin", "/r/c.bin"].iter().enumerate() {
+        assert!(matches!(upload(&svc, p, &body(3000, i as u8)).unwrap(), TaskStatus::Committed { .. }));
+    }
+    assert!(matches!(upload(&svc, "/r/b.bin", &body(5000, 9)).unwrap(), TaskStatus::Committed { .. }));
+
+    let db = c.dir.join(format!("directory-{}.db", leader));
+    let dir = || tape_rs::daemon::directory::Directory::open_reader(&db).unwrap();
+    c.wait("目录追上", || dir().live_on("PA0001L8").unwrap_or((0, 0)) == (3, 3000 + 5000 + 3000));
+    let (_, live_before) = dir().live_on("PA0001L8").unwrap();
+    let written_before = c.st(leader).tapes["PA0001L8"].bytes_written;
+    assert!(
+        written_before > live_before,
+        "带上实际写掉的字节多于活着的字节，差额就是被重写掉的那一份：写掉 {} 活着 {}",
+        written_before,
+        live_before
+    );
+
+    // 源带正好是当前写入带：回收要先把写入带换掉，再来搬它
+    c.admin(Command::TapeReclaim { barcode: "PA0001L8".into() });
+    c.wait("回收完成", || {
+        c.st(leader).tapes.get("PA0001L8").is_some_and(|t| t.state == "appendable" && t.files == 0)
+    });
+
+    // 回收途中可以换届：状态在 Raft 里，新执行者会接着搬。所以读之前重新问一次谁在服务
+    let (leader, _) = c.wait_serving(None, 0);
+    let db = c.dir.join(format!("directory-{}.db", leader));
+    let dir = || tape_rs::daemon::directory::Directory::open_reader(&db).unwrap();
+
+    // 三个文件都还在，而且 /r/b.bin 拿到的是重写之后的那一版
+    for (i, p) in ["/r/a.bin", "/r/c.bin"].iter().enumerate() {
+        let want = body(3000, if i == 0 { 0 } else { 2 });
+        assert_eq!(c.read_via(leader, p).unwrap(), want, "{} 的内容", p);
+    }
+    assert_eq!(c.read_via(leader, "/r/b.bin").unwrap(), body(5000, 9), "被重写过的路径拿到的必须是新版本");
+
+    // 目录里再没有任何一条记录指向源带；三个文件都记在第二盘上
+    c.wait("目录清干净", || dir().live_on("PA0001L8").unwrap_or((1, 1)) == (0, 0));
+    let d = dir();
+    for p in ["/r/a.bin", "/r/b.bin", "/r/c.bin"] {
+        assert_eq!(d.stat(POOL, p).unwrap().unwrap().barcode, "PA0002L8", "{}", p);
+    }
+    // 源带真的被重新格式化了：带上一个文件都没有
+    assert!(tape_files(&c.lib, "PA0001L8").is_empty(), "源带应当是空的");
+    assert_eq!(tape_files(&c.lib, "PA0002L8").len(), 3);
+    c.shutdown();
+}
+
+/// 读一盘模拟介质上最后一份索引里的文件列表。
+fn tape_files(lib: &SimLibrary, barcode: &str) -> Vec<String> {
+    let cart = lib.cartridge(barcode).unwrap();
+    let xml = cart.partitions[1]
+        .objects
+        .iter()
+        .rev()
+        .find_map(|o| match o {
+            tape_rs::scsi::sim::LogicalObject::Record(d) if d.windows(10).any(|w| w == b"<ltfsindex") => Some(d.clone()),
+            _ => None,
+        })
+        .expect("带上应当有索引");
+    let idx = tape_rs::ltfs::index::LtfsIndex::parse(&xml).unwrap();
+    let mut v = Vec::new();
+    idx.walk_files(|p, _| v.push(p.to_string()));
+    v.sort();
+    v
+}
+
 /// PN07：目录比磁带还新（不应出现）时，装载后不改目录，把带标为 check 等人核验。
 #[test]
 fn a_directory_ahead_of_the_tape_marks_the_tape_for_checking() {
@@ -996,18 +1093,18 @@ fn a_directory_ahead_of_the_tape_marks_the_tape_for_checking() {
     let results = put_until(&svc, "r", 3000, 4, |_| false);
     // 代数也要等：换带时执行线程会先往状态里塞一条占位记录，代数是 0
     c.wait("第一盘转 data_full", || {
-        c.st(leader).tapes.get("PA0001L8").is_some_and(|t| t.0 == "data_full" && t.1 > 0)
+        c.st(leader).tapes.get("PA0001L8").is_some_and(|t| t.state == "data_full" && t.generation > 0)
     });
-    let real_gen = c.st(leader).tapes["PA0001L8"].1;
+    let real_gen = c.st(leader).tapes["PA0001L8"].generation;
     // 伪造一条比磁带更新的目录批次
     use tape_rs::daemon::state::FileRec;
-    c.admin(Command::CatalogPart { barcode: "PA0001L8".into(), generation: real_gen + 5, part: 0, files: vec![FileRec { path: "/ghost.bin".into(), length: 1, sha256: String::new() }] });
-    c.admin(Command::TapeCommitted { barcode: "PA0001L8".into(), volume_uuid: "x".into(), generation: real_gen + 5, files: 4, bytes_used: 1, parts: 1, full: false });
-    c.wait("伪造批次已应用", || c.st(leader).tapes["PA0001L8"].1 == real_gen + 5);
+    c.admin(Command::CatalogPart { barcode: "PA0001L8".into(), generation: real_gen + 5, part: 0, files: vec![FileRec { path: "/ghost.bin".into(), length: 1, sha256: String::new(), version: (0, 0) }] });
+    c.admin(Command::TapeCommitted { barcode: "PA0001L8".into(), volume_uuid: "x".into(), generation: real_gen + 5, files: 4, bytes_used: 1, bytes_written: 1, parts: 1, full: false });
+    c.wait("伪造批次已应用", || c.st(leader).tapes["PA0001L8"].generation == real_gen + 5);
     assert!(svc.stat("/ghost.bin").unwrap().is_some());
     // 读第一盘上的真实文件会装载它：发现目录比磁带新
     assert_eq!(c.read_via(leader, &results[0].0).unwrap(), body(3000, 0));
-    c.wait("标为 check", || c.st(leader).tapes["PA0001L8"].0 == "check");
+    c.wait("标为 check", || c.st(leader).tapes["PA0001L8"].state == "check");
     assert!(svc.stat("/ghost.bin").unwrap().is_some(), "不自动改目录，等人核验");
     c.shutdown();
 }
@@ -1076,7 +1173,7 @@ fn a_lagging_node_catches_up_from_a_snapshot_and_pulls_the_directory() {
     let st = c.st(lagging);
     assert_eq!(st.pools.len(), 1);
     assert_eq!(st.tapes.len(), 2);
-    assert_eq!(st.tapes["PA0001L8"].1, c.st(leader).tapes["PA0001L8"].1, "磁带代数一致");
+    assert_eq!(st.tapes["PA0001L8"].generation, c.st(leader).tapes["PA0001L8"].generation, "磁带代数一致");
     // 它自己的日志也已经压缩过：重启不必从头重放
     assert!(log_range(&c.dir, lagging).1 > 1, "落后节点的日志也从快照点开始");
     c.shutdown();

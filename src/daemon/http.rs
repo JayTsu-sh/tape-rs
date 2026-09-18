@@ -10,6 +10,7 @@
 //! POST /admin/pools/<name>[?file_limit=N]      新建池（只有 Raft Leader 受理）
 //! POST /admin/tapes/<barcode>?pool=<名称或UUID>  磁带归入池
 //! DELETE /admin/tapes/<barcode>                 解除归属
+//! POST /admin/tapes/<barcode>/reclaim           回收：把带上还活着的文件搬到同池其他带，再重新格式化它
 //!
 //! 不在服务的节点一律返回 503，并在 JSON 里给出它所知的 Leader 地址。
 
@@ -213,7 +214,20 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                         .tapes
                         .iter()
                         .map(|b| match s.tapes.get(b) {
-                            Some(t) => json!({"barcode": b, "state": t.0, "generation": t.1, "files": t.2, "bytes_used": t.3}),
+                            Some(t) => {
+                                // 可回收空间 = 带上实际写掉的字节 − 目录里还指向这盘带的字节。
+                                // 差额有三个来源：同一盘带上被重写的旧副本、当前版本已经在别的
+                                // 带上的旧副本，以及历次收尾放弃的块。容量读数拿不到时（还没装载过）
+                                // 退回索引里的字节数，那只算得出后一种。
+                                let (live_files, live_bytes) = ctx.files.live_on(b).unwrap_or((0, 0));
+                                let written = t.bytes_written.max(t.bytes_used);
+                                json!({
+                                    "barcode": b, "state": t.state, "generation": t.generation, "files": t.files,
+                                    "bytes_used": t.bytes_used, "bytes_written": t.bytes_written,
+                                    "live_files": live_files, "live_bytes": live_bytes,
+                                    "reclaimable_bytes": written.saturating_sub(live_bytes),
+                                })
+                            }
                             None => json!({"barcode": b}),
                         })
                         .collect();
@@ -226,6 +240,10 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
             let file_limit = query_param(query, "file_limit").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_FILE_LIMIT);
             let cmd = Command::PoolCreate { uuid: uuid::Uuid::new_v4().to_string(), name: p[13..].to_string(), file_limit };
             admin(&mut conn, ctx, cmd)
+        }
+        ("POST", p) if p.starts_with("/admin/tapes/") && p.ends_with("/reclaim") => {
+            let barcode = p[13..p.len() - "/reclaim".len()].to_string();
+            admin(&mut conn, ctx, Command::TapeReclaim { barcode })
         }
         ("POST", p) if p.starts_with("/admin/tapes/") => match query_param(query, "pool") {
             Some(pool) => admin(&mut conn, ctx, Command::TapeAssign { barcode: p[13..].to_string(), pool: percent_decode(pool) }),

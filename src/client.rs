@@ -65,6 +65,21 @@ pub struct PoolInfo {
     pub name: String,
     pub file_limit: u64,
     pub tapes: Vec<String>,
+    pub tape_details: Vec<TapeInfo>,
+}
+
+/// 池里一盘带的概况。`reclaimable` 是带上已用字节里目录已经不再引用的部分：
+/// 被重写或被搬走的旧副本，以及历次收尾放弃的块。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TapeInfo {
+    pub barcode: String,
+    pub state: String,
+    pub generation: u64,
+    pub files: u64,
+    pub bytes_used: u64,
+    pub live_files: u64,
+    pub live_bytes: u64,
+    pub reclaimable: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,6 +345,12 @@ impl Client {
         self.admin("DELETE", &format!("/admin/tapes/{}", barcode))
     }
 
+    /// 回收一盘带：把它上面还活着的文件搬到同池的其他带上，然后重新格式化它。
+    /// 这个调用只是把带标成"回收中"就返回；搬迁由执行者在后台做，进度看 `pools`。
+    pub fn tape_reclaim(&mut self, barcode: &str) -> Result<String> {
+        self.admin("POST", &format!("/admin/tapes/{}/reclaim", barcode))
+    }
+
     /// 池与磁带归属。由 `addr` 指定的节点用它已应用的日志回答；`None` 时问 Leader。
     pub fn pools(&mut self, addr: Option<&str>) -> Result<Vec<PoolInfo>> {
         let j = match addr {
@@ -345,6 +366,23 @@ impl Client {
                         name: p["name"].as_str().unwrap_or("").to_string(),
                         file_limit: p["file_limit"].as_u64().unwrap_or(0),
                         tapes: p["tapes"].as_array().map(|t| t.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
+                        tape_details: p["tape_details"]
+                            .as_array()
+                            .map(|t| {
+                                t.iter()
+                                    .map(|d| TapeInfo {
+                                        barcode: d["barcode"].as_str().unwrap_or("").to_string(),
+                                        state: d["state"].as_str().unwrap_or("-").to_string(),
+                                        generation: d["generation"].as_u64().unwrap_or(0),
+                                        files: d["files"].as_u64().unwrap_or(0),
+                                        bytes_used: d["bytes_used"].as_u64().unwrap_or(0),
+                                        live_files: d["live_files"].as_u64().unwrap_or(0),
+                                        live_bytes: d["live_bytes"].as_u64().unwrap_or(0),
+                                        reclaimable: d["reclaimable_bytes"].as_u64().unwrap_or(0),
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                     })
                     .collect()
             })

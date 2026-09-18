@@ -53,15 +53,24 @@ impl Directory {
              CREATE TABLE IF NOT EXISTS pools (uuid TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, file_limit INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS tapes (barcode TEXT PRIMARY KEY, pool_uuid TEXT NOT NULL REFERENCES pools(uuid),
                  volume_uuid TEXT NOT NULL DEFAULT '', generation INTEGER NOT NULL DEFAULT 0,
-                 files INTEGER NOT NULL DEFAULT 0, bytes_used INTEGER NOT NULL DEFAULT 0);
+                 files INTEGER NOT NULL DEFAULT 0, bytes_used INTEGER NOT NULL DEFAULT 0,
+                 bytes_written INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE IF NOT EXISTS files (pool_uuid TEXT NOT NULL, path TEXT NOT NULL, barcode TEXT NOT NULL,
-                 generation INTEGER NOT NULL, length INTEGER NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY (pool_uuid, path));
+                 generation INTEGER NOT NULL, length INTEGER NOT NULL, sha256 TEXT NOT NULL,
+                 ver_round INTEGER NOT NULL DEFAULT 0, ver_seq INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (pool_uuid, path));
              CREATE INDEX IF NOT EXISTS files_by_tape ON files (barcode);
              CREATE TABLE IF NOT EXISTS staging (barcode TEXT NOT NULL, generation INTEGER NOT NULL, part INTEGER NOT NULL,
-                 path TEXT NOT NULL, length INTEGER NOT NULL, sha256 TEXT NOT NULL);
+                 path TEXT NOT NULL, length INTEGER NOT NULL, sha256 TEXT NOT NULL,
+                 ver_round INTEGER NOT NULL DEFAULT 0, ver_seq INTEGER NOT NULL DEFAULT 0);
              CREATE INDEX IF NOT EXISTS staging_by_batch ON staging (barcode, generation, part);",
         )
         .map_err(db_err)?;
+        // 版本列是后加的。老库里没有时补上，默认 0：没有版本的记录不会抢走任何路径
+        for (t, cols) in [("files", &["ver_round", "ver_seq"][..]), ("staging", &["ver_round", "ver_seq"]), ("tapes", &["bytes_written"])] {
+            for c in cols {
+                let _ = db.execute(&format!("ALTER TABLE {} ADD COLUMN {} INTEGER NOT NULL DEFAULT 0", t, c), []);
+            }
+        }
         let applied: Option<i64> =
             db.query_row("SELECT v FROM meta WHERE k = 'applied_index'", [], |r| r.get(0)).optional().map_err(db_err)?;
         Ok(Self { db, applied: applied.unwrap_or(0) as u64 })
@@ -158,17 +167,24 @@ impl Directory {
         match (cmd, outcome) {
             (Command::CatalogPart { barcode, generation, part, files }, _) => {
                 let mut ins = tx
-                    .prepare("INSERT INTO staging (barcode, generation, part, path, length, sha256) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
+                    .prepare(
+                        "INSERT INTO staging (barcode, generation, part, path, length, sha256, ver_round, ver_seq)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    )
                     .map_err(db_err)?;
                 for f in files {
-                    ins.execute(params![barcode, *generation as i64, *part as i64, f.path, f.length as i64, f.sha256]).map_err(db_err)?;
+                    ins.execute(params![
+                        barcode, *generation as i64, *part as i64, f.path, f.length as i64, f.sha256,
+                        f.version.0 as i64, f.version.1 as i64
+                    ])
+                    .map_err(db_err)?;
                 }
                 if files.is_empty() {
                     // 空片也要留痕，片数才对得上
-                    ins.execute(params![barcode, *generation as i64, *part as i64, "", -1i64, ""]).map_err(db_err)?;
+                    ins.execute(params![barcode, *generation as i64, *part as i64, "", -1i64, "", 0i64, 0i64]).map_err(db_err)?;
                 }
             }
-            (Command::TapeCommitted { barcode, volume_uuid, generation, files, bytes_used, parts, full }, Applied::CatalogCommitted) => {
+            (Command::TapeCommitted { barcode, volume_uuid, generation, files, bytes_used, bytes_written, parts, full }, Applied::CatalogCommitted) => {
                 let have: i64 = tx
                     .query_row(
                         "SELECT COUNT(DISTINCT part) FROM staging WHERE barcode = ?1 AND generation = ?2",
@@ -182,22 +198,45 @@ impl Directory {
                     if *full {
                         tx.execute("DELETE FROM files WHERE barcode = ?1", params![barcode]).map_err(db_err)?;
                     }
+                    // 同一路径可以同时存在于多盘带上：被重写的旧副本还留在原带上，回收搬迁
+                    // 期间新旧两份并存。哪一份算数只看版本，不看合并顺序——否则装载一盘旧带
+                    // 做一次对账就会把目录指回旧内容。同一盘带自己报的记录无条件采纳（它是
+                    // 自己内容的权威）。
                     tx.execute(
-                        "INSERT OR REPLACE INTO files (pool_uuid, path, barcode, generation, length, sha256)
-                         SELECT t.pool_uuid, s.path, s.barcode, s.generation, s.length, s.sha256
+                        "INSERT INTO files (pool_uuid, path, barcode, generation, length, sha256, ver_round, ver_seq)
+                         SELECT t.pool_uuid, s.path, s.barcode, s.generation, s.length, s.sha256, s.ver_round, s.ver_seq
                          FROM staging s JOIN tapes t ON t.barcode = s.barcode
-                         WHERE s.barcode = ?1 AND s.generation = ?2 AND s.length >= 0",
+                         WHERE s.barcode = ?1 AND s.generation = ?2 AND s.length >= 0
+                         ON CONFLICT(pool_uuid, path) DO UPDATE SET
+                             barcode = excluded.barcode, generation = excluded.generation, length = excluded.length,
+                             sha256 = excluded.sha256, ver_round = excluded.ver_round, ver_seq = excluded.ver_seq
+                         WHERE excluded.barcode = files.barcode
+                            OR excluded.ver_round > files.ver_round
+                            OR (excluded.ver_round = files.ver_round AND excluded.ver_seq > files.ver_seq)",
                         params![barcode, *generation as i64],
                     )
                     .map_err(db_err)?;
                     tx.execute(
-                        "UPDATE tapes SET volume_uuid = ?2, generation = ?3, files = ?4, bytes_used = ?5 WHERE barcode = ?1",
-                        params![barcode, volume_uuid, *generation as i64, *files as i64, *bytes_used as i64],
+                        "UPDATE tapes SET volume_uuid = ?2, generation = ?3, files = ?4, bytes_used = ?5, bytes_written = ?6
+                         WHERE barcode = ?1",
+                        params![barcode, volume_uuid, *generation as i64, *files as i64, *bytes_used as i64, *bytes_written as i64],
                     )
                     .map_err(db_err)?;
                 }
                 tx.execute("DELETE FROM staging WHERE barcode = ?1 AND generation <= ?2", params![barcode, *generation as i64])
                     .map_err(db_err)?;
+            }
+            (Command::TapeReclaimed { barcode, volume_uuid }, Applied::Reclaimed) => {
+                // 带已重新格式化。状态机在应用这条之前已经确认它还在回收中，而执行者在格式化
+                // 之前已经确认目录里没有任何路径还指向它，所以这里删的都是被搬走或被重写的旧副本。
+                tx.execute("DELETE FROM files WHERE barcode = ?1", params![barcode]).map_err(db_err)?;
+                tx.execute("DELETE FROM staging WHERE barcode = ?1", params![barcode]).map_err(db_err)?;
+                tx.execute(
+                    "UPDATE tapes SET volume_uuid = ?2, generation = 1, files = 0, bytes_used = 0, bytes_written = 0
+                     WHERE barcode = ?1",
+                    params![barcode, volume_uuid],
+                )
+                .map_err(db_err)?;
             }
             _ => {}
         }
@@ -234,6 +273,27 @@ impl Directory {
             .optional()
             .map_err(db_err)?;
         Ok(g.unwrap_or(0) as u64)
+    }
+
+    /// 目录认为还活在这盘带上的文件：条数与字节数。带上已用字节减去它就是可回收空间
+    /// （被重写、被搬迁的旧副本，以及收尾放弃的块）。
+    pub fn live_on(&self, barcode: &str) -> Result<(u64, u64)> {
+        let (n, b): (i64, i64) = self
+            .db
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(length), 0) FROM files WHERE barcode = ?1",
+                params![barcode],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(db_err)?;
+        Ok((n as u64, b as u64))
+    }
+
+    /// 回收的工作单：目录里还指向这盘带的全部路径，按路径排序（各节点结论一致，也便于续跑）。
+    pub fn paths_on(&self, barcode: &str) -> Result<Vec<String>> {
+        let mut stmt = self.db.prepare("SELECT path FROM files WHERE barcode = ?1 ORDER BY path").map_err(db_err)?;
+        let rows = stmt.query_map(params![barcode], |r| r.get::<_, String>(0)).map_err(db_err)?;
+        rows.collect::<std::result::Result<_, _>>().map_err(db_err)
     }
 
     pub fn stat(&self, pool_uuid: &str, path: &str) -> Result<Option<FileRow>> {
@@ -335,11 +395,11 @@ mod tests {
             d.apply(idx, &c, &out).unwrap();
             out
         };
-        let rec = |p: &str, n: u64| FileRec { path: p.into(), length: n, sha256: format!("{:064x}", n) };
+        let rec = |p: &str, n: u64| FileRec { path: p.into(), length: n, sha256: format!("{:064x}", n), version: (1, n) };
         run(&mut ctl, &mut d, Command::PoolCreate { uuid: "u".into(), name: "p".into(), file_limit: 10 });
         run(&mut ctl, &mut d, Command::TapeAssign { barcode: "T1".into(), pool: "p".into() });
         let commit = |g: u64, parts: u32, files: u64, full: bool| Command::TapeCommitted {
-            barcode: "T1".into(), volume_uuid: "v".into(), generation: g, files, bytes_used: 100, parts, full,
+            barcode: "T1".into(), volume_uuid: "v".into(), generation: g, files, bytes_used: 100, bytes_written: 100, parts, full,
         };
 
         // 两片的批次：第二片到达、摘要应用之前，一条都不可见
@@ -364,6 +424,70 @@ mod tests {
         // 只读连接看到同样的内容
         let r = Directory::open_reader(&path).unwrap();
         assert_eq!(r.stat("u", "/c").unwrap().unwrap().sha256, format!("{:064x}", 3));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同一路径可以同时存在于两盘带上：被重写的旧副本还留在原带上，回收搬迁期间新旧并存。
+    /// 哪一份算数只能看版本，不能看并入顺序——否则装载一盘旧带做一次对账就把目录指回了旧内容，
+    /// 而回收在那之后格式化源带，就是实打实的数据丢失。
+    #[test]
+    fn the_newest_version_wins_whatever_order_the_tapes_are_reconciled_in() {
+        use super::super::state::FileRec;
+        let dir = std::env::temp_dir().join(format!("ltfsd-directory-ver-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("directory.db");
+        let _ = std::fs::remove_file(&path);
+        let mut ctl = ControlState::default();
+        let mut d = Directory::open(&path).unwrap();
+        let mut idx = 0u64;
+        let mut run = |ctl: &mut ControlState, d: &mut Directory, c: Command| {
+            idx += 1;
+            let out = ctl.apply(idx, &c);
+            d.apply(idx, &c, &out).unwrap();
+        };
+        run(&mut ctl, &mut d, Command::PoolCreate { uuid: "u".into(), name: "p".into(), file_limit: 10 });
+        for b in ["T1", "T2"] {
+            run(&mut ctl, &mut d, Command::TapeAssign { barcode: b.into(), pool: "p".into() });
+        }
+        // 一整批：一片记录 + 一条摘要
+        let mut batch = |ctl: &mut ControlState, d: &mut Directory, b: &str, g: u64, len: u64, ver: (u64, u64), full: bool| {
+            let f = FileRec { path: "/a".into(), length: len, sha256: String::new(), version: ver };
+            run(ctl, d, Command::CatalogPart { barcode: b.into(), generation: g, part: 0, files: vec![f] });
+            run(ctl, d, Command::TapeCommitted {
+                barcode: b.into(), volume_uuid: "v".into(), generation: g, files: 1, bytes_used: len, bytes_written: len, parts: 1, full,
+            });
+        };
+        let where_is = |d: &Directory| d.stat("u", "/a").unwrap().map(|f| (f.barcode, f.length)).unwrap();
+
+        // /a 先写在 T1，然后被重写到 T2
+        batch(&mut ctl, &mut d, "T1", 2, 10, (1, 1), false);
+        assert_eq!(where_is(&d), ("T1".to_string(), 10));
+        batch(&mut ctl, &mut d, "T2", 2, 20, (1, 5), false);
+        assert_eq!(where_is(&d), ("T2".to_string(), 20));
+
+        // 装载 T1（选带、读取都会做）→ 它报出自己的完整列表，旧副本还在上面。不能抢回去
+        batch(&mut ctl, &mut d, "T1", 3, 10, (1, 1), true);
+        assert_eq!(where_is(&d), ("T2".to_string(), 20), "旧版本不得覆盖新版本");
+        assert_eq!(d.live_on("T1").unwrap(), (0, 0), "T1 上已经没有活着的文件，可以回收");
+        assert_eq!(d.live_on("T2").unwrap(), (1, 20));
+        assert_eq!(d.paths_on("T2").unwrap(), vec!["/a".to_string()]);
+
+        // 反方向也要对：写 T2 的那一届没来得及把目录记进日志，目录还停在 T1；
+        // 之后装载 T2 对账，新版本要能纠正过来（PN06 走的就是这条路）
+        let rec = |len: u64, ver: (u64, u64)| FileRec { path: "/b".into(), length: len, sha256: String::new(), version: ver };
+        run(&mut ctl, &mut d, Command::CatalogPart { barcode: "T1".into(), generation: 5, part: 0, files: vec![rec(10, (1, 2))] });
+        run(&mut ctl, &mut d, Command::TapeCommitted {
+            barcode: "T1".into(), volume_uuid: "v".into(), generation: 5, files: 1, bytes_used: 10, bytes_written: 10, parts: 1, full: true,
+        });
+        assert_eq!(d.stat("u", "/b").unwrap().unwrap().barcode, "T1");
+        run(&mut ctl, &mut d, Command::CatalogPart {
+            barcode: "T2".into(), generation: 6, part: 0,
+            files: vec![FileRec { path: "/a".into(), length: 20, sha256: String::new(), version: (1, 5) }, rec(30, (2, 9))],
+        });
+        run(&mut ctl, &mut d, Command::TapeCommitted {
+            barcode: "T2".into(), volume_uuid: "v".into(), generation: 6, files: 2, bytes_used: 50, bytes_written: 50, parts: 1, full: true,
+        });
+        assert_eq!(d.stat("u", "/b").unwrap().map(|f| (f.barcode, f.length)), Some(("T2".to_string(), 30)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
