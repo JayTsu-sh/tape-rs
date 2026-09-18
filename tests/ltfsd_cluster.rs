@@ -45,14 +45,16 @@ impl Network for ChannelNet {
 struct SimProvider {
     lib: SimLibrary,
     initiator: u32,
+    drives: usize,
 }
 
 impl DeviceProvider for SimProvider {
     fn open_all(&self) -> Result<Vec<ManagedDevice>> {
-        Ok(vec![
-            ManagedDevice { name: "drive0".into(), serial: "SIMDRV0000".into(), kind: DeviceKind::Drive, dev: Box::new(self.lib.drive_as(0, self.initiator)) },
-            ManagedDevice { name: "changer".into(), serial: "SIMLIB0000000001".into(), kind: DeviceKind::Changer, dev: Box::new(self.lib.changer()) },
-        ])
+        let mut v: Vec<ManagedDevice> = (0..self.drives)
+            .map(|i| ManagedDevice { name: format!("drive{}", i), serial: format!("SIMDRV{:04}", i), kind: DeviceKind::Drive, dev: Box::new(self.lib.drive_as(i, self.initiator)) })
+            .collect();
+        v.push(ManagedDevice { name: "changer".into(), serial: "SIMLIB0000000001".into(), kind: DeviceKind::Changer, dev: Box::new(self.lib.changer()) });
+        Ok(v)
     }
 }
 
@@ -105,8 +107,8 @@ impl Cluster {
             status.insert(id, shared.clone());
             let (exec_tx, exec_rx) = channel();
             let (ev_tx, ev_rx) = channel();
-            let provider = Box::new(SimProvider { lib: lib.clone(), initiator: id as u32 });
-            let eopts = ExecOptions { node_id: id as u8, interval: Duration::from_millis(40), demo_write, salvage: false, block_size: 64 * 1024 };
+            let provider = Box::new(SimProvider { lib: lib.clone(), initiator: id as u32, drives: lib.drive_count() });
+            let eopts = ExecOptions { node_id: id as u8, interval: Duration::from_millis(40), demo_write, salvage: false, block_size: 64 * 1024, read_idle: Duration::from_millis(250) };
             let policy = tape_rs::daemon::files::BatchPolicy { max_bytes: 4 << 20, max_files: 50, idle: Duration::from_millis(25), max_wait: Duration::from_millis(400) };
             let files = tape_rs::daemon::files::FileService::with_options(dir.join(format!("spool-{}", id)), policy, Some(dir.join(format!("directory-{}.db", id)))).unwrap();
             let status_for_exec = shared.clone();
@@ -126,8 +128,9 @@ impl Cluster {
                 id,
                 peers: ids.to_vec(),
                 tick: Duration::from_millis(15),
-                election_ticks: 10,
-                heartbeat_ticks: 2,
+                // 选举超时 300 ms：并行加压时调度抖动不至于让 Leader 误判失去多数派。生产配置是 1 秒
+                election_ticks: 20,
+                heartbeat_ticks: 3,
                 status_file: None,
                 directory_file: Some(dir.join(format!("directory-{}.db", id))),
                 cooldown: Duration::from_millis(1500),
@@ -313,10 +316,21 @@ fn upload(svc: &FileService, path: &str, data: &[u8]) -> std::result::Result<Tas
 }
 
 impl Cluster {
+    /// 读一个文件；"稍后重试"（唯一的驱动器正忙）就重试，直到超时。
     fn read_via(&self, node: u64, path: &str) -> std::result::Result<Vec<u8>, String> {
-        let (tx, rx) = channel();
-        self.execs[&node].send(ExecRequest::Read { path: path.to_string(), reply: tx }).unwrap();
-        rx.recv_timeout(Duration::from_secs(15)).map_err(|e| e.to_string())?
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let (tx, rx) = channel();
+            self.execs[&node].send(ExecRequest::Read { path: path.to_string(), reply: tx }).unwrap();
+            match rx.recv_timeout(Duration::from_secs(15)).map_err(|e| e.to_string())? {
+                Ok(d) => return Ok(d),
+                Err(tape_rs::daemon::executor::ReadError::Busy(why)) if Instant::now() < deadline => {
+                    let _ = why;
+                    thread::sleep(Duration::from_millis(30));
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+        }
     }
 }
 
@@ -450,9 +464,9 @@ fn lone_executor(name: &str) -> (Sender<ExecRequest>, std::sync::mpsc::Receiver<
     let (ev_tx, ev_rx) = channel();
     let dir = std::env::temp_dir().join(format!("ltfsd-exec-{}-{}", name, std::process::id()));
     let files = FileService::new(dir).unwrap();
-    let opts = ExecOptions { node_id: 1, interval: Duration::from_secs(3600), demo_write: false, salvage: false, block_size: 64 * 1024 };
+    let opts = ExecOptions { node_id: 1, interval: Duration::from_secs(3600), demo_write: false, salvage: false, block_size: 64 * 1024, read_idle: Duration::from_millis(250) };
     let status: SharedStatus = Arc::new(Mutex::new(NodeStatus::default()));
-    thread::spawn(move || executor::run(Box::new(SimProvider { lib, initiator: 1 }), opts, rx, ev_tx, files, status));
+    thread::spawn(move || executor::run(Box::new(SimProvider { lib, initiator: 1, drives: 1 }), opts, rx, ev_tx, files, status));
     (tx, ev_rx)
 }
 
@@ -861,5 +875,99 @@ fn rejected_large_uploads_get_a_clean_answer_over_http() {
     assert!(resp.contains("too_large"));
     // 正常大小的照常成功
     assert_eq!(cl.put("/ok.bin", &vec![1u8; 300_000]).unwrap().attempts, 1);
+    c.shutdown();
+}
+
+// ---------- 跨磁带读取（P4）----------
+
+/// 只有一个驱动器：读不在驱动器里的带要临时换带，读完换回，服务继续。
+#[test]
+fn reading_from_another_tape_with_a_single_drive_swaps_and_swaps_back() {
+    let lib = small_tape_library(64);
+    let c = Cluster::start_lib("read-swap", false, lib, 4, &["PA0001L8", "PA0002L8"]);
+    let (leader, round) = c.wait_serving(None, 0);
+    let svc = c.services[&leader].clone();
+    c.wait("文件服务开放", || svc.serving_round() == Some(round));
+    let results = put_until(&svc, "r", 4000, 6, |_| false);
+    assert!(results.iter().all(|(_, r)| r.is_ok()));
+    c.wait("第一盘转 data_full", || c.st(leader).tapes.get("PA0001L8").is_some_and(|t| t.0 == "data_full"));
+    assert_eq!(svc.tape().unwrap().barcode, "PA0002L8");
+    let db = c.dir.join(format!("directory-{}.db", leader));
+    c.wait("目录追上", || tape_rs::daemon::directory::Directory::open_reader(&db).unwrap().list(POOL).map(|l| l.len()).unwrap_or(0) == 6);
+
+    // 写入侧忙着（有已准入未完成的上传）时，读别的带得到"稍后重试"，写入不被打断
+    let (p0, _) = &results[0];
+    let h = svc.begin("/inflight.bin", 10).unwrap();
+    let (tx, rx) = channel();
+    c.execs[&leader].send(ExecRequest::Read { path: p0.clone(), reply: tx }).unwrap();
+    assert!(matches!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), Err(tape_rs::daemon::executor::ReadError::Busy(_))));
+    svc.abort(h);
+    assert_eq!(svc.tape().unwrap().barcode, "PA0002L8", "写入带没被换掉");
+
+    // 写入侧空闲后：目录说它在 PA0001L8；读它要临时换带
+    assert_eq!(svc.stat(p0).unwrap().unwrap().barcode, "PA0001L8");
+    assert_eq!(c.read_via(leader, p0).unwrap(), body(4000, 0));
+    // 读完自动换回写入带，服务继续
+    c.wait("换回写入带", || svc.serving_round() == Some(round) && svc.tape().is_some_and(|t| t.barcode == "PA0002L8"));
+    assert!(matches!(upload(&svc, "/after-read.bin", &body(100, 9)).unwrap(), TaskStatus::Committed { .. }));
+    // 当前带上的文件照常读
+    assert_eq!(c.read_via(leader, &results[5].0).unwrap(), body(4000, 5));
+    c.shutdown();
+}
+
+/// 有两个驱动器：读带装进第二个驱动器并留在那里，再次读不用重新装载；空闲后卸回槽位。
+#[test]
+fn a_second_drive_serves_reads_and_idle_read_tapes_are_unloaded() {
+    let lib = SimLibrary::new(2, 6, 1);
+    for (i, b) in ["PA0001L8", "PA0002L8"].iter().enumerate() {
+        lib.insert_cartridge(SimCartridge::blank(b, 64 << 20), i).unwrap();
+    }
+    let c = Cluster::start_lib("read-drive2", false, lib, 3, &["PA0001L8", "PA0002L8"]);
+    let (leader, round) = c.wait_serving(None, 0);
+    let svc = c.services[&leader].clone();
+    c.wait("文件服务开放", || svc.serving_round() == Some(round));
+    let results = put_until(&svc, "r", 3000, 5, |_| false);
+    c.wait("第一盘转 data_full", || c.st(leader).tapes.get("PA0001L8").is_some_and(|t| t.0 == "data_full"));
+    let db = c.dir.join(format!("directory-{}.db", leader));
+    c.wait("目录追上", || tape_rs::daemon::directory::Directory::open_reader(&db).unwrap().list(POOL).map(|l| l.len()).unwrap_or(0) == 5);
+
+    let drives = |lib: &SimLibrary| -> Vec<Option<String>> { (0..2).map(|i| lib.loaded_barcode(i)).collect() };
+    let before = drives(&c.lib);
+    assert_eq!(c.read_via(leader, &results[0].0).unwrap(), body(3000, 0));
+    let during = drives(&c.lib);
+    assert!(during.iter().any(|b| b.as_deref() == Some("PA0001L8")), "读带装进了一个驱动器: {during:?}");
+    assert!(during.iter().any(|b| b.as_deref() == Some("PA0002L8")), "写入带没被动: {during:?}");
+    assert_ne!(before, during);
+    // 写入不受影响，再次读同一盘不重新装载
+    assert!(matches!(upload(&svc, "/mid.bin", &body(100, 7)).unwrap(), TaskStatus::Committed { .. }));
+    assert_eq!(c.read_via(leader, &results[1].0).unwrap(), body(3000, 1));
+    assert_eq!(drives(&c.lib), during);
+    // 空闲 250 ms 后读带被卸回
+    c.wait("读带空闲卸回", || !drives(&c.lib).iter().any(|b| b.as_deref() == Some("PA0001L8")));
+    assert!(drives(&c.lib).iter().any(|b| b.as_deref() == Some("PA0002L8")));
+    c.shutdown();
+}
+
+/// PN07：目录比磁带还新（不应出现）时，装载后不改目录，把带标为 check 等人核验。
+#[test]
+fn a_directory_ahead_of_the_tape_marks_the_tape_for_checking() {
+    let lib = small_tape_library(64);
+    let c = Cluster::start_lib("dir-ahead", false, lib, 3, &["PA0001L8", "PA0002L8"]);
+    let (leader, round) = c.wait_serving(None, 0);
+    let svc = c.services[&leader].clone();
+    c.wait("文件服务开放", || svc.serving_round() == Some(round));
+    let results = put_until(&svc, "r", 3000, 4, |_| false);
+    c.wait("第一盘转 data_full", || c.st(leader).tapes.get("PA0001L8").is_some_and(|t| t.0 == "data_full"));
+    let real_gen = c.st(leader).tapes["PA0001L8"].1;
+    // 伪造一条比磁带更新的目录批次
+    use tape_rs::daemon::state::FileRec;
+    c.admin(Command::CatalogPart { barcode: "PA0001L8".into(), generation: real_gen + 5, part: 0, files: vec![FileRec { path: "/ghost.bin".into(), length: 1, sha256: String::new() }] });
+    c.admin(Command::TapeCommitted { barcode: "PA0001L8".into(), volume_uuid: "x".into(), generation: real_gen + 5, files: 4, bytes_used: 1, parts: 1, full: false });
+    c.wait("伪造批次已应用", || c.st(leader).tapes["PA0001L8"].1 == real_gen + 5);
+    assert!(svc.stat("/ghost.bin").unwrap().is_some());
+    // 读第一盘上的真实文件会装载它：发现目录比磁带新
+    assert_eq!(c.read_via(leader, &results[0].0).unwrap(), body(3000, 0));
+    c.wait("标为 check", || c.st(leader).tapes["PA0001L8"].0 == "check");
+    assert!(svc.stat("/ghost.bin").unwrap().is_some(), "不自动改目录，等人核验");
     c.shutdown();
 }

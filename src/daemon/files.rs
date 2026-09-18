@@ -294,6 +294,13 @@ impl FileService {
         g.read_only = pool_uuid.map(|p| (round, p));
     }
 
+    /// 写入侧是否空闲：队列空、没有正在提交的批、没有已准入但未完成的上传、没有待处理的换带。
+    /// 只有一个驱动器时，只有这时才允许把写入带换下来读别的带。
+    pub fn write_side_idle(&self, round: u64) -> bool {
+        let g = self.lock();
+        g.serving.as_ref().filter(|s| s.round == round).is_some_and(|s| s.queue.is_empty() && s.in_batch.is_empty() && s.admitted == 0 && s.switch.is_none())
+    }
+
     /// 执行线程询问：当前这盘带是否需要换掉，换成什么状态。
     pub fn switch_requested(&self, round: u64) -> Option<&'static str> {
         self.lock().serving.as_ref().filter(|s| s.round == round).and_then(|s| s.switch)

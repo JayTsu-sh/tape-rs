@@ -51,6 +51,9 @@ struct Args {
     /// 自动格式化空白带时用的块大小（字节）
     #[arg(long, default_value_t = 524_288)]
     block_size: u32,
+    /// 为读请求装载的带空闲这么久后卸回槽位（毫秒）
+    #[arg(long, default_value_t = 300_000)]
+    read_idle_ms: u64,
     /// 自动收尾时打捞未索引数据（默认放弃）
     #[arg(long)]
     salvage: bool,
@@ -110,6 +113,7 @@ fn main() {
         demo_write: args.demo_write,
         salvage: args.salvage,
         block_size: args.block_size,
+        read_idle: Duration::from_millis(args.read_idle_ms),
     };
     let policy = BatchPolicy {
         max_bytes: args.batch_mib << 20,

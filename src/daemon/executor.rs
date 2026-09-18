@@ -88,8 +88,24 @@ pub enum ExecRequest {
     /// 文件服务有已完成的上传等待落带。
     Work,
     /// 读出一个已提交文件的内容。
-    Read { path: String, reply: Sender<std::result::Result<Vec<u8>, String>> },
+    Read { path: String, reply: Sender<std::result::Result<Vec<u8>, ReadError>> },
     Shutdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadError {
+    /// 此刻读不了，稍后重试即可：只有一个驱动器且写入侧正忙，或换带尚未完成。
+    Busy(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadError::Busy(s) => write!(f, "稍后重试: {}", s),
+            ReadError::Failed(s) => write!(f, "{}", s),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +132,8 @@ pub struct ExecOptions {
     pub salvage: bool,
     /// 自动格式化空白带时用的块大小
     pub block_size: u32,
+    /// 为读请求装载的带空闲这么久后卸回槽位
+    pub read_idle: Duration,
 }
 
 struct Active {
@@ -125,6 +143,8 @@ struct Active {
     serving: bool,
     /// 正在服务的驱动器在 `devices` 里的下标
     drive: Option<usize>,
+    /// 为读请求装载的带：驱动器下标、条码、最近一次使用
+    read: Option<(usize, String, Instant)>,
     seq: u64,
 }
 
@@ -211,9 +231,9 @@ pub fn run(
                 }
             }
             Ok(ExecRequest::Read { path, reply }) => {
-                let res = match active.as_ref().filter(|a| a.serving).and_then(|a| a.drive.map(|i| (a, i))) {
-                    Some((a, i)) => read_file(a.devices[i].dev.as_ref(), &path).map_err(|e| e.to_string()),
-                    None => Err("本节点不在服务".to_string()),
+                let res = match active.as_mut().filter(|a| a.serving) {
+                    Some(a) => read_any(a, &opts, &files, &status, &tx, &path),
+                    None => Err(ReadError::Failed("本节点不在服务".to_string())),
                 };
                 let _ = reply.send(res);
             }
@@ -285,7 +305,7 @@ fn takeover(provider: &dyn DeviceProvider, opts: &ExecOptions, round: u64) -> Re
             }
         }
     }
-    Ok(Active { round, key, devices, serving: false, drive: None, seq: 0 })
+    Ok(Active { round, key, devices, serving: false, drive: None, read: None, seq: 0 })
 }
 
 fn catalog_of(index: &crate::ltfs::index::LtfsIndex) -> (Vec<FileRec>, u64) {
@@ -680,8 +700,135 @@ fn read_file(dev: &dyn TapeTransport, path: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// 读一个文件，无论它在哪盘带上。目录给出条码；不在驱动器里就装载。
+/// 有第二个驱动器就用它（读带留在里面，空闲后卸回）；只有一个驱动器就临时换带，读完换回。
+fn read_any(a: &mut Active, opts: &ExecOptions, files: &FileService, status: &SharedStatus, tx: &Sender<ExecEvent>, path: &str) -> std::result::Result<Vec<u8>, ReadError> {
+    read_any_inner(a, opts, files, status, tx, path)
+}
+
+fn read_any_inner(a: &mut Active, opts: &ExecOptions, files: &FileService, status: &SharedStatus, tx: &Sender<ExecEvent>, path: &str) -> std::result::Result<Vec<u8>, ReadError> {
+    use ReadError::{Busy, Failed};
+    let st = files.stat(path).map_err(|e| Failed(e.to_string()))?.ok_or_else(|| Failed(format!("文件不存在: {}", path)))?;
+    let barcode = st.barcode;
+    // 1. 就在写入带上
+    if files.tape().is_some_and(|t| t.barcode == barcode) {
+        if let Some(i) = a.drive {
+            return read_file(a.devices[i].dev.as_ref(), path).map_err(|e| Failed(e.to_string()));
+        }
+    }
+    // 2. 就在读带上
+    if let Some((i, b, _)) = &a.read {
+        if *b == barcode {
+            let i = *i;
+            let out = read_file(a.devices[i].dev.as_ref(), path).map_err(|e| Failed(e.to_string()))?;
+            a.read = Some((i, barcode, Instant::now()));
+            return Ok(out);
+        }
+    }
+    // 3. 要装载。先找驱动器
+    let inv = inventory(&a.devices).map_err(|e| Failed(e.to_string()))?;
+    let Some(&from) = inv.slots.get(&barcode) else {
+        return Err(Failed(format!("{} 不在库里的存储槽位中", barcode)));
+    };
+    let write_dev = a.drive;
+    let mut target: Option<usize> = None;
+    // 3a. 之前的读带占着一个驱动器：卸回去
+    if let Some((i, b, _)) = a.read.take() {
+        if let Some(d) = inv.drives.iter().find(|d| d.dev == i) {
+            unload_drive(&a.devices, &inv, d).map_err(|e| Failed(format!("卸下读带 {} 失败: {}", b, e)))?;
+            target = Some(i);
+        }
+    }
+    let inv = inventory(&a.devices).map_err(|e| Failed(e.to_string()))?;
+    if target.is_none() {
+        target = inv.drives.iter().find(|d| d.loaded.is_none() && Some(d.dev) != write_dev).map(|d| d.dev);
+    }
+    let mut swapped_write = false;
+    if target.is_none() {
+        // 3b. 没有第二个驱动器：把写入带暂时卸下（先落带），读完再换回
+        let Some(w) = write_dev else { return Err(Failed("没有可用的驱动器".to_string())) };
+        // 写入侧还在忙（队列、在途上传、提交中、待换带）就不换：让读请求稍后重试，
+        // 而不是让写入等读。执行线程若在这里原地等，队列就没人落带了。
+        if !files.write_side_idle(a.round) {
+            return Err(Busy(format!("唯一的驱动器正在写入 {}，读 {} 上的文件要等写入侧空闲", files.tape().map(|t| t.barcode).unwrap_or_default(), barcode)));
+        }
+        files.close("暂时换带读取");
+        if let Some(d) = inv.drives.iter().find(|d| d.dev == w) {
+            unload_drive(&a.devices, &inv, d).map_err(|e| Failed(format!("卸下写入带失败: {}", e)))?;
+        }
+        a.drive = None;
+        target = Some(w);
+        swapped_write = true;
+    }
+    let i = target.expect("已确定驱动器");
+    let inv = inventory(&a.devices).map_err(|e| Failed(e.to_string()))?;
+    let addr = inv.drives.iter().find(|d| d.dev == i).map(|d| d.addr).ok_or_else(|| Failed("驱动器不在库存里".to_string()))?;
+    info!("执行线程: 为读取装载 {} -> {}", barcode, a.devices[i].name);
+    let loaded = move_medium(&a.devices, from, addr)
+        .and_then(|_| wait_ready(a.devices[i].dev.as_ref()))
+        .and_then(|_| LtfsVolume::mount(a.devices[i].dev.as_ref()));
+    let result = match loaded {
+        Ok(vol) => {
+            // 装载了就对账：目录若落后于磁带，以磁带为准
+            let known = status.lock().unwrap_or_else(|e| e.into_inner()).tapes.get(&barcode).map(|t| t.1).unwrap_or(0);
+            if known != vol.index().generation {
+                let (list, bytes_used) = catalog_of(vol.index());
+                let _ = tx.send(ExecEvent::Committed {
+                    round: a.round,
+                    barcode: barcode.clone(),
+                    volume_uuid: vol.label().volume_uuid.to_string(),
+                    generation: vol.index().generation,
+                    files_total: list.len() as u64,
+                    bytes_used,
+                    files: list,
+                    full: true,
+                });
+            }
+            let p = path.trim_start_matches('/');
+            let mut out = Vec::new();
+            vol.read_file_to_writer(p, &mut out).map(|_| out).map_err(|e| Failed(e.to_string()))
+        }
+        Err(e) => Err(Failed(format!("装载 {} 读取失败: {}", barcode, e))),
+    };
+    if swapped_write {
+        // 读完就换回：读带卸回槽位，重新选写入带
+        let inv2 = inventory(&a.devices).map_err(|e| Failed(e.to_string()))?;
+        if let Some(d) = inv2.drives.iter().find(|d| d.dev == i) {
+            let _ = unload_drive(&a.devices, &inv2, d);
+        }
+        match ensure_write_tape(a, opts, files, status, tx) {
+            Ok(summary) => {
+                let _ = tx.send(ExecEvent::Serving { round: a.round, summary });
+            }
+            Err(e) => return Err(Failed(format!("读取后恢复写入带失败: {}", e))),
+        }
+    } else {
+        a.read = Some((i, barcode, Instant::now()));
+    }
+    result
+}
+
+/// 读带空闲太久：卸回槽位，把驱动器腾出来。
+fn unload_idle_read_tape(a: &mut Active, opts: &ExecOptions) {
+    let Some((i, b, last)) = &a.read else { return };
+    if last.elapsed() < opts.read_idle {
+        return;
+    }
+    let (i, b) = (*i, b.clone());
+    if let Ok(inv) = inventory(&a.devices) {
+        if let Some(d) = inv.drives.iter().find(|d| d.dev == i) {
+            match unload_drive(&a.devices, &inv, d) {
+                Ok(()) => info!("执行线程: 读带 {} 空闲，已卸回槽位", b),
+                Err(e) => warn!("执行线程: 卸下读带 {} 失败: {}", b, e),
+            }
+        }
+    }
+    a.read = None;
+}
+
 /// 服务期间的周期工作。返回 `Err(原因)` 表示已失去执行资格。
 fn periodic(a: &mut Active, opts: &ExecOptions) -> std::result::Result<(), String> {
+    unload_idle_read_tape(a, opts);
     if let (true, Some(i)) = (opts.demo_write, a.drive) {
         let dev = a.devices[i].dev.as_ref();
         a.seq += 1;

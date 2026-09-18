@@ -334,6 +334,16 @@ impl SimLibrary {
         Ok(())
     }
 
+    /// 驱动器数量。
+    pub fn drive_count(&self) -> usize {
+        lock(&self.state).drives.len()
+    }
+
+    /// 某个驱动器里装着的磁带条码。
+    pub fn loaded_barcode(&self, idx: usize) -> Option<String> {
+        lock(&self.state).drives.get(idx).and_then(|d| d.cartridge.clone())
+    }
+
     pub fn changer(&self) -> SimTransport {
         SimTransport {
             lib: Arc::clone(&self.state),

@@ -142,7 +142,11 @@ pub fn run(
                         if my_round != Some(round) || !is_leader {
                             info!("{} 第 {} 代的目录记录未写入日志：已不是执行者", barcode, generation);
                         } else if full && known == generation {
-                            // 接管时的完整列表：目录已经是这一代，不用重写
+                            // 装载时的完整列表：目录已经是这一代，不用重写
+                        } else if full && known > generation {
+                            // 目录比磁带还新：不应出现（磁带被回退或换了盘）。不改目录，标记该带待核验并告警
+                            warn!("{} 目录是第 {} 代，磁带只有第 {} 代：标记待核验，不自动修改", barcode, known, generation);
+                            propose(&mut node, &Command::TapeState { barcode, state: super::state::tape_state::CHECK.to_string() });
                         } else {
                             if full {
                                 info!("{} 目录停在第 {} 代，磁带是第 {} 代：以磁带为准重写该带的目录", barcode, known, generation);
@@ -228,14 +232,13 @@ pub fn run(
             if let Some(d) = directory.as_mut() {
                 d.apply(entry.index, &cmd, &applied)?;
             }
-            if let Applied::Admin(result) = &applied {
-                let waiter = <[u8; 8]>::try_from(entry.context.as_ref()).ok().and_then(|b| pending_admin.remove(&u64::from_be_bytes(b)));
-                if let Some(tx) = waiter {
-                    let _ = tx.send(match result {
-                        Ok(s) => AdminReply::Ok(s.clone()),
-                        Err(e) => AdminReply::Rejected(e.clone()),
-                    });
-                }
+            let waiter = <[u8; 8]>::try_from(entry.context.as_ref()).ok().and_then(|b| pending_admin.remove(&u64::from_be_bytes(b)));
+            if let Some(tx) = waiter {
+                let _ = tx.send(match &applied {
+                    Applied::Admin(Ok(s)) => AdminReply::Ok(s.clone()),
+                    Applied::Admin(Err(e)) => AdminReply::Rejected(e.clone()),
+                    _ => AdminReply::Ok("已应用".to_string()),
+                });
             }
             match applied {
                 Applied::NewExecutor(e) if e.node == cfg.id && is_leader && e.term == term => {

@@ -270,7 +270,10 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
             }
             match rx.recv_timeout(ctx.wait_timeout) {
                 Ok(Ok(bytes)) => respond(&mut conn, 200, "OK", "application/octet-stream", &bytes),
-                Ok(Err(e)) => respond_json(&mut conn, 404, "Not Found", json!({"error": "read_failed", "detail": e})),
+                Ok(Err(tape_rs_read_busy @ super::executor::ReadError::Busy(_))) => {
+                    respond_json(&mut conn, 503, "Service Unavailable", json!({"error": "drive_busy", "detail": tape_rs_read_busy.to_string()}))
+                }
+                Ok(Err(e)) => respond_json(&mut conn, 404, "Not Found", json!({"error": "read_failed", "detail": e.to_string()})),
                 Err(_) => respond_json(&mut conn, 504, "Gateway Timeout", json!({"error": "read_timeout"})),
             }
         }
