@@ -1,0 +1,26 @@
+# 续期接受语义与原始授权约束的细化审计
+
+Type: research
+Labels: wayfinder:research
+Status: resolved
+Assignee: raft_ha_research
+Parent: [高可用双接口 LTFS 客户端决策地图](../map.md)
+Blocked by: 30
+
+## Question
+
+审计 18 的原始 QG/RQ 裁定与 29/30 后续解释：哪些是用户接受的安全要求，哪些是草案自加的具体生效点？是否存在不弱化原要求的完整逻辑接受解释，或者必须明确报告语义变更？不得只是再复述 CAS 时间窗口。
+
+## Scope
+
+对照原始裁定及线性化原论文、必要官方时钟资料，区分项目语义和文献事实。给出成功续期、待处理、保守终止、明确终止及迟到发布的合法/非法历史；无法证明细化则明确不放行，不选库、不添实时假设、不实施或运行测试。独立 research 分支/工作树只提交报告。
+
+## Answer
+
+限定审计完成，见[研究报告](/tmp/tape-rs-renewal-refinement-JNW0rX/docs/research/renewal-contract-refinement.md)。独立分支 `research/renewal-contract-refinement`，报告提交 `242e44eb47a7f59aa5826dc62a9a4a6dd0211925`。
+
+回溯本地已记录的 18 QG/RQ：原要求是期限内接受合格证据、在途不延期、过期/终止不复活，未固定最终确认 C 为唯一接受点。第 30 轮将 P 限为未接受登记是助手后来采用的更强解释，不冒充用户原始逐项要求；报告不是对历史聊天的独立考证。
+
+依自动接受授权，推进[稳态续期细化候选](../renewal-acceptance.md)：成功分支以有后采样及时性证书的 P 为逻辑接受点，C 公开证明；失败分支不强行映射到 P。Pending 读者只能使用保守旧截止；关闭赢则终止不可逆，输给 C 则先重读；C 超过新期限仅是历史确认，不恢复当前执行权。
+
+完成的是顺序对象与条件历史映射草案，不是形式化或 Rust/弱内存/时钟组合证明。RA01—RA06 未实现/执行，首次启用、K→G、快速撤销和设备隔离仍待收敛；18 保持 claimed，09 依赖不解除，没有运行模型或访问设备。
