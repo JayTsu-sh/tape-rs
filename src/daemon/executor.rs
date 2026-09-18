@@ -89,7 +89,8 @@ pub enum ExecRequest {
     Work,
     /// 读出一个已提交文件的内容。
     Read { path: String, reply: Sender<std::result::Result<Vec<u8>, ReadError>> },
-    Shutdown,
+    /// 计划停机：落带、退带、释放预留，然后经 `done` 回执。见 `shut_down`。
+    Shutdown { done: Option<Sender<()>> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,7 +166,17 @@ pub fn run(
             wait = wait.min(due);
         }
         match rx.recv_timeout(wait) {
-            Ok(ExecRequest::Shutdown) | Err(RecvTimeoutError::Disconnected) => return,
+            Ok(ExecRequest::Shutdown { done }) => {
+                if let Some(a) = active.take() {
+                    shut_down(a, &files, &tx);
+                }
+                if let Some(d) = done {
+                    let _ = d.send(());
+                }
+                return;
+            }
+            // Raft 循环没了：不能再证明自己还有资格，立刻停手，也不去动设备
+            Err(RecvTimeoutError::Disconnected) => return,
             Ok(ExecRequest::Stop { round, reason }) => {
                 // 停手请求可能晚于更新一轮的接管请求到达：只停它指明的那一轮
                 if round.is_some() && active.as_ref().map(|a| a.round) != round {
@@ -274,6 +285,38 @@ pub fn run(
                     let _ = tx.send(ExecEvent::Lost { round, reason });
                 }
             }
+        }
+    }
+}
+
+/// 计划停机。顺序不能换：
+///
+/// 1. 关掉文件服务，不再收新的上传；
+/// 2. 把队列里已完成的上传落带并提交，让卷停在一个完整的尾部（失败也继续——卷交给下一个
+///    执行者按恢复协议收尾，那条路本来就存在）；
+/// 3. 给驱动器发 UNLOAD。Holo 的 handler 不收到 UNLOAD 不落盘（P4 查出来的），真实驱动器上
+///    这也是让介质回到可取走状态的一步；
+/// 4. **最后**才释放预留。释放只是计划移交的优化：不释放同样是安全的（下一个执行者会抢占），
+///    但会在设备上留下一个已经不存在的持有者，让下一轮多绕一次抢占。正因为它是优化，
+///    绝不能提前做——只有确认本线程不会再碰设备之后，放掉这层保护才是对的。
+fn shut_down(mut a: Active, files: &FileService, tx: &Sender<ExecEvent>) {
+    info!("执行线程: 轮次 {} 计划停机", a.round);
+    files.close("正在停机");
+    if a.serving && let Err(e) = process_uploads(&mut a, files, tx, true) {
+        warn!("执行线程: 停机前落带失败: {}；卷留给下一个执行者收尾", e);
+    }
+    let mut drives: Vec<usize> = [a.drive, a.read.as_ref().map(|(i, ..)| *i)].into_iter().flatten().collect();
+    drives.dedup();
+    for i in drives {
+        if let Err(e) = TapeDrive::new(a.devices[i].dev.as_ref()).unload() {
+            warn!("执行线程: {} 退带失败: {}", a.devices[i].name, e);
+        }
+    }
+    for d in &a.devices {
+        match reservation::release_and_unregister(d.dev.as_ref(), a.key) {
+            Ok(()) => info!("执行线程: {} 的预留已释放", d.name),
+            // 已经被抢占的设备本来就不归我们了，不是错误
+            Err(e) => warn!("执行线程: {} 释放预留失败: {}", d.name, e),
         }
     }
 }

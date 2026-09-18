@@ -84,6 +84,42 @@ struct Args {
     /// 日志压缩：距上次快照累积这么多字节即做一次快照（MiB）
     #[arg(long, default_value_t = 256)]
     snapshot_mib: u64,
+    /// 收到 SIGTERM/SIGINT 后最多等多久让执行线程落带、退带、释放预留（秒）
+    #[arg(long, default_value_t = 300)]
+    shutdown_grace_s: u64,
+}
+
+/// SIGTERM/SIGINT 只置一个标志——信号处理函数里能做的事很少，发通道不在其中。
+/// 再来一次信号就直接退出，好让"按两次 Ctrl-C"可以放弃等待。
+static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_stop_signal(_: nix::libc::c_int) {
+    if STOPPING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        // 已经在停了，第二次信号不再等待
+        unsafe { nix::libc::_exit(1) };
+    }
+}
+
+/// 装上信号处理，并起一个线程把它转成 `NodeInput::Shutdown`。
+fn install_signal_handler(inbox: std::sync::mpsc::Sender<NodeInput>) {
+    use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+    let action = SigAction::new(SigHandler::Handler(on_stop_signal), SaFlags::empty(), SigSet::empty());
+    for sig in [Signal::SIGTERM, Signal::SIGINT] {
+        // SAFETY: 处理函数只对一个 AtomicBool 做 swap，失败路径只调 _exit，都是信号安全的
+        if let Err(e) = unsafe { sigaction(sig, &action) } {
+            eprintln!("装 {:?} 处理失败: {}", sig, e);
+        }
+    }
+    thread::Builder::new()
+        .name("ltfsd-signal".into())
+        .spawn(move || {
+            while !STOPPING.load(std::sync::atomic::Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(100));
+            }
+            log::info!("收到停机信号，正在计划停机（再按一次直接退出）");
+            let _ = inbox.send(NodeInput::Shutdown);
+        })
+        .expect("信号线程");
 }
 
 fn main() {
@@ -167,6 +203,7 @@ fn main() {
         status_file: Some(args.data_dir.join("status.json")),
         directory_file: Some(directory_file),
         cooldown: Duration::from_secs(20),
+        shutdown_grace: Duration::from_secs(args.shutdown_grace_s),
         snapshot: tape_rs::daemon::store::SnapshotPolicy {
             entries: args.snapshot_entries,
             bytes: args.snapshot_mib << 20,
@@ -187,6 +224,7 @@ fn main() {
         });
         http::serve(listen, ctx).expect("启动客户端接口");
     }
+    install_signal_handler(inbox_tx.clone());
     if let Err(e) =
         node::run_with(cfg, store, Box::new(net), Some(fetcher), Some(inbox_tx.clone()), inbox_rx, exec_tx, status)
     {

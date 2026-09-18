@@ -163,6 +163,7 @@ impl Cluster {
                 status_file: None,
                 directory_file: Some(dir.join(format!("directory-{}.db", id))),
                 cooldown: Duration::from_millis(1500),
+                shutdown_grace: Duration::from_secs(20),
                 // 压得很紧：每个用例都会走一遍快照与日志压缩
                 snapshot: tape_rs::daemon::store::SnapshotPolicy { entries: 32, bytes: 8 << 20 },
             };
@@ -258,7 +259,8 @@ impl Cluster {
         for tx in self.inboxes.values() {
             let _ = tx.send(NodeInput::Shutdown);
         }
-        thread::sleep(Duration::from_millis(100));
+        // 停机现在要落带、退带、放预留，别在它做完之前把数据目录删掉
+        thread::sleep(Duration::from_millis(400));
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -1078,4 +1080,52 @@ fn a_lagging_node_catches_up_from_a_snapshot_and_pulls_the_directory() {
     // 它自己的日志也已经压缩过：重启不必从头重放
     assert!(log_range(&c.dir, lagging).1 > 1, "落后节点的日志也从快照点开始");
     c.shutdown();
+}
+
+/// 计划停机：把队列落带、退带，最后释放全部设备的预留。不释放也是安全的（下一个执行者会抢占），
+/// 但设备上会留着一个已经不存在的持有者。
+#[test]
+fn a_planned_shutdown_commits_the_queue_and_releases_every_reservation() {
+    let c = Cluster::start_with("graceful", false);
+    let (leader, round) = c.wait_serving(None, 0);
+    let svc = c.services[&leader].clone();
+    c.wait("文件服务开放", || svc.serving_round() == Some(round));
+    let files = put_until(&svc, "g", 4000, 3, |_| false);
+    assert!(files.iter().all(|(_, r)| matches!(r, Ok(TaskStatus::Committed { .. }))), "{:?}", files);
+
+    // 停机之前：执行者持有全部设备
+    let key = ReservationKey::new(leader as u8, round);
+    let drives = c.lib.drive_count();
+    for i in 0..drives {
+        assert_eq!(read_status(&c.lib.drive_as(i, 99)).unwrap().holder.map(|h| h.0), Some(key.0));
+    }
+    // 模拟器的换带器不支持 PR（fence 对它返回 Unsupported），所以这里只看驱动器
+
+    for tx in c.inboxes.values() {
+        let _ = tx.send(NodeInput::Shutdown);
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let clear = || {
+        let drives = (0..drives).all(|i| {
+            let st = read_status(&c.lib.drive_as(i, 99)).unwrap();
+            st.holder.is_none() && st.keys.is_empty()
+        });
+        drives
+    };
+    while !clear() {
+        assert!(Instant::now() < deadline, "停机后设备上仍有预留或注册");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // 卷仍是完整的：停机前落的带读得回来，下一次接管不必收尾。
+    // 停机给驱动器发过 UNLOAD，介质已退出，要先 LOAD 回去才能读
+    let dev = c.lib.drive_as(0, 99);
+    tape_rs::tape::commands::TapeDrive::new(&dev).load().unwrap();
+    let vol = tape_rs::ltfs::volume::LtfsVolume::mount(&dev).unwrap();
+    assert!(vol.writable(), "停机后卷应当是完整尾部: {:?}", vol.recovery().notes);
+    let on_tape: Vec<String> = vol.list().into_iter().map(|f| f.0).collect();
+    for (p, _) in &files {
+        assert!(on_tape.iter().any(|t| t.trim_start_matches('/') == p.trim_start_matches('/')), "{p} 不在带上: {on_tape:?}");
+    }
+    let _ = std::fs::remove_dir_all(&c.dir);
 }

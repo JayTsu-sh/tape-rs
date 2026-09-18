@@ -33,6 +33,8 @@ pub struct NodeConfig {
     pub cooldown: Duration,
     /// 多久做一次快照并压缩日志
     pub snapshot: SnapshotPolicy,
+    /// 计划停机时最多等执行线程多久（落带、退带、释放预留）
+    pub shutdown_grace: Duration,
 }
 
 /// 对外可见的节点状态快照。
@@ -134,8 +136,20 @@ pub fn run_with(
     loop {
         let wait = next_tick.saturating_duration_since(Instant::now());
         match inbox.recv_timeout(wait) {
-            Ok(NodeInput::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
-                let _ = exec.send(ExecRequest::Shutdown);
+            Ok(NodeInput::Shutdown) => {
+                // 等执行线程把队列落带、退带、放掉预留，再让进程退出。等不到就照常退：
+                // 不释放预留是安全的，下一个执行者会抢占。
+                let (done, wait_done) = std::sync::mpsc::channel();
+                if exec.send(ExecRequest::Shutdown { done: Some(done) }).is_ok()
+                    && wait_done.recv_timeout(cfg.shutdown_grace).is_err()
+                {
+                    warn!("等执行线程停机超过 {:?}，直接退出；设备上的预留留给下一个执行者抢占", cfg.shutdown_grace);
+                }
+                info!("节点 {} 停机", cfg.id);
+                return Ok(());
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = exec.send(ExecRequest::Shutdown { done: None });
                 return Ok(());
             }
             Ok(NodeInput::Raft(m)) => {
