@@ -136,6 +136,10 @@ pub enum ExecEvent {
     Lost { round: u64, reason: String },
     /// 一盘带回收完毕：内容已全部搬到同池的其他带上，源带已重新格式化并写好池标记。
     Reclaimed { round: u64, barcode: String, volume_uuid: String, files: u64, bytes: u64 },
+    /// 一次回收没做完就放弃了。`state` 是带该回到的状态：资源不够（驱动器数、装不上、
+    /// 路径一直被占）退回 `appendable`；数据对不上、读不出来这类问题标成 `check`。
+    /// 带绝不能留在 `reclaiming` 上——那个状态没有别的出口，而且带还会被继续写。
+    ReclaimAbandoned { round: u64, barcode: String, reason: String, state: String },
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +168,11 @@ struct Active {
     /// 本轮已写下的文件数，同时是版本号里的序号
     seq: u64,
     reclaim: Option<Reclaim>,
+    /// 连续几个周期没能开始回收（装不上、没有空驱动器）
+    reclaim_failures: u32,
+    /// 刚放弃回收的带和放弃后过了几个周期：状态里的 `reclaiming` 要等 TapeState 应用后才消失，
+    /// 这期间不要再拿它开工
+    reclaim_given_up: Option<(String, u32)>,
 }
 
 /// 正在进行的回收。状态在 Raft 里（磁带状态 `reclaiming`），这里只是本轮的工作现场：
@@ -187,6 +196,10 @@ struct Reclaim {
 
 /// 同一个路径反复被客户端重写时，回收最多让路这么多遍。
 const RECLAIM_MAX_PASSES: u32 = 20;
+/// 开始回收（装源带）连续失败这么多个周期就放弃，把带退回可写。
+const RECLAIM_START_ATTEMPTS: u32 = 5;
+/// 放弃之后最多等这么多个周期让 TapeState 应用；超过了就当提案丢了，重新来过。
+const RECLAIM_GIVE_UP_GRACE: u32 = 10;
 /// 搬完之后最多等目录应用这么多个工作周期（默认 3 秒一个，约 5 分钟）。
 const RECLAIM_MAX_WAITS: u32 = 100;
 
@@ -402,7 +415,7 @@ fn takeover(provider: &dyn DeviceProvider, opts: &ExecOptions, round: u64) -> Re
             }
         }
     }
-    Ok(Active { round, key, devices, serving: false, drive: None, read: None, seq: 0, reclaim: None })
+    Ok(Active { round, key, devices, serving: false, drive: None, read: None, seq: 0, reclaim: None, reclaim_failures: 0, reclaim_given_up: None })
 }
 
 fn catalog_of(index: &crate::ltfs::index::LtfsIndex) -> (Vec<FileRec>, u64) {
@@ -973,18 +986,44 @@ fn drive_reclaim(
     tx: &Sender<ExecEvent>,
 ) -> std::result::Result<bool, String> {
     if a.reclaim.is_none() {
-        let Some(barcode) = pending_reclaim(status) else { return Ok(false) };
+        let Some(barcode) = pending_reclaim(status) else {
+            a.reclaim_given_up = None;
+            return Ok(false);
+        };
+        // 刚放弃过这盘带：等状态机把 TapeState 应用上来，别马上又拿它开工
+        if let Some((b, n)) = &mut a.reclaim_given_up {
+            if *b == barcode && *n < RECLAIM_GIVE_UP_GRACE {
+                *n += 1;
+                return Ok(false);
+            }
+            a.reclaim_given_up = None;
+        }
         match start_reclaim(a, opts, files, status, tx, &barcode) {
-            Ok(()) => {}
+            Ok(()) => a.reclaim_failures = 0,
             Err(e) if ownership_lost(&e) => return Err(e.to_string()),
             Err(e) => {
-                // 暂时干不了（没有空驱动器、带不在库里）：状态留着，下个周期再试
-                warn!("执行线程: 暂时无法回收 {}: {}", barcode, e);
+                // 干不了。驱动器不够是确定的；装不上、没有空驱动器再试几个周期。
+                // 之后都放弃并把带退回可写：留在 reclaiming 上既没有出口，又还会被继续写
+                a.reclaim_failures += 1;
+                let definite = a.devices.iter().filter(|d| d.kind == DeviceKind::Drive).count() < 2;
+                if definite || a.reclaim_failures >= RECLAIM_START_ATTEMPTS {
+                    a.reclaim_failures = 0;
+                    give_up_reclaim(a, tx, &barcode, &e.to_string(), tape_state::APPENDABLE);
+                } else {
+                    warn!("执行线程: 暂时无法回收 {}: {}（第 {} 次）", barcode, e, a.reclaim_failures);
+                }
                 return Ok(false);
             }
         }
     }
     reclaim_step(a, opts, files, status, tx)
+}
+
+/// 放弃对一盘带的回收：上报原因和它该回到的状态，并记住一段时间内不再拿它开工。
+fn give_up_reclaim(a: &mut Active, tx: &Sender<ExecEvent>, barcode: &str, reason: &str, state: &str) {
+    error!("执行线程: 放弃回收 {}（状态改为 {}）：{}", barcode, state, reason);
+    let _ = tx.send(ExecEvent::ReclaimAbandoned { round: a.round, barcode: barcode.to_string(), reason: reason.to_string(), state: state.to_string() });
+    a.reclaim_given_up = Some((barcode.to_string(), 0));
 }
 
 /// 准备工作现场：必要时先换掉写入带，再把源带装进另一台驱动器，读出它的工作单。
@@ -1078,8 +1117,10 @@ fn reclaim_step(
     let chunk = match copy_chunk(a, files) {
         Ok(c) => c,
         Err(e) if ownership_lost(&e) => return Err(e.to_string()),
+        // NotReady 是"这次做不成"（路径一直被客户端占着），不是带有问题
         Err(e) => {
-            abort_reclaim(a, tx, &e.to_string(), true);
+            let attention = !matches!(e, TapeError::NotReady(_));
+            abort_reclaim(a, tx, &e.to_string(), attention);
             return Ok(false);
         }
     };
@@ -1096,7 +1137,8 @@ fn reclaim_step(
         Ok(_) => Ok(false),
         Err(e) if ownership_lost(&e) => Err(e.to_string()),
         Err(e) => {
-            abort_reclaim(a, tx, &e.to_string(), true);
+            let attention = !matches!(e, TapeError::NotReady(_));
+            abort_reclaim(a, tx, &e.to_string(), attention);
             Ok(false)
         }
     }
@@ -1150,7 +1192,7 @@ fn copy_chunk(a: &mut Active, files: &FileService) -> Result<Chunk> {
     }
     r.passes += 1;
     if r.passes > RECLAIM_MAX_PASSES {
-        return Err(TapeError::Ltfs(format!(
+        return Err(TapeError::NotReady(format!(
             "{} 上有 {} 个路径一直被客户端占用（例如 {}），放弃这次回收",
             r.barcode,
             r.retry.len(),
@@ -1313,13 +1355,11 @@ fn unload_reclaim_drive(a: &Active, di: usize, barcode: &str) {
 }
 
 /// 放弃这次回收。`needs_attention` 为真时把带标成待核验：数据对不上、读不出来这类问题
-/// 必须有人来看，绝不能让它继续留在回收队列里被反复重试。
+/// 必须有人来看；否则退回可写。两种情况都不能让它继续留在回收队列里被反复重试。
 fn abort_reclaim(a: &mut Active, tx: &Sender<ExecEvent>, reason: &str, needs_attention: bool) {
     let Some(r) = a.reclaim.take() else { return };
-    error!("执行线程: 放弃回收 {}：{}", r.barcode, reason);
-    if needs_attention {
-        let _ = tx.send(ExecEvent::TapeState { round: a.round, barcode: r.barcode.clone(), state: tape_state::CHECK.to_string() });
-    }
+    let state = if needs_attention { tape_state::CHECK } else { tape_state::APPENDABLE };
+    give_up_reclaim(a, tx, &r.barcode, reason, state);
     unload_reclaim_drive(a, r.drive, &r.barcode);
 }
 

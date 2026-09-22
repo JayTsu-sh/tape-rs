@@ -459,6 +459,15 @@ impl ControlState {
             }
             _ => {}
         }
+        // 与 EE 一致（GLESR211E）：搬出来的文件要有地方放。同池里没有别的可写带，
+        // 受理了也只会让这盘带停在 reclaiming 上没有出口
+        let pool = &self.tapes[barcode];
+        let has_target = self.tapes.iter().any(|(b, u)| {
+            u == pool && b != barcode && self.tape_state.get(b).map(String::as_str).unwrap_or(tape_state::APPENDABLE) == tape_state::APPENDABLE
+        });
+        if !has_target {
+            return Err(format!("{} 所在的池里没有别的可写带作为回收目标", barcode));
+        }
         self.tape_state.insert(barcode.to_string(), tape_state::RECLAIMING.to_string());
         Ok(format!("{} 开始回收", barcode))
     }
@@ -601,7 +610,8 @@ mod tests {
         assert_eq!(restored, s);
     }
 
-    /// 回收会格式化源带，所以入口的校验要严：只对已归属、且状态说明带本身没问题的带受理。
+    /// 回收会格式化源带，所以入口的校验要严：只对已归属、且状态说明带本身没问题的带受理，
+    /// 而且同池里得有别的可写带能接收搬出来的文件（EE 的 GLESR211E）。
     #[test]
     fn reclaim_is_only_accepted_for_an_assigned_healthy_tape() {
         let mut s = ControlState::default();
@@ -609,9 +619,16 @@ mod tests {
         let reclaim = |b: &str| Command::TapeReclaim { barcode: b.into() };
         assert!(matches!(s.apply(2, &reclaim("T1")), Applied::Admin(Err(_))), "未归属的带不受理");
         s.apply(3, &Command::TapeAssign { barcode: "T1".into(), pool: "p".into() });
+        assert!(matches!(s.apply(4, &reclaim("T1")), Applied::Admin(Err(e)) if e.contains("目标")), "池里只有这一盘带，没有目标");
+        assert_eq!(s.tape_state.get("T1"), None, "被拒绝的命令不改状态");
+        s.apply(5, &Command::TapeAssign { barcode: "T2".into(), pool: "p".into() });
+        s.apply(6, &Command::TapeState { barcode: "T2".into(), state: tape_state::FULL.into() });
+        assert!(matches!(s.apply(7, &reclaim("T1")), Applied::Admin(Err(_))), "写满的带不算目标");
+        s.apply(8, &Command::TapeState { barcode: "T2".into(), state: tape_state::APPENDABLE.into() });
         assert!(matches!(s.apply(4, &reclaim("T1")), Applied::Admin(Ok(_))));
         assert_eq!(s.tape_state["T1"], tape_state::RECLAIMING);
         assert!(matches!(s.apply(5, &reclaim("T1")), Applied::Admin(Err(_))), "重复下发不受理");
+        assert!(matches!(s.apply(5, &reclaim("T2")), Applied::Admin(Err(_))), "T1 在回收中，不能再当 T2 的目标");
 
         // 带本身有问题的，先人工处理
         s.apply(6, &Command::TapeState { barcode: "T1".into(), state: tape_state::CHECK.into() });

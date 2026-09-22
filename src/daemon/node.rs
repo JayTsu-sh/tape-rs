@@ -35,6 +35,9 @@ pub struct NodeConfig {
     pub snapshot: SnapshotPolicy,
     /// 计划停机时最多等执行线程多久（落带、退带、释放预留）
     pub shutdown_grace: Duration,
+    /// 本节点配置的驱动器数。回收需要两台（一台放写入带、一台放源带），
+    /// 不够时 Leader 在受理阶段就同步拒绝，不进日志。
+    pub drives: usize,
 }
 
 /// 对外可见的节点状态快照。
@@ -52,6 +55,19 @@ pub struct NodeStatus {
     pub pools: Vec<PoolRow>,
     /// 条码 → 概况
     pub tapes: std::collections::BTreeMap<String, TapeRow>,
+    /// 本节点配置的驱动器数
+    pub drives: usize,
+    /// 本节点执行线程最近一次回收的结果（做完或放弃）。节点本地事实，换届后清空。
+    pub last_reclaim: Option<ReclaimRecord>,
+}
+
+/// 最近一次回收的结果。`outcome` 是 `done` 或 `abandoned`，`detail` 是搬迁量或放弃原因。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReclaimRecord {
+    pub round: u64,
+    pub barcode: String,
+    pub outcome: String,
+    pub detail: String,
 }
 
 /// 一盘带在控制状态里的概况。
@@ -144,6 +160,7 @@ pub fn run_with(
     let mut proposed_term: Option<u64> = None;
     let mut cooldown_until = Instant::now();
     let mut local = String::from("空闲");
+    let mut last_reclaim: Option<ReclaimRecord> = None;
     let mut next_tick = Instant::now() + cfg.tick;
     let mut last_status = String::new();
 
@@ -174,6 +191,15 @@ pub fn run_with(
             Ok(NodeInput::Admin { cmd, reply }) => {
                 if node.raft.state != StateRole::Leader {
                     let _ = reply.send(AdminReply::NotLeader(node.raft.leader_id));
+                } else if let Command::TapeReclaim { barcode } = &cmd
+                    && cfg.drives < 2
+                {
+                    // 与 EE 一致（GLESL154E）：资源不够是命令期失败，磁带状态不动。
+                    // 驱动器数是本节点的事实，进不了状态机，所以在提案之前拦下
+                    let _ = reply.send(AdminReply::Rejected(format!(
+                        "回收 {} 需要两台驱动器（一台放写入带，一台放源带），本节点只配置了 {} 台",
+                        barcode, cfg.drives
+                    )));
                 } else {
                     let id = next_admin;
                     next_admin += 1;
@@ -261,6 +287,12 @@ pub fn run_with(
                         }
                     }
                     ExecEvent::Reclaimed { round, barcode, volume_uuid, files, bytes } => {
+                        last_reclaim = Some(ReclaimRecord {
+                            round,
+                            barcode: barcode.clone(),
+                            outcome: "done".into(),
+                            detail: format!("搬走 {} 个文件 / {} MiB，已重新格式化", files, bytes >> 20),
+                        });
                         if my_round == Some(round) && is_leader {
                             info!("磁带 {} 回收完毕：搬走 {} 个文件 / {} MiB，已重新格式化", barcode, files, bytes >> 20);
                             propose(&mut node, &Command::TapeReclaimed { barcode, volume_uuid });
@@ -276,6 +308,13 @@ pub fn run_with(
                             propose(&mut node, &Command::TapeState { barcode, state });
                         }
                     }
+                    ExecEvent::ReclaimAbandoned { round, barcode, reason, state } => {
+                        last_reclaim = Some(ReclaimRecord { round, barcode: barcode.clone(), outcome: "abandoned".into(), detail: reason.clone() });
+                        if my_round == Some(round) && is_leader {
+                            warn!("磁带 {} 的回收已放弃（{}），状态改为 {}", barcode, reason, state);
+                            propose(&mut node, &Command::TapeState { barcode, state });
+                        }
+                    }
                     ExecEvent::Serving { round, summary } => {
                         info!("轮次 {} 开始服务：{}", round, summary);
                         local = format!("轮次 {}：服务中。{}", round, summary);
@@ -283,6 +322,7 @@ pub fn run_with(
                     ExecEvent::FenceFailed { round, reason } | ExecEvent::Lost { round, reason } => {
                         error!("轮次 {} 放弃：{}", round, reason);
                         local = format!("轮次 {} 已放弃：{}", round, reason);
+                        last_reclaim = None;
                         if my_round == Some(round) {
                             my_round = None;
                         }
@@ -426,7 +466,7 @@ pub fn run_with(
             });
         }
 
-        publish_status(&cfg, &node, &ctl, &local, &status, &mut last_status);
+        publish_status(&cfg, &node, &ctl, &local, &last_reclaim, &status, &mut last_status);
     }
 }
 
@@ -554,11 +594,14 @@ fn publish_status(
     node: &RawNode<ControlStorage>,
     ctl: &ControlState,
     local: &str,
+    last_reclaim: &Option<ReclaimRecord>,
     shared: &SharedStatus,
     last: &mut String,
 ) {
     let st = NodeStatus {
         id: cfg.id,
+        drives: cfg.drives,
+        last_reclaim: last_reclaim.clone(),
         role: format!("{:?}", node.raft.state),
         term: node.raft.term,
         leader: node.raft.leader_id,
@@ -597,7 +640,8 @@ fn publish_status(
     let text = json!({
         "id": st.id, "role": st.role, "term": st.term, "leader": st.leader,
         "executor": st.executor.as_ref().map(|e| json!({"node": e.node, "round": e.round, "term": e.term, "fenced": e.fenced})),
-        "local": st.local, "applied_index": st.applied_index,
+        "local": st.local, "applied_index": st.applied_index, "drives": st.drives,
+        "last_reclaim": st.last_reclaim.as_ref().map(|r| json!({"round": r.round, "barcode": r.barcode, "outcome": r.outcome, "detail": r.detail})),
         "tapes": st.tapes.iter().map(|(b, t)| json!({"barcode": b, "state": t.state, "generation": t.generation, "files": t.files, "bytes_used": t.bytes_used, "bytes_written": t.bytes_written})).collect::<Vec<_>>(),
         "pools": st.pools.iter().map(|p| json!({"uuid": p.uuid, "name": p.name, "file_limit": p.file_limit, "tapes": p.tapes})).collect::<Vec<_>>(),
     })

@@ -113,6 +113,12 @@ impl Cluster {
 
     /// 用准备好的模拟库启动三节点集群，建一个池并把 `assign` 里的条码归进去。
     fn start_lib(name: &str, demo_write: bool, lib: SimLibrary, file_limit: u64, assign: &[&str]) -> Self {
+        Self::start_lib_with(name, demo_write, lib, file_limit, assign, None)
+    }
+
+    /// `claimed_drives` 是节点配置里声称的驱动器数（默认与模拟库一致）。故意报多，
+    /// 可以让 Leader 的受理检查放行、执行线程在设备上才发现不够。
+    fn start_lib_with(name: &str, demo_write: bool, lib: SimLibrary, file_limit: u64, assign: &[&str], claimed_drives: Option<usize>) -> Self {
 
         let dir = std::env::temp_dir().join(format!("ltfsd-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -165,6 +171,7 @@ impl Cluster {
                 directory_file: Some(dir.join(format!("directory-{}.db", id))),
                 cooldown: Duration::from_millis(1500),
                 shutdown_grace: Duration::from_secs(20),
+                drives: claimed_drives.unwrap_or(lib.drive_count()),
                 // 压得很紧：每个用例都会走一遍快照与日志压缩
                 snapshot: tape_rs::daemon::store::SnapshotPolicy { entries: 32, bytes: 8 << 20 },
             };
@@ -201,6 +208,24 @@ impl Cluster {
                 }
             }
             assert!(Instant::now() < deadline, "管理命令没有被受理: {:?}", cmd);
+            thread::sleep(Duration::from_millis(30));
+        }
+    }
+
+    /// 向当前 Leader 提交一条管理命令，返回状态机（或 Leader 受理阶段）的结论。
+    fn admin_result(&self, cmd: Command) -> std::result::Result<String, String> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            for id in 1..=3u64 {
+                let (tx, rx) = channel();
+                let _ = self.inboxes[&id].send(NodeInput::Admin { cmd: cmd.clone(), reply: tx });
+                match rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(AdminReply::Ok(s)) => return Ok(s),
+                    Ok(AdminReply::Rejected(why)) => return Err(why),
+                    _ => {}
+                }
+            }
+            assert!(Instant::now() < deadline, "管理命令没有得到结论: {:?}", cmd);
             thread::sleep(Duration::from_millis(30));
         }
     }
@@ -1060,6 +1085,82 @@ fn reclaiming_a_tape_moves_the_live_files_away_and_reformats_it() {
     // 源带真的被重新格式化了：带上一个文件都没有
     assert!(tape_files(&c.lib, "PA0001L8").is_empty(), "源带应当是空的");
     assert_eq!(tape_files(&c.lib, "PA0002L8").len(), 3);
+    c.shutdown();
+}
+
+/// 回收需要两台驱动器。只有一台的节点在受理阶段就同步拒绝（EE 的 GLESL154E），
+/// 磁带状态不动，也不进日志；服务照常。
+#[test]
+fn reclaim_is_refused_synchronously_when_the_node_has_one_drive() {
+    let lib = SimLibrary::new(1, 4, 1);
+    for (i, b) in ["PB0001L8", "PB0002L8"].iter().enumerate() {
+        lib.insert_cartridge(SimCartridge::blank(b, 64 << 20), i).unwrap();
+    }
+    let c = Cluster::start_lib("reclaim1", false, lib, 10, &["PB0001L8", "PB0002L8"]);
+    let (leader, round) = c.wait_serving(None, 0);
+    let svc = c.services[&leader].clone();
+    c.wait("文件服务开放", || svc.serving_round() == Some(round));
+    assert!(matches!(upload(&svc, "/s/a.bin", &body(2000, 1)).unwrap(), TaskStatus::Committed { .. }));
+    // 上传之后目录条目还在应用：等日志停下来再记基线
+    let applied_before = {
+        let mut last = c.st(leader).applied_index;
+        loop {
+            thread::sleep(Duration::from_millis(300));
+            let now = c.st(leader).applied_index;
+            if now == last {
+                break now;
+            }
+            last = now;
+        }
+    };
+
+    let why = c.admin_result(Command::TapeReclaim { barcode: "PB0001L8".into() }).unwrap_err();
+    assert!(why.contains("两台驱动器"), "{}", why);
+    let s = c.st(leader);
+    assert_eq!(s.tapes["PB0001L8"].state, "appendable");
+    assert_eq!(s.applied_index, applied_before, "被拒绝的命令不占日志");
+    assert_eq!(s.drives, 1);
+    // 写入没有被换带打断
+    assert!(matches!(upload(&svc, "/s/b.bin", &body(2000, 2)).unwrap(), TaskStatus::Committed { .. }));
+    assert_eq!(svc.tape().unwrap().barcode, "PB0001L8");
+    c.shutdown();
+}
+
+/// Leader 放行了、执行线程在设备上才发现干不了：带退回可写并记下原因，
+/// 不能永远停在 reclaiming 上（那个状态没有别的出口，而且带还会被继续写）。
+/// 同池没有别的可写带时状态机本身也拒绝（EE 的 GLESR211E）。
+#[test]
+fn a_reclaim_that_cannot_start_falls_back_to_appendable_with_a_reason() {
+    let lib = SimLibrary::new(1, 4, 1);
+    for (i, b) in ["PC0001L8", "PC0002L8"].iter().enumerate() {
+        lib.insert_cartridge(SimCartridge::blank(b, 64 << 20), i).unwrap();
+    }
+    // 节点声称有两台驱动器，模拟库里只有一台
+    let c = Cluster::start_lib_with("reclaim2", false, lib, 10, &["PC0001L8"], Some(2));
+    let (leader, round) = c.wait_serving(None, 0);
+    let svc = c.services[&leader].clone();
+    c.wait("文件服务开放", || svc.serving_round() == Some(round));
+    assert!(matches!(upload(&svc, "/t/a.bin", &body(2000, 1)).unwrap(), TaskStatus::Committed { .. }));
+
+    // 池里只有这一盘带：没有目标，状态机拒绝
+    let why = c.admin_result(Command::TapeReclaim { barcode: "PC0001L8".into() }).unwrap_err();
+    assert!(why.contains("目标"), "{}", why);
+    assert_eq!(c.st(leader).tapes["PC0001L8"].state, "appendable");
+
+    // 有了目标带，受理；执行线程发现只有一台驱动器，放弃并退回可写
+    c.admin(Command::TapeAssign { barcode: "PC0002L8".into(), pool: POOL.into() });
+    c.admin_result(Command::TapeReclaim { barcode: "PC0001L8".into() }).unwrap();
+    c.wait("回收放弃后退回可写", || {
+        let s = c.st(leader);
+        s.tapes["PC0001L8"].state == "appendable" && s.last_reclaim.as_ref().is_some_and(|r| r.outcome == "abandoned")
+    });
+    let r = c.st(leader).last_reclaim.unwrap();
+    assert_eq!(r.barcode, "PC0001L8");
+    assert!(r.detail.contains("两台驱动器"), "{}", r.detail);
+    // 内容还在，服务照常
+    assert_eq!(c.read_via(leader, "/t/a.bin").unwrap(), body(2000, 1));
+    assert!(matches!(upload(&svc, "/t/b.bin", &body(2000, 2)).unwrap(), TaskStatus::Committed { .. }));
+    assert!(tape_files(&c.lib, "PC0001L8").contains(&"t/a.bin".to_string()) || !tape_files(&c.lib, "PC0001L8").is_empty(), "源带没有被格式化");
     c.shutdown();
 }
 

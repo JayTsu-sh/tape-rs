@@ -201,6 +201,8 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                     "id": s.id, "role": s.role, "term": s.term, "leader": s.leader, "local": s.local,
                     "executor": s.executor.map(|e| json!({"node": e.node, "round": e.round, "fenced": e.fenced})),
                     "serving_round": ctx.files.serving_round(),
+                    "drives": s.drives,
+                    "last_reclaim": s.last_reclaim.map(|r| json!({"round": r.round, "barcode": r.barcode, "outcome": r.outcome, "detail": r.detail})),
                 }),
             )
         }

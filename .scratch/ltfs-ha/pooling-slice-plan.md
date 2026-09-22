@@ -432,7 +432,7 @@ P5 实机演练暴露的缺口：`kill -9` 之后设备上留着一个已经不�
 
 演练脚本里踩到的一点（不是产品问题）：`wipe` 用的是 `kill -9`，预留会按设计留在设备上等下一任抢占，所以**手工重置磁带之前得先 `pr-fence` + `pr-release` 清一次**，否则 `inventory` 直接 RESERVATION CONFLICT。集群自己接管时不需要这一步——新执行者的 `fence` 就是干这个的。
 
-#### 单驱动器下的回收：tape-rs 已实测，EE 对照未完成（2026-09-18，**进行中**）
+#### 单驱动器下的回收：tape-rs 与 EE 的对照（2026-09-18 起，2026-09-22 完成）
 
 **tape-rs 的行为（已实测，Holo TAPERS 库，三节点都用 `--drive-serial` 只给一台驱动器）**
 
@@ -462,26 +462,62 @@ P5 实机演练暴露的缺口：`kill -9` 之后设备上留着一个已经不�
 
 结论方向已经很清楚：**EE 把回收建模成一个任务对象**，无论成败都有 ID、有历史、有可查询的失败原因，而且默认是同步的、返回码有确定语义（`--async` 才变成后台任务）；资源不足一律是**命令期失败**，磁带状态不被改动。tape-rs 则是 fire-and-forget 地改了复制状态，把问题留在日志里。
 
-还没做到的那一步：**驱动器不足时 EE 具体报什么**。EE 的二进制里有两条对应消息——
+**驱动器不足时 EE 的行为（2026-09-22 实测完成）**
 
-- `For each device type for all tapes within pool %s, it is necessary to have two drives that match these device types.`
-- `For the reclamation of tape(s), the drives available do not match the required device type for the tapes within pool %s.`
+前置：EE8006L8 归入 EETEST 成功（任务 1083，格式化 4 秒），池里两盘带，磁带检查不再先触发。
 
-它们和"无效选项""磁带数超上限"排在同一块参数校验消息里，看着是命令期校验，但**没有实测到**，因为磁带检查总是先触发：EETEST 池里只有一盘 CLI 认得的带。EE 的磁带 ID 必须是 8 位（6 位 VOLSER + 2 位介质码，如 `EE8005L8`），而 Holo 自动命名生成的是 `前缀(3)+序号(3)+L08` 共 9 位（`EE8000L08`…），EE 直接以 `GLESL060E: Tape IDs must be eight characters long` 拒绝，所以那 6 盘备用带一盘都加不进池。
+| 场景 | EE 的行为 |
+| --- | --- |
+| down 两台驱动器只剩 1 台，`eeadm tape reclaim EE8005L8 -p EETEST` | 任务 1087，**同步返回 rc=2**，`GLESL154E: For the reclamation of tape(s), the drives available do not match the required device type for the tapes within pool EETEST.` 磁带状态不变 |
+| 同上，选择式 `-G 0 -U 0` | 任务 1088，同样 GLESL154E，rc=2 |
+| 同上，`--async` | rc=0，任务 1089 随后 failed；`task show` 里 `Workload: 0 tapes`、`Result Summary: (GLESL154E) …` |
+| 2 台 up（分属节点 2、3） | 任务 1091，rc=2，先 `GLESR229E: Reclaim and datamigrate operations within the same node group require at least one node that has two or more drives available for general operation.` 再 GLESL154E |
+| 3 台全 up（三节点各 1 台） | 任务 1093，同 GLESR229E + GLESL154E |
 
-**下次从这里接着做**
+两点结论：
 
-1. Holo 的建带 API 接受显式条码，正则是 `^([A-Z0-9]{1,3})([0-9]{3})L([0-9]{1,2})$`（`control-plane/internal/api/cartridge_naming.go`），所以 `EE8`+`006`+`L8` 合法。**已经建好**：
-   `POST http://127.0.0.1/v1/cartridges`（在 10.131.9.70 上）
-   `{"cartridgeId":"EE8006L8","barcode":"EE8006L8","poolId":"pool1","libraryId":"lisa4300","capacityBytes":107374182400,"ltoGeneration":8,"mediaType":"LTO8","expandSlots":false}`
-   → 201，落在 lisa4300 槽 1031。**EE 还没 rescan，所以 EE 目前还不知道它。**
-2. 接着要做：`eeadm library rescan` → `eeadm tape assign EE8006L8 -p EETEST`（会格式化这盘新带）→ `eeadm drive down` 两台 → `eeadm tape reclaim EE8005L8 -p EETEST`，看是不是报那条 "necessary to have two drives"。
-3. 做完务必还原：`eeadm drive up` 两台 → `eeadm tape unassign EE8006L8` → 从 Holo 删掉 EE8006L8。
+1. EE 的回收在**命令期**校验资源：磁带不足（GLESR211E/GLESL116E）先于驱动器不足（GLESL154E）；任何一项不满足都是同步失败、rc=2、磁带状态不变，任务对象保留失败原因。`--async` 只是把同一次校验的结果放到任务记录里。
+2. **EE 要求"同一节点上有两台可用驱动器"**（GLESR229E），不是整组两台。这个实验室每节点一台，所以 EE 在这里永远做不了回收——源带和目标带都由同一个 LE 进程搬。tape-rs 的执行者本来就独占整组驱动器，"两台驱动器"对我们是整组条件，不需要照搬同节点约束。
 
-**当前实验室状态（都需要收拾）**
+**对 tape-rs 的设计裁定（据上面的对照）**
 
-- tape-rs 三节点**还在跑**，单驱动器配置（`ltfsd_ctl1.sh start1`），Leader 是节点 2 轮次 2。TS1000L08 停在 `reclaiming`、8 个文件（含演练后加写的 `/rc/after_reclaim.bin`）；TS1001L08 空。
-- EE 的两台驱动器**已经恢复 up**，三节点 available，EE8005L8 仍在 EETEST 且 appendable——EE 侧除了多了 3 条失败任务记录（1067、1070、1071、1072）之外没有别的改动。
-- Holo 的 lisa4300 库里**多了一盘 EE8006L8**（槽 1031），EE 尚未感知。
+- `TapeReclaim` 不再是只改状态的 fire-and-forget：受理前由执行者核对驱动器数（≥2）与池内可用目标带（≥1 盘 appendable 且不是源带），不满足即**同步拒绝**（HTTP 409/507 带原因），磁带状态不动。这与 EE 一致，也直接消掉"停在 `reclaiming` 出不来"和"停在 `reclaiming` 还在被写入"两个缺陷。
+- 受理后仍走复制状态（换届可接续）；执行中途资源又不够（驱动器坏、目标带写满）时，执行者把状态退回 `appendable` 并记一条带原因的事件，而不是无限重试 WARN。
+- 是否引入 EE 式任务对象（ID、历史、可查询）：**暂不**。命令期失败改成同步答复后，剩下的"执行期失败原因"先用 `/cluster` 状态里的一条 `last_reclaim` 记录承载；任务对象等 38 的任务模型整体落地时一起做。
 
-**结论待定的设计问题**（等 EE 对照做完再定）：tape-rs 要不要照 EE 的样子把回收做成有 ID、可查询、可取消的任务对象；至少上面那两个问题（停在 `reclaiming` 出不来、停在 `reclaiming` 还在被写入）是需要修的。
+**实验室过程中的两条教训**（细节见 [实验室环境](lab-environment.md#holo-在-lisa4300-库里建带删带会停用-ee2ee3-的换带器发布2026-09-22)）：
+
+1. 9 月 18 日在 Holo 建 EE8006L8 时，控制平面的 `ensureLibraryAutoPublications` 把 ee2/ee3 的换带器发布（`library-lisa4300-ee2/-ee3`，非自动生成）一并停用了，EE 节点 2/3 的 LE 从那时起做不了库存，这次 `tape assign` 失败（GLESL093E）才暴露。已按原字段重新发布、重跑 ACL 脚本、逐节点 `node down → systemctl restart ltfsle → node up` 恢复。
+2. 因此 EE8006L8 **没有从 Holo 删掉**（删带会再次触发同一停用），只在 EE 里 unassign，留在 lisa4300 槽 1031 作 unassigned；要删的话先做好上述恢复的准备。
+
+**当前实验室状态（2026-09-22）**：tape-rs 三节点仍在单驱动器配置下运行（节点 2 轮次 2 是执行者），TS1000L08 仍停在 `reclaiming`、8 个文件，等上面的裁定实施后用它验证"拒绝路径"；EE 三节点 available、三台驱动器 up、EETEST 只有 EE8005L8。
+
+#### 回收受理与放弃的实施（2026-09-22，按上面的裁定）
+
+**改动**
+
+- `state.rs::tape_reclaim`：同池没有别的 `appendable` 带就拒绝（"所在的池里没有别的可写带作为回收目标"）。这条在复制状态上判定，所有节点结论相同。
+- `node.rs`：`NodeConfig.drives`（ltfsd 取 `--drive-serial` 的个数）。Leader 收到 `TapeReclaim` 时先看本节点驱动器数，少于 2 直接回 `Rejected`，不提案、不占日志。`NodeStatus` 新增 `drives` 和 `last_reclaim{round, barcode, outcome: done|abandoned, detail}`，`/cluster` 一并输出；换届时清空。
+- `executor.rs`：新事件 `ReclaimAbandoned{barcode, reason, state}`。开工失败时，驱动器不够是确定的立即放弃；装不上、没有空驱动器再试 `RECLAIM_START_ATTEMPTS`（5）个周期；放弃即把带退回 `appendable`。搬到一半的放弃走同一条路：数据对不上、读不出来仍标 `check`，路径一直被客户端占着（现在返回 `NotReady`）退回 `appendable`。放弃后记住这盘带 `RECLAIM_GIVE_UP_GRACE`（10）个周期，等 TapeState 应用上来，别马上又拿它开工。
+- 客户端不用改：`Client::tape_reclaim` 收到 409 就是 `Err(Rejected{detail})`，`ltfsctl` 打印"服务端拒绝 (409): …"。
+
+**验证**
+
+| 项 | 结果 |
+| --- | --- |
+| 状态机单元测试 | 只有一盘带、目标带写满、目标带自己在回收中，三种都拒绝且不改状态 |
+| 集群测试 `reclaim_is_refused_synchronously_when_the_node_has_one_drive` | 单驱动器：同步拒绝，理由含"两台驱动器"，日志索引不动，写入照常不换带 |
+| 集群测试 `a_reclaim_that_cannot_start_falls_back_to_appendable_with_a_reason` | 节点声称两台驱动器、模拟库只有一台：先因没有目标被状态机拒绝；有了目标后受理，执行线程放弃，带退回 appendable，`last_reclaim.outcome == abandoned`，读写照常，源带未格式化 |
+| 全量 | 22 个集群用例 + 其余全过；集群测试 10 路并行 × 2 轮 20/20 |
+
+**实机（Holo 三节点，池 rc，从上一轮"卡在 reclaiming"的现场接着来）**
+
+| 步骤 | 结果 |
+| --- | --- |
+| 三节点计划停机，换新二进制（旧的备份为 `ltfsd.pre-reclaim-gate`），单驱动器配置重启 | 节点 1 接管轮次 31；2 秒内 `放弃回收 TS1000L08（状态改为 appendable）：回收需要两台驱动器`，随后 TS1000L08 重新成为写入带（gen 12、8 个文件） |
+| `ltfsctl tape reclaim TS1000L08`（单驱动器） | `服务端拒绝 (409): 回收 TS1000L08 需要两台驱动器（一台放写入带，一台放源带），本节点只配置了 1 台`；`/cluster` 里 `drives: 1`，`last_reclaim` 为 abandoned 带原因 |
+| 三节点计划停机，两驱动器配置重启；`tape unassign TS1001L08` 后再发回收 | `服务端拒绝 (409): TS1000L08 所在的池里没有别的可写带作为回收目标` |
+| `tape assign TS1001L08 rc` 后再发回收 | 受理；源带正是写入带，先换到 TS1001L08，再把源带装进第二台驱动器；8 秒后"搬走 8 个文件 / 49 MiB，已重新格式化"，`last_reclaim.outcome == done` |
+| 事后 | TS1000L08 gen=1、0 文件；TS1001L08 gen=3、8 文件；读回 f0/f5/after_reclaim 三个文件的 sha256 与目录记录逐一相同 |
+
+**实验室现状**：tape-rs 三节点以标准两驱动器配置运行（节点 1 轮次 35 是执行者），TS1001L08 是写入带（8 个文件），TS1000L08 空。EE 侧未动。

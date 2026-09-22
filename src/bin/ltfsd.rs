@@ -204,6 +204,7 @@ fn main() {
         directory_file: Some(directory_file),
         cooldown: Duration::from_secs(20),
         shutdown_grace: Duration::from_secs(args.shutdown_grace_s),
+        drives: args.drive_serials.len(),
         snapshot: tape_rs::daemon::store::SnapshotPolicy {
             entries: args.snapshot_entries,
             bytes: args.snapshot_mib << 20,

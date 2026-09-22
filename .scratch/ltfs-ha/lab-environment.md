@@ -276,3 +276,18 @@ Holo 为开源项目 github.com/Holo-VTL/Holo（Rust 数据面 + Go 控制面 + 
 TAPERS 新增两盘 256 MiB 的小带 `TS1000L08`（槽位 5）、`TS1001L08`（槽位 6），经 Holo 控制面 API 创建，用于写满换带的演练。演练后两盘各有 5 个 20 MiB 文件并带池标记 `small`，都在槽位里；要重用需重新格式化。
 
 第七处 Holo 偏差与修复（2026-09-18）见[池化切片计划](pooling-slice-plan.md#p4-实机读取已补齐2026-09-18修复第七处-holo-偏差)。handler 二进制换为 `holo-tcmu-handler.ssc-freshload`，上一版备份 `holo-tcmu-handler.before-freshload`，全量 diff `Holo.local-changes.after-claude-freshload.patch`；只重启了 tapers 的三个 handler。实验室操作磁带的脚本一律要在换带前先 `tape-rs drive-unload`。
+
+### Holo 在 lisa4300 库里建带/删带会停用 ee2/ee3 的换带器发布（2026-09-22）
+
+**现象**：2026-09-18 05:56 用 `POST /v1/cartridges` 在 lisa4300 建 EE8006L8 的同一秒，Holo 控制平面删掉了 iSCSI 目标 `library-lisa4300-ee2` 和 `-ee3` 及其 backstore；ee2/ee3 的发起方从此每 2 秒重登失败（`conn error (1020)`），EE 节点 2/3 的 LE 报 `LTFSI1096E Library failes to get inventory`。EE 的 `node list`/`drive list` 直到需要用到那两个节点的换带器时（`tape assign` → 格式化任务 → GLESL093E）才显示异常（驱动器 `missing`）。
+
+**原因**（源码 `control-plane/internal/api/resources_handler.go`）：`ensureLibraryAutoPublications` 在建驱动器、建带、删带、加槽、删库、建链时运行，把该库下所有 ready 状态、IQN 不在"自动生成集合"（库的规范 IQN + 各驱动器 IQN）里的发布全部 `Unpublish`。ee2/ee3 的换带器发布是 9 月 15 日以 actor `ee3-expansion` 手工 POST 的，属于会被清掉的那一类。`unpublishDependentPublications`（删带/擦带/导出时）另按 cartridgeId 匹配。控制台的"目标发布"页只读，看不出这一层。
+
+**恢复步骤**（已验证，约 5 分钟）：
+
+1. 在 holo-vtl 上按原字段重新发布两份（被停用的旧记录留在 `GET /v1/targets/publications` 里，state=disabled，IQN 可复用）：
+   `curl -X POST http://127.0.0.1/v1/targets/publications -H 'Content-Type: application/json' -d '{"poolId":"pool1","libraryId":"lisa4300","driveId":"lisa4300-drv-01","cartridgeId":"EE8000L08","targetIqn":"iqn.2026-04.cloud.backupnext.holo:library-lisa4300-ee2","deviceRole":"changer","deviceProfile":"ibm-3573-tl","driveProfile":"ibm-ult3580-td8","actor":"..."}'`（ee3 同理）。
+2. `sudo /usr/local/sbin/configure-ee-holo-acls`（建 ACL、关 generate_node_acls、saveconfig）。发起方几秒内自动重登。
+3. LE 进程缓存了旧的换带器设备，iSCSI 恢复后仍报 LTFSI1096E，须逐节点：ee1 上 `eeadm node down N` → 该节点 `systemctl restart ltfsle.service` → `eeadm node up N`。做完 `drive list` 三台 ok。装着带的驱动器（当时节点 3 装着 EE8005L8）重启 LE 后磁带回槽位。
+
+**约定**：以后在 lisa4300 里做任何 Holo 资源变更（建带、删带、擦带）前，先确认 EE 没有任务，做完立即按上面 1—3 恢复；或者在 TAPERS 库里建带（TAPERS 的发布都是自动生成的，不受影响）。EE8006L8 因此留在 lisa4300（unassigned），未删。
