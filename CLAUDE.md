@@ -57,6 +57,8 @@ The correct binding is `ioctl_readwrite_bad!(sg_io, 0x2285u64, SgIoHdr);` (done 
 
 ## Architecture
 
+Diagrams (deployment, module layers, ltfsd threads and channels, takeover sequence, write path, on-tape layout, tape states): [`docs/architecture.html`](docs/architecture.html). It is a hand-drawn snapshot as of `a605260`; update it when a change moves one of those mechanisms.
+
 Four-layer stack, low → high:
 
 1. **`scsi/sg_io.rs`** — `SgIoHdr` `#[repr(C)]` mirror of `sg_io_hdr_t` from `<scsi/sg.h>` (88 bytes on x86_64 with natural 4-byte padding before `usr_ptr`). Only the raw ioctl binding lives here.
