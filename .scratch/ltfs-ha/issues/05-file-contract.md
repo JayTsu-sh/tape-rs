@@ -53,7 +53,7 @@ Blocked by: 04
 | 问题 | 用户裁定 |
 | --- | --- |
 | 同一路径再次上传 | 默认替换；`If-None-Match: *` 为只创建（412 / `EEXIST`） |
-| 删除与重命名 | 支持删除，写带版本号的墓碑（`.tapers/tombstones/<路径>`，目录按版本取大者）；不支持 rename |
+| 删除与重命名 | 支持删除，写带版本号的墓碑（`.tapers/deleted/<sha256(路径)>` + `tapers.deletedPath`，目录按版本取大者）；不支持 rename |
 | 已暂存未落带的 `stat` | 区分状态：200 + `state: uploading/staged`，附已提交旧版本；404 只表示视图可信且不存在 |
 | FUSE 的地位 | 首版就实现 |
 | FUSE `close` / `fsync` | `close` = 已暂存（被拒绝时返回错误）；`fsync` = 上传当前内容并等落带 |
