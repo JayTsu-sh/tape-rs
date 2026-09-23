@@ -2,7 +2,7 @@
 
 Type: grilling
 Labels: wayfinder:grilling
-Status: claimed
+Status: resolved
 Assignee: claude
 Parent: [高可用双接口 LTFS 客户端决策地图](../map.md)
 Blocked by: 04
@@ -45,3 +45,32 @@ Blocked by: 04
 - 错误类别与 errno 映射表固定；RecoveryInProgress 不得映射为 ENOENT。
 
 **仍待 04 收敛后补齐**：会话期限与校准等待数值、partial 可读范围（D02）、fsync 与 time/size 交错（D03/PC）、恢复期间可信视图判定（RV01—RV05）。FC01—FC10 未实现/执行。本票据保持 claimed，不解除 07/08 依赖；Python Client API 只封装原生接口，不新增语义。
+
+## Answer
+
+**结论（2026-09-23）：05 resolved。** 用户在两轮提问里回答了 8 项（下表），合同全文改写在[文件接口契约](../file-contract.md)。9-17 的候选是在 ltfsd 实现之前写的，按流式写入设计；实现采用"整文件暂存 → 合批落带"，与之冲突的部分以实现为准并在契约开头说明。
+
+| 问题 | 用户裁定 |
+| --- | --- |
+| 同一路径再次上传 | 默认替换；`If-None-Match: *` 为只创建（412 / `EEXIST`） |
+| 删除与重命名 | 支持删除，写带版本号的墓碑（`.tapers/tombstones/<路径>`，目录按版本取大者）；不支持 rename |
+| 已暂存未落带的 `stat` | 区分状态：200 + `state: uploading/staged`，附已提交旧版本；404 只表示视图可信且不存在 |
+| FUSE 的地位 | 首版就实现 |
+| FUSE `close` / `fsync` | `close` = 已暂存（被拒绝时返回错误）；`fsync` = 上传当前内容并等落带 |
+| 读暂存中的文件 | 不能读：有旧版本读旧版本，否则 `EBUSY` |
+| 目录 | 隐式目录；`mkdir` 只在挂载内存里生效，`rmdir` 只对空目录 |
+| FUSE 放在哪里 | 独立进程，基于客户端库，可装在任何主机 |
+
+**以实现为准的修订**（向用户说明过，未反对）：整文件暂存、上传需已知长度；单个文件不会"部分已提交"，`partial` 状态删除，04 的部分文件保留只剩接管收尾的 salvage；不提供持久任务查询，结果未定按"路径 + 长度 + sha256"判定。
+
+**按推荐自行决定、用户可推翻的细节**：FUSE `rename` 返回 `EXDEV` 而不是 `EOPNOTSUPP`，让 `mv` 自动退回复制 + 删除（rsync 默认的临时文件改名因此不可用）；墓碑在回收时按活对象搬走，清理留到后续；`chmod/chown/utimens` 返回 `EOPNOTSUPP`；`GET /files` 支持单段 `Range`；`list?dir=` 按目录列举。
+
+**与 EE 的对照**：EE 删除 GPFS 文件不改磁带，要等 `reconcile` 装带改写索引（与写入互斥）；未对账的带导出再导入会出现已删除文件。tape-rs 的墓碑不需要装旧带，单独导入旧带时同样会"复活"。删除切片实施前在实验室实际观察 EE 的删除、覆盖写和 migrated 文件读取（契约末节）。
+
+**实施切片**（按"EE 观察 → Holo 偏差核对 → 实现与模拟器测试 → Holo 演练"）：
+
+1. F1 语义补齐：只创建（412）、`stat` 在途状态、`list?dir=`/`pending=1`、`Range` 读、`not_committed`。FC01/02/09/10/11。
+2. F2 删除：墓碑写带、目录按版本应用墓碑、回收搬墓碑、客户端与 ltfsctl。FC06/07/08。
+3. F3 FUSE 适配器 `tape-fuse`：本地缓存写、close/fsync、错误映射、xattr。FC03/04/05/12。
+
+未定的只有数值（合批时长、`retry_for`、暂存额度），沿用配置项。本票据不再阻塞 07/08。

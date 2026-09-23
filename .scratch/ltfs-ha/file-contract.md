@@ -1,141 +1,153 @@
-# 文件接口契约候选：原生接口与 FUSE 子集的共同语义
+# 文件接口契约：原生接口与 FUSE 的共同语义
 
-关联：[票据 05](issues/05-file-contract.md) · [提交契约 04](issues/04-durability.md) · [恢复与数据承诺 02](issues/02-availability-contract.md#answer) · [卷提交状态机](commit-state-machine.md) · [容量账本](capacity-reservations.md) · [任务与调度](ee-task-scheduling.md) · [资源与状态模型](ee-resource-model.md)
+关联：[票据 05](issues/05-file-contract.md) · [提交契约 04](issues/04-durability.md#answer) · [池化切片](pooling-slice-plan.md) · [任务与调度](ee-task-scheduling.md) · [资源与状态模型](ee-resource-model.md)
 
-状态：依自动接受授权采用的首版候选，票据 05 保持 claimed。只定义语义与错误类别，不定义 Rust 类型签名、Python 绑定形态、FUSE 库选型或 errno 之外的编码。依赖 04 尚未收敛的部分在文末单列，不提前解除。
+状态：**已裁定（2026-09-23，票据 05 resolved）**。2026-09-17 的首版候选写在 ltfsd 实现之前，按"先整文件接收、再批量落带"的写入模型设计了流式写、partial 状态和默认 create_only；这些与实现不符的部分已按用户裁定改写，旧版见 git 历史（`a1d163c` 及更早）。本文只定语义、线上表示和错误映射，数值（合批时长、重试窗口、暂存区额度）沿用配置项，不在此固定。
 
-## 范围与入口
+## 写入模型（已实现，契约以此为准）
 
-首版支持：查询（stat/状态）、枚举、读取、创建、顺序写入、重命名、删除、目录创建/删除、标准扩展属性读写。不支持：writable mmap、硬链接、原地随机覆盖、已完成文件追加、多节点同时写、跨卷原子操作。
-
-两个入口共享同一语义模型，差别只在表达方式：
-
-| 概念 | 原生接口（Rust LIB，Python 为其绑定） | FUSE |
-| --- | --- | --- |
-| 写入单元 | 显式上传任务：`put(path, source, size?, mode)` 返回任务 ID（含接管轮次前缀，见 38） | 以写方式打开的文件句柄隐式对应一个上传任务，close 结束任务 |
-| 严格持久化 | `commit(task)` / `wait(task)` 返回归档结果 | `fsync`/`fdatasync` 等待覆盖当前快照的卷提交 |
-| 取消 | `cancel(task)` | 无显式取消；close 前中断只结束进程侧写入，任务仍按“未完成”处理（见取消节） |
-| 状态查询 | `stat(path)` 返回文件状态与版本；`status(task)` 返回任务状态 | `stat` + 扩展属性 `user.tape.state`、`user.tape.version` 只读 |
-| 目录枚举 | `list(dir)` 含每项状态 | readdir 返回条目；状态经 xattr 查询 |
-
-Python Client API 不新增语义；它暴露原生接口的同一组操作、状态和错误类别。
+- 一次上传 = 一个完整对象。服务端先把整个内容接收到执行者节点的暂存区，校验长度后标记完成，再由合批提交整批写带（`files.rs`：准入 → 接收 → 完成 → 冻结 → 落带 → 发布）。上传前必须知道长度（HTTP `Content-Length`）。
+- 索引只引用完整文件，所以**单个文件不会处于"部分已提交"**。04 裁定的"保留已可靠提交的部分文件"在这个模型下只剩一种来源：接管收尾时 `TailPolicy::Salvage` 把未索引尾部登记成 `_ltfs_lostandfound/` 下的只读文件。文件状态里不再有 `partial`。
+- 暂存不复制。执行者更换时：仅暂存的任务失败（需重传），已进入提交批次的任务结果未定（查询该路径判定）。
+- 不提供按任务 ID 的持久查询、服务端幂等键或去重：`/tasks/<id>` 只在受理它的节点、同一进程内有效。结果未定由客户端按"路径 + 长度 + sha256"判定（见"结果未定与安全重试"）。
 
 ## 文件状态
 
-每个路径对应一个当前版本，版本由提交时的索引代次与文件身份决定。状态取值：
-
-| 状态 | 含义 | 可读 | 可作为写目标 |
+| 状态 | 含义 | 读 | 线上表示 |
 | --- | --- | --- | --- |
-| in_progress | 有活动上传任务/写句柄 | 否（其他句柄） | 否 |
-| ready | 已完整接收，尚未被可靠索引提交覆盖 | 否 | 否 |
-| committed | 当前版本已可靠提交并本地发布 | 是 | 仅替换 |
-| partial | 上传异常结束，仅前缀已可靠提交；按 04 保留、不自动删除 | 仅原生显式读取前缀 | 仅替换 |
-| unknown | 提交结果不明或视图不可信（恢复中） | 否 | 否 |
+| committed | 当前版本已随卷提交落带并发布 | 可读 | `stat` 200，`state: committed` |
+| uploading | 已准入，内容还在接收 | 读已提交旧版本（如有），否则 `not_committed` | `stat` 200，`state: uploading` |
+| staged | 已完整暂存，等待合批落带 | 同上 | `stat` 200，`state: staged` |
+| 不存在 | 视图可信且没有当前版本，也没有在途任务；包括被墓碑覆盖 | — | `stat` 404 |
+| 恢复中 | 本节点不在服务（换届、接管、恢复） | — | 503；客户端库等待并跟随 Leader |
 
-`ready` 与 `committed` 的区别对客户端可见：在 `ready` 状态返回给读者的不是“文件不存在”，而是“尚未提交”。目录枚举列出全部状态的条目，不隐藏 in_progress/ready/partial。
+- `stat` 对 uploading/staged 同时附上已提交的当前版本（字段 `committed`，没有则省略），调用方能看到"新版本在途、旧版本仍是当前"。
+- `list` 默认只列已提交；`pending=1` 时附上在途路径及其状态。
+- 恢复中绝不回答 404：视图不可信时只能答 503。
 
 ## 创建与替换
 
-- 默认 `create_only`：路径已存在（任何状态）即拒绝，错误 `AlreadyExists`。FUSE 对应 `O_CREAT|O_EXCL`；普通 `O_CREAT` 无 `O_TRUNC` 打开已存在文件视为追加意图，首版拒绝（见偏移写）。
-- `replace`：创建新版本；旧版本在新版本 committed 之前仍是当前可读版本，切换在新版本所在索引提交发布时原子发生。FUSE 对应 `O_TRUNC`。
-- 替换失败（异常结束）时旧版本保持当前，新版本按 partial 保留且不成为当前版本；`stat` 同时报告当前版本与 partial 版本存在。
-- 替换不回收旧版本占用的磁带空间；由对账/回收任务处理（37/38）。
+- `PUT /files/<path>` 默认**替换**：新版本在它所在的卷提交发布时原子成为当前版本；之前旧版本一直可读。替换不回收旧版本占用的磁带空间，由回收（reclaim）处理。
+- **只创建**：请求带 `If-None-Match: *`。路径有已提交的当前版本 → 412 `exists`；路径有在途任务 → 409 `path_busy`（与普通上传相同）。客户端库 `Client::put_new`，FUSE 的 `O_CREAT|O_EXCL`。
+  - 判定依据是准入时的已提交视图（本轮刚落带的 + 目录库）。已知边界：旧执行者已落带、但 `TapeCommitted` 尚未进 Raft 就失效，而新执行者又选了别的写入带时，这个文件要等那盘带下次被打开并对账后才进目录；这段时间里只创建与 `stat` 都看不到它。`ensure_write_tape` 优先已装载的带，通常新执行者会打开同一盘带。
+- 同一路径同一时刻只能有一个在途任务（`VolumeState` 的路径预留）。
+- 全集群的版本顺序由 `tapers.version = 轮次.序号` 给出（见 CLAUDE.md "File versions"），替换与删除都按它比较。
 
-## 写入与偏移
+## 删除（墓碑）
 
-- 只接受从当前逻辑末尾开始的顺序写入。原生接口按流提交；FUSE `write` 的 offset 必须等于当前长度，否则 `EINVAL`（原生 `NotSequential`）。允许零长度写。
-- 大小已知的原生上传在开始时按 04 预留整文件预算；未知大小按滚动额度。预算确定不足在准入或滚动申请时拒绝：原生 `InsufficientCapacity`，FUSE `ENOSPC`；校准等待超时：原生 `CalibrationTimeout`，FUSE `EAGAIN`。
-- 数据流式写带，不要求先整文件落到 SSD；`write` 返回只表示接收进有界缓冲，缓冲满时背压阻塞（04）。
-- 已完成（ready/committed）文件不允许再次以写方式打开追加：原生 `AppendNotSupported`，FUSE `EOPNOTSUPP`。需要修改用替换。
+EE 的做法（[资源模型](ee-resource-model.md)、[39](issues/39-ee-fault-recovery-evidence.md)）：删除 GPFS 里的文件并不动磁带，要等 `reconcile` 装上那盘带、改写它的索引才从带上去掉，reconcile 与写入互斥；没对账过的带导出再导入时，已删除的文件会重新出现。tape-rs 没有 GPFS，磁带是权威、目录只是缓存，而且被删文件可能在任何一盘带上，所以删除写**墓碑**而不改旧带：
 
-## 完成、fsync 与归档成功
+- `DELETE /files/<path>`：路径没有已提交的当前版本 → 404；有在途任务 → 409 `path_busy`；否则受理，202 = 已暂存，`?wait=1` 等到落带后 200。
+- 墓碑是当前写入带上的一个零长度文件 `.tapers/tombstones/<path>`，带 `tapers.version` 与 `tapers.tombstone = <path>`。它和普通上传走同一条合批落带路径，同一批次里的墓碑与上传一起发布。IBM LTFS 能读这盘带，只是把墓碑当普通空文件。
+- 目录按版本取大者：墓碑版本更高则该路径不存在；之后重新上传得到更大的版本，路径复活。
+- 回收时墓碑按活对象搬到目标带（很小，不做逐条判断是否仍有旧副本）。墓碑的最终清理留到后续（需要"池里不再有更旧副本"的证明）。
+- 与 EE 相同的局限：单独拿出一盘旧带（不带墓碑所在的带）重建目录时，被删文件会重新出现。
 
-- 原生：源数据传完并 `complete` 后任务进入 ready；`commit(task)` 请求把该文件纳入下一次卷提交并等待结果，`wait(task)` 只等待不催促。返回 `Archived{version}` 才是归档成功；`Indeterminate` 表示结果未定；其他为明确失败。
-- FUSE：`fsync(fd)` 对打开写句柄触发覆盖“截至此刻有效长度”的卷提交并等待；返回 0 表示该快照已归档持久化，不表示文件已完整。`close` 只把文件标为 ready，返回 0 不表示归档成功；需要确认的应用必须在 close 前 `fsync`。`fsync(dirfd)` 提交该目录下待提交的命名空间变化。
-- `fsync` 返回错误只表示这次确认失败或结果未定，不表示数据未写；应用通过 `user.tape.state` 或原生 `stat` 核对。FUSE 无法区分“结果未定”与“失败”的情形统一返回 `EIO`，细分靠 xattr。
-- 同卷多个 ready 文件可共享一次提交（04）；单个 `commit` 不保证其他文件同时提交。
+## 重命名
+
+不支持。FUSE 的 `rename` 返回 `EXDEV`；原生接口没有 rename。
+
+选 `EXDEV` 而不是 `EOPNOTSUPP` 的原因：`mv` 遇到 `EXDEV` 会自动退回"复制 + 删除"，这正是裁定要求应用自己做的事，于是 `mv` 能直接用。代价是 rsync 默认的"写临时文件再改名"会失败（rsync 不做这个回退），需用 `--inplace` 写新文件。用户可推翻为 `EOPNOTSUPP`。
 
 ## 读取
 
-- 读取只服务 committed 的当前版本。in_progress/ready 返回 `NotYetCommitted`（FUSE `EBUSY`）；unknown/恢复中返回 `RecoveryInProgress`（FUSE `EBUSY`）；partial 只有原生 `read_partial(path)` 显式读取已提交前缀，FUSE 不可读（`EBUSY`）。
-- 读取任务按 38 的 H 优先级派发；随机 `pread` 允许，但性能按顺序读优化，不承诺随机读延迟。
-- 读句柄不绑定执行实例：换 Leader 后，已提交文件的后续读取在恢复完成后可继续，调用方可能观察到一次 `RecoveryInProgress`。
+- 只服务已提交的当前版本。路径只有在途任务、没有已提交版本时答 409 `not_committed`。
+- `GET /files/<path>` 支持单段 `Range: bytes=a-b`（206）。性能按顺序读优化，随机读可能触发重新定位。
+- 读可以服务池里任何一盘带（`read_any`）；单驱动器正在写时答 503 `drive_busy`，客户端稍后重试。
 
-- **元数据读的一致性（2026-09-17，来自 41）**：`stat`、`list` 由当前 Leader 用内存里的已提交视图回答，接受有界陈旧，界限为多数派确认周期：刚被取代、尚未察觉的旧 Leader 可能在这段时间内返回稍旧的目录。归档是否成功不受影响：它以卷提交为准，旧 Leader 无法提交（设备拒绝）。需要强一致的调用方用原生接口的 `wait`/`status(task)`，它们以提交事实为依据。按推荐记录，用户可推翻。
+## 目录
 
-## 重命名与删除
+隐式目录：有文件（已提交或在途）就有目录。服务端不存目录记录。
 
-- rename/unlink/mkdir/rmdir 是命名空间变化：受理后立即在本地视图生效，持久化随下一次卷提交；需要确认时用 `fsync(dirfd)` 或原生 `commit_namespace(dir)`。
-- 对 in_progress/ready 文件 rename 或 unlink：拒绝 `EBUSY`（原生 `InProgress`）；须先取消或等待提交。
-- unlink 已 committed 文件：当前有打开读句柄时允许，读句柄继续读到 close；数据在磁带上直到回收。
-- rename 跨目录允许，跨卷不允许（`EXDEV`）。目录删除要求目录在当前视图为空，包括无 partial 条目。
+- `GET /list?dir=<d>` 返回该目录的直接子项：文件（含长度、状态）和子目录名。不带 `dir` 时保持现有的全量列举（ltfsctl 用）。
+- FUSE 的 `mkdir` 只在该挂载的内存里创建空目录，直到有文件写进去；挂载重启或别的挂载看不到它。`rmdir` 只对没有子项（已提交、在途、内存目录都没有）的目录成功。
+- `.tapers/` 与 `_ltfs_lostandfound/` 不出现在 FUSE 的根目录列举里；原生 `list` 照常可见。
 
-## 取消与会话
+## 完成与归档确认
 
-- 原生 `cancel(task)`：停止后续接收，不回滚；已可靠提交的前缀按 partial 保留；返回时报告已提交前缀长度或“无已提交数据”。取消与完成竞争时以服务端先受理者为准，另一方得到 `AlreadyCompleted`/`AlreadyCancelled`。
-- FUSE：进程被中断只影响进程；未 close 的句柄在会话到期（04 会话规则）后由服务端按“未完成”结束，等同取消。
-- 会话过期后旧句柄的写与 fsync 返回 `ESTALE`（原生 `SessionExpired`）；已提交状态不受影响。
-- 网络超时不代表取消成功；原生调用方在超时后必须查询 `status(task)`。
+| 入口 | 已暂存 | 已归档（卷提交） |
+| --- | --- | --- |
+| HTTP | `PUT` 202 | `PUT ?wait=1` 201，或 `GET /tasks/<id>?wait=1` |
+| 客户端库 | —（库不暴露"仅暂存"） | `Client::put` / `put_new` 返回即已落带（现有行为） |
+| FUSE | `close` 返回 0 | `fsync` 返回 0 |
 
-## 接管与句柄
-
-| 情形 | 写句柄/上传任务 | 读句柄 | 客户端应做 |
-| --- | --- | --- | --- |
-| Leader 更换，客户端节点存活 | 全部 aborted；下一次 write/fsync 返回 `ESTALE`；原生 `status` 返回 `TerminatedRound` | 恢复完成后可继续 | 按下节核验后重传 |
-| 客户端节点同时故障 | 同上，客户端重启后按任务清单核验 | — | 同上 |
-| 同节点执行实例原地重启 | 同 Leader 更换（新执行实例，见 39） | 同上 | 同上 |
-| 仅 FUSE 适配器重启 | 句柄失效 `ESTALE`；后端任务仍按会话规则处理 | 句柄失效 | 重开 |
-
-不承诺内核 fd 跨节点迁移或旧句柄无感延续。
+- FUSE `close`（`flush`）把本地缓存的内容上传到暂存区后返回；被拒绝时 `close` 返回对应 errno。**`close` 成功不代表已归档**：换届时暂存会作废，文件随之消失（或回到旧版本）。需要确认的应用必须在 `close` 前 `fsync`。
+- FUSE `fsync` 在写句柄上：上传截至此刻的内容并等到落带（最长约为合批的 `max_wait`，默认 60 s）；返回 0 即该内容已归档。之后继续写入的内容在下次 `close`/`fsync` 时作为新版本整体上传（替换）。`fsync` 在目录上：等本挂载发出的删除都落带。
+- 结果未定时客户端库先按路径判定（下节）；仍无法判定时 `fsync` 返回 `EIO`，应用用 `getxattr user.tape.state` 核对。
 
 ## 结果未定与安全重试
 
-应用持有未确认任务清单与源数据（02）。收到 `Indeterminate`/`TerminatedRound`/`ESTALE` 后，在新 Leader 恢复完成后按以下规则核验，不盲目重传：
+应用（或 FUSE 适配器）持有源数据。上传途中连接断开、服务端答 `indeterminate`，或换届后查不到任务时：
 
-1. `stat(path)` 为 committed 且版本/长度与本次上传一致（可用应用自设的标准 xattr 辅助比对）→ 视为已完成，不重传。项目不保证能把该状态对应到某次请求，判断责任在应用。
-2. committed 但版本/长度不一致（例如是旧版本）→ 用 `replace` 重传。
-3. partial 或不存在 → 用 `replace`（partial）或 `create_only`（不存在）重传；重传从 0 开始，不续传前缀。
-4. unknown/`RecoveryInProgress` → 等待，不重传。
+1. 在当前 Leader 上 `stat(path)`：committed 且长度与 sha256 与本次上传一致 → 已完成，不重传（`Client::put` 已实现，`resolved_by_query`）。
+2. committed 但内容不一致、或 404 → 按原模式重传（替换，或只创建）。
+3. staged/uploading → 等它结束再判定；503 → 等待。
+4. 可能已到达服务端的请求不会被库悄悄发到另一个节点重放。
 
-首版不提供按任务 ID 的持久结果查询、自动去重或服务端幂等键；`create_only` 语义是唯一由服务端提供的重放保护。
+## 接管与句柄
 
-## 错误类别与 errno 映射
+- 换届或执行者重启：服务端所有在途任务终止（仅暂存 → failed，已入批 → indeterminate）；读在新执行者恢复后继续。
+- FUSE 是独立进程，经客户端库连接集群，可装在任何主机上；它的打开句柄不绑定某个 ltfsd 节点。换届期间的调用阻塞到客户端库的 `retry_for`，超时返回 `EBUSY`。
+- FUSE 进程自身重启：打开的句柄全部失效（`ESTALE`），本地缓存里未 `close` 的内容丢弃。
+- 不承诺内核 fd 迁移。
 
-| 原生错误类别 | FUSE errno | 含义 |
+## FUSE 操作子集
+
+| 操作 | 行为 |
+| --- | --- |
+| `lookup`/`getattr` | 已提交：长度、索引的修改时间；在途且无已提交版本：长度为暂存长度。文件 0644、目录 0755，属主为挂载用户 |
+| `readdir` | `list?dir=&pending=1` + 内存目录 |
+| `open` 只读 | 已提交可读；否则 `EBUSY` |
+| `create` / `open(O_WRONLY\|O_TRUNC)` | 本地缓存文件；`O_EXCL` → 只创建 |
+| `open` 已存在文件写但无 `O_TRUNC`，或 `O_RDWR`、`O_APPEND` | `EOPNOTSUPP` |
+| `write` | offset 必须等于当前长度，否则 `EINVAL` |
+| `flush`（close） | 上传到暂存区（见上） |
+| `fsync` | 上传并等落带（见上） |
+| `unlink` | `DELETE`；在途 `EBUSY`，不存在 `ENOENT` |
+| `rename` | `EXDEV` |
+| `mkdir`/`rmdir` | 见"目录" |
+| `truncate` | 只允许截到 0 且文件正以写方式打开；其他 `EOPNOTSUPP` |
+| `chmod`/`chown`/`utimens`/`setxattr` | `EOPNOTSUPP`（`cp -p` 会告警但继续） |
+| `getxattr` | 只读：`user.tape.state`、`user.tape.version`、`user.tape.barcode`、`user.tape.sha256`，以及索引里文件自带的 xattr |
+| `link`/`symlink`/可写 `mmap` | `EOPNOTSUPP`（只读 `mmap` 由内核经 `read` 支持） |
+
+## 错误映射
+
+| HTTP | 原因 | 客户端库 | FUSE errno |
+| --- | --- | --- | --- |
+| 404 | 视图可信且不存在 | `NotFound` | `ENOENT` |
+| 409 `path_busy` | 路径有在途任务 | `Rejected` | `EBUSY` |
+| 409 `not_committed` | 读在途文件 | `Rejected` | `EBUSY` |
+| 412 `exists` | 只创建冲突 | `Exists` | `EEXIST` |
+| 400 `bad_path` | 路径非法 | `Rejected` | `EINVAL` |
+| 503 `not_serving`/`switching_tape`/`drive_busy` | 恢复中、换带、驱动器忙 | 库内等待重试；`retry_for` 到期 `NoLeader` | `EBUSY` |
+| 503 `read_only` | 卷受限只读 | `Rejected` | `EROFS` |
+| 507 `too_large` | 比一盘带还大 | `Rejected` | `EFBIG` |
+| 507 `no_tape` / `insufficient_capacity` | 池里没有可写带 | `Rejected` | `ENOSPC` |
+| 500 `indeterminate` | 结果未定且按路径无法判定 | `Indeterminate` | `EIO` |
+| 500 `failed`/`spool_io` | 明确失败 | `Rejected` | `EIO` |
+
+恢复中与未定状态不得映射为 `ENOENT`。
+
+## 验证 FC01—FC12
+
+| 编号 | 内容 | 层 |
 | --- | --- | --- |
-| AlreadyExists | EEXIST | create_only 冲突 |
-| NotFound | ENOENT | 当前视图确认不存在（视图可信时才返回） |
-| InProgress / NotYetCommitted | EBUSY | 目标有活动任务或尚未提交 |
-| RecoveryInProgress | EBUSY | 视图不可信或卷恢复中；不是不存在 |
-| InsufficientCapacity | ENOSPC | 可信预算确定不足 |
-| CalibrationTimeout | EAGAIN | 校准等待到期 |
-| NotSequential | EINVAL | 偏移写 |
-| AppendNotSupported / NotSupported | EOPNOTSUPP | 首版不支持的操作 |
-| SessionExpired / TerminatedRound | ESTALE | 会话或执行实例已终止 |
-| Indeterminate | EIO | 结果未定；细分靠 xattr |
-| IoFailure | EIO | 明确失败 |
-| CrossVolume | EXDEV | 跨卷 rename |
+| FC01 | 只创建遇到已提交路径 412，不产生新版本；遇到在途路径 409 | 模拟器集群 |
+| FC02 | 替换在途时旧版本一直可读，落带后切到新版本 | 模拟器集群 |
+| FC03 | FUSE 非顺序写 `EINVAL`，已存在文件无 `O_TRUNC` 写 `EOPNOTSUPP` | FUSE 适配器（模拟后端） |
+| FC04 | `close` 后 `stat` 为 staged、读 `EBUSY`；`fsync` 返回 0 后为 committed 且可读 | 两层 |
+| FC05 | `fsync` 期间换届：返回 0（经路径判定）或 `EIO`；之后 `stat` 为 committed 或不存在，不会"磁带有数据但被隐藏" | 模拟器集群 + Holo |
+| FC06 | 删除后 `stat` 404；装入被删文件所在的旧带并对账后仍 404；重新上传后路径复活 | 模拟器集群 + Holo |
+| FC07 | 删除在途路径 409；删除不存在路径 404 | 模拟器集群 |
+| FC08 | 回收一盘带着墓碑的带后，被删路径仍不存在 | 模拟器集群 |
+| FC09 | 恢复中 `stat` 503，不回答 404 | 模拟器集群 |
+| FC10 | `Range` 读返回正确片段 | 模拟器集群 + Holo |
+| FC11 | `list?dir=` 只返回直接子项；FUSE `mkdir`/`rmdir` 规则 | 两层 |
+| FC12 | FUSE `mv` 经 `EXDEV` 退回复制 + 删除，结果路径内容一致、源路径不存在 | FUSE + Holo |
 
-FUSE 不得把 RecoveryInProgress 或 unknown 翻译成 ENOENT。
+## 与 EE 的对照（切片实施时先在实验室观察）
 
-## 依赖 04 尚未收敛的项
-
-- 会话期限、校准等待上限、缓冲额度：数值留空。
-- partial 前缀的具体可读范围判定依赖 D02 尾部恢复协议。
-- `fsync` 快照与 time/size 触发的交错细节依赖 commit-state-machine 的 D03/PC。
-- 恢复期间“可信当前视图”的判定依赖 RV01—RV05。
-
-## 候选验证 FC01—FC10
-
-- FC01：create_only 冲突返回 AlreadyExists/EEXIST，不创建新版本。
-- FC02：replace 失败后旧版本仍可读，新版本以 partial 存在且不可作为普通读目标。
-- FC03：非顺序偏移写返回 NotSequential/EINVAL，不写入。
-- FC04：close 后 stat 为 ready，读取返回 NotYetCommitted；fsync 返回 0 后 stat 为 committed 且可读。
-- FC05：fsync 期间换 Leader，调用返回 ESTALE/Indeterminate，随后 stat 给出 committed/partial/不存在之一，不出现“文件不存在但磁带已有数据被隐藏”。
-- FC06：unlink 有读句柄的 committed 文件，读到 close 成功，之后 stat 为 NotFound。
-- FC07：rename in_progress 文件返回 EBUSY。
-- FC08：容量确定不足在准入返回 ENOSPC，未消耗任何预算。
-- FC09：恢复期间读取返回 EBUSY 而非 ENOENT；恢复完成后返回数据。
-- FC10：cancel 与 complete 竞争，只有一方成功，另一方得到对应 Already* 错误，预算不重复释放。
-
-均未实现/执行。
+- 删除：EE 删除 GPFS 文件后 `eeadm file state` 与磁带索引的变化、`reconcile` 何时去掉带上副本、未对账带导入的表现。
+- 覆盖写：EE 覆盖一个 migrated 文件后旧副本在带上的状态（预期为"已失效、待 reclaim"），对照 tape-rs 的版本 + 回收。
+- 只读访问 migrated 文件时的召回与 `EBUSY`/阻塞行为，对照 FUSE 读在途文件的 `EBUSY`。

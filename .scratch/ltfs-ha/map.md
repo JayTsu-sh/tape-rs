@@ -120,6 +120,7 @@ Status: open
 - 池化切片 [P5 已完成](pooling-slice-plan.md#p5-已完成2026-09-18raft-快照日志压缩与日志回滚)（快照 = 控制状态 + 目录库文件指针，快照点不超过目录库已落库位置，三种日志回滚），[计划停机释放预留](pooling-slice-plan.md#计划停机释放预留2026-09-18)，以及 [reclaim](pooling-slice-plan.md#回收reclaim2026-09-18)（全集群文件版本 `tapers.version` = 轮次.序号、两道销毁前闸门、可回收空间按 MAM 容量算；回收途中两次换届的实机演练通过，IBM ltfsck 判定一致；第八处 Holo 偏差：容量查询不看分区号）。均在模拟器与 Holo 三节点上验证。
 - [单驱动器下的回收：EE 对照已完成](pooling-slice-plan.md#单驱动器下的回收tape-rs-与-ee-的对照2026-09-18-起2026-09-22-完成)（2026-09-22）：EE 在命令期同步校验磁带数与驱动器数，不满足即 rc=2、磁带状态不变（GLESR211E / GLESL154E），且要求**同一节点**两台驱动器（GLESR229E）；tape-rs 现状是先改复制状态再在执行线程无限重试，磁带卡在 `reclaiming` 且仍被写入。裁定：`TapeReclaim` 受理前同步核对资源并拒绝，执行期资源不足退回 `appendable` 并记原因，暂不引入任务对象。[已实施并在 Holo 验证](pooling-slice-plan.md#回收受理与放弃的实施2026-09-22按上面的裁定)（`a605260`）：单驱动器同步 409、无目标带由状态机拒绝，卡在 `reclaiming` 的带由下一任执行者 2 秒内退回 `appendable`。过程中发现并修复 Holo 的一处环境陷阱（lisa4300 建带会停用 ee2/ee3 的换带器发布），见实验室环境。
 - 04 已 resolved（2026-09-22）：把 04 定义的全部验证项编号对回 `tests/sim_recovery.rs`、`sim_commit_faults.rs`、`volume_state.rs`、`sim_close_tail.rs`、`ltfsd_cluster.rs` 与 Holo 演练/hw_tapers 六场景，结论写在票据 Answer。未覆盖的只剩真机物理语义（D01 屏障、掉电形态）、06 的数值（DV01/DV08）、05/07 的接口（U03/U05/RV03）和几个无专门用例的协议保证（AP05 写保护、PR02、RE06/RE08 单独用例）。05 现在只被 04 阻塞，成为 frontier。
+- 05 已 resolved（2026-09-23）：用户两轮回答 8 项——默认替换 + `If-None-Match` 只创建；删除用带版本的墓碑、不支持 rename；`stat` 区分 uploading/staged；首版实现 FUSE（独立进程、基于客户端库，close=已暂存、fsync=等落带，暂存中不可读，隐式目录）。契约全文按"整文件暂存 → 合批落带"的实现改写，`partial` 状态删除。实施分 F1 语义补齐、F2 删除、F3 FUSE 三个切片。用户同日授权此后按推荐默认值自主推进、以 EE 为参照。
 - 每次会话使用 wayfinder；交互决策使用 grilling 和 domain-modeling；模块设计使用 codebase-design；外部事实研究使用 research 子代理。
 - 领域术语见 [LTFS 归档与接管](../../CONTEXT.md)。本地 tracker 的操作约定见 [Tracker](tracker.md)。规格在路线明确后由后续实施规划阶段汇总，当前地图只索引决策。
 
@@ -127,7 +128,7 @@ Status: open
 
 已形成每卷差量发布、首次/稳态/交接、标准库表示、稳定故障域、来源职责及无洞审查、BOOTTIME、EG 对外资格与许可组合顺序；现补齐独立 SQLite 控制库、四类事务、RAM 配套和独占/恢复基线。下一技术切点为控制对象条件及初始化重入、输出来源/实际网络交付与认证、安全关联容器和来源有效性；04 的 D02/D03 逻辑协议已形成（[尾部协议](recovery-tail-protocol.md)、[根表示](publication-root.md)），剩余为模拟/实机验证与数值。不再把尚未编写 SQL/绑定当作未选存储机制，未运行验证与尚缺协议分别列明，不能以研究完成替代后者。
 
-地图仍 open。进入 spec 前须核对：04 提交/恢复、05 文件行为、06 性能与已明确留空的业务输入、18 控制授权、09 部署前提、08 接管验收及 07 模块边界均已形成可实施的裁定，相关阻塞已解除；不能只因一批研究报告完成就关闭地图。（2026-09-22：04 已 resolved，06 已 resolved；余下 05/07/08/09/18。）
+地图仍 open。进入 spec 前须核对：04 提交/恢复、05 文件行为、06 性能与已明确留空的业务输入、18 控制授权、09 部署前提、08 接管验收及 07 模块边界均已形成可实施的裁定，相关阻塞已解除；不能只因一批研究报告完成就关闭地图。（2026-09-23：04、05、06 已 resolved；余下 07/08/09/18。）
 
 模型或现场测试未运行不自动等于地图永远不能完成，但所需假设、实际算法/边界、验证方法及未证明保证必须明确；尚不知道如何满足安全契约的关键协议，不能仅移到“以后验证”便关闭票据。用户允许留空的数值仍留空，并标明后续测量/配置要求，不为开始 spec 编造指标。
 
@@ -135,6 +136,7 @@ Status: open
 
 ## Decisions so far
 
+- [原生文件接口与 POSIX 子集的共同语义](issues/05-file-contract.md#answer) — resolved（2026-09-23）；替换为默认、只创建可选，墓碑删除、无 rename，stat 区分在途状态，首版 FUSE（close=暂存、fsync=落带）；契约见 [file-contract.md](file-contract.md)，F1—F3 三个实施切片。
 - [暂存确认、卷提交与故障恢复契约](issues/04-durability.md#answer) — resolved（2026-09-22）；D01—D04 已实现并在模拟器验证，D02/D04/D06/D07 在 Holo 三节点演练、经 IBM LTFS 双向校准；TP/SC/AP/RE/RV/PC/PR/DV 逐项对回测试与演练，未覆盖项分别移交真机清单、06 数值、05/07 接口。实施中修订的裁定汇总在 Answer 里（接管后自动收尾、IP 领先判定、增量索引未实现改写 Full）。
 - [IBM EE 故障分类、监控恢复与运维事件的借鉴边界](issues/39-ee-fault-recovery-evidence.md) — 限定研究完成；六层故障模型、介质健康进入/离开规则、执行实例原地重启顺序及诊断事件约定；监控进程不直接触发切换；未运行验证。
 - [IBM EE 任务模型与 MMM 调度规则的借鉴边界](issues/38-ee-task-scheduling-evidence.md) — 限定研究完成；采用三级优先级、安全切点抢占、mountlimit/已装载优先的选择规则及含轮次前缀的任务身份；任务队列不进 Raft，换 Leader 后旧任务 aborted；未运行验证。
