@@ -2,7 +2,7 @@
 
 Type: grilling
 Labels: wayfinder:grilling
-Status: claimed
+Status: resolved
 Assignee: codex
 Parent: [高可用双接口 LTFS 客户端决策地图](../map.md)
 Blocked by: 01, 02, 03, 10, 11, 12
@@ -944,3 +944,70 @@ TP01—TP08 未实现/执行；预算数值留空由 08/06 确定；具体 CDB �
 ### D04 实施进展：DV02 与贯通场景在模拟器上执行
 
 依用户实施授权，`LtfsVolume` 实现了已发布视图与工作索引分离、按阶段分类的提交失败冻结（`CommitFailed{stage}`），并在 SimTransport 上执行 DV02 各故障点与“首个贯通场景”三分支（见 [commit-validation.md 实施进展](../commit-validation.md#实施进展2026-09-17)）。结果与 04 已裁定政策一致：可靠落带事实不因响应丢失回滚，索引残缺不发布，未索引尾部不自动追加。DV01/03/04/07/08 仍未实现；设备持久化证据待实机。04 保持 claimed。
+
+## Answer
+
+**结论（2026-09-22）：04 resolved。** D01—D04 四项产物都已从"待设计"走到"已实现并验证"：提交与恢复协议在 `src/ltfs/{volume,recovery}.rs`、`src/core/volume_state.rs` 和 `src/daemon/` 里实现，验证项在模拟器上执行，D02/D04/D06/D07 的关键场景又在 Holo-VTL 三节点上演练，格式与恢复规则经 IBM LTFS 2.4.8.3 双向校准。仍未证明的保证按地图规则逐条列出并指明去向（真机清单、06 的测量、05/07 的接口），不再作为本票据的缺口。以下把 04 定义的每组验证项对回证据；未列出的编号即未覆盖，写在最后一节。
+
+### D01 最终屏障
+
+- 实现：`commit` 的阶段序列 locate → opening_fm → index_records → closing_fm → index_partition → **barrier**（`WRITE FILEMARKS(IMMED=0, count=0)`，即候选路径第 2 条的显式最终同步）→ vci；任一阶段失败返回 `CommitFailed{stage}`、冻结卷、已发布视图不变，"结果未定"由调用方经重新挂载与恢复协议裁定。这就是"错误分类与恢复写入门控"表里第 3、4 行的实现。
+- 证据：`sim_commit_faults.rs` 的 `dv02_fault_on_final_barrier_is_indeterminate_but_committed`（屏障失败但 DP 已完整，恢复出该提交）、`…_on_index_partition_dp_already_committed`、`…_on_vci_write_keeps_commit_and_partial_fast_path`。
+- 未证明：屏障返回 GOOD 是否等于物理落带。依据只有 SSC 规范与 Holo（软件实现），已列入[待真机验证清单](../real-hardware-checklist.md#提交与恢复04)。"结束标记兼任屏障"的减少命令优化没有采用，也没有需求。
+
+### D02 恢复证据与安全尾部
+
+| 项 | 模拟器（`tests/sim_recovery.rs` 等） | Holo 实机（`examples/hw_tapers.rs`，[结果](../lab-environment.md#实机故障场景与第四处-holo-偏差vcr-不随写入变化2026-09-17)） |
+| --- | --- | --- |
+| TP01 | `tp01_fresh_volume_is_complete_and_writable`、`tp01_after_commits_chain_is_verified`、`tp01_vci_fast_path_hits_after_commit` | hw01、hw02 |
+| TP02 | `tp02_stale_vci_falls_back_to_standard_path`、`vci_pointing_at_wrong_block_is_rejected_then_standard_path_succeeds` | hw03（VCI 不被采信） |
+| TP03 | `tp03_fake_index_with_wrong_self_pointer` | hw05（反向 3 步） |
+| TP04 | `tp04_index_interrupted_before_closing_filemark`、`dv02_fault_in_index_records_leaves_truncated_index` | hw04 |
+| TP05 | `tp05_unindexed_data_tail_is_read_only`、`tp05_under_holo_quirks_still_classifies_unindexed_tail` | hw03；三节点演练里节点 3 写到一半被暂停后留下的 T1 |
+| TP06 | `tp06_broken_chain_is_restricted` | 未构造（需要改写链中间的索引） |
+| TP07 | `tp07_ip_lagging_dp_is_debt_not_error`；`ip_ahead_with_back_pointer_to_dp_last_is_consistent`（反向校准后新增） | hw06；读 IBM 写的克隆带时 IBM 自己留下的 IP 落后一代 |
+| TP08 | `tp08_locate_failure_at_append_position_blocks_write` | 未构造（需要注入 LOCATE 失败） |
+| 预算/冲突 | `budget_exhausted_without_index_is_restricted`、`ip_newer_than_dp_is_a_conflict`、`mam_vcr_is_read_only_and_changes_on_write`、`constant_vcr_does_not_hide_newer_committed_index` | 第四、五处 Holo 偏差就是在这里暴露并修复的 |
+
+- SC01—SC05：SC01 由 `constant_vcr_does_not_hide_newer_committed_index` 与 VCI 提示"结束文件标记须紧接 EOD"规则覆盖；SC02 由协议本身保证（从 EOD 逐区域反向步进，唯一的跳转是 VCI 提示且提示必须与 EOD 相邻）；SC03 = `budget_exhausted_without_index_is_restricted`；SC04 取了比要求更严的做法：恢复不跨挂载保留任何进度，每次 `mount` 从头核验，所有权由预留守卫在追加前、提交前、屏障前核对（`sim_fencing.rs` pf05/pf06）；SC05 = `tp08_…`（搜索成立、追加核对不成立 → 只读）。
+- AP01—AP05：AP01 = TP01/hw01/hw02；AP02 = TP07/hw06；AP03 = TP05/hw03（挂载时不自动追加、不发布、不截断）；AP04 = `pf06_same_node_new_round_gets_a_new_key_and_old_round_is_stale`、`late_fence_from_an_older_round_cannot_steal_from_a_newer_round`、`volume_state.rs::pc05`；AP05 的"位置未知"= TP08，"容量不足"= `admission_respects_capacity_and_path_exclusivity` 与 ltfsd 的 507 `no_tape`/`too_large`（`blank_tapes_are_formatted_on_first_use_and_full_tapes_are_switched`），**"写保护介质"未构造**（模拟器不建模 WP 位）。
+- RE01—RE10：RE01/RE02 由 ltfsd 承担——磁带按换带器库存 + 驱动器序列号识别，未归属的带不触碰，装载即以磁带为准对账目录，目录比磁带新时标 `check`（`a_directory_ahead_of_the_tape_marks_the_tape_for_checking`），别的数据不覆盖（`a_tape_holding_foreign_data_is_never_formatted`），池标记不符即 `label_mismatch`；RE03 = TP03/TP04 + `ip_newer_than_dp_is_a_conflict`；RE04 = TP05/TP08；RE05：挂载不修复介质（`fake_index_and_complete_tails_are_not_closed_automatically`），旧执行者的迟到事件不改新状态（`a_late_stop_for_an_older_round_does_not_cancel_the_newer_round`、pc05）；RE06 的假索引分支 = TP03，合法代数跳跃由链核验只走回指针、不做代数算术保证（无单独用例）；RE07 = TP02 + `dv02_fault_on_vci_write_keeps_commit_and_partial_fast_path` + 旧布局 VCI 解码失败只退回标准路径；RE08 = TP06（断链），环/指向更高代数按协议第 5 步拒绝（无单独用例）；**RE09 不在首版范围**（见下节"增量索引"）；RE10 = 预算耗尽与读错都只报受限，不发修复命令。
+- RV01—RV05：RV01 = `budget_exhausted_without_index_is_restricted`（DP 预算耗尽时 IP 视图不能证明当前性，受限而非退回旧 IP）；RV02 = TP05/TP08；RV03/RV04：提交失败冻结卷、失去预留即停手让位（`leader_that_loses_its_reservation_yields_and_another_node_takes_over`、`partitioned_leader_is_fenced_by_the_new_leader`，设备侧 pf01）；RV05 = 换届后暂存任务 failed、已入批 indeterminate，不恢复旧上传（`committed_uploads_survive_failover_and_unconfirmed_ones_never_corrupt`、`client_library_hides_failover_from_the_application`）。
+- IBM 校准：tape-rs 读 IBM 写的带、IBM LTFS 读 tape-rs 写的带、ltfsck 判定接管收尾后与两次换届回收后的卷一致，见 [lab-environment.md](../lab-environment.md) 与 [40](40-volume-layout-interop.md)。
+
+### D03 运行时一致性
+
+- 实现：`src/core/volume_state.rs`（不可变根、路径复制、单指针发布、O(1) poisoned 根、单调时钟会话）；**已接线**：ltfsd 的 `files.rs` 以它为准入→接收→完成→冻结→落带→发布的顺序器，"完成 + 入队"与"排空 + 冻结"同锁，冻结批恰好覆盖落带的文件。
+- PC01—PC06、PR01/PR04/PR06 = `tests/volume_state.rs`（PR05 由 pc02 覆盖，PR03 由 pc04 覆盖预构造失效根的行为）。PV02 = pc01，PV03 = pc02，PV04 = pc03/pc04，PV05 = pc05 + 集群故障切换用例；Holo 上观察到真实的"提交已落带但响应未送出"样例，到新 Leader 查询即可判定。
+- 未覆盖：PV01（S2 前置准备资源不足不发索引命令）与 DV01 的索引预算两层检查没有单独实现——首版用每盘带文件数软上限与容量保留空间做准入，索引成本按 42 的实测（约 1 KB/文件，每次提交写两份 Full）由合批控制；具体额度归 06 测量。PR02（读者持旧根期间连续三批）未单独执行。
+
+### D04 验证对照
+
+| 组 | 状态 |
+| --- | --- |
+| DV01 | 未实现（见上，归 06 数值） |
+| DV02 | 模拟器全部阶段 + 掉电分支；Holo 上 T1/T2/T3 形态（hw03—hw05）；物理屏障待真机 |
+| DV03 | `volume_state.rs` |
+| DV04 | 软件层 pc02/pr04/准入用例；容量读数来自每次提交时的 MAM 分区容量（第八处 Holo 偏差修复后可信）；数值留空 |
+| DV05/DV06 | 上表；三节点隔离接力、写到一半被暂停后接管、`ltfs-takeover --salvage`、kill -9 执行者后接管，均在 Holo 通过 |
+| DV07 | `a_planned_shutdown_commits_the_queue_and_releases_every_reservation` + Holo 3.7 秒内三节点优雅退出、卷停在完整尾部（U01/U02/U04 覆盖；**U03 到期不强切、U05 卸载响应丢失未构造**） |
+| DV08 | 只有零散测量（P2：32 路并发 400 文件由 1 文件/秒到 18 文件/秒；sha256 1248 MiB/s）；P01—P06 归 06 |
+| 贯通场景 | `threading_scenario_three_branches_do_not_mix`：三分支下甲完整可读，乙分别不可见/不可见/可见，写资格否/否/是 |
+
+### 实施过程中修订的裁定（均已记录在对应文档，这里汇总）
+
+1. **接管后自动收尾**（2026-09-17，用户接受）：修订"未索引尾部首版不自动追加"。挂载仍不追加；但新执行者在设备回读确认独占后，对 T1/T2 在 EOD 追加一份索引使卷可写（不截断、不覆盖，默认放弃并记块范围，可选打捞）。`tests/sim_close_tail.rs`，Holo 演练，IBM ltfsck 判定一致。
+2. **IP 领先的判定**（反向校准后）："IP 代数高于 DP 即冲突"改为"仅 IP 回指针不指向 DP 末索引才冲突"；新增"视图含 IP 上的文件数据则只读"。
+3. **D02 两处细化**：相邻文件标记之间的空区域计为一步；DP 预算耗尽不得退回 IP 视图。
+4. **VCI 提示的采信条件**：提示索引的结束文件标记必须紧接 EOD，否则走标准搜索（Holo 恒定 VCR 暴露）。
+5. **增量索引**：[已裁定：无回执的增量索引与逐文件确认](#已裁定无回执的增量索引与逐文件确认)采用的 DP 增量索引**未实现**，首版每次提交写 Full（两分区各一份）；代价由 42 的合批与每盘文件数上限吸收，写增量索引与读外来 2.5 增量卷的边界归 40。这是范围收缩，不是规则变更；RE09 随之不在首版范围。
+6. 与 D03 相关的 ltfsd 层补充：文件版本 `tapers.version = 轮次.序号` 给目录一个全序（回收与重读旧带时防止目录回退）；回收的两道销毁前闸门。
+
+### 未覆盖项及去向
+
+- 真机：D01 物理屏障语义、EOD/SPACE/READ POSITION 在分区边界的真实语义、掉电后驱动器对未刷缓冲的处理、TP06/TP08 的实机构造 → [待真机验证清单](../real-hardware-checklist.md)。
+- 数值：DV01/PV01 的索引预算、DV04 的会话/校准时长、DV08 的 P01—P06 → 06 的测量契约。
+- 接口：U03（排空到期的管理动作）、U05（卸载响应丢失的核验入口）、RV03 对读者的失效通知形式 → 05/07。
+- 用例：AP05 写保护介质、PR02、RE06 合法代数跳跃与 RE08 环的单独用例，实现上由协议保证但没有专门的测试。
+
+按地图规则："所需假设、实际算法/边界、验证方法及未证明保证必须明确"，以上均已明确，04 不再阻塞 05/07/08。

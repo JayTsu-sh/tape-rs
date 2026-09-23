@@ -150,3 +150,7 @@
 - **首个贯通场景**：三分支（数据已写索引未完成 / 索引结果未知 / S4 成立响应未送达）同一份甲均完整可读，乙分别不可见、不可见、可见且内容一致，写资格分别否、否、是。
 
 随后 `src/core/volume_state.rs` 落地了 D03 根与差量发布：**DV03**（X/Y 覆盖、S4 后根构造失败、重复/乱序结果、旧实例结果）与 **DV04** 的软件层部分（取消与校准竞争、续期与到期检查竞争、预留只释放未消耗余额）由 `tests/volume_state.rs` 的 PC01—PC06/PR04 覆盖。未覆盖：DV01（发布资源准备额度）、DV07（排空卸载）、DV08（性能）；`VolumeState` 尚未与 `LtfsVolume` 的提交流程接线。软件层通过不替代设备持久化证据；D01 屏障的实机语义待 Holo-VTL（经 EE 校准）与物理驱动器验证。
+
+## 结果对照（2026-09-22）
+
+04 已 resolved，DV01—DV08 与 TP/SC/AP/RE/RV/PC/PR 的逐项证据对照写在[票据 Answer](issues/04-durability.md#answer)。本文"实施进展"里"`VolumeState` 尚未与 `LtfsVolume` 的提交流程接线"已过时：ltfsd 的 `files.rs` 以 `VolumeState` 为顺序器。未覆盖：DV01（索引预算，归 06）、DV07 的 U03/U05、DV08 的 P01—P06（归 06）、AP05 写保护、PR02。
