@@ -14,7 +14,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use crate::core::volume_state::{DirNode, FileVersion, FrozenBatch, S4Evidence, StateError, VolumeState};
+use crate::core::volume_state::{DirNode, FileVersion, FrozenBatch, PendingState, S4Evidence, StateError, VolumeState};
 use crate::ltfs::index::{DirectoryNode, LtfsIndex};
 
 use super::directory::Directory;
@@ -73,6 +73,8 @@ pub enum ServiceError {
     /// 本节点当前不在服务（不是执行者，或还在接管途中）。
     NotServing(String),
     PathBusy(String),
+    /// 只创建：路径已有已提交的当前版本。
+    Exists(String),
     InsufficientCapacity { requested: u64, available: u64 },
     NotWritable(String),
     BadPath(String),
@@ -90,6 +92,7 @@ impl std::fmt::Display for ServiceError {
         match self {
             ServiceError::NotServing(s) => write!(f, "本节点不在服务: {}", s),
             ServiceError::PathBusy(p) => write!(f, "路径正在上传: {}", p),
+            ServiceError::Exists(p) => write!(f, "路径已存在: {}", p),
             ServiceError::InsufficientCapacity { requested, available } => {
                 write!(f, "空间不足: 需要 {} 可用 {}", requested, available)
             }
@@ -130,6 +133,40 @@ pub struct Stat {
     pub barcode: String,
     /// 内容的 sha256（十六进制小写）；文件没有哈希属性时为空串
     pub sha256: String,
+}
+
+/// 路径上未提交的变更。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InFlight {
+    /// 已准入，内容还在接收
+    Uploading,
+    /// 已完整暂存，等待合批落带
+    Staged,
+}
+
+impl InFlight {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InFlight::Uploading => "uploading",
+            InFlight::Staged => "staged",
+        }
+    }
+}
+
+/// 一个路径的全貌：已提交的当前版本，加上可能在途的新版本（契约 file-contract.md "文件状态"）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathState {
+    pub committed: Option<Stat>,
+    /// 在途变更及其已接收的长度
+    pub in_flight: Option<(InFlight, u64)>,
+}
+
+/// 目录里的一个直接子项。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirEntry {
+    /// `committed` 是已提交版本的长度；`in_flight` 同 `PathState`
+    File { committed: Option<u64>, in_flight: Option<(InFlight, u64)> },
+    Dir,
 }
 
 struct Serving {
@@ -181,6 +218,11 @@ fn norm(path: &str) -> Result<String, ServiceError> {
         return Err(ServiceError::BadPath(path.to_string()));
     }
     Ok(format!("/{}", parts.join("/")))
+}
+
+/// 本轮刚落带的 `recent` 里有这个路径的当前版本。
+fn recent_live(s: &Serving, path: &str) -> bool {
+    s.recent.contains_key(path)
 }
 
 fn map_state(e: StateError) -> ServiceError {
@@ -449,7 +491,17 @@ impl FileService {
 
     /// 准入：登记路径并预留空间。之后调用方把内容写进 `handle.spool`，边写边 `ingest`。
     pub fn begin(&self, path: &str, len: u64) -> Result<UploadHandle, ServiceError> {
+        self.begin_with(path, len, false)
+    }
+
+    /// `create_only`：路径已有已提交的当前版本就拒绝（`Exists`）。在途的由路径预留拒绝（`PathBusy`）。
+    pub fn begin_with(&self, path: &str, len: u64, create_only: bool) -> Result<UploadHandle, ServiceError> {
         let path = norm(path)?;
+        // 本轮之前提交的只在目录库里，查询不能在锁里做；本轮的在 `recent` 里，下面在锁里再看一次，
+        // 因为这两步之间可能正好有一批发布了同一路径。
+        if create_only && self.stat(&path)?.is_some() {
+            return Err(ServiceError::Exists(path));
+        }
         let mut g = self.lock();
         let task = g.next_task;
         let why = g.why_not.clone();
@@ -457,6 +509,9 @@ impl FileService {
             return Err(ServiceError::NoTape(why));
         }
         let s = g.serving.as_mut().ok_or(ServiceError::NotServing(why))?;
+        if create_only && recent_live(s, &path) {
+            return Err(ServiceError::Exists(path));
+        }
         if len > s.limits.usable_capacity {
             return Err(ServiceError::TooLarge { requested: len, tape_capacity: s.limits.usable_capacity });
         }
@@ -598,6 +653,81 @@ impl FileService {
             out.entry(p).or_insert(n);
         }
         Ok(out)
+    }
+
+    /// 路径的全貌：已提交版本（同 `stat`）加在途变更。
+    pub fn stat_full(&self, path: &str) -> Result<PathState, ServiceError> {
+        let path = norm(path)?;
+        let committed = self.stat(&path)?;
+        let in_flight = self.in_flight(&path);
+        Ok(PathState { committed, in_flight })
+    }
+
+    fn in_flight(&self, path: &str) -> Option<(InFlight, u64)> {
+        let g = self.lock();
+        let root = g.serving.as_ref()?.state.load();
+        root.pending.get(path).map(|e| {
+            let st = match e.state {
+                PendingState::InProgress => InFlight::Uploading,
+                PendingState::Ready => InFlight::Staged,
+            };
+            (st, e.staged_len)
+        })
+    }
+
+    /// 一个目录的直接子项。目录是隐式的：有文件就有目录，没有子项的非根目录不存在（`Ok(None)`）。
+    /// `pending` 为真时附上只在途、尚未提交的路径。
+    pub fn list_dir(&self, dir: &str, pending: bool) -> Result<Option<BTreeMap<String, DirEntry>>, ServiceError> {
+        let prefix = if dir.trim_matches('/').is_empty() { "/".to_string() } else { format!("{}/", norm(dir)?) };
+        let mut out: BTreeMap<String, DirEntry> = BTreeMap::new();
+        fn add(out: &mut BTreeMap<String, DirEntry>, prefix: &str, path: &str, committed: Option<u64>, flight: Option<(InFlight, u64)>) {
+            let Some(rest) = path.strip_prefix(prefix) else { return };
+            match rest.split_once('/') {
+                Some((sub, _)) => {
+                    out.entry(sub.to_string()).or_insert(DirEntry::Dir);
+                }
+                None => match out.entry(rest.to_string()).or_insert(DirEntry::File { committed: None, in_flight: None }) {
+                    DirEntry::File { committed: c, in_flight: f } => {
+                        *c = c.or(committed);
+                        *f = f.or(flight);
+                    }
+                    // 同名的目录与文件：LTFS 里不会出现，目录优先
+                    DirEntry::Dir => {}
+                },
+            }
+        }
+        // TODO（目录库）：按前缀查询，而不是取全量再过滤
+        for (p, len) in self.list()? {
+            add(&mut out, &prefix, &p, Some(len), None);
+        }
+        let flights: Vec<(String, (InFlight, u64))> = {
+            let g = self.lock();
+            match g.serving.as_ref() {
+                Some(s) => s
+                    .state
+                    .load()
+                    .pending
+                    .iter()
+                    .map(|(p, e)| {
+                        let st = if e.state == PendingState::Ready { InFlight::Staged } else { InFlight::Uploading };
+                        (p.clone(), (st, e.staged_len))
+                    })
+                    .collect(),
+                None => Vec::new(),
+            }
+        };
+        for (p, f) in flights {
+            if pending {
+                add(&mut out, &prefix, &p, None, Some(f));
+            } else if let Some(DirEntry::File { in_flight, .. }) = p.strip_prefix(&prefix).and_then(|n| out.get_mut(n)) {
+                // 已提交的文件上正有新版本在途：照样标出来
+                *in_flight = Some(f);
+            }
+        }
+        if out.is_empty() && prefix != "/" {
+            return Ok(None);
+        }
+        Ok(Some(out))
     }
 
     /// 当前服务的磁带。

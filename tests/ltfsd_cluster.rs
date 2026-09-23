@@ -954,6 +954,102 @@ fn rejected_large_uploads_get_a_clean_answer_over_http() {
     c.shutdown();
 }
 
+// ---------- 文件契约 F1（file-contract.md）----------
+
+/// 发一个不带内容的请求，返回整个响应文本。
+fn raw_http(addr: &str, req: &str) -> String {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    s.write_all(req.as_bytes()).unwrap();
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).unwrap();
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// FC01 只创建、FC02 替换在途时旧版本可读、FC09 不在服务的节点不答 404、FC10 Range、FC11 按目录列举，
+/// 以及在途状态经 stat 可见、只在途的路径读取答 not_committed。
+#[test]
+fn file_contract_create_only_in_flight_state_range_and_directories() {
+    use tape_rs::client::ClientError;
+    let c = Cluster::start_with("f1", false);
+    let (leader, round) = c.wait_serving(None, 0);
+    let svc = &c.services[&leader];
+    c.wait("文件服务开放", || svc.serving_round() == Some(round));
+    let endpoints = c.start_http();
+    let mut cl = Client::new(endpoints.clone());
+
+    // FC01：只创建
+    let v1 = body(90_000, 1);
+    cl.put("/f1/a.bin", &v1).unwrap();
+    let before = cl.stat("/f1/a.bin").unwrap().unwrap();
+    match cl.put_new("/f1/a.bin", &body(10, 9)) {
+        Err(ClientError::Exists(p)) => assert_eq!(p, "/f1/a.bin"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(cl.stat("/f1/a.bin").unwrap().unwrap(), before, "被拒的只创建不产生新版本");
+    assert_eq!(cl.put_new("/f1/new.bin", &body(5_000, 2)).unwrap().attempts, 1);
+
+    // FC02：新版本在途时，stat 报告在途状态，读到的仍是旧版本
+    let v2 = body(120_000, 7);
+    let h = svc.begin("/f1/a.bin", v2.len() as u64).unwrap();
+    let p = cl.stat_path("/f1/a.bin").unwrap().unwrap();
+    assert_eq!(p.state, "uploading");
+    assert_eq!(p.current.as_ref().map(|s| s.length), Some(v1.len() as u64));
+    assert_eq!(cl.get("/f1/a.bin").unwrap(), v1);
+    assert!(matches!(cl.put_new("/f1/a.bin", &body(10, 3)), Err(ClientError::Exists(_))));
+
+    // 只在途、没有已提交版本的路径
+    let h2 = svc.begin("/f1/fresh.bin", 10).unwrap();
+    let p = cl.stat_path("/f1/fresh.bin").unwrap().unwrap();
+    assert_eq!((p.state.as_str(), p.current), ("uploading", None));
+    assert_eq!(cl.stat("/f1/fresh.bin").unwrap(), None);
+    match cl.get("/f1/fresh.bin") {
+        Err(ClientError::Rejected { status: 409, body }) => assert!(body.contains("not_committed"), "{body}"),
+        other => panic!("{other:?}"),
+    }
+    match cl.put_new("/f1/fresh.bin", &body(10, 4)) {
+        Err(ClientError::Rejected { status: 409, body }) => assert!(body.contains("path_busy"), "{body}"),
+        other => panic!("{other:?}"),
+    }
+
+    // FC11：按目录列举
+    let names = |items: &[tape_rs::client::DirItem]| items.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+    let committed_only = cl.list_dir("/f1", false).unwrap();
+    assert_eq!(names(&committed_only), vec!["a.bin", "new.bin"]);
+    let a = committed_only.iter().find(|e| e.name == "a.bin").unwrap();
+    assert_eq!((a.state.as_str(), a.committed_length), ("uploading", Some(v1.len() as u64)), "已提交文件上有新版本在途");
+    let with_pending = cl.list_dir("/f1", true).unwrap();
+    assert_eq!(names(&with_pending), vec!["a.bin", "fresh.bin", "new.bin"]);
+    let root = cl.list_dir("/", false).unwrap();
+    assert!(root.iter().any(|e| e.name == "f1" && e.is_dir), "{root:?}");
+    assert!(matches!(cl.list_dir("/nope", false), Err(ClientError::NotFound)));
+
+    // 在途版本落带后成为当前版本；放弃的在途路径不留痕迹
+    std::fs::write(&h.spool, &v2).unwrap();
+    svc.ingest(&h, v2.len() as u64).unwrap();
+    svc.finish(h, v2.len() as u64).unwrap();
+    svc.abort(h2);
+    c.wait("新版本落带", || svc.stat_full("/f1/a.bin").is_ok_and(|p| p.in_flight.is_none() && p.committed.is_some_and(|s| s.len == v2.len() as u64)));
+    assert_eq!(cl.get("/f1/a.bin").unwrap(), v2);
+    assert_eq!(cl.stat_path("/f1/fresh.bin").unwrap(), None);
+
+    // FC10：Range
+    assert_eq!(cl.get_range("/f1/a.bin", 100, 50).unwrap(), v2[100..150]);
+    let n = v2.len() as u64;
+    assert_eq!(cl.get_range("/f1/a.bin", n - 10, 100).unwrap(), v2[v2.len() - 10..], "越过末尾的部分截掉");
+    assert!(matches!(cl.get_range("/f1/a.bin", n, 1), Err(ClientError::Rejected { status: 416, .. })));
+    let addr = &endpoints[leader as usize - 1];
+    let resp = raw_http(addr, "GET /files/f1/a.bin HTTP/1.1\r\nHost: x\r\nRange: bytes=-5\r\n\r\n");
+    assert!(resp.starts_with("HTTP/1.1 206"), "{}", &resp[..resp.len().min(120)]);
+    assert!(resp.contains(&format!("Content-Range: bytes {}-{}/{}", n - 5, n - 1, n)), "{}", &resp[..resp.len().min(200)]);
+
+    // FC09：不在服务的节点答 503，不答 404
+    let follower = (1..=3).find(|i| *i != leader).unwrap();
+    let resp = raw_http(&endpoints[follower as usize - 1], "GET /stat/f1/a.bin HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(resp.starts_with("HTTP/1.1 503"), "{}", &resp[..resp.len().min(120)]);
+    c.shutdown();
+}
+
 // ---------- 跨磁带读取（P4）----------
 
 /// 只有一个驱动器：读不在驱动器里的带要临时换带，读完换回，服务继续。

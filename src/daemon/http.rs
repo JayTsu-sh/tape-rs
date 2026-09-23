@@ -1,10 +1,13 @@
 //! 最小 HTTP/1.1 客户端接口（骨架用，不引入新依赖）。每个连接一个线程，一次请求后关闭。
 //!
-//! PUT  /files/<path>[?wait=1]   上传。202 = 已暂存；带 wait 时等到落带，201 = 已提交
-//! GET  /files/<path>            读出已提交的文件内容
-//! GET  /stat/<path>             已提交视图里的文件信息；404 = 未提交
+//! PUT  /files/<path>[?wait=1]   上传（默认替换）。202 = 已暂存；带 wait 时等到落带，201 = 已提交。
+//!                               `If-None-Match: *` 为只创建，路径已有已提交版本时 412
+//! GET  /files/<path>            读出已提交的文件内容；支持单段 `Range`（206）；只有在途版本时 409
+//! GET  /stat/<path>             路径状态：committed / uploading / staged；404 = 不存在
 //! GET  /tasks/<id>[?wait=1]     上传任务的状态
-//! GET  /list                    已提交视图的全部文件
+//! GET  /list[?dir=<d>[&pending=1]]  不带 dir：已提交视图的全部文件；带 dir：该目录的直接子项
+//!
+//! 语义见研究笔记 file-contract.md。
 //! GET  /cluster                 本节点对集群的自述
 //! GET  /admin/pools             池与磁带归属（任何节点可答，来自已应用的日志）
 //! POST /admin/pools/<name>[?file_limit=N]      新建池（只有 Raft Leader 受理）
@@ -26,7 +29,7 @@ use log::{info, warn};
 use serde_json::{Value, json};
 
 use super::executor::ExecRequest;
-use super::files::{FileService, ServiceError, TaskStatus};
+use super::files::{DirEntry, FileService, PathState, ServiceError, TaskStatus};
 use super::net::{AdminReply, NodeInput};
 use super::node::SharedStatus;
 use super::state::{Command, DEFAULT_FILE_LIMIT};
@@ -68,6 +71,46 @@ fn respond(conn: &mut TcpStream, code: u16, reason: &str, ctype: &str, body: &[u
         body.len()
     )?;
     conn.write_all(body)
+}
+
+/// 206：`body` 是 `[start, start + body.len())` 这一段，`total` 是文件全长。
+fn respond_range(conn: &mut TcpStream, start: u64, total: u64, body: &[u8]) -> std::io::Result<()> {
+    let end = start + body.len() as u64;
+    write!(
+        conn,
+        "HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        start,
+        end.saturating_sub(1),
+        total,
+        body.len()
+    )?;
+    conn.write_all(body)?;
+    conn.flush()
+}
+
+/// 单段 `Range: bytes=a-b` / `bytes=a-` / `bytes=-n`，按全长 `total` 解析成 `[start, end)`。
+/// 多段或写法不认识时返回 `None`（按 RFC 9110 可以当没有 Range，回整个文件）；
+/// 起点越过文件末尾时返回 `Some(Err(()))`（416）。
+pub fn parse_range(v: &str, total: u64) -> Option<Result<(u64, u64), ()>> {
+    let spec = v.trim().strip_prefix("bytes=")?;
+    if spec.contains(',') {
+        return None;
+    }
+    let (a, b) = spec.split_once('-')?;
+    let (a, b) = (a.trim(), b.trim());
+    if a.is_empty() {
+        let n: u64 = b.parse().ok()?;
+        if n == 0 {
+            return Some(Err(()));
+        }
+        return Some(Ok((total.saturating_sub(n), total)));
+    }
+    let start: u64 = a.parse().ok()?;
+    let end = if b.is_empty() { total } else { b.parse::<u64>().ok()?.saturating_add(1).min(total) };
+    if start >= total || end <= start {
+        return Some(Err(()));
+    }
+    Some(Ok((start, end)))
 }
 
 fn respond_json(conn: &mut TcpStream, code: u16, reason: &str, v: Value) -> std::io::Result<()> {
@@ -113,6 +156,7 @@ fn service_error(conn: &mut TcpStream, ctx: &HttpContext, e: ServiceError) -> st
             json!({"error": "too_large", "requested": requested, "tape_capacity": tape_capacity}),
         ),
         ServiceError::PathBusy(p) => respond_json(conn, 409, "Conflict", json!({"error": "path_busy", "path": p})),
+        ServiceError::Exists(p) => respond_json(conn, 412, "Precondition Failed", json!({"error": "exists", "path": p})),
         ServiceError::InsufficientCapacity { requested, available } => respond_json(
             conn,
             507,
@@ -174,6 +218,8 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
     let path = percent_decode(raw_path);
     let mut content_length: Option<u64> = None;
     let mut expects_continue = false;
+    let mut create_only = false;
+    let mut range: Option<String> = None;
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h)? == 0 || h == "\r\n" || h == "\n" {
@@ -186,6 +232,12 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
             if k.eq_ignore_ascii_case("expect") && v.trim().eq_ignore_ascii_case("100-continue") {
                 // 先不回：等准入成功再让客户端发内容；被拒绝就直接回最终结论
                 expects_continue = true;
+            }
+            if k.eq_ignore_ascii_case("if-none-match") && v.trim() == "*" {
+                create_only = true;
+            }
+            if k.eq_ignore_ascii_case("range") {
+                range = Some(v.trim().to_string());
             }
         }
     }
@@ -254,18 +306,63 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
         ("DELETE", p) if p.starts_with("/admin/tapes/") => {
             admin(&mut conn, ctx, Command::TapeUnassign { barcode: p[13..].to_string() })
         }
-        ("GET", "/list") => match ctx.files.list() {
-            Ok(m) => respond_json(&mut conn, 200, "OK", json!({"files": m})),
-            Err(e) => service_error(&mut conn, ctx, e),
+        ("GET", "/list") => match query_param(query, "dir") {
+            Some(dir) => {
+                let dir = percent_decode(dir);
+                let pending = query_param(query, "pending") == Some("1");
+                match ctx.files.list_dir(&dir, pending) {
+                    Ok(Some(entries)) => {
+                        let v: Vec<Value> = entries
+                            .into_iter()
+                            .map(|(name, e)| match e {
+                                DirEntry::Dir => json!({"name": name, "type": "dir"}),
+                                DirEntry::File { committed, in_flight } => {
+                                    let mut j = json!({"name": name, "type": "file", "state": in_flight.map(|f| f.0.as_str()).unwrap_or("committed")});
+                                    if let Some(n) = committed {
+                                        j["committed_length"] = json!(n);
+                                    }
+                                    if let Some((_, n)) = in_flight {
+                                        j["staged_length"] = json!(n);
+                                    }
+                                    j
+                                }
+                            })
+                            .collect();
+                        respond_json(&mut conn, 200, "OK", json!({"dir": dir, "entries": v}))
+                    }
+                    Ok(None) => respond_json(&mut conn, 404, "Not Found", json!({"error": "not_found", "dir": dir})),
+                    Err(e) => service_error(&mut conn, ctx, e),
+                }
+            }
+            None => match ctx.files.list() {
+                Ok(m) => respond_json(&mut conn, 200, "OK", json!({"files": m})),
+                Err(e) => service_error(&mut conn, ctx, e),
+            },
         },
-        ("GET", p) if p.starts_with("/stat/") => match ctx.files.stat(&p[5..]) {
-            Ok(Some(s)) => respond_json(
-                &mut conn,
-                200,
-                "OK",
-                json!({"path": &p[5..], "committed": true, "length": s.len, "generation": s.generation, "round": s.round, "barcode": s.barcode, "sha256": s.sha256}),
-            ),
-            Ok(None) => respond_json(&mut conn, 404, "Not Found", json!({"path": &p[5..], "committed": false})),
+        ("GET", p) if p.starts_with("/stat/") => match ctx.files.stat_full(&p[5..]) {
+            Ok(PathState { committed, in_flight }) => {
+                let committed_json = committed.as_ref().map(|s| {
+                    json!({"length": s.len, "generation": s.generation, "round": s.round, "barcode": s.barcode, "sha256": s.sha256})
+                });
+                match (in_flight, committed_json) {
+                    (None, None) => respond_json(&mut conn, 404, "Not Found", json!({"path": &p[5..], "committed": false})),
+                    // 已提交且没有新版本在途：字段放在顶层（与旧格式相同）
+                    (None, Some(mut j)) => {
+                        j["path"] = json!(&p[5..]);
+                        j["state"] = json!("committed");
+                        j["committed"] = json!(true);
+                        respond_json(&mut conn, 200, "OK", j)
+                    }
+                    // 新版本在途：顶层是在途的状态与已接收长度，已提交的当前版本（如有）放在 current
+                    (Some((st, len)), cur) => {
+                        let mut j = json!({"path": &p[5..], "state": st.as_str(), "length": len, "committed": false});
+                        if let Some(c) = cur {
+                            j["current"] = c;
+                        }
+                        respond_json(&mut conn, 200, "OK", j)
+                    }
+                }
+            }
             Err(e) => service_error(&mut conn, ctx, e),
         },
         ("GET", p) if p.starts_with("/tasks/") => {
@@ -280,8 +377,15 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
             }
         }
         ("GET", p) if p.starts_with("/files/") => {
-            if let Err(e) = ctx.files.stat(&p[6..]) {
-                return service_error(&mut conn, ctx, e);
+            match ctx.files.stat_full(&p[6..]) {
+                Err(e) => return service_error(&mut conn, ctx, e),
+                Ok(PathState { committed: None, in_flight: Some((st, _)) }) => {
+                    return respond_json(&mut conn, 409, "Conflict", json!({"error": "not_committed", "path": &p[6..], "state": st.as_str()}));
+                }
+                Ok(PathState { committed: None, in_flight: None }) => {
+                    return respond_json(&mut conn, 404, "Not Found", json!({"error": "not_found", "path": &p[6..]}));
+                }
+                Ok(_) => {}
             }
             let (tx, rx) = channel();
             let sent = ctx.exec.lock().unwrap_or_else(|e| e.into_inner()).send(ExecRequest::Read { path: p[6..].to_string(), reply: tx });
@@ -289,7 +393,12 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                 return respond_json(&mut conn, 503, "Service Unavailable", json!({"error": "executor_gone"}));
             }
             match rx.recv_timeout(ctx.wait_timeout) {
-                Ok(Ok(bytes)) => respond(&mut conn, 200, "OK", "application/octet-stream", &bytes),
+                // TODO：按范围只读需要的块，而不是整个文件读出来再切
+                Ok(Ok(bytes)) => match range.as_deref().and_then(|r| parse_range(r, bytes.len() as u64)) {
+                    Some(Ok((a, b))) => respond_range(&mut conn, a, bytes.len() as u64, &bytes[a as usize..b as usize]),
+                    Some(Err(())) => respond_json(&mut conn, 416, "Range Not Satisfiable", json!({"error": "bad_range", "length": bytes.len()})),
+                    None => respond(&mut conn, 200, "OK", "application/octet-stream", &bytes),
+                },
                 Ok(Err(tape_rs_read_busy @ super::executor::ReadError::Busy(_))) => {
                     respond_json(&mut conn, 503, "Service Unavailable", json!({"error": "drive_busy", "detail": tape_rs_read_busy.to_string()}))
                 }
@@ -301,7 +410,7 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
             let Some(len) = content_length else {
                 return respond_json(&mut conn, 411, "Length Required", json!({"error": "length_required"}));
             };
-            let h = match ctx.files.begin(&p[6..], len) {
+            let h = match ctx.files.begin_with(&p[6..], len, create_only) {
                 Ok(h) => h,
                 Err(e) => {
                     // 没有用 Expect 的客户端此刻正在发内容。不读掉就关连接，对方收到的是连接重置，
@@ -345,5 +454,24 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
             respond_json(&mut conn, code, reason, body)
         }
         _ => respond_json(&mut conn, 404, "Not Found", json!({"error": "no_such_route"})),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_range;
+
+    #[test]
+    fn range_forms() {
+        assert_eq!(parse_range("bytes=0-9", 100), Some(Ok((0, 10))));
+        assert_eq!(parse_range("bytes=90-", 100), Some(Ok((90, 100))));
+        assert_eq!(parse_range("bytes=95-200", 100), Some(Ok((95, 100))), "终点越过末尾就截到末尾");
+        assert_eq!(parse_range("bytes=-5", 100), Some(Ok((95, 100))));
+        assert_eq!(parse_range("bytes=-500", 100), Some(Ok((0, 100))));
+        assert_eq!(parse_range("bytes=100-", 100), Some(Err(())), "起点在末尾");
+        assert_eq!(parse_range("bytes=5-2", 100), Some(Err(())));
+        assert_eq!(parse_range("bytes=-0", 100), Some(Err(())));
+        assert_eq!(parse_range("bytes=0-1,5-6", 100), None, "多段当没有 Range");
+        assert_eq!(parse_range("items=0-1", 100), None);
     }
 }

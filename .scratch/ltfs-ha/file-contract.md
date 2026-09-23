@@ -21,7 +21,7 @@
 | 不存在 | 视图可信且没有当前版本，也没有在途任务；包括被墓碑覆盖 | — | `stat` 404 |
 | 恢复中 | 本节点不在服务（换届、接管、恢复） | — | 503；客户端库等待并跟随 Leader |
 
-- `stat` 对 uploading/staged 同时附上已提交的当前版本（字段 `committed`，没有则省略），调用方能看到"新版本在途、旧版本仍是当前"。
+- `stat` 对 uploading/staged 在顶层给出在途状态与已接收长度，已提交的当前版本放在字段 `current`（没有则省略），调用方能看到"新版本在途、旧版本仍是当前"。已提交且无在途时字段在顶层，与旧格式兼容。
 - `list` 默认只列已提交；`pending=1` 时附上在途路径及其状态。
 - 恢复中绝不回答 404：视图不可信时只能答 503。
 
@@ -128,6 +128,11 @@ EE 的做法（[资源模型](ee-resource-model.md)、[39](issues/39-ee-fault-re
 | 500 `failed`/`spool_io` | 明确失败 | `Rejected` | `EIO` |
 
 恢复中与未定状态不得映射为 `ENOENT`。
+
+## 实施状态
+
+- **F1（2026-09-23）已实现**：`FileService::begin_with`（只创建）、`stat_full`、`list_dir`；HTTP `If-None-Match: *` → 412、`/stat` 在途状态、`/list?dir=&pending=1`、单段 `Range`（206/416）、只在途路径读取 409 `not_committed`、不存在 404；客户端库 `put_new`、`stat_path`、`get_range`、`list_dir`，结果未定时遇到在途状态先等它结束再判定；`ltfsctl put --new`、`stat` 显示状态、`list --dir [--pending]`。FC01/02/09/10/11 由 `ltfsd_cluster.rs::file_contract_create_only_in_flight_state_range_and_directories` 覆盖。已知的简化：`Range` 仍是整文件读出后切片（`read_file` 256 MiB 上限不变），`list_dir` 取全量再按前缀过滤；两处都标了 TODO，F3 FUSE 做大文件读与大目录时要换成按块读和目录库前缀查询。
+- F2 删除：进行中（另一会话）。F3 FUSE：未开始。
 
 ## 验证 FC01—FC12
 

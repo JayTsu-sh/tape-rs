@@ -15,14 +15,26 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// 上传本地文件并等到落带
-    Put { file: String, path: String },
+    /// 上传本地文件并等到落带（默认替换已有版本）
+    Put {
+        file: String,
+        path: String,
+        /// 只创建：路径已有已提交版本时失败
+        #[arg(long)]
+        new: bool,
+    },
     /// 读出已提交的文件
     Get { path: String, output: String },
-    /// 查询文件是否已提交
+    /// 查询路径状态：已提交 / 上传中 / 已暂存
     Stat { path: String },
-    /// 列出已提交的全部文件
-    List,
+    /// 列出已提交的全部文件；给出 --dir 时只列该目录的直接子项
+    List {
+        #[arg(long)]
+        dir: Option<String>,
+        /// 同时列出尚未落带的在途文件（需要 --dir）
+        #[arg(long)]
+        pending: bool,
+    },
     /// 各节点的自述
     Cluster,
     /// 池管理
@@ -69,9 +81,9 @@ fn main() {
     let mut c = Client::new(args.endpoints.clone());
     let r: Result<(), Box<dyn std::error::Error>> = (|| {
         match args.cmd {
-            Cmd::Put { file, path } => {
+            Cmd::Put { file, path, new } => {
                 let data = std::fs::read(&file)?;
-                let o = c.put(&path, &data)?;
+                let o = if new { c.put_new(&path, &data)? } else { c.put(&path, &data)? };
                 println!(
                     "已提交 {} ({} 字节) 索引代数 {}  请求次数 {}{}",
                     path,
@@ -86,13 +98,39 @@ fn main() {
                 std::fs::write(&output, &d)?;
                 println!("{} -> {} ({} 字节)", path, output, d.len());
             }
-            Cmd::Stat { path } => match c.stat(&path)? {
-                Some(s) => println!("已提交  {} 字节  索引代数 {}  执行轮次 {}", s.length, s.generation, s.round),
-                None => println!("未提交"),
+            Cmd::Stat { path } => match c.stat_path(&path)? {
+                None => println!("不存在"),
+                Some(p) => {
+                    if p.state != "committed" {
+                        println!("{}  已接收 {} 字节", if p.state == "staged" { "已暂存，等待落带" } else { "上传中" }, p.length);
+                    }
+                    match p.current {
+                        Some(s) => println!(
+                            "{}  {} 字节  索引代数 {}  磁带 {}  sha256 {}",
+                            if p.state == "committed" { "已提交" } else { "当前版本" },
+                            s.length,
+                            s.generation,
+                            s.barcode,
+                            s.sha256
+                        ),
+                        None => println!("没有已提交的版本"),
+                    }
+                }
             },
-            Cmd::List => {
+            Cmd::List { dir: None, .. } => {
                 for (p, n) in c.list()? {
                     println!("{:>12}  {}", n, p);
+                }
+            }
+            Cmd::List { dir: Some(d), pending } => {
+                for e in c.list_dir(&d, pending)? {
+                    if e.is_dir {
+                        println!("{:>12}  {}/", "", e.name);
+                    } else {
+                        let n = e.committed_length.or(e.staged_length).unwrap_or(0);
+                        let st = if e.state == "committed" { String::new() } else { format!("  ({})", e.state) };
+                        println!("{:>12}  {}{}", n, e.name, st);
+                    }
                 }
             }
             Cmd::Pool { cmd: PoolCmd::Create { name, file_limit } } => {

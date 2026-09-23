@@ -22,6 +22,8 @@ pub enum ClientError {
     /// 服务端明确拒绝：路径冲突、空间不足、路径非法等。重试无益。
     Rejected { status: u16, body: String },
     NotFound,
+    /// 只创建（`put_new`）：路径已有已提交的当前版本。
+    Exists(String),
     Io(std::io::Error),
 }
 
@@ -31,6 +33,7 @@ impl std::fmt::Display for ClientError {
             ClientError::NoLeader(s) => write!(f, "没有可用的 Leader: {}", s),
             ClientError::Rejected { status, body } => write!(f, "服务端拒绝 ({}): {}", status, body),
             ClientError::NotFound => write!(f, "不存在"),
+            ClientError::Exists(p) => write!(f, "路径已存在: {}", p),
             ClientError::Io(e) => write!(f, "I/O: {}", e),
         }
     }
@@ -57,6 +60,37 @@ pub struct FileStat {
     pub barcode: String,
     /// 服务端写带时算出的内容 sha256（十六进制小写）
     pub sha256: String,
+}
+
+/// 路径的状态（`stat_path`）。`state` 为 `committed`、`uploading` 或 `staged`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathStat {
+    pub state: String,
+    /// committed 时是文件长度；在途时是已接收的长度
+    pub length: u64,
+    /// 已提交的当前版本。在途的新版本落带之前，读到的是它
+    pub current: Option<FileStat>,
+}
+
+/// 目录的一个直接子项（`list_dir`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirItem {
+    pub name: String,
+    pub is_dir: bool,
+    /// 文件：`committed`、`uploading` 或 `staged`；目录为空串
+    pub state: String,
+    pub committed_length: Option<u64>,
+    pub staged_length: Option<u64>,
+}
+
+fn file_stat(j: &Value) -> FileStat {
+    FileStat {
+        length: j["length"].as_u64().unwrap_or(0),
+        generation: j["generation"].as_u64().unwrap_or(0),
+        round: j["round"].as_u64().unwrap_or(0),
+        barcode: j["barcode"].as_str().unwrap_or("").to_string(),
+        sha256: j["sha256"].as_str().unwrap_or("").to_string(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,20 +158,27 @@ impl Client {
 
     /// 出错时第一项说明请求是否可能已经到达服务端：连接都没建立起来则为 false。
     fn request(&self, addr: &str, method: &str, path: &str, body: Option<&[u8]>) -> std::result::Result<Response, (bool, std::io::Error)> {
+        self.request_with(addr, method, path, body, &[])
+    }
+
+    fn request_with(&self, addr: &str, method: &str, path: &str, body: Option<&[u8]>, headers: &[(&str, &str)]) -> std::result::Result<Response, (bool, std::io::Error)> {
         let sock = addr
             .to_socket_addrs()
             .map_err(|e| (false, e))?
             .next()
             .ok_or_else(|| (false, std::io::Error::other("地址无法解析")))?;
         let conn = TcpStream::connect_timeout(&sock, Duration::from_secs(3)).map_err(|e| (false, e))?;
-        self.exchange(conn, addr, method, path, body).map_err(|e| (true, e))
+        self.exchange(conn, addr, method, path, body, headers).map_err(|e| (true, e))
     }
 
-    fn exchange(&self, mut conn: TcpStream, addr: &str, method: &str, path: &str, body: Option<&[u8]>) -> std::io::Result<Response> {
+    fn exchange(&self, mut conn: TcpStream, addr: &str, method: &str, path: &str, body: Option<&[u8]>, headers: &[(&str, &str)]) -> std::io::Result<Response> {
         conn.set_read_timeout(Some(self.io_timeout))?;
         conn.set_write_timeout(Some(self.io_timeout))?;
         let _ = conn.set_nodelay(true);
         write!(conn, "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n", method, encode_path(path), addr)?;
+        for (k, v) in headers {
+            write!(conn, "{}: {}\r\n", k, v)?;
+        }
         // 大的内容先问一声：服务端准入成功才回 100，被拒绝就直接给最终结论，内容不必发
         let ask_first = body.is_some_and(|b| b.len() >= 64 * 1024);
         if let Some(b) = body {
@@ -194,6 +235,10 @@ impl Client {
     /// 向 Leader 发一次请求。503 时跟随提示或换节点，直到 `retry_for` 用完。
     /// 传输层错误原样返回，由调用方决定含义（对上传来说它意味着结果未定）。
     fn to_leader(&mut self, method: &str, path: &str, body: Option<&[u8]>) -> Result<Response> {
+        self.to_leader_with(method, path, body, &[])
+    }
+
+    fn to_leader_with(&mut self, method: &str, path: &str, body: Option<&[u8]>, headers: &[(&str, &str)]) -> Result<Response> {
         let deadline = Instant::now() + self.retry_for;
         let mut last = String::from("尚未尝试");
         loop {
@@ -203,7 +248,7 @@ impl Client {
             while i < order.len() {
                 let addr = order[i].clone();
                 i += 1;
-                match self.request(&addr, method, path, body) {
+                match self.request_with(&addr, method, path, body, headers) {
                     Ok(r) if r.status == 503 => {
                         let j = r.json();
                         last = format!("{} 不在服务: {}", addr, j.get("detail").and_then(Value::as_str).unwrap_or(""));
@@ -241,27 +286,38 @@ impl Client {
         }
     }
 
-    /// 已提交视图里的文件。`Ok(None)` 表示未提交。
+    /// 已提交的当前版本。`Ok(None)` 表示没有（可能有新版本在途，见 `stat_path`）。
     pub fn stat(&mut self, path: &str) -> Result<Option<FileStat>> {
+        Ok(self.stat_path(path)?.and_then(|p| p.current))
+    }
+
+    /// 路径的全貌：已提交的当前版本加在途的新版本。`Ok(None)` 表示不存在。
+    pub fn stat_path(&mut self, path: &str) -> Result<Option<PathStat>> {
         let r = self.to_leader("GET", &format!("/stat/{}", path.trim_start_matches('/')), None)?;
         match r.status {
             200 => {
                 let j = r.json();
-                Ok(Some(FileStat {
-                    length: j["length"].as_u64().unwrap_or(0),
-                    generation: j["generation"].as_u64().unwrap_or(0),
-                    round: j["round"].as_u64().unwrap_or(0),
-                    barcode: j["barcode"].as_str().unwrap_or("").to_string(),
-                    sha256: j["sha256"].as_str().unwrap_or("").to_string(),
-                }))
+                let state = j["state"].as_str().unwrap_or("committed").to_string();
+                let current = if state == "committed" { Some(file_stat(&j)) } else { j.get("current").map(file_stat) };
+                Ok(Some(PathStat { length: j["length"].as_u64().unwrap_or(0), state, current }))
             }
             404 => Ok(None),
             s => Err(ClientError::Rejected { status: s, body: String::from_utf8_lossy(&r.body).into_owned() }),
         }
     }
 
-    /// 上传并等到落带。返回即表示已随卷提交；出错表示确定没有成功或无法判定。
+    /// 上传并等到落带（替换已有版本）。返回即表示已随卷提交；出错表示确定没有成功或无法判定。
     pub fn put(&mut self, path: &str, data: &[u8]) -> Result<PutOutcome> {
+        self.put_inner(path, data, false)
+    }
+
+    /// 只创建：路径已有已提交的当前版本时返回 `Exists`，不产生新版本。
+    pub fn put_new(&mut self, path: &str, data: &[u8]) -> Result<PutOutcome> {
+        self.put_inner(path, data, true)
+    }
+
+    fn put_inner(&mut self, path: &str, data: &[u8], create_only: bool) -> Result<PutOutcome> {
+        let headers: &[(&str, &str)] = if create_only { &[("If-None-Match", "*")] } else { &[] };
         let route = format!("/files/{}?wait=1", path.trim_start_matches('/'));
         let digest: String = {
             use sha2::{Digest, Sha256};
@@ -271,7 +327,7 @@ impl Client {
         let mut attempts = 0;
         loop {
             attempts += 1;
-            let uncertain = match self.to_leader("PUT", &route, Some(data)) {
+            let uncertain = match self.to_leader_with("PUT", &route, Some(data), headers) {
                 Ok(r) if r.status == 201 => {
                     return Ok(PutOutcome {
                         generation: r.json()["generation"].as_u64().unwrap_or(0),
@@ -282,14 +338,22 @@ impl Client {
                 // 服务端明确说没落带（仅暂存时执行者更换）：可以直接重传
                 Ok(r) if r.status == 500 && r.json()["status"] == "failed" => false,
                 Ok(r) if r.status == 500 => true,
+                Ok(r) if r.status == 412 => return Err(ClientError::Exists(path.to_string())),
                 Ok(r) => return Err(ClientError::Rejected { status: r.status, body: String::from_utf8_lossy(&r.body).into_owned() }),
                 Err(ClientError::Io(_)) => true,
                 Err(e) => return Err(e),
             };
             if uncertain {
                 // 结果未定：到当前 Leader 上查这个路径。已提交且内容哈希与本次上传相同即视为成功。
-                if let Some(st) = self.stat(path)?.filter(|s| s.length == data.len() as u64 && s.sha256 == digest) {
-                    return Ok(PutOutcome { generation: st.generation, attempts, resolved_by_query: true });
+                // 路径上还有在途版本（可能就是这次上传，还在暂存或落带途中）：等它有结论再判定，
+                // 此时重传只会撞上路径预留。
+                let mut st = self.stat_path(path)?;
+                while st.as_ref().is_some_and(|s| s.state != "committed") && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(300));
+                    st = self.stat_path(path)?;
+                }
+                if let Some(cur) = st.and_then(|s| s.current).filter(|s| s.length == data.len() as u64 && s.sha256 == digest) {
+                    return Ok(PutOutcome { generation: cur.generation, attempts, resolved_by_query: true });
                 }
             }
             if Instant::now() >= deadline {
@@ -302,6 +366,46 @@ impl Client {
         let r = self.to_leader("GET", &format!("/files/{}", path.trim_start_matches('/')), None)?;
         match r.status {
             200 => Ok(r.body),
+            404 => Err(ClientError::NotFound),
+            s => Err(ClientError::Rejected { status: s, body: String::from_utf8_lossy(&r.body).into_owned() }),
+        }
+    }
+
+    /// 读 `[offset, offset + len)`，超出文件末尾的部分截掉。起点越过末尾时返回 `Rejected{416}`。
+    pub fn get_range(&mut self, path: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let range = format!("bytes={}-{}", offset, offset + len - 1);
+        let r = self.to_leader_with("GET", &format!("/files/{}", path.trim_start_matches('/')), None, &[("Range", &range)])?;
+        match r.status {
+            206 => Ok(r.body),
+            // 服务端不认这个 Range 时回整个文件
+            200 => Ok(r.body.into_iter().skip(offset as usize).take(len as usize).collect()),
+            404 => Err(ClientError::NotFound),
+            s => Err(ClientError::Rejected { status: s, body: String::from_utf8_lossy(&r.body).into_owned() }),
+        }
+    }
+
+    /// 目录的直接子项。`pending` 为真时包括只在途、尚未提交的文件。目录不存在时 `NotFound`。
+    pub fn list_dir(&mut self, dir: &str, pending: bool) -> Result<Vec<DirItem>> {
+        let q = format!("/list?dir={}{}", encode_query(dir), if pending { "&pending=1" } else { "" });
+        let r = self.to_leader("GET", &q, None)?;
+        match r.status {
+            200 => Ok(r.json()["entries"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|e| DirItem {
+                            name: e["name"].as_str().unwrap_or("").to_string(),
+                            is_dir: e["type"] == "dir",
+                            state: e["state"].as_str().unwrap_or("").to_string(),
+                            committed_length: e["committed_length"].as_u64(),
+                            staged_length: e["staged_length"].as_u64(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()),
             404 => Err(ClientError::NotFound),
             s => Err(ClientError::Rejected { status: s, body: String::from_utf8_lossy(&r.body).into_owned() }),
         }
@@ -393,6 +497,18 @@ impl Client {
     pub fn node_status(&self, addr: &str) -> Result<Value> {
         Ok(self.request(addr, "GET", "/cluster", None).map_err(|(_, e)| e)?.json())
     }
+}
+
+/// 查询参数值的百分号编码（`/` 也编码，服务端 `percent_decode` 还原）。
+fn encode_query(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for b in v.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            other => out.push_str(&format!("%{:02X}", other)),
+        }
+    }
+    out
 }
 
 fn encode_path(path: &str) -> String {
