@@ -25,3 +25,16 @@ slog-stdlog = "4"
 [dev-dependencies]
 # 集成测试直接查控制存储，验证日志确实被压缩过
 rusqlite = { version = "0.31", features = ["bundled"] }
+
+[dependencies.fuser]
+# FUSE 适配器 tape-fuse（`--features fuse`）。不用 libfuse：挂载走 fusermount3，库本身纯 Rust
+version = "0.18"
+optional = true
+default-features = false
+
+[features]
+fuse = ["dep:fuser"]
+
+[[bin]]
+name = "tape-fuse"
+required-features = ["fuse"]

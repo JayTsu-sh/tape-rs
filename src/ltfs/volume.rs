@@ -549,6 +549,28 @@ impl<'a> LtfsVolume<'a> {
         Ok(())
     }
 
+    /// 从工作索引里去掉一个文件（LTFS 的 unlink）。数据块留在带上，不再被引用；
+    /// 下次提交写出的索引里没有它。返回是否真的有这个文件。空目录保留。
+    pub fn remove_file(&mut self, path: &str) -> Result<bool> {
+        self.ensure_writable()?;
+        let (dir_parts, file_name) = split_path(path)?;
+        let mut dir = &mut self.working.root;
+        for part in dir_parts {
+            match dir.subdirs.iter().position(|d| d.name == part) {
+                Some(i) => dir = &mut dir.subdirs[i],
+                None => return Ok(false),
+            }
+        }
+        let before = dir.files.len();
+        dir.files.retain(|f| f.name != file_name);
+        if dir.files.len() == before {
+            return Ok(false);
+        }
+        self.dirty = true;
+        info!("删除 {}（数据块保留在带上，待回收）", path);
+        Ok(true)
+    }
+
     /// 读出文件并与索引里的哈希比对。优先 sha256sum，其次 md5sum。
     pub fn verify_file(&self, path: &str) -> Result<HashVerdict> {
         let file = self
@@ -884,6 +906,28 @@ pub const XATTR_ABANDONED: &str = "tapers.abandonedBlocks";
 /// 所以 (轮次, 序号) 是整个集群范围内的全序。没有这个属性的文件（EE 写的、打捞出来的）
 /// 记为 (0, 0)。
 pub const XATTR_VERSION: &str = "tapers.version";
+/// 墓碑文件的扩展属性：被删除的路径。
+pub const XATTR_DELETED_PATH: &str = "tapers.deletedPath";
+/// 墓碑所在的目录。删除一个路径时，在当前写入带上登记一个零长度文件
+/// `/.tapers/deleted/<sha256(路径)>`，带 `tapers.deletedPath` 与 `tapers.version`。
+///
+/// 被删文件的旧副本可能留在任何一盘别的带上，删除不去装载它们。带是目录的权威，
+/// 所以"删过"这件事也必须落在带上，否则装载那盘旧带做一次对账就会把文件找回来，
+/// 控制存储整体丢失后从带重建目录也会复活它。墓碑与文件用同一套版本比较。
+pub const TOMBSTONE_DIR: &str = ".tapers/deleted";
+
+/// 路径 `path`（以 `/` 开头）的墓碑文件在卷内的路径（不以 `/` 开头）。
+/// 用哈希做文件名：被删路径里的目录层次不能在墓碑目录里重建（`/a` 和 `/a/b` 会冲突）。
+pub fn tombstone_path(path: &str) -> String {
+    let digest = Sha256::digest(path.as_bytes());
+    format!("{}/{}", TOMBSTONE_DIR, hex(&digest))
+}
+
+/// 卷内路径（不以 `/` 开头）是不是墓碑目录下的文件。
+pub fn is_tombstone_path(path: &str) -> bool {
+    path.trim_start_matches('/').strip_prefix(TOMBSTONE_DIR).is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// 与 IBM LTFS 的 lost+found 目录同名。
 pub const LOST_AND_FOUND: &str = "_ltfs_lostandfound";
 

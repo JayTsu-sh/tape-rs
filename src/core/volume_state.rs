@@ -120,6 +120,8 @@ pub struct PendingEntry {
     /// 最早未提交变更的登记时刻（time-based 触发计时起点，发布不重置）。
     pub earliest_registered: u64,
     pub reservation: ReservationId,
+    /// 删除：发布时把路径从已提交视图里去掉，而不是写入一个版本。
+    pub removal: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,6 +191,8 @@ pub struct CoverEntry {
     pub len: u64,
     /// 覆盖的是完整文件（Ready）还是打开文件的快照前缀。
     pub complete: bool,
+    /// 删除：发布时去掉该路径。
+    pub removal: bool,
 }
 
 /// S2 冻结描述：本批要发布的精确覆盖与转换依据。
@@ -555,6 +559,28 @@ impl VolumeState {
         reserve: u64,
         now: u64,
     ) -> Result<ReservationId, StateError> {
+        self.admit_entry(session, path, reserve, now, false)
+    }
+
+    /// 准入一次删除：不预留预算，登记 in_progress 条目占住路径，之后 `complete` 入批。
+    /// 发布时路径从已提交视图里消失。与写入一样，同一路径同时只能有一个未提交的变更。
+    pub fn admit_removal(
+        &self,
+        session: SessionId,
+        path: &str,
+        now: u64,
+    ) -> Result<ReservationId, StateError> {
+        self.admit_entry(session, path, 0, now, true)
+    }
+
+    fn admit_entry(
+        &self,
+        session: SessionId,
+        path: &str,
+        reserve: u64,
+        now: u64,
+        removal: bool,
+    ) -> Result<ReservationId, StateError> {
         let mut g = self.lock();
         let cur = Arc::clone(&g.current);
         if !cur.capability.writable {
@@ -603,6 +629,7 @@ impl VolumeState {
                 committed_prefix: 0,
                 earliest_registered: now,
                 reservation: rid,
+                removal,
             },
         );
         root.ledger = Arc::new(ledger);
@@ -724,6 +751,7 @@ impl VolumeState {
                     version: e.version,
                     len: e.staged_len,
                     complete,
+                    removal: e.removal,
                 },
             );
             if !sessions_in_batch.contains(&e.session) {
@@ -801,12 +829,14 @@ impl VolumeState {
             let Some((dirs, name)) = split_path(path) else {
                 continue;
             };
-            let fv = Arc::new(FileVersion {
-                version: c.version,
-                len: c.len,
-                partial: !c.complete,
+            let fv = (!c.removal).then(|| {
+                Arc::new(FileVersion {
+                    version: c.version,
+                    len: c.len,
+                    partial: !c.complete,
+                })
             });
-            committed = committed.with_file(&dirs, name, Some(fv), &mut stats_delta);
+            committed = committed.with_file(&dirs, name, fv, &mut stats_delta);
             match pending.get_mut(path) {
                 Some(e) if e.version == c.version => {
                     if c.complete && e.staged_len == c.len {

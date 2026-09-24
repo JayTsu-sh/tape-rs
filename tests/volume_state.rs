@@ -31,7 +31,8 @@ fn pc01_snapshot_x_then_more_writes_y_keeps_y_pending() {
         CoverEntry {
             version: 1,
             len: 400,
-            complete: false
+            complete: false,
+            removal: false,
         }
     );
     // 写索引期间继续接收 Y
@@ -67,7 +68,8 @@ fn pc01_snapshot_x_then_more_writes_y_keeps_y_pending() {
         CoverEntry {
             version: 1,
             len: 700,
-            complete: true
+            complete: true,
+            removal: false,
         }
     );
     let out2 = st.publish(&batch2, evidence(&batch2)).unwrap();
@@ -340,7 +342,36 @@ fn admission_respects_capacity_and_path_exclusivity() {
             version: 9,
             len: 1,
             complete: true,
+            removal: false,
         },
     );
     let _ = cover;
+}
+
+/// 删除（文件契约 05）：删除与写入共用"一个路径同时只有一个未提交变更"的占位；
+/// 发布之前旧版本照常可见，发布之后路径从已提交视图里消失，不占预算。
+#[test]
+fn removal_takes_the_path_out_of_the_view_only_when_published() {
+    let st = fresh();
+    st.open_session(1, 100);
+    st.admit(1, "/d/a", 100, 1).unwrap();
+    st.ingest("/d/a", 100).unwrap();
+    st.complete("/d/a").unwrap();
+    let b = st.freeze(&[]).unwrap();
+    st.publish(&b, evidence(&b)).unwrap();
+    assert_eq!(st.load().committed.get("/d/a").map(|f| f.len), Some(100));
+
+    let before = st.load().ledger.available();
+    st.admit_removal(1, "/d/a", 2).unwrap();
+    assert_eq!(st.load().ledger.available(), before, "删除不预留预算");
+    assert!(matches!(st.admit(1, "/d/a", 1, 3), Err(StateError::PathBusy(_))));
+    st.complete("/d/a").unwrap();
+    let b = st.freeze(&[]).unwrap();
+    assert!(b.cover["/d/a"].removal);
+    assert!(st.load().committed.get("/d/a").is_some(), "发布之前仍是旧视图");
+    st.publish(&b, evidence(&b)).unwrap();
+    assert!(st.load().committed.get("/d/a").is_none());
+    assert!(st.load().pending.is_empty());
+    // 路径空出来了，可以再建
+    st.admit(1, "/d/a", 10, 4).unwrap();
 }

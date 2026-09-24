@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use log::{error, info, warn};
 use sha2::{Digest, Sha256};
 
-use super::files::{FileService, TapeIdent, TapeLimits};
+use super::files::{FileService, TapeIdent, TapeLimits, catalog_of};
 use super::state::tape_state;
 use super::node::SharedStatus;
 use super::state::FileRec;
@@ -20,7 +20,10 @@ use crate::changer::element::ElementType;
 use crate::error::{Result, TapeError};
 use crate::ltfs::recovery::TailKind;
 use crate::ltfs::mkltfs::{MkltfsOptions, mkltfs};
-use crate::ltfs::volume::{FormatProbe, LtfsVolume, TailPolicy, XATTR_POOL_NAME, XATTR_POOL_UUID, XATTR_VERSION, probe_format};
+use crate::ltfs::volume::{
+    FormatProbe, LtfsVolume, TailPolicy, XATTR_DELETED_PATH, XATTR_POOL_NAME, XATTR_POOL_UUID, XATTR_VERSION, is_tombstone_path, probe_format,
+    tombstone_path,
+};
 use crate::tape::commands::TapeDrive;
 use crate::scsi::device::ScsiDevice;
 use crate::scsi::inquiry::{enumerate_sg_nodes, read_unit_serial};
@@ -418,21 +421,6 @@ fn takeover(provider: &dyn DeviceProvider, opts: &ExecOptions, round: u64) -> Re
     Ok(Active { round, key, devices, serving: false, drive: None, read: None, seq: 0, reclaim: None, reclaim_failures: 0, reclaim_given_up: None })
 }
 
-fn catalog_of(index: &crate::ltfs::index::LtfsIndex) -> (Vec<FileRec>, u64) {
-    let mut files = Vec::new();
-    let mut bytes = 0u64;
-    index.walk_files(|p, f| {
-        bytes += f.length;
-        files.push(FileRec {
-            path: format!("/{}", p),
-            length: f.length,
-            sha256: f.xattr(crate::ltfs::index::XATTR_SHA256).unwrap_or("").to_string(),
-            version: f.xattr(XATTR_VERSION).and_then(parse_version).unwrap_or((0, 0)),
-        });
-    });
-    (files, bytes)
-}
-
 /// 带上实际写掉的字节：数据分区的最大容量减去剩余容量。读不到就返回 0。
 /// 它与索引里活着的字节之差，就是被重写的旧副本和收尾放弃的块占的空间。
 fn bytes_written_on(dev: &dyn TapeTransport) -> u64 {
@@ -442,12 +430,6 @@ fn bytes_written_on(dev: &dyn TapeTransport) -> u64 {
         .flatten()
         .map(|pc| pc.maximum.saturating_sub(pc.remaining))
         .unwrap_or(0)
-}
-
-/// 版本属性的文本形式是 `轮次.序号`。认不出来的按 (0, 0) 处理：它抢不走任何路径。
-fn parse_version(s: &str) -> Option<(u64, u64)> {
-    let (round, seq) = s.split_once('.')?;
-    Some((round.parse().ok()?, seq.parse().ok()?))
 }
 
 /// 本轮写下的下一个版本号。轮次全局单调，一轮之内只有这一个执行者在串行写入。
@@ -787,9 +769,19 @@ fn process_uploads(a: &mut Active, files: &FileService, tx: &Sender<ExecEvent>, 
             let mut vol = LtfsVolume::mount(dev)?;
             vol.set_reservation_guard(Some(key));
             for u in &uploads {
-                let mut f = std::io::BufReader::new(std::fs::File::open(&u.spool)?);
                 seq += 1;
-                vol.append_file_with_xattrs(&u.path, &mut f, &[(XATTR_VERSION, &format!("{}.{}", round, seq))])?;
+                let ver = format!("{}.{}", round, seq);
+                // 同一盘带上一个路径只留一条记录：删除去掉本带上的文件，写入去掉本带上的墓碑。
+                // 别的带上的旧副本不动，由版本比较让它们失效（见 `TOMBSTONE_DIR`）。
+                if u.delete {
+                    vol.remove_file(&u.path)?;
+                    let tomb = tombstone_path(&u.path);
+                    vol.append_file_with_xattrs(&tomb, &mut std::io::empty(), &[(XATTR_VERSION, &ver), (XATTR_DELETED_PATH, &u.path)])?;
+                } else {
+                    vol.remove_file(&tombstone_path(&u.path))?;
+                    let mut f = std::io::BufReader::new(std::fs::File::open(&u.spool)?);
+                    vol.append_file_with_xattrs(&u.path, &mut f, &[(XATTR_VERSION, &ver)])?;
+                }
             }
             vol.commit()?;
             let (all, bytes_used) = catalog_of(vol.index());
@@ -1218,11 +1210,16 @@ enum Copied {
 fn copy_one(vol: &LtfsVolume, source: &str, path: &str, files: &FileService) -> Result<Copied> {
     let p = path.trim_start_matches('/');
     let Some(node) = vol.index().find_file(p) else { return Ok(Copied::Superseded) };
+    if is_tombstone_path(p) {
+        // 墓碑目录下没有被删路径的文件不是我们写的，没有要保住的东西
+        let Some(target) = node.xattr(XATTR_DELETED_PATH) else { return Ok(Copied::Superseded) };
+        return copy_tombstone(source, target, files);
+    }
     let len = node.length;
     let want = node.xattr(crate::ltfs::index::XATTR_SHA256).unwrap_or("").to_string();
-    // 目录说这个路径的当前版本在别的带上：源带上这一份是被重写掉的旧副本，不用搬。
+    // 目录说这个路径的当前记录在别的带上（被重写或被删除）：源带上这一份是旧副本，不用搬。
     // 查不到的（目录还没经 Raft 应用到本地）照搬不误：多一份总比留在要被格式化的带上强。
-    if files.stat(path).map_err(|e| TapeError::Ltfs(e.to_string()))?.is_some_and(|st| st.barcode != source) {
+    if files.lookup(path).map_err(|e| TapeError::Ltfs(e.to_string()))?.is_some_and(|st| st.barcode != source || st.deleted) {
         return Ok(Copied::Superseded);
     }
     let h = match files.begin(path, len) {
@@ -1257,6 +1254,22 @@ fn copy_one(vol: &LtfsVolume, source: &str, path: &str, files: &FileService) -> 
             files.abort(h);
             Err(e)
         }
+    }
+}
+
+/// 搬一块墓碑：在当前写入带上以新版本重新落一次。墓碑在带上是活的——源带一格式化，
+/// 别的带上的旧副本就会在下次对账时复活——所以和文件一样要有着落才能格式化。
+fn copy_tombstone(source: &str, target: &str, files: &FileService) -> Result<Copied> {
+    // 这个路径已由别的带上的记录（新上传的文件，或另一块墓碑）决定：源带上这块作废了
+    if files.lookup(target).map_err(|e| TapeError::Ltfs(e.to_string()))?.is_some_and(|st| st.barcode != source) {
+        return Ok(Copied::Superseded);
+    }
+    match files.relocate_tombstone(target) {
+        Ok(_) => Ok(Copied::Moved(0)),
+        // 客户端正在重新上传这个路径：它的版本更新，让它先走
+        Err(super::files::ServiceError::PathBusy(_)) | Err(super::files::ServiceError::SwitchingTape(_)) => Ok(Copied::Retry),
+        Err(e @ (super::files::ServiceError::NoTape(_) | super::files::ServiceError::NotServing(_))) => Ok(Copied::Halt(e.to_string())),
+        Err(e) => Err(TapeError::Ltfs(format!("回收 {} 的墓碑失败: {}", target, e))),
     }
 }
 
@@ -1304,10 +1317,17 @@ fn finish_reclaim(
     let mut orphans = Vec::new();
     {
         let vol = LtfsVolume::mount(dev)?;
+        // 墓碑按它记的被删路径核对：那个路径的当前记录（新文件或搬过去的墓碑）必须在别的带上
         let mut paths = Vec::new();
-        vol.index().walk_files(|p, _| paths.push(format!("/{}", p)));
+        vol.index().walk_files(|p, f| {
+            if !is_tombstone_path(p) {
+                paths.push(format!("/{}", p));
+            } else if let Some(target) = f.xattr(XATTR_DELETED_PATH) {
+                paths.push(target.to_string());
+            }
+        });
         for path in paths {
-            match files.stat(&path) {
+            match files.lookup(&path) {
                 Ok(Some(st)) if st.barcode != source => {}
                 _ => orphans.push(path),
             }

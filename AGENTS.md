@@ -12,6 +12,9 @@
 
 ## 开始工作
 
+交接状态与原 Claude 本地记忆里的工作约定见 `.scratch/ltfs-ha/handoff-to-codex.md`，开始前先读。
+
+
 1. 运行 `git status --short`，识别并保护已有改动。
 2. 本仓库已启用 CodeGraph。定位或理解代码时，先运行 `codegraph status .`；索引过期则运行 `codegraph sync .`。优先用 `codegraph explore "<问题或符号>"` 获取源码与调用路径，再按需使用 `rg` 或直接读取文件。
 3. 涉及 SCSI/SG_IO、CDB、机械手、磁带读写、LTFS、超时或远程硬件流程时，修改或执行命令前完整阅读 `CLAUDE.md` 中对应章节；它是硬件细节和远程开发流程的项目参考。

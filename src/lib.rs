@@ -7,3 +7,4 @@ pub mod error;
 pub mod ltfs;
 pub mod scsi;
 pub mod tape;
+pub mod tapefs;

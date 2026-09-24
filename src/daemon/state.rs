@@ -52,6 +52,9 @@ pub struct FileRec {
     /// 这一份内容的版本 (轮次, 序号)，取自带上的 `tapers.version`。见 `ltfs::volume::XATTR_VERSION`。
     /// 目录按它取大者：同一路径的多份物理副本（重写、回收搬迁）里只有最新的一份算数。
     pub version: (u64, u64),
+    /// 墓碑：该路径在这个版本被删除（带上是 `.tapers/deleted/<哈希>`，见 `ltfs::volume::TOMBSTONE_DIR`）。
+    /// 与文件按同一套版本比较，版本更高者胜。
+    pub deleted: bool,
 }
 
 /// 目录条目单片的大小上限（字节，按 JSON 编码后估算）。
@@ -93,7 +96,7 @@ impl Command {
             }
             Command::CatalogPart { barcode, generation, part, files } => json!({
                 "op": "catalog_part", "barcode": barcode, "generation": generation, "part": part,
-                "files": files.iter().map(|f| json!([f.path, f.length, f.sha256, f.version.0, f.version.1])).collect::<Vec<_>>(),
+                "files": files.iter().map(|f| json!([f.path, f.length, f.sha256, f.version.0, f.version.1, f.deleted])).collect::<Vec<_>>(),
             }),
             Command::TapeCommitted { barcode, volume_uuid, generation, files, bytes_used, bytes_written, parts, full } => json!({
                 "op": "tape_committed", "barcode": barcode, "volume_uuid": volume_uuid, "generation": generation,
@@ -132,6 +135,8 @@ impl Command {
                             length: f.get(1)?.as_u64()?,
                             sha256: f.get(2)?.as_str()?.to_string(),
                             version: (f.get(3).and_then(Value::as_u64).unwrap_or(0), f.get(4).and_then(Value::as_u64).unwrap_or(0)),
+                            // 旧日志里的条目没有这一项：都是文件
+                            deleted: f.get(5).and_then(Value::as_bool).unwrap_or(false),
                         })
                     })
                     .collect::<Option<Vec<_>>>()?;
@@ -564,7 +569,7 @@ mod tests {
     #[test]
     fn catalog_commands_roundtrip_and_split() {
         let files: Vec<FileRec> = (0..10_000)
-            .map(|i| FileRec { path: format!("/dir/sub/object-{:08}.bin", i), length: i, sha256: "ab".repeat(32), version: (7, i) })
+            .map(|i| FileRec { path: format!("/dir/sub/object-{:08}.bin", i), length: i, sha256: "ab".repeat(32), version: (7, i), deleted: i % 5 == 0 })
             .collect();
         let parts = split_catalog(&files);
         assert!(parts.len() >= 2, "一万条记录超过 1 MiB，应当分片");
@@ -576,6 +581,12 @@ mod tests {
             assert_eq!(Command::decode(&enc), Some(c));
         }
         assert_eq!(split_catalog(&[]), vec![Vec::<FileRec>::new()]);
+        // 加墓碑之前写进日志的条目只有五项：解出来是文件
+        let old = r#"{"op":"catalog_part","barcode":"T1","generation":3,"part":0,"files":[["/a",5,"",2,9]]}"#;
+        match Command::decode(old.as_bytes()) {
+            Some(Command::CatalogPart { files, .. }) => assert_eq!((files[0].version, files[0].deleted), ((2, 9), false)),
+            other => panic!("{:?}", other),
+        }
         let t = Command::TapeCommitted { barcode: "T1".into(), volume_uuid: "v".into(), generation: 7, files: 3, bytes_used: 9, bytes_written: 12, parts: 2, full: true };
         assert_eq!(Command::decode(&t.encode()), Some(t));
     }

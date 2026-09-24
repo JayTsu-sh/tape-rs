@@ -7,6 +7,10 @@
 //!
 //! 暂存区不复制。执行者更换时：仅暂存的任务失败（向新 Leader 重传）；已进入提交批次的
 //! 任务结果未定（向新 Leader 查询该路径即可判定）。
+//!
+//! 删除与上传走同一条路：`delete` 准入一个删除（占住路径、不预留空间）并入队，执行线程在
+//! 同一批里把墓碑写到当前写入带上（见 `ltfs::volume::TOMBSTONE_DIR`）。`/.tapers/` 是保留目录，
+//! 客户端路径不能落在里面。
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
@@ -16,9 +20,48 @@ use std::time::{Duration, Instant};
 
 use crate::core::volume_state::{DirNode, FileVersion, FrozenBatch, PendingState, S4Evidence, StateError, VolumeState};
 use crate::ltfs::index::{DirectoryNode, LtfsIndex};
+use crate::ltfs::volume::{XATTR_DELETED_PATH, XATTR_VERSION, is_tombstone_path};
 
 use super::directory::Directory;
 use super::executor::ExecRequest;
+use super::state::FileRec;
+
+/// 一盘带索引里的全部目录记录与活着的字节数。墓碑按它记的被删路径报告（`deleted`），
+/// 墓碑目录下没有 `tapers.deletedPath` 的文件不认。同一盘带上一个路径只应有一条记录
+/// （写入会去掉同带上的墓碑，删除会去掉同带上的文件）；万一有两条，取版本大的。
+pub fn catalog_of(index: &LtfsIndex) -> (Vec<FileRec>, u64) {
+    let mut by_path: BTreeMap<String, FileRec> = BTreeMap::new();
+    let mut bytes = 0u64;
+    index.walk_files(|p, f| {
+        let version = f.xattr(XATTR_VERSION).and_then(parse_version).unwrap_or((0, 0));
+        let rec = if is_tombstone_path(p) {
+            let Some(target) = f.xattr(XATTR_DELETED_PATH) else { return };
+            FileRec { path: target.to_string(), length: 0, sha256: String::new(), version, deleted: true }
+        } else {
+            bytes += f.length;
+            FileRec {
+                path: format!("/{}", p),
+                length: f.length,
+                sha256: f.xattr(crate::ltfs::index::XATTR_SHA256).unwrap_or("").to_string(),
+                version,
+                deleted: false,
+            }
+        };
+        match by_path.get(&rec.path) {
+            Some(old) if old.version >= rec.version => {}
+            _ => {
+                by_path.insert(rec.path.clone(), rec);
+            }
+        }
+    });
+    (by_path.into_values().collect(), bytes)
+}
+
+/// 版本属性的文本形式是 `轮次.序号`。认不出来的按 (0, 0) 处理：它抢不走任何路径。
+pub fn parse_version(s: &str) -> Option<(u64, u64)> {
+    let (round, seq) = s.split_once('.')?;
+    Some((round.parse().ok()?, seq.parse().ok()?))
+}
 
 /// 合批策略：四个触发条件任一满足就提交一批。推导见研究笔记 pooling-slice-plan.md。
 /// 字节数和文件数是触发阈值，不是硬上限：到达阈值就提交，取队列时把已到齐的全部带走。
@@ -75,6 +118,8 @@ pub enum ServiceError {
     PathBusy(String),
     /// 只创建：路径已有已提交的当前版本。
     Exists(String),
+    /// 删除：路径没有已提交的当前版本（从未有过，或已被删除）。
+    NotFound(String),
     InsufficientCapacity { requested: u64, available: u64 },
     NotWritable(String),
     BadPath(String),
@@ -93,6 +138,7 @@ impl std::fmt::Display for ServiceError {
             ServiceError::NotServing(s) => write!(f, "本节点不在服务: {}", s),
             ServiceError::PathBusy(p) => write!(f, "路径正在上传: {}", p),
             ServiceError::Exists(p) => write!(f, "路径已存在: {}", p),
+            ServiceError::NotFound(p) => write!(f, "路径不存在: {}", p),
             ServiceError::InsufficientCapacity { requested, available } => {
                 write!(f, "空间不足: 需要 {} 可用 {}", requested, available)
             }
@@ -114,6 +160,8 @@ pub struct Upload {
     pub path: String,
     pub spool: PathBuf,
     pub len: u64,
+    /// 这是一次删除：没有内容，落带时写墓碑
+    pub delete: bool,
 }
 
 /// 上传途中的句柄。`finish` 或 `abort` 二选一。
@@ -133,6 +181,9 @@ pub struct Stat {
     pub barcode: String,
     /// 内容的 sha256（十六进制小写）；文件没有哈希属性时为空串
     pub sha256: String,
+    /// 墓碑：路径在这里被删除（`barcode` 是墓碑所在的带）。`stat` 从不返回这种记录，
+    /// 只有 `lookup` 会。
+    pub deleted: bool,
 }
 
 /// 路径上未提交的变更。
@@ -142,6 +193,8 @@ pub enum InFlight {
     Uploading,
     /// 已完整暂存，等待合批落带
     Staged,
+    /// 删除已受理，等待墓碑落带
+    Deleting,
 }
 
 impl InFlight {
@@ -149,6 +202,7 @@ impl InFlight {
         match self {
             InFlight::Uploading => "uploading",
             InFlight::Staged => "staged",
+            InFlight::Deleting => "deleting",
         }
     }
 }
@@ -217,12 +271,26 @@ fn norm(path: &str) -> Result<String, ServiceError> {
     if parts.is_empty() || parts.iter().any(|p| *p == "." || *p == "..") || path.ends_with('/') {
         return Err(ServiceError::BadPath(path.to_string()));
     }
+    // 墓碑目录（`ltfs::volume::TOMBSTONE_DIR`）所在的保留目录
+    if parts[0] == ".tapers" {
+        return Err(ServiceError::BadPath(path.to_string()));
+    }
     Ok(format!("/{}", parts.join("/")))
 }
 
 /// 本轮刚落带的 `recent` 里有这个路径的当前版本。
 fn recent_live(s: &Serving, path: &str) -> bool {
-    s.recent.contains_key(path)
+    s.recent.get(path).is_some_and(|st| !st.deleted)
+}
+
+fn in_flight_of(e: &crate::core::volume_state::PendingEntry) -> InFlight {
+    if e.removal {
+        InFlight::Deleting
+    } else if e.state == PendingState::Ready {
+        InFlight::Staged
+    } else {
+        InFlight::Uploading
+    }
 }
 
 fn map_state(e: StateError) -> ServiceError {
@@ -305,21 +373,23 @@ impl FileService {
             admitted: 0,
             switch: None,
             recent: {
-                // 当前装着的这盘带以刚读到的索引为准，不必等目录经 Raft 对账
-                let mut m = HashMap::new();
-                index.walk_files(|p, f| {
-                    m.insert(
-                        format!("/{}", p),
-                        Stat {
-                            len: f.length,
+                // 当前装着的这盘带以刚读到的索引为准，不必等目录经 Raft 对账。墓碑也记下：
+                // 本带上删掉的路径不能再从目录库里查出旧副本
+                catalog_of(index)
+                    .0
+                    .into_iter()
+                    .map(|r| {
+                        let st = Stat {
+                            len: r.length,
                             generation: index.generation,
                             round,
                             barcode: tape.barcode.clone(),
-                            sha256: f.xattr(crate::ltfs::index::XATTR_SHA256).unwrap_or("").to_string(),
-                        },
-                    );
-                });
-                m
+                            sha256: r.sha256,
+                            deleted: r.deleted,
+                        };
+                        (r.path, st)
+                    })
+                    .collect()
             },
             tape,
         });
@@ -466,6 +536,7 @@ impl FileService {
                                 round,
                                 barcode: s.tape.barcode.clone(),
                                 sha256: hashes.get(&u.path).cloned().unwrap_or_default(),
+                                deleted: u.delete,
                             };
                             s.recent.insert(u.path.clone(), st);
                         }
@@ -477,7 +548,9 @@ impl FileService {
             Err(e) => Err(e),
         };
         for u in uploads {
-            let _ = std::fs::remove_file(&u.spool);
+            if !u.delete {
+                let _ = std::fs::remove_file(&u.spool);
+            }
             let st = match &outcome {
                 Ok(generation) => TaskStatus::Committed { generation: *generation },
                 Err(e) => TaskStatus::Indeterminate { reason: e.clone() },
@@ -558,7 +631,7 @@ impl FileService {
             let why = g.why_not.clone();
             let s = g.serving.as_mut().filter(|s| s.round == h.round).ok_or(ServiceError::NotServing(why))?;
             s.state.complete(&h.path).map_err(map_state)?;
-            s.queue.push_back(Upload { task: h.task, path: h.path.clone(), spool: h.spool.clone(), len });
+            s.queue.push_back(Upload { task: h.task, path: h.path.clone(), spool: h.spool.clone(), len, delete: false });
             s.queue_bytes += len;
             let now = Instant::now();
             s.oldest.get_or_insert(now);
@@ -622,8 +695,9 @@ impl FileService {
             let g = self.lock();
             match (&g.serving, &g.read_only) {
                 (Some(s), _) => {
+                    // 本轮删掉的路径：目录库里那一行可能还没经 Raft 换成墓碑，不能再往下查
                     if let Some(st) = s.recent.get(&path) {
-                        return Ok(Some(st.clone()));
+                        return Ok((!st.deleted).then(|| st.clone()));
                     }
                     (s.round, s.tape.pool_uuid.clone())
                 }
@@ -637,20 +711,114 @@ impl FileService {
             round,
             barcode: f.barcode,
             sha256: f.sha256,
+            deleted: false,
         }))
     }
 
-    pub fn list(&self) -> Result<BTreeMap<String, u64>, ServiceError> {
-        let (pool, mut out) = {
+    /// 路径在已提交视图里的那条记录，墓碑也返回（`deleted`）。回收用它判断源带上的一份
+    /// 是否已被别处的新版本取代——被删除也算取代。
+    pub fn lookup(&self, path: &str) -> Result<Option<Stat>, ServiceError> {
+        let path = norm(path)?;
+        let (round, pool) = {
             let g = self.lock();
             match (&g.serving, &g.read_only) {
-                (Some(s), _) => (s.tape.pool_uuid.clone(), s.recent.iter().map(|(p, st)| (p.clone(), st.len)).collect::<BTreeMap<_, _>>()),
-                (None, Some((_, pool))) => (pool.clone(), BTreeMap::new()),
+                (Some(s), _) => {
+                    if let Some(st) = s.recent.get(&path) {
+                        return Ok(Some(st.clone()));
+                    }
+                    (s.round, s.tape.pool_uuid.clone())
+                }
+                (None, Some((round, pool))) => (*round, pool.clone()),
+                (None, None) => return Err(ServiceError::NotServing(g.why_not.clone())),
+            }
+        };
+        Ok(self.with_reader(|d| d.lookup(&pool, &path).ok().flatten()).map(|f| Stat {
+            len: f.length,
+            generation: f.generation,
+            round,
+            barcode: f.barcode,
+            sha256: f.sha256,
+            deleted: f.deleted,
+        }))
+    }
+
+    /// 删除一个已提交的路径（文件契约"删除（墓碑）"）。受理即返回任务号，与上传一样
+    /// `Staged` 之后随下一批落带变成 `Committed`。路径没有当前版本 → `NotFound`；
+    /// 路径上有在途变更 → `PathBusy`。
+    pub fn delete(&self, path: &str) -> Result<u64, ServiceError> {
+        let path = norm(path)?;
+        // 本轮之前提交的只在目录库里，不能在锁里查；本轮的在锁里再看一次
+        if self.stat(&path)?.is_none() {
+            return Err(ServiceError::NotFound(path));
+        }
+        self.enqueue_removal(path, true)
+    }
+
+    /// 回收搬迁墓碑：源带上的墓碑要在别的带上重新落一次（新版本），源带才能格式化。
+    /// 不检查路径是否存在——它本来就不存在。
+    pub fn relocate_tombstone(&self, path: &str) -> Result<u64, ServiceError> {
+        let path = norm(path)?;
+        self.enqueue_removal(path, false)
+    }
+
+    fn enqueue_removal(&self, path: String, must_exist: bool) -> Result<u64, ServiceError> {
+        {
+            let mut g = self.lock();
+            let task = g.next_task;
+            let why = g.why_not.clone();
+            if g.serving.is_none() && g.no_tape {
+                return Err(ServiceError::NoTape(why));
+            }
+            let s = g.serving.as_mut().ok_or(ServiceError::NotServing(why))?;
+            if must_exist && s.recent.get(&path).is_some_and(|st| st.deleted) {
+                return Err(ServiceError::NotFound(path));
+            }
+            if let Some(state) = s.switch {
+                return Err(ServiceError::SwitchingTape(format!("{} 已 {}", s.tape.barcode, state)));
+            }
+            // 墓碑也是索引里的一条
+            if s.recent.len() as u64 + s.admitted >= s.limits.file_limit {
+                s.switch = Some(super::state::tape_state::DATA_FULL);
+                let msg = format!("{} 的文件数已到上限 {}", s.tape.barcode, s.limits.file_limit);
+                drop(g);
+                self.kick();
+                return Err(ServiceError::SwitchingTape(msg));
+            }
+            let now = s.opened.elapsed().as_secs();
+            s.state.open_session(task, u64::MAX);
+            s.state.admit_removal(task, &path, now).map_err(map_state)?;
+            s.state.complete(&path).map_err(map_state)?;
+            s.admitted += 1;
+            s.queue.push_back(Upload { task, path, spool: PathBuf::new(), len: 0, delete: true });
+            let now = Instant::now();
+            s.oldest.get_or_insert(now);
+            s.newest = Some(now);
+            g.tasks.insert(task, TaskStatus::Staged);
+            g.next_task += 1;
+            drop(g);
+            self.kick();
+            Ok(task)
+        }
+    }
+
+    pub fn list(&self) -> Result<BTreeMap<String, u64>, ServiceError> {
+        let (pool, mut out, gone) = {
+            let g = self.lock();
+            match (&g.serving, &g.read_only) {
+                (Some(s), _) => (
+                    s.tape.pool_uuid.clone(),
+                    s.recent.iter().filter(|(_, st)| !st.deleted).map(|(p, st)| (p.clone(), st.len)).collect::<BTreeMap<_, _>>(),
+                    // 本轮删掉的路径盖住目录库里可能还没换成墓碑的旧行
+                    s.recent.iter().filter(|(_, st)| st.deleted).map(|(p, _)| p.clone()).collect::<std::collections::HashSet<_>>(),
+                ),
+                (None, Some((_, pool))) => (pool.clone(), BTreeMap::new(), Default::default()),
                 (None, None) => return Err(ServiceError::NotServing(g.why_not.clone())),
             }
         };
         for (p, n) in self.with_reader(|d| d.list(&pool).ok()).unwrap_or_default() {
-            out.entry(p).or_insert(n);
+            if !gone.contains(&p) {
+                out.entry(p).or_insert(n);
+            }
         }
         Ok(out)
     }
@@ -666,13 +834,7 @@ impl FileService {
     fn in_flight(&self, path: &str) -> Option<(InFlight, u64)> {
         let g = self.lock();
         let root = g.serving.as_ref()?.state.load();
-        root.pending.get(path).map(|e| {
-            let st = match e.state {
-                PendingState::InProgress => InFlight::Uploading,
-                PendingState::Ready => InFlight::Staged,
-            };
-            (st, e.staged_len)
-        })
+        root.pending.get(path).map(|e| (in_flight_of(e), e.staged_len))
     }
 
     /// 一个目录的直接子项。目录是隐式的：有文件就有目录，没有子项的非根目录不存在（`Ok(None)`）。
@@ -708,10 +870,7 @@ impl FileService {
                     .load()
                     .pending
                     .iter()
-                    .map(|(p, e)| {
-                        let st = if e.state == PendingState::Ready { InFlight::Staged } else { InFlight::Uploading };
-                        (p.clone(), (st, e.staged_len))
-                    })
+                    .map(|(p, e)| (p.clone(), (in_flight_of(e), e.staged_len)))
                     .collect(),
                 None => Vec::new(),
             }

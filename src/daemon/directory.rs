@@ -27,6 +27,8 @@ pub struct FileRow {
     pub generation: u64,
     pub length: u64,
     pub sha256: String,
+    /// 这一行是墓碑：路径已被删除，`barcode` 是墓碑所在的带。`stat`/`list` 不返回这种行。
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,16 +59,23 @@ impl Directory {
                  bytes_written INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE IF NOT EXISTS files (pool_uuid TEXT NOT NULL, path TEXT NOT NULL, barcode TEXT NOT NULL,
                  generation INTEGER NOT NULL, length INTEGER NOT NULL, sha256 TEXT NOT NULL,
-                 ver_round INTEGER NOT NULL DEFAULT 0, ver_seq INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (pool_uuid, path));
+                 ver_round INTEGER NOT NULL DEFAULT 0, ver_seq INTEGER NOT NULL DEFAULT 0,
+                 deleted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (pool_uuid, path));
              CREATE INDEX IF NOT EXISTS files_by_tape ON files (barcode);
              CREATE TABLE IF NOT EXISTS staging (barcode TEXT NOT NULL, generation INTEGER NOT NULL, part INTEGER NOT NULL,
                  path TEXT NOT NULL, length INTEGER NOT NULL, sha256 TEXT NOT NULL,
-                 ver_round INTEGER NOT NULL DEFAULT 0, ver_seq INTEGER NOT NULL DEFAULT 0);
+                 ver_round INTEGER NOT NULL DEFAULT 0, ver_seq INTEGER NOT NULL DEFAULT 0,
+                 deleted INTEGER NOT NULL DEFAULT 0);
              CREATE INDEX IF NOT EXISTS staging_by_batch ON staging (barcode, generation, part);",
         )
         .map_err(db_err)?;
-        // 版本列是后加的。老库里没有时补上，默认 0：没有版本的记录不会抢走任何路径
-        for (t, cols) in [("files", &["ver_round", "ver_seq"][..]), ("staging", &["ver_round", "ver_seq"]), ("tapes", &["bytes_written"])] {
+        // 版本列、墓碑列是后加的。老库里没有时补上，默认 0：没有版本的记录不会抢走任何路径，
+        // 老记录都是文件
+        for (t, cols) in [
+            ("files", &["ver_round", "ver_seq", "deleted"][..]),
+            ("staging", &["ver_round", "ver_seq", "deleted"]),
+            ("tapes", &["bytes_written"]),
+        ] {
             for c in cols {
                 let _ = db.execute(&format!("ALTER TABLE {} ADD COLUMN {} INTEGER NOT NULL DEFAULT 0", t, c), []);
             }
@@ -168,20 +177,20 @@ impl Directory {
             (Command::CatalogPart { barcode, generation, part, files }, _) => {
                 let mut ins = tx
                     .prepare(
-                        "INSERT INTO staging (barcode, generation, part, path, length, sha256, ver_round, ver_seq)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        "INSERT INTO staging (barcode, generation, part, path, length, sha256, ver_round, ver_seq, deleted)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     )
                     .map_err(db_err)?;
                 for f in files {
                     ins.execute(params![
                         barcode, *generation as i64, *part as i64, f.path, f.length as i64, f.sha256,
-                        f.version.0 as i64, f.version.1 as i64
+                        f.version.0 as i64, f.version.1 as i64, f.deleted as i64
                     ])
                     .map_err(db_err)?;
                 }
                 if files.is_empty() {
                     // 空片也要留痕，片数才对得上
-                    ins.execute(params![barcode, *generation as i64, *part as i64, "", -1i64, "", 0i64, 0i64]).map_err(db_err)?;
+                    ins.execute(params![barcode, *generation as i64, *part as i64, "", -1i64, "", 0i64, 0i64, 0i64]).map_err(db_err)?;
                 }
             }
             (Command::TapeCommitted { barcode, volume_uuid, generation, files, bytes_used, bytes_written, parts, full }, Applied::CatalogCommitted) => {
@@ -202,14 +211,18 @@ impl Directory {
                     // 期间新旧两份并存。哪一份算数只看版本，不看合并顺序——否则装载一盘旧带
                     // 做一次对账就会把目录指回旧内容。同一盘带自己报的记录无条件采纳（它是
                     // 自己内容的权威）。
+                    //
+                    // 墓碑也是一行（`deleted = 1`），与文件按同一套版本比较：删除之后再装载一盘带着
+                    // 旧副本的带做对账，旧副本的版本低，抢不回路径；重新上传得到更大的版本，路径复活。
                     tx.execute(
-                        "INSERT INTO files (pool_uuid, path, barcode, generation, length, sha256, ver_round, ver_seq)
-                         SELECT t.pool_uuid, s.path, s.barcode, s.generation, s.length, s.sha256, s.ver_round, s.ver_seq
+                        "INSERT INTO files (pool_uuid, path, barcode, generation, length, sha256, ver_round, ver_seq, deleted)
+                         SELECT t.pool_uuid, s.path, s.barcode, s.generation, s.length, s.sha256, s.ver_round, s.ver_seq, s.deleted
                          FROM staging s JOIN tapes t ON t.barcode = s.barcode
                          WHERE s.barcode = ?1 AND s.generation = ?2 AND s.length >= 0
                          ON CONFLICT(pool_uuid, path) DO UPDATE SET
                              barcode = excluded.barcode, generation = excluded.generation, length = excluded.length,
-                             sha256 = excluded.sha256, ver_round = excluded.ver_round, ver_seq = excluded.ver_seq
+                             sha256 = excluded.sha256, ver_round = excluded.ver_round, ver_seq = excluded.ver_seq,
+                             deleted = excluded.deleted
                          WHERE excluded.barcode = files.barcode
                             OR excluded.ver_round > files.ver_round
                             OR (excluded.ver_round = files.ver_round AND excluded.ver_seq > files.ver_seq)",
@@ -275,8 +288,9 @@ impl Directory {
         Ok(g.unwrap_or(0) as u64)
     }
 
-    /// 目录认为还活在这盘带上的文件：条数与字节数。带上已用字节减去它就是可回收空间
-    /// （被重写、被搬迁的旧副本，以及收尾放弃的块）。
+    /// 目录认为还活在这盘带上的记录：条数与字节数。带上已用字节减去它就是可回收空间
+    /// （被重写、被搬迁、被删除的旧副本，以及收尾放弃的块）。条数里含墓碑（零字节）：
+    /// 墓碑在带上也是活的，回收要把它搬走，所以格式化前的闸门一同算它。
     pub fn live_on(&self, barcode: &str) -> Result<(u64, u64)> {
         let (n, b): (i64, i64) = self
             .db
@@ -296,19 +310,35 @@ impl Directory {
         rows.collect::<std::result::Result<_, _>>().map_err(db_err)
     }
 
+    /// 路径的当前版本；被删除的路径返回 `None`。
     pub fn stat(&self, pool_uuid: &str, path: &str) -> Result<Option<FileRow>> {
+        Ok(self.lookup(pool_uuid, path)?.filter(|f| !f.deleted))
+    }
+
+    /// 路径在目录里的那一行，墓碑也返回。回收用它判断带上的一份是不是已被别处的新版本
+    /// （文件或墓碑）取代。
+    pub fn lookup(&self, pool_uuid: &str, path: &str) -> Result<Option<FileRow>> {
         self.db
             .query_row(
-                "SELECT barcode, generation, length, sha256 FROM files WHERE pool_uuid = ?1 AND path = ?2",
+                "SELECT barcode, generation, length, sha256, deleted FROM files WHERE pool_uuid = ?1 AND path = ?2",
                 params![pool_uuid, path],
-                |r| Ok(FileRow { barcode: r.get(0)?, generation: r.get::<_, i64>(1)? as u64, length: r.get::<_, i64>(2)? as u64, sha256: r.get(3)? }),
+                |r| {
+                    Ok(FileRow {
+                        barcode: r.get(0)?,
+                        generation: r.get::<_, i64>(1)? as u64,
+                        length: r.get::<_, i64>(2)? as u64,
+                        sha256: r.get(3)?,
+                        deleted: r.get::<_, i64>(4)? != 0,
+                    })
+                },
             )
             .optional()
             .map_err(db_err)
     }
 
     pub fn list(&self, pool_uuid: &str) -> Result<Vec<(String, u64)>> {
-        let mut stmt = self.db.prepare("SELECT path, length FROM files WHERE pool_uuid = ?1 ORDER BY path").map_err(db_err)?;
+        let mut stmt =
+            self.db.prepare("SELECT path, length FROM files WHERE pool_uuid = ?1 AND deleted = 0 ORDER BY path").map_err(db_err)?;
         let rows = stmt.query_map(params![pool_uuid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))).map_err(db_err)?;
         rows.collect::<std::result::Result<_, _>>().map_err(db_err)
     }
@@ -395,7 +425,7 @@ mod tests {
             d.apply(idx, &c, &out).unwrap();
             out
         };
-        let rec = |p: &str, n: u64| FileRec { path: p.into(), length: n, sha256: format!("{:064x}", n), version: (1, n) };
+        let rec = |p: &str, n: u64| FileRec { path: p.into(), length: n, sha256: format!("{:064x}", n), version: (1, n), deleted: false };
         run(&mut ctl, &mut d, Command::PoolCreate { uuid: "u".into(), name: "p".into(), file_limit: 10 });
         run(&mut ctl, &mut d, Command::TapeAssign { barcode: "T1".into(), pool: "p".into() });
         let commit = |g: u64, parts: u32, files: u64, full: bool| Command::TapeCommitted {
@@ -451,7 +481,7 @@ mod tests {
         }
         // 一整批：一片记录 + 一条摘要
         let mut batch = |ctl: &mut ControlState, d: &mut Directory, b: &str, g: u64, len: u64, ver: (u64, u64), full: bool| {
-            let f = FileRec { path: "/a".into(), length: len, sha256: String::new(), version: ver };
+            let f = FileRec { path: "/a".into(), length: len, sha256: String::new(), version: ver, deleted: false };
             run(ctl, d, Command::CatalogPart { barcode: b.into(), generation: g, part: 0, files: vec![f] });
             run(ctl, d, Command::TapeCommitted {
                 barcode: b.into(), volume_uuid: "v".into(), generation: g, files: 1, bytes_used: len, bytes_written: len, parts: 1, full,
@@ -474,7 +504,7 @@ mod tests {
 
         // 反方向也要对：写 T2 的那一届没来得及把目录记进日志，目录还停在 T1；
         // 之后装载 T2 对账，新版本要能纠正过来（PN06 走的就是这条路）
-        let rec = |len: u64, ver: (u64, u64)| FileRec { path: "/b".into(), length: len, sha256: String::new(), version: ver };
+        let rec = |len: u64, ver: (u64, u64)| FileRec { path: "/b".into(), length: len, sha256: String::new(), version: ver, deleted: false };
         run(&mut ctl, &mut d, Command::CatalogPart { barcode: "T1".into(), generation: 5, part: 0, files: vec![rec(10, (1, 2))] });
         run(&mut ctl, &mut d, Command::TapeCommitted {
             barcode: "T1".into(), volume_uuid: "v".into(), generation: 5, files: 1, bytes_used: 10, bytes_written: 10, parts: 1, full: true,
@@ -482,12 +512,67 @@ mod tests {
         assert_eq!(d.stat("u", "/b").unwrap().unwrap().barcode, "T1");
         run(&mut ctl, &mut d, Command::CatalogPart {
             barcode: "T2".into(), generation: 6, part: 0,
-            files: vec![FileRec { path: "/a".into(), length: 20, sha256: String::new(), version: (1, 5) }, rec(30, (2, 9))],
+            files: vec![FileRec { path: "/a".into(), length: 20, sha256: String::new(), version: (1, 5), deleted: false }, rec(30, (2, 9))],
         });
         run(&mut ctl, &mut d, Command::TapeCommitted {
             barcode: "T2".into(), volume_uuid: "v".into(), generation: 6, files: 2, bytes_used: 50, bytes_written: 50, parts: 1, full: true,
         });
         assert_eq!(d.stat("u", "/b").unwrap().map(|f| (f.barcode, f.length)), Some(("T2".to_string(), 30)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 删除写的是墓碑（文件契约 05，FC06 的目录层）：它和文件按同一套版本比较。
+    /// 删除之后装载带着旧副本的带做对账，路径不能复活；重新上传得到更大的版本，路径复活。
+    #[test]
+    fn a_tombstone_outranks_older_copies_and_a_newer_upload_outranks_it() {
+        use super::super::state::FileRec;
+        let dir = std::env::temp_dir().join(format!("ltfsd-directory-del-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("directory.db");
+        let _ = std::fs::remove_file(&path);
+        let mut ctl = ControlState::default();
+        let mut d = Directory::open(&path).unwrap();
+        let mut idx = 0u64;
+        let mut run = |ctl: &mut ControlState, d: &mut Directory, c: Command| {
+            idx += 1;
+            let out = ctl.apply(idx, &c);
+            d.apply(idx, &c, &out).unwrap();
+        };
+        run(&mut ctl, &mut d, Command::PoolCreate { uuid: "u".into(), name: "p".into(), file_limit: 10 });
+        for b in ["T1", "T2"] {
+            run(&mut ctl, &mut d, Command::TapeAssign { barcode: b.into(), pool: "p".into() });
+        }
+        let rec = |len: u64, ver: (u64, u64), deleted: bool| FileRec { path: "/a".into(), length: len, sha256: String::new(), version: ver, deleted };
+        let mut batch = |ctl: &mut ControlState, d: &mut Directory, b: &str, g: u64, files: Vec<FileRec>, full: bool| {
+            let n = files.len() as u64;
+            run(ctl, d, Command::CatalogPart { barcode: b.into(), generation: g, part: 0, files });
+            run(ctl, d, Command::TapeCommitted {
+                barcode: b.into(), volume_uuid: "v".into(), generation: g, files: n, bytes_used: 0, bytes_written: 0, parts: 1, full,
+            });
+        };
+
+        batch(&mut ctl, &mut d, "T1", 2, vec![rec(10, (1, 1), false)], false);
+        assert_eq!(d.stat("u", "/a").unwrap().map(|f| f.barcode), Some("T1".into()));
+        // 删除：墓碑落在当前写入带 T2 上
+        batch(&mut ctl, &mut d, "T2", 2, vec![rec(0, (2, 1), true)], false);
+        assert_eq!(d.stat("u", "/a").unwrap(), None);
+        assert!(d.list("u").unwrap().is_empty());
+        let row = d.lookup("u", "/a").unwrap().unwrap();
+        assert!(row.deleted && row.barcode == "T2");
+        assert_eq!(d.live_on("T1").unwrap(), (0, 0), "T1 上的旧副本成了可回收空间");
+        assert_eq!(d.live_on("T2").unwrap(), (1, 0), "墓碑是 T2 上一条活记录，回收要搬它");
+
+        // 装载 T1 做完整对账：旧副本抢不回路径
+        batch(&mut ctl, &mut d, "T1", 3, vec![rec(10, (1, 1), false)], true);
+        assert_eq!(d.stat("u", "/a").unwrap(), None, "被删除的文件不得因对账旧带而复活");
+        // T2 自己再对账一次：墓碑还在
+        batch(&mut ctl, &mut d, "T2", 3, vec![rec(0, (2, 1), true)], true);
+        assert!(d.lookup("u", "/a").unwrap().unwrap().deleted);
+
+        // 重新上传到 T2（同一盘带上墓碑被新文件替换）：路径复活
+        batch(&mut ctl, &mut d, "T2", 4, vec![rec(7, (2, 4), false)], true);
+        assert_eq!(d.stat("u", "/a").unwrap().map(|f| (f.barcode, f.length)), Some(("T2".into(), 7)));
+        assert_eq!(d.list("u").unwrap(), vec![("/a".to_string(), 7)]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
