@@ -24,7 +24,7 @@ Blocked by: 25, 28
 
 ## Assets
 
-- [研究报告](/tmp/tape-rs-permit-publication-m7bhRM/docs/research/permit-publication-evidence.md)。
+- [研究报告](../../../docs/research/permit-publication-evidence.md)。
 - worktree：`/tmp/tape-rs-permit-publication-m7bhRM`；分支：`research/permit-publication-evidence`；提交：`709feceb88ff68102d71962a12197bd247a0a419`。
 
 ## Answer

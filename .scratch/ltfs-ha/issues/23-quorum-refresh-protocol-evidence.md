@@ -23,7 +23,7 @@ Blocked by: 20, 21, 22
 
 ## Assets
 
-- [研究报告](/tmp/tape-rs-quorum-refresh-QBbS4E/docs/research/quorum-refresh-protocol-evidence.md)。
+- [研究报告](../../../docs/research/quorum-refresh-protocol-evidence.md)。
 - 独立 worktree：`/tmp/tape-rs-quorum-refresh-QBbS4E`；分支：`research/quorum-refresh-protocol-evidence`；提交：`bdf8a1aa105f8fc4e4fc2aff7d92f2a1833fee58`。
 
 ## Answer

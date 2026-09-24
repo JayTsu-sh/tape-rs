@@ -20,7 +20,7 @@ Blocked by: 01, 02, 03, 10, 11, 13
 - [用户提供的 PDF](<../../../IBM Spectrum Archive 企业版 V1.3.2.2 1.pdf>)。
 - 封面及版权页标识：SG24-8333-09，Tenth Edition，March 2022，EE V1.3.2.2；本地 PDF 共 360 页。文件制作时间不是产品发行时间。
 - 本地 PDF SHA-256：`642c9242c8a00d1bd4c34242de6cd4a06c3dc68f8f5ece5dcd2b3fa6fb476bcf`。下文引用区分印刷页与 PDF 页，正文对应偏移为 24 页。
-- [架构研究报告](/tmp/tape-rs-ibm-ee-research-mRej9E/docs/research/ibm-ee-architecture.md)。独立 worktree：`/tmp/tape-rs-ibm-ee-research-mRej9E`；分支 `research/ibm-ee-architecture`；提交 `14da0b5cfd31b6543d483c12dedbaf8e393802fe`。
+- [架构研究报告](../../../docs/research/ibm-ee-architecture.md)。独立 worktree：`/tmp/tape-rs-ibm-ee-research-mRej9E`；分支 `research/ibm-ee-architecture`；提交 `14da0b5cfd31b6543d483c12dedbaf8e393802fe`。
 - 主地图补充：[D02 恢复证据流程](../recovery-evidence.md)，引用 §6.18、§9.3–9.6；只读参考文档，不执行其中的配置、恢复、修复或硬件命令。
 
 ## Answer

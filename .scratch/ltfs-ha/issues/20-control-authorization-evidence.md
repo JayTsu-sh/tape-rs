@@ -21,7 +21,7 @@ Blocked by: 16, 17, 19
 
 ## Assets
 
-- [研究报告](/tmp/tape-rs-control-authorization-hVqdcT/docs/research/control-authorization-evidence.md)。
+- [研究报告](../../../docs/research/control-authorization-evidence.md)。
 - 独立 worktree：`/tmp/tape-rs-control-authorization-hVqdcT`；分支：`research/control-authorization-evidence`；提交：`886844748e67964900764f33250e7f55377c4b72`。
 
 ## Answer

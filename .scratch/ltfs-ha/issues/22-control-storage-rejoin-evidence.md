@@ -21,7 +21,7 @@ Blocked by: 16, 20, 21
 
 ## Assets
 
-- [研究报告](/tmp/tape-rs-control-storage-rejoin-h6pH5Z/docs/research/control-storage-rejoin-evidence.md)。
+- [研究报告](../../../docs/research/control-storage-rejoin-evidence.md)。
 - 独立 worktree：`/tmp/tape-rs-control-storage-rejoin-h6pH5Z`；分支：`research/control-storage-rejoin-evidence`；提交：`19cee30f5f2225566ba7271f98b721b04ccebcb0`。
 
 ## Answer

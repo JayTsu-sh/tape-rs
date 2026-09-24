@@ -14,7 +14,7 @@ Blocked by:
 ## Assets
 
 - 研究分支：`research/ltfs-ha-evidence`；独立 worktree：`/tmp/tape-rs-ha-research-rD1Cvk`。
-- [研究报告](/tmp/tape-rs-ha-research-rD1Cvk/docs/research/ltfs-ha-evidence.md)：研究分支的 `docs/research/ltfs-ha-evidence.md`，提交 `8b83cccc443dcb0af2913df9f56e3791d35d4ba4`。worktree 移除后可用 `git show research/ltfs-ha-evidence:docs/research/ltfs-ha-evidence.md` 读取。
+- [研究报告](../../../docs/research/ltfs-ha-evidence.md)：研究分支的 `docs/research/ltfs-ha-evidence.md`，提交 `8b83cccc443dcb0af2913df9f56e3791d35d4ba4`。worktree 移除后可用 `git show research/ltfs-ha-evidence:docs/research/ltfs-ha-evidence.md` 读取。
 
 ## Answer
 

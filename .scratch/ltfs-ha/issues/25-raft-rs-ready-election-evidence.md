@@ -39,7 +39,7 @@ Blocked by: 24
 
 ## Assets
 
-- [研究报告](/tmp/tape-rs-ready-election-e8ZZMA/docs/research/raft-rs-ready-election-evidence.md)。
+- [研究报告](../../../docs/research/raft-rs-ready-election-evidence.md)。
 - worktree：`/tmp/tape-rs-ready-election-e8ZZMA`；分支：`research/raft-rs-ready-election-evidence`；提交：`c3c5917514a068775a7b46a52a77a90be87c4660`。
 
 ## Answer

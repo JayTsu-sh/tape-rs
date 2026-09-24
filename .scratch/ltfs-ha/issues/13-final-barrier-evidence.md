@@ -17,7 +17,7 @@ Blocked by: 10, 11
 
 - 研究分支：`research/ltfs-final-barrier`；提交：`4544f78`。
 - 独立 worktree：`/tmp/tape-rs-final-barrier-research-rIlumF`。
-- [研究报告](/tmp/tape-rs-final-barrier-research-rIlumF/docs/research/ltfs-final-barrier.md)。
+- [研究报告](../../../docs/research/ltfs-final-barrier.md)。
 
 ## Answer
 

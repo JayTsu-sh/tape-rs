@@ -18,7 +18,7 @@ Blocked by: 01, 02, 03
 ## Assets
 
 - 后续裁定：[17](17-raft-ha-direction.md#answer)选择三个节点均接带库、Leader 直接承担设备执行。报告中的 C 仅控制及 Leader/owner 分离是当时的候选建议，未被采用；多数派、持久复制与隔离边界的事实核对仍适用。
-- [研究报告](/tmp/tape-rs-raft-ha-research-NGSlAw/docs/research/raft-ha-evidence.md)。
+- [研究报告](../../../docs/research/raft-ha-evidence.md)。
 - 独立 worktree：`/tmp/tape-rs-raft-ha-research-NGSlAw`；分支：`research/raft-ha-evidence`；提交：`ca7a81a73be9ab297459e4154b0975f5096b92f8`。
 
 ## Answer

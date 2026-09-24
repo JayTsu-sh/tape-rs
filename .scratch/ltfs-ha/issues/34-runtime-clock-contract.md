@@ -17,7 +17,7 @@ Blocked by: 31, 32, 33
 
 ## Answer
 
-限定研究完成，见[报告](/tmp/tape-rs-runtime-clock-ogktMr/docs/research/runtime-clock-contract.md)。独立分支 `research/runtime-clock-contract`，提交 `6645c8ce41144e2165db13c582c1a08af70b81e1`，仅报告提交。
+限定研究完成，见[报告](../../../docs/research/runtime-clock-contract.md)。独立分支 `research/runtime-clock-contract`，提交 `6645c8ce41144e2165db13c582c1a08af70b81e1`，仅报告提交。
 
 依自动接受授权采用[BOOTTIME 计时契约](../runtime-clock.md)：原 t0/W/当前检查用同一受支持时间域、检查算术与错误；定时器只提示，不能延长原期限。计入 Linux 系统挂起不等于证明所有 VM 生命周期行为，单调也不保证真实秒数速率误差有界。
 

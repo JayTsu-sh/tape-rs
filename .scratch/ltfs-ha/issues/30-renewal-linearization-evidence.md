@@ -25,7 +25,7 @@ Blocked by: 23, 29
 
 ## Assets
 
-- [研究报告](/tmp/tape-rs-renewal-linearization-vZMLn5/docs/research/renewal-linearization-evidence.md)。
+- [研究报告](../../../docs/research/renewal-linearization-evidence.md)。
 - worktree：`/tmp/tape-rs-renewal-linearization-vZMLn5`；分支：`research/renewal-linearization-evidence`；提交：`aeca36a5650974e53360ea16b56765be2d52fce0`。
 
 ## Answer

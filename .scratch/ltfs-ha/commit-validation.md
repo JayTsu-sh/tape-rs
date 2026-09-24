@@ -50,11 +50,11 @@
 
 [资格同步 QS01—QS06](raft-rs-binding.md#同步验证场景)关联 EG/RQ/LG/CT：资格往返、迟到健康、Ready 等待、发布与内核调用重叠、精确许可终止及重复/重启。均未实现/执行；源端获知、发布和消费延迟必须可观察，不把只有当前布尔值或永远受限当正确同步。
 
-[禁选计时 ET01—ET06](/tmp/tape-rs-election-timer-HxpokL/docs/research/raft-rs-election-timer-evidence.md#5-最小验证义务)细化 EG/RQ：饱和阈值、合法重置、恢复合格、Ready 交错、整数边界及配置阻塞后的进展。均未实现/执行；[EE3 只读环境核对](lab-environment.md#已核验的-ee3-基线)不是这些用例的运行证据。
+[禁选计时 ET01—ET06](../../docs/research/raft-rs-election-timer-evidence.md#5-最小验证义务)细化 EG/RQ：饱和阈值、合法重置、恢复合格、Ready 交错、整数边界及配置阻塞后的进展。均未实现/执行；[EE3 只读环境核对](lab-environment.md#已核验的-ee3-基线)不是这些用例的运行证据。
 
-[单 Ready 绑定规格](raft-rs-binding.md)细化 RB01—RB06，复用 [25 的 RE01—RE06](/tmp/tape-rs-ready-election-e8ZZMA/docs/research/raft-rs-ready-election-evidence.md#5-未证明项与验证入口)：两组输出、快照安装、保存期间失效、禁选计时、TimeoutNow 及正常复制。此处 RE 属控制研究编号，不与下文卷恢复 RE 编号混用；均未实现/执行，不把公开字段存在当完整门控证明。
+[单 Ready 绑定规格](raft-rs-binding.md)细化 RB01—RB06，复用 [25 的 RE01—RE06](../../docs/research/raft-rs-ready-election-evidence.md#5-未证明项与验证入口)：两组输出、快照安装、保存期间失效、禁选计时、TimeoutNow 及正常复制。此处 RE 属控制研究编号，不与下文卷恢复 RE 编号混用；均未实现/执行，不把公开字段存在当完整门控证明。
 
-[Rust Raft 绑定研究的 RB01—RB06](/tmp/tape-rs-rust-raft-binding-xbvYzk/docs/research/rust-raft-binding-evidence.md#5-存储故障与验证门槛)对应 DV06/DV08 及既有 EG/RQ/CT/CS：可靠保存通知、实际应用、全竞选入口、safe 确认、快照恢复和新授权正例。均未实现/执行，用户已接受优先验证 raft-rs，不因接受方向或研究完成记为测试通过。
+[Rust Raft 绑定研究的 RB01—RB06](../../docs/research/rust-raft-binding-evidence.md#5-存储故障与验证门槛)对应 DV06/DV08 及既有 EG/RQ/CT/CS：可靠保存通知、实际应用、全竞选入口、safe 确认、快照恢复和新授权正例。均未实现/执行，用户已接受优先验证 raft-rs，不因接受方向或研究完成记为测试通过。
 
 [控制接口事件契约](control-interface-events.md)将 FT01—FT04 的切点分为提案/提交/实际应用、快照保存/发布/回收、派发/效果/响应和维护交接。事件标识不代表实现 API；无派发的断言须有完整边界观测，模型私有真值不向恢复逻辑泄露。不新增逐文件同步日志，具体绑定及测试均未完成。
 

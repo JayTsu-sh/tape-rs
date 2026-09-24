@@ -15,7 +15,7 @@ Blocked by: 16, 17
 
 ## Assets
 
-- [研究报告](/tmp/tape-rs-device-aware-election-l6m3S0/docs/research/device-aware-raft-election.md)。
+- [研究报告](../../../docs/research/device-aware-raft-election.md)。
 - 独立 worktree：`/tmp/tape-rs-device-aware-election-l6m3S0`；分支：`research/device-aware-raft-election`；提交：`9c61d50493ef60b7b001b0e2a0c910cced22d38f`。
 
 ## Answer

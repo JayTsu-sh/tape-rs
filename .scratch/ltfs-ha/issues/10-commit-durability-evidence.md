@@ -16,7 +16,7 @@ Blocked by: 01
 ## Assets
 
 - 分支 `research/ltfs-commit-durability`，worktree `/tmp/tape-rs-commit-research-QIDBx0`。
-- [研究报告](/tmp/tape-rs-commit-research-QIDBx0/docs/research/ltfs-commit-durability.md)：该分支的 `docs/research/ltfs-commit-durability.md`，提交 `0073163`。worktree 移除后可用 `git show research/ltfs-commit-durability:docs/research/ltfs-commit-durability.md` 读取。
+- [研究报告](../../../docs/research/ltfs-commit-durability.md)：该分支的 `docs/research/ltfs-commit-durability.md`，提交 `0073163`。worktree 移除后可用 `git show research/ltfs-commit-durability:docs/research/ltfs-commit-durability.md` 读取。
 
 ## Answer
 

@@ -15,7 +15,7 @@ Blocked by: 10, 11, 13, 14
 
 ## Assets
 
-- [研究报告](/tmp/tape-rs-recovery-chain-Y50XuQ/docs/research/ltfs-recovery-chain.md)。
+- [研究报告](../../../docs/research/ltfs-recovery-chain.md)。
 - 独立 worktree：`/tmp/tape-rs-recovery-chain-Y50XuQ`；分支：`research/ltfs-recovery-chain`；提交：`e850a8e`。
 - 主文档：[D02 协议细化](../recovery-evidence.md#d02-细化条件式快速定位与独立验证)。
 

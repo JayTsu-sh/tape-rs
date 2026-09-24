@@ -27,7 +27,7 @@ Blocked by: 25, 26
 
 ## Assets
 
-- [研究报告](/tmp/tape-rs-network-evidence-8tgeS1/docs/research/raft-rs-network-evidence.md)。
+- [研究报告](../../../docs/research/raft-rs-network-evidence.md)。
 - worktree：`/tmp/tape-rs-network-evidence-8tgeS1`；分支：`research/raft-rs-network-evidence`；提交：`9b368e7d8aa10c5c31bb4f36b8d7724a85fd1288`。
 
 ## Answer

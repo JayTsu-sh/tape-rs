@@ -14,7 +14,7 @@ Blocked by: 11
 ## Assets
 
 - 分支 `research/ltfs-receipt-storage`，worktree `/tmp/tape-rs-receipt-research-fFWbcY`。
-- [研究报告](/tmp/tape-rs-receipt-research-fFWbcY/docs/research/ltfs-receipt-storage.md)：该分支的 `docs/research/ltfs-receipt-storage.md`，提交 `e81074277ee3c830ff39770a7ec26f3b5b4f7ca2`。worktree 移除后可用 `git show research/ltfs-receipt-storage:docs/research/ltfs-receipt-storage.md` 读取。
+- [研究报告](../../../docs/research/ltfs-receipt-storage.md)：该分支的 `docs/research/ltfs-receipt-storage.md`，提交 `e81074277ee3c830ff39770a7ec26f3b5b4f7ca2`。worktree 移除后可用 `git show research/ltfs-receipt-storage:docs/research/ltfs-receipt-storage.md` 读取。
 
 ## Answer
 

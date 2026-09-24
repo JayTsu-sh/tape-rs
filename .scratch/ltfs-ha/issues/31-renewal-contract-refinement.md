@@ -17,7 +17,7 @@ Blocked by: 30
 
 ## Answer
 
-限定审计完成，见[研究报告](/tmp/tape-rs-renewal-refinement-JNW0rX/docs/research/renewal-contract-refinement.md)。独立分支 `research/renewal-contract-refinement`，报告提交 `242e44eb47a7f59aa5826dc62a9a4a6dd0211925`。
+限定审计完成，见[研究报告](../../../docs/research/renewal-contract-refinement.md)。独立分支 `research/renewal-contract-refinement`，报告提交 `242e44eb47a7f59aa5826dc62a9a4a6dd0211925`。
 
 回溯本地已记录的 18 QG/RQ：原要求是期限内接受合格证据、在途不延期、过期/终止不复活，未固定最终确认 C 为唯一接受点。第 30 轮将 P 限为未接受登记是助手后来采用的更强解释，不冒充用户原始逐项要求；报告不是对历史聊天的独立考证。
 

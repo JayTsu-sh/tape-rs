@@ -23,7 +23,7 @@ Blocked by: 16, 19, 20
 
 ## Assets
 
-- [研究报告](/tmp/tape-rs-authority-liveness-aJxliM/docs/research/authority-liveness-evidence.md)。
+- [研究报告](../../../docs/research/authority-liveness-evidence.md)。
 - 独立 worktree：`/tmp/tape-rs-authority-liveness-aJxliM`；分支：`research/authority-liveness-evidence`；提交：`24ea8c2e758f1127218f4e6dc0c57c22d76b4551`。
 - 官方参考源码固定在 etcd-io/raft commit `3cbf6a74be3fa392edd8b64253fcd11c3ce5649b`，仅用于事实核对，不作为本项目库选型。
 

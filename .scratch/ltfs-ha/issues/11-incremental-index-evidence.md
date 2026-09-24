@@ -14,7 +14,7 @@ Blocked by: 10
 ## Assets
 
 - 研究分支：`research/ltfs-incremental-index`，worktree `/tmp/tape-rs-incremental-research-EeXGG3`。
-- [研究报告](/tmp/tape-rs-incremental-research-EeXGG3/docs/research/ltfs-incremental-index.md)：该分支的 `docs/research/ltfs-incremental-index.md`，提交 `74f03eb`。worktree 移除后可用 `git show research/ltfs-incremental-index:docs/research/ltfs-incremental-index.md` 读取。
+- [研究报告](../../../docs/research/ltfs-incremental-index.md)：该分支的 `docs/research/ltfs-incremental-index.md`，提交 `74f03eb`。worktree 移除后可用 `git show research/ltfs-incremental-index:docs/research/ltfs-incremental-index.md` 读取。
 
 ## Answer
 

@@ -17,7 +17,7 @@ Blocked by: 25, 26, 27, 33, 34
 
 ## Answer
 
-限定研究完成，见[报告](/tmp/tape-rs-election-overlap-mwWmAF/docs/research/election-invalidation-overlap.md)。独立分支 `research/election-invalidation-overlap`，提交 `7fb2d12f592c2b4496b95081a32927a56854f375`，仅报告提交；固定核对 raft-rs v0.7.0。
+限定研究完成，见[报告](../../../docs/research/election-invalidation-overlap.md)。独立分支 `research/election-invalidation-overlap`，提交 `7fb2d12f592c2b4496b95081a32927a56854f375`，仅报告提交；固定核对 raft-rs v0.7.0。
 
 依自动接受授权，明确采用[可发布领导资格与调用产物隔离](../election-overlap.md)：并发失效期间库内角色可能短暂变化，但不对外发布/服务不合格的新 Leader，不建立 K/G；合法退回仍保存 term/vote/log 及必要 apply，正常投票/复制响应不随旧竞选整批删除。这是本轮选择的可观察契约，不倒写成用户原先要求的内部瞬时保证。
 

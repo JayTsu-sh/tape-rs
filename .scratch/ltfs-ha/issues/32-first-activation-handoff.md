@@ -17,7 +17,7 @@ Blocked by: 31
 
 ## Answer
 
-限定研究完成，见[报告](/tmp/tape-rs-first-handoff-zwBaje/docs/research/first-activation-handoff.md)。独立分支 `research/first-activation-handoff`，提交 `66939dccfd78eb3bbcd254055936ea782fcfd4d8`，仅提交报告。
+限定研究完成，见[报告](../../../docs/research/first-activation-handoff.md)。独立分支 `research/first-activation-handoff`，提交 `66939dccfd78eb3bbcd254055936ea782fcfd4d8`，仅提交报告。
 
 首次 Pending 没有旧执行权；交接 Pending 两侧副作用均拒绝。成功分支以证书证明及时的 P 接受，C 只公开证据；G 截止仅来自自身 Eg，不能取 max(Dk,Eg)。交接失败必须保留 K 的封闭/退出效果，不能照搬稳态失败无续期效果的映射；真正终止不复活。
 

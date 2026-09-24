@@ -24,7 +24,7 @@ Blocked by: 22, 25
 
 ## Assets
 
-- [研究报告](/tmp/tape-rs-storage-recovery-Kv1hWo/docs/research/raft-rs-storage-recovery-evidence.md)。
+- [研究报告](../../../docs/research/raft-rs-storage-recovery-evidence.md)。
 - worktree：`/tmp/tape-rs-storage-recovery-Kv1hWo`；分支：`research/raft-rs-storage-recovery-evidence`；提交：`e0b0093531c59a0e2858c7e66e814f826cbac987`。
 
 ## Answer

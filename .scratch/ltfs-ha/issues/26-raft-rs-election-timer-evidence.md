@@ -19,7 +19,7 @@ Blocked by: 25
 
 ## Assets
 
-- [研究报告](/tmp/tape-rs-election-timer-HxpokL/docs/research/raft-rs-election-timer-evidence.md)。
+- [研究报告](../../../docs/research/raft-rs-election-timer-evidence.md)。
 - worktree：`/tmp/tape-rs-election-timer-HxpokL`；分支：`research/raft-rs-election-timer-evidence`；提交：`d05635d2fe05f2ad2e73ce215a643d16110ccbac`。
 
 ## Answer

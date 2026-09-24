@@ -17,7 +17,7 @@ Blocked by: 29, 31, 32
 
 ## Answer
 
-限定研究完成，见[报告](/tmp/tape-rs-permit-state-sdUme0/docs/research/permit-state-representation.md)。独立分支 `research/permit-state-representation`，提交 `09daaacd1dc978020a6e51e4e9433c590f912720`，仅报告提交。
+限定研究完成，见[报告](../../../docs/research/permit-state-representation.md)。独立分支 `research/permit-state-representation`，提交 `09daaacd1dc978020a6e51e4e9433c590f912720`，仅报告提交。
 
 依自动接受授权采用[标准库表示基线](../permit-representation.md)：稳定 Arc 传递对象，Mutex 保护不可变描述，整数原子控制字与精确前态竞争；读者 try_lock 忙则暂拒。发布 CAS 失败须在锁内恢复旧描述，不能回写旧 token 或清 STOP。整轮故障与旧 K 阶段/到期关闭分别处理，不能把后者退化为无条件整轮 STOP。
 

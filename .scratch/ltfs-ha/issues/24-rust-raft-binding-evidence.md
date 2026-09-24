@@ -32,7 +32,7 @@ Blocked by: 19, 20, 22, 23
 
 ## Assets
 
-- [研究报告](/tmp/tape-rs-rust-raft-binding-xbvYzk/docs/research/rust-raft-binding-evidence.md)。
+- [研究报告](../../../docs/research/rust-raft-binding-evidence.md)。
 - 独立 worktree：`/tmp/tape-rs-rust-raft-binding-xbvYzk`；分支：`research/rust-raft-binding-evidence`；提交：`5aef9aac2330d77b8d3cf25a789b2d0523556d5e`。
 - 固定来源：raft-rs v0.7.0 / `10c6e9db6792b85c81784e44fc278f895d5f0ab0`；OpenRaft v0.9.21 / `fc315d5a21cd6480fd715c03c322b9cc7268e6ee`。仅代表研究版本，不声称最新或最终生产版本。
 

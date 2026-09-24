@@ -17,7 +17,7 @@ Blocked by: 28, 29, 35
 
 ## Answer
 
-限定研究完成，见[报告](/tmp/tape-rs-control-sqlite-d4DHnP/docs/research/control-store-sqlite.md)。独立分支 `research/control-store-sqlite`，提交 `19304a0f8669e041e109505022284d1c9dd9374b`，仅报告提交。
+限定研究完成，见[报告](../../../docs/research/control-store-sqlite.md)。独立分支 `research/control-store-sqlite`，提交 `19304a0f8669e041e109505022284d1c9dd9374b`，仅报告提交。
 
 依自动接受授权采用[独立单库对象及事务映射](../control-store-transactions.md)与 [SQLite 运行基线](../control-store-sqlite.md)：DELETE＋EXTRA、单工作入口/连接、同库完整快照、可靠提交后才发布 RAM Storage 视图，SQLite 3.53.4 作为固定上游验证候选。事务锁之外使用终身本地 flock，仍受真实收束、存储同步及部署防克隆前提约束。
 
