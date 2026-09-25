@@ -8,6 +8,7 @@
 //! 保持在同一模块便于两端共享数据结构。
 
 use std::fmt::Write as _;
+use std::collections::BTreeSet;
 
 use bytes::Bytes;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
@@ -19,14 +20,14 @@ use crate::error::{Result, TapeError};
 use crate::ltfs::label::LTFS_VERSION;
 
 /// Index 的"位置"：partition + 起始块号。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexLocation {
     pub partition: char,
     pub start_block: u64,
 }
 
 /// 单个 extent：文件在磁带上连续的一段。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Extent {
     pub partition: char,
     pub start_block: u64,
@@ -38,7 +39,7 @@ pub struct Extent {
 }
 
 /// 通用的时间戳/uid 字段集合（文件与目录共用）。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NodeMeta {
     pub readonly: bool,
     pub creation_time: String,
@@ -64,8 +65,11 @@ pub struct Xattr {
 pub const XATTR_MD5: &str = "ltfs.hash.md5sum";
 pub const XATTR_SHA256: &str = "ltfs.hash.sha256sum";
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileNode {
+    /// 增量中明确出现的字段；None 表示完整对象。
+    pub delta_fields: Option<BTreeSet<String>>,
+    pub open_for_write: Option<bool>,
     pub name: String,
     pub length: u64,
     pub meta: NodeMeta,
@@ -87,8 +91,10 @@ impl FileNode {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DirectoryNode {
+    /// 增量导航目录可能只有 name 与 contents。
+    pub delta_fields: Option<BTreeSet<String>>,
     pub name: String,
     pub meta: NodeMeta,
     pub files: Vec<FileNode>,
@@ -98,6 +104,11 @@ pub struct DirectoryNode {
 
 #[derive(Debug, Clone)]
 pub struct LtfsIndex {
+    pub incremental: bool,
+    /// 已重放的完整内存视图不是原始增量 XML，禁止误序列化成缺少删除项的增量。
+    pub(crate) materialized: bool,
+    pub previous_incremental_location: Option<IndexLocation>,
+    pub comment: Option<String>,
     pub version: String,
     pub creator: String,
     pub volume_uuid: Uuid,
@@ -122,6 +133,10 @@ impl LtfsIndex {
     pub fn empty(volume_uuid: Uuid, creator: String, data_partition: char) -> Self {
         let now = crate::ltfs::label::ltfs_time_now();
         Self {
+            incremental: false,
+            materialized: false,
+            previous_incremental_location: None,
+            comment: None,
             version: LTFS_VERSION.to_string(),
             creator,
             volume_uuid,
@@ -134,6 +149,7 @@ impl LtfsIndex {
             volume_lock_state: None,
             unknown_elements: Vec::new(),
             root: DirectoryNode {
+                delta_fields: None,
                 name: String::new(),
                 meta: NodeMeta {
                     readonly: false,
@@ -173,7 +189,7 @@ impl LtfsIndex {
     /// 解析 XML index。
     pub fn parse(xml: &[u8]) -> Result<Self> {
         let mut reader = Reader::from_reader(xml);
-        reader.config_mut().trim_text(true);
+        reader.config_mut().trim_text(false);
         let mut p = IndexParser::new();
         let mut bufv = Vec::new();
         loop {
@@ -188,24 +204,30 @@ impl LtfsIndex {
                 }
                 Event::End(e) => p.on_end(e)?,
                 Event::Text(t) => p.on_text(&t.unescape()?),
+                Event::CData(t) => p.on_text(std::str::from_utf8(t.as_ref()).map_err(|e| TapeError::Ltfs(e.to_string()))?),
                 _ => {}
             }
         }
-        p.finish()
+        let index = p.finish()?;
+        index.validate_incremental()?;
+        Ok(index)
     }
 
     /// 序列化为 XML。self_location / previous_location / generation 由调用方
     /// 在 commit 前设好。
     pub fn to_xml(&self) -> Result<Bytes> {
+        if self.incremental && self.materialized { return Err(TapeError::Ltfs("已重放视图不能作为原始增量序列化，请生成差分或完整检查点".into())); }
         let mut out = Vec::with_capacity(4096);
         let mut w = Writer::new_with_indent(&mut out, b' ', 2);
         w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
 
-        let mut root = BytesStart::new("ltfsindex");
+        let root_name = if self.incremental { "ltfsincrementalindex" } else { "ltfsindex" };
+        let mut root = BytesStart::new(root_name);
         root.push_attribute(("version", self.version.as_str()));
         w.write_event(Event::Start(root))?;
 
         write_text(&mut w, "creator", &self.creator)?;
+        if let Some(comment) = &self.comment { write_text(&mut w, "comment", comment)?; }
         write_text(&mut w, "volumeuuid", &self.volume_uuid.to_string())?;
         write_u64(&mut w, "generationnumber", self.generation)?;
         write_text(&mut w, "updatetime", &self.update_time)?;
@@ -213,11 +235,12 @@ impl LtfsIndex {
         if let Some(prev) = self.previous_location {
             write_location(&mut w, "previousgenerationlocation", &prev)?;
         }
-        write_text(
-            &mut w,
-            "allowpolicyupdate",
-            if self.allow_policy_update { "true" } else { "false" },
-        )?;
+        if let Some(prev) = self.previous_incremental_location {
+            write_location(&mut w, "previousincrementallocation", &prev)?;
+        }
+        if !self.incremental {
+            write_text(&mut w, "allowpolicyupdate", if self.allow_policy_update { "true" } else { "false" })?;
+        }
         if let Some(state) = &self.volume_lock_state {
             write_text(&mut w, "volumelockstate", state)?;
         }
@@ -225,7 +248,7 @@ impl LtfsIndex {
 
         write_directory(&mut w, &self.root, /*is_root=*/ true)?;
 
-        w.write_event(Event::End(BytesEnd::new("ltfsindex")))?;
+        w.write_event(Event::End(BytesEnd::new(root_name)))?;
         Ok(Bytes::from(out))
     }
 }
@@ -250,10 +273,29 @@ fn walk_dir<F: FnMut(&str, &FileNode)>(dir: &DirectoryNode, prefix: &str, f: &mu
 }
 
 fn write_text<W: std::io::Write>(w: &mut Writer<W>, tag: &str, text: &str) -> Result<()> {
-    w.write_event(Event::Start(BytesStart::new(tag)))?;
+    let mut start = BytesStart::new(tag);
+    let encoded;
+    let text = if matches!(tag, "name" | "key" | "symlink") && text.chars().any(|c| c.is_ascii_control()) {
+        start.push_attribute(("percentencoded", "true"));
+        encoded = text.chars().map(|c| if c.is_ascii_control() || c == '%' { format!("%{:02X}", c as u32) } else { c.to_string() }).collect::<String>();
+        encoded.as_str()
+    } else { text };
+    w.write_event(Event::Start(start))?;
     w.write_event(Event::Text(BytesText::new(text)))?;
     w.write_event(Event::End(BytesEnd::new(tag)))?;
     Ok(())
+}
+
+fn decode_name(text: &str) -> Result<String> {
+    let mut bytes = Vec::new(); let mut i = 0;
+    while i < text.len() {
+        if text.as_bytes()[i] == b'%' {
+            let pair = text.as_bytes().get(i + 1..i + 3).ok_or_else(|| TapeError::Ltfs("名称百分号编码截断".into()))?;
+            let hex = std::str::from_utf8(pair).map_err(|e| TapeError::Ltfs(e.to_string()))?;
+            bytes.push(u8::from_str_radix(hex, 16).map_err(|e| TapeError::Ltfs(e.to_string()))?); i += 3;
+        } else { bytes.push(text.as_bytes()[i]); i += 1; }
+    }
+    String::from_utf8(bytes).map_err(|e| TapeError::Ltfs(e.to_string()))
 }
 
 fn write_u64<W: std::io::Write>(w: &mut Writer<W>, tag: &str, v: u64) -> Result<()> {
@@ -270,14 +312,18 @@ fn write_location<W: std::io::Write>(w: &mut Writer<W>, tag: &str, loc: &IndexLo
     Ok(())
 }
 
-fn write_meta<W: std::io::Write>(w: &mut Writer<W>, meta: &NodeMeta) -> Result<()> {
-    write_text(w, "readonly", if meta.readonly { "true" } else { "false" })?;
-    write_text(w, "creationtime", &meta.creation_time)?;
-    write_text(w, "changetime", &meta.change_time)?;
-    write_text(w, "modifytime", &meta.modify_time)?;
-    write_text(w, "accesstime", &meta.access_time)?;
-    write_text(w, "backuptime", &meta.backup_time)?;
-    write_u64(w, "fileuid", meta.file_uid)?;
+fn present(fields: &Option<BTreeSet<String>>, key: &str) -> bool {
+    fields.as_ref().is_none_or(|f| f.contains(key))
+}
+
+fn write_meta<W: std::io::Write>(w: &mut Writer<W>, meta: &NodeMeta, fields: &Option<BTreeSet<String>>) -> Result<()> {
+    if present(fields, "readonly") { write_text(w, "readonly", if meta.readonly { "true" } else { "false" })?; }
+    if present(fields, "creationtime") { write_text(w, "creationtime", &meta.creation_time)?; }
+    if present(fields, "changetime") { write_text(w, "changetime", &meta.change_time)?; }
+    if present(fields, "modifytime") { write_text(w, "modifytime", &meta.modify_time)?; }
+    if present(fields, "accesstime") { write_text(w, "accesstime", &meta.access_time)?; }
+    if present(fields, "backuptime") { write_text(w, "backuptime", &meta.backup_time)?; }
+    if present(fields, "fileuid") { write_u64(w, "fileuid", meta.file_uid)?; }
     Ok(())
 }
 
@@ -293,9 +339,15 @@ fn write_xattrs<W: std::io::Write>(w: &mut Writer<W>, xattrs: &[Xattr]) -> Resul
         if x.base64 {
             value.push_attribute(("type", "base64"));
         }
-        w.write_event(Event::Start(value))?;
-        w.write_event(Event::Text(BytesText::new(&x.value)))?;
-        w.write_event(Event::End(BytesEnd::new("value")))?;
+        // IBM treats an explicit empty base64 body as a decode error; the
+        // empty element represents a zero-length value without decoding it.
+        if x.value.is_empty() {
+            w.write_event(Event::Empty(value))?;
+        } else {
+            w.write_event(Event::Start(value))?;
+            w.write_event(Event::Text(BytesText::new(&x.value)))?;
+            w.write_event(Event::End(BytesEnd::new("value")))?;
+        }
         w.write_event(Event::End(BytesEnd::new("xattr")))?;
     }
     w.write_event(Event::End(BytesEnd::new("extendedattributes")))?;
@@ -305,14 +357,26 @@ fn write_xattrs<W: std::io::Write>(w: &mut Writer<W>, xattrs: &[Xattr]) -> Resul
 fn write_file<W: std::io::Write>(w: &mut Writer<W>, f: &FileNode) -> Result<()> {
     w.write_event(Event::Start(BytesStart::new("file")))?;
     write_text(w, "name", &f.name)?;
-    write_u64(w, "length", f.length)?;
-    write_meta(w, &f.meta)?;
-    write_xattrs(w, &f.xattrs)?;
-    if let Some(target) = &f.symlink {
+    if f.delta_fields.as_ref().is_some_and(|v| v.contains("deleted")) {
+        w.write_event(Event::Empty(BytesStart::new("deleted")))?;
+        w.write_event(Event::End(BytesEnd::new("file")))?;
+        return Ok(());
+    }
+    if present(&f.delta_fields, "length") { write_u64(w, "length", f.length)?; }
+    write_meta(w, &f.meta, &f.delta_fields)?;
+    if present(&f.delta_fields, "extendedattributes") {
+        write_xattrs(w, &f.xattrs)?;
+        if f.xattrs.is_empty() && f.delta_fields.is_some() { w.write_event(Event::Empty(BytesStart::new("extendedattributes")))?; }
+    }
+    if let Some(value) = f.open_for_write && present(&f.delta_fields, "openforwrite") {
+        write_text(w, "openforwrite", if value { "true" } else { "false" })?;
+    }
+    if let Some(target) = &f.symlink && present(&f.delta_fields, "symlink") {
         write_text(w, "symlink", target)?;
         w.write_event(Event::End(BytesEnd::new("file")))?;
         return Ok(());
     }
+    if present(&f.delta_fields, "extentinfo") {
     w.write_event(Event::Start(BytesStart::new("extentinfo")))?;
     for ext in &f.extents {
         w.write_event(Event::Start(BytesStart::new("extent")))?;
@@ -324,6 +388,7 @@ fn write_file<W: std::io::Write>(w: &mut Writer<W>, f: &FileNode) -> Result<()> 
         w.write_event(Event::End(BytesEnd::new("extent")))?;
     }
     w.write_event(Event::End(BytesEnd::new("extentinfo")))?;
+    }
     w.write_event(Event::End(BytesEnd::new("file")))?;
     Ok(())
 }
@@ -334,14 +399,18 @@ fn write_directory<W: std::io::Write>(
     is_root: bool,
 ) -> Result<()> {
     w.write_event(Event::Start(BytesStart::new("directory")))?;
-    if !is_root {
-        write_text(w, "name", &d.name)?;
-    } else {
-        // root 的 name 为空串，但节点必须存在
-        write_text(w, "name", "")?;
+    let _ = is_root;
+    write_text(w, "name", &d.name)?;
+    if d.delta_fields.as_ref().is_some_and(|v| v.contains("deleted")) {
+        w.write_event(Event::Empty(BytesStart::new("deleted")))?;
+        w.write_event(Event::End(BytesEnd::new("directory")))?;
+        return Ok(());
     }
-    write_meta(w, &d.meta)?;
-    write_xattrs(w, &d.xattrs)?;
+    write_meta(w, &d.meta, &d.delta_fields)?;
+    if present(&d.delta_fields, "extendedattributes") {
+        write_xattrs(w, &d.xattrs)?;
+        if d.xattrs.is_empty() && d.delta_fields.is_some() { w.write_event(Event::Empty(BytesStart::new("extendedattributes")))?; }
+    }
     w.write_event(Event::Start(BytesStart::new("contents")))?;
     for f in &d.files {
         write_file(w, f)?;
@@ -358,6 +427,11 @@ fn write_directory<W: std::io::Write>(
 
 /// 栈式 XML 状态机：维护 path 栈 + "当前"目录/文件/extent。
 struct IndexParser {
+    incremental: bool,
+    previous_incremental_location: Option<IndexLocation>,
+    header_fields: BTreeSet<String>,
+    percent_encoded: BTreeSet<usize>,
+    comment: Option<String>,
     path: Vec<String>,
     text: String,
     version: String,
@@ -388,6 +462,7 @@ struct IndexParser {
 
 /// 本实现能解析并原样回写的元素。其余的记入 `unknown_elements`。
 const KNOWN_ELEMENTS: &[&str] = &[
+    "ltfsincrementalindex", "previousincrementallocation", "deleted", "comment", "openforwrite",
     "ltfsindex", "creator", "volumeuuid", "generationnumber", "updatetime", "location",
     "previousgenerationlocation", "allowpolicyupdate", "volumelockstate", "highestfileuid",
     "directory", "contents", "file", "name", "length", "readonly", "creationtime", "changetime",
@@ -399,6 +474,11 @@ const KNOWN_ELEMENTS: &[&str] = &[
 impl IndexParser {
     fn new() -> Self {
         Self {
+            incremental: false,
+            previous_incremental_location: None,
+            header_fields: BTreeSet::new(),
+            percent_encoded: BTreeSet::new(),
+            comment: None,
             path: Vec::new(),
             text: String::new(),
             version: String::new(),
@@ -424,13 +504,22 @@ impl IndexParser {
     fn on_start(&mut self, e: BytesStart<'_>) -> Result<()> {
         let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
         self.text.clear();
+        if self.path.len() >= 512 { return Err(TapeError::Ltfs("索引 XML 嵌套深度超过预算".into())); }
+        if matches!(name.as_str(), "name" | "key" | "symlink") && e.attributes().flatten().any(|a| a.key.as_ref() == b"percentencoded" && matches!(a.value.as_ref(), b"true" | b"1")) {
+            self.percent_encoded.insert(self.path.len());
+        }
 
         if !KNOWN_ELEMENTS.contains(&name.as_str()) && !self.unknown_elements.contains(&name) {
             self.unknown_elements.push(name.clone());
         }
 
+        if name == "deleted" && !self.incremental { return Err(TapeError::Ltfs("完整索引不能包含 deleted".into())); }
+        if self.incremental && matches!(name.as_str(), "allowpolicyupdate" | "dataplacementpolicy") {
+            return Err(TapeError::Ltfs("增量索引不允许放置策略".into()));
+        }
         match name.as_str() {
-            "ltfsindex" => {
+            "ltfsindex" | "ltfsincrementalindex" => {
+                self.incremental = name == "ltfsincrementalindex";
                 for a in e.attributes().flatten() {
                     if a.key.as_ref() == b"version" {
                         self.version = String::from_utf8_lossy(&a.value).to_string();
@@ -438,10 +527,10 @@ impl IndexParser {
                 }
             }
             "directory" => {
-                self.dir_stack.push(DirectoryNode::default());
+                self.dir_stack.push(DirectoryNode { delta_fields: self.incremental.then(BTreeSet::new), ..Default::default() });
             }
             "file" => {
-                self.file_stack.push(FileNode::default());
+                self.file_stack.push(FileNode { delta_fields: self.incremental.then(BTreeSet::new), ..Default::default() });
             }
             "xattr" => {
                 self.cur_xattr = Some(Xattr { key: String::new(), value: String::new(), base64: false });
@@ -463,7 +552,7 @@ impl IndexParser {
                     file_offset: 0,
                 });
             }
-            "location" | "previousgenerationlocation" => {
+            "location" | "previousgenerationlocation" | "previousincrementallocation" => {
                 self.cur_location = Some(IndexLocation { partition: 'b', start_block: 0 });
                 self.cur_location_tag = Some(name.clone());
             }
@@ -480,11 +569,25 @@ impl IndexParser {
     fn on_end(&mut self, _e: BytesEnd<'_>) -> Result<()> {
         let name = self.path.pop().unwrap_or_default();
         let parent = self.path.last().cloned().unwrap_or_default();
-        let text = std::mem::take(&mut self.text);
+        let mut text = std::mem::take(&mut self.text);
+        if self.percent_encoded.remove(&self.path.len()) { text = decode_name(&text)?; }
         let trimmed = text.trim();
 
+        if self.incremental {
+            if parent == "ltfsincrementalindex" && !self.header_fields.insert(name.clone()) { return Err(TapeError::Ltfs(format!("增量头字段重复: {name}"))); }
+            if matches!(name.as_str(), "readonly" | "openforwrite") && !matches!(trimmed, "true" | "false" | "1" | "0") { return Err(TapeError::Ltfs("增量 readonly 非法".into())); }
+            if name == "partition" && (trimmed.len() != 1 || !trimmed.as_bytes()[0].is_ascii_alphabetic()) { return Err(TapeError::Ltfs("增量 partition 非法".into())); }
+            if matches!(name.as_str(), "length" | "fileuid" | "generationnumber" | "highestfileuid" | "startblock" | "byteoffset" | "bytecount" | "fileoffset") && trimmed.parse::<u64>().is_err() {
+                return Err(TapeError::Ltfs(format!("增量数值非法: {name}")));
+            }
+            let fields = if parent == "file" { self.file_stack.last_mut().and_then(|f| f.delta_fields.as_mut()) }
+                else if parent == "directory" { self.dir_stack.last_mut().and_then(|d| d.delta_fields.as_mut()) }
+                else { None };
+            if let Some(fields) = fields && !fields.insert(name.clone()) { return Err(TapeError::Ltfs(format!("增量字段重复: {name}"))); }
+            if name == "deleted" && !trimmed.is_empty() { return Err(TapeError::Ltfs("deleted 必须为空元素".into())); }
+        }
         // location 字段
-        if self.cur_location.is_some() && (parent == "location" || parent == "previousgenerationlocation") {
+        if self.cur_location.is_some() && (parent == "location" || parent == "previousgenerationlocation" || parent == "previousincrementallocation") {
             if let Some(loc) = self.cur_location.as_mut() {
                 match name.as_str() {
                     "partition" => loc.partition = trimmed.chars().next().unwrap_or('b'),
@@ -493,10 +596,12 @@ impl IndexParser {
                 }
             }
         }
-        if name == "location" || name == "previousgenerationlocation" {
+        if name == "location" || name == "previousgenerationlocation" || name == "previousincrementallocation" {
             if let (Some(loc), Some(tag)) = (self.cur_location.take(), self.cur_location_tag.take()) {
                 if tag == "location" {
                     self.self_location = Some(loc);
+                } else if tag == "previousincrementallocation" {
+                    self.previous_incremental_location = Some(loc);
                 } else {
                     self.previous_location = Some(loc);
                 }
@@ -550,9 +655,10 @@ impl IndexParser {
         if parent == "file" {
             if let Some(file) = self.file_stack.last_mut() {
                 match name.as_str() {
-                    "name" => file.name = trimmed.to_string(),
+                    "name" => file.name = text.clone(),
                     "length" => file.length = trimmed.parse().unwrap_or(0),
                     "symlink" => file.symlink = Some(text.clone()),
+                    "openforwrite" => file.open_for_write = Some(matches!(trimmed, "true" | "1")),
                     _ => apply_meta(&mut file.meta, &name, trimmed),
                 }
             }
@@ -562,16 +668,17 @@ impl IndexParser {
         if parent == "directory" {
             if let Some(dir) = self.dir_stack.last_mut() {
                 match name.as_str() {
-                    "name" => dir.name = trimmed.to_string(),
+                    "name" => dir.name = text.clone(),
                     _ => apply_meta(&mut dir.meta, &name, trimmed),
                 }
             }
         }
 
         // 顶层 ltfsindex 字段
-        if parent == "ltfsindex" {
+        if parent == "ltfsindex" || parent == "ltfsincrementalindex" {
             match name.as_str() {
                 "creator" => self.creator = trimmed.to_string(),
+                "comment" => self.comment = Some(text.clone()),
                 "volumeuuid" => self.volume_uuid = Uuid::parse_str(trimmed).ok(),
                 "generationnumber" => self.generation = trimmed.parse().unwrap_or(0),
                 "updatetime" => self.update_time = trimmed.to_string(),
@@ -607,6 +714,14 @@ impl IndexParser {
     }
 
     fn finish(mut self) -> Result<LtfsIndex> {
+        if self.incremental && (!self.path.is_empty() || self.self_location.is_none()) {
+            return Err(TapeError::Ltfs("增量 XML 截断或缺少 location".into()));
+        }
+        if self.incremental {
+            for key in ["creator", "volumeuuid", "generationnumber", "updatetime", "location", "previousgenerationlocation", "highestfileuid", "directory"] {
+                if !self.header_fields.contains(key) { return Err(TapeError::Ltfs(format!("增量缺少 {key}"))); }
+            }
+        }
         let volume_uuid = self
             .volume_uuid
             .ok_or_else(|| TapeError::Ltfs("index 缺少 volumeuuid".into()))?;
@@ -618,6 +733,10 @@ impl IndexParser {
             .pop()
             .ok_or_else(|| TapeError::Ltfs("index 缺少 root directory".into()))?;
         Ok(LtfsIndex {
+            incremental: self.incremental,
+            materialized: false,
+            previous_incremental_location: self.previous_incremental_location,
+            comment: self.comment,
             version: if self.version.is_empty() { LTFS_VERSION.into() } else { self.version },
             creator: self.creator,
             volume_uuid,
@@ -743,6 +862,20 @@ mod tests {
 </contents></directory>
 </contents></directory>
 </ltfsindex>"#;
+
+    #[test]
+    fn empty_base64_xattr_uses_ibm_compatible_empty_element() {
+        let mut idx = LtfsIndex::parse(IBM_STYLE.as_bytes()).unwrap();
+        idx.root.xattrs = vec![Xattr {
+            key: "empty".into(),
+            value: String::new(),
+            base64: true,
+        }];
+        let xml = idx.to_xml().unwrap();
+        assert!(String::from_utf8_lossy(&xml).contains("<value type=\"base64\"/>"));
+        let parsed = LtfsIndex::parse(&xml).unwrap();
+        assert_eq!(parsed.root.xattrs, idx.root.xattrs);
+    }
 
     #[test]
     fn ibm_style_index_roundtrips_xattrs_symlink_and_lockstate() {

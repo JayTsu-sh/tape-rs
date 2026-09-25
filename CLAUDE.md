@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Current handoff (2026-09-25)
+
+Before continuing LTFS interoperability, FUSE, reclaim, or Holo/LE work, read [`docs/CLAUDE-HANDOFF.md`](docs/CLAUDE-HANDOFF.md) for the current branch, deployed versions, isolated media state, latest verification, unresolved findings, and next safe step. Detailed evidence is indexed in `.scratch/ltfs-ha/handoff-to-codex.md` and its linked reports.
+
 ## Project Overview
 
 CLI tool that controls an IBM TS4300 (labelled `IBM 3573-TL`) tape library by sending raw SCSI CDBs through the Linux `SG_IO` ioctl — **not** via LTFS mount. The target hardware is attached to a remote dev VM `10.128.54.118` (via an Emulex LPe16002B FC HBA); on that box the changer is `/dev/sg2`, the LTO-8 drives are `/dev/sg1` (ULT3580-TD8) and `/dev/sg3` (ULT3580-HH8).
@@ -12,24 +16,12 @@ CLI tool that controls an IBM TS4300 (labelled `IBM 3573-TL`) tape library by se
 
 ## Remote dev workflow
 
-There is no git remote configured for this project; code is shipped via scp. The canonical loop is: **edit locally → scp to `root@10.128.54.118:/root/jay/tape-rs/` → `cargo build --release` there → exercise against real hardware**. Key auth is already set up; no password needed.
+The active development branch is `ltfs-recovery-ibm-interop`, with GitHub remote `origin` configured. Commit related source, tests, and handoff docs on this branch and push it when requested. Holo/LE test deployment is separate from GitHub: first read the current handoff and the hardware safety rules below, build for the lab hosts, and deploy only to the isolated test cluster unless the task explicitly asks to change the formal cluster. The physical TS4300 is unavailable; lab hardware validation uses Holo VTL.
 
-```bash
-# push a single file
-scp src/scsi/device.rs root@10.128.54.118:/root/jay/tape-rs/src/scsi/
-
-# push whole tree (skip target/)
-scp -r Cargo.toml src root@10.128.54.118:/root/jay/tape-rs/
-
-# build + smoke test
-ssh root@10.128.54.118 'cd /root/jay/tape-rs && source ~/.cargo/env && cargo build --release \
-  && ./target/release/tape-rs inquiry /dev/sg2 \
-  && ./target/release/tape-rs inventory --device /dev/sg2'
-```
+The `10.128.54.118` SCP setup is historical, not the active Holo workflow. Use the current handoff for lab host paths and isolated-cluster procedures.
 
 Set `RUST_LOG=debug` for the `execute()`-level CDB/sense traces.
 
-The repeatable generate → push → remote-compile → debug loop is captured as a project-scoped skill at `.claude/skills/tape-rs-remote-dev/SKILL.md`. Invoke it by name (`tape-rs-remote-dev`) whenever iterating on SCSI / SG_IO code.
 
 ## SCSI standards this project implements
 

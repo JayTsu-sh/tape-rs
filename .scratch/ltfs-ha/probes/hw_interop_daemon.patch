@@ -1,0 +1,22 @@
+--- src/bin/ltfsd.rs
++++ examples/hw_interop_daemon.rs
+@@ -225,6 +225,19 @@
+         });
+         http::serve(listen, ctx).expect("启动客户端接口");
+     }
++    if let Ok(uuid) = std::env::var("TAPE_RS_INTEROP_POOL_UUID") {
++        let tx = inbox_tx.clone();
++        let st = status.clone();
++        thread::spawn(move || {
++            thread::sleep(Duration::from_secs(5));
++            let (reply, rx) = channel();
++            tx.send(NodeInput::Admin { cmd: tape_rs::daemon::state::Command::PoolCreate {
++                uuid, name: "rc".into(), file_limit: 200_000,
++            }, reply }).unwrap();
++            eprintln!("INTEROP_POOL {:?}", rx.recv_timeout(Duration::from_secs(30)));
++            drop(st);
++        });
++    }
+     install_signal_handler(inbox_tx.clone());
+     if let Err(e) =
+         node::run_with(cfg, store, Box::new(net), Some(fetcher), Some(inbox_tx.clone()), inbox_rx, exec_tx, status)

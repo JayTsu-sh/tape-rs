@@ -1,0 +1,1 @@
+{"method": "POST", "path": "/xattrs?path=rc%2Fxattr-fault-20260925&name=user.set&flags=1", "mode": "response", "status": 201, "body": "{\"generation\":65,\"status\":\"committed\",\"task\":1}\n", "upstream": "10.131.9.74"}

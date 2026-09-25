@@ -24,6 +24,8 @@ pub enum ClientError {
     NotFound,
     /// 只创建（`put_new`）：路径已有已提交的当前版本。
     Exists(String),
+    /// 请求可能已执行，但没有拿到持久化确认；不得自动重发删除。
+    Indeterminate(String),
     Io(std::io::Error),
 }
 
@@ -34,6 +36,7 @@ impl std::fmt::Display for ClientError {
             ClientError::Rejected { status, body } => write!(f, "服务端拒绝 ({}): {}", status, body),
             ClientError::NotFound => write!(f, "不存在"),
             ClientError::Exists(p) => write!(f, "路径已存在: {}", p),
+            ClientError::Indeterminate(s) => write!(f, "结果未定，请核对后再操作: {}", s),
             ClientError::Io(e) => write!(f, "I/O: {}", e),
         }
     }
@@ -60,6 +63,10 @@ pub struct FileStat {
     pub barcode: String,
     /// 服务端写带时算出的内容 sha256（十六进制小写）
     pub sha256: String,
+    /// 文件的内容版本（轮次、序号），不是当前回答查询的执行轮次。
+    pub version: (u64, u64),
+    /// 索引 modify_time/xattrs；旧服务端或旧缓存没有该字段时为 null。
+    pub metadata: Value,
 }
 
 /// 路径的状态（`stat_path`）。`state` 为 `committed`、`uploading` 或 `staged`。
@@ -90,6 +97,8 @@ fn file_stat(j: &Value) -> FileStat {
         round: j["round"].as_u64().unwrap_or(0),
         barcode: j["barcode"].as_str().unwrap_or("").to_string(),
         sha256: j["sha256"].as_str().unwrap_or("").to_string(),
+        version: (j["version"][0].as_u64().unwrap_or(0), j["version"][1].as_u64().unwrap_or(0)),
+        metadata: j.get("metadata").cloned().unwrap_or(Value::Null),
     }
 }
 
@@ -361,9 +370,9 @@ impl Client {
                         if self.leader.as_deref() == Some(addr.as_str()) {
                             self.leader = None;
                         }
-                        // 带内容的请求一旦可能已到达服务端，就可能已被执行：不能换个节点悄悄重发，
-                        // 交给调用方按"结果未定"处理
-                        if sent && body.is_some() {
+                        // 有副作用的请求（包括无内容的 DELETE）一旦可能已到达服务端，
+                        // 不能换个节点悄悄重发，交给调用方按“结果未定”处理。
+                        if sent && (body.is_some() || !matches!(method, "GET" | "HEAD")) {
                             return Err(ClientError::Io(e));
                         }
                         // 内容可能已经写了一部分进 sink：不能在别的节点上接着写，交给调用方从头再来
@@ -447,6 +456,8 @@ impl Client {
                 Ok(r) if r.status == 202 && !wait => {
                     return Ok(PutOutcome { generation: 0, attempts, resolved_by_query: false, committed: false });
                 }
+                // 等待窗口结束仍在暂存：继续查询，不能当拒绝或立即重传。
+                Ok(r) if r.status == 202 => true,
                 // 服务端明确说没落带（仅暂存时执行者更换）：可以直接重传
                 Ok(r) if r.status == 500 && r.json()["status"] == "failed" => false,
                 Ok(r) if r.status == 500 => true,
@@ -476,6 +487,114 @@ impl Client {
             if Instant::now() >= deadline {
                 return Err(ClientError::NoLeader("上传在期限内没有得到确认".into()));
             }
+        }
+    }
+
+    /// 删除并等待墓碑落带。仅明确的提交响应表示成功；响应丢失或等待超时返回
+    /// `Indeterminate`，不按路径重发，避免删掉他人随后创建的新版本。
+    pub fn delete(&mut self, path: &str) -> Result<()> {
+        let route = format!("/files/{}?wait=1", path.trim_start_matches('/'));
+        let r = self.to_leader("DELETE", &route, None).map_err(|e| match e {
+            ClientError::Io(e) => ClientError::Indeterminate(format!("删除 {}: {}", path, e)),
+            other => other,
+        })?;
+        match r.status {
+            200 if r.json()["status"] == "committed" => Ok(()),
+            404 => Err(ClientError::NotFound),
+            202 | 504 => Err(ClientError::Indeterminate(format!("删除 {} 尚未取得落带确认: {}", path, String::from_utf8_lossy(&r.body)))),
+            500 if r.json()["status"] == "indeterminate" => {
+                Err(ClientError::Indeterminate(format!("删除 {}: {}", path, String::from_utf8_lossy(&r.body))))
+            }
+            s => Err(ClientError::Rejected { status: s, body: String::from_utf8_lossy(&r.body).into_owned() }),
+        }
+    }
+
+    /// 创建原生 LTFS 目录；成功表示索引已提交。父目录必须存在。
+    /// 原子同卷改名。响应丢失返回 Indeterminate，不重放。
+    pub fn rename(&mut self, from: &str, to: &str, no_replace: bool) -> Result<()> {
+        let route = format!(
+            "/rename?from={}&to={}&noreplace={}",
+            encode_query(from),
+            encode_query(to),
+            u8::from(no_replace)
+        );
+        self.namespace_change("POST", &route, from, None)
+    }
+
+    /// 设置用户扩展属性；flags为0、CREATE(1)或REPLACE(2)。成功表示索引提交。
+    pub fn setxattr(&mut self, path: &str, name: &str, value: &[u8], flags: u32) -> Result<()> {
+        let route = format!(
+            "/xattrs?path={}&name={}&flags={}",
+            encode_query(path),
+            encode_query(name),
+            flags
+        );
+        self.namespace_change("POST", &route, path, Some(value))
+    }
+
+    /// 删除用户扩展属性，响应丢失返回Indeterminate而不重放。
+    pub fn removexattr(&mut self, path: &str, name: &str) -> Result<()> {
+        let route = format!(
+            "/xattrs?path={}&name={}",
+            encode_query(path),
+            encode_query(name)
+        );
+        self.namespace_change("DELETE", &route, path, None)
+    }
+
+    /// 创建符号链接，目标原样保留。成功表示索引提交；响应丢失不重放。
+    pub fn symlink(&mut self, target: &str, path: &str) -> Result<()> {
+        let route = format!(
+            "/symlinks?path={}&target={}",
+            encode_query(path),
+            encode_query(target)
+        );
+        self.namespace_change("POST", &route, path, None)
+    }
+
+    pub fn mkdir(&mut self, path: &str) -> Result<()> {
+        self.directory_change("POST", path)
+    }
+
+    /// 删除空目录。响应丢失时不自动重发，避免删除后来同名创建的目录。
+    pub fn rmdir(&mut self, path: &str) -> Result<()> {
+        self.directory_change("DELETE", path)
+    }
+
+    fn directory_change(&mut self, method: &str, path: &str) -> Result<()> {
+        let route = format!("/directories/{}", path.trim_start_matches('/'));
+        self.namespace_change(method, &route, path, None)
+    }
+
+    fn namespace_change(&mut self, method: &str, route: &str, path: &str, body: Option<&[u8]>) -> Result<()> {
+        let deadline = Instant::now() + self.retry_for;
+        loop {
+            let r = self.to_leader(method, route, body).map_err(|e| match e {
+                ClientError::Io(e) => ClientError::Indeterminate(format!("目录操作 {}: {}", path, e)),
+                other => other,
+            })?;
+            if r.status == 500 && r.json()["status"] == "failed" && Instant::now() < deadline {
+                // 明确未落带，重试不会删除或覆盖已提交的新对象。
+                self.leader = None;
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            return match r.status {
+                201 if r.json()["status"] == "committed" => Ok(()),
+                404 => Err(ClientError::NotFound),
+                412 => Err(ClientError::Exists(path.into())),
+                202 | 504 => Err(ClientError::Indeterminate(format!(
+                    "目录 {} 尚未取得落带确认",
+                    path
+                ))),
+                500 if r.json()["status"] == "indeterminate" => Err(ClientError::Indeterminate(
+                    format!("目录 {} 提交结果未定", path),
+                )),
+                status => Err(ClientError::Rejected {
+                    status,
+                    body: String::from_utf8_lossy(&r.body).into_owned(),
+                }),
+            };
         }
     }
 
@@ -670,4 +789,184 @@ fn encode_path(path: &str) -> String {
         out.push_str(q);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn waiting_upload_queries_after_staged_response() {
+        use sha2::{Digest, Sha256};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = Client::new(vec![listener.local_addr().unwrap().to_string()]);
+        let server = std::thread::spawn(move || {
+            for (method, response) in [
+                ("PUT", serde_json::json!({"status": "staged", "task": 1})),
+                ("GET", serde_json::json!({"state": "committed", "length": 3, "generation": 2, "sha256": format!("{:x}", Sha256::digest(b"abc"))})),
+            ] {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.starts_with(method), "不得再次发送 PUT: {line}");
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" { break; }
+                }
+                if method == "PUT" {
+                    let mut body = [0; 3];
+                    reader.read_exact(&mut body).unwrap();
+                    assert_eq!(&body, b"abc");
+                }
+                let body = response.to_string();
+                write!(reader.get_mut(), "HTTP/1.1 {} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", if method == "PUT" { 202 } else { 200 }, body.len(), body).unwrap();
+            }
+        });
+        let result = client.put("/a", b"abc").unwrap();
+        assert!(result.committed && result.resolved_by_query);
+        assert_eq!(result.attempts, 1);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn delete_with_lost_response_is_not_replayed() {
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let second = TcpListener::bind("127.0.0.1:0").unwrap();
+        second.set_nonblocking(true).unwrap();
+        let mut client = Client::new(vec![first.local_addr().unwrap().to_string(), second.local_addr().unwrap().to_string()]);
+        client.retry_for = Duration::ZERO;
+        let server = std::thread::spawn(move || {
+            let (stream, _) = first.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.starts_with("DELETE /files/a?wait=1 "));
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" { break; }
+            }
+            // 模拟已执行删除，但提交响应丢失。
+        });
+        assert!(matches!(client.delete("/a"), Err(ClientError::Indeterminate(_))));
+        server.join().unwrap();
+        assert_eq!(second.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    }
+    #[test]
+    fn metadata_mutations_with_lost_response_are_not_replayed() {
+        for method in ["POST", "DELETE", "RENAME", "SETXATTR", "REMOVEXATTR", "SYMLINK"] {
+            let first = TcpListener::bind("127.0.0.1:0").unwrap();
+            let second = TcpListener::bind("127.0.0.1:0").unwrap();
+            second.set_nonblocking(true).unwrap();
+            let mut client = Client::new([
+                first.local_addr().unwrap().to_string(),
+                second.local_addr().unwrap().to_string(),
+            ]);
+            client.retry_for = Duration::ZERO;
+            let server = std::thread::spawn(move || {
+                let (stream, _) = first.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if method == "SYMLINK" {
+                    assert!(line.starts_with("POST /symlinks?"));
+                } else if method == "RENAME" {
+                    assert!(line.starts_with("POST /rename?"));
+                } else if method == "SETXATTR" {
+                    assert!(line.starts_with("POST /xattrs?"));
+                } else if method == "REMOVEXATTR" {
+                    assert!(line.starts_with("DELETE /xattrs?"));
+                } else {
+                    assert!(line.starts_with(&format!("{} /directories/a ", method)));
+                }
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+            });
+            let result = if method == "SYMLINK" {
+                client.symlink("target", "/a")
+            } else if method == "RENAME" {
+                client.rename("/a", "/b", false)
+            } else if method == "SETXATTR" {
+                client.setxattr("/a", "user.test", b"", 0)
+            } else if method == "REMOVEXATTR" {
+                client.removexattr("/a", "user.test")
+            } else if method == "POST" {
+                client.mkdir("/a")
+            } else {
+                client.rmdir("/a")
+            };
+            assert!(matches!(result, Err(ClientError::Indeterminate(_))));
+            server.join().unwrap();
+            assert_eq!(
+                second.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
+
+    #[test]
+    fn read_failure_does_not_replay_partial_output_or_generic_server_errors() {
+        for partial in [true, false] {
+            let first = TcpListener::bind("127.0.0.1:0").unwrap();
+            let second = TcpListener::bind("127.0.0.1:0").unwrap();
+            second.set_nonblocking(true).unwrap();
+            let mut client = Client::new([
+                first.local_addr().unwrap().to_string(),
+                second.local_addr().unwrap().to_string(),
+            ]);
+            client.retry_for = Duration::ZERO;
+            let server = std::thread::spawn(move || {
+                let (stream, _) = first.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                if partial {
+                    reader
+                        .get_mut()
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nabc")
+                        .unwrap();
+                } else {
+                    let body = br#"{"error":"read_failed","detail":"medium error"}"#;
+                    write!(
+                        reader.get_mut(),
+                        "HTTP/1.1 500 Error\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    )
+                    .unwrap();
+                    reader.get_mut().write_all(body).unwrap();
+                }
+            });
+            let mut out = Vec::new();
+            let result = client.get_to("/file", &mut out);
+            if partial {
+                assert!(matches!(result, Err(ClientError::Io(_))));
+                assert_eq!(out, b"abc");
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ClientError::Rejected { status: 500, .. })
+                ));
+                assert!(out.is_empty());
+            }
+            server.join().unwrap();
+            assert_eq!(
+                second.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
+
 }

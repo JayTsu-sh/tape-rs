@@ -1,0 +1,44 @@
+{
+  "barcode": "RT2502L8",
+  "committed": true,
+  "generation": 76,
+  "length": 26,
+  "metadata": {
+    "modify_time": "2026-09-24T23:36:49.141803429Z",
+    "xattrs": [
+      {
+        "base64": false,
+        "key": "ltfs.hash.sha256sum",
+        "value": "02e288f0667a8246708bafd075353baf8e1ce2dc556cbf3d2449135a933a99a5"
+      },
+      {
+        "base64": true,
+        "key": "cut",
+        "value": "dW5jb21taXR0ZWQ="
+      },
+      {
+        "base64": true,
+        "key": "powercut.binary",
+        "value": "AP9wb3dlcmN1dAA="
+      },
+      {
+        "base64": true,
+        "key": "powercut.empty",
+        "value": ""
+      },
+      {
+        "base64": false,
+        "key": "tapers.version",
+        "value": "220.3"
+      }
+    ]
+  },
+  "path": "/rc/xattr-fault-20260925",
+  "round": 231,
+  "sha256": "02e288f0667a8246708bafd075353baf8e1ce2dc556cbf3d2449135a933a99a5",
+  "state": "committed",
+  "version": [
+    220,
+    3
+  ]
+}

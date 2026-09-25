@@ -1,0 +1,2 @@
+55093 bash -c pgrep -af "tape-fuse|ha-fault-proxy" || true; mountpoint /home/rocky/tape-rs-rename-20260924/mnt
+/home/rocky/tape-rs-rename-20260924/mnt is not a mountpoint

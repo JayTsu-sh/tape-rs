@@ -1,0 +1,4 @@
+{"method": "POST", "path": "/rename?from=rc%2Frename-interop-20260924%2Flost-source&to=rc%2Frename-interop-20260924%2Flost-target&noreplace=0", "mode": "response", "status": 201, "body": "{\"generation\":44,\"status\":\"committed\",\"task\":20}\n", "upstream": "10.131.9.72"}READY 7591 10.131.9.72
+REQUEST GET /stat/rc/keep.bin target False
+REQUEST POST /rename?from=rc%2Frename-interop-20260924%2Flost-source&to=rc%2Frename-interop-20260924%2Flost-target&noreplace=0 target True
+EVENT {"method": "POST", "path": "/rename?from=rc%2Frename-interop-20260924%2Flost-source&to=rc%2Frename-interop-20260924%2Flost-target&noreplace=0", "mode": "response", "status": 201, "body": "{\"generation\":44,\"status\":\"committed\",\"task\":20}\n", "upstream": "10.131.9.72"}

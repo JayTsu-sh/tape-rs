@@ -1,0 +1,10 @@
+keep.bin bytes 65536 sha256 7daca2095d0438260fa849183dfc67faa459fdf4936e1bc91eec6b281b27e4c2 mtime 1790200000123456789
+XATTR keep.bin {'user.roundtrip.binary': '00ff4c452d726f756e6474726970'}
+edit.bin bytes 70012 sha256 3c2f1b0ed0090d476885163291f3fddecd4ac4d3d73453175c960e160a7015b2 mtime 1790254286152524592
+XATTR edit.bin {}
+new.bin bytes 26 sha256 75ad67ecf8c747a39fa87f1c2449a2cd06c2af93248e40b02f56805491560096 mtime 1790254288591221779
+PASS LE content/keep mtime/empty directory/symlink; index 2.5.0
+Traceback (most recent call last):
+  File "/home/rocky/tape-rs-ltfs25-20260924/roundtrip-le.py", line 33, in <module>
+    assert not missing, 'LE confirms xattr lost: '+repr(missing)
+AssertionError: LE confirms xattr lost: ['edit.bin']

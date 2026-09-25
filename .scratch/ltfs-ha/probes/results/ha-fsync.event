@@ -1,0 +1,1 @@
+{"method": "PUT", "path": "/files/rc/edit.bin?wait=1", "mode": "response", "status": 201, "body": "{\"generation\":10,\"status\":\"committed\",\"task\":2}\n", "upstream": "10.131.9.71"}

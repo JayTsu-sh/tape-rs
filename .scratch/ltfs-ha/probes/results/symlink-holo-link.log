@@ -1,0 +1,1 @@
+PASS lstat/readlink/readdir/mmap rc/link -> keep.bin

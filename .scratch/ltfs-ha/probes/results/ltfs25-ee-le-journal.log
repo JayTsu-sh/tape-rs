@@ -1,0 +1,6 @@
+Sep 24 12:23:17 ee1.ee.lab ltfs[1164206]: 11d294 LTFS17096W The index read from the tape uses a newer version of the LTFS format than the one supported by this software. Some functionality might be unavailable. If this tape is modified, the index downgrades format version to 2.4.0 from 2.5.0.
+Sep 24 12:23:17 ee1.ee.lab ltfs[1164206]: 11d294 LTFS11031I Volume mounted successfully. TS1001 : Gen = 37 / (a, 5) -> (b, 234) / IBMlisa41D6C.
+Sep 24 12:24:13 ee1.ee.lab ltfs[1164206]: 11d5ed LTFS17096W The index read from the tape uses a newer version of the LTFS format than the one supported by this software. Some functionality might be unavailable. If this tape is modified, the index downgrades format version to 2.4.0 from 2.5.0.
+Sep 24 12:24:13 ee1.ee.lab ltfs[1164206]: 11d5ed LTFS11031I Volume mounted successfully. TS1001 : Gen = 37 / (a, 5) -> (b, 234) / IBMlisa41D6C.
+Sep 24 12:25:23 ee1.ee.lab ltfs[1164206]: 11db79 LTFS17265I Skip writing the index because of the volume is not dirty and current self pointer points IP.
+Sep 24 12:25:23 ee1.ee.lab ltfs[1164206]: 11db79 LTFS11749I Unmounted TS1001L8 from IBMlisa41D6C.

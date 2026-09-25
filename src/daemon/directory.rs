@@ -16,6 +16,14 @@ pub struct Directory {
     applied: u64,
 }
 
+fn namespace_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(String, bool)> {
+    let metadata: serde_json::Value =
+        serde_json::from_str(&r.get::<_, String>(1)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+    Ok((r.get(0)?, super::files::is_directory(&metadata)))
+}
+
 fn db_err(e: rusqlite::Error) -> TapeError {
     TapeError::Ltfs(format!("目录库: {}", e))
 }
@@ -29,6 +37,8 @@ pub struct FileRow {
     pub sha256: String,
     /// 这一行是墓碑：路径已被删除，`barcode` 是墓碑所在的带。`stat`/`list` 不返回这种行。
     pub deleted: bool,
+    pub version: (u64, u64),
+    pub metadata: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +88,13 @@ impl Directory {
         ] {
             for c in cols {
                 let _ = db.execute(&format!("ALTER TABLE {} ADD COLUMN {} INTEGER NOT NULL DEFAULT 0", t, c), []);
+            }
+        }
+        for table in ["files", "staging"] {
+            let mut stmt = db.prepare(&format!("PRAGMA table_info({})", table)).map_err(db_err)?;
+            let cols = stmt.query_map([], |r| r.get::<_, String>(1)).map_err(db_err)?.collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)?;
+            if !cols.iter().any(|c| c == "metadata") {
+                db.execute(&format!("ALTER TABLE {} ADD COLUMN metadata TEXT NOT NULL DEFAULT 'null'", table), []).map_err(db_err)?;
             }
         }
         let applied: Option<i64> =
@@ -177,20 +194,20 @@ impl Directory {
             (Command::CatalogPart { barcode, generation, part, files }, _) => {
                 let mut ins = tx
                     .prepare(
-                        "INSERT INTO staging (barcode, generation, part, path, length, sha256, ver_round, ver_seq, deleted)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        "INSERT INTO staging (barcode, generation, part, path, length, sha256, ver_round, ver_seq, deleted, metadata)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     )
                     .map_err(db_err)?;
                 for f in files {
                     ins.execute(params![
                         barcode, *generation as i64, *part as i64, f.path, f.length as i64, f.sha256,
-                        f.version.0 as i64, f.version.1 as i64, f.deleted as i64
+                        f.version.0 as i64, f.version.1 as i64, f.deleted as i64, f.metadata.to_string()
                     ])
                     .map_err(db_err)?;
                 }
                 if files.is_empty() {
                     // 空片也要留痕，片数才对得上
-                    ins.execute(params![barcode, *generation as i64, *part as i64, "", -1i64, "", 0i64, 0i64, 0i64]).map_err(db_err)?;
+                    ins.execute(params![barcode, *generation as i64, *part as i64, "", -1i64, "", 0i64, 0i64, 0i64, "null"]).map_err(db_err)?;
                 }
             }
             (Command::TapeCommitted { barcode, volume_uuid, generation, files, bytes_used, bytes_written, parts, full }, Applied::CatalogCommitted) => {
@@ -215,14 +232,14 @@ impl Directory {
                     // 墓碑也是一行（`deleted = 1`），与文件按同一套版本比较：删除之后再装载一盘带着
                     // 旧副本的带做对账，旧副本的版本低，抢不回路径；重新上传得到更大的版本，路径复活。
                     tx.execute(
-                        "INSERT INTO files (pool_uuid, path, barcode, generation, length, sha256, ver_round, ver_seq, deleted)
-                         SELECT t.pool_uuid, s.path, s.barcode, s.generation, s.length, s.sha256, s.ver_round, s.ver_seq, s.deleted
+                        "INSERT INTO files (pool_uuid, path, barcode, generation, length, sha256, ver_round, ver_seq, deleted, metadata)
+                         SELECT t.pool_uuid, s.path, s.barcode, s.generation, s.length, s.sha256, s.ver_round, s.ver_seq, s.deleted, s.metadata
                          FROM staging s JOIN tapes t ON t.barcode = s.barcode
                          WHERE s.barcode = ?1 AND s.generation = ?2 AND s.length >= 0
                          ON CONFLICT(pool_uuid, path) DO UPDATE SET
                              barcode = excluded.barcode, generation = excluded.generation, length = excluded.length,
                              sha256 = excluded.sha256, ver_round = excluded.ver_round, ver_seq = excluded.ver_seq,
-                             deleted = excluded.deleted
+                             deleted = excluded.deleted, metadata = excluded.metadata
                          WHERE excluded.barcode = files.barcode
                             OR excluded.ver_round > files.ver_round
                             OR (excluded.ver_round = files.ver_round AND excluded.ver_seq > files.ver_seq)",
@@ -289,7 +306,7 @@ impl Directory {
     }
 
     /// 目录认为还活在这盘带上的记录：条数与字节数。带上已用字节减去它就是可回收空间
-    /// （被重写、被搬迁、被删除的旧副本，以及收尾放弃的块）。条数里含墓碑（零字节）：
+    /// （被重写、被搬迁、被删除的旧副本，以及收尾放弃的块）。条数包含目录和墓碑（零字节）：
     /// 墓碑在带上也是活的，回收要把它搬走，所以格式化前的闸门一同算它。
     pub fn live_on(&self, barcode: &str) -> Result<(u64, u64)> {
         let (n, b): (i64, i64) = self
@@ -320,7 +337,7 @@ impl Directory {
     pub fn lookup(&self, pool_uuid: &str, path: &str) -> Result<Option<FileRow>> {
         self.db
             .query_row(
-                "SELECT barcode, generation, length, sha256, deleted FROM files WHERE pool_uuid = ?1 AND path = ?2",
+                "SELECT barcode, generation, length, sha256, deleted, ver_round, ver_seq, metadata FROM files WHERE pool_uuid = ?1 AND path = ?2",
                 params![pool_uuid, path],
                 |r| {
                     Ok(FileRow {
@@ -329,6 +346,8 @@ impl Directory {
                         length: r.get::<_, i64>(2)? as u64,
                         sha256: r.get(3)?,
                         deleted: r.get::<_, i64>(4)? != 0,
+                        version: (r.get::<_, i64>(5)? as u64, r.get::<_, i64>(6)? as u64),
+                        metadata: serde_json::from_str(&r.get::<_, String>(7)?).map_err(|e| rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e)))?,
                     })
                 },
             )
@@ -336,11 +355,66 @@ impl Directory {
             .map_err(db_err)
     }
 
-    pub fn list(&self, pool_uuid: &str) -> Result<Vec<(String, u64)>> {
-        let mut stmt =
-            self.db.prepare("SELECT path, length FROM files WHERE pool_uuid = ?1 AND deleted = 0 ORDER BY path").map_err(db_err)?;
-        let rows = stmt.query_map(params![pool_uuid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))).map_err(db_err)?;
+    /// 文件准入需要的同名、祖先和后代记录；范围查询利用 (pool_uuid, path) 索引。
+    /// 用二进制范围而不是 LIKE，避免路径里的 % / _ 被当作通配符。
+    pub(crate) fn namespace_nodes(
+        &self,
+        pool_uuid: &str,
+        path: &str,
+    ) -> Result<std::collections::BTreeMap<String, bool>> {
+        let mut stmt = self.db.prepare(
+            "SELECT path, metadata FROM files WHERE pool_uuid = ?1 AND path >= ?2 AND path < ?3 AND deleted = 0",
+        ).map_err(db_err)?;
+        let rows = stmt
+            .query_map(
+                params![pool_uuid, format!("{}/", path), format!("{}0", path)],
+                namespace_row,
+            )
+            .map_err(db_err)?;
+        let mut out = rows
+            .collect::<std::result::Result<std::collections::BTreeMap<_, _>, _>>()
+            .map_err(db_err)?;
+        let mut stmt = self
+            .db
+            .prepare(
+                "SELECT path, metadata FROM files WHERE pool_uuid = ?1 AND path = ?2 AND deleted = 0",
+            )
+            .map_err(db_err)?;
+        let mut ancestor = path;
+        while !ancestor.is_empty() {
+            if let Some(p) = stmt
+                .query_row(params![pool_uuid, ancestor], namespace_row)
+                .optional()
+                .map_err(db_err)?
+            {
+                out.insert(p.0, p.1);
+            }
+            ancestor = ancestor
+                .rsplit_once('/')
+                .map(|(parent, _)| parent)
+                .unwrap_or("");
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn list_nodes(&self, pool_uuid: &str) -> Result<Vec<(String, u64, bool)>> {
+        let mut stmt = self.db.prepare("SELECT path, metadata, length FROM files WHERE pool_uuid = ?1 AND deleted = 0 ORDER BY path").map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![pool_uuid], |r| {
+                let (p, d) = namespace_row(r)?;
+                Ok((p, r.get::<_, i64>(2)? as u64, d))
+            })
+            .map_err(db_err)?;
         rows.collect::<std::result::Result<_, _>>().map_err(db_err)
+    }
+
+    pub fn list(&self, pool_uuid: &str) -> Result<Vec<(String, u64)>> {
+        Ok(self
+            .list_nodes(pool_uuid)?
+            .into_iter()
+            .filter(|(_, _, d)| !d)
+            .map(|(p, n, _)| (p, n))
+            .collect())
     }
 
     /// 库里的内容是否与内存里的控制状态一致（自检用）。
@@ -374,6 +448,23 @@ mod tests {
             Command::Takeover { node: 1, term: 1 },
             Command::TapeUnassign { barcode: "T1".into() },
         ]
+    }
+
+    #[test]
+    fn older_directory_migrates_without_losing_versions() {
+        let path = std::env::temp_dir().join(format!("tape-old-meta-{}.db", uuid::Uuid::new_v4()));
+        let d = Directory::open(&path).unwrap();
+        d.db.execute_batch("ALTER TABLE files DROP COLUMN metadata; ALTER TABLE staging DROP COLUMN metadata;
+            INSERT INTO files(pool_uuid,path,barcode,generation,length,sha256,ver_round,ver_seq,deleted)
+            VALUES('p','/a','T1',2,3,'',7,12,0);").unwrap();
+        drop(d);
+        let d = Directory::open(&path).unwrap();
+        let row = d.stat("p", "/a").unwrap().unwrap();
+        assert_eq!(row.version, (7, 12));
+        assert!(row.metadata.is_null());
+        assert_eq!(row.length, 3);
+        drop(d);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -425,7 +516,7 @@ mod tests {
             d.apply(idx, &c, &out).unwrap();
             out
         };
-        let rec = |p: &str, n: u64| FileRec { path: p.into(), length: n, sha256: format!("{:064x}", n), version: (1, n), deleted: false };
+        let rec = |p: &str, n: u64| FileRec { metadata: serde_json::Value::Null, path: p.into(), length: n, sha256: format!("{:064x}", n), version: (1, n), deleted: false };
         run(&mut ctl, &mut d, Command::PoolCreate { uuid: "u".into(), name: "p".into(), file_limit: 10 });
         run(&mut ctl, &mut d, Command::TapeAssign { barcode: "T1".into(), pool: "p".into() });
         let commit = |g: u64, parts: u32, files: u64, full: bool| Command::TapeCommitted {
@@ -481,7 +572,7 @@ mod tests {
         }
         // 一整批：一片记录 + 一条摘要
         let mut batch = |ctl: &mut ControlState, d: &mut Directory, b: &str, g: u64, len: u64, ver: (u64, u64), full: bool| {
-            let f = FileRec { path: "/a".into(), length: len, sha256: String::new(), version: ver, deleted: false };
+            let f = FileRec { metadata: serde_json::Value::Null, path: "/a".into(), length: len, sha256: String::new(), version: ver, deleted: false };
             run(ctl, d, Command::CatalogPart { barcode: b.into(), generation: g, part: 0, files: vec![f] });
             run(ctl, d, Command::TapeCommitted {
                 barcode: b.into(), volume_uuid: "v".into(), generation: g, files: 1, bytes_used: len, bytes_written: len, parts: 1, full,
@@ -504,7 +595,7 @@ mod tests {
 
         // 反方向也要对：写 T2 的那一届没来得及把目录记进日志，目录还停在 T1；
         // 之后装载 T2 对账，新版本要能纠正过来（PN06 走的就是这条路）
-        let rec = |len: u64, ver: (u64, u64)| FileRec { path: "/b".into(), length: len, sha256: String::new(), version: ver, deleted: false };
+        let rec = |len: u64, ver: (u64, u64)| FileRec { metadata: serde_json::Value::Null, path: "/b".into(), length: len, sha256: String::new(), version: ver, deleted: false };
         run(&mut ctl, &mut d, Command::CatalogPart { barcode: "T1".into(), generation: 5, part: 0, files: vec![rec(10, (1, 2))] });
         run(&mut ctl, &mut d, Command::TapeCommitted {
             barcode: "T1".into(), volume_uuid: "v".into(), generation: 5, files: 1, bytes_used: 10, bytes_written: 10, parts: 1, full: true,
@@ -512,7 +603,7 @@ mod tests {
         assert_eq!(d.stat("u", "/b").unwrap().unwrap().barcode, "T1");
         run(&mut ctl, &mut d, Command::CatalogPart {
             barcode: "T2".into(), generation: 6, part: 0,
-            files: vec![FileRec { path: "/a".into(), length: 20, sha256: String::new(), version: (1, 5), deleted: false }, rec(30, (2, 9))],
+            files: vec![FileRec { metadata: serde_json::Value::Null, path: "/a".into(), length: 20, sha256: String::new(), version: (1, 5), deleted: false }, rec(30, (2, 9))],
         });
         run(&mut ctl, &mut d, Command::TapeCommitted {
             barcode: "T2".into(), volume_uuid: "v".into(), generation: 6, files: 2, bytes_used: 50, bytes_written: 50, parts: 1, full: true,
@@ -542,7 +633,7 @@ mod tests {
         for b in ["T1", "T2"] {
             run(&mut ctl, &mut d, Command::TapeAssign { barcode: b.into(), pool: "p".into() });
         }
-        let rec = |len: u64, ver: (u64, u64), deleted: bool| FileRec { path: "/a".into(), length: len, sha256: String::new(), version: ver, deleted };
+        let rec = |len: u64, ver: (u64, u64), deleted: bool| FileRec { metadata: serde_json::Value::Null, path: "/a".into(), length: len, sha256: String::new(), version: ver, deleted };
         let mut batch = |ctl: &mut ControlState, d: &mut Directory, b: &str, g: u64, files: Vec<FileRec>, full: bool| {
             let n = files.len() as u64;
             run(ctl, d, Command::CatalogPart { barcode: b.into(), generation: g, part: 0, files });

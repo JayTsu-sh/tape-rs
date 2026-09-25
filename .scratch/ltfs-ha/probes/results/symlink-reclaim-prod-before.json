@@ -1,0 +1,35 @@
+{
+  "71": {
+    "exe": "/home/rocky/tape-rs-symlink-create-prod-20260925/ltfsd",
+    "sha256": "45ca052da5867aafcf5e77f15ad7a3b728041ed79c08e0b392c25f87cada405d",
+    "rows": 42,
+    "catalog_sha256": "7d5660c28eb3023b91fc7f835ad41028c81530fe562bdfc1563437df065dbcd4"
+  },
+  "72": {
+    "exe": "/home/rocky/tape-rs-symlink-create-prod-20260925/ltfsd",
+    "sha256": "45ca052da5867aafcf5e77f15ad7a3b728041ed79c08e0b392c25f87cada405d",
+    "rows": 42,
+    "catalog_sha256": "7d5660c28eb3023b91fc7f835ad41028c81530fe562bdfc1563437df065dbcd4"
+  },
+  "74": {
+    "exe": "/home/rocky/tape-rs-symlink-create-prod-20260925/ltfsd",
+    "sha256": "45ca052da5867aafcf5e77f15ad7a3b728041ed79c08e0b392c25f87cada405d",
+    "rows": 42,
+    "catalog_sha256": "7d5660c28eb3023b91fc7f835ad41028c81530fe562bdfc1563437df065dbcd4"
+  },
+  "cluster": {
+    "drives": 2,
+    "executor": {
+      "fenced": true,
+      "node": 3,
+      "round": 327
+    },
+    "id": 3,
+    "last_reclaim": null,
+    "leader": 3,
+    "local": "\u8f6e\u6b21 327\uff1a\u670d\u52a1\u4e2d\u3002IBMtaper2287 (/dev/sg6) [TS1001L08]: gen=86 \u6587\u4ef6 36 \u4e2a \u5c3e\u90e8 Complete\uff1b\u53ef\u7528 24 MiB",
+    "role": "Leader",
+    "serving_round": 327,
+    "term": 39
+  }
+}

@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "/home/rocky/tape-rs-recovery-le-20260925/recovery-le.py", line 30, in <module>
+    assert hashlib.sha256((root / path.lstrip('/')).read_bytes()).hexdigest() == sha, path
+  File "/usr/lib64/python3.9/pathlib.py", line 1259, in read_bytes
+    with self.open(mode='rb') as f:
+  File "/usr/lib64/python3.9/pathlib.py", line 1252, in open
+    return io.open(self, mode, buffering, encoding, errors, newline,
+  File "/usr/lib64/python3.9/pathlib.py", line 1120, in _opener
+    return self._accessor.open(self, flags, mode)
+BlockingIOError: [Errno 11] Resource temporarily unavailable: '/home/rocky/tape-rs-recovery-le-20260925/mnt/rc/link'

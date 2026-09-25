@@ -1,0 +1,12 @@
+[2026-09-25T01:11:53Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=129
+[2026-09-25T01:11:53Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=125
+[2026-09-25T01:11:53Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=121
+[2026-09-25T01:11:53Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=118
+[2026-09-25T01:11:53Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=114
+[2026-09-25T01:11:53Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=110
+[2026-09-25T01:11:53Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=8
+[2026-09-25T01:11:53Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=5
+[2026-09-25T01:11:53Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=415
+[2026-09-25T01:11:53Z INFO  tape_rs::ltfs::volume] index gen=95 highest_uid=93 (dp_tail=Complete, ip_tail=Complete, writable=true)
+[2026-09-25T01:11:53Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=93
+[2026-09-25T01:11:53Z INFO  tape_rs::ltfs::volume] 读取 rc/f5.bin: 8388608 字节

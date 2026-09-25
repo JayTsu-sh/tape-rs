@@ -1,0 +1,23 @@
+库布局：1 机械手 · 2 驱动器 · 10 存储槽 · 2 I/E 口
+
+[2026-09-24T15:11:47Z WARN  tape_rs::scsi::transport] READ ATTRIBUTE: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 1 次）
+[2026-09-24T15:11:47Z WARN  tape_rs::scsi::transport] READ ATTRIBUTE: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 2 次）
+=== 驱动器 ===
+  驱动器   1 [载带]: TS1001L08  <- 存储槽 6   [serial IBMtaper2287, 设备 /dev/sg6]
+  驱动器   2 [空]: -   [serial IBMtaper3D5E, 设备 /dev/sg7]
+
+=== 存储槽 ===
+  存储槽   1 [载带]: TR8000L08
+  存储槽   2 [载带]: TR8001L08
+  存储槽   3 [载带]: TR8002L08
+  存储槽   4 [载带]: TR8003L08
+  存储槽   5 [载带]: TS1000L08
+  存储槽   6 [空]: -
+  存储槽   7 [载带]: RT2502L8
+  存储槽   8 [空]: -
+  存储槽   9 [空]: -
+  存储槽  10 [空]: -
+
+=== I/E 口 ===
+  I/E 口   1 [空]: -
+  I/E 口   2 [空]: -

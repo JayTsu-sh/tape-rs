@@ -1052,6 +1052,42 @@ fn file_contract_create_only_in_flight_state_range_and_directories() {
 
 // ---------- 跨磁带读取（P4）----------
 
+/// FC06/FC07：删除必须落带才确认；在途路径拒绝，换届后墓碑仍生效，重新上传可以复活。
+#[test]
+fn file_deletion_is_committed_and_survives_takeover() {
+    use tape_rs::client::ClientError;
+    let c = Cluster::start_with("f2-delete", false);
+    let (leader, round) = c.wait_serving(None, 0);
+    let svc = &c.services[&leader];
+    c.wait("文件服务开放", || svc.serving_round() == Some(round));
+    let endpoints = c.start_http();
+    let mut cl = Client::new(endpoints);
+
+    assert!(matches!(cl.delete("/missing"), Err(ClientError::NotFound)));
+    let pending = svc.begin("/new", 5).unwrap();
+    assert!(matches!(cl.delete("/new"), Err(ClientError::Rejected { status: 409, .. })));
+    svc.abort(pending);
+
+    cl.put("/deleted", b"old content").unwrap();
+    let pending = svc.begin("/deleted", 5).unwrap();
+    assert!(matches!(cl.delete("/deleted"), Err(ClientError::Rejected { status: 409, .. })));
+    svc.abort(pending);
+    cl.delete("/deleted").unwrap();
+    assert_eq!(cl.stat("/deleted").unwrap(), None);
+    assert!(matches!(cl.get("/deleted"), Err(ClientError::NotFound)));
+    assert!(!cl.list().unwrap().iter().any(|(p, _)| p == "/deleted"));
+    assert!(matches!(cl.delete("/deleted"), Err(ClientError::NotFound)));
+    assert!(svc.lookup("/deleted").unwrap().unwrap().deleted, "墓碑必须已提交");
+
+    c.isolated.lock().unwrap().insert(leader);
+    let (new, next_round) = c.wait_serving(Some(leader), round + 1);
+    c.wait("新执行者开放文件服务", || c.services[&new].serving_round() == Some(next_round));
+    assert_eq!(cl.stat("/deleted").unwrap(), None);
+    cl.put_new("/deleted", b"new content").unwrap();
+    assert_eq!(cl.get("/deleted").unwrap(), b"new content");
+    c.shutdown();
+}
+
 /// 只有一个驱动器：读不在驱动器里的带要临时换带，读完换回，服务继续。
 #[test]
 fn reading_from_another_tape_with_a_single_drive_swaps_and_swaps_back() {
@@ -1144,7 +1180,7 @@ fn reclaiming_a_tape_moves_the_live_files_away_and_reformats_it() {
 
     let db = c.dir.join(format!("directory-{}.db", leader));
     let dir = || tape_rs::daemon::directory::Directory::open_reader(&db).unwrap();
-    c.wait("目录追上", || dir().live_on("PA0001L8").unwrap_or((0, 0)) == (3, 3000 + 5000 + 3000));
+    c.wait("目录追上", || dir().live_on("PA0001L8").unwrap_or((0, 0)) == (4, 3000 + 5000 + 3000));
     let (_, live_before) = dir().live_on("PA0001L8").unwrap();
     let written_before = c.st(leader).tapes["PA0001L8"].bytes_written;
     assert!(
@@ -1181,6 +1217,39 @@ fn reclaiming_a_tape_moves_the_live_files_away_and_reformats_it() {
     // 源带真的被重新格式化了：带上一个文件都没有
     assert!(tape_files(&c.lib, "PA0001L8").is_empty(), "源带应当是空的");
     assert_eq!(tape_files(&c.lib, "PA0002L8").len(), 3);
+    c.shutdown();
+}
+
+/// FC08：回收搬迁墓碑后，旧版本仍不可见，接管后也不能复活。
+#[test]
+fn reclaim_preserves_tombstones() {
+    let lib = SimLibrary::new(2, 6, 1);
+    for (i, b) in ["PD0001L8", "PD0002L8"].iter().enumerate() {
+        lib.insert_cartridge(SimCartridge::blank(b, 64 << 20), i).unwrap();
+    }
+    let c = Cluster::start_lib("reclaim-delete", false, lib, 100, &["PD0001L8", "PD0002L8"]);
+    let (leader, round) = c.wait_serving(None, 0);
+    let svc = &c.services[&leader];
+    c.wait("文件服务开放", || svc.serving_round() == Some(round));
+    let mut cl = Client::new(c.start_http());
+    cl.put("/removed", b"old").unwrap();
+    cl.put("/kept", b"live").unwrap();
+    cl.delete("/removed").unwrap();
+    c.wait("墓碑目录追上", || c.st(leader).tapes["PD0001L8"].generation >= svc.lookup("/removed").unwrap().unwrap().generation);
+    c.admin(Command::TapeReclaim { barcode: "PD0001L8".into() });
+    c.wait("回收完成", || c.st(leader).tapes["PD0001L8"].files == 0);
+    assert_eq!(cl.stat("/removed").unwrap(), None);
+    assert_eq!(cl.get("/kept").unwrap(), b"live");
+    let tombstone = svc.lookup("/removed").unwrap().unwrap();
+    assert!(tombstone.deleted);
+    assert_eq!(tombstone.barcode, "PD0002L8");
+    assert!(tape_files(&c.lib, "PD0001L8").is_empty());
+    c.isolated.lock().unwrap().insert(leader);
+    let (new, next_round) = c.wait_serving(Some(leader), round + 1);
+    c.wait("新执行者开放文件服务", || c.services[&new].serving_round() == Some(next_round));
+    assert_eq!(cl.stat("/removed").unwrap(), None);
+    cl.put_new("/removed", b"revived").unwrap();
+    assert_eq!(cl.get("/removed").unwrap(), b"revived");
     c.shutdown();
 }
 
@@ -1260,21 +1329,15 @@ fn a_reclaim_that_cannot_start_falls_back_to_appendable_with_a_reason() {
     c.shutdown();
 }
 
-/// 读一盘模拟介质上最后一份索引里的文件列表。
+/// 对介质副本执行真实恢复，兼容 Full + Incremental，不扰动执行线程的磁头。
 fn tape_files(lib: &SimLibrary, barcode: &str) -> Vec<String> {
-    let cart = lib.cartridge(barcode).unwrap();
-    let xml = cart.partitions[1]
-        .objects
-        .iter()
-        .rev()
-        .find_map(|o| match o {
-            tape_rs::scsi::sim::LogicalObject::Record(d) if d.windows(10).any(|w| w == b"<ltfsindex") => Some(d.clone()),
-            _ => None,
-        })
-        .expect("带上应当有索引");
-    let idx = tape_rs::ltfs::index::LtfsIndex::parse(&xml).unwrap();
+    let copy = SimLibrary::new(1, 1, 1);
+    copy.insert_cartridge(lib.cartridge(barcode).unwrap(), 0).unwrap();
+    copy.load_into_drive(barcode, 0).unwrap();
+    let dev = copy.drive(0);
+    let vol = tape_rs::ltfs::volume::LtfsVolume::mount(&dev).unwrap();
     let mut v = Vec::new();
-    idx.walk_files(|p, _| v.push(p.to_string()));
+    vol.index().walk_files(|p, _| v.push(p.to_string()));
     v.sort();
     v
 }
@@ -1295,7 +1358,7 @@ fn a_directory_ahead_of_the_tape_marks_the_tape_for_checking() {
     let real_gen = c.st(leader).tapes["PA0001L8"].generation;
     // 伪造一条比磁带更新的目录批次
     use tape_rs::daemon::state::FileRec;
-    c.admin(Command::CatalogPart { barcode: "PA0001L8".into(), generation: real_gen + 5, part: 0, files: vec![FileRec { path: "/ghost.bin".into(), length: 1, sha256: String::new(), version: (0, 0) }] });
+    c.admin(Command::CatalogPart { barcode: "PA0001L8".into(), generation: real_gen + 5, part: 0, files: vec![FileRec { metadata: serde_json::Value::Null, path: "/ghost.bin".into(), length: 1, sha256: String::new(), version: (0, 0), deleted: false }] });
     c.admin(Command::TapeCommitted { barcode: "PA0001L8".into(), volume_uuid: "x".into(), generation: real_gen + 5, files: 4, bytes_used: 1, bytes_written: 1, parts: 1, full: false });
     c.wait("伪造批次已应用", || c.st(leader).tapes["PA0001L8"].generation == real_gen + 5);
     assert!(svc.stat("/ghost.bin").unwrap().is_some());
@@ -1387,6 +1450,13 @@ fn a_planned_shutdown_commits_the_queue_and_releases_every_reservation() {
     let files = put_until(&svc, "g", 4000, 3, |_| false);
     assert!(files.iter().all(|(_, r)| matches!(r, Ok(TaskStatus::Committed { .. }))), "{:?}", files);
 
+    // 普通上传留下标准 DP 增量，IP 保留此前完整索引。
+    let live = c.lib.drive_as(0, leader as u32);
+    let vol = tape_rs::ltfs::volume::LtfsVolume::mount(&live).unwrap();
+    assert!(vol.index().incremental);
+    assert!(vol.recovery().ip_debt);
+    drop(vol);
+
     // 停机之前：执行者持有全部设备
     let key = ReservationKey::new(leader as u8, round);
     let drives = c.lib.drive_count();
@@ -1417,9 +1487,878 @@ fn a_planned_shutdown_commits_the_queue_and_releases_every_reservation() {
     tape_rs::tape::commands::TapeDrive::new(&dev).load().unwrap();
     let vol = tape_rs::ltfs::volume::LtfsVolume::mount(&dev).unwrap();
     assert!(vol.writable(), "停机后卷应当是完整尾部: {:?}", vol.recovery().notes);
+    assert!(!vol.index().incremental, "正常停机必须生成 DP 全量检查点");
+    assert!(!vol.recovery().ip_debt);
+    let ip = &vol.recovery().ip.last_index.as_ref().unwrap().index;
+    assert!(!ip.incremental);
+    assert_eq!(ip.generation, vol.index().generation);
+    assert_eq!(ip.previous_location, Some(vol.index().self_location));
+
     let on_tape: Vec<String> = vol.list().into_iter().map(|f| f.0).collect();
     for (p, _) in &files {
         assert!(on_tape.iter().any(|t| t.trim_start_matches('/') == p.trim_start_matches('/')), "{p} 不在带上: {on_tape:?}");
     }
     let _ = std::fs::remove_dir_all(&c.dir);
+}
+
+/// 下载经过磁带、匿名暂存文件和 HTTP；超过原来的 256 MiB 上限，客户端不缓存全量。
+#[test]
+fn streaming_download_above_256_mib() {
+    use std::io::Write;
+    let lib = SimLibrary::new(1, 4, 1);
+    lib.insert_cartridge(SimCartridge::blank("LG0001L8", 768 << 20), 0).unwrap();
+    let c = Cluster::start_lib("large-download", false, lib, 100, &["LG0001L8"]);
+    let (leader, round) = c.wait_serving(None, 0);
+    c.wait("文件服务开放", || c.services[&leader].serving_round() == Some(round));
+    let path = c.dir.join("source.bin");
+    let block = body(1 << 20, 37);
+    let mut file = std::fs::File::create(&path).unwrap();
+    for _ in 0..257 { file.write_all(&block).unwrap(); }
+    drop(file);
+    let mut cl = Client::new(c.start_http());
+    cl.retry_for = Duration::from_secs(180);
+    let uploaded = cl.put_file("/large", &path, false, true).unwrap();
+    assert_eq!(uploaded.attempts, 1, "等待提交不能重复上传");
+    struct CheckedSink { pos: u64, block: Vec<u8> }
+    impl Write for CheckedSink {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            for (i, byte) in data.iter().enumerate() {
+                assert_eq!(*byte, self.block[(self.pos as usize + i) % self.block.len()]);
+            }
+            self.pos += data.len() as u64;
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let mut sink = CheckedSink { pos: 0, block };
+    assert_eq!(cl.get_to("/large", &mut sink).unwrap(), 257 << 20);
+    assert_eq!(sink.pos, 257 << 20);
+    c.shutdown();
+}
+
+#[test]
+fn file_metadata_survives_catalog_publication_and_takeover() {
+    let lib = SimLibrary::new(1, 4, 1);
+    lib.insert_cartridge(SimCartridge::blank(BARCODE, 64 << 20), 0).unwrap();
+    lib.load_into_drive(BARCODE, 0).unwrap();
+    let dev = lib.drive_as(0, 50);
+    mkltfs(&dev, &MkltfsOptions { volume_id: "META".into(), block_size: 64 * 1024, ..Default::default() }).unwrap();
+    let expected_time = {
+        let mut vol = tape_rs::ltfs::volume::LtfsVolume::mount(&dev).unwrap();
+        vol.append_file_with_xattrs("/imported", &mut std::io::Cursor::new(b"content"), &[("note", "原始属性"), ("tapers.version", "1.5")]).unwrap();
+        vol.commit().unwrap();
+        vol.index().find_file("imported").unwrap().meta.modify_time.clone()
+    };
+    let c = Cluster::start_lib("metadata", false, lib, 100, &[BARCODE]);
+    let (leader, round) = c.wait_serving(None, 0);
+    c.wait("文件服务开放", || c.services[&leader].serving_round() == Some(round));
+    let mut cl = Client::new(c.start_http());
+    let imported = cl.stat("/imported").unwrap().unwrap();
+    assert_eq!(imported.version, (1, 5));
+    assert_eq!(imported.metadata["modify_time"], expected_time);
+    assert!(imported.metadata["xattrs"].as_array().unwrap().iter().any(|x| x["key"] == "note" && x["value"] == "原始属性"));
+    cl.put("/new", b"new data").unwrap();
+    let written = cl.stat("/new").unwrap().unwrap();
+    assert_eq!(written.version.0, round);
+    assert!(!written.metadata["modify_time"].as_str().unwrap().is_empty());
+    let db = c.dir.join(format!("directory-{}.db", leader));
+    c.wait("目录保存元数据", || {
+        let d = tape_rs::daemon::directory::Directory::open_reader(&db).unwrap();
+        d.stat(POOL, "/new").unwrap().is_some_and(|r| r.version == written.version && r.metadata == written.metadata)
+    });
+    c.isolated.lock().unwrap().insert(leader);
+    let (next, next_round) = c.wait_serving(Some(leader), round + 1);
+    c.wait("接管后文件服务开放", || c.services[&next].serving_round() == Some(next_round));
+    let recovered = cl.stat("/new").unwrap().unwrap();
+    assert_eq!(recovered.version, written.version);
+    assert_eq!(recovered.metadata, written.metadata);
+    assert_eq!(cl.stat("/imported").unwrap().unwrap().metadata, imported.metadata);
+    c.shutdown();
+}
+
+#[test]
+fn reclaim_preserves_file_metadata_with_a_new_version() {
+    let lib = SimLibrary::new(2, 6, 1);
+    for (slot, barcode) in ["MD0001L8", "MD0002L8"].iter().enumerate() {
+        lib.insert_cartridge(SimCartridge::blank(barcode, 64 << 20), slot).unwrap();
+    }
+    lib.load_into_drive("MD0001L8", 0).unwrap();
+    let dev = lib.drive_as(0, 50);
+    mkltfs(&dev, &MkltfsOptions { volume_id: "META".into(), block_size: 64 * 1024, ..Default::default() }).unwrap();
+    {
+        let mut vol = tape_rs::ltfs::volume::LtfsVolume::mount(&dev).unwrap();
+        vol.append_file_with_xattrs("/keep", &mut std::io::Cursor::new(b"content"), &[("note", "回收前的属性"), ("tapers.version", "1.1")]).unwrap();
+        vol.commit().unwrap();
+    }
+    let c = Cluster::start_lib("reclaim-metadata", false, lib, 100, &["MD0001L8", "MD0002L8"]);
+    let (leader, round) = c.wait_serving(None, 0);
+    c.wait("文件服务开放", || c.services[&leader].serving_round() == Some(round));
+    let mut cl = Client::new(c.start_http());
+    let before = cl.stat("/keep").unwrap().unwrap();
+    c.admin(Command::TapeReclaim { barcode: "MD0001L8".into() });
+    c.wait("元数据回收完成", || c.st(leader).tapes["MD0001L8"].files == 0);
+    let after = cl.stat("/keep").unwrap().unwrap();
+    assert_eq!(after.barcode, "MD0002L8");
+    assert!(after.version > before.version);
+    assert_eq!(after.metadata["modify_time"], before.metadata["modify_time"]);
+    assert!(after.metadata["xattrs"].as_array().unwrap().iter().any(|x| x["key"] == "note" && x["value"] == "回收前的属性"));
+    assert_eq!(after.sha256, before.sha256);
+    assert_eq!(cl.get("/keep").unwrap(), b"content");
+    assert!(tape_files(&c.lib, "MD0001L8").is_empty());
+    c.isolated.lock().unwrap().insert(leader);
+    let (next, next_round) = c.wait_serving(Some(leader), round + 1);
+    c.wait("接管后文件服务开放", || c.services[&next].serving_round() == Some(next_round));
+    let recovered = cl.stat("/keep").unwrap().unwrap();
+    assert_eq!(recovered.metadata, after.metadata);
+    assert_eq!(recovered.version, after.version);
+    c.shutdown();
+}
+
+#[test]
+fn overwrites_preserve_xattrs_on_same_and_different_tapes() {
+    use tape_rs::ltfs::index::Xattr;
+    let lib = SimLibrary::new(2, 6, 1);
+    for (slot, barcode) in ["XA0001L8", "XA0002L8"].iter().enumerate() {
+        lib.insert_cartridge(SimCartridge::blank(barcode, 64 << 20), slot)
+            .unwrap();
+    }
+    lib.load_into_drive("XA0001L8", 0).unwrap();
+    let dev = lib.drive_as(0, 50);
+    mkltfs(
+        &dev,
+        &MkltfsOptions {
+            volume_id: "XATTR".into(),
+            block_size: 64 * 1024,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    {
+        let mut vol = tape_rs::ltfs::volume::LtfsVolume::mount(&dev).unwrap();
+        vol.set_hash_policy(tape_rs::ltfs::volume::HashPolicy {
+            md5: true,
+            sha256: true,
+        });
+        vol.append_file_with_xattrs(
+            "/edit",
+            &mut std::io::Cursor::new(b"old"),
+            &[("note", "原始属性")],
+        )
+        .unwrap();
+        vol.set_node_xattr(
+            "/edit",
+            Xattr {
+                key: "binary".into(),
+                value: "AP8=".into(),
+                base64: true,
+            },
+            false,
+            false,
+        )
+        .unwrap();
+        vol.commit().unwrap();
+    }
+    let c = Cluster::start_lib("overwrite-xattrs", false, lib, 3, &["XA0001L8", "XA0002L8"]);
+    let (leader, round) = c.wait_serving(None, 0);
+    c.wait("文件服务开放", || {
+        c.services[&leader].serving_round() == Some(round)
+    });
+    let mut cl = Client::new(c.start_http());
+    let before = cl.stat("/edit").unwrap().unwrap();
+    let held = c.services[&leader].begin("/edit", 1).unwrap();
+    assert!(matches!(
+        cl.put("/edit", b"conflict"),
+        Err(tape_rs::client::ClientError::Rejected { status: 409, .. })
+    ));
+    c.services[&leader].abort(held);
+    for (data, barcode) in [
+        (b"same tape".as_slice(), "XA0001L8"),
+        (b"other tape".as_slice(), "XA0002L8"),
+    ] {
+        assert!(cl.put("/edit", data).unwrap().committed);
+        let after = cl.stat("/edit").unwrap().unwrap();
+        assert_eq!(after.barcode, barcode);
+        let attrs = after.metadata["xattrs"].as_array().unwrap();
+        assert!(
+            attrs
+                .iter()
+                .any(|x| x["key"] == "note" && x["value"] == "原始属性")
+        );
+        assert!(
+            attrs
+                .iter()
+                .any(|x| x["key"] == "binary" && x["value"] == "AP8=" && x["base64"] == true)
+        );
+        use sha2::Digest;
+        assert_eq!(after.sha256, format!("{:x}", sha2::Sha256::digest(data)));
+        assert!(attrs.iter().any(|x| x["key"] == "ltfs.hash.md5sum"
+            && x["value"] == format!("{:x}", md5::Md5::digest(data))));
+        assert_ne!(after.sha256, before.sha256);
+        assert_ne!(
+            after.metadata["modify_time"],
+            before.metadata["modify_time"]
+        );
+        assert_eq!(cl.get("/edit").unwrap(), data);
+        if barcode == "XA0001L8" {
+            cl.put("/filler", b"switch tape").unwrap();
+            cl.put("/filler2", b"switch tape").unwrap();
+        }
+    }
+    c.shutdown();
+}
+
+/// 文件准入必须跨磁带检查类型，接管后仍给客户端明确的拒绝结果。
+#[test]
+fn namespace_conflicts_across_tapes_and_takeover() {
+    use tape_rs::client::ClientError;
+    let c = Cluster::start_lib(
+        "namespace-conflicts",
+        false,
+        small_tape_library(64),
+        3,
+        &["PA0001L8", "PA0002L8"],
+    );
+    let (leader, round) = c.wait_serving(None, 0);
+    c.wait("文件服务开放", || {
+        c.services[&leader].serving_round() == Some(round)
+    });
+    let mut cl = Client::new(c.start_http());
+    for p in ["/d_%/file", "/d_ax/file", "/filler", "/second"] {
+        cl.put(p, b"preserve").unwrap();
+    }
+    assert_eq!(cl.stat("/d_%/file").unwrap().unwrap().barcode, "PA0001L8");
+    assert_eq!(cl.stat("/second").unwrap().unwrap().barcode, "PA0002L8");
+    let check = |cl: &mut Client| {
+        for (path, error) in [
+            ("/d_%", "is_directory"),
+            ("/d_%/file/child", "not_directory"),
+        ] {
+            match cl.put(path, b"rejected") {
+                Err(ClientError::Rejected { status: 409, body }) => {
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(&body).unwrap()["error"],
+                        error
+                    );
+                }
+                other => panic!("路径 {path} 应被拒绝: {other:?}"),
+            }
+        }
+        assert!(matches!(
+            cl.delete("/d_%"),
+            Err(ClientError::Rejected { status: 409, .. })
+        ));
+        assert_eq!(cl.get("/d_%/file").unwrap(), b"preserve");
+    };
+    check(&mut cl);
+    // /d 只是文本前缀，不是 /d_% 的父路径。
+    cl.put("/d", b"independent").unwrap();
+    c.isolated.lock().unwrap().insert(leader);
+    let (next, next_round) = c.wait_serving(Some(leader), round + 1);
+    c.wait("接管后文件服务开放", || {
+        c.services[&next].serving_round() == Some(next_round)
+    });
+    check(&mut cl);
+    assert_eq!(cl.get("/d").unwrap(), b"independent");
+    c.shutdown();
+}
+
+#[test]
+fn persistent_directories_survive_fuse_remount_and_takeover() {
+    use tape_rs::client::ClientError;
+    use tape_rs::tapefs::{ClientBackend, ROOT_INO, TapeFs};
+    let c = Cluster::start_with("persistent-directories", false);
+    let (leader, round) = c.wait_serving(None, 0);
+    c.wait("目录服务开放", || {
+        c.services[&leader].serving_round() == Some(round)
+    });
+    let endpoints = c.start_http();
+    let mut cl = Client::new(endpoints.clone());
+    cl.mkdir("/empty").unwrap();
+    let before = cl.stat("/empty").unwrap().unwrap();
+    assert_eq!(before.metadata["kind"], "directory");
+    assert!(cl.list_dir("/empty", false).unwrap().is_empty());
+    assert!(matches!(
+        cl.get("/empty"),
+        Err(ClientError::Rejected { status: 409, .. })
+    ));
+    assert!(matches!(cl.mkdir("/empty"), Err(ClientError::Exists(_))));
+    assert!(matches!(
+        cl.mkdir("/missing/child"),
+        Err(ClientError::NotFound)
+    ));
+    cl.mkdir("/empty/child").unwrap();
+    assert!(matches!(
+        cl.rmdir("/empty"),
+        Err(ClientError::Rejected { status: 409, .. })
+    ));
+    let held = c.services[&leader].begin("/empty/child/file", 1).unwrap();
+    assert!(matches!(
+        cl.rmdir("/empty/child"),
+        Err(ClientError::Rejected { status: 409, .. })
+    ));
+    c.services[&leader].abort(held);
+    cl.rmdir("/empty/child").unwrap();
+    // The same path may safely change kind after rmdir.
+    cl.put("/empty/child", b"file after directory").unwrap();
+    assert!(matches!(
+        cl.rmdir("/empty/child"),
+        Err(ClientError::Rejected { status: 409, .. })
+    ));
+    cl.delete("/empty/child").unwrap();
+    assert!(cl.list_dir("/empty", false).unwrap().is_empty());
+    let fs = TapeFs::new(
+        ClientBackend::new(Client::new(endpoints.clone())),
+        c.dir.join("fuse-cache"),
+    )
+    .unwrap();
+    let made = fs.mkdir(ROOT_INO, "fused").unwrap();
+    assert!(made.is_dir);
+    drop(fs);
+    let fs = TapeFs::new(
+        ClientBackend::new(Client::new(endpoints.clone())),
+        c.dir.join("fuse-cache"),
+    )
+    .unwrap();
+    assert!(fs.lookup(ROOT_INO, "fused").unwrap().is_dir);
+    fs.rmdir(ROOT_INO, "fused").unwrap();
+    assert_eq!(fs.lookup(ROOT_INO, "fused").err(), Some(nix::libc::ENOENT));
+    drop(fs);
+    c.isolated.lock().unwrap().insert(leader);
+    let (next, next_round) = c.wait_serving(Some(leader), round + 1);
+    c.wait("接管后目录服务开放", || {
+        c.services[&next].serving_round() == Some(next_round)
+    });
+    assert!(cl.list_dir("/empty", false).unwrap().is_empty());
+    assert_eq!(
+        cl.stat("/empty").unwrap().unwrap().metadata["node"]["creation_time"],
+        before.metadata["node"]["creation_time"]
+    );
+    assert!(cl.stat("/fused").unwrap().is_none());
+    assert!(cl.stat("/empty/child").unwrap().is_none());
+    cl.rmdir("/empty").unwrap();
+    cl.mkdir("/empty").unwrap();
+    assert!(cl.list_dir("/empty", false).unwrap().is_empty());
+    c.shutdown();
+}
+
+#[test]
+fn reclaim_preserves_native_empty_directories_and_their_metadata() {
+    use tape_rs::ltfs::{index::Xattr, volume::LtfsVolume};
+    let lib = SimLibrary::new(2, 6, 1);
+    for (i, b) in ["PA0001L8", "PA0002L8"].iter().enumerate() {
+        lib.insert_cartridge(SimCartridge::blank(b, 64 << 20), i)
+            .unwrap();
+    }
+    lib.load_into_drive("PA0001L8", 0).unwrap();
+    let dev = lib.drive_as(0, 50);
+    mkltfs(
+        &dev,
+        &MkltfsOptions {
+            volume_id: "DIRS".into(),
+            block_size: 64 * 1024,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    {
+        let mut vol = LtfsVolume::mount(&dev).unwrap();
+        vol.create_directory("/native").unwrap();
+        vol.create_directory("/native/empty").unwrap();
+        vol.set_node_xattr(
+            "/native/empty",
+            Xattr {
+                key: "binary".into(),
+                value: "AP8=".into(),
+                base64: true,
+            },
+            false,
+            false,
+        )
+        .unwrap();
+        vol.commit().unwrap();
+    }
+    let c = Cluster::start_lib(
+        "reclaim-directories",
+        false,
+        lib,
+        100,
+        &["PA0001L8", "PA0002L8"],
+    );
+    let (leader, round) = c.wait_serving(None, 0);
+    c.wait("目录服务开放", || {
+        c.services[&leader].serving_round() == Some(round)
+    });
+    let mut cl = Client::new(c.start_http());
+    let before = cl.stat("/native/empty").unwrap().unwrap();
+    cl.mkdir("/removed").unwrap();
+    cl.rmdir("/removed").unwrap();
+    c.admin(Command::TapeReclaim {
+        barcode: "PA0001L8".into(),
+    });
+    c.wait("含空目录的磁带回收完成", || {
+        c.st(leader)
+            .last_reclaim
+            .as_ref()
+            .is_some_and(|r| r.barcode == "PA0001L8" && r.outcome == "done")
+    });
+    let after = cl.stat("/native/empty").unwrap().unwrap();
+    assert_eq!(after.barcode, "PA0002L8");
+    assert_eq!(after.metadata["node"], before.metadata["node"]);
+    assert!(
+        after.metadata["xattrs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["key"] == "binary" && x["value"] == "AP8=" && x["base64"] == true)
+    );
+    assert!(cl.list_dir("/native/empty", false).unwrap().is_empty());
+    assert!(cl.stat("/removed").unwrap().is_none());
+    c.isolated.lock().unwrap().insert(leader);
+    let (next, next_round) = c.wait_serving(Some(leader), round + 1);
+    c.wait("接管完成", || {
+        c.services[&next].serving_round() == Some(next_round)
+    });
+    assert!(cl.list_dir("/native/empty", false).unwrap().is_empty());
+    assert!(cl.stat("/removed").unwrap().is_none());
+    c.shutdown();
+}
+
+#[test]
+fn directory_tombstones_survive_reconciling_an_old_tape() {
+    let lib = SimLibrary::new(2, 6, 1);
+    for (i, b) in ["PA0001L8", "PA0002L8"].iter().enumerate() {
+        lib.insert_cartridge(SimCartridge::blank(b, 64 << 20), i)
+            .unwrap();
+    }
+    let c = Cluster::start_lib(
+        "directory-old-tape",
+        false,
+        lib,
+        2,
+        &["PA0001L8", "PA0002L8"],
+    );
+    let (leader, round) = c.wait_serving(None, 0);
+    c.wait("目录服务开放", || {
+        c.services[&leader].serving_round() == Some(round)
+    });
+    let mut cl = Client::new(c.start_http());
+    cl.mkdir("/gone").unwrap();
+    cl.put("/first", b"old tape").unwrap();
+    cl.put("/filler", b"fill first tape").unwrap();
+    cl.put("/second", b"new tape").unwrap();
+    assert_eq!(cl.stat("/second").unwrap().unwrap().barcode, "PA0002L8");
+    cl.rmdir("/gone").unwrap();
+    // Loading the old tape publishes its still-existing native directory again.
+    assert_eq!(cl.get("/first").unwrap(), b"old tape");
+    assert!(cl.stat("/gone").unwrap().is_none());
+    let db = c.dir.join(format!("directory-{}.db", leader));
+    c.wait("目录删除墓碑进入 Raft", || {
+        tape_rs::daemon::directory::Directory::open_reader(&db)
+            .unwrap()
+            .lookup(POOL, "/gone")
+            .unwrap()
+            .is_some_and(|r| r.deleted && r.barcode == "PA0002L8")
+    });
+    c.isolated.lock().unwrap().insert(leader);
+    let (next, next_round) = c.wait_serving(Some(leader), round + 1);
+    c.wait("接管后仍保留墓碑", || {
+        c.services[&next].serving_round() == Some(next_round)
+    });
+    assert!(cl.stat("/gone").unwrap().is_none());
+    cl.mkdir("/gone").unwrap();
+    assert!(cl.list_dir("/gone", false).unwrap().is_empty());
+    c.shutdown();
+}
+
+#[test]
+fn atomic_rename_preserves_native_nodes_and_survives_takeover() {
+    use tape_rs::ltfs::volume::LtfsVolume;
+    let lib = SimLibrary::new(1, 4, 1);
+    lib.insert_cartridge(SimCartridge::blank(BARCODE, 64 << 20), 0)
+        .unwrap();
+    lib.load_into_drive(BARCODE, 0).unwrap();
+    let dev = lib.drive_as(0, 50);
+    mkltfs(
+        &dev,
+        &MkltfsOptions {
+            volume_id: "RENAME".into(),
+            block_size: 65536,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let original = {
+        let mut vol = LtfsVolume::mount(&dev).unwrap();
+        vol.create_directory("/source").unwrap();
+        vol.create_directory("/source/empty").unwrap();
+        vol.append_file_with_xattrs(
+            "/source/file",
+            &mut std::io::Cursor::new(b"renamed content"),
+            &[("note", "保留属性")],
+        )
+        .unwrap();
+        vol.commit().unwrap();
+        vol.index().find_file("source/file").unwrap().clone()
+    };
+    let c = Cluster::start_lib("atomic-rename", false, lib, 100, &[BARCODE]);
+    let (leader, round) = c.wait_serving(None, 0);
+    c.wait("服务开放", || {
+        c.services[&leader].serving_round() == Some(round)
+    });
+    let endpoints = c.start_http();
+    let mut cl = Client::new(endpoints.clone());
+    cl.mkdir("/target").unwrap();
+    cl.rename("/source", "/target", false).unwrap();
+    assert!(cl.stat("/source").unwrap().is_none());
+    assert!(cl.stat("/source/file").unwrap().is_none());
+    assert_eq!(cl.get("/target/file").unwrap(), b"renamed content");
+    assert!(cl.list_dir("/target/empty", false).unwrap().is_empty());
+    cl.rename("/target/file", "/target/% ?文件", true).unwrap();
+    cl.put("/replace", b"old target").unwrap();
+    cl.rename("/target/% ?文件", "/replace", false).unwrap();
+    c.isolated.lock().unwrap().insert(leader);
+    let (next, nr) = c.wait_serving(Some(leader), round + 1);
+    c.wait("接管开放", || {
+        c.services[&next].serving_round() == Some(nr)
+    });
+    // 保留旧 Leader 缓存，读取应在设备隔离后切换到新执行者。
+    assert_eq!(cl.get("/replace").unwrap(), b"renamed content");
+    assert!(cl.stat("/source/empty").unwrap().is_none());
+    assert!(cl.stat("/target/% ?文件").unwrap().is_none());
+    assert_eq!(cl.get("/replace").unwrap(), b"renamed content");
+    let copy = SimLibrary::new(1, 1, 1);
+    copy.insert_cartridge(c.lib.cartridge(BARCODE).unwrap(), 0)
+        .unwrap();
+    copy.load_into_drive(BARCODE, 0).unwrap();
+    let dev = copy.drive(0);
+    let vol = LtfsVolume::mount(&dev).unwrap();
+    let renamed = vol.index().find_file("replace").unwrap();
+    assert_eq!(renamed.meta.file_uid, original.meta.file_uid);
+    assert_eq!(renamed.extents, original.extents);
+    assert_eq!(renamed.meta.modify_time, original.meta.modify_time);
+    assert_eq!(renamed.xattr("note"), Some("保留属性"));
+    assert!(vol.index().find_directory("source").is_none());
+    c.shutdown();
+}
+
+#[test]
+fn client_read_retries_after_executor_reports_preemption() {
+    use tape_rs::scsi::reservation::{ReservationKey, fence};
+    let c = Cluster::start_with("read-preempt", false);
+    let (leader, round) = c.wait_serving(None, 0);
+    c.wait("服务开放", || {
+        c.services[&leader].serving_round() == Some(round)
+    });
+    let mut cl = Client::new(c.start_http());
+    cl.put("/read-preempt", b"complete response only").unwrap();
+    assert_eq!(cl.get("/read-preempt").unwrap(), b"complete response only");
+    fence(&c.lib.drive_as(0, 99), ReservationKey::new(99, round)).unwrap();
+    let mut out = Vec::new();
+    assert_eq!(cl.get_to("/read-preempt", &mut out).unwrap(), 22);
+    assert_eq!(out, b"complete response only");
+    let (next, _) = c.wait_serving(Some(leader), round + 1);
+    assert_ne!(next, leader);
+}
+
+#[test]
+fn user_xattrs_commit_without_rewriting_data_and_survive_takeover() {
+    use nix::libc;
+    use tape_rs::ltfs::volume::LtfsVolume;
+    use tape_rs::tapefs::{ClientBackend, TapeFs};
+    let c = Cluster::start_with("user-xattrs", false);
+    let (leader, round) = c.wait_serving(None, 0);
+    c.wait("服务开放", || {
+        c.services[&leader].serving_round() == Some(round)
+    });
+    let endpoints = c.start_http();
+    let mut cl = Client::new(endpoints.clone());
+    cl.put("/file", b"unchanged content").unwrap();
+    cl.mkdir("/dir").unwrap();
+    let native = || {
+        let copy = SimLibrary::new(1, 1, 1);
+        copy.insert_cartridge(c.lib.cartridge(BARCODE).unwrap(), 0)
+            .unwrap();
+        copy.load_into_drive(BARCODE, 0).unwrap();
+        let dev = copy.drive(0);
+        let vol = LtfsVolume::mount(&dev).unwrap();
+        vol.index().find_file("file").unwrap().clone()
+    };
+    let original = native();
+    cl.setxattr("/file", "user.binary", &[0, 255, 0xe4, 0xb8, 0xad], 1)
+        .unwrap();
+    assert!(matches!(
+        cl.setxattr("/file", "user.binary", b"other", 1),
+        Err(tape_rs::client::ClientError::Exists(_))
+    ));
+    let missing = cl.setxattr("/file", "user.missing", b"x", 2).unwrap_err();
+    assert_eq!(tape_rs::tapefs::errno_of(&missing), libc::ENODATA);
+    cl.setxattr("/file", "user.binary", &[0, 255, 42], 2)
+        .unwrap();
+    cl.setxattr("/file", "user.empty", b"", 0).unwrap();
+    cl.setxattr("/dir", "user.directory", b"directory\0\xff", 0)
+        .unwrap();
+    let large = vec![0xff; 65536];
+    cl.setxattr("/file", "user.large", &large, 0).unwrap();
+    let current = native();
+    assert_eq!(current.extents, original.extents);
+    assert_eq!(current.meta.file_uid, original.meta.file_uid);
+    assert_eq!(current.meta.modify_time, original.meta.modify_time);
+    assert_eq!(
+        current.xattr("ltfs.hash.sha256sum"),
+        original.xattr("ltfs.hash.sha256sum")
+    );
+    let t = TapeFs::new(ClientBackend::new(cl.clone()), c.dir.join("xattr-cache")).unwrap();
+    let file = t.lookup(1, "file").unwrap();
+    let directory = t.lookup(1, "dir").unwrap();
+    assert_eq!(t.getxattr(file.ino, "user.binary").unwrap(), [0, 255, 42]);
+    assert_eq!(t.getxattr(file.ino, "user.large").unwrap(), large);
+    assert!(
+        t.listxattr(directory.ino)
+            .unwrap()
+            .split(|b| *b == 0)
+            .any(|n| n == b"user.directory")
+    );
+    // 打开writer的脏内容先提交；后续内容覆盖仍保留属性。
+    let fh = t.open(file.ino, libc::O_RDWR).unwrap();
+    t.write(fh, 0, b"UPDATED").unwrap();
+    t.change_xattr(file.ino, "user.writer", Some(b"writer\0"), 0)
+        .unwrap();
+    t.write(fh, 0, b"REWRITE").unwrap();
+    t.fsync(fh).unwrap();
+    t.release(fh);
+    assert_eq!(t.getxattr(file.ino, "user.writer").unwrap(), b"writer\0");
+    t.change_xattr(directory.ino, "user.directory", None, 0)
+        .unwrap();
+    assert_eq!(
+        t.getxattr(directory.ino, "user.directory"),
+        Err(libc::ENODATA)
+    );
+    cl.removexattr("/file", "user.binary").unwrap();
+    assert_eq!(t.getxattr(file.ino, "user.binary"), Err(libc::ENODATA));
+    c.isolated.lock().unwrap().insert(leader);
+    let (next, nr) = c.wait_serving(Some(leader), round + 1);
+    c.wait("接管开放", || {
+        c.services[&next].serving_round() == Some(nr)
+    });
+    let t = TapeFs::new(
+        ClientBackend::new(Client::new(endpoints)),
+        c.dir.join("xattr-remount"),
+    )
+    .unwrap();
+    let file = t.lookup(1, "file").unwrap();
+    assert_eq!(t.getxattr(file.ino, "user.writer").unwrap(), b"writer\0");
+    assert_eq!(t.getxattr(file.ino, "user.empty").unwrap(), b"");
+    assert_eq!(t.getxattr(file.ino, "user.binary"), Err(libc::ENODATA));
+}
+
+#[test]
+fn symlinks_commit_and_survive_remount_and_takeover() {
+    use tape_rs::client::ClientError;
+    use tape_rs::tapefs::{ClientBackend, ROOT_INO, TapeFs};
+    let c = Cluster::start_with("symlink-create", false);
+    let (leader, round) = c.wait_serving(None, 0);
+    c.wait("符号链接服务开放", || {
+        c.services[&leader].serving_round() == Some(round)
+    });
+    let endpoints = c.start_http();
+    let mut cl = Client::new(endpoints.clone());
+    cl.put("/target", b"target unchanged").unwrap();
+    let before = cl.stat("/target").unwrap().unwrap();
+    for (path, target) in [
+        ("/link", "target"),
+        ("/dangling", "../missing & 中文%?#"),
+        ("/absolute", "/target"),
+        ("/loop", "loop"),
+    ] {
+        cl.symlink(target, path).unwrap();
+        let st = cl.stat(path).unwrap().unwrap();
+        assert_eq!(st.length, 0);
+        assert_eq!(st.metadata["kind"], "symlink");
+        assert_eq!(st.metadata["symlink"], target);
+        assert!(matches!(
+            cl.symlink("different", path),
+            Err(ClientError::Exists(_))
+        ));
+    }
+    let fs = TapeFs::new(
+        ClientBackend::new(Client::new(endpoints.clone())),
+        c.dir.join("link-cache"),
+    )
+    .unwrap();
+    let made = fs.symlink(ROOT_INO, "fused", "target").unwrap();
+    assert!(made.is_symlink);
+    assert_eq!(made.size, 6);
+    assert_eq!(fs.readlink(made.ino).unwrap(), b"target");
+    drop(fs);
+    c.isolated.lock().unwrap().insert(leader);
+    let (next, next_round) = c.wait_serving(Some(leader), round + 1);
+    c.wait("接管后链接服务开放", || {
+        c.services[&next].serving_round() == Some(next_round)
+    });
+    let fs = TapeFs::new(
+        ClientBackend::new(Client::new(endpoints)),
+        c.dir.join("link-cache-new"),
+    )
+    .unwrap();
+    let link = fs.lookup(ROOT_INO, "fused").unwrap();
+    assert!(link.is_symlink);
+    assert_eq!(fs.readlink(link.ino).unwrap(), b"target");
+    fs.rename(ROOT_INO, "fused", ROOT_INO, "renamed", false)
+        .unwrap();
+    assert_eq!(
+        fs.readlink(fs.lookup(ROOT_INO, "renamed").unwrap().ino)
+            .unwrap(),
+        b"target"
+    );
+    fs.unlink(ROOT_INO, "renamed").unwrap();
+    assert_eq!(
+        fs.lookup(ROOT_INO, "renamed").err(),
+        Some(nix::libc::ENOENT)
+    );
+    fs.symlink(ROOT_INO, "renamed", "dangling").unwrap();
+    assert_eq!(
+        cl.stat("/dangling").unwrap().unwrap().metadata["symlink"],
+        "../missing & 中文%?#"
+    );
+    let after = cl.stat("/target").unwrap().unwrap();
+    assert_eq!(before.version, after.version);
+    assert_eq!(before.metadata, after.metadata);
+    assert_eq!(cl.get("/target").unwrap(), b"target unchanged");
+    c.shutdown();
+}
+
+#[test]
+fn reclaim_preserves_symlinks_without_resolving_targets() {
+    use tape_rs::ltfs::{index::Xattr, volume::LtfsVolume};
+    use tape_rs::tapefs::{ClientBackend, ROOT_INO, TapeFs};
+    let lib = SimLibrary::new(2, 6, 1);
+    for (i, b) in ["PA0001L8", "PA0002L8"].iter().enumerate() {
+        lib.insert_cartridge(SimCartridge::blank(b, 64 << 20), i)
+            .unwrap();
+    }
+    lib.load_into_drive("PA0001L8", 0).unwrap();
+    let dev = lib.drive_as(0, 50);
+    mkltfs(
+        &dev,
+        &MkltfsOptions {
+            volume_id: "LINKS".into(),
+            block_size: 64 * 1024,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let links = [
+        ("link", "target"),
+        ("dangling", "missing"),
+        ("loop", "loop"),
+        ("absolute", "/target"),
+        ("chain", "link"),
+        ("directory", "dir"),
+    ];
+    let original;
+    {
+        let mut vol = LtfsVolume::mount(&dev).unwrap();
+        vol.append_file("/target", &mut &b"target content"[..])
+            .unwrap();
+        vol.create_directory("/dir").unwrap();
+        for (name, target) in links {
+            vol.add_symlink(&format!("/{name}"), target).unwrap();
+            vol.set_node_xattr(
+                &format!("/{name}"),
+                Xattr {
+                    key: "binary".into(),
+                    value: "AP8=".into(),
+                    base64: true,
+                },
+                false,
+                false,
+            )
+            .unwrap();
+        }
+        vol.set_node_readonly("/dangling", true).unwrap();
+        vol.commit().unwrap();
+        original = vol.index().clone();
+    }
+    let c = Cluster::start_lib(
+        "reclaim-symlinks",
+        false,
+        lib,
+        100,
+        &["PA0001L8", "PA0002L8"],
+    );
+    let (leader, round) = c.wait_serving(None, 0);
+    c.wait("链接服务开放", || {
+        c.services[&leader].serving_round() == Some(round)
+    });
+    let endpoints = c.start_http();
+    let mut cl = Client::new(endpoints.clone());
+    c.admin(Command::TapeReclaim {
+        barcode: "PA0001L8".into(),
+    });
+    c.wait("链接回收结束", || c.st(leader).last_reclaim.is_some());
+    let outcome = c.st(leader).last_reclaim.unwrap();
+    assert_eq!(outcome.outcome, "done", "{outcome:?}");
+    for (name, target) in links {
+        let st = cl.stat(&format!("/{name}")).unwrap().unwrap();
+        assert_eq!(st.barcode, "PA0002L8");
+        assert_eq!(st.length, 0);
+        assert_eq!(st.metadata["kind"], "symlink");
+        assert_eq!(st.metadata["symlink"], target);
+        assert_eq!(
+            st.metadata["modify_time"],
+            original.find_file(name).unwrap().meta.modify_time
+        );
+        assert!(
+            st.metadata["xattrs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x["key"] == "binary" && x["value"] == "AP8=" && x["base64"] == true)
+        );
+    }
+    // Inspect the actual destination index: all timestamps/readonly/xattrs survive,
+    // link nodes have no data extents and newly allocated UIDs are unique.
+    let cart = c.lib.cartridge("PA0002L8").unwrap();
+    let detached = SimLibrary::new(1, 2, 0);
+    detached.insert_cartridge(cart, 0).unwrap();
+    detached.load_into_drive("PA0002L8", 0).unwrap();
+    let detached_drive = detached.drive(0);
+    let recovered = LtfsVolume::mount(&detached_drive).unwrap();
+    let moved = recovered.index();
+    let mut uids = std::collections::HashSet::new();
+    moved.walk_files(|_, f| {
+        assert!(uids.insert(f.meta.file_uid));
+    });
+    moved.walk_directories(|_, d| {
+        assert!(uids.insert(d.meta.file_uid));
+    });
+    for (name, _) in links {
+        let old = original.find_file(name).unwrap();
+        let node = moved.find_file(name).unwrap();
+        let mut expected = old.meta.clone();
+        expected.file_uid = node.meta.file_uid;
+        assert_eq!(node.meta, expected);
+        assert!(node.extents.is_empty());
+        assert_eq!(node.symlink, old.symlink);
+        for attr in &old.xattrs {
+            assert!(node.xattrs.contains(attr));
+        }
+    }
+    c.isolated.lock().unwrap().insert(leader);
+    let (next, next_round) = c.wait_serving(Some(leader), round + 1);
+    c.wait("链接回收后接管", || {
+        c.services[&next].serving_round() == Some(next_round)
+    });
+    let fs = TapeFs::new(
+        ClientBackend::new(Client::new(endpoints)),
+        c.dir.join("link-reclaim-cache"),
+    )
+    .unwrap();
+    for (name, target) in links {
+        let attr = fs.lookup(ROOT_INO, name).unwrap();
+        assert!(attr.is_symlink);
+        assert_eq!(fs.readlink(attr.ino).unwrap(), target.as_bytes());
+    }
+    assert_eq!(cl.get("/target").unwrap(), b"target content");
+    c.shutdown();
 }

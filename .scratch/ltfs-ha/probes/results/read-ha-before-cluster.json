@@ -1,0 +1,47 @@
+[
+  {
+    "drives": 2,
+    "executor": {
+      "fenced": true,
+      "node": 3,
+      "round": 119
+    },
+    "id": 1,
+    "last_reclaim": null,
+    "leader": 3,
+    "local": "空闲",
+    "role": "Follower",
+    "serving_round": null,
+    "term": 12
+  },
+  {
+    "drives": 2,
+    "executor": {
+      "fenced": true,
+      "node": 3,
+      "round": 119
+    },
+    "id": 2,
+    "last_reclaim": null,
+    "leader": 3,
+    "local": "空闲",
+    "role": "Follower",
+    "serving_round": null,
+    "term": 12
+  },
+  {
+    "drives": 2,
+    "executor": {
+      "fenced": true,
+      "node": 3,
+      "round": 119
+    },
+    "id": 3,
+    "last_reclaim": null,
+    "leader": 3,
+    "local": "轮次 119：服务中。IBMtaper2287 (/dev/sg6) [RT2502L8]: gen=46 文件 24 个 尾部 Complete；可用 90 MiB",
+    "role": "Leader",
+    "serving_round": 119,
+    "term": 12
+  }
+]

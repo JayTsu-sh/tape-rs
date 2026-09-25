@@ -25,6 +25,8 @@ enum Cmd {
     },
     /// 读出已提交的文件
     Get { path: String, output: String },
+    /// 删除文件并等墓碑落带（不立即回收介质空间）
+    Delete { path: String },
     /// 查询路径状态：已提交 / 上传中 / 已暂存
     Stat { path: String },
     /// 列出已提交的全部文件；给出 --dir 时只列该目录的直接子项
@@ -82,21 +84,26 @@ fn main() {
     let r: Result<(), Box<dyn std::error::Error>> = (|| {
         match args.cmd {
             Cmd::Put { file, path, new } => {
-                let data = std::fs::read(&file)?;
-                let o = if new { c.put_new(&path, &data)? } else { c.put(&path, &data)? };
+                let local = std::path::Path::new(&file);
+                let len = std::fs::metadata(local)?.len();
+                let o = c.put_file(&path, local, new, true)?;
                 println!(
                     "已提交 {} ({} 字节) 索引代数 {}  请求次数 {}{}",
                     path,
-                    data.len(),
+                    len,
                     o.generation,
                     o.attempts,
                     if o.resolved_by_query { "  (经查询判定)" } else { "" }
                 );
             }
             Cmd::Get { path, output } => {
-                let d = c.get(&path)?;
-                std::fs::write(&output, &d)?;
-                println!("{} -> {} ({} 字节)", path, output, d.len());
+                let mut out = std::fs::File::create(&output)?;
+                let len = c.get_to(&path, &mut out)?;
+                println!("{} -> {} ({} 字节)", path, output, len);
+            }
+            Cmd::Delete { path } => {
+                c.delete(&path)?;
+                println!("已删除 {}（墓碑已落带）", path);
             }
             Cmd::Stat { path } => match c.stat_path(&path)? {
                 None => println!("不存在"),

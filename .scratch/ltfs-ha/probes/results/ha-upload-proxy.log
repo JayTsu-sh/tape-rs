@@ -1,0 +1,7 @@
+READY 7605 10.131.9.74
+REQUEST PUT /files/rc/ha-upload.bin?wait=1 target True
+EVENT {"method": "PUT", "path": "/files/rc/ha-upload.bin?wait=1", "mode": "partial", "forwarded": 65536, "remaining": 4128768, "upstream": "10.131.9.74"}
+PROXY_ERROR ConnectionRefusedError(111, 'Connection refused')
+PROXY_ERROR ConnectionRefusedError(111, 'Connection refused')
+PROXY_ERROR ConnectionRefusedError(111, 'Connection refused')
+PROXY_ERROR ConnectionRefusedError(111, 'Connection refused')

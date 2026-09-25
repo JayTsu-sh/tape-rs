@@ -1,0 +1,19 @@
+READY
+{"request": "GET /stat/rc/ha-upload.bin HTTP/1.1", "status": 200, "length": 471, "error": null}
+{"request": "GET /stat/rc/ha-upload.bin HTTP/1.1", "status": 200, "length": 471, "error": null}
+{"request": "GET /stat/rc/ha-upload.bin HTTP/1.1", "status": 200, "length": 471, "error": null}
+{"request": "GET /files/rc/ha-upload.bin HTTP/1.1", "status": 200, "length": 4194304, "error": null}
+{"request": "GET /files/rc/ha-upload.bin HTTP/1.1", "status": 200, "length": 4194304, "error": null}
+{"request": "GET /files/rc/ha-upload.bin HTTP/1.1", "status": 200, "length": 4194304, "error": null}
+{"request": "GET /files/rc/ha-upload.bin HTTP/1.1", "status": 200, "length": 4194304, "error": null}
+{"request": "GET /files/rc/ha-upload.bin HTTP/1.1", "status": 200, "length": 4194304, "error": null}
+{"request": "GET /files/rc/ha-upload.bin HTTP/1.1", "status": 206, "length": 65536, "error": null}
+{"request": "GET /stat/rc/ha-upload.bin HTTP/1.1", "status": 200, "length": 471, "error": null}
+{"request": "GET /stat/rc/ha-upload.bin HTTP/1.1", "status": 200, "length": 471, "error": null}
+{"request": "GET /stat/rc/ha-upload.bin HTTP/1.1", "status": 200, "length": 471, "error": null}
+{"request": "GET /files/rc/ha-upload.bin HTTP/1.1", "status": 200, "length": 4194304, "error": null}
+{"request": "GET /files/rc/ha-upload.bin HTTP/1.1", "status": 200, "length": 4194304, "error": null}
+{"request": "GET /files/rc/ha-upload.bin HTTP/1.1", "status": 200, "length": 4194304, "error": null}
+{"request": "GET /files/rc/ha-upload.bin HTTP/1.1", "status": 503, "length": 138, "error": "{\"detail\":\"\u7a0d\u540e\u91cd\u8bd5: \u8bfb\u53d6\u6587\u4ef6\u5931\u8d25: SCSI command failed: status=0x02, sense_key=0x06, asc=0x2a, ascq=0x05\",\"error\":\"drive_busy\"}\n"}
+{"request": "GET /files/rc/ha-upload.bin HTTP/1.1", "status": 503, "length": 175, "error": "{\"detail\":\"\u8bfb\u53d6\u6587\u4ef6\u5931\u8d25: SCSI command failed: status=0x02, sense_key=0x06, asc=0x2a, ascq=0x05\",\"error\":\"not_serving\",\"leader\":3,\"leader_url\":\"http://10.131.9.74:7501\"}\n"}
+{"request": "GET /files/rc/ha-upload.bin HTTP/1.1", "status": 503, "length": 175, "error": "{\"detail\":\"\u8bfb\u53d6\u6587\u4ef6\u5931\u8d25: SCSI command failed: status=0x02, sense_key=0x06, asc=0x2a, ascq=0x05\",\"error\":\"not_serving\",\"leader\":3,\"leader_url\":\"http://10.131.9.74:7501\"}\n"}

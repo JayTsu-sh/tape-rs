@@ -508,6 +508,9 @@ html { scroll-behavior: smooth; }
   <section id="node">
     <h2>ltfsd 节点内部 <span class="tag">线程 · 通道 · 文件</span></h2>
     <p>设备操作可能要几分钟，所以设备只由执行线程访问，绝不放在 Raft 循环里。线程之间只通过 <code>mpsc</code> 通道和共享的 <code>FileService</code> 交互。</p>
+    <p>文件下载通过 <code>ReadTo</code> 请求：执行线程分块读带并写入匿名暂存文件，成功后把句柄交还 HTTP 线程流式发送。慢客户端不继续占用设备线程；Range 当前从完整暂存文件切片，临时磁盘用量随文件大小增长。</p>
+    <p>tape-fuse 使用内核页缓存和 write-through；同一 inode 的句柄共享本地文件，覆盖/截断立即可见。删除仅解除路径，旧引用保持对象，同名重建分配新 inode。close 仅暂存，写句柄 fsync 等待归档；不启用异步 writeback-cache。已有引用期间检测到远端内容变化时，新 open 返回 ESTALE，避免混用页缓存。</p>
+    <p>文件目录记录同时传递版本、索引修改时间和原始扩展属性：CatalogPart → SQLite → FileService → HTTP stat → FUSE。旧记录缺少的元数据保持未知，目录迁移不会主动读取设备。</p>
     <figure>
       <div class="canvas">
         <svg viewBox="0 0 1000 520" role="img" aria-label="ltfsd 节点内部：HTTP 线程、Raft 循环、执行线程、事件转发线程、网络线程、目录库拉取线程，以及 raft.db、directory.db、spool 三类持久化文件之间的通道。">
@@ -946,6 +949,9 @@ html { scroll-behavior: smooth; }
       <figcaption>reclaim 从 <code>appendable</code>、<code>data_full</code>、<code>full</code> 都可以发起（图中只画了后两条）；<code>label_mismatch</code> 和 <code>check</code> 需要先人工处理。重新格式化源带前必须通过两道闸：目录里已经没有任何一行指向它，而且源带自己索引里的每条路径都能在别的带上找到。<code>TapeReclaimed</code> 是唯一允许摘要代数回退的地方。</figcaption>
     </figure>
   </section>
+
+  <p>2026-09-24：mkdir/rmdir 已复用文件准入、合批提交与 Raft 目录发布流程；目录在 LTFS 中保持原生节点，catalog 通过 metadata.kind 区分，空目录和目录墓碑均纳入回收与格式化前的核验。FUSE 的成功响应以索引提交为准。</p>
+  <p>当前写入卷内 rename：在同一批次预留和提交源/目标子树，原生节点保留 UID 与 extent，旧路径逐项写版本化墓碑。跨带返回 EXDEV。FUSE 保留 inode 并切换打开句柄路径，提交结果未定时停止挂载后续写入，等待核对及重挂载。</p>
 
   <footer>依据 <code>src/</code>、<code>CLAUDE.md</code> 与 <code>.scratch/ltfs-ha/</code> 整理，对应提交 a605260。目前的“硬件”结论都来自 Holo-VTL，真实 LTO-8 / TS4300 固件的行为尚未验证。</footer>
 </div>

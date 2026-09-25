@@ -1,0 +1,47 @@
+[
+  {
+    "drives": 2,
+    "executor": {
+      "fenced": true,
+      "node": 1,
+      "round": 202
+    },
+    "id": 1,
+    "last_reclaim": null,
+    "leader": 1,
+    "local": "轮次 202：服务中。IBMtaper2287 (/dev/sg10) [TS1001L08]: gen=58 文件 25 个 尾部 Complete；可用 39 MiB",
+    "role": "Leader",
+    "serving_round": 202,
+    "term": 24
+  },
+  {
+    "drives": 2,
+    "executor": {
+      "fenced": true,
+      "node": 1,
+      "round": 202
+    },
+    "id": 2,
+    "last_reclaim": null,
+    "leader": 1,
+    "local": "空闲",
+    "role": "Follower",
+    "serving_round": null,
+    "term": 24
+  },
+  {
+    "drives": 2,
+    "executor": {
+      "fenced": true,
+      "node": 1,
+      "round": 202
+    },
+    "id": 3,
+    "last_reclaim": null,
+    "leader": 1,
+    "local": "空闲",
+    "role": "Follower",
+    "serving_round": null,
+    "term": 24
+  }
+]

@@ -12,7 +12,7 @@
 //! 同一批里把墓碑写到当前写入带上（见 `ltfs::volume::TOMBSTONE_DIR`）。`/.tapers/` 是保留目录，
 //! 客户端路径不能落在里面。
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -28,7 +28,8 @@ use super::state::FileRec;
 
 /// 一盘带索引里的全部目录记录与活着的字节数。墓碑按它记的被删路径报告（`deleted`），
 /// 墓碑目录下没有 `tapers.deletedPath` 的文件不认。同一盘带上一个路径只应有一条记录
-/// （写入会去掉同带上的墓碑，删除会去掉同带上的文件）；万一有两条，取版本大的。
+/// （写入会去掉同带上的墓碑，删除会去掉同带上的文件）。外部 LTFS 改回旧名时
+/// 可能保留私有墓碑；此时原生节点是本卷现状，优先于墓碑，但不提升其跨带版本。
 pub fn catalog_of(index: &LtfsIndex) -> (Vec<FileRec>, u64) {
     let mut by_path: BTreeMap<String, FileRec> = BTreeMap::new();
     let mut bytes = 0u64;
@@ -36,10 +37,18 @@ pub fn catalog_of(index: &LtfsIndex) -> (Vec<FileRec>, u64) {
         let version = f.xattr(XATTR_VERSION).and_then(parse_version).unwrap_or((0, 0));
         let rec = if is_tombstone_path(p) {
             let Some(target) = f.xattr(XATTR_DELETED_PATH) else { return };
-            FileRec { path: target.to_string(), length: 0, sha256: String::new(), version, deleted: true }
+            FileRec { metadata: if f.xattr("tapers.deletedKind") == Some("directory") { serde_json::json!({"kind":"directory"}) } else { serde_json::Value::Null }, path: target.to_string(), length: 0, sha256: String::new(), version, deleted: true }
         } else {
             bytes += f.length;
-            FileRec {
+            let mut metadata = serde_json::json!({
+                "modify_time": f.meta.modify_time,
+                "xattrs": f.xattrs.iter().map(|x| serde_json::json!({"key": x.key, "value": x.value, "base64": x.base64})).collect::<Vec<_>>()
+            });
+            if let Some(target) = &f.symlink {
+                metadata["kind"] = serde_json::json!("symlink");
+                metadata["symlink"] = serde_json::json!(target);
+            }
+            FileRec { metadata,
                 path: format!("/{}", p),
                 length: f.length,
                 sha256: f.xattr(crate::ltfs::index::XATTR_SHA256).unwrap_or("").to_string(),
@@ -48,13 +57,85 @@ pub fn catalog_of(index: &LtfsIndex) -> (Vec<FileRec>, u64) {
             }
         };
         match by_path.get(&rec.path) {
-            Some(old) if old.version >= rec.version => {}
+            Some(old)
+                if (rec.deleted && !old.deleted)
+                    || (old.deleted == rec.deleted && old.version >= rec.version) => {}
             _ => {
                 by_path.insert(rec.path.clone(), rec);
             }
         }
     });
+    index.walk_directories(|p, d| {
+        if p == ".tapers" || p.starts_with(".tapers/") { return; }
+        let version = d.xattrs.iter().find(|x| x.key == XATTR_VERSION).and_then(|x| parse_version(&x.value)).unwrap_or_default();
+        let rec = FileRec {
+            path: format!("/{}", p), length: 0, sha256: String::new(), version, deleted: false,
+            metadata: serde_json::json!({"kind": "directory", "modify_time": d.meta.modify_time, "xattrs": d.xattrs.iter().map(|x| serde_json::json!({"key":x.key,"value":x.value,"base64":x.base64})).collect::<Vec<_>>(), "node": {"readonly":d.meta.readonly,"creation_time":d.meta.creation_time,"change_time":d.meta.change_time,"modify_time":d.meta.modify_time,"access_time":d.meta.access_time,"backup_time":d.meta.backup_time}}),
+        };
+        if by_path.get(&rec.path).is_none_or(|old| old.deleted || old.version < rec.version) {
+            by_path.insert(rec.path.clone(), rec);
+        }
+    });
     (by_path.into_values().collect(), bytes)
+}
+
+pub(crate) fn directory_metadata(
+    value: &serde_json::Value,
+) -> Result<crate::ltfs::volume::FileMetadata, ServiceError> {
+    let parse = || -> Option<crate::ltfs::volume::FileMetadata> {
+        let n = &value["node"];
+        Some(crate::ltfs::volume::FileMetadata {
+            meta: crate::ltfs::index::NodeMeta {
+                readonly: n["readonly"].as_bool()?,
+                creation_time: n["creation_time"].as_str()?.into(),
+                change_time: n["change_time"].as_str()?.into(),
+                modify_time: n["modify_time"].as_str()?.into(),
+                access_time: n["access_time"].as_str()?.into(),
+                backup_time: n["backup_time"].as_str()?.into(),
+                file_uid: 0,
+            },
+            xattrs: value["xattrs"]
+                .as_array()?
+                .iter()
+                .map(|x| {
+                    Some(crate::ltfs::index::Xattr {
+                        key: x["key"].as_str()?.into(),
+                        value: x["value"].as_str()?.into(),
+                        base64: x["base64"].as_bool()?,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
+        })
+    };
+    parse().ok_or_else(|| ServiceError::Io("目录属性损坏，拒绝有损搬迁".into()))
+}
+
+pub(crate) fn is_directory(metadata: &serde_json::Value) -> bool {
+    metadata["kind"] == "directory"
+}
+
+/// Linux用户属性到LTFS属性名；内部元数据和虚拟属性不允许绕过服务修改。
+pub fn writable_xattr_key(name: &str) -> Result<&str, ServiceError> {
+    let key = name
+        .strip_prefix("user.")
+        .ok_or_else(|| ServiceError::ProtectedAttribute(name.into()))?;
+    if key.is_empty()
+        || key.starts_with("user.")
+        || name.len() > 255
+        || name
+            .chars()
+            .any(|c| c.is_control() || c == '\u{fffe}' || c == '\u{ffff}')
+    {
+        return Err(ServiceError::BadPath("扩展属性名非法".into()));
+    }
+    let reserved = key.trim_start_matches("user.");
+    if ["tapers.", "tape.", "ltfs."]
+        .iter()
+        .any(|p| reserved.starts_with(p))
+    {
+        return Err(ServiceError::ProtectedAttribute(name.into()));
+    }
+    Ok(key)
 }
 
 /// 版本属性的文本形式是 `轮次.序号`。认不出来的按 (0, 0) 处理：它抢不走任何路径。
@@ -120,6 +201,13 @@ pub enum ServiceError {
     Exists(String),
     /// 删除：路径没有已提交的当前版本（从未有过，或已被删除）。
     NotFound(String),
+    IsDirectory(String),
+    NotDirectory(String),
+    NotEmpty(String),
+    CrossDevice(String),
+    NoAttribute(String),
+    ProtectedAttribute(String),
+    AttributeTooLarge,
     InsufficientCapacity { requested: u64, available: u64 },
     NotWritable(String),
     BadPath(String),
@@ -136,9 +224,16 @@ impl std::fmt::Display for ServiceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ServiceError::NotServing(s) => write!(f, "本节点不在服务: {}", s),
-            ServiceError::PathBusy(p) => write!(f, "路径正在上传: {}", p),
+            ServiceError::PathBusy(p) => write!(f, "路径或其父子路径正在变更: {}", p),
             ServiceError::Exists(p) => write!(f, "路径已存在: {}", p),
             ServiceError::NotFound(p) => write!(f, "路径不存在: {}", p),
+            ServiceError::IsDirectory(p) => write!(f, "路径是目录: {}", p),
+            ServiceError::CrossDevice(p) => write!(f, "此元数据操作要求对象位于当前写入卷: {}", p),
+            ServiceError::NoAttribute(p) => write!(f, "扩展属性不存在: {}", p),
+            ServiceError::ProtectedAttribute(p) => write!(f, "扩展属性不可修改: {}", p),
+            ServiceError::AttributeTooLarge => write!(f, "扩展属性超过65536字节"),
+            ServiceError::NotEmpty(p) => write!(f, "目录非空: {}", p),
+            ServiceError::NotDirectory(p) => write!(f, "父路径不是目录: {}", p),
             ServiceError::InsufficientCapacity { requested, available } => {
                 write!(f, "空间不足: 需要 {} 可用 {}", requested, available)
             }
@@ -162,6 +257,13 @@ pub struct Upload {
     pub len: u64,
     /// 这是一次删除：没有内容，落带时写墓碑
     pub delete: bool,
+    pub(crate) directory: bool,
+    pub(crate) symlink_target: Option<String>,
+    /// 同卷引用改名：(原路径，是否为整棵子树的根操作)。
+    pub(crate) rename_from: Option<(String, bool)>,
+    /// (索引属性名，设置值；None表示删除)，只修改原生节点。
+    pub(crate) xattr_change: Option<(String, Option<crate::ltfs::index::Xattr>)>,
+    pub(crate) metadata: Option<crate::ltfs::volume::FileMetadata>,
 }
 
 /// 上传途中的句柄。`finish` 或 `abort` 二选一。
@@ -184,6 +286,8 @@ pub struct Stat {
     /// 墓碑：路径在这里被删除（`barcode` 是墓碑所在的带）。`stat` 从不返回这种记录，
     /// 只有 `lookup` 会。
     pub deleted: bool,
+    pub version: (u64, u64),
+    pub metadata: serde_json::Value,
 }
 
 /// 路径上未提交的变更。
@@ -224,6 +328,7 @@ pub enum DirEntry {
 }
 
 struct Serving {
+    draining: bool,
     round: u64,
     state: Arc<VolumeState>,
     queue: VecDeque<Upload>,
@@ -232,6 +337,7 @@ struct Serving {
     oldest: Option<Instant>,
     newest: Option<Instant>,
     in_batch: Vec<u64>,
+    namespace_pending: BTreeSet<String>,
     opened: Instant,
     tape: TapeIdent,
     limits: TapeLimits,
@@ -268,7 +374,7 @@ pub struct FileService {
 
 fn norm(path: &str) -> Result<String, ServiceError> {
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    if parts.is_empty() || parts.iter().any(|p| *p == "." || *p == "..") || path.ends_with('/') {
+    if parts.is_empty() || parts.iter().any(|p| *p == "." || *p == ".." || p.contains('\0')) || path.ends_with('/') {
         return Err(ServiceError::BadPath(path.to_string()));
     }
     // 墓碑目录（`ltfs::volume::TOMBSTONE_DIR`）所在的保留目录
@@ -278,9 +384,37 @@ fn norm(path: &str) -> Result<String, ServiceError> {
     Ok(format!("/{}", parts.join("/")))
 }
 
-/// 本轮刚落带的 `recent` 里有这个路径的当前版本。
-fn recent_live(s: &Serving, path: &str) -> bool {
-    s.recent.get(path).is_some_and(|st| !st.deleted)
+/// 必须按路径分量比较：/a 与 /ab 不冲突，/a 与 /a/b 冲突。
+fn descendant(path: &str, parent: &str) -> bool {
+    path.strip_prefix(parent)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn check_pending(s: &Serving, path: &str) -> Result<(), ServiceError> {
+    if s.state
+        .load()
+        .pending
+        .keys()
+        .any(|p| p == path || descendant(p, path) || descendant(path, p))
+    {
+        return Err(ServiceError::PathBusy(path.into()));
+    }
+    Ok(())
+}
+
+fn check_file_namespace(
+    s: &Serving,
+    path: &str,
+    live: &BTreeMap<String, bool>,
+) -> Result<(), ServiceError> {
+    check_pending(s, path)?;
+    if let Some((parent, _)) = live.iter().find(|(p, dir)| !**dir && descendant(path, p)) {
+        return Err(ServiceError::NotDirectory(parent.clone()));
+    }
+    if live.get(path) == Some(&true) || live.keys().any(|p| descendant(p, path)) {
+        return Err(ServiceError::IsDirectory(path.into()));
+    }
+    Ok(())
 }
 
 fn in_flight_of(e: &crate::core::volume_state::PendingEntry) -> InFlight {
@@ -320,6 +454,15 @@ pub fn committed_view(index: &LtfsIndex) -> Arc<DirNode> {
 }
 
 impl FileService {
+    /// 下载暂存文件创建后立即 unlink，最后一个句柄关闭时由内核回收。
+    pub fn read_spool(&self) -> std::io::Result<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = self.spool_dir.join(format!("read-{}", uuid::Uuid::new_v4()));
+        let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path)?;
+        std::fs::remove_file(path)?;
+        Ok(file)
+    }
+
     pub fn new(spool_dir: PathBuf) -> std::io::Result<Arc<Self>> {
         Self::with_options(spool_dir, BatchPolicy::default(), None)
     }
@@ -357,10 +500,41 @@ impl FileService {
     // ---------- 执行线程一侧 ----------
 
     /// 接管完成：以恢复得到的视图开放服务。
-    pub fn open(&self, round: u64, tape: TapeIdent, limits: TapeLimits, index: &LtfsIndex, free_bytes: u64, writable: bool) {
-        let state = Arc::new(VolumeState::new(round, committed_view(index), index.generation, free_bytes, writable));
+    pub fn open(
+        &self,
+        round: u64,
+        tape: TapeIdent,
+        limits: TapeLimits,
+        index: &LtfsIndex,
+        free_bytes: u64,
+        writable: bool,
+    ) {
+        let state = Arc::new(VolumeState::new(
+            round,
+            committed_view(index),
+            index.generation,
+            free_bytes,
+            writable,
+        ));
+        let mut records = Vec::new();
+        for r in catalog_of(index).0 {
+            if self.directory_path.is_some() {
+                match self.with_reader(|d| Some(d.lookup(&tape.pool_uuid, &r.path))) {
+                    Some(Ok(Some(old))) if old.barcode != tape.barcode && old.version >= r.version => {
+                        continue;
+                    }
+                    Some(Ok(_)) => {}
+                    _ => {
+                        self.close("无法读取目录，不能安全开放命名空间");
+                        return;
+                    }
+                }
+            }
+            records.push(r);
+        }
         let mut g = self.lock();
         g.serving = Some(Serving {
+            draining: false,
             round,
             state,
             queue: VecDeque::new(),
@@ -368,6 +542,7 @@ impl FileService {
             oldest: None,
             newest: None,
             in_batch: Vec::new(),
+            namespace_pending: BTreeSet::new(),
             opened: Instant::now(),
             limits,
             admitted: 0,
@@ -375,8 +550,7 @@ impl FileService {
             recent: {
                 // 当前装着的这盘带以刚读到的索引为准，不必等目录经 Raft 对账。墓碑也记下：
                 // 本带上删掉的路径不能再从目录库里查出旧副本
-                catalog_of(index)
-                    .0
+                records
                     .into_iter()
                     .map(|r| {
                         let st = Stat {
@@ -386,6 +560,8 @@ impl FileService {
                             barcode: tape.barcode.clone(),
                             sha256: r.sha256,
                             deleted: r.deleted,
+                            version: r.version,
+                            metadata: r.metadata,
                         };
                         (r.path, st)
                     })
@@ -434,6 +610,11 @@ impl FileService {
     /// 执行线程询问：当前这盘带是否需要换掉，换成什么状态。
     pub fn switch_requested(&self, round: u64) -> Option<&'static str> {
         self.lock().serving.as_ref().filter(|s| s.round == round).and_then(|s| s.switch)
+    }
+
+    /// 关闭新入队入口，保留已完成队列供计划停机落带。
+    pub fn drain(&self) {
+        if let Some(s) = self.lock().serving.as_mut() { s.draining = true; }
     }
 
     /// 停止服务。仅暂存的任务判失败，已进入提交批次的判结果未定。
@@ -510,24 +691,38 @@ impl FileService {
     }
 
     /// 批次落带结果。成功则发布到已提交视图；失败则这些任务结果未定，由调用方决定是否停止服务。
-    /// `result` 成功时带索引代数，以及每个文件由写带过程算出的 sha256（路径 → 十六进制）。
+    /// `result` 成功时带索引代数，以及每个路径从已提交索引提取的目录记录（含哈希和元数据）。
     pub fn batch_done(
         &self,
         round: u64,
         batch: &FrozenBatch,
         uploads: &[Upload],
-        result: Result<(u64, HashMap<String, String>), String>,
+        result: Result<(u64, HashMap<String, FileRec>), String>,
     ) {
         let mut g = self.lock();
         let Some(s) = g.serving.as_mut().filter(|s| s.round == round) else {
             return;
         };
         s.in_batch.clear();
+        for u in uploads {
+            s.namespace_pending.remove(&u.path);
+        }
         // 这些上传离开了流水线：成功的从此计入"带上已有文件"，不能再算在已准入里
         s.admitted = s.admitted.saturating_sub(uploads.len() as u64);
         let outcome = match result {
             Ok((tape_generation, hashes)) => {
-                match s.state.publish(batch, S4Evidence { batch_id: batch.batch_id, generation: batch.generation }) {
+                match s.state.publish_namespace(
+                    batch,
+                    S4Evidence {
+                        batch_id: batch.batch_id,
+                        generation: batch.generation,
+                    },
+                    &uploads
+                        .iter()
+                        .filter(|u| u.directory)
+                        .map(|u| u.path.clone())
+                        .collect(),
+                ) {
                     Ok(_) => {
                         for u in uploads {
                             let st = Stat {
@@ -535,10 +730,33 @@ impl FileService {
                                 generation: tape_generation,
                                 round,
                                 barcode: s.tape.barcode.clone(),
-                                sha256: hashes.get(&u.path).cloned().unwrap_or_default(),
+                                sha256: hashes
+                                    .get(&u.path)
+                                    .map(|r| r.sha256.clone())
+                                    .unwrap_or_default(),
+                                version: hashes.get(&u.path).map(|r| r.version).unwrap_or_default(),
+                                metadata: hashes
+                                    .get(&u.path)
+                                    .map(|r| r.metadata.clone())
+                                    .unwrap_or_default(),
                                 deleted: u.delete,
                             };
                             s.recent.insert(u.path.clone(), st);
+                        }
+                        for r in hashes.values() {
+                            s.recent.insert(
+                                r.path.clone(),
+                                Stat {
+                                    len: r.length,
+                                    generation: tape_generation,
+                                    round,
+                                    barcode: s.tape.barcode.clone(),
+                                    sha256: r.sha256.clone(),
+                                    version: r.version,
+                                    metadata: r.metadata.clone(),
+                                    deleted: r.deleted,
+                                },
+                            );
                         }
                         Ok(tape_generation)
                     }
@@ -552,7 +770,9 @@ impl FileService {
                 let _ = std::fs::remove_file(&u.spool);
             }
             let st = match &outcome {
-                Ok(generation) => TaskStatus::Committed { generation: *generation },
+                Ok(generation) => TaskStatus::Committed {
+                    generation: *generation,
+                },
                 Err(e) => TaskStatus::Indeterminate { reason: e.clone() },
             };
             g.tasks.insert(u.task, st);
@@ -562,19 +782,70 @@ impl FileService {
 
     // ---------- 客户端一侧 ----------
 
+    /// 数据库查询不持有服务锁；准入时核对同一个卷实例，并用 recent 覆盖查询期间的发布。
+    fn namespace_snapshot(
+        &self,
+        path: &str,
+    ) -> Result<(Arc<VolumeState>, BTreeMap<String, bool>), ServiceError> {
+        let (state, pool) = {
+            let g = self.lock();
+            let s = g.serving.as_ref().ok_or_else(|| {
+                if g.no_tape {
+                    ServiceError::NoTape(g.why_not.clone())
+                } else {
+                    ServiceError::NotServing(g.why_not.clone())
+                }
+            })?;
+            (Arc::clone(&s.state), s.tape.pool_uuid.clone())
+        };
+        let live = if self.directory_path.is_some() {
+            self.with_reader(|d| Some(d.namespace_nodes(&pool, path)))
+                .ok_or_else(|| ServiceError::Io("无法读取目录，不能判定路径冲突".into()))?
+                .map_err(|e| ServiceError::Io(format!("查询路径冲突失败: {}", e)))?
+        } else {
+            BTreeMap::new()
+        };
+        Ok((state, live))
+    }
+
+    fn admission_view(
+        s: &Serving,
+        state: &Arc<VolumeState>,
+        path: &str,
+        mut live: BTreeMap<String, bool>,
+    ) -> Result<BTreeMap<String, bool>, ServiceError> {
+        if !Arc::ptr_eq(&s.state, state) {
+            return Err(ServiceError::NotServing(
+                "查询期间服务卷已切换，请重试".into(),
+            ));
+        }
+        for (p, st) in &s.recent {
+            if p != path && !descendant(p, path) && !descendant(path, p) {
+                continue;
+            }
+            if st.deleted {
+                live.remove(p);
+            } else {
+                live.insert(p.clone(), is_directory(&st.metadata));
+            }
+        }
+        Ok(live)
+    }
+
     /// 准入：登记路径并预留空间。之后调用方把内容写进 `handle.spool`，边写边 `ingest`。
     pub fn begin(&self, path: &str, len: u64) -> Result<UploadHandle, ServiceError> {
         self.begin_with(path, len, false)
     }
 
     /// `create_only`：路径已有已提交的当前版本就拒绝（`Exists`）。在途的由路径预留拒绝（`PathBusy`）。
-    pub fn begin_with(&self, path: &str, len: u64, create_only: bool) -> Result<UploadHandle, ServiceError> {
+    pub fn begin_with(
+        &self,
+        path: &str,
+        len: u64,
+        create_only: bool,
+    ) -> Result<UploadHandle, ServiceError> {
         let path = norm(path)?;
-        // 本轮之前提交的只在目录库里，查询不能在锁里做；本轮的在 `recent` 里，下面在锁里再看一次，
-        // 因为这两步之间可能正好有一批发布了同一路径。
-        if create_only && self.stat(&path)?.is_some() {
-            return Err(ServiceError::Exists(path));
-        }
+        let (state, live) = self.namespace_snapshot(&path)?;
         let mut g = self.lock();
         let task = g.next_task;
         let why = g.why_not.clone();
@@ -582,18 +853,38 @@ impl FileService {
             return Err(ServiceError::NoTape(why));
         }
         let s = g.serving.as_mut().ok_or(ServiceError::NotServing(why))?;
-        if create_only && recent_live(s, &path) {
+        if s.draining {
+            return Err(ServiceError::NotServing("正在停机".into()));
+        }
+        let live = Self::admission_view(s, &state, &path, live)?;
+        if create_only && live.contains_key(&path) {
             return Err(ServiceError::Exists(path));
         }
+        check_file_namespace(s, &path, &live)?;
         if len > s.limits.usable_capacity {
-            return Err(ServiceError::TooLarge { requested: len, tape_capacity: s.limits.usable_capacity });
+            return Err(ServiceError::TooLarge {
+                requested: len,
+                tape_capacity: s.limits.usable_capacity,
+            });
         }
         if let Some(state) = s.switch {
-            return Err(ServiceError::SwitchingTape(format!("{} 已 {}", s.tape.barcode, state)));
+            return Err(ServiceError::SwitchingTape(format!(
+                "{} 已 {}",
+                s.tape.barcode, state
+            )));
         }
-        if s.recent.len() as u64 + s.admitted >= s.limits.file_limit {
+        if s.recent
+            .values()
+            .filter(|st| !is_directory(&st.metadata))
+            .count() as u64
+            + s.admitted
+            >= s.limits.file_limit
+        {
             s.switch = Some(super::state::tape_state::DATA_FULL);
-            let msg = format!("{} 的文件数已到上限 {}", s.tape.barcode, s.limits.file_limit);
+            let msg = format!(
+                "{} 的文件数已到上限 {}",
+                s.tape.barcode, s.limits.file_limit
+            );
             drop(g);
             self.kick();
             return Err(ServiceError::SwitchingTape(msg));
@@ -602,10 +893,16 @@ impl FileService {
         s.state.open_session(task, u64::MAX);
         match s.state.admit(task, &path, len, now) {
             Ok(_) => {}
-            Err(StateError::InsufficientCapacity { requested, available }) => {
+            Err(StateError::InsufficientCapacity {
+                requested,
+                available,
+            }) => {
                 // 这盘带放不下，但文件并不比单盘大：换下一盘，让调用方稍后重试
                 s.switch = Some(super::state::tape_state::FULL);
-                let msg = format!("{} 剩余 {} 字节，放不下 {} 字节", s.tape.barcode, available, requested);
+                let msg = format!(
+                    "{} 剩余 {} 字节，放不下 {} 字节",
+                    s.tape.barcode, available, requested
+                );
                 drop(g);
                 self.kick();
                 return Err(ServiceError::SwitchingTape(msg));
@@ -615,7 +912,12 @@ impl FileService {
         s.admitted += 1;
         let round = s.round;
         g.next_task += 1;
-        Ok(UploadHandle { task, spool: self.spool_dir.join(format!("task-{}.part", task)), path, round })
+        Ok(UploadHandle {
+            task,
+            spool: self.spool_dir.join(format!("task-{}.part", task)),
+            path,
+            round,
+        })
     }
 
     pub fn ingest(&self, h: &UploadHandle, bytes: u64) -> Result<(), ServiceError> {
@@ -626,12 +928,48 @@ impl FileService {
 
     /// 内容已完整暂存：标记完成并入队，唤醒执行线程。
     pub fn finish(&self, h: UploadHandle, len: u64) -> Result<u64, ServiceError> {
+        // 路径已经准入并持有预留，其他上传/删除不能在这里替换它。
+        // 从目录的当前版本取属性，不能只查当前写带（覆盖可能换到另一盘带）。
+        let metadata = (|| {
+            let Some(current) = self.stat(&h.path)? else {
+                return Ok(None);
+            };
+            let attrs = current.metadata["xattrs"]
+                .as_array()
+                .ok_or_else(|| ServiceError::Io("当前文件缺少扩展属性记录，拒绝有损覆盖".into()))?;
+            let mut xattrs = Vec::with_capacity(attrs.len());
+            for attr in attrs {
+                let malformed = || ServiceError::Io("当前文件扩展属性记录损坏，拒绝覆盖".into());
+                xattrs.push(crate::ltfs::index::Xattr {
+                    key: attr["key"].as_str().ok_or_else(malformed)?.to_string(),
+                    value: attr["value"].as_str().ok_or_else(malformed)?.to_string(),
+                    base64: attr["base64"].as_bool().ok_or_else(malformed)?,
+                });
+            }
+            Ok(Some(crate::ltfs::volume::FileMetadata::replacement(xattrs)))
+        })();
+        match metadata {
+            Ok(metadata) => self.finish_with_metadata(h, len, metadata),
+            Err(e) => {
+                self.abort(h);
+                Err(e)
+            }
+        }
+    }
+
+    pub(crate) fn finish_with_metadata(&self, h: UploadHandle, len: u64, metadata: Option<crate::ltfs::volume::FileMetadata>) -> Result<u64, ServiceError> {
         {
             let mut g = self.lock();
             let why = g.why_not.clone();
             let s = g.serving.as_mut().filter(|s| s.round == h.round).ok_or(ServiceError::NotServing(why))?;
+            if s.draining {
+                let _ = s.state.cancel(h.task);
+                s.admitted = s.admitted.saturating_sub(1);
+                let _ = std::fs::remove_file(&h.spool);
+                return Err(ServiceError::NotServing("正在停机，请重新上传".into()));
+            }
             s.state.complete(&h.path).map_err(map_state)?;
-            s.queue.push_back(Upload { task: h.task, path: h.path.clone(), spool: h.spool.clone(), len, delete: false });
+            s.queue.push_back(Upload { task: h.task, path: h.path.clone(), spool: h.spool.clone(), len, delete: false, symlink_target: None, rename_from: None, xattr_change: None, directory: false, metadata });
             s.queue_bytes += len;
             let now = Instant::now();
             s.oldest.get_or_insert(now);
@@ -705,12 +1043,21 @@ impl FileService {
                 (None, None) => return Err(ServiceError::NotServing(g.why_not.clone())),
             }
         };
-        Ok(self.with_reader(|d| d.stat(&pool, &path).ok().flatten()).map(|f| Stat {
+        let current = if self.directory_path.is_some() {
+            self.with_reader(|d| Some(d.stat(&pool, &path)))
+                .ok_or_else(|| ServiceError::Io("无法读取目录，不能判定文件是否存在".into()))?
+                .map_err(|e| ServiceError::Io(format!("查询文件目录失败: {}", e)))?
+        } else {
+            None
+        };
+        Ok(current.map(|f| Stat {
             len: f.length,
             generation: f.generation,
             round,
             barcode: f.barcode,
             sha256: f.sha256,
+            version: f.version,
+            metadata: f.metadata,
             deleted: false,
         }))
     }
@@ -732,12 +1079,21 @@ impl FileService {
                 (None, None) => return Err(ServiceError::NotServing(g.why_not.clone())),
             }
         };
-        Ok(self.with_reader(|d| d.lookup(&pool, &path).ok().flatten()).map(|f| Stat {
+        let row = if self.directory_path.is_some() {
+            self.with_reader(|d| Some(d.lookup(&pool, &path)))
+                .ok_or_else(|| ServiceError::Io("无法读取命名空间目录".into()))?
+                .map_err(|e| ServiceError::Io(e.to_string()))?
+        } else {
+            None
+        };
+        Ok(row.map(|f| Stat {
             len: f.length,
             generation: f.generation,
             round,
             barcode: f.barcode,
             sha256: f.sha256,
+            version: f.version,
+            metadata: f.metadata,
             deleted: f.deleted,
         }))
     }
@@ -747,21 +1103,31 @@ impl FileService {
     /// 路径上有在途变更 → `PathBusy`。
     pub fn delete(&self, path: &str) -> Result<u64, ServiceError> {
         let path = norm(path)?;
-        // 本轮之前提交的只在目录库里，不能在锁里查；本轮的在锁里再看一次
-        if self.stat(&path)?.is_none() {
-            return Err(ServiceError::NotFound(path));
-        }
-        self.enqueue_removal(path, true)
+        self.enqueue_removal(path, true, false)
     }
 
     /// 回收搬迁墓碑：源带上的墓碑要在别的带上重新落一次（新版本），源带才能格式化。
     /// 不检查路径是否存在——它本来就不存在。
     pub fn relocate_tombstone(&self, path: &str) -> Result<u64, ServiceError> {
         let path = norm(path)?;
-        self.enqueue_removal(path, false)
+        self.enqueue_removal(path, false, false)
     }
 
-    fn enqueue_removal(&self, path: String, must_exist: bool) -> Result<u64, ServiceError> {
+    pub(crate) fn relocate_tombstone_kind(
+        &self,
+        path: &str,
+        directory: bool,
+    ) -> Result<u64, ServiceError> {
+        self.enqueue_removal(norm(path)?, false, directory)
+    }
+
+    fn enqueue_removal(
+        &self,
+        path: String,
+        must_exist: bool,
+        directory: bool,
+    ) -> Result<u64, ServiceError> {
+        let (state, live) = self.namespace_snapshot(&path)?;
         {
             let mut g = self.lock();
             let task = g.next_task;
@@ -770,16 +1136,40 @@ impl FileService {
                 return Err(ServiceError::NoTape(why));
             }
             let s = g.serving.as_mut().ok_or(ServiceError::NotServing(why))?;
-            if must_exist && s.recent.get(&path).is_some_and(|st| st.deleted) {
+            if s.draining {
+                return Err(ServiceError::NotServing("正在停机".into()));
+            }
+            let live = Self::admission_view(s, &state, &path, live)?;
+            if must_exist {
+                check_file_namespace(s, &path, &live)?;
+            } else {
+                check_pending(s, &path)?;
+                if s.recent.contains_key(&path) {
+                    return Err(ServiceError::Exists(path));
+                }
+            }
+            if must_exist && !live.contains_key(&path) {
                 return Err(ServiceError::NotFound(path));
             }
             if let Some(state) = s.switch {
-                return Err(ServiceError::SwitchingTape(format!("{} 已 {}", s.tape.barcode, state)));
+                return Err(ServiceError::SwitchingTape(format!(
+                    "{} 已 {}",
+                    s.tape.barcode, state
+                )));
             }
             // 墓碑也是索引里的一条
-            if s.recent.len() as u64 + s.admitted >= s.limits.file_limit {
+            if s.recent
+                .values()
+                .filter(|st| !is_directory(&st.metadata))
+                .count() as u64
+                + s.admitted
+                >= s.limits.file_limit
+            {
                 s.switch = Some(super::state::tape_state::DATA_FULL);
-                let msg = format!("{} 的文件数已到上限 {}", s.tape.barcode, s.limits.file_limit);
+                let msg = format!(
+                    "{} 的文件数已到上限 {}",
+                    s.tape.barcode, s.limits.file_limit
+                );
                 drop(g);
                 self.kick();
                 return Err(ServiceError::SwitchingTape(msg));
@@ -789,7 +1179,19 @@ impl FileService {
             s.state.admit_removal(task, &path, now).map_err(map_state)?;
             s.state.complete(&path).map_err(map_state)?;
             s.admitted += 1;
-            s.queue.push_back(Upload { task, path, spool: PathBuf::new(), len: 0, delete: true });
+            if directory {
+                s.namespace_pending.insert(path.clone());
+            }
+            s.queue.push_back(Upload {
+                task,
+                path,
+                spool: PathBuf::new(),
+                len: 0,
+                delete: true,
+                directory,
+                symlink_target: None, rename_from: None, xattr_change: None,
+                metadata: None,
+            });
             let now = Instant::now();
             s.oldest.get_or_insert(now);
             s.newest = Some(now);
@@ -801,23 +1203,414 @@ impl FileService {
         }
     }
 
+    /// 用户属性的原生元数据提交；不复制文件内容，不借用其他带的extent。
+    pub fn change_xattr(
+        &self,
+        path: &str,
+        name: &str,
+        value: Option<&[u8]>,
+        flags: u32,
+    ) -> Result<u64, ServiceError> {
+        use base64::Engine;
+        let key = writable_xattr_key(name)?;
+        if flags > 2 || (value.is_none() && flags != 0) {
+            return Err(ServiceError::BadPath("扩展属性flags非法".into()));
+        }
+        if value.is_some_and(|v| v.len() > 65536) {
+            return Err(ServiceError::AttributeTooLarge);
+        }
+        let path = norm(path)?;
+        let (state, live) = self.namespace_snapshot(&path)?;
+        let mut g = self.lock();
+        let task = g.next_task;
+        let why = g.why_not.clone();
+        let s = g.serving.as_mut().ok_or(ServiceError::NotServing(why))?;
+        if s.draining {
+            return Err(ServiceError::NotServing("正在停机".into()));
+        }
+        let live = Self::admission_view(s, &state, &path, live)?;
+        check_pending(s, &path)?;
+        let directory = *live
+            .get(&path)
+            .ok_or_else(|| ServiceError::NotFound(path.clone()))?;
+        let st = s
+            .recent
+            .get(&path)
+            .filter(|st| !st.deleted && st.barcode == s.tape.barcode)
+            .ok_or_else(|| ServiceError::CrossDevice(path.clone()))?;
+        let attrs = st.metadata["xattrs"]
+            .as_array()
+            .ok_or_else(|| ServiceError::Io("属性目录缺失".into()))?;
+        // LE索引通常不带user.前缀；兼容已有带前缀记录，避免生成同名别名。
+        let existing = attrs.iter().find(|x| x["key"] == key || x["key"] == name);
+        if existing.is_some() && flags == 1 {
+            return Err(ServiceError::Exists(name.into()));
+        }
+        if existing.is_none() && (flags == 2 || value.is_none()) {
+            return Err(ServiceError::NoAttribute(name.into()));
+        }
+        let key = existing
+            .and_then(|x| x["key"].as_str())
+            .unwrap_or(key)
+            .to_string();
+        let len = st.len;
+        if let Some(reason) = s.switch {
+            return Err(ServiceError::SwitchingTape(reason.into()));
+        }
+        s.state.open_session(task, u64::MAX);
+        let admitted = s
+            .state
+            .admit(task, &path, 0, s.opened.elapsed().as_secs())
+            .and_then(|_| s.state.stage_reference(&path, len))
+            .and_then(|_| s.state.complete(&path));
+        if let Err(e) = admitted {
+            let _ = s.state.cancel(task);
+            return Err(map_state(e));
+        }
+        s.namespace_pending.insert(path.clone());
+        s.admitted += 1;
+        let attr = value.map(|v| crate::ltfs::index::Xattr {
+            key: key.clone(),
+            value: base64::engine::general_purpose::STANDARD.encode(v),
+            base64: true,
+        });
+        s.queue.push_back(Upload {
+            task,
+            path,
+            spool: PathBuf::new(),
+            len,
+            delete: false,
+            directory,
+            symlink_target: None, rename_from: None,
+            xattr_change: Some((key, attr)),
+            metadata: None,
+        });
+        let now = Instant::now();
+        s.oldest.get_or_insert(now);
+        s.newest = Some(now);
+        g.tasks.insert(task, TaskStatus::Staged);
+        g.next_task += 1;
+        drop(g);
+        self.kick();
+        Ok(task)
+    }
+
+    pub fn mkdir(&self, path: &str) -> Result<u64, ServiceError> {
+        self.node_change(path, false, None, None)
+    }
+
+    pub fn rmdir(&self, path: &str) -> Result<u64, ServiceError> {
+        self.node_change(path, true, None, None)
+    }
+
+    pub(crate) fn relocate_directory(
+        &self,
+        path: &str,
+        metadata: crate::ltfs::volume::FileMetadata,
+    ) -> Result<u64, ServiceError> {
+        self.node_change(path, false, Some(metadata), None)
+    }
+
+    /// 创建原生符号链接；目标不解析，允许悬空和绝对路径。
+    pub fn symlink(&self, target: &str, path: &str) -> Result<u64, ServiceError> {
+        if target.is_empty()
+            || !target.chars().all(|c| {
+                matches!(c,
+            '\u{9}' | '\u{a}' | '\u{d}' | '\u{20}'..='\u{d7ff}' |
+            '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')
+            })
+        {
+            return Err(ServiceError::BadPath(
+                "符号链接目标为空或包含 XML 非法字符".into(),
+            ));
+        }
+        self.node_change(path, false, None, Some(target.to_string()))
+    }
+
+    pub(crate) fn relocate_symlink(
+        &self,
+        path: &str,
+        target: &str,
+        metadata: crate::ltfs::volume::FileMetadata,
+    ) -> Result<u64, ServiceError> {
+        self.node_change(path, false, Some(metadata), Some(target.into()))
+    }
+
+    fn node_change(
+        &self,
+        path: &str,
+        remove: bool,
+        metadata: Option<crate::ltfs::volume::FileMetadata>,
+        symlink_target: Option<String>,
+    ) -> Result<u64, ServiceError> {
+        let path = norm(path)?;
+        let (state, live) = self.namespace_snapshot(&path)?;
+        let mut g = self.lock();
+        let task = g.next_task;
+        let why = g.why_not.clone();
+        let s = g.serving.as_mut().ok_or(ServiceError::NotServing(why))?;
+        if s.draining {
+            return Err(ServiceError::NotServing("正在停机".into()));
+        }
+        let live = Self::admission_view(s, &state, &path, live)?;
+        check_pending(s, &path)?;
+        // 回收源带不再可写；当前写带刚发布的同名记录已取代这份源副本。
+        if metadata.is_some() && s.recent.contains_key(&path) {
+            return Err(ServiceError::Exists(path));
+        }
+        if let Some((p, _)) = live.iter().find(|(p, dir)| !**dir && descendant(&path, p)) {
+            return Err(ServiceError::NotDirectory(p.clone()));
+        }
+        let children = live.keys().any(|p| descendant(p, &path));
+        if remove {
+            if live.get(&path) == Some(&false) {
+                return Err(ServiceError::NotDirectory(path));
+            }
+            if children {
+                return Err(ServiceError::NotEmpty(path));
+            }
+            if live.get(&path) != Some(&true) {
+                return Err(ServiceError::NotFound(path));
+            }
+        } else if metadata.is_none() {
+            if live.contains_key(&path) || children {
+                return Err(ServiceError::Exists(path));
+            }
+            let parent = path.rsplit_once('/').unwrap().0;
+            if !parent.is_empty() && live.get(parent) != Some(&true) {
+                return Err(ServiceError::NotFound(parent.into()));
+            }
+        } else if symlink_target.is_some() {
+            if live.get(&path) == Some(&true) || children {
+                return Err(ServiceError::IsDirectory(path));
+            }
+        } else if live.get(&path) == Some(&false) {
+            return Err(ServiceError::NotDirectory(path));
+        }
+        if let Some(state) = s.switch {
+            return Err(ServiceError::SwitchingTape(state.into()));
+        }
+        if symlink_target.is_some()
+            && s.recent
+                .values()
+                .filter(|st| !is_directory(&st.metadata))
+                .count() as u64
+                + s.admitted
+                >= s.limits.file_limit
+        {
+            s.switch = Some(super::state::tape_state::DATA_FULL);
+            let message = format!(
+                "{} 的文件数已到上限 {}",
+                s.tape.barcode, s.limits.file_limit
+            );
+            drop(g);
+            self.kick();
+            return Err(ServiceError::SwitchingTape(message));
+        }
+        let now = s.opened.elapsed().as_secs();
+        s.state.open_session(task, u64::MAX);
+        if remove {
+            s.state.admit_removal(task, &path, now).map_err(map_state)?;
+        } else {
+            s.state.admit(task, &path, 0, now).map_err(map_state)?;
+        }
+        s.state.complete(&path).map_err(map_state)?;
+        s.admitted += 1;
+        s.namespace_pending.insert(path.clone());
+        s.queue.push_back(Upload {
+            task,
+            path,
+            spool: PathBuf::new(),
+            len: 0,
+            delete: remove,
+            directory: symlink_target.is_none(),
+            symlink_target,
+            rename_from: None,
+            xattr_change: None,
+            metadata,
+        });
+        let now = Instant::now();
+        s.oldest.get_or_insert(now);
+        s.newest = Some(now);
+        g.tasks.insert(task, TaskStatus::Staged);
+        g.next_task += 1;
+        drop(g);
+        self.kick();
+        Ok(task)
+    }
+
+    /// 同写入卷原子改名。所有源/目标条目在同一锁内准入并进入同一批索引。
+    pub fn rename(&self, from: &str, to: &str, no_replace: bool) -> Result<u64, ServiceError> {
+        let from = norm(from)?;
+        let to = norm(to)?;
+        let (state, source) = self.namespace_snapshot(&from)?;
+        let (target_state, target) = self.namespace_snapshot(&to)?;
+        let mut g = self.lock();
+        let task = g.next_task;
+        let why = g.why_not.clone();
+        let s = g.serving.as_mut().ok_or(ServiceError::NotServing(why))?;
+        if s.draining {
+            return Err(ServiceError::NotServing("正在停机".into()));
+        }
+        let source = Self::admission_view(s, &state, &from, source)?;
+        let target = Self::admission_view(s, &target_state, &to, target)?;
+        check_pending(s, &from)?;
+        check_pending(s, &to)?;
+        let directory = *source
+            .get(&from)
+            .ok_or_else(|| ServiceError::NotFound(from.clone()))?;
+        if from == to {
+            if no_replace {
+                return Err(ServiceError::Exists(to));
+            }
+            let generation = s.state.load().generation;
+            g.tasks.insert(task, TaskStatus::Committed { generation });
+            g.next_task += 1;
+            return Ok(task);
+        }
+        if descendant(&to, &from) || descendant(&from, &to) {
+            return Err(ServiceError::BadPath("源和目标不能互为祖先".into()));
+        }
+        if let Some((p, _)) = target.iter().find(|(p, d)| !**d && descendant(&to, p)) {
+            return Err(ServiceError::NotDirectory(p.clone()));
+        }
+        let parent = to.rsplit_once('/').unwrap().0;
+        if !parent.is_empty() && target.get(parent) != Some(&true) {
+            return Err(ServiceError::NotFound(parent.into()));
+        }
+        if let Some(target_dir) = target.get(&to) {
+            if no_replace {
+                return Err(ServiceError::Exists(to));
+            }
+            if directory && !target_dir {
+                return Err(ServiceError::NotDirectory(to));
+            }
+            if !directory && *target_dir {
+                return Err(ServiceError::IsDirectory(to));
+            }
+            if target.keys().any(|p| descendant(p, &to)) {
+                return Err(ServiceError::NotEmpty(to));
+            }
+            if s.recent
+                .get(&to)
+                .is_none_or(|st| st.deleted || st.barcode != s.tape.barcode)
+            {
+                return Err(ServiceError::CrossDevice(to));
+            }
+        }
+        if let Some(reason) = s.switch {
+            return Err(ServiceError::SwitchingTape(reason.into()));
+        }
+        let mut uploads = Vec::new();
+        for (path, dir) in source
+            .iter()
+            .filter(|(p, _)| **p == from || descendant(p, &from))
+        {
+            let st = s
+                .recent
+                .get(path)
+                .filter(|st| !st.deleted && st.barcode == s.tape.barcode)
+                .ok_or_else(|| ServiceError::CrossDevice(path.clone()))?;
+            uploads.push(Upload {
+                task,
+                path: format!("{}{}", to, &path[from.len()..]),
+                spool: PathBuf::new(),
+                len: st.len,
+                delete: false,
+                directory: *dir,
+                metadata: None,
+                symlink_target: None, rename_from: Some((path.clone(), *path == from)), xattr_change: None,
+            });
+        }
+        let removals: Vec<_> = uploads
+            .iter()
+            .rev()
+            .map(|u| Upload {
+                task,
+                path: u.rename_from.as_ref().unwrap().0.clone(),
+                spool: PathBuf::new(),
+                len: 0,
+                delete: true,
+                directory: u.directory,
+                metadata: None,
+                symlink_target: None, rename_from: None, xattr_change: None,
+            })
+            .collect();
+        uploads.extend(removals);
+        let now = s.opened.elapsed().as_secs();
+        s.state.open_session(task, u64::MAX);
+        for u in &uploads {
+            let admitted = if u.delete {
+                s.state.admit_removal(task, &u.path, now)
+            } else {
+                s.state.admit(task, &u.path, 0, now)
+            };
+            if let Err(e) = admitted {
+                let _ = s.state.cancel(task);
+                return Err(map_state(e));
+            }
+        }
+        // 尚未 complete 时取消可以整体撤销；长度只作视图发布，不消耗数据区预算。
+        for u in &uploads {
+            if !u.delete {
+                s.state.stage_reference(&u.path, u.len).map_err(map_state)?;
+            }
+            s.state.complete(&u.path).map_err(map_state)?;
+            s.namespace_pending.insert(u.path.clone());
+        }
+        s.admitted += uploads.len() as u64;
+        s.queue.extend(uploads);
+        let now = Instant::now();
+        s.oldest.get_or_insert(now);
+        s.newest = Some(now);
+        g.tasks.insert(task, TaskStatus::Staged);
+        g.next_task += 1;
+        drop(g);
+        self.kick();
+        Ok(task)
+    }
+
     pub fn list(&self) -> Result<BTreeMap<String, u64>, ServiceError> {
+        Ok(self
+            .list_nodes()?
+            .into_iter()
+            .filter(|(_, (_, d))| !d)
+            .map(|(p, (n, _))| (p, n))
+            .collect())
+    }
+
+    fn list_nodes(&self) -> Result<BTreeMap<String, (u64, bool)>, ServiceError> {
         let (pool, mut out, gone) = {
             let g = self.lock();
             match (&g.serving, &g.read_only) {
                 (Some(s), _) => (
                     s.tape.pool_uuid.clone(),
-                    s.recent.iter().filter(|(_, st)| !st.deleted).map(|(p, st)| (p.clone(), st.len)).collect::<BTreeMap<_, _>>(),
+                    s.recent
+                        .iter()
+                        .filter(|(_, st)| !st.deleted)
+                        .map(|(p, st)| (p.clone(), (st.len, is_directory(&st.metadata))))
+                        .collect::<BTreeMap<_, _>>(),
                     // 本轮删掉的路径盖住目录库里可能还没换成墓碑的旧行
-                    s.recent.iter().filter(|(_, st)| st.deleted).map(|(p, _)| p.clone()).collect::<std::collections::HashSet<_>>(),
+                    s.recent
+                        .iter()
+                        .filter(|(_, st)| st.deleted)
+                        .map(|(p, _)| p.clone())
+                        .collect::<std::collections::HashSet<_>>(),
                 ),
                 (None, Some((_, pool))) => (pool.clone(), BTreeMap::new(), Default::default()),
                 (None, None) => return Err(ServiceError::NotServing(g.why_not.clone())),
             }
         };
-        for (p, n) in self.with_reader(|d| d.list(&pool).ok()).unwrap_or_default() {
+        let rows = if self.directory_path.is_some() {
+            self.with_reader(|d| Some(d.list_nodes(&pool)))
+                .ok_or_else(|| ServiceError::Io("无法读取命名空间目录".into()))?
+                .map_err(|e| ServiceError::Io(e.to_string()))?
+        } else {
+            Vec::new()
+        };
+        for (p, n, d) in rows {
             if !gone.contains(&p) {
-                out.entry(p).or_insert(n);
+                out.entry(p).or_insert((n, d));
             }
         }
         Ok(out)
@@ -833,23 +1626,54 @@ impl FileService {
 
     fn in_flight(&self, path: &str) -> Option<(InFlight, u64)> {
         let g = self.lock();
-        let root = g.serving.as_ref()?.state.load();
-        root.pending.get(path).map(|e| (in_flight_of(e), e.staged_len))
+        let s = g.serving.as_ref()?;
+        if s.namespace_pending.contains(path) {
+            return None;
+        }
+        let root = s.state.load();
+        root.pending
+            .get(path)
+            .map(|e| (in_flight_of(e), e.staged_len))
     }
 
-    /// 一个目录的直接子项。目录是隐式的：有文件就有目录，没有子项的非根目录不存在（`Ok(None)`）。
+    /// 一个目录的直接子项。目录记录使空目录可见；旧 catalog 的文件前缀仍可推导非空目录。
     /// `pending` 为真时附上只在途、尚未提交的路径。
-    pub fn list_dir(&self, dir: &str, pending: bool) -> Result<Option<BTreeMap<String, DirEntry>>, ServiceError> {
-        let prefix = if dir.trim_matches('/').is_empty() { "/".to_string() } else { format!("{}/", norm(dir)?) };
+    pub fn list_dir(
+        &self,
+        dir: &str,
+        pending: bool,
+    ) -> Result<Option<BTreeMap<String, DirEntry>>, ServiceError> {
+        let prefix = if dir.trim_matches('/').is_empty() {
+            "/".to_string()
+        } else {
+            format!("{}/", norm(dir)?)
+        };
         let mut out: BTreeMap<String, DirEntry> = BTreeMap::new();
-        fn add(out: &mut BTreeMap<String, DirEntry>, prefix: &str, path: &str, committed: Option<u64>, flight: Option<(InFlight, u64)>) {
-            let Some(rest) = path.strip_prefix(prefix) else { return };
+        fn add(
+            out: &mut BTreeMap<String, DirEntry>,
+            prefix: &str,
+            path: &str,
+            committed: Option<u64>,
+            flight: Option<(InFlight, u64)>,
+        ) {
+            let Some(rest) = path.strip_prefix(prefix) else {
+                return;
+            };
+            if rest.is_empty() {
+                return;
+            }
             match rest.split_once('/') {
                 Some((sub, _)) => {
                     out.entry(sub.to_string()).or_insert(DirEntry::Dir);
                 }
-                None => match out.entry(rest.to_string()).or_insert(DirEntry::File { committed: None, in_flight: None }) {
-                    DirEntry::File { committed: c, in_flight: f } => {
+                None => match out.entry(rest.to_string()).or_insert(DirEntry::File {
+                    committed: None,
+                    in_flight: None,
+                }) {
+                    DirEntry::File {
+                        committed: c,
+                        in_flight: f,
+                    } => {
                         *c = c.or(committed);
                         *f = f.or(flight);
                     }
@@ -859,8 +1683,18 @@ impl FileService {
             }
         }
         // TODO（目录库）：按前缀查询，而不是取全量再过滤
-        for (p, len) in self.list()? {
-            add(&mut out, &prefix, &p, Some(len), None);
+        let nodes = self.list_nodes()?;
+        let own = nodes.get(prefix.trim_end_matches('/'));
+        if own.is_some_and(|(_, d)| !d) {
+            return Err(ServiceError::NotDirectory(dir.into()));
+        }
+        let exists = prefix == "/" || own.is_some_and(|(_, d)| *d);
+        for (p, (len, directory)) in &nodes {
+            if *directory {
+                add(&mut out, &prefix, &format!("{}/", p), None, None);
+            } else {
+                add(&mut out, &prefix, p, Some(*len), None);
+            }
         }
         let flights: Vec<(String, (InFlight, u64))> = {
             let g = self.lock();
@@ -870,6 +1704,7 @@ impl FileService {
                     .load()
                     .pending
                     .iter()
+                    .filter(|(p, _)| !s.namespace_pending.contains(*p))
                     .map(|(p, e)| (p.clone(), (in_flight_of(e), e.staged_len)))
                     .collect(),
                 None => Vec::new(),
@@ -878,12 +1713,14 @@ impl FileService {
         for (p, f) in flights {
             if pending {
                 add(&mut out, &prefix, &p, None, Some(f));
-            } else if let Some(DirEntry::File { in_flight, .. }) = p.strip_prefix(&prefix).and_then(|n| out.get_mut(n)) {
+            } else if let Some(DirEntry::File { in_flight, .. }) =
+                p.strip_prefix(&prefix).and_then(|n| out.get_mut(n))
+            {
                 // 已提交的文件上正有新版本在途：照样标出来
                 *in_flight = Some(f);
             }
         }
-        if out.is_empty() && prefix != "/" {
+        if out.is_empty() && !exists {
             return Ok(None);
         }
         Ok(Some(out))

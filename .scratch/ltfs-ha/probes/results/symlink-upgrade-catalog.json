@@ -1,0 +1,20 @@
+[
+  {
+    "exe": "/home/rocky/tape-rs-symlink-prod-20260925/ltfsd",
+    "sha256": "418339d1f60b277c07759b42c775342557c36c84fc4df3a84a23b6ed13f88ae8",
+    "rows": 31,
+    "catalog_sha256": "a6c01dada1bf202c64da6d0e4e4a2b84e9d69cdcf5ff10e79bf6d5eb1dfdddb0"
+  },
+  {
+    "exe": "/home/rocky/tape-rs-symlink-prod-20260925/ltfsd",
+    "sha256": "418339d1f60b277c07759b42c775342557c36c84fc4df3a84a23b6ed13f88ae8",
+    "rows": 31,
+    "catalog_sha256": "a6c01dada1bf202c64da6d0e4e4a2b84e9d69cdcf5ff10e79bf6d5eb1dfdddb0"
+  },
+  {
+    "exe": "/home/rocky/tape-rs-symlink-prod-20260925/ltfsd",
+    "sha256": "418339d1f60b277c07759b42c775342557c36c84fc4df3a84a23b6ed13f88ae8",
+    "rows": 31,
+    "catalog_sha256": "a6c01dada1bf202c64da6d0e4e4a2b84e9d69cdcf5ff10e79bf6d5eb1dfdddb0"
+  }
+]

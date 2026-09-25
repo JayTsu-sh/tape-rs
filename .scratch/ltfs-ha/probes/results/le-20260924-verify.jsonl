@@ -1,0 +1,3 @@
+Tape EE8005L8 has been successfully mounted to target drive IBMlisa41D6C.
+{"name": "after_normal_remount", "status": "PASS", "detail": {"generation": "8", "files_checked": 8}, "seconds": 0.0051}
+{"name": "readonly_mmap_after_remount", "status": "PASS", "detail": "7daca2095d0438260fa849183dfc67faa459fdf4936e1bc91eec6b281b27e4c2", "seconds": 0.0006}

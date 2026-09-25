@@ -21,6 +21,7 @@ raft = { version = "0.7", default-features = false, features = ["protobuf-codec"
 protobuf = "2"
 slog = "2"
 slog-stdlog = "4"
+base64 = "0.22"
 
 [dev-dependencies]
 # 集成测试直接查控制存储，验证日志确实被压缩过

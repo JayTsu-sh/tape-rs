@@ -266,14 +266,13 @@ pub fn run_with(
                         let known = ctl.tape_summary.get(&barcode).map(|t| t.generation).unwrap_or(0);
                         if my_round != Some(round) || !is_leader {
                             info!("{} 第 {} 代的目录记录未写入日志：已不是执行者", barcode, generation);
-                        } else if full && known == generation {
-                            // 装载时的完整列表：目录已经是这一代，不用重写
                         } else if full && known > generation {
                             // 目录比磁带还新：不应出现（磁带被回退或换了盘）。不改目录，标记该带待核验并告警
                             warn!("{} 目录是第 {} 代，磁带只有第 {} 代：标记待核验，不自动修改", barcode, known, generation);
                             propose(&mut node, &Command::TapeState { barcode, state: super::state::tape_state::CHECK.to_string() });
                         } else {
                             if full {
+                                // 同代也刷新：旧版 catalog 可能缺少原生空目录记录。
                                 info!("{} 目录停在第 {} 代，磁带是第 {} 代：以磁带为准重写该带的目录", barcode, known, generation);
                             }
                             let parts = split_catalog(&files);

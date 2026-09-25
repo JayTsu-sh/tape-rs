@@ -1,0 +1,9 @@
+   Compiling tape-rs v0.1.0 (/work/jay/tape-rs-ltfs-recovery-ibm-interop)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.51s
+     Running tests/ltfsd_cluster.rs (/work/cargo-target/debug/deps/ltfsd_cluster-0df699d40388ecd6)
+
+running 1 test
+test namespace_conflicts_across_tapes_and_takeover ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 35 filtered out; finished in 2.33s
+

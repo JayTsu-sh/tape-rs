@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use log::{error, info, warn};
 use sha2::{Digest, Sha256};
 
-use super::files::{FileService, TapeIdent, TapeLimits, catalog_of};
+use super::files::{FileService, TapeIdent, TapeLimits, catalog_of, is_directory};
 use super::state::tape_state;
 use super::node::SharedStatus;
 use super::state::FileRec;
@@ -93,6 +93,8 @@ pub enum ExecRequest {
     Work,
     /// 读出一个已提交文件的内容。
     Read { path: String, reply: Sender<std::result::Result<Vec<u8>, ReadError>> },
+    /// 分块写入调用方提供的临时文件；成功后交还句柄，慢客户端不阻塞设备线程。
+    ReadTo { path: String, file: std::fs::File, reply: Sender<std::result::Result<std::fs::File, ReadError>> },
     /// 计划停机：落带、退带、释放预留，然后经 `done` 回执。见 `shut_down`。
     Shutdown { done: Option<Sender<()>> },
 }
@@ -102,13 +104,26 @@ pub enum ReadError {
     /// 此刻读不了，稍后重试即可：只有一个驱动器且写入侧正忙，或换带尚未完成。
     Busy(String),
     Failed(String),
+    /// 读取期间失去设备所有权，必须先终止本轮再交给客户端换节点。
+    Lost(String),
+}
+
+impl ReadError {
+    fn device(e: TapeError, context: &str) -> Self {
+        let reason = format!("{}: {}", context, e);
+        if ownership_lost(&e) {
+            Self::Lost(reason)
+        } else {
+            Self::Failed(reason)
+        }
+    }
 }
 
 impl std::fmt::Display for ReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ReadError::Busy(s) => write!(f, "稍后重试: {}", s),
-            ReadError::Failed(s) => write!(f, "{}", s),
+            ReadError::Failed(s) | ReadError::Lost(s) => write!(f, "{}", s),
         }
     }
 }
@@ -299,10 +314,24 @@ pub fn run(
                 }
             }
             Ok(ExecRequest::Read { path, reply }) => {
+                let was_serving = active.as_ref().is_some_and(|a| a.serving);
                 let res = match active.as_mut().filter(|a| a.serving) {
-                    Some(a) => read_any(a, &opts, &files, &status, &tx, &path),
-                    None => Err(ReadError::Failed("本节点不在服务".to_string())),
+                    Some(a) => {
+                        let mut out = Vec::new();
+                        read_any(a, &opts, &files, &status, &tx, &path, &mut out).map(|_| out)
+                    },
+                    None => Err(ReadError::Busy("本节点不在服务".to_string())),
                 };
+                if was_serving && active.as_ref().is_some_and(|a| !a.serving) { active = None; }
+                let _ = reply.send(res);
+            }
+            Ok(ExecRequest::ReadTo { path, mut file, reply }) => {
+                let was_serving = active.as_ref().is_some_and(|a| a.serving);
+                let res = match active.as_mut().filter(|a| a.serving) {
+                    Some(a) => read_any(a, &opts, &files, &status, &tx, &path, &mut file).map(|_| file),
+                    None => Err(ReadError::Busy("本节点不在服务".to_string())),
+                };
+                if was_serving && active.as_ref().is_some_and(|a| !a.serving) { active = None; }
                 let _ = reply.send(res);
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -369,10 +398,18 @@ pub fn run(
 ///    绝不能提前做——只有确认本线程不会再碰设备之后，放掉这层保护才是对的。
 fn shut_down(mut a: Active, files: &FileService, tx: &Sender<ExecEvent>) {
     info!("执行线程: 轮次 {} 计划停机", a.round);
-    files.close("正在停机");
+    files.drain();
     if a.serving && let Err(e) = process_uploads(&mut a, files, tx, true) {
         warn!("执行线程: 停机前落带失败: {}；卷留给下一个执行者收尾", e);
+        files.close("停机提交失败");
+        return;
     }
+    if a.serving && let Err(e) = checkpoint_write_tape(&a, files, tx) {
+        warn!("执行线程: 停机检查点失败: {}；保留介质和预留，等待恢复", e);
+        files.close("停机检查点失败");
+        return;
+    }
+    files.close("正在停机");
     let mut drives: Vec<usize> =
         [a.drive, a.read.as_ref().map(|(i, ..)| *i), a.reclaim.as_ref().map(|r| r.drive)].into_iter().flatten().collect();
     drives.sort_unstable();
@@ -498,7 +535,7 @@ fn unload_drive(devices: &[ManagedDevice], inv: &Inventory, drive: &DriveSlot) -
     let Some((barcode, home)) = &drive.loaded else { return Ok(()) };
     let dest = home.filter(|h| inv.empty_slots.contains(h)).or(inv.empty_slots.first().copied()).ok_or_else(|| TapeError::NotReady("没有空槽位可卸带".into()))?;
     // 先让驱动器退带；有的库要求这样，模拟设备上是空操作
-    let _ = TapeDrive::new(devices[drive.dev].dev.as_ref()).unload();
+    TapeDrive::new(devices[drive.dev].dev.as_ref()).unload()?;
     info!("执行线程: 卸带 {} -> 槽位 {:#06x}", barcode, dest);
     move_medium(devices, drive.addr, dest)
 }
@@ -691,7 +728,10 @@ fn open_candidate(
     }
 
     // 5. 还写得下吗
-    let files_now = vol.list().len() as u64;
+    let (list, bytes_used) = catalog_of(vol.index());
+    let files_now = list.iter().filter(|r| !is_directory(&r.metadata)).count() as u64;
+    let mut index_entries = vol.list().len() as u64 + 1;
+    vol.index().walk_directories(|_, _| index_entries += 1);
     let (total, remaining) = crate::ltfs::mam::Mam::with_partition(dev, 1)
         .read_partition_capacity()
         .ok()
@@ -699,7 +739,7 @@ fn open_candidate(
         .map(|pc| (pc.maximum, pc.remaining)) // 已经是字节
         .unwrap_or((1 << 50, 1 << 50));
     // 保留空间：任何时候都要写得下收尾所需的索引
-    let index_bytes = (files_now + 1) * 1100;
+    let index_bytes = index_entries * 1100;
     let reserve = (total / 50).max(4 * index_bytes) + (total / 20).min(1 << 30);
     if files_now >= c.file_limit {
         return Ok(Err((format!("{} 文件数 {} 已到上限", c.barcode, files_now), tape_state::DATA_FULL)));
@@ -717,13 +757,12 @@ fn open_candidate(
         true,
     );
     // 把这盘带的完整列表交给 Raft 层：目录落后于磁带时据此对账（以磁带为准）
-    let (list, bytes_used) = catalog_of(vol.index());
     let _ = tx.send(ExecEvent::Committed {
         round: a.round,
         barcode: c.barcode.clone(),
         volume_uuid: vol.label().volume_uuid.to_string(),
         generation: vol.index().generation,
-        files_total: list.len() as u64,
+        files_total: list.iter().filter(|r| !is_directory(&r.metadata)).count() as u64,
         bytes_used,
         bytes_written: total.saturating_sub(remaining),
         files: list,
@@ -733,9 +772,39 @@ fn open_candidate(
     Ok(Ok(summary))
 }
 
+/// 已接纳写入的卷在离开驱动器前收束增量；不触碰读带、拒绝候选或未分配介质。
+fn checkpoint_write_tape(a: &Active, files: &FileService, tx: &Sender<ExecEvent>) -> Result<()> {
+    let Some(i) = a.drive else { return Ok(()) };
+    let tape = files.tape().ok_or_else(|| TapeError::NotReady("缺少写入卷身份，不能生成卸载检查点".into()))?;
+    reservation::verify_holder(a.devices[i].dev.as_ref(), a.key)?;
+    let inv = inventory(&a.devices)?;
+    if !inv.drives.iter().any(|d| d.dev == i && d.loaded.as_ref().is_some_and(|(b, _)| *b == tape.barcode)) {
+        return Err(TapeError::NotReady("卸载检查点的介质与写入卷不符".into()));
+    }
+    let dev = a.devices[i].dev.as_ref();
+    let mut vol = LtfsVolume::mount(dev)?;
+    if !vol.index().incremental { return Ok(()); }
+    vol.set_reservation_guard(Some(a.key));
+    vol.commit()?;
+    let (list, bytes_used) = catalog_of(vol.index());
+    let _ = tx.send(ExecEvent::Committed {
+        round: a.round,
+        barcode: tape.barcode,
+        volume_uuid: vol.label().volume_uuid.to_string(),
+        generation: vol.index().generation,
+        files_total: list.iter().filter(|r| !is_directory(&r.metadata)).count() as u64,
+        bytes_used,
+        bytes_written: bytes_written_on(dev),
+        files: list,
+        full: true,
+    });
+    Ok(())
+}
+
 /// 当前带写满或到文件数上限：把队列里剩下的落带，标记状态，卸回槽位，换下一盘。
 fn switch_tape(a: &mut Active, opts: &ExecOptions, files: &FileService, status: &SharedStatus, tx: &Sender<ExecEvent>, new_state: &str) -> std::result::Result<String, String> {
     process_uploads(a, files, tx, true)?;
+    checkpoint_write_tape(a, files, tx).map_err(|e| e.to_string())?;
     let barcode = files.tape().map(|t| t.barcode).unwrap_or_default();
     info!("执行线程: {} 转为 {}，换下一盘", barcode, new_state);
     files.close(&format!("{} 已 {}，正在换带", barcode, new_state));
@@ -755,44 +824,167 @@ fn switch_tape(a: &mut Active, opts: &ExecOptions, files: &FileService, status: 
     ensure_write_tape(a, opts, files, status, tx).map_err(|e| e.to_string())
 }
 
+fn prepare_parent_directories(
+    vol: &mut LtfsVolume,
+    path: &str,
+    version: &str,
+    files: &FileService,
+    changed: &mut std::collections::BTreeSet<String>,
+    touch_parent: bool,
+) -> Result<()> {
+    let parts: Vec<_> = path.trim_matches('/').split('/').collect();
+    let mut parent = String::new();
+    for part in &parts[..parts.len().saturating_sub(1)] {
+        parent.push('/');
+        parent.push_str(part);
+        let mut metadata = match files
+            .stat(&parent)
+            .map_err(|e| TapeError::Ltfs(e.to_string()))?
+        {
+            Some(st) if is_directory(&st.metadata) => {
+                super::files::directory_metadata(&st.metadata)
+                    .map_err(|e| TapeError::Ltfs(e.to_string()))?
+            }
+            Some(_) => return Err(TapeError::Ltfs(format!("父路径 {} 不是目录", parent))),
+            None => crate::ltfs::volume::FileMetadata::replacement(Vec::new()),
+        };
+        if touch_parent && path.rsplit_once('/').is_some_and(|(p, _)| p == parent) {
+            let now = crate::ltfs::label::ltfs_time_now();
+            metadata.meta.modify_time = now.clone();
+            metadata.meta.change_time = now;
+        }
+        vol.remove_file(&tombstone_path(&parent))?;
+        vol.put_catalog_directory(&parent, version, &metadata)?;
+        changed.insert(parent.clone());
+    }
+    Ok(())
+}
+
 /// 把文件服务里已完成的上传成批落带：一次挂载、逐个追加、一次提交，然后发布。
 /// 返回 `Err(原因)` 表示本轮不能再继续（失去资格，或提交结果未定需要重新恢复）。
-fn process_uploads(a: &mut Active, files: &FileService, tx: &Sender<ExecEvent>, flush: bool) -> std::result::Result<(), String> {
+fn process_uploads(
+    a: &mut Active,
+    files: &FileService,
+    tx: &Sender<ExecEvent>,
+    flush: bool,
+) -> std::result::Result<(), String> {
     let Some(i) = a.drive else {
         return Ok(());
     };
-    while let Some((batch, uploads)) = if flush { files.take_batch_now(a.round) } else { files.take_batch(a.round) } {
+    while let Some((batch, uploads)) = if flush {
+        files.take_batch_now(a.round)
+    } else {
+        files.take_batch(a.round)
+    } {
         let dev = a.devices[i].dev.as_ref();
         let (round, key) = (a.round, a.key);
         let mut seq = a.seq;
         let result = (|| -> Result<ExecEvent> {
             let mut vol = LtfsVolume::mount(dev)?;
             vol.set_reservation_guard(Some(key));
+            let mut changed = std::collections::BTreeSet::new();
             for u in &uploads {
                 seq += 1;
                 let ver = format!("{}.{}", round, seq);
+                if let Some((key, attr)) = &u.xattr_change {
+                    if let Some(attr) = attr {
+                        vol.set_node_xattr(&u.path, attr.clone(), false, false)?;
+                    } else {
+                        vol.remove_node_xattr(&u.path, key)?;
+                    }
+                    vol.set_catalog_version(&u.path, &ver)?;
+                    changed.insert(u.path.clone());
+                    continue;
+                }
+                if let Some((from, root)) = &u.rename_from {
+                    if *root {
+                        // 防止把当前池视图已删除或被别带替代的旧子项随目录搬过去。
+                        let expected: std::collections::BTreeSet<_> = uploads.iter().filter(|v| v.task == u.task)
+                            .filter_map(|v| v.rename_from.as_ref().map(|(p, _)| p.clone())).collect();
+                        let actual: std::collections::BTreeSet<_> = catalog_of(vol.index()).0.into_iter()
+                            .filter(|r| !r.deleted && (r.path == *from || r.path.starts_with(&format!("{from}/"))))
+                            .map(|r| r.path).collect();
+                        if actual != expected { return Err(TapeError::Ltfs("改名源目录与当前卷不一致".into())); }
+                        prepare_parent_directories(&mut vol, from, &ver, files, &mut changed, true)?;
+                        prepare_parent_directories(&mut vol, &u.path, &ver, files, &mut changed, true)?;
+                        vol.discard_catalog_path(&u.path)?;
+                        vol.rename_path(from, &u.path)?;
+                    }
+                    vol.remove_file(&tombstone_path(&u.path))?;
+                    vol.set_catalog_version(&u.path, &ver)?;
+                    changed.insert(u.path.clone());
+                    continue;
+                }
                 // 同一盘带上一个路径只留一条记录：删除去掉本带上的文件，写入去掉本带上的墓碑。
                 // 别的带上的旧副本不动，由版本比较让它们失效（见 `TOMBSTONE_DIR`）。
+                changed.insert(u.path.clone());
+                let current = files
+                    .lookup(&u.path)
+                    .map_err(|e| TapeError::Ltfs(e.to_string()))?;
+                let existed = current.as_ref().is_some_and(|st| !st.deleted);
+                if !u.delete || existed {
+                    prepare_parent_directories(
+                        &mut vol,
+                        &u.path,
+                        &ver,
+                        files,
+                        &mut changed,
+                        if u.delete { existed } else { !existed },
+                    )?;
+                }
                 if u.delete {
-                    vol.remove_file(&u.path)?;
+                    vol.discard_catalog_path(&u.path)?;
                     let tomb = tombstone_path(&u.path);
-                    vol.append_file_with_xattrs(&tomb, &mut std::io::empty(), &[(XATTR_VERSION, &ver), (XATTR_DELETED_PATH, &u.path)])?;
+                    vol.append_file_with_xattrs(
+                        &tomb,
+                        &mut std::io::empty(),
+                        &[
+                            (XATTR_VERSION, &ver),
+                            (XATTR_DELETED_PATH, &u.path),
+                            (
+                                "tapers.deletedKind",
+                                if u.directory { "directory" } else { "file" },
+                            ),
+                        ],
+                    )?;
+                } else if let Some(target) = &u.symlink_target {
+                    vol.discard_catalog_path(&u.path)?;
+                    vol.remove_file(&tombstone_path(&u.path))?;
+                    vol.add_symlink_with_metadata(&u.path, target, u.metadata.as_ref())?;
+                    vol.set_catalog_version(&u.path, &ver)?;
+                } else if u.directory {
+                    vol.remove_file(&tombstone_path(&u.path))?;
+                    if u.metadata.is_none() {
+                        vol.discard_catalog_path(&u.path)?;
+                    }
+                    let metadata = u.metadata.clone().unwrap_or_else(|| {
+                        crate::ltfs::volume::FileMetadata::replacement(Vec::new())
+                    });
+                    vol.put_catalog_directory(&u.path, &ver, &metadata)?;
                 } else {
+                    vol.discard_catalog_path(&u.path)?;
                     vol.remove_file(&tombstone_path(&u.path))?;
                     let mut f = std::io::BufReader::new(std::fs::File::open(&u.spool)?);
-                    vol.append_file_with_xattrs(&u.path, &mut f, &[(XATTR_VERSION, &ver)])?;
+                    if let Some(metadata) = &u.metadata {
+                        vol.append_relocated_file(&u.path, &mut f, &ver, metadata)?;
+                    } else {
+                        vol.append_file_with_xattrs(&u.path, &mut f, &[(XATTR_VERSION, &ver)])?;
+                    }
                 }
             }
-            vol.commit()?;
+            vol.commit_incremental()?;
             let (all, bytes_used) = catalog_of(vol.index());
-            let written: Vec<FileRec> =
-                all.iter().filter(|r| uploads.iter().any(|u| u.path == r.path)).cloned().collect();
+            let written: Vec<FileRec> = all
+                .iter()
+                .filter(|r| changed.contains(&r.path))
+                .cloned()
+                .collect();
             Ok(ExecEvent::Committed {
                 round: a.round,
                 barcode: files.tape().map(|t| t.barcode).unwrap_or_default(),
                 volume_uuid: vol.label().volume_uuid.to_string(),
                 generation: vol.index().generation,
-                files_total: all.len() as u64,
+                files_total: all.iter().filter(|r| !is_directory(&r.metadata)).count() as u64,
                 bytes_used,
                 // 一次 MAM 读，不动磁带：可回收空间要靠它才算得准
                 bytes_written: bytes_written_on(dev),
@@ -803,9 +995,21 @@ fn process_uploads(a: &mut Active, files: &FileService, tx: &Sender<ExecEvent>, 
         a.seq = seq;
         match result {
             Ok(ev) => {
-                if let ExecEvent::Committed { generation, files: written, .. } = &ev {
-                    info!("执行线程: 已提交 {} 个文件，索引 gen={}", uploads.len(), generation);
-                    let hashes = written.iter().map(|r| (r.path.clone(), r.sha256.clone())).collect();
+                if let ExecEvent::Committed {
+                    generation,
+                    files: written,
+                    ..
+                } = &ev
+                {
+                    info!(
+                        "执行线程: 已提交 {} 个文件，索引 gen={}",
+                        uploads.len(),
+                        generation
+                    );
+                    let hashes = written
+                        .iter()
+                        .map(|r| (r.path.clone(), r.clone()))
+                        .collect();
                     files.batch_done(a.round, &batch, &uploads, Ok((*generation, hashes)));
                 }
                 let _ = tx.send(ev);
@@ -820,46 +1024,57 @@ fn process_uploads(a: &mut Active, files: &FileService, tx: &Sender<ExecEvent>, 
     Ok(())
 }
 
-fn read_file(dev: &dyn TapeTransport, path: &str) -> Result<Vec<u8>> {
-    const MAX: u64 = 256 << 20;
+fn read_file<W: Write>(dev: &dyn TapeTransport, path: &str, out: &mut W) -> Result<u64> {
     let vol = LtfsVolume::mount(dev)?;
-    let p = path.trim_start_matches('/');
-    let len = vol.index().find_file(p).map(|f| f.length).ok_or_else(|| TapeError::Ltfs(format!("文件不存在: {}", path)))?;
-    if len > MAX {
-        return Err(TapeError::Ltfs(format!("文件 {} 字节，超过骨架读接口的上限", len)));
-    }
-    let mut out = Vec::with_capacity(len as usize);
-    vol.read_file_to_writer(p, &mut out)?;
-    Ok(out)
+    vol.read_file_to_writer(path.trim_start_matches('/'), out)
 }
 
 /// 读一个文件，无论它在哪盘带上。目录给出条码；不在驱动器里就装载。
 /// 有第二个驱动器就用它（读带留在里面，空闲后卸回）；只有一个驱动器就临时换带，读完换回。
-fn read_any(a: &mut Active, opts: &ExecOptions, files: &FileService, status: &SharedStatus, tx: &Sender<ExecEvent>, path: &str) -> std::result::Result<Vec<u8>, ReadError> {
-    read_any_inner(a, opts, files, status, tx, path)
+fn read_any<W: Write>(
+    a: &mut Active,
+    opts: &ExecOptions,
+    files: &FileService,
+    status: &SharedStatus,
+    tx: &Sender<ExecEvent>,
+    path: &str,
+    out: &mut W,
+) -> std::result::Result<u64, ReadError> {
+    let result = read_any_inner(a, opts, files, status, tx, path, out);
+    if let Err(ReadError::Lost(reason)) = &result {
+        a.serving = false;
+        files.close(reason);
+        let _ = tx.send(ExecEvent::Lost {
+            round: a.round,
+            reason: reason.clone(),
+        });
+        // HTTP 的读取先写私有 spool，尚未向客户端发送内容，可以安全换节点重读。
+        return Err(ReadError::Busy(reason.clone()));
+    }
+    result
 }
 
-fn read_any_inner(a: &mut Active, opts: &ExecOptions, files: &FileService, status: &SharedStatus, tx: &Sender<ExecEvent>, path: &str) -> std::result::Result<Vec<u8>, ReadError> {
+fn read_any_inner<W: Write>(a: &mut Active, opts: &ExecOptions, files: &FileService, status: &SharedStatus, tx: &Sender<ExecEvent>, path: &str, out: &mut W) -> std::result::Result<u64, ReadError> {
     use ReadError::{Busy, Failed};
     let st = files.stat(path).map_err(|e| Failed(e.to_string()))?.ok_or_else(|| Failed(format!("文件不存在: {}", path)))?;
     let barcode = st.barcode;
     // 1. 就在写入带上
     if files.tape().is_some_and(|t| t.barcode == barcode) {
         if let Some(i) = a.drive {
-            return read_file(a.devices[i].dev.as_ref(), path).map_err(|e| Failed(e.to_string()));
+            return read_file(a.devices[i].dev.as_ref(), path, out).map_err(|e| ReadError::device(e, "读取文件失败"));
         }
     }
     // 2. 就在读带上
     if let Some((i, b, _)) = &a.read {
         if *b == barcode {
             let i = *i;
-            let out = read_file(a.devices[i].dev.as_ref(), path).map_err(|e| Failed(e.to_string()))?;
+            let out = read_file(a.devices[i].dev.as_ref(), path, out).map_err(|e| ReadError::device(e, "读取文件失败"))?;
             a.read = Some((i, barcode, Instant::now()));
             return Ok(out);
         }
     }
     // 3. 要装载。先找驱动器
-    let inv = inventory(&a.devices).map_err(|e| Failed(e.to_string()))?;
+    let inv = inventory(&a.devices).map_err(|e| ReadError::device(e, "读取库存失败"))?;
     let Some(&from) = inv.slots.get(&barcode) else {
         return Err(Failed(format!("{} 不在库里的存储槽位中", barcode)));
     };
@@ -868,11 +1083,11 @@ fn read_any_inner(a: &mut Active, opts: &ExecOptions, files: &FileService, statu
     // 3a. 之前的读带占着一个驱动器：卸回去
     if let Some((i, b, _)) = a.read.take() {
         if let Some(d) = inv.drives.iter().find(|d| d.dev == i) {
-            unload_drive(&a.devices, &inv, d).map_err(|e| Failed(format!("卸下读带 {} 失败: {}", b, e)))?;
+            unload_drive(&a.devices, &inv, d).map_err(|e| ReadError::device(e, &format!("卸下读带 {} 失败", b)))?;
             target = Some(i);
         }
     }
-    let inv = inventory(&a.devices).map_err(|e| Failed(e.to_string()))?;
+    let inv = inventory(&a.devices).map_err(|e| ReadError::device(e, "读取库存失败"))?;
     if target.is_none() {
         target = inv.drives.iter().find(|d| d.loaded.is_none() && Some(d.dev) != write_dev).map(|d| d.dev);
     }
@@ -885,16 +1100,23 @@ fn read_any_inner(a: &mut Active, opts: &ExecOptions, files: &FileService, statu
         if !files.write_side_idle(a.round) {
             return Err(Busy(format!("唯一的驱动器正在写入 {}，读 {} 上的文件要等写入侧空闲", files.tape().map(|t| t.barcode).unwrap_or_default(), barcode)));
         }
+        if let Err(e) = checkpoint_write_tape(a, files, tx) {
+            let reason = format!("写入带检查点失败: {}", e);
+            a.serving = false;
+            files.close(&reason);
+            let _ = tx.send(ExecEvent::Lost { round: a.round, reason: reason.clone() });
+            return Err(Failed(reason));
+        }
         files.close("暂时换带读取");
         if let Some(d) = inv.drives.iter().find(|d| d.dev == w) {
-            unload_drive(&a.devices, &inv, d).map_err(|e| Failed(format!("卸下写入带失败: {}", e)))?;
+            unload_drive(&a.devices, &inv, d).map_err(|e| ReadError::device(e, "卸下写入带失败"))?;
         }
         a.drive = None;
         target = Some(w);
         swapped_write = true;
     }
     let i = target.expect("已确定驱动器");
-    let inv = inventory(&a.devices).map_err(|e| Failed(e.to_string()))?;
+    let inv = inventory(&a.devices).map_err(|e| ReadError::device(e, "读取库存失败"))?;
     let addr = inv.drives.iter().find(|d| d.dev == i).map(|d| d.addr).ok_or_else(|| Failed("驱动器不在库存里".to_string()))?;
     info!("执行线程: 为读取装载 {} -> {}", barcode, a.devices[i].name);
     let loaded = move_medium(&a.devices, from, addr)
@@ -911,7 +1133,7 @@ fn read_any_inner(a: &mut Active, opts: &ExecOptions, files: &FileService, statu
                     barcode: barcode.clone(),
                     volume_uuid: vol.label().volume_uuid.to_string(),
                     generation: vol.index().generation,
-                    files_total: list.len() as u64,
+                    files_total: list.iter().filter(|r| !is_directory(&r.metadata)).count() as u64,
                     bytes_used,
                     bytes_written: bytes_written_on(a.devices[i].dev.as_ref()),
                     files: list,
@@ -919,22 +1141,24 @@ fn read_any_inner(a: &mut Active, opts: &ExecOptions, files: &FileService, statu
                 });
             }
             let p = path.trim_start_matches('/');
-            let mut out = Vec::new();
-            vol.read_file_to_writer(p, &mut out).map(|_| out).map_err(|e| Failed(e.to_string()))
+            vol.read_file_to_writer(p, out).map_err(|e| ReadError::device(e, "读取文件失败"))
         }
-        Err(e) => Err(Failed(format!("装载 {} 读取失败: {}", barcode, e))),
+        Err(e) => Err(ReadError::device(e, &format!("装载 {} 读取失败", barcode))),
     };
+    if matches!(&result, Err(ReadError::Lost(_))) {
+        return result;
+    }
     if swapped_write {
         // 读完就换回：读带卸回槽位，重新选写入带
-        let inv2 = inventory(&a.devices).map_err(|e| Failed(e.to_string()))?;
+        let inv2 = inventory(&a.devices).map_err(|e| ReadError::device(e, "读取库存失败"))?;
         if let Some(d) = inv2.drives.iter().find(|d| d.dev == i) {
-            let _ = unload_drive(&a.devices, &inv2, d);
+            unload_drive(&a.devices, &inv2, d).map_err(|e| ReadError::device(e, "读取后卸带失败"))?;
         }
         match ensure_write_tape(a, opts, files, status, tx) {
             Ok(summary) => {
                 let _ = tx.send(ExecEvent::Serving { round: a.round, summary });
             }
-            Err(e) => return Err(Failed(format!("读取后恢复写入带失败: {}", e))),
+            Err(e) => return Err(ReadError::device(e, "读取后恢复写入带失败")),
         }
     } else {
         a.read = Some((i, barcode, Instant::now()));
@@ -1039,6 +1263,9 @@ fn start_reclaim(
     let vol = LtfsVolume::mount(a.devices[drive].dev.as_ref())?;
     let mut todo = Vec::new();
     vol.index().walk_files(|p, _| todo.push(format!("/{}", p)));
+    vol.index().walk_directories(|p, _| {
+        if p != ".tapers" && !p.starts_with(".tapers/") { todo.push(format!("/{}", p)); }
+    });
     // 字典序搬，从末尾取，所以倒过来放。顺序固定便于换届之后接着看日志
     todo.sort();
     todo.reverse();
@@ -1209,46 +1436,119 @@ enum Copied {
 /// 端到端验证；对不上宁可整次回收作废，也不能把读坏的内容写到新带上再把源带格式化掉。
 fn copy_one(vol: &LtfsVolume, source: &str, path: &str, files: &FileService) -> Result<Copied> {
     let p = path.trim_start_matches('/');
-    let Some(node) = vol.index().find_file(p) else { return Ok(Copied::Superseded) };
+    if let Some(dir) = vol.index().find_directory(p) {
+        if files
+            .lookup(path)
+            .map_err(|e| TapeError::Ltfs(e.to_string()))?
+            .is_some_and(|st| st.barcode != source || st.deleted)
+        {
+            return Ok(Copied::Superseded);
+        }
+        return match files.relocate_directory(path, dir.into()) {
+            Ok(_) => Ok(Copied::Moved(0)),
+            Err(super::files::ServiceError::Exists(_)) => Ok(Copied::Superseded),
+            Err(
+                super::files::ServiceError::PathBusy(_)
+                | super::files::ServiceError::SwitchingTape(_),
+            ) => Ok(Copied::Retry),
+            Err(
+                e @ (super::files::ServiceError::NoTape(_)
+                | super::files::ServiceError::NotServing(_)),
+            ) => Ok(Copied::Halt(e.to_string())),
+            Err(e) => Err(TapeError::Ltfs(format!("回收目录 {} 失败: {}", path, e))),
+        };
+    }
+    let Some(node) = vol.index().find_file(p) else {
+        return Ok(Copied::Superseded);
+    };
     if is_tombstone_path(p) {
         // 墓碑目录下没有被删路径的文件不是我们写的，没有要保住的东西
-        let Some(target) = node.xattr(XATTR_DELETED_PATH) else { return Ok(Copied::Superseded) };
-        return copy_tombstone(source, target, files);
+        let Some(target) = node.xattr(XATTR_DELETED_PATH) else {
+            return Ok(Copied::Superseded);
+        };
+        return copy_tombstone(
+            source,
+            target,
+            node.xattr("tapers.deletedKind") == Some("directory"),
+            files,
+        );
     }
     let len = node.length;
-    let want = node.xattr(crate::ltfs::index::XATTR_SHA256).unwrap_or("").to_string();
+    let want = node
+        .xattr(crate::ltfs::index::XATTR_SHA256)
+        .unwrap_or("")
+        .to_string();
     // 目录说这个路径的当前记录在别的带上（被重写或被删除）：源带上这一份是旧副本，不用搬。
     // 查不到的（目录还没经 Raft 应用到本地）照搬不误：多一份总比留在要被格式化的带上强。
-    if files.lookup(path).map_err(|e| TapeError::Ltfs(e.to_string()))?.is_some_and(|st| st.barcode != source || st.deleted) {
+    if files
+        .lookup(path)
+        .map_err(|e| TapeError::Ltfs(e.to_string()))?
+        .is_some_and(|st| st.barcode != source || st.deleted)
+    {
         return Ok(Copied::Superseded);
+    }
+    if let Some(target) = &node.symlink {
+        return match files.relocate_symlink(path, target, node.into()) {
+            Ok(_) => Ok(Copied::Moved(0)),
+            Err(super::files::ServiceError::Exists(_)) => Ok(Copied::Superseded),
+            Err(
+                super::files::ServiceError::PathBusy(_)
+                | super::files::ServiceError::SwitchingTape(_),
+            ) => Ok(Copied::Retry),
+            Err(
+                e @ (super::files::ServiceError::NoTape(_)
+                | super::files::ServiceError::NotServing(_)),
+            ) => Ok(Copied::Halt(e.to_string())),
+            Err(e) => Err(TapeError::Ltfs(format!(
+                "回收符号链接 {} 失败: {}",
+                path, e
+            ))),
+        };
     }
     let h = match files.begin(path, len) {
         Ok(h) => h,
         // 客户端正在重写同一个路径：它写的是更新的版本，让它先走
-        Err(super::files::ServiceError::PathBusy(_)) | Err(super::files::ServiceError::SwitchingTape(_)) => {
+        Err(super::files::ServiceError::PathBusy(_))
+        | Err(super::files::ServiceError::SwitchingTape(_)) => {
             return Ok(Copied::Retry);
         }
         // 池里已经没有可写的带了：加带是运维动作，等它，别把源带标成有问题
-        Err(e @ (super::files::ServiceError::NoTape(_) | super::files::ServiceError::NotServing(_))) => {
+        Err(
+            e @ (super::files::ServiceError::NoTape(_) | super::files::ServiceError::NotServing(_)),
+        ) => {
             return Ok(Copied::Halt(e.to_string()));
         }
         Err(e) => return Err(TapeError::Ltfs(format!("回收 {} 准入失败: {}", path, e))),
     };
     let read = (|| -> Result<String> {
-        let mut w = HashingWriter { inner: std::io::BufWriter::new(std::fs::File::create(&h.spool)?), hash: Sha256::new() };
+        let mut w = HashingWriter {
+            inner: std::io::BufWriter::new(std::fs::File::create(&h.spool)?),
+            hash: Sha256::new(),
+        };
         vol.read_file_to_writer(p, &mut w)?;
         w.inner.flush()?;
-        Ok(w.hash.finalize().iter().map(|b| format!("{:02x}", b)).collect())
+        Ok(w.hash
+            .finalize()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect())
     })();
     match read {
         Ok(got) if want.is_empty() || got == want => {
-            files.ingest(&h, len).map_err(|e| TapeError::Ltfs(e.to_string()))?;
-            files.finish(h, len).map_err(|e| TapeError::Ltfs(e.to_string()))?;
+            files
+                .ingest(&h, len)
+                .map_err(|e| TapeError::Ltfs(e.to_string()))?;
+            files
+                .finish_with_metadata(h, len, Some(node.into()))
+                .map_err(|e| TapeError::Ltfs(e.to_string()))?;
             Ok(Copied::Moved(len))
         }
         Ok(got) => {
             files.abort(h);
-            Err(TapeError::Ltfs(format!("{} 上的 {} 读出来是 {}，索引里记的是 {}", source, path, got, want)))
+            Err(TapeError::Ltfs(format!(
+                "{} 上的 {} 读出来是 {}，索引里记的是 {}",
+                source, path, got, want
+            )))
         }
         Err(e) => {
             files.abort(h);
@@ -1259,17 +1559,33 @@ fn copy_one(vol: &LtfsVolume, source: &str, path: &str, files: &FileService) -> 
 
 /// 搬一块墓碑：在当前写入带上以新版本重新落一次。墓碑在带上是活的——源带一格式化，
 /// 别的带上的旧副本就会在下次对账时复活——所以和文件一样要有着落才能格式化。
-fn copy_tombstone(source: &str, target: &str, files: &FileService) -> Result<Copied> {
+fn copy_tombstone(
+    source: &str,
+    target: &str,
+    directory: bool,
+    files: &FileService,
+) -> Result<Copied> {
     // 这个路径已由别的带上的记录（新上传的文件，或另一块墓碑）决定：源带上这块作废了
-    if files.lookup(target).map_err(|e| TapeError::Ltfs(e.to_string()))?.is_some_and(|st| st.barcode != source) {
+    if files
+        .lookup(target)
+        .map_err(|e| TapeError::Ltfs(e.to_string()))?
+        .is_some_and(|st| st.barcode != source)
+    {
         return Ok(Copied::Superseded);
     }
-    match files.relocate_tombstone(target) {
+    match files.relocate_tombstone_kind(target, directory) {
         Ok(_) => Ok(Copied::Moved(0)),
+        Err(super::files::ServiceError::Exists(_)) => Ok(Copied::Superseded),
         // 客户端正在重新上传这个路径：它的版本更新，让它先走
-        Err(super::files::ServiceError::PathBusy(_)) | Err(super::files::ServiceError::SwitchingTape(_)) => Ok(Copied::Retry),
-        Err(e @ (super::files::ServiceError::NoTape(_) | super::files::ServiceError::NotServing(_))) => Ok(Copied::Halt(e.to_string())),
-        Err(e) => Err(TapeError::Ltfs(format!("回收 {} 的墓碑失败: {}", target, e))),
+        Err(super::files::ServiceError::PathBusy(_))
+        | Err(super::files::ServiceError::SwitchingTape(_)) => Ok(Copied::Retry),
+        Err(
+            e @ (super::files::ServiceError::NoTape(_) | super::files::ServiceError::NotServing(_)),
+        ) => Ok(Copied::Halt(e.to_string())),
+        Err(e) => Err(TapeError::Ltfs(format!(
+            "回收 {} 的墓碑失败: {}",
+            target, e
+        ))),
     }
 }
 
@@ -1325,6 +1641,9 @@ fn finish_reclaim(
             } else if let Some(target) = f.xattr(XATTR_DELETED_PATH) {
                 paths.push(target.to_string());
             }
+        });
+        vol.index().walk_directories(|p, _| {
+            if p != ".tapers" && !p.starts_with(".tapers/") { paths.push(format!("/{}", p)); }
         });
         for path in paths {
             match files.lookup(&path) {
@@ -1431,4 +1750,37 @@ fn periodic(a: &mut Active, opts: &ExecOptions) -> std::result::Result<(), Strin
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod read_error_tests {
+    use super::*;
+
+    #[test]
+    fn ownership_errors_are_distinct_from_medium_errors() {
+        for (key, asc, ascq, lost) in [(6, 0x2a, 3, true), (6, 0x29, 0, true), (3, 0x11, 0, false)]
+        {
+            let err = ReadError::device(
+                TapeError::ScsiCommand {
+                    status: 2,
+                    sense_key: key,
+                    asc,
+                    ascq,
+                },
+                "读取测试",
+            );
+            assert_eq!(matches!(err, ReadError::Lost(_)), lost);
+            assert!(err.to_string().contains("status=0x02"));
+            assert!(err.to_string().contains("sense_key="));
+        }
+        assert!(matches!(
+            ReadError::device(
+                TapeError::ReservationConflict {
+                    device: "drive0".into()
+                },
+                "读取测试"
+            ),
+            ReadError::Lost(_)
+        ));
+    }
 }

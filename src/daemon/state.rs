@@ -55,6 +55,8 @@ pub struct FileRec {
     /// 墓碑：该路径在这个版本被删除（带上是 `.tapers/deleted/<哈希>`，见 `ltfs::volume::TOMBSTONE_DIR`）。
     /// 与文件按同一套版本比较，版本更高者胜。
     pub deleted: bool,
+    /// 原始索引修改时间与 xattr；旧日志未缓存时为 null。
+    pub metadata: Value,
 }
 
 /// 目录条目单片的大小上限（字节，按 JSON 编码后估算）。
@@ -65,7 +67,7 @@ pub fn split_catalog(files: &[FileRec]) -> Vec<Vec<FileRec>> {
     let mut out = vec![Vec::new()];
     let mut size = 0usize;
     for f in files {
-        let cost = f.path.len() + f.sha256.len() + 72;
+        let cost = f.path.len() + f.sha256.len() + f.metadata.to_string().len() + 72;
         if size + cost > CATALOG_PART_BYTES && !out.last().is_some_and(Vec::is_empty) {
             out.push(Vec::new());
             size = 0;
@@ -96,7 +98,7 @@ impl Command {
             }
             Command::CatalogPart { barcode, generation, part, files } => json!({
                 "op": "catalog_part", "barcode": barcode, "generation": generation, "part": part,
-                "files": files.iter().map(|f| json!([f.path, f.length, f.sha256, f.version.0, f.version.1, f.deleted])).collect::<Vec<_>>(),
+                "files": files.iter().map(|f| json!([f.path, f.length, f.sha256, f.version.0, f.version.1, f.deleted, f.metadata])).collect::<Vec<_>>(),
             }),
             Command::TapeCommitted { barcode, volume_uuid, generation, files, bytes_used, bytes_written, parts, full } => json!({
                 "op": "tape_committed", "barcode": barcode, "volume_uuid": volume_uuid, "generation": generation,
@@ -137,6 +139,7 @@ impl Command {
                             version: (f.get(3).and_then(Value::as_u64).unwrap_or(0), f.get(4).and_then(Value::as_u64).unwrap_or(0)),
                             // 旧日志里的条目没有这一项：都是文件
                             deleted: f.get(5).and_then(Value::as_bool).unwrap_or(false),
+                            metadata: f.get(6).cloned().unwrap_or(Value::Null),
                         })
                     })
                     .collect::<Option<Vec<_>>>()?;
@@ -569,7 +572,7 @@ mod tests {
     #[test]
     fn catalog_commands_roundtrip_and_split() {
         let files: Vec<FileRec> = (0..10_000)
-            .map(|i| FileRec { path: format!("/dir/sub/object-{:08}.bin", i), length: i, sha256: "ab".repeat(32), version: (7, i), deleted: i % 5 == 0 })
+            .map(|i| FileRec { metadata: json!({"modify_time": "2026-09-24T01:02:03.123456789Z", "xattrs": [{"key": "note", "value": "数据", "base64": false}]}), path: format!("/dir/sub/object-{:08}.bin", i), length: i, sha256: "ab".repeat(32), version: (7, i), deleted: i % 5 == 0 })
             .collect();
         let parts = split_catalog(&files);
         assert!(parts.len() >= 2, "一万条记录超过 1 MiB，应当分片");

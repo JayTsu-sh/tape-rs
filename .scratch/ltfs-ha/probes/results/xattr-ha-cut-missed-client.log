@@ -1,0 +1,4 @@
+
+thread 'main' (58163) panicked at examples/hw_xattr_fault.rs:25:13:
+Ok(())
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

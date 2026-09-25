@@ -1,0 +1,21 @@
+   Compiling tape-rs v0.1.0 (/work/jay/tape-rs-ltfs-recovery-ibm-interop)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.23s
+     Running tests/ltfsd_cluster.rs (/work/cargo-target/debug/deps/ltfsd_cluster-0df699d40388ecd6)
+
+running 1 test
+
+thread 'reclaim_preserves_symlinks_without_resolving_targets' (4044032) panicked at tests/ltfsd_cluster.rs:2262:5:
+assertion `left == right` failed: ReclaimRecord { round: 2, barcode: "PA0001L8", outcome: "abandoned", detail: "LTFS format error: 符号链接目标不可读: dangling -> missing" }
+  left: "abandoned"
+ right: "done"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test reclaim_preserves_symlinks_without_resolving_targets ... FAILED
+
+failures:
+
+failures:
+    reclaim_preserves_symlinks_without_resolving_targets
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 37 filtered out; finished in 0.83s
+
+error: test failed, to rerun pass `--test ltfsd_cluster`

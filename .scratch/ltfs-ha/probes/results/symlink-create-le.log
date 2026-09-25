@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/tmp/symlink-create-probe.py", line 29, in <module>
+    assert os.path.islink(p/name),name
+AssertionError: relative

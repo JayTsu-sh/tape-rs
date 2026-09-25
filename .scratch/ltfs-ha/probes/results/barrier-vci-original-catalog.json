@@ -1,0 +1,20 @@
+[
+  {
+    "exe": "/home/rocky/tape-rs-xattr-prod-20260924/ltfsd",
+    "sha256": "f8c2383146c4b595d42993838bbbfd353efef064d0f57296a17758d66f2d2e8d",
+    "rows": 31,
+    "catalog_sha256": "a6c01dada1bf202c64da6d0e4e4a2b84e9d69cdcf5ff10e79bf6d5eb1dfdddb0"
+  },
+  {
+    "exe": "/home/rocky/tape-rs-xattr-prod-20260924/ltfsd",
+    "sha256": "f8c2383146c4b595d42993838bbbfd353efef064d0f57296a17758d66f2d2e8d",
+    "rows": 31,
+    "catalog_sha256": "a6c01dada1bf202c64da6d0e4e4a2b84e9d69cdcf5ff10e79bf6d5eb1dfdddb0"
+  },
+  {
+    "exe": "/home/rocky/tape-rs-xattr-prod-20260924/ltfsd",
+    "sha256": "f8c2383146c4b595d42993838bbbfd353efef064d0f57296a17758d66f2d2e8d",
+    "rows": 31,
+    "catalog_sha256": "a6c01dada1bf202c64da6d0e4e4a2b84e9d69cdcf5ff10e79bf6d5eb1dfdddb0"
+  }
+]

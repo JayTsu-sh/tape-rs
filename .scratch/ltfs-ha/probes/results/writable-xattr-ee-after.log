@@ -1,0 +1,40 @@
+Node ID  State      Node IP     Drives  Ctrl Node    Library   Node Group  Host Name         
+1        available  10.10.2.71       1  yes(active)  LISA4300  G0          ee1-cluster.ee.lab
+2        available  10.10.2.72       1  no           LISA4300  G0          ee2-cluster.ee.lab
+3        available  10.10.2.74       1  no           LISA4300  G0          ee3-cluster.ee.lab
+No active task found.
+sha256sum: /gpfs/f3: No such file or directory
+{
+  "status": "NEED_ASSIGN",
+  "severity": "INFO",
+  "handling": "UNMOUNTED",
+  "read_perms": 0,
+  "mount_node": null,
+  "accessible": true,
+  "format_condition": "WRITABLE",
+  "label_mismatch": false,
+  "total_blocks": 204,
+  "valid_blocks": 18,
+  "slot_type": "SLOT",
+  "slot": 1032,
+  "home_slot": 1032,
+  "place_by_operator": false,
+  "validation_error": null,
+  "cart_type": 136,
+  "density_code": "0x5e",
+  "is_encrypted": false,
+  "is_worm": false,
+  "write_protect": "NONE",
+  "total_ip": 122,
+  "remaining_ip": 121,
+  "total_dp": 61,
+  "remaining_dp": 28,
+  "total_cap": 61,
+  "remaining_cap": 28,
+  "tape_alert": 9223372036854775808,
+  "obj_type": "cartridge",
+  "obj_id": "TS1000L8",
+  "assignment": "UNASSIGNED",
+  "placed_by_operator": false
+}
+cd5c2a3513cfef51485baeddfeda2009269e2bb53944aa469512f4dc2ca2779e  /gpfs/tapers-del/f3

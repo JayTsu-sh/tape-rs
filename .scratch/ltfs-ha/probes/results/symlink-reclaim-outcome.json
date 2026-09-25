@@ -1,0 +1,20 @@
+{
+  "drives": 2,
+  "executor": {
+    "fenced": true,
+    "node": 1,
+    "round": 49
+  },
+  "id": 1,
+  "last_reclaim": {
+    "barcode": "SR2501L8",
+    "detail": "\u642c\u8d70 11 \u4e2a\u6587\u4ef6 / 0 MiB\uff0c\u5df2\u91cd\u65b0\u683c\u5f0f\u5316",
+    "outcome": "done",
+    "round": 49
+  },
+  "leader": 1,
+  "local": "\u8f6e\u6b21 49\uff1a\u670d\u52a1\u4e2d\u3002IBMtaper2287 (/dev/sg10) [SR2502L8]: gen=1 \u6587\u4ef6 0 \u4e2a \u5c3e\u90e8 Complete\uff1b\u5df2\u5199\u5165\u6c60\u6807\u8bb0\uff1b\u53ef\u7528 236 MiB",
+  "role": "Leader",
+  "serving_round": 49,
+  "term": 2
+}

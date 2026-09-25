@@ -27,11 +27,48 @@ use crate::error::{Result, TapeError};
 use crate::tape::commands::TapeDrive;
 
 use super::index::{
-    DirectoryNode, Extent, FileNode, IndexLocation, LtfsIndex, NodeMeta, XATTR_MD5, XATTR_SHA256,
+    DirectoryNode, Extent, FileNode, IndexLocation, LtfsIndex, NodeMeta, Xattr, XATTR_MD5, XATTR_SHA256,
 };
 use super::label::{LtfsLabel, PART_INDEX};
 use super::mam::{Mam, VolumeCoherencyInfo};
 use super::recovery::{self, RecoveryBudget, RecoveryReport};
+
+/// 回收或覆盖携带的逻辑文件属性；源卷 UID 不复用，不携带 extent 或旧副本的位置。
+#[derive(Debug, Clone)]
+pub(crate) struct FileMetadata {
+    pub meta: NodeMeta,
+    pub xattrs: Vec<Xattr>,
+}
+
+impl FileMetadata {
+    /// 内容覆盖保留扩展属性，时间与普通新写入一致；UID 和摘要在落带时重建。
+    pub(crate) fn replacement(xattrs: Vec<Xattr>) -> Self {
+        let now = crate::ltfs::label::ltfs_time_now();
+        Self {
+            meta: NodeMeta {
+                creation_time: now.clone(),
+                change_time: now.clone(),
+                modify_time: now.clone(),
+                access_time: now.clone(),
+                backup_time: now,
+                ..Default::default()
+            },
+            xattrs,
+        }
+    }
+}
+
+impl From<&DirectoryNode> for FileMetadata {
+    fn from(node: &DirectoryNode) -> Self {
+        Self { meta: node.meta.clone(), xattrs: node.xattrs.clone() }
+    }
+}
+
+impl From<&FileNode> for FileMetadata {
+    fn from(node: &FileNode) -> Self {
+        Self { meta: node.meta.clone(), xattrs: node.xattrs.clone() }
+    }
+}
 
 /// P0 / P1 起始块布局常量（与 `mkltfs` 生成的结构一一对应）。
 pub const VOL1_BLOCK: u64 = 0;
@@ -63,6 +100,10 @@ pub struct LtfsVolume<'a> {
     dirty: bool,
     /// DP 上最新一份索引的位置：commit 时作为 `previousgenerationlocation`。
     last_dp_index: Option<IndexLocation>,
+    last_dp_incremental: Option<IndexLocation>,
+    last_ip: Option<(u64, u64)>,
+    incremental_depth: u32,
+    incremental_limit: u32,
     /// 挂载时的恢复报告；`writable == recovery.append_ok`。
     recovery: RecoveryReport,
     writable: bool,
@@ -117,7 +158,10 @@ impl<'a> LtfsVolume<'a> {
 
         // 3. P1 append point = 恢复报告中的 EOD。
         let p1_write_head = report.dp.eod.max(P1_DATA_START);
-        let last_dp_index = recovery::dp_index_location(&report, label.data_partition);
+        let dp = report.dp.last_index.as_ref();
+        let last_dp_index = dp.and_then(|c| if c.index.incremental { c.index.previous_location } else { Some(c.index.self_location) });
+        let last_dp_incremental = dp.filter(|c| c.index.incremental).map(|c| c.index.self_location);
+        let last_ip = report.ip.last_index.as_ref().map(|c| (c.index.generation, c.start_block));
         for note in report.notes.iter().chain(&report.dp.notes).chain(&report.ip.notes) {
             debug!("恢复备注: {}", note);
         }
@@ -161,6 +205,10 @@ impl<'a> LtfsVolume<'a> {
             p1_write_head,
             dirty: false,
             last_dp_index,
+            last_dp_incremental,
+            last_ip,
+            incremental_depth: report.incremental_depth,
+            incremental_limit: 5.min(budget.max_chain_len),
             recovery: report,
             writable,
             restricted_reason,
@@ -205,10 +253,12 @@ impl<'a> LtfsVolume<'a> {
             debug!("VCR 无效（全 0/全 1），跳过 VCI 更新");
             return Ok(());
         }
-        for (partition, block) in [(0u8, P0_INDEX_BLOCK), (1u8, p1_index_block)] {
+        let ip = if self.working.incremental { self.last_ip } else { Some((self.working.generation, P0_INDEX_BLOCK)) };
+        for (partition, entry) in [(0u8, ip), (1u8, Some((self.working.generation, p1_index_block)))] {
+            let Some((generation, block)) = entry else { continue; };
             let vci = VolumeCoherencyInfo {
                 vcr: vcr.to_vec(),
-                generation: self.working.generation,
+                generation,
                 block,
                 volume_uuid: self.label.volume_uuid,
             };
@@ -278,6 +328,9 @@ impl<'a> LtfsVolume<'a> {
             };
         }
         if file.extents.is_empty() {
+            if file.length != 0 {
+                return Err(TapeError::Ltfs(format!("文件 {} 缺少数据 extent", path)));
+            }
             return Ok(0);
         }
 
@@ -294,7 +347,7 @@ impl<'a> LtfsVolume<'a> {
             while remaining > 0 {
                 let n = self.drive.read_block(&mut buf)?;
                 if n == 0 {
-                    break;
+                    return Err(TapeError::Ltfs(format!("文件 {} 的 extent 提前结束，缺少 {} 字节", path, remaining)));
                 }
                 let slice_start = if first_block {
                     ext.byte_offset as usize
@@ -310,6 +363,9 @@ impl<'a> LtfsVolume<'a> {
                 }
                 first_block = false;
             }
+        }
+        if total != file.length {
+            return Err(TapeError::Ltfs(format!("文件 {} 长度不符: 索引 {}，读取 {}", path, file.length, total)));
         }
         w.flush()?;
         info!("读取 {}: {} 字节", path, total);
@@ -517,13 +573,23 @@ impl<'a> LtfsVolume<'a> {
     /// 在工作索引里登记一个符号链接（§9.2.9）。不写任何数据块，commit 后生效。
     /// IBM EE 用它把用户路径指向 `.LTFSEE_DATA/<id>`。
     pub fn add_symlink(&mut self, path: &str, target: &str) -> Result<()> {
+        self.add_symlink_with_metadata(path, target, None)
+    }
+
+    /// 回收链接只复制节点，不读取目标、不携带源卷 extent 或 UID。
+    pub(crate) fn add_symlink_with_metadata(
+        &mut self,
+        path: &str,
+        target: &str,
+        preserved: Option<&FileMetadata>,
+    ) -> Result<()> {
         self.ensure_writable()?;
         if target.is_empty() {
             return Err(TapeError::Ltfs(format!("符号链接目标为空: {}", path)));
         }
         self.working.highest_file_uid += 1;
         let now = crate::ltfs::label::ltfs_time_now();
-        let meta = NodeMeta {
+        let mut meta = NodeMeta {
             readonly: false,
             creation_time: now.clone(),
             change_time: now.clone(),
@@ -532,6 +598,10 @@ impl<'a> LtfsVolume<'a> {
             backup_time: now,
             file_uid: self.working.highest_file_uid,
         };
+        if let Some(metadata) = preserved {
+            meta = metadata.meta.clone();
+            meta.file_uid = self.working.highest_file_uid;
+        }
         let (dir_parts, file_name) = split_path(path)?;
         let dir = ensure_dir(
             &mut self.working.root,
@@ -543,6 +613,7 @@ impl<'a> LtfsVolume<'a> {
             name: file_name.to_string(),
             meta,
             symlink: Some(target.to_string()),
+            xattrs: preserved.map(|m| m.xattrs.clone()).unwrap_or_default(),
             ..Default::default()
         });
         self.dirty = true;
@@ -571,6 +642,95 @@ impl<'a> LtfsVolume<'a> {
         Ok(true)
     }
 
+    /// 修改只进入工作索引；commit_incremental 将其持久化为标准 DP 增量。
+    pub fn create_directory(&mut self, path: &str) -> Result<()> {
+        self.ensure_writable()?; self.working.create_directory(path)?; self.dirty = true; Ok(())
+    }
+
+    /// 守护进程已按池内最新视图验证路径可替换后，丢弃本带的旧命名空间副本。
+    /// 只改工作索引；不回收数据块，失败提交仍由卷冻结保护。
+    pub(crate) fn discard_catalog_path(&mut self, path: &str) -> Result<()> {
+        self.ensure_writable()?;
+        let (parents, name) = split_path(path)?;
+        let mut d = &mut self.working.root;
+        for p in parents {
+            let Some(child) = d.subdirs.iter_mut().find(|d| d.name == p) else {
+                return Ok(());
+            };
+            d = child;
+        }
+        d.files.retain(|f| f.name != name);
+        d.subdirs.retain(|d| d.name != name);
+        self.dirty = true;
+        Ok(())
+    }
+
+    pub(crate) fn put_catalog_directory(
+        &mut self,
+        path: &str,
+        version: &str,
+        metadata: &FileMetadata,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        if self.working.find_directory(path).is_none() {
+            self.remove_file(path)?;
+            self.working.create_directory(path)?;
+        }
+        let (parents, name) = split_path(path)?;
+        let mut d = &mut self.working.root;
+        for p in parents {
+            d = d
+                .subdirs
+                .iter_mut()
+                .find(|d| d.name == p)
+                .expect("父目录已创建");
+        }
+        let d = d
+            .subdirs
+            .iter_mut()
+            .find(|d| d.name == name)
+            .expect("目录已创建");
+        let uid = d.meta.file_uid;
+        d.meta = metadata.meta.clone();
+        d.meta.file_uid = uid;
+        d.xattrs = metadata.xattrs.clone();
+        d.xattrs.retain(|x| x.key != XATTR_VERSION);
+        d.xattrs.push(Xattr {
+            key: XATTR_VERSION.into(),
+            value: version.into(),
+            base64: false,
+        });
+        self.dirty = true;
+        Ok(())
+    }
+
+    pub fn remove_directory(&mut self, path: &str) -> Result<()> {
+        self.ensure_writable()?; self.working.remove_directory(path)?; self.dirty = true; Ok(())
+    }
+
+    pub(crate) fn set_catalog_version(&mut self, path: &str, version: &str) -> Result<()> {
+        self.ensure_writable()?;
+        self.working.set_catalog_version(path, version)?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    pub fn rename_path(&mut self, from: &str, to: &str) -> Result<()> {
+        self.ensure_writable()?; self.working.rename_path(from, to)?; self.dirty = true; Ok(())
+    }
+
+    pub fn set_node_xattr(&mut self, path: &str, attr: Xattr, create_only: bool, replace_only: bool) -> Result<()> {
+        self.ensure_writable()?; self.working.set_node_xattr(path, attr, create_only, replace_only)?; self.dirty = true; Ok(())
+    }
+
+    pub fn remove_node_xattr(&mut self, path: &str, key: &str) -> Result<()> {
+        self.ensure_writable()?; self.working.remove_node_xattr(path, key)?; self.dirty = true; Ok(())
+    }
+
+    pub fn set_node_readonly(&mut self, path: &str, readonly: bool) -> Result<()> {
+        self.ensure_writable()?; self.working.set_node_readonly(path, readonly)?; self.dirty = true; Ok(())
+    }
+
     /// 读出文件并与索引里的哈希比对。优先 sha256sum，其次 md5sum。
     pub fn verify_file(&self, path: &str) -> Result<HashVerdict> {
         let file = self
@@ -593,13 +753,21 @@ impl<'a> LtfsVolume<'a> {
     }
 
     /// 同 `append_file`，并附带调用方给的文本型扩展属性。
-    /// `ltfs.hash.md5sum` 总是由本函数按实际写入内容计算。
+    /// 内容哈希由本函数依照 HashPolicy 按实际写入内容计算。
     pub fn append_file_with_xattrs<R: Read>(
         &mut self,
         path: &str,
         r: &mut R,
         xattrs: &[(&str, &str)],
     ) -> Result<u64> {
+        self.append_file_inner(path, r, xattrs, None)
+    }
+
+    pub(crate) fn append_relocated_file<R: Read>(&mut self, path: &str, r: &mut R, version: &str, metadata: &FileMetadata) -> Result<u64> {
+        self.append_file_inner(path, r, &[(XATTR_VERSION, version)], Some(metadata))
+    }
+
+    fn append_file_inner<R: Read>(&mut self, path: &str, r: &mut R, xattrs: &[(&str, &str)], preserved: Option<&FileMetadata>) -> Result<u64> {
         self.ensure_writable()?;
         if path.is_empty() || path.ends_with('/') {
             return Err(TapeError::Ltfs(format!("非法文件路径: {}", path)));
@@ -616,8 +784,10 @@ impl<'a> LtfsVolume<'a> {
         let start_block = self.p1_write_head;
         let mut byte_count: u64 = 0;
         let mut cur_block = start_block;
-        let mut md5 = self.hash_policy.md5.then(Md5::new);
-        let mut sha256 = self.hash_policy.sha256.then(Sha256::new);
+        // 搬迁时也重算源文件已有的哈希，不复制可能过期的摘要值。
+        let had_hash = |key: &str| preserved.is_some_and(|m| m.xattrs.iter().any(|x| x.key == key));
+        let mut md5 = (self.hash_policy.md5 || had_hash(XATTR_MD5)).then(Md5::new);
+        let mut sha256 = (self.hash_policy.sha256 || had_hash(XATTR_SHA256)).then(Sha256::new);
 
         loop {
             let mut filled = 0;
@@ -656,7 +826,7 @@ impl<'a> LtfsVolume<'a> {
         self.working.highest_file_uid += 1;
         let uid = self.working.highest_file_uid;
         let now = crate::ltfs::label::ltfs_time_now();
-        let meta = NodeMeta {
+        let meta = preserved.map_or_else(|| NodeMeta {
             readonly: false,
             creation_time: now.clone(),
             change_time: now.clone(),
@@ -664,7 +834,7 @@ impl<'a> LtfsVolume<'a> {
             access_time: now.clone(),
             backup_time: now,
             file_uid: uid,
-        };
+        }, |m| NodeMeta { file_uid: uid, ..m.meta.clone() });
         let extents = if byte_count > 0 {
             vec![Extent {
                 partition: self.label.data_partition,
@@ -690,6 +860,7 @@ impl<'a> LtfsVolume<'a> {
             length: byte_count,
             meta,
             extents,
+            xattrs: preserved.map(|m| m.xattrs.clone()).unwrap_or_default(),
             ..Default::default()
         };
         for (key, value) in xattrs {
@@ -719,12 +890,30 @@ impl<'a> LtfsVolume<'a> {
     /// 2. P0 覆盖写入最新 index
     /// 3. 更新 MAM VCI
     pub fn commit(&mut self) -> Result<()> {
+        // 增量之后即便没有新变化，也必须能显式生成完整检查点。
+        if self.index.incremental { self.dirty = true; }
+        self.commit_mode(false)
+    }
+
+    /// LTFS 2.5 提交：通常只追加 DP 增量；连续 5 份（或较小恢复预算）后写 DP/IP Full。
+    /// 清洁卸载也会写 Full 检查点，计数跨重新挂载保留。
+    pub fn commit_incremental(&mut self) -> Result<()> {
+        if !self.dirty { return Ok(()); }
+        if self.incremental_depth >= self.incremental_limit
+            || self.index.self_location.partition != self.label.data_partition
+        {
+            return self.commit();
+        }
+        self.commit_mode(true)
+    }
+
+    fn commit_mode(&mut self, incremental: bool) -> Result<()> {
         if !self.dirty {
             debug!("commit: nothing to do");
             return Ok(());
         }
         self.ensure_writable()?;
-        match self.commit_inner() {
+        match self.commit_inner(incremental) {
             Ok(()) => Ok(()),
             Err((stage, err)) => {
                 self.freeze_after_commit_failure(stage, &err);
@@ -740,7 +929,7 @@ impl<'a> LtfsVolume<'a> {
     /// `locate` / `opening_fm`（尚未写索引，数据仍在但本卷冻结）、
     /// `index_records` / `closing_fm`（索引残缺，结果未定）、
     /// `index_partition` / `barrier` / `vci`（DP 索引可能已完整，结果未定）。
-    fn commit_inner(&mut self) -> std::result::Result<(), (&'static str, TapeError)> {
+    fn commit_inner(&mut self, incremental: bool) -> std::result::Result<(), (&'static str, TapeError)> {
         // 回指指向 DP 上的前一份 Full（LTFS 2.5.1 §5.4.3）；旧版本曾误指向 IP。
         // 动带之前先自检；失败时介质未被触碰，但为了语义统一仍按提交失败冻结。
         if let Some(key) = self.reservation_guard {
@@ -751,6 +940,9 @@ impl<'a> LtfsVolume<'a> {
         self.working.generation += 1;
         self.working.update_time = crate::ltfs::label::ltfs_time_now();
         self.working.previous_location = prev;
+        self.working.previous_incremental_location = self.last_dp_incremental;
+        self.working.incremental = incremental;
+        if incremental || self.last_dp_incremental.is_some() { self.working.version = "2.5.0".into(); }
 
         // —— S3：DP 索引构造 [FM][records][FM] —— //
         self.drive
@@ -764,7 +956,8 @@ impl<'a> LtfsVolume<'a> {
             partition: self.label.data_partition,
             start_block: p1_index_block,
         };
-        let xml = self.working.to_xml().map_err(|e| ("encode", e))?;
+        let encoded = if incremental { self.working.incremental_since(&self.index).map_err(|e| ("encode", e))? } else { self.working.clone() };
+        let xml = encoded.to_xml().map_err(|e| ("encode", e))?;
         let blocks_written = write_bytes_in_blocks(&self.drive, &xml, self.block_size as usize)
             .map_err(|e| ("index_records", e))?;
         self.drive
@@ -773,6 +966,7 @@ impl<'a> LtfsVolume<'a> {
         self.p1_write_head = p1_index_block + blocks_written as u64 + 1;
 
         // —— IP：同一份 XML，自指针指向 P0 —— //
+        if !incremental {
         let mut p0_index = self.working.clone();
         p0_index.self_location = IndexLocation {
             partition: self.label.index_partition,
@@ -780,6 +974,7 @@ impl<'a> LtfsVolume<'a> {
         };
         // 一致卷的定义：IP 末索引回指 DP 上最后一个完整索引，也就是刚写好的同代那份。
         // 指向上一代的话 IBM LTFS 会判为不一致，挂载时自行补写 IP。
+        p0_index.previous_incremental_location = None;
         p0_index.previous_location = Some(IndexLocation {
             partition: self.label.data_partition,
             start_block: p1_index_block,
@@ -797,6 +992,8 @@ impl<'a> LtfsVolume<'a> {
             .write_filemark(1)
             .map_err(|e| ("index_partition", e))?;
 
+        }
+
         // —— 屏障前自检：设备报告的预留持有者必须仍是本轮的键 —— //
         // 预留可能在不知情时丢失（驱动器复位且未启用跨断电保持）；把这个窗口限制在一次提交之内。
         if let Some(key) = self.reservation_guard {
@@ -809,7 +1006,17 @@ impl<'a> LtfsVolume<'a> {
 
         // —— S5：发布已提交视图 —— //
         self.dirty = false;
-        self.last_dp_index = Some(self.working.self_location);
+        if incremental {
+            self.last_dp_incremental = Some(self.working.self_location);
+            self.incremental_depth += 1;
+        }
+        else {
+            self.last_dp_index = Some(self.working.self_location);
+            self.last_dp_incremental = None;
+            self.incremental_depth = 0;
+            self.last_ip = Some((self.working.generation, P0_INDEX_BLOCK));
+        }
+        self.working.materialized = incremental;
         self.index = self.working.clone();
         info!(
             "commit: gen {} @ P0 {}, P1 {}",
@@ -820,7 +1027,7 @@ impl<'a> LtfsVolume<'a> {
 
     /// 卸载：保证写回并倒带。调用后 Volume 被消费。
     pub fn unmount(mut self) -> Result<()> {
-        if self.dirty && self.writable {
+        if (self.dirty || self.index.incremental) && self.writable {
             self.commit()?;
         }
         self.drive.rewind()?;
@@ -1052,4 +1259,60 @@ fn write_bytes_in_blocks(drive: &TapeDrive<'_>, data: &[u8], block_size: usize) 
         blocks += 1;
     }
     Ok(blocks)
+}
+
+#[cfg(test)]
+mod relocation_tests {
+    use super::*;
+    use crate::ltfs::mkltfs::{MkltfsOptions, mkltfs};
+    use crate::scsi::sim::{SimCartridge, SimLibrary};
+
+    #[test]
+    fn relocation_keeps_logical_metadata_but_rebuilds_physical_identity_and_hashes() {
+        let lib = SimLibrary::new(1, 2, 1);
+        lib.insert_cartridge(SimCartridge::blank("META01L8", 64 << 20), 0).unwrap();
+        lib.load_into_drive("META01L8", 0).unwrap();
+        let dev = lib.drive(0);
+        mkltfs(&dev, &MkltfsOptions::default()).unwrap();
+        let when = "2020-01-02T03:04:05.123456789Z".to_string();
+        let metadata = FileMetadata {
+            meta: NodeMeta {
+                readonly: true, file_uid: 9000, creation_time: when.clone(), change_time: when.clone(),
+                modify_time: when.clone(), access_time: when.clone(), backup_time: when.clone(),
+            },
+            xattrs: vec![
+                Xattr { key: "note".into(), value: "原始文本".into(), base64: false },
+                Xattr { key: "binary".into(), value: "AAEC/w==".into(), base64: true },
+                Xattr { key: XATTR_VERSION.into(), value: "1.1".into(), base64: false },
+                Xattr { key: XATTR_MD5.into(), value: "过期摘要".into(), base64: false },
+                Xattr { key: XATTR_SHA256.into(), value: "过期摘要".into(), base64: false },
+            ],
+        };
+        let mut vol = LtfsVolume::mount(&dev).unwrap();
+        for (path, data) in [("/data", &b"content"[..]), ("/empty", &b""[..])] {
+            vol.append_relocated_file(path, &mut std::io::Cursor::new(data), "9.7", &metadata).unwrap();
+        }
+        vol.commit().unwrap();
+        let vol = LtfsVolume::mount(&dev).unwrap();
+        let mut uids = std::collections::HashSet::new();
+        for (path, data) in [("data", &b"content"[..]), ("empty", &b""[..])] {
+            let node = vol.index().find_file(path).unwrap();
+            assert!(node.meta.readonly);
+            assert_ne!(node.meta.file_uid, 9000);
+            assert!(uids.insert(node.meta.file_uid));
+            assert_eq!(node.meta.modify_time, when);
+            assert_eq!(node.meta.creation_time, when);
+            assert_eq!(node.meta.change_time, when);
+            assert_eq!(node.meta.access_time, when);
+            assert_eq!(node.meta.backup_time, when);
+            assert_eq!(node.xattr(XATTR_VERSION), Some("9.7"));
+            assert_eq!(node.xattr("note"), Some("原始文本"));
+            assert_eq!(node.xattrs.iter().find(|x| x.key == "binary"), Some(&metadata.xattrs[1]));
+            assert_eq!(node.xattr(XATTR_MD5), Some(hex(&Md5::digest(data)).as_str()));
+            assert_eq!(node.xattr(XATTR_SHA256), Some(hex(&Sha256::digest(data)).as_str()));
+            let mut read = Vec::new();
+            vol.read_file_to_writer(path, &mut read).unwrap();
+            assert_eq!(read, data);
+        }
+    }
 }

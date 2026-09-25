@@ -3,6 +3,8 @@
 //! PUT  /files/<path>[?wait=1]   上传（默认替换）。202 = 已暂存；带 wait 时等到落带，201 = 已提交。
 //!                               `If-None-Match: *` 为只创建，路径已有已提交版本时 412
 //! GET  /files/<path>            读出已提交的文件内容；支持单段 `Range`（206）；只有在途版本时 409
+//! DELETE /files/<path>[?wait=1] 删除：202 = 墓碑已暂存，200 = 墓碑已落带
+//! POST/DELETE /directories/<path> 创建/删除空目录；201 = 索引已提交，202 = 仍在暂存
 //! GET  /stat/<path>             路径状态：committed / uploading / staged；404 = 不存在
 //! GET  /tasks/<id>[?wait=1]     上传任务的状态
 //! GET  /list[?dir=<d>[&pending=1]]  不带 dir：已提交视图的全部文件；带 dir：该目录的直接子项
@@ -18,7 +20,7 @@
 //! 不在服务的节点一律返回 503，并在 JSON 里给出它所知的 Leader 地址。
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -73,18 +75,26 @@ fn respond(conn: &mut TcpStream, code: u16, reason: &str, ctype: &str, body: &[u
     conn.write_all(body)
 }
 
-/// 206：`body` 是 `[start, start + body.len())` 这一段，`total` 是文件全长。
-fn respond_range(conn: &mut TcpStream, start: u64, total: u64, body: &[u8]) -> std::io::Result<()> {
-    let end = start + body.len() as u64;
-    write!(
-        conn,
-        "HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        start,
-        end.saturating_sub(1),
-        total,
-        body.len()
-    )?;
-    conn.write_all(body)?;
+/// 磁带读完后再发送；Range 从磁盘切片，内存不随文件大小增长。
+fn respond_file(conn: &mut TcpStream, mut file: std::fs::File, range: Option<&str>) -> std::io::Result<()> {
+    let total = file.metadata()?.len();
+    let (start, end) = match range.and_then(|r| parse_range(r, total)) {
+        Some(Err(())) => return respond_json(conn, 416, "Range Not Satisfiable", json!({"error": "bad_range", "length": total})),
+        Some(Ok((start, end))) => {
+            write!(conn, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\n", start, end - 1, total)?;
+            (start, end)
+        }
+        None => {
+            write!(conn, "HTTP/1.1 200 OK\r\n")?;
+            (0, total)
+        }
+    };
+    write!(conn, "Content-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", end - start)?;
+    file.seek(SeekFrom::Start(start))?;
+    let copied = std::io::copy(&mut file.take(end - start), conn)?;
+    if copied != end - start {
+        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "下载暂存内容不完整"));
+    }
     conn.flush()
 }
 
@@ -100,7 +110,7 @@ pub fn parse_range(v: &str, total: u64) -> Option<Result<(u64, u64), ()>> {
     let (a, b) = (a.trim(), b.trim());
     if a.is_empty() {
         let n: u64 = b.parse().ok()?;
-        if n == 0 {
+        if n == 0 || total == 0 {
             return Some(Err(()));
         }
         return Some(Ok((total.saturating_sub(n), total)));
@@ -148,6 +158,10 @@ fn service_error(conn: &mut TcpStream, ctx: &HttpContext, e: ServiceError) -> st
             // 503 且不给 Leader 提示：客户端库会稍后向同一个节点重试
             respond_json(conn, 503, "Service Unavailable", json!({"error": "switching_tape", "detail": why}))
         }
+        ServiceError::NoAttribute(name) => respond_json(conn, 409, "Conflict", json!({"error":"no_attribute", "name":name})),
+        ServiceError::ProtectedAttribute(name) => respond_json(conn, 403, "Forbidden", json!({"error":"protected_attribute", "name":name})),
+        ServiceError::AttributeTooLarge => respond_json(conn, 413, "Payload Too Large", json!({"error":"attribute_too_large"})),
+        ServiceError::CrossDevice(path) => respond_json(conn, 409, "Conflict", json!({"error":"cross_device", "path":path})),
         ServiceError::NoTape(why) => respond_json(conn, 507, "Insufficient Storage", json!({"error": "no_tape", "detail": why})),
         ServiceError::TooLarge { requested, tape_capacity } => respond_json(
             conn,
@@ -155,8 +169,12 @@ fn service_error(conn: &mut TcpStream, ctx: &HttpContext, e: ServiceError) -> st
             "Insufficient Storage",
             json!({"error": "too_large", "requested": requested, "tape_capacity": tape_capacity}),
         ),
+        ServiceError::NotEmpty(p) => respond_json(conn, 409, "Conflict", json!({"error": "not_empty", "path": p})),
+        ServiceError::IsDirectory(p) => respond_json(conn, 409, "Conflict", json!({"error": "is_directory", "path": p})),
+        ServiceError::NotDirectory(p) => respond_json(conn, 409, "Conflict", json!({"error": "not_directory", "path": p})),
         ServiceError::PathBusy(p) => respond_json(conn, 409, "Conflict", json!({"error": "path_busy", "path": p})),
         ServiceError::Exists(p) => respond_json(conn, 412, "Precondition Failed", json!({"error": "exists", "path": p})),
+        ServiceError::NotFound(p) => respond_json(conn, 404, "Not Found", json!({"error": "not_found", "path": p})),
         ServiceError::InsufficientCapacity { requested, available } => respond_json(
             conn,
             507,
@@ -342,7 +360,7 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
         ("GET", p) if p.starts_with("/stat/") => match ctx.files.stat_full(&p[5..]) {
             Ok(PathState { committed, in_flight }) => {
                 let committed_json = committed.as_ref().map(|s| {
-                    json!({"length": s.len, "generation": s.generation, "round": s.round, "barcode": s.barcode, "sha256": s.sha256})
+                    json!({"length": s.len, "generation": s.generation, "round": s.round, "barcode": s.barcode, "sha256": s.sha256, "version": s.version, "metadata": s.metadata})
                 });
                 match (in_flight, committed_json) {
                     (None, None) => respond_json(&mut conn, 404, "Not Found", json!({"path": &p[5..], "committed": false})),
@@ -385,26 +403,136 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                 Ok(PathState { committed: None, in_flight: None }) => {
                     return respond_json(&mut conn, 404, "Not Found", json!({"error": "not_found", "path": &p[6..]}));
                 }
+                Ok(PathState { committed: Some(st), .. }) if super::files::is_directory(&st.metadata) => {
+                    return service_error(&mut conn, ctx, ServiceError::IsDirectory(p[6..].into()));
+                }
                 Ok(_) => {}
             }
             let (tx, rx) = channel();
-            let sent = ctx.exec.lock().unwrap_or_else(|e| e.into_inner()).send(ExecRequest::Read { path: p[6..].to_string(), reply: tx });
+            let file = match ctx.files.read_spool() {
+                Ok(file) => file,
+                Err(e) => return respond_json(&mut conn, 500, "Internal Server Error", json!({"error": "spool_io", "detail": e.to_string()})),
+            };
+            let sent = ctx.exec.lock().unwrap_or_else(|e| e.into_inner()).send(ExecRequest::ReadTo { path: p[6..].to_string(), file, reply: tx });
             if sent.is_err() {
                 return respond_json(&mut conn, 503, "Service Unavailable", json!({"error": "executor_gone"}));
             }
             match rx.recv_timeout(ctx.wait_timeout) {
-                // TODO：按范围只读需要的块，而不是整个文件读出来再切
-                Ok(Ok(bytes)) => match range.as_deref().and_then(|r| parse_range(r, bytes.len() as u64)) {
-                    Some(Ok((a, b))) => respond_range(&mut conn, a, bytes.len() as u64, &bytes[a as usize..b as usize]),
-                    Some(Err(())) => respond_json(&mut conn, 416, "Range Not Satisfiable", json!({"error": "bad_range", "length": bytes.len()})),
-                    None => respond(&mut conn, 200, "OK", "application/octet-stream", &bytes),
-                },
+                Ok(Ok(file)) => respond_file(&mut conn, file, range.as_deref()),
                 Ok(Err(tape_rs_read_busy @ super::executor::ReadError::Busy(_))) => {
                     respond_json(&mut conn, 503, "Service Unavailable", json!({"error": "drive_busy", "detail": tape_rs_read_busy.to_string()}))
                 }
-                Ok(Err(e)) => respond_json(&mut conn, 404, "Not Found", json!({"error": "read_failed", "detail": e.to_string()})),
+                Ok(Err(e)) => respond_json(&mut conn, 500, "Internal Server Error", json!({"error": "read_failed", "detail": e.to_string()})),
                 Err(_) => respond_json(&mut conn, 504, "Gateway Timeout", json!({"error": "read_timeout"})),
             }
+        }
+        (method @ ("POST" | "DELETE"), "/xattrs") => {
+            let Some(path) = query_param(query, "path") else {
+                return respond_json(
+                    &mut conn,
+                    400,
+                    "Bad Request",
+                    json!({"error":"missing_path"}),
+                );
+            };
+            let Some(name) = query_param(query, "name") else {
+                return respond_json(
+                    &mut conn,
+                    400,
+                    "Bad Request",
+                    json!({"error":"missing_attribute_name"}),
+                );
+            };
+            let flags = match query_param(query, "flags").unwrap_or("0").parse::<u32>() {
+                Ok(v) => v,
+                Err(_) => {
+                    return respond_json(
+                        &mut conn,
+                        400,
+                        "Bad Request",
+                        json!({"error":"invalid_flags"}),
+                    );
+                }
+            };
+            let value = if method == "POST" {
+                let Some(len) = content_length else {
+                    return respond_json(
+                        &mut conn,
+                        411,
+                        "Length Required",
+                        json!({"error":"length_required"}),
+                    );
+                };
+                if len > 65536 {
+                    return service_error(&mut conn, ctx, ServiceError::AttributeTooLarge);
+                }
+                if expects_continue {
+                    conn.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+                }
+                let mut value = vec![0; len as usize];
+                reader.read_exact(&mut value)?;
+                Some(value)
+            } else {
+                None
+            };
+            let task = match ctx.files.change_xattr(
+                &percent_decode(path),
+                &percent_decode(name),
+                value.as_deref(),
+                flags,
+            ) {
+                Ok(t) => t,
+                Err(e) => return service_error(&mut conn, ctx, e),
+            };
+            let st = ctx
+                .files
+                .wait_task(task, ctx.wait_timeout)
+                .unwrap_or(TaskStatus::Staged);
+            let (code, reason, body) = task_json(task, &st);
+            respond_json(&mut conn, code, reason, body)
+        }
+        ("POST", "/symlinks") => {
+            let (Some(path), Some(target)) = (query_param(query, "path"), query_param(query, "target")) else {
+                return respond_json(&mut conn, 400, "Bad Request", json!({"error":"missing_path_or_target"}));
+            };
+            let task = match ctx.files.symlink(&percent_decode(target), &percent_decode(path)) {
+                Ok(task) => task, Err(e) => return service_error(&mut conn, ctx, e),
+            };
+            let st = ctx.files.wait_task(task, ctx.wait_timeout).unwrap_or(TaskStatus::Staged);
+            let (code, reason, body) = task_json(task, &st);
+            respond_json(&mut conn, code, reason, body)
+        }
+        ("POST", "/rename") => {
+            let Some(from) = query_param(query, "from") else {
+                return respond_json(&mut conn, 400, "Bad Request", json!({"error":"missing_source"}));
+            };
+            let Some(to) = query_param(query, "to") else {
+                return respond_json(&mut conn, 400, "Bad Request", json!({"error":"missing_target"}));
+            };
+            let task = match ctx.files.rename(&percent_decode(from), &percent_decode(to), query_param(query, "noreplace") == Some("1")) {
+                Ok(task) => task, Err(e) => return service_error(&mut conn, ctx, e),
+            };
+            let st = ctx.files.wait_task(task, ctx.wait_timeout).unwrap_or(TaskStatus::Staged);
+            let (code, reason, body) = task_json(task, &st);
+            respond_json(&mut conn, code, reason, body)
+        }
+        (method @ ("POST" | "DELETE"), p) if p.starts_with("/directories/") => {
+            let task = match if method == "POST" { ctx.files.mkdir(&p[12..]) } else { ctx.files.rmdir(&p[12..]) } {
+                Ok(task) => task, Err(e) => return service_error(&mut conn, ctx, e),
+            };
+            let st = ctx.files.wait_task(task, ctx.wait_timeout).unwrap_or(TaskStatus::Staged);
+            let (code, reason, body) = task_json(task, &st);
+            respond_json(&mut conn, code, reason, body)
+        }
+        ("DELETE", p) if p.starts_with("/files/") => {
+            let task = match ctx.files.delete(&p[6..]) {
+                Ok(task) => task,
+                Err(e) => return service_error(&mut conn, ctx, e),
+            };
+            let st = if wait { ctx.files.wait_task(task, ctx.wait_timeout) } else { ctx.files.task(task) };
+            let (code, reason, body) = task_json(task, &st.unwrap_or(TaskStatus::Staged));
+            let (code, reason) = if code == 201 { (200, "OK") } else { (code, reason) };
+            respond_json(&mut conn, code, reason, body)
         }
         ("PUT", p) if p.starts_with("/files/") => {
             let Some(len) = content_length else {
@@ -471,6 +599,8 @@ mod tests {
         assert_eq!(parse_range("bytes=100-", 100), Some(Err(())), "起点在末尾");
         assert_eq!(parse_range("bytes=5-2", 100), Some(Err(())));
         assert_eq!(parse_range("bytes=-0", 100), Some(Err(())));
+        assert_eq!(parse_range("bytes=-5", 0), Some(Err(())));
+        assert_eq!(parse_range("bytes=0-", 0), Some(Err(())));
         assert_eq!(parse_range("bytes=0-1,5-6", 100), None, "多段当没有 Range");
         assert_eq!(parse_range("items=0-1", 100), None);
     }

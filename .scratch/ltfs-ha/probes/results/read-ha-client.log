@@ -1,0 +1,2 @@
+PASS get_to: 4 MiB完整且无重复拼接
+PASS get/get_range: 保留旧缓存后自动切换

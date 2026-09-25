@@ -1,0 +1,65 @@
+{
+  "dir": "/rc",
+  "entries": [
+    {
+      "committed_length": 1024,
+      "name": "_probe.bin",
+      "state": "committed",
+      "type": "file"
+    },
+    {
+      "committed_length": 1048576,
+      "name": "after_reclaim.bin",
+      "state": "committed",
+      "type": "file"
+    },
+    {
+      "name": "codex-20260924",
+      "type": "dir"
+    },
+    {
+      "name": "codex-cached-20260924",
+      "type": "dir"
+    },
+    {
+      "name": "codex-cached-final-20260924",
+      "type": "dir"
+    },
+    {
+      "committed_length": 8388608,
+      "name": "f0.bin",
+      "state": "committed",
+      "type": "file"
+    },
+    {
+      "committed_length": 8388608,
+      "name": "f1.bin",
+      "state": "committed",
+      "type": "file"
+    },
+    {
+      "committed_length": 8388608,
+      "name": "f2.bin",
+      "state": "committed",
+      "type": "file"
+    },
+    {
+      "committed_length": 8388608,
+      "name": "f3.bin",
+      "state": "committed",
+      "type": "file"
+    },
+    {
+      "committed_length": 8388608,
+      "name": "f4.bin",
+      "state": "committed",
+      "type": "file"
+    },
+    {
+      "committed_length": 8388608,
+      "name": "f5.bin",
+      "state": "committed",
+      "type": "file"
+    }
+  ]
+}

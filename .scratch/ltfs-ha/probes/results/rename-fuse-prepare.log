@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/home/rocky/tape-rs-rename-20260924/rename-fuse.py", line 38, in <module>
+    assert os.pread(target,10,0)==b'detached!!t'
+AssertionError

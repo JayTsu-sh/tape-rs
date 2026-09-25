@@ -1,0 +1,2 @@
+GAP: /rc/link symlink read not supported; strict fuse mode remains failing
+PASS fuse-regular baseline hashes=12 recovered attrs, new file, binary/empty xattrs, pread/mmap

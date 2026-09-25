@@ -1,0 +1,73 @@
+{
+  "before": {
+    "barcode": "RT2502L8",
+    "committed": true,
+    "generation": 73,
+    "length": 26,
+    "metadata": {
+      "modify_time": "2026-09-24T23:36:49.141803429Z",
+      "xattrs": [
+        {
+          "base64": false,
+          "key": "ltfs.hash.sha256sum",
+          "value": "02e288f0667a8246708bafd075353baf8e1ce2dc556cbf3d2449135a933a99a5"
+        },
+        {
+          "base64": true,
+          "key": "cut",
+          "value": "dW5jb21taXR0ZWQ="
+        },
+        {
+          "base64": true,
+          "key": "set",
+          "value": "AP9jb21taXR0ZWQ="
+        },
+        {
+          "base64": false,
+          "key": "tapers.version",
+          "value": "210.1"
+        }
+      ]
+    },
+    "path": "/rc/xattr-fault-20260925",
+    "round": 220,
+    "sha256": "02e288f0667a8246708bafd075353baf8e1ce2dc556cbf3d2449135a933a99a5",
+    "state": "committed",
+    "version": [
+      210,
+      1
+    ]
+  },
+  "baseline": {
+    "files": {
+      "/rc/dir-interop-20260924/le-file": 23,
+      "/rc/edit.bin": 70012,
+      "/rc/ha-delete.bin": 34,
+      "/rc/ha-upload.bin": 4194304,
+      "/rc/keep.bin": 65536,
+      "/rc/link": 0,
+      "/rc/new.bin": 26,
+      "/rc/rename-interop-20260924/client-target": 13,
+      "/rc/rename-interop-20260924/lost-target/file": 20,
+      "/rc/rename-interop-20260924/replace-again-target": 10,
+      "/rc/rename-interop-20260924/target": 12,
+      "/rc/xattr-fault-20260925": 26,
+      "/rc/xattr-interop-20260924/file": 22
+    }
+  },
+  "hashes": {
+    "/rc/dir-interop-20260924/le-file": "d9ac7a078d5b23bcd074f8de325c5bb204d14e4b938ca7a27ac4097117044e5d",
+    "/rc/edit.bin": "84597e955e5de74231acdcc939fd74098ef372c0d2356268e25e6c58598ae8fd",
+    "/rc/ha-delete.bin": "90b11f72caf3534dfe476a45cb81732215454c571db7f1e32d5e7f47f912b0fa",
+    "/rc/ha-upload.bin": "a117210941a0b00dcb2d8577e680d84b6fa0eaf760d2afc654c953b9859d54fa",
+    "/rc/keep.bin": "7daca2095d0438260fa849183dfc67faa459fdf4936e1bc91eec6b281b27e4c2",
+    "/rc/link": "7daca2095d0438260fa849183dfc67faa459fdf4936e1bc91eec6b281b27e4c2",
+    "/rc/new.bin": "75ad67ecf8c747a39fa87f1c2449a2cd06c2af93248e40b02f56805491560096",
+    "/rc/rename-interop-20260924/client-target": "54dcd278ebd1f9771be85bd7045f8250aa640b2c6437d6ef5e907dfa894758fb",
+    "/rc/rename-interop-20260924/lost-target/file": "45c36048a69c57bca747d5dd719a9e7848ae17db99030323bda165bf3ac2ffdf",
+    "/rc/rename-interop-20260924/replace-again-target": "f5afae78a1c61541200e5730aef358f2f0a636e7e24af28fc6994d4a0f7c712c",
+    "/rc/rename-interop-20260924/target": "db38ef2bd2270789b5dd1c0ab5290f89dd3c01bdd94c314245bbf5c80b390501",
+    "/rc/xattr-fault-20260925": "02e288f0667a8246708bafd075353baf8e1ce2dc556cbf3d2449135a933a99a5",
+    "/rc/xattr-interop-20260924/file": "f1c6874ec955903c68947d65496fafded32cfc101356d78ad324062f67f24bad"
+  }
+}

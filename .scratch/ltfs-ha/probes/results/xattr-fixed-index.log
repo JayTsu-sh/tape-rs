@@ -1,0 +1,4 @@
+partitions/partition-1/data_000000.seg version 2.5.0 gen7
+edit.bin [('roundtrip.binary', 'AP9MRS1yb3VuZHRyaXA='), ('tapers.version', '6.2'), ('ltfs.hash.sha256sum', '3c2f1b0ed0090d476885163291f3fddecd4ac4d3d73453175c960e160a7015b2')]
+partitions/partition-0/data_000000.seg version 2.5.0 gen7
+edit.bin [('roundtrip.binary', 'AP9MRS1yb3VuZHRyaXA='), ('tapers.version', '6.2'), ('ltfs.hash.sha256sum', '3c2f1b0ed0090d476885163291f3fddecd4ac4d3d73453175c960e160a7015b2')]

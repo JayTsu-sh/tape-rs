@@ -490,3 +490,17 @@ fn locked_volume_mounts_read_only() {
     vol.commit().unwrap();
     assert_eq!(vol.index().volume_lock_state.as_deref(), Some("unlocked"));
 }
+
+#[test]
+fn read_rejects_a_premature_filemark() {
+    let (lib, dev) = formatted_drive();
+    let mut vol = LtfsVolume::mount(&dev).unwrap();
+    vol.append_file("/truncated", &mut Cursor::new(payload(100_000, 9))).unwrap();
+    vol.commit().unwrap();
+    let block = vol.index().find_file("truncated").unwrap().extents[0].start_block;
+    lib.with_cartridge_mut(BARCODE, |cart| {
+        cart.partitions[1].objects[block as usize] = tape_rs::scsi::sim::LogicalObject::Filemark;
+    });
+    let err = vol.read_file_to_writer("truncated", &mut std::io::sink()).unwrap_err();
+    assert!(err.to_string().contains("提前结束"), "{err}");
+}

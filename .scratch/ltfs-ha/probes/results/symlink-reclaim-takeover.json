@@ -1,0 +1,15 @@
+{
+  "drives": 2,
+  "executor": {
+    "fenced": true,
+    "node": 2,
+    "round": 62
+  },
+  "id": 2,
+  "last_reclaim": null,
+  "leader": 2,
+  "local": "\u8f6e\u6b21 62\uff1a\u670d\u52a1\u4e2d\u3002IBMtaper2287 (/dev/sg10) [SR2502L8]: gen=4 \u6587\u4ef6 10 \u4e2a \u5c3e\u90e8 Complete\uff1b\u53ef\u7528 235 MiB",
+  "role": "Leader",
+  "serving_round": 62,
+  "term": 3
+}

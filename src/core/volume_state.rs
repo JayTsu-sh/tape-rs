@@ -60,6 +60,38 @@ impl DirNode {
                 .sum::<usize>()
     }
 
+    fn with_directory(
+        self: &Arc<Self>,
+        parts: &[&str],
+        remove: bool,
+        stats: &mut PublishStats,
+    ) -> Arc<Self> {
+        let Some((name, rest)) = parts.split_first() else {
+            return Arc::clone(self);
+        };
+        if remove && !rest.is_empty() && !self.subdirs.contains_key(*name) {
+            return Arc::clone(self);
+        }
+        stats.nodes_copied += 1;
+        let mut node = Self {
+            files: self.files.clone(),
+            subdirs: self.subdirs.clone(),
+        };
+        if rest.is_empty() {
+            node.files.remove(*name);
+            if remove {
+                node.subdirs.remove(*name);
+            } else {
+                node.subdirs.entry(name.to_string()).or_default();
+            }
+        } else {
+            node.files.remove(*name);
+            let child = node.subdirs.entry(name.to_string()).or_default();
+            *child = child.with_directory(rest, remove, stats);
+        }
+        Arc::new(node)
+    }
+
     /// 路径复制：返回一棵新树，只复制 `dirs` 路径上的节点。`file == None` 表示删除。
     fn with_file(
         self: &Arc<Self>,
@@ -68,6 +100,9 @@ impl DirNode {
         file: Option<Arc<FileVersion>>,
         stats: &mut PublishStats,
     ) -> Arc<DirNode> {
+        if file.is_none() && !dirs.is_empty() && !self.subdirs.contains_key(dirs[0]) {
+            return Arc::clone(self);
+        }
         stats.nodes_copied += 1;
         let mut node = DirNode {
             files: self.files.clone(),
@@ -76,6 +111,7 @@ impl DirNode {
         if dirs.is_empty() {
             match file {
                 Some(f) => {
+                    node.subdirs.remove(name);
                     node.files.insert(name.to_string(), f);
                 }
                 None => {
@@ -83,6 +119,7 @@ impl DirNode {
                 }
             }
         } else {
+            node.files.remove(dirs[0]);
             let child = match node.subdirs.get(dirs[0]) {
                 Some(c) => c.clone(),
                 None => Arc::new(DirNode::default()),
@@ -674,6 +711,23 @@ impl VolumeState {
         Ok(Self::swap(&mut g, root).epoch)
     }
 
+    /// 同卷改名引用已有 extent：发布长度，但不重复消耗物理容量。
+    pub(crate) fn stage_reference(&self, path: &str, len: u64) -> Result<(), StateError> {
+        let mut g = self.lock();
+        let mut root = g.current.next();
+        let mut pending = (*root.pending).clone();
+        let e = pending
+            .get_mut(path)
+            .ok_or_else(|| StateError::NoSuchPending(path.into()))?;
+        if e.state != PendingState::InProgress || e.removal {
+            return Err(StateError::PathBusy(path.into()));
+        }
+        e.staged_len = len;
+        root.pending = Arc::new(pending);
+        Self::swap(&mut g, root);
+        Ok(())
+    }
+
     pub fn complete(&self, path: &str) -> Result<u64, StateError> {
         let mut g = self.lock();
         let cur = Arc::clone(&g.current);
@@ -789,6 +843,15 @@ impl VolumeState {
         batch: &FrozenBatch,
         evidence: S4Evidence,
     ) -> Result<PublishOutcome, StateError> {
+        self.publish_namespace(batch, evidence, &std::collections::BTreeSet::new())
+    }
+
+    pub(crate) fn publish_namespace(
+        &self,
+        batch: &FrozenBatch,
+        evidence: S4Evidence,
+        directories: &std::collections::BTreeSet<String>,
+    ) -> Result<PublishOutcome, StateError> {
         let mut g = self.lock();
         // CP2：证据必须精确对应批次
         if evidence.batch_id != batch.batch_id {
@@ -836,7 +899,13 @@ impl VolumeState {
                     partial: !c.complete,
                 })
             });
-            committed = committed.with_file(&dirs, name, fv, &mut stats_delta);
+            if directories.contains(path) {
+                let mut parts = dirs;
+                parts.push(name);
+                committed = committed.with_directory(&parts, c.removal, &mut stats_delta);
+            } else {
+                committed = committed.with_file(&dirs, name, fv, &mut stats_delta);
+            }
             match pending.get_mut(path) {
                 Some(e) if e.version == c.version => {
                     if c.complete && e.staged_len == c.len {
@@ -921,5 +990,94 @@ impl VolumeState {
             .filter(|w| w.notified && batch.cover.contains_key(&w.path))
             .map(|w| w.id)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+
+    #[test]
+    fn rename_reference_uses_no_capacity_and_removals_do_not_recreate_ancestors() {
+        let mut root = Arc::new(DirNode::default());
+        let mut stats = PublishStats::default();
+        root = root.with_directory(&["a", "empty"], false, &mut stats);
+        root = root.with_file(
+            &["a"],
+            "file",
+            Some(Arc::new(FileVersion {
+                version: 1,
+                len: 4096,
+                partial: false,
+            })),
+            &mut stats,
+        );
+        let state = VolumeState::new(1, root, 1, 0, true);
+        state.open_session(1, u64::MAX);
+        for p in ["/a", "/a/empty", "/a/file"] {
+            state.admit_removal(1, p, 0).unwrap();
+            state.complete(p).unwrap();
+        }
+        for (p, n) in [("/b", 0), ("/b/empty", 0), ("/b/file", 4096)] {
+            state.admit(1, p, 0, 0).unwrap();
+            state.stage_reference(p, n).unwrap();
+            state.complete(p).unwrap();
+        }
+        let batch = state.freeze(&[]).unwrap();
+        state
+            .publish_namespace(
+                &batch,
+                S4Evidence {
+                    batch_id: batch.batch_id,
+                    generation: batch.generation,
+                },
+                &["/a", "/a/empty", "/b", "/b/empty"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            )
+            .unwrap();
+        let root = state.load();
+        assert!(!root.committed.subdirs.contains_key("a"));
+        assert_eq!(root.committed.get("/b/file").unwrap().len, 4096);
+        assert_eq!(root.ledger.consumed_since_cut, 0);
+        assert!(root.pending.is_empty());
+    }
+
+    #[test]
+    fn directory_publication_is_atomic_and_does_not_create_a_file() {
+        let state = VolumeState::new(1, Arc::new(DirNode::default()), 1, 1024, true);
+        let directories = ["/empty".to_string()].into_iter().collect();
+        state.open_session(1, u64::MAX);
+        state.admit(1, "/empty", 0, 0).unwrap();
+        state.complete("/empty").unwrap();
+        let batch = state.freeze(&[]).unwrap();
+        let before = state.load();
+        let proof = S4Evidence {
+            batch_id: batch.batch_id,
+            generation: batch.generation,
+        };
+        state
+            .publish_namespace(&batch, proof, &directories)
+            .unwrap();
+        assert!(before.committed.subdirs.is_empty());
+        let created = state.load();
+        assert!(created.committed.subdirs.contains_key("empty"));
+        assert!(created.committed.files.is_empty());
+        assert!(created.pending.is_empty());
+        state.open_session(2, u64::MAX);
+        state.admit_removal(2, "/empty", 1).unwrap();
+        state.complete("/empty").unwrap();
+        let batch = state.freeze(&[]).unwrap();
+        let proof = S4Evidence {
+            batch_id: batch.batch_id,
+            generation: batch.generation,
+        };
+        state
+            .publish_namespace(&batch, proof, &directories)
+            .unwrap();
+        assert!(created.committed.subdirs.contains_key("empty"));
+        assert!(state.load().committed.subdirs.is_empty());
+        assert!(state.load().committed.files.is_empty());
     }
 }

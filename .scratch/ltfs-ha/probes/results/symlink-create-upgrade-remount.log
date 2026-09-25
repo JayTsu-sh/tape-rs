@@ -1,0 +1,1 @@
+{"mode": "verify", "links": {"relative": "target", "dangling": "../absent & 中文%?#", "directory": "subdir", "loop": "loop", "中文": "target", "chain": "relative"}, "sha256": "dc233f09e28bbab5f69d0013ea971969d12ae0eb212959075ec4354cd25ef665", "passed": true}

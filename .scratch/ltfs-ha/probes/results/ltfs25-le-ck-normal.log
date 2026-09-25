@@ -1,0 +1,81 @@
+LTFS16000I Starting ltfsck, LTFS version 2.4.8.3 (10521), log level 2.
+LTFS16088I Launched by "/opt/ibm/ltfsle/bin/ltfsck /dev/sg10".
+LTFS16089I This binary is built for Linux (x86_64).
+LTFS16090I GCC version is 11.5.0 20240719 (Red Hat 11.5.0-5).
+LTFS17087I Kernel version: Linux version 5.14.0-427.20.1.el9_4.x86_64 (mockbuild@iad1-prod-build001.bld.equ.rockylinux.org) (gcc (GCC) 11.4.1 20231218 (Red Hat 11.4.1-3), GNU ld version 2.35.2-43.el9) #1 SMP PREEMPT_DYNAMIC Fri Jun 7 14:51:39 UTC 2024 i386.
+LTFS17089I Distribution: NAME="Rocky Linux".
+LTFS17089I Distribution: Rocky Linux release 9.4 (Blue Onyx).
+LTFS17089I Distribution: Rocky Linux release 9.4 (Blue Onyx).
+LTFS17089I Distribution: Rocky Linux release 9.4 (Blue Onyx).
+LTFS17085I Plugin: Loading "sg" tape backend.
+LTFS30209I Opening a device through sg-ibmtape driver (/dev/sg10).
+LTFS30250I Opened the SCSI tape device 15.0.0.0 (/dev/sg10).
+LTFS30207I Vendor ID is IBM     .
+LTFS30208I Product ID is ULT3580-TD8     .
+LTFS30214I Firmware revision is HB81.
+LTFS30215I Drive serial is IBMtaper2287.
+LTFS30285I The reserved buffer size of /dev/sg10 is 1048576.
+LTFS30205I RSOC (0xa3) returns -20601.
+LTFS30263I RSOC returns Not Ready to Ready Transition, Medium May Have Changed (-20601) /dev/sg10.
+LTFS30262I Forcing drive dump.
+LTFS39802W Unknown SCSI OP code 0x1d, use default timeout.
+LTFS30205I FORCE_DUMP (0x1d) returns -20601.
+LTFS30263I FORCE_DUMP returns Not Ready to Ready Transition, Medium May Have Changed (-20601) /dev/sg10.
+LTFS30262I Forcing drive dump.
+LTFS39802W Unknown SCSI OP code 0x1d, use default timeout.
+LTFS30253I Saving drive dump to /tmp/ltfs_IBMtaper2287_2026_0924_121402_f.dmp.
+LTFS39802W Unknown SCSI OP code 0x3c, use default timeout.
+LTFS30253I Saving drive dump to /tmp/ltfs_IBMtaper2287_2026_0924_121402_f.dmp.
+LTFS39802W Unknown SCSI OP code 0x3c, use default timeout.
+LTFS30294I Setting up timeout values from vendor and device.
+LTFS17160I Maximum device block size is 1048576.
+LTFS11330I Loading cartridge.
+LTFS30252I Logical block protection is disabled.
+LTFS11332I Load successful.
+LTFS17157I Changing the drive setting to write-anywhere mode.
+LTFS16014I Checking LTFS file system on '/dev/sg10'.
+LTFS30252I Logical block protection is disabled.
+LTFS16023I LTFS volume information:.
+LTFS16024I Volser (bar code) : TS1001.
+LTFS16025I Volume UUID     : 295fe36b-1154-437c-a1e9-a3205030fb75.
+LTFS16026I Format time     : 2026-09-18 05:47:05.525242450 UTC.
+LTFS16027I Block size      : 524288.
+LTFS16028I Compression     : Disabled.
+LTFS16029I Index partition : ID = a, SCSI Partition = 0.
+LTFS16030I Data partition  : ID = b, SCSI Partition = 1.
+
+LTFS30205I READ_ATTR (0x8c) returns -20501.
+LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg10.
+LTFS30233I Cannot read attribute (-20501).
+LTFS11336I The attribute does not exist. Ignore the expected error.
+LTFS11005I Mounting the volume.
+LTFS30252I Logical block protection is disabled.
+LTFS30205I READ_ATTR (0x8c) returns -20501.
+LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg10.
+LTFS30233I Cannot read attribute (-20501).
+LTFS11336I The attribute does not exist. Ignore the expected error.
+LTFS11026I Performing a full medium consistency check.
+LTFS17096W The index read from the tape uses a newer version of the LTFS format than the one supported by this software. Some functionality might be unavailable. If this tape is modified, the index downgrades format version to 2.4.0 from 2.5.0.
+LTFS17096W The index read from the tape uses a newer version of the LTFS format than the one supported by this software. Some functionality might be unavailable. If this tape is modified, the index downgrades format version to 2.4.0 from 2.5.0.
+LTFS11233I Updating MAM coherency data.
+LTFS30205I READ_ATTR (0x8c) returns -20501.
+LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg10.
+LTFS30233I Cannot read attribute (-20501).
+LTFS17227I Tape attribute: Vendor = tape-rs .
+LTFS17227I Tape attribute: Application Name = tape-rs ltfs                    .
+LTFS17227I Tape attribute: Application Version = 0.1.0   .
+LTFS17227I Tape attribute: Medium Label =                                                                                                                                                                 .
+LTFS17228I Tape attribute: Text Localization ID = 0x00.
+LTFS17227I Tape attribute: Barcode = TS1001                          .
+LTFS17227I Tape attribute: Application Format Version = 2.4.0           .
+LTFS17228I Tape attribute: Volume Lock Status = 0x00.
+LTFS17227I Tape attribute: Media Pool name =                                                                                                                                                                 .
+LTFS11031I Volume mounted successfully. TS1001 : Gen = 33 / (a, 5) -> (b, 219) / IBMtaper2287.
+LTFS30205I READ_ATTR (0x8c) returns -20501.
+LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg10.
+LTFS30233I Cannot read attribute (-20501).
+LTFS11336I The attribute does not exist. Ignore the expected error.
+LTFS17265I Skip writing the index because of the volume is not dirty and current self pointer points IP.
+LTFS11034I Volume unmounted successfully.
+LTFS16022I Volume is consistent.
+LTFS30252I Logical block protection is disabled.

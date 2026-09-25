@@ -1,0 +1,42 @@
+{
+  "71": {
+    "exe": "/home/rocky/tape-rs-symlink-create-prod-20260925/ltfsd",
+    "sha256": "45ca052da5867aafcf5e77f15ad7a3b728041ed79c08e0b392c25f87cada405d",
+    "rows": 42,
+    "original_rows_verified": 30,
+    "catalog_sha256": "89691e412db63fe43f18bd3b2ad33ff2f9f12337748f8ca92f5885282c6211c8",
+    "generation": 96
+  },
+  "72": {
+    "exe": "/home/rocky/tape-rs-symlink-create-prod-20260925/ltfsd",
+    "sha256": "45ca052da5867aafcf5e77f15ad7a3b728041ed79c08e0b392c25f87cada405d",
+    "rows": 42,
+    "original_rows_verified": 30,
+    "catalog_sha256": "89691e412db63fe43f18bd3b2ad33ff2f9f12337748f8ca92f5885282c6211c8",
+    "generation": 96
+  },
+  "cluster": {
+    "drives": 2,
+    "executor": {
+      "fenced": true,
+      "node": 2,
+      "round": 350
+    },
+    "id": 2,
+    "last_reclaim": null,
+    "leader": 2,
+    "local": "\u8f6e\u6b21 350\uff1a\u670d\u52a1\u4e2d\u3002IBMtaper2287 (/dev/sg10) [TS1001L08]: gen=96 \u6587\u4ef6 38 \u4e2a \u5c3e\u90e8 Complete\uff1b\u53ef\u7528 19 MiB",
+    "role": "Leader",
+    "serving_round": 350,
+    "term": 40
+  },
+  "74": {
+    "exe": "/home/rocky/tape-rs-symlink-create-prod-20260925/ltfsd",
+    "sha256": "45ca052da5867aafcf5e77f15ad7a3b728041ed79c08e0b392c25f87cada405d",
+    "rows": 42,
+    "original_rows_verified": 30,
+    "catalog_sha256": "89691e412db63fe43f18bd3b2ad33ff2f9f12337748f8ca92f5885282c6211c8",
+    "generation": 96
+  },
+  "original_files_verified": 9
+}

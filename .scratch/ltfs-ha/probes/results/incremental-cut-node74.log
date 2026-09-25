@@ -1,0 +1,131 @@
+[2026-09-24T23:46:45Z INFO  tape_rs::daemon::net] 节点间通信监听 0.0.0.0:7500
+[2026-09-24T23:46:45Z INFO  tape_rs::daemon::http] 客户端接口监听 0.0.0.0:7501
+[2026-09-24T23:46:45Z INFO  raft::raft] switched to configuration, raft_id: 3, config: Configuration { voters: Configuration { incoming: Configuration { voters: {1, 2, 3} }, outgoing: Configuration { voters: {} } }, learners: {}, learners_next: {}, auto_leave: false }
+[2026-09-24T23:46:45Z INFO  raft::raft] became follower at term 20, raft_id: 3, term: 20
+[2026-09-24T23:46:45Z INFO  raft::raft] newRaft, raft_id: 3, peers: Configuration { incoming: Configuration { voters: {1, 2, 3} }, outgoing: Configuration { voters: {} } }, last term: 20, last index: 194, applied: 0, commit: 194, term: 20
+[2026-09-24T23:46:45Z INFO  raft::raw_node] RawNode created with id 3., raft_id: 3, id: 3
+[2026-09-24T23:46:45Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 2
+[2026-09-24T23:46:45Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 14
+[2026-09-24T23:46:45Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 21
+[2026-09-24T23:46:45Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 31
+[2026-09-24T23:46:45Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 54
+[2026-09-24T23:46:45Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 59
+[2026-09-24T23:46:45Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 109
+[2026-09-24T23:46:45Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 114
+[2026-09-24T23:46:45Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 124
+[2026-09-24T23:46:45Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 129
+[2026-09-24T23:46:45Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 157
+[2026-09-24T23:46:45Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 162
+[2026-09-24T23:46:45Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 184
+[2026-09-24T23:46:45Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 191
+[2026-09-24T23:46:47Z INFO  raft::raft] [logterm: 20, index: 194, vote: 2] rejected vote from 1 [logterm: 19, index: 189] at term 20, raft_id: 3, msg type: MsgRequestPreVote, term: 20, msg_index: 189, msg_term: 19, from: 1, vote: 2, log_index: 194, log_term: 20
+[2026-09-24T23:46:47Z INFO  raft::raft] starting a new election, raft_id: 3, term: 20
+[2026-09-24T23:46:47Z INFO  raft::raft] became pre-candidate at term 20, raft_id: 3, term: 20
+[2026-09-24T23:46:47Z INFO  raft::raft] broadcasting vote request, raft_id: 3, to: [1, 2], log_index: 194, log_term: 20, term: 20, type: MsgRequestPreVote
+[2026-09-24T23:46:47Z INFO  raft::raft] received votes response, raft_id: 3, term: 20, type: MsgRequestPreVoteResponse, approvals: 2, rejections: 0, from: 1, vote: true
+[2026-09-24T23:46:47Z INFO  raft::raft] became candidate at term 21, raft_id: 3, term: 21
+[2026-09-24T23:46:47Z INFO  raft::raft] broadcasting vote request, raft_id: 3, to: [1, 2], log_index: 194, log_term: 20, term: 21, type: MsgRequestVote
+[2026-09-24T23:46:47Z INFO  raft::raft] received votes response, raft_id: 3, term: 21, type: MsgRequestVoteResponse, approvals: 2, rejections: 0, from: 1, vote: true
+[2026-09-24T23:46:47Z INFO  raft::raft] became leader at term 21, raft_id: 3, term: 21
+[2026-09-24T23:46:47Z INFO  tape_rs::daemon::node] 本节点成为执行者，轮次 196（任期 21）
+[2026-09-24T23:46:47Z INFO  tape_rs::scsi::reservation] /dev/sg6: 预留现状 generation=57 keys=[] holder=None
+[2026-09-24T23:46:47Z INFO  tape_rs::daemon::executor] 执行线程: IBMtaper2287 (/dev/sg6) 已隔离（原持有者 None）
+[2026-09-24T23:46:47Z INFO  tape_rs::scsi::reservation] /dev/sg7: 预留现状 generation=55 keys=[] holder=None
+[2026-09-24T23:46:47Z INFO  tape_rs::daemon::executor] 执行线程: IBMtaper2287_LL3 (/dev/sg7) 已隔离（原持有者 None）
+[2026-09-24T23:46:47Z INFO  tape_rs::scsi::reservation] /dev/sg8: 预留现状 generation=55 keys=[] holder=None
+[2026-09-24T23:46:47Z INFO  tape_rs::daemon::executor] 执行线程: IBMtaper3D5E (/dev/sg8) 已隔离（原持有者 None）
+[2026-09-24T23:46:47Z INFO  tape_rs::daemon::executor] 执行线程: 装载 RT2502L8 (槽位 0x0406) -> 驱动器 IBMtaper2287 (/dev/sg6)
+[2026-09-24T23:46:47Z INFO  tape_rs::changer::commands] 移动介质: 从 0x0406 到 0x0100
+[2026-09-24T23:46:47Z INFO  tape_rs::changer::commands] 移动完成
+[2026-09-24T23:46:47Z WARN  tape_rs::scsi::transport] TEST UNIT READY: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 1 次）
+[2026-09-24T23:46:47Z WARN  tape_rs::scsi::transport] TEST UNIT READY: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 2 次）
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=0
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=2
+[2026-09-24T23:46:47Z INFO  tape_rs::ltfs::volume] LTFS label: version=2.4.0 uuid=26aefb84-fbc8-4c4a-a500-c85264ba2d29 blocksize=524288 compression=false
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=0
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=232
+[2026-09-24T23:46:47Z INFO  tape_rs::ltfs::recovery] 分区 1 VCI 快速路径命中 gen=67 @ 232..233
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=0
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=5
+[2026-09-24T23:46:47Z INFO  tape_rs::ltfs::recovery] 分区 0 VCI 快速路径命中 gen=67 @ 5..6
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=223
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=202
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=199
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=193
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=184
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=165
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=162
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=153
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=130
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=111
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=91
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=87
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=75
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=57
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=28
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=13
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=8
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=5
+[2026-09-24T23:46:47Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=234
+[2026-09-24T23:46:47Z INFO  tape_rs::ltfs::volume] index gen=67 highest_uid=56 (dp_tail=Complete, ip_tail=Complete, writable=true)
+[2026-09-24T23:46:47Z INFO  tape_rs::daemon::node] RT2502L8 目录停在第 66 代，磁带是第 67 代：以磁带为准重写该带的目录
+[2026-09-24T23:46:47Z INFO  tape_rs::daemon::node] 轮次 196 开始服务：IBMtaper2287 (/dev/sg6) [RT2502L8]: gen=67 文件 26 个 尾部 Complete；可用 79 MiB
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=2
+[2026-09-24T23:46:57Z INFO  tape_rs::ltfs::volume] LTFS label: version=2.4.0 uuid=26aefb84-fbc8-4c4a-a500-c85264ba2d29 blocksize=524288 compression=false
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=0
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=232
+[2026-09-24T23:46:57Z INFO  tape_rs::ltfs::recovery] 分区 1 VCI 快速路径命中 gen=67 @ 232..233
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=0
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=5
+[2026-09-24T23:46:57Z INFO  tape_rs::ltfs::recovery] 分区 0 VCI 快速路径命中 gen=67 @ 5..6
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=223
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=202
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=199
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=193
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=184
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=165
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=162
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=153
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=130
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=111
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=91
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=87
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=75
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=57
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=28
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=13
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=8
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=5
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=234
+[2026-09-24T23:46:57Z INFO  tape_rs::ltfs::volume] index gen=67 highest_uid=56 (dp_tail=Complete, ip_tail=Complete, writable=true)
+[2026-09-24T23:46:57Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=204
+[2026-09-24T23:46:57Z INFO  tape_rs::ltfs::volume] 读取 rc/xattr-fault-20260925: 26 字节
+[2026-09-24T23:47:29Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=2
+[2026-09-24T23:47:29Z INFO  tape_rs::ltfs::volume] LTFS label: version=2.4.0 uuid=26aefb84-fbc8-4c4a-a500-c85264ba2d29 blocksize=524288 compression=false
+[2026-09-24T23:47:30Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=0
+[2026-09-24T23:47:31Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=232
+[2026-09-24T23:47:31Z INFO  tape_rs::ltfs::recovery] 分区 1 VCI 快速路径命中 gen=67 @ 232..233
+[2026-09-24T23:47:31Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=0
+[2026-09-24T23:47:32Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=5
+[2026-09-24T23:47:32Z INFO  tape_rs::ltfs::recovery] 分区 0 VCI 快速路径命中 gen=67 @ 5..6
+[2026-09-24T23:47:32Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=223
+[2026-09-24T23:47:33Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=202
+[2026-09-24T23:47:34Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=199
+[2026-09-24T23:47:34Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=193
+[2026-09-24T23:47:35Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=184
+[2026-09-24T23:47:35Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=165
+[2026-09-24T23:47:36Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=162
+[2026-09-24T23:47:37Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=153
+[2026-09-24T23:47:37Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=130
+[2026-09-24T23:47:38Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=111
+[2026-09-24T23:47:38Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=91
+[2026-09-24T23:47:39Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=87
+[2026-09-24T23:47:40Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=75
+[2026-09-24T23:47:40Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=57
+[2026-09-24T23:47:41Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=28
+[2026-09-24T23:47:41Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=13
+[2026-09-24T23:47:42Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=8
+[2026-09-24T23:47:43Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=5
+[2026-09-24T23:47:43Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=234
+[2026-09-24T23:47:44Z INFO  tape_rs::ltfs::volume] index gen=67 highest_uid=56 (dp_tail=Complete, ip_tail=Complete, writable=true)
+[2026-09-24T23:47:44Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=234

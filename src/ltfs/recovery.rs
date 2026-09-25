@@ -103,6 +103,8 @@ pub struct RecoveryReport {
     pub chain_ok: bool,
     /// 已核验的回指深度（不含末索引本身）。
     pub chain_depth: u32,
+    /// 最新 DP Full 之后已重放的连续增量数。
+    pub incremental_depth: u32,
     pub chain_truncated_by_budget: bool,
     /// IP 落后于 DP（允许，记为维护债务）。
     pub ip_debt: bool,
@@ -127,10 +129,12 @@ impl RecoveryReport {
         match (&self.dp.last_index, &self.ip.last_index) {
             (Some(d), Some(i)) => {
                 i.index.generation > d.index.generation
-                    && i.index
-                        .previous_location
-                        .is_some_and(|p| p.start_block == d.start_block
-                            && p.partition == d.index.self_location.partition)
+                    && if d.index.incremental {
+                        i.index.previous_incremental_location == Some(d.index.self_location)
+                            && i.index.previous_location == d.index.previous_location
+                    } else {
+                        i.index.previous_location == Some(d.index.self_location)
+                    }
             }
             _ => false,
         }
@@ -229,7 +233,7 @@ fn read_until_fm(
 
 fn looks_like_index(bytes: &[u8]) -> bool {
     let head = &bytes[..bytes.len().min(512)];
-    head.windows(10).any(|w| w == b"<ltfsindex")
+    [b"<ltfsindex".as_slice(), b"<ltfsincrementalindex".as_slice()].iter().any(|tag| head.windows(tag.len()).any(|w| w == *tag))
 }
 
 fn validate_candidate(
@@ -238,6 +242,12 @@ fn validate_candidate(
     part_char: char,
     start_block: u64,
 ) -> std::result::Result<(), String> {
+    if idx.incremental && part_char != label.data_partition {
+        return Err("增量索引只允许位于 DP".into());
+    }
+    if idx.previous_incremental_location.is_some_and(|p| p.partition != label.data_partition || (part_char == label.data_partition && p.start_block >= start_block)) {
+        return Err("增量回指分区或方向非法".into());
+    }
     if idx.volume_uuid != label.volume_uuid {
         return Err(format!("卷 UUID 不符: {}", idx.volume_uuid));
     }
@@ -584,6 +594,37 @@ pub fn verify_chain(
     Ok((true, depth, false))
 }
 
+/// 增量目标必须完整回溯到其 Full 基线，再按正序原子应用；预算不足不能降级成成功。
+fn replay_incremental_chain(
+    drive: &TapeDrive<'_>, label: &LtfsLabel, candidate: &mut IndexCandidate, budget: &RecoveryBudget,
+) -> Result<u32> {
+    let mut chain = Vec::new();
+    let mut current = candidate.index.clone();
+    while current.incremental {
+        if chain.len() >= budget.max_chain_len as usize {
+            return Err(TapeError::RecoveryRestricted { reason: "增量链重放预算耗尽".into() });
+        }
+        let loc = current.previous_incremental_location.or(current.previous_location)
+            .ok_or_else(|| TapeError::Ltfs("增量缺少基线位置".into()))?;
+        if loc.partition != label.data_partition || loc.start_block >= current.self_location.start_block {
+            return Err(TapeError::Ltfs("增量前驱分区或方向非法".into()));
+        }
+        let (bytes, ended, _) = read_until_fm(drive, 1, loc.start_block, label.blocksize as usize, budget.max_index_bytes)?;
+        if !ended { return Err(TapeError::Ltfs("增量前驱构造残缺".into())); }
+        let prior = LtfsIndex::parse(&bytes)?;
+        validate_candidate(&prior, label, label.data_partition, loc.start_block).map_err(TapeError::Ltfs)?;
+        if prior.generation >= current.generation || prior.incremental != current.previous_incremental_location.is_some() {
+            return Err(TapeError::Ltfs("增量前驱类型或代数不符".into()));
+        }
+        chain.push(current);
+        current = prior;
+    }
+    let count = chain.len() as u32;
+    for delta in chain.iter().rev() { current = current.apply_incremental(delta)?; }
+    candidate.index = current;
+    Ok(count)
+}
+
 // ---------- VCI 快速路径 ----------
 
 /// 按 §10.3 读取介质 VCR 与两分区 VCI，返回各分区的末索引定位提示。
@@ -643,14 +684,23 @@ pub fn recover(
     let drive = &drive;
     let mut notes = Vec::new();
     let hints = vci_hints(device, label, &mut notes);
-    let dp = scan_partition(drive, 1, label.data_partition, label, budget, hints[1])?;
+    let mut dp = scan_partition(drive, 1, label.data_partition, label, budget, hints[1])?;
     let ip = scan_partition(drive, 0, label.index_partition, label, budget, hints[0])?;
 
-    let (chain_ok, chain_depth, chain_truncated) = match &dp.last_index {
+    let replay = match &mut dp.last_index {
+        Some(c) if c.index.incremental => replay_incremental_chain(drive, label, c, budget),
+        _ => Ok(0),
+    };
+    let (mut chain_ok, mut chain_depth, chain_truncated) = match &dp.last_index {
         Some(c) => verify_chain(drive, label, c, budget, &mut notes)?,
         None => (true, 0, false),
     };
 
+    let mut incremental_depth = 0;
+    match replay {
+        Ok(depth) => { incremental_depth = depth; chain_depth += depth; },
+        Err(e) => { chain_ok = false; notes.push(format!("增量链恢复失败: {e}")); }
+    }
     let ip_debt = match (&dp.last_index, &ip.last_index) {
         (Some(d), Some(i)) => i.index.generation < d.index.generation,
         (Some(_), None) => true,
@@ -665,6 +715,7 @@ pub fn recover(
         ip,
         chain_ok,
         chain_depth,
+        incremental_depth,
         chain_truncated_by_budget: chain_truncated,
         ip_debt,
         append_ok: false,

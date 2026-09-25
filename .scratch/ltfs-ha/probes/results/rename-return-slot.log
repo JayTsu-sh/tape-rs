@@ -1,0 +1,4 @@
+卸载: drive 0 (addr 0x0100) → slot 7 (addr 0x0406)
+[2026-09-24T14:51:15Z INFO  tape_rs::changer::commands] 移动介质: 从 0x0100 到 0x0406
+[2026-09-24T14:51:15Z INFO  tape_rs::changer::commands] 移动完成
+卸载完成
