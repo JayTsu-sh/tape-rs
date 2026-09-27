@@ -1,8 +1,8 @@
-"""LISA 第二驱动器上的直接库基线；EE节点2已正常下线，LE已退出。"""
+"""实机单驱动器直接库基线；私有 LE 已正常退出，两盘专用 RC 介质已重建空卷基线。"""
 import json,os,subprocess,time
 from pathlib import Path
 assert os.environ.get('TAPE_RS_PERF_COMPARE')=='RC0018L9-RC0017L9'
-base=Path('/root/tape-rs-io-20260927');cli='/root/tape-rs-io-20260927/tape-rs'
+base=Path('/root/tape-rs-io-20260927');cli='/root/tape-rs-io-20260927/tape-rs-candidate'
 assert subprocess.run(['pgrep','-x','ltfs'],capture_output=True).returncode==1
 assert not os.path.ismount(str(base/'le-mount'))
 changer,drive='/dev/sg4','/dev/sg3';serial='11EB4A80F1'

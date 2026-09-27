@@ -14,10 +14,12 @@ struct Trace {
     commands: RefCell<Vec<Vec<u8>>>,
     writes: RefCell<Vec<(usize, usize)>>,
     short_write: Cell<bool>,
+    no_data_timeouts: RefCell<Vec<(u8, u32)>>,
 }
 impl TapeTransport for Trace {
     fn execute_no_data(&self, c: &[u8], t: u32) -> Result<ScsiResult> {
         self.commands.borrow_mut().push(c.to_vec());
+        self.no_data_timeouts.borrow_mut().push((c[0], t));
         self.inner.execute_no_data(c, t)
     }
     fn execute_read(&self, c: &[u8], b: &mut [u8], t: u32) -> Result<ScsiResult> {
@@ -51,6 +53,7 @@ fn setup() -> (SimLibrary, Trace) {
         commands: RefCell::default(),
         writes: RefCell::default(),
         short_write: Cell::new(false),
+        no_data_timeouts: RefCell::default(),
     };
     mkltfs(
         &dev,
@@ -253,4 +256,18 @@ fn source_error_after_a_record_freezes_the_unindexed_tail() {
     assert!(!vol.writable());
     assert_eq!(dev.writes.borrow().len(), 1);
     assert!(vol.index().find_file("broken").is_none());
+}
+
+#[test]
+fn load_allows_lto9_initialization_without_resubmitting_the_command() {
+    let (_lib, dev) = setup();
+    dev.commands.borrow_mut().clear();
+    dev.no_data_timeouts.borrow_mut().clear();
+    tape_rs::tape::commands::TapeDrive::new(&dev)
+        .load()
+        .unwrap();
+    assert_eq!(*dev.commands.borrow(), vec![vec![0x1b, 0, 0, 0, 1, 0]]);
+    let timeouts = dev.no_data_timeouts.borrow();
+    assert_eq!(timeouts.len(), 1);
+    assert!(timeouts[0].1 >= 2 * 60 * 60 * 1000);
 }

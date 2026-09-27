@@ -59,3 +59,21 @@ Holo direct I/O中断诊断已实测：probes/results/le-io-direct-interrupt.tra
 Holo当前PF最终为本轮LE数据，均归槽且取消分配；aligned-le-final备份与SHA校验已完成。正式三节点未部署候选。
 
 补充前瞻检查：参考LTFS的[tape.c](https://raw.githubusercontent.com/LinearTapeFileSystem/ltfs/master/src/libltfs/tape.c)正常关闭路径通常会关闭append-only模式并释放预留。实机切换到Rust前必须正常退出LE并核验设备状态；该源码不是已安装LE二进制行为的替代证据。
+
+## 实机新增发现：LTO-9 首次 LOAD 超时
+
+2026-09-27 15:49:26 CST，/proc/scsi/sg/debug显示sg3独占打开，只有一条op=0x1b、timeout=7200000ms、elapsed=426990ms的在途命令；LE日志正在LOAD RC0017L9，尚未写该盘标签。仅观察kernel和LE日志，没有发额外TUR/LOAD，也没有中断。无法仅凭耗时断定一定在介质优化；但[IBM TS4300文档](https://www.ibm.com/docs/en/ts4300-tape-library?topic=features-media-optimization)明确LTO-9首次装带介质优化可能两小时，建议不中断。
+
+因此将TapeDrive::load的SG_IO超时从300000延长至7200000ms，与观察到的LE请求一致；保持单次LOAD及既有UA处理。兼容影响：无响应LOAD最长等待增加；不改变介质内容或CDB位域。新增传输层回归验证调用一次、CDB保持1B0000000100、超时覆盖两小时；9项le_sync测试及严格Clippy通过，兼容构建完成。候选控制CLI另存实机tape-rs-candidate，未覆盖旧验证二进制。新LOAD路径的实机执行仍待当前LE作业完成。
+
+
+### 实机自动作业交接（15:58 CST）
+
+format-second.py正在RC0017L9的LOAD，内核elapsed约955s，仍只有单条LOAD在途；不要重发或中断。physical-le-runner pid1107426等待format-baseline.complete；physical-native-runner pid1129509等待physical-le.complete。后者会保留LE证据、按顺序重建两盘RC空卷、正常卸载私有LE并核验PR无持有者，才临时开启allow_dio并运行Rust。任意阶段失败均停止。日志均在/root/tape-rs-io-20260927/{format-second,physical-le-runner,physical-native-runner}.log。专用LE pid1085305、admin17600。实机测试尚未开始，不能报告吞吐通过。
+
+LE计时完成后另运行physical-direct-diagnostic-20260927.py，单独追踪8MiB写+fdatasync/fsync/普通sync，不将诊断时间混入JSONL；成功后才发布LE完成标记。Rust下一轮重置会清除这次诊断数据。Native门控固定序列号+清单UUID，控制程序使用tape-rs-candidate（含2小时LOAD），保留旧tape-rs。
+
+候选二进制SHA256：
+
+- tape-rs-candidate: `6f8c525209f5a525597d33b588f16d96aea54b3c7b32ed56ce05bf9b94f0eef5`
+- performance_compare: `7f9f6b858554a152b72c5ff2a385a1eba164e13af852ea716812aad2b0b189dc`

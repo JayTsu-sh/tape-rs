@@ -9,6 +9,10 @@ use crate::error::{Result, TapeError};
 use crate::scsi::cdb;
 use crate::scsi::transport::{TapeTransport, retry_unit_attention};
 
+// LTO-9 首次装带可能执行最长两小时的介质优化；实机 LE 的 LOAD 同样使用7200000ms。
+// IBM TS4300 Media optimization：不要用普通机械操作的五分钟限制中断初始化。
+const LOAD_TIMEOUT_MS: u32 = 7_200_000;
+
 /// LOG SENSE 响应缓冲区长度（大多数 log page ≤ 8 KiB）。
 const LOG_SENSE_BUF_LEN: usize = 8 * 1024;
 /// REPORT DENSITY SUPPORT 响应缓冲区长度。
@@ -121,7 +125,9 @@ impl<'a> TapeDrive<'a> {
     pub fn load(&self) -> Result<()> {
         info!("装载磁带...");
         let cdb_bytes = cdb::load_unload(true);
-        retry_unit_attention("LOAD", || self.device.execute_no_data(&cdb_bytes, 300_000))?;
+        retry_unit_attention("LOAD", || {
+            self.device.execute_no_data(&cdb_bytes, LOAD_TIMEOUT_MS)
+        })?;
         info!("装载完成");
         Ok(())
     }

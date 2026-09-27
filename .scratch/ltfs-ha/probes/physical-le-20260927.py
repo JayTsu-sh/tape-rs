@@ -91,3 +91,6 @@ for i in range(2):
  start=time.monotonic();unload();load(target);reads(path)
  emit(dict(interface='IBM-LE-FUSE',kind='cross-tape-first-read',cycle=i,barcode=target,bytes=256*2**20,seconds=time.monotonic()-start))
 unload();emit(dict(kind='complete',passed=True))
+
+# 独立诊断不写入计时JSONL；发生错误则外层不会发布LE完成标记。
+subprocess.run(['python3',str(base/'physical-direct-diagnostic-20260927.py')],check=True)
