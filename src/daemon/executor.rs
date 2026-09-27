@@ -377,17 +377,13 @@ pub fn run(
             Ok(ExecRequest::Sync { round, reply }) => {
                 let result = match active.as_mut().filter(|a| a.serving && a.round == round) {
                     Some(a) if a.drive.is_some() && files.serving_round() == Some(round) => {
-                        process_uploads_limited(a, &files, &tx, true, 1)
-                            .and_then(|()| {
-                                checkpoint_write_tape(a, &files, &tx).map_err(|e| e.to_string())
-                            })
-                            .and_then(|()| {
-                                if files.serving_round() == Some(round) {
-                                    Ok(())
-                                } else {
-                                    Err("同步期间执行轮次已失效".into())
-                                }
-                            })
+                        process_uploads_limited(a, &files, &tx, true, 1).and_then(|()| {
+                            if files.serving_round() == Some(round) {
+                                Ok(())
+                            } else {
+                                Err("同步期间执行轮次已失效".into())
+                            }
+                        })
                     }
                     _ => Err("同步目标未就绪或执行轮次已失效".into()),
                 };
@@ -1068,7 +1064,7 @@ fn checkpoint_write_tape(a: &Active, files: &FileService, tx: &Sender<ExecEvent>
     }
     let dev = a.devices[i].dev.as_ref();
     let mut vol = LtfsVolume::mount(dev)?;
-    if !vol.index().incremental {
+    if !vol.needs_checkpoint() {
         return Ok(());
     }
     vol.set_reservation_guard(Some(a.key));

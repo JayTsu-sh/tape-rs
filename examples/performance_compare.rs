@@ -1,4 +1,4 @@
-//! 同一 Holo 介质上的直接库基线。只允许显式门控和 PF2701/PF2702 UUID；不格式化、不换带。
+//! 专用介质上的直接库基线。显式门控、驱动序列号和清单 UUID 校验；不格式化、不换带。
 //! 装卸带由外部探针核对 inventory 后执行，计时单独保存。不要对业务介质运行。
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -7,7 +7,7 @@ use std::time::Instant;
 use clap::Parser;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tape_rs::ltfs::volume::LtfsVolume;
+use tape_rs::ltfs::volume::{HashPolicy, LtfsVolume};
 use tape_rs::scsi::device::ScsiDevice;
 use tape_rs::scsi::inquiry::read_unit_serial;
 
@@ -15,6 +15,9 @@ use tape_rs::scsi::inquiry::read_unit_serial;
 struct Args {
     #[arg(long)]
     device: String,
+    /// 使用已授权的实机 RC0018L9/RC0017L9，仍核验清单 UUID。
+    #[arg(long)]
+    physical: bool,
     #[arg(long)]
     manifest: PathBuf,
     #[arg(long)]
@@ -27,6 +30,12 @@ struct Args {
     path: Option<String>,
     #[arg(long)]
     once: bool,
+    /// 与 LE 默认写入对齐：默认不额外写入内容摘要。
+    #[arg(long)]
+    store_sha256: bool,
+    /// 测量已有内存切片的无中间拷贝入口，独立于默认文件流基线。
+    #[arg(long)]
+    borrowed: bool,
 }
 struct Manifest {
     barcode: String,
@@ -56,11 +65,20 @@ impl Write for CheckedBytes {
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    if std::env::var("TAPE_RS_PERF_COMPARE").as_deref() != Ok("PF2701L08-PF2702L08") {
+    let (gate, serial, barcodes) = if args.physical {
+        ("RC0018L9-RC0017L9", "11EB4A80F1", ["RC0018L9", "RC0017L9"])
+    } else {
+        (
+            "PF2701L08-PF2702L08",
+            "IBMlisa42299",
+            ["PF2701L08", "PF2702L08"],
+        )
+    };
+    if std::env::var("TAPE_RS_PERF_COMPARE").as_deref() != Ok(gate) {
         return Err("缺少专用测试介质门控，拒绝访问设备".into());
     }
-    if !matches!(args.mode.as_str(), "write" | "read" | "list") {
-        return Err("mode 必须为 write/read/list".into());
+    if !matches!(args.mode.as_str(), "write" | "read" | "list" | "checkpoint") {
+        return Err("mode 必须为 write/read/list/checkpoint".into());
     }
     let value: serde_json::Value = serde_json::from_reader(std::fs::File::open(&args.manifest)?)?;
     let manifest = Manifest {
@@ -86,7 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .collect::<Result<Vec<_>, _>>()?,
     };
-    if !matches!(manifest.barcode.as_str(), "PF2701L08" | "PF2702L08") {
+    if !barcodes.contains(&manifest.barcode.as_str()) {
         return Err("不是专用性能测试介质".into());
     }
     let rows: Vec<_> = manifest
@@ -108,7 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("清单路径或分组非法".into());
     }
     let dev = ScsiDevice::open(&args.device)?;
-    if read_unit_serial(&dev).as_deref() != Some("IBMlisa42299") {
+    if read_unit_serial(&dev).as_deref() != Some(serial) {
         return Err("驱动器序列号不匹配，拒绝访问介质".into());
     }
     let start = Instant::now();
@@ -117,6 +135,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("介质 UUID 不匹配，拒绝继续".into());
     }
     let mount_seconds = start.elapsed().as_secs_f64();
+    vol.set_hash_policy(HashPolicy {
+        md5: false,
+        sha256: args.store_sha256,
+    });
     match args.mode.as_str() {
         "write" => {
             if !vol.writable() {
@@ -146,9 +168,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let start = Instant::now();
             let mut mixed_reads = 0;
             for (i, row) in rows.iter().enumerate() {
-                let mut source =
-                    std::io::BufReader::new(std::fs::File::open(args.source.join(&row.path))?);
-                vol.append_file(&row.path, &mut source)?;
+                if args.borrowed {
+                    let source = std::fs::read(args.source.join(&row.path))?;
+                    vol.append_bytes(&row.path, &source)?;
+                } else {
+                    let mut source = std::fs::File::open(args.source.join(&row.path))?;
+                    vol.append_file(&row.path, &mut source)?;
+                }
                 if args.group == "mixed" && (i + 1) % 16 == 0 {
                     let large: Vec<_> = manifest
                         .files
@@ -173,7 +199,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let data_seconds = start.elapsed().as_secs_f64();
             let commit = Instant::now();
-            vol.commit()?;
+            vol.sync()?;
             let commit_seconds = commit.elapsed().as_secs_f64();
             println!(
                 "{}",
@@ -221,7 +247,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 json!({"interface":"rust-library","kind":"list","group":args.group,"count":count,"mount_seconds":mount_seconds,"samples_ms":samples})
             );
         }
+        "checkpoint" => {
+            let start = Instant::now();
+            vol.commit()?;
+            println!(
+                "{}",
+                json!({"interface":"rust-library","kind":"checkpoint","mount_seconds":mount_seconds,"seconds":start.elapsed().as_secs_f64(),"generation":vol.index().generation})
+            );
+        }
         _ => unreachable!(),
     }
+    let stats = dev.direct_io_stats();
+    println!(
+        "{}",
+        json!({"interface":"rust-library","kind":"direct-io","read":{"direct":stats.read.direct,"mixed":stats.read.mixed,"indirect":stats.read.indirect},"write":{"direct":stats.write.direct,"mixed":stats.write.mixed,"indirect":stats.write.indirect},"store_sha256":args.store_sha256,"borrowed":args.borrowed})
+    );
     Ok(())
 }

@@ -9,6 +9,12 @@ pub const SG_DXFER_NONE: i32 = -1;
 pub const SG_DXFER_TO_DEV: i32 = -2;
 pub const SG_DXFER_FROM_DEV: i32 = -3;
 
+/// Linux sg.h：请求直接映射用户页；不能满足时内核回退到间接 I/O。
+pub const SG_FLAG_DIRECT_IO: u32 = 1;
+pub const SG_INFO_DIRECT_IO_MASK: u32 = 0x6;
+pub const SG_INFO_DIRECT_IO: u32 = 0x2;
+pub const SG_INFO_MIXED_IO: u32 = 0x4;
+
 /// SCSI 状态码（SPC-5 Table 50）
 pub const SCSI_STATUS_GOOD: u8 = 0x00;
 /// 命令未执行；目标暂忙。
@@ -113,3 +119,20 @@ impl SgIoHdr {
 // 并返回虚假的 host_status（本例里是 0x7562，即 "us" 两个 ASCII 字节）。
 const SG_IO: u64 = 0x2285;
 nix::ioctl_readwrite_bad!(sg_io, SG_IO, SgIoHdr);
+
+/// Linux sg.h 的 SG_GET_REQUEST_TABLE 条目；req_state=1 表示命令仍在执行。
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SgRequestInfo {
+    pub req_state: u8,
+    pub orphan: u8,
+    pub sg_io_owned: u8,
+    pub problem: u8,
+    pub pack_id: i32,
+    pub usr_ptr: usize,
+    pub duration: u32,
+    pub unused: i32,
+}
+
+pub(crate) const SG_MAX_QUEUE: usize = 16;
+nix::ioctl_read_bad!(sg_get_request_table, 0x2286, [SgRequestInfo; SG_MAX_QUEUE]);

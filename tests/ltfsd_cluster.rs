@@ -3730,7 +3730,7 @@ fn check_symlink_reclaim(cut: Option<ReclaimCut>) {
 }
 
 #[test]
-fn explicit_sync_commits_staged_files_and_closes_incremental_index() {
+fn explicit_sync_commits_staged_files_without_forcing_ip_checkpoint() {
     use tape_rs::ltfs::volume::LtfsVolume;
     use tape_rs::tapefs::{ClientBackend, ROOT_INO, TapeFs};
     let c = Cluster::start_with("explicit-sync", false);
@@ -3757,7 +3757,8 @@ fn explicit_sync_commits_staged_files_and_closes_incremental_index() {
     copy.load_into_drive(BARCODE, 0).unwrap();
     let drive = copy.drive(0);
     let vol = LtfsVolume::mount(&drive).unwrap();
-    assert!(!vol.index().incremental);
+    assert!(vol.index().incremental);
+    assert!(vol.needs_checkpoint());
     assert!(vol.writable());
     for (path, expected) in [
         ("remote", b"staged by another client".as_slice()),
@@ -3789,7 +3790,7 @@ fn explicit_sync_commits_staged_files_and_closes_incremental_index() {
 }
 
 #[test]
-fn explicit_sync_surfaces_checkpoint_failure_without_retrying() {
+fn clean_sync_does_not_start_checkpoint_or_consume_write_fault() {
     use std::sync::atomic::Ordering;
     for medium in [false, true] {
         let c = Cluster::start_with(if medium { "sync-medium" } else { "sync-lost" }, false);
@@ -3806,11 +3807,12 @@ fn explicit_sync_surfaces_checkpoint_failure_without_retrying() {
             .initiator
             .store(leader as u32, Ordering::SeqCst);
         let result = cl.sync();
-        assert_eq!(c.checkpoint_fault.initiator.load(Ordering::SeqCst), 0);
-        assert!(
-            matches!(result, Err(tape_rs::client::ClientError::Indeterminate(_))),
-            "{result:?}"
+        assert_eq!(
+            c.checkpoint_fault.initiator.load(Ordering::SeqCst),
+            leader as u32
         );
+        assert!(result.is_ok(), "{result:?}");
+        c.checkpoint_fault.initiator.store(0, Ordering::SeqCst);
         c.shutdown();
     }
 }

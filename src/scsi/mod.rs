@@ -1,3 +1,4 @@
+pub(crate) mod buffer;
 pub mod cdb;
 pub mod device;
 pub mod inquiry;

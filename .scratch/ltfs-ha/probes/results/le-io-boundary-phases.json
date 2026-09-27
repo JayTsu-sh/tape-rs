@@ -1,0 +1,50 @@
+[
+  {
+    "phase": "mkdir",
+    "time": 1790492457.5508254
+  },
+  {
+    "phase": "open",
+    "time": 1790492457.5791464
+  },
+  {
+    "phase": "write",
+    "time": 1790492457.5803328
+  },
+  {
+    "phase": "fdatasync",
+    "time": 1790492457.6001782
+  },
+  {
+    "phase": "fsync",
+    "time": 1790492457.6937184
+  },
+  {
+    "phase": "close",
+    "time": 1790492457.6940484
+  },
+  {
+    "phase": "sync",
+    "time": 1790492457.6943374
+  },
+  {
+    "phase": "read-first",
+    "time": 1790492458.6088562
+  },
+  {
+    "phase": "read-repeat",
+    "time": 1790492458.6154718
+  },
+  {
+    "phase": "unload",
+    "time": 1790492458.619416
+  },
+  {
+    "phase": "unassign",
+    "time": 1790492459.6571195
+  },
+  {
+    "phase": "complete",
+    "time": 1790492459.9385347
+  }
+]

@@ -172,7 +172,8 @@ fn read_index_file<W: Write>(
     }
 
     let mut total: u64 = 0;
-    let mut buf = vec![0u8; block_size as usize];
+    let mut buffer = crate::scsi::buffer::TransferBuffer::new(block_size as usize);
+    let buf = buffer.as_mut_slice();
 
     for ext in &file.extents {
         let partition = partition_char_to_num(ext.partition);
@@ -182,7 +183,7 @@ fn read_index_file<W: Write>(
         let mut remaining = ext.byte_count;
         let mut first_block = true;
         while remaining > 0 {
-            let n = drive.read_block(&mut buf)?;
+            let n = drive.read_block(buf)?;
             if n == 0 {
                 return Err(TapeError::Ltfs(format!(
                     "文件 {} 的 extent 提前结束，缺少 {} 字节",
@@ -362,7 +363,7 @@ impl<'a> LtfsVolume<'a> {
     }
 
     /// 为 P0 与 P1 写入 VCI（各自的最新索引位置）。驱动器不提供 VCR 时跳过并记录。
-    fn write_vci_all(&self, p1_index_block: u64) -> Result<()> {
+    fn write_vci_all(&self, p1_index_block: u64, checkpoint: bool) -> Result<()> {
         let Some(vcr) = self.mam.read_vcr()? else {
             debug!("驱动器未提供 VCR，跳过 VCI 更新");
             return Ok(());
@@ -371,10 +372,10 @@ impl<'a> LtfsVolume<'a> {
             debug!("VCR 无效（全 0/全 1），跳过 VCI 更新");
             return Ok(());
         }
-        let ip = if self.working.incremental {
-            self.last_ip
-        } else {
+        let ip = if checkpoint {
             Some((self.working.generation, P0_INDEX_BLOCK))
+        } else {
+            self.last_ip
         };
         for (partition, entry) in [
             (0u8, ip),
@@ -946,6 +947,27 @@ impl<'a> LtfsVolume<'a> {
         xattrs: &[(&str, &str)],
         preserved: Option<&FileMetadata>,
     ) -> Result<u64> {
+        let mut source = StreamBlocks {
+            reader: r,
+            buffer: crate::scsi::buffer::TransferBuffer::new(self.block_size as usize),
+        };
+        self.append_blocks(path, &mut source, xattrs, preserved)
+    }
+
+    /// 已在内存中的内容直接按记录借用给 SG_IO，不复制到中间流缓冲区。
+    /// 内核是否直接映射用户页由 ScsiDevice::direct_io_stats() 的实际返回计数判断。
+    pub fn append_bytes(&mut self, path: &str, data: &[u8]) -> Result<u64> {
+        let mut source = SliceBlocks(data.chunks(self.block_size as usize));
+        self.append_blocks(path, &mut source, &[], None)
+    }
+
+    fn append_blocks(
+        &mut self,
+        path: &str,
+        source: &mut impl BlockSource,
+        xattrs: &[(&str, &str)],
+        preserved: Option<&FileMetadata>,
+    ) -> Result<u64> {
         self.ensure_writable()?;
         if path.is_empty() || path.ends_with('/') {
             return Err(TapeError::Ltfs(format!("非法文件路径: {}", path)));
@@ -956,9 +978,7 @@ impl<'a> LtfsVolume<'a> {
         // 1. LOCATE P1 write head
         self.drive.locate(1, self.p1_write_head, true)?;
 
-        // 2. 流式写入，整块为单位
-        let block_size = self.block_size as usize;
-        let mut buf = vec![0u8; block_size];
+        // 2. 源提供完整记录；内存切片无需额外复制。
         let start_block = self.p1_write_head;
         let mut byte_count: u64 = 0;
         let mut cur_block = start_block;
@@ -968,28 +988,37 @@ impl<'a> LtfsVolume<'a> {
         let mut sha256 = (self.hash_policy.sha256 || had_hash(XATTR_SHA256)).then(Sha256::new);
 
         loop {
-            let mut filled = 0;
-            while filled < block_size {
-                match r.read(&mut buf[filled..])? {
-                    0 => break,
-                    n => filled += n,
+            let block = match source.next_block() {
+                Ok(Some(block)) => block,
+                Ok(None) => break,
+                Err(e) => {
+                    self.freeze_after_commit_failure("data_source", &e);
+                    return Err(e);
                 }
+            };
+            let written = match self.drive.write_block(block) {
+                Ok(n) => n,
+                Err(e) => {
+                    self.freeze_after_commit_failure("data_records", &e);
+                    return Err(e);
+                }
+            };
+            if written != block.len() {
+                let err = TapeError::InvalidResponse {
+                    expected: block.len(),
+                    actual: written,
+                };
+                self.freeze_after_commit_failure("data_records", &err);
+                return Err(err);
             }
-            if filled == 0 {
-                break;
-            }
-            self.drive.write_block(&buf[..filled])?;
             if let Some(h) = md5.as_mut() {
-                h.update(&buf[..filled]);
+                h.update(block);
             }
             if let Some(h) = sha256.as_mut() {
-                h.update(&buf[..filled]);
+                h.update(block);
             }
-            byte_count += filled as u64;
+            byte_count += block.len() as u64;
             cur_block += 1;
-            if filled < block_size {
-                break;
-            }
         }
 
         if byte_count == 0 {
@@ -1070,16 +1099,33 @@ impl<'a> LtfsVolume<'a> {
         Ok(byte_count)
     }
 
-    /// 提交：
-    /// 1. P1 tail 写 FM + index + FM（形成新 generation）
-    /// 2. P0 覆盖写入最新 index
-    /// 3. 更新 MAM VCI
+    /// LE 普通 sync：将完整索引追加到 DP，保留 IP 检查点到清洁卸载时更新。
+    /// 成功后新目录可从 DP 恢复；不意味着 IP 已追平。
+    pub fn sync(&mut self) -> Result<()> {
+        self.commit_mode(false, false)
+    }
+
+    /// IP 尚未包含当前完整视图，清洁卸载前需要检查点。
+    pub fn needs_checkpoint(&self) -> bool {
+        self.dirty
+            || self.index.incremental
+            || self
+                .last_ip
+                .is_none_or(|(generation, _)| generation != self.index.generation)
+    }
+
+    /// 显式双分区检查点；保留原 commit API 的归档语义。
+    /// 普通 I/O 同步使用 sync()，卸载时才保证 IP 追平。
     pub fn commit(&mut self) -> Result<()> {
-        // 增量之后即便没有新变化，也必须能显式生成完整检查点。
+        if !self.dirty && !self.index.incremental && self.needs_checkpoint() {
+            self.ensure_writable()?;
+            let result = self.checkpoint_existing();
+            return self.finish_commit(result);
+        }
         if self.index.incremental {
             self.dirty = true;
         }
-        self.commit_mode(false)
+        self.commit_mode(false, true)
     }
 
     /// LTFS 2.5 提交：通常只追加 DP 增量；连续 5 份（或较小恢复预算）后写 DP/IP Full。
@@ -1093,16 +1139,24 @@ impl<'a> LtfsVolume<'a> {
         {
             return self.commit();
         }
-        self.commit_mode(true)
+        self.commit_mode(true, false)
     }
 
-    fn commit_mode(&mut self, incremental: bool) -> Result<()> {
+    fn commit_mode(&mut self, incremental: bool, checkpoint: bool) -> Result<()> {
         if !self.dirty {
             debug!("commit: nothing to do");
             return Ok(());
         }
         self.ensure_writable()?;
-        match self.commit_inner(incremental) {
+        let result = self.commit_inner(incremental, checkpoint);
+        self.finish_commit(result)
+    }
+
+    fn finish_commit(
+        &mut self,
+        result: std::result::Result<(), (&'static str, TapeError)>,
+    ) -> Result<()> {
+        match result {
             Ok(()) => Ok(()),
             Err((stage, err)) => {
                 self.freeze_after_commit_failure(stage, &err);
@@ -1121,6 +1175,7 @@ impl<'a> LtfsVolume<'a> {
     fn commit_inner(
         &mut self,
         incremental: bool,
+        checkpoint: bool,
     ) -> std::result::Result<(), (&'static str, TapeError)> {
         // 回指指向 DP 上的前一份 Full（LTFS 2.5.1 §5.4.3）；旧版本曾误指向 IP。
         // 动带之前先自检；失败时介质未被触碰，但为了语义统一仍按提交失败冻结。
@@ -1165,32 +1220,8 @@ impl<'a> LtfsVolume<'a> {
             .map_err(|e| ("closing_fm", e))?;
         self.p1_write_head = p1_index_block + blocks_written as u64 + 1;
 
-        // —— IP：同一份 XML，自指针指向 P0 —— //
-        if !incremental {
-            let mut p0_index = self.working.clone();
-            p0_index.self_location = IndexLocation {
-                partition: self.label.index_partition,
-                start_block: P0_INDEX_BLOCK,
-            };
-            // 一致卷的定义：IP 末索引回指 DP 上最后一个完整索引，也就是刚写好的同代那份。
-            // 指向上一代的话 IBM LTFS 会判为不一致，挂载时自行补写 IP。
-            p0_index.previous_incremental_location = None;
-            p0_index.previous_location = Some(IndexLocation {
-                partition: self.label.data_partition,
-                start_block: p1_index_block,
-            });
-            let p0_xml = p0_index.to_xml().map_err(|e| ("encode", e))?;
-            self.drive
-                .locate(0, P1_DATA_START, true)
-                .map_err(|e| ("index_partition", e))?;
-            self.drive
-                .write_filemark(1)
-                .map_err(|e| ("index_partition", e))?;
-            write_bytes_in_blocks(&self.drive, &p0_xml, self.block_size as usize)
-                .map_err(|e| ("index_partition", e))?;
-            self.drive
-                .write_filemark(1)
-                .map_err(|e| ("index_partition", e))?;
+        if checkpoint {
+            self.write_ip_index(p1_index_block)?;
         }
 
         // —— 屏障前自检：设备报告的预留持有者必须仍是本轮的键 —— //
@@ -1201,7 +1232,8 @@ impl<'a> LtfsVolume<'a> {
 
         // —— S4：最终屏障（D01 保守候选）；§10.3：读 VCR → 写全部分区 VCI —— //
         self.drive.write_filemark(0).map_err(|e| ("barrier", e))?;
-        self.write_vci_all(p1_index_block).map_err(|e| ("vci", e))?;
+        self.write_vci_all(p1_index_block, checkpoint)
+            .map_err(|e| ("vci", e))?;
 
         // —— S5：发布已提交视图 —— //
         self.dirty = false;
@@ -1212,24 +1244,105 @@ impl<'a> LtfsVolume<'a> {
             self.last_dp_index = Some(self.working.self_location);
             self.last_dp_incremental = None;
             self.incremental_depth = 0;
+        }
+        if checkpoint {
             self.last_ip = Some((self.working.generation, P0_INDEX_BLOCK));
         }
         self.working.materialized = incremental;
         self.index = self.working.clone();
         info!(
-            "commit: gen {} @ P0 {}, P1 {}",
-            self.working.generation, P0_INDEX_BLOCK, p1_index_block
+            "commit: gen {} @ DP {}, IP checkpoint={}",
+            self.working.generation, p1_index_block, checkpoint
         );
+        Ok(())
+    }
+
+    fn write_ip_index(
+        &self,
+        p1_index_block: u64,
+    ) -> std::result::Result<(), (&'static str, TapeError)> {
+        let mut p0_index = self.working.clone();
+        p0_index.self_location = IndexLocation {
+            partition: self.label.index_partition,
+            start_block: P0_INDEX_BLOCK,
+        };
+        p0_index.previous_incremental_location = None;
+        p0_index.previous_location = Some(IndexLocation {
+            partition: self.label.data_partition,
+            start_block: p1_index_block,
+        });
+        let xml = p0_index.to_xml().map_err(|e| ("encode", e))?;
+        self.drive
+            .locate(0, P1_DATA_START, true)
+            .map_err(|e| ("index_partition", e))?;
+        self.drive
+            .write_filemark(1)
+            .map_err(|e| ("index_partition", e))?;
+        write_bytes_in_blocks(&self.drive, &xml, self.block_size as usize)
+            .map_err(|e| ("index_partition", e))?;
+        self.drive
+            .write_filemark(1)
+            .map_err(|e| ("index_partition", e))?;
+        Ok(())
+    }
+
+    /// DP Full 已持久化时，只复制同代索引到 IP，不制造新 DP generation。
+    fn checkpoint_existing(&mut self) -> std::result::Result<(), (&'static str, TapeError)> {
+        if let Some(key) = self.reservation_guard {
+            crate::scsi::reservation::verify_holder(self.device, key)
+                .map_err(|e| ("guard_pre", e))?;
+        }
+        let block = self.index.self_location.start_block;
+        self.write_ip_index(block)?;
+        if let Some(key) = self.reservation_guard {
+            crate::scsi::reservation::verify_holder(self.device, key).map_err(|e| ("guard", e))?;
+        }
+        self.drive.write_filemark(0).map_err(|e| ("barrier", e))?;
+        self.write_vci_all(block, true).map_err(|e| ("vci", e))?;
+        self.last_ip = Some((self.index.generation, P0_INDEX_BLOCK));
         Ok(())
     }
 
     /// 卸载：保证写回并倒带。调用后 Volume 被消费。
     pub fn unmount(mut self) -> Result<()> {
-        if (self.dirty || self.index.incremental) && self.writable {
+        if self.needs_checkpoint() && self.writable {
             self.commit()?;
         }
         self.drive.rewind()?;
         Ok(())
+    }
+}
+
+trait BlockSource {
+    fn next_block(&mut self) -> Result<Option<&[u8]>>;
+}
+
+struct SliceBlocks<'a>(std::slice::Chunks<'a, u8>);
+
+impl BlockSource for SliceBlocks<'_> {
+    fn next_block(&mut self) -> Result<Option<&[u8]>> {
+        Ok(self.0.next())
+    }
+}
+
+struct StreamBlocks<'a, R> {
+    reader: &'a mut R,
+    buffer: crate::scsi::buffer::TransferBuffer,
+}
+
+impl<R: Read> BlockSource for StreamBlocks<'_, R> {
+    fn next_block(&mut self) -> Result<Option<&[u8]>> {
+        let buf = self.buffer.as_mut_slice();
+        let mut filled = 0;
+        while filled < buf.len() {
+            match self.reader.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok((filled != 0).then_some(&buf[..filled]))
     }
 }
 
