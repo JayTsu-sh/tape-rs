@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/home/rocky/tape-rs-performance-20260927/performance-20260927.py", line 73, in <module>
+    r=pool.submit(reads);c=pool.submit(controls);batch('mixed-two-drives' if mode=='multidrive' else 'mixed',64,32768,16);r.result();c.result()
+  File "/home/rocky/tape-rs-performance-20260927/performance-20260927.py", line 22, in batch
+    if create:req('POST','/directories'+directory)
+  File "/home/rocky/tape-rs-performance-20260927/performance-20260927.py", line 9, in req
+    assert status in (200,201,202),(method,path,status,data[:500])
+AssertionError: ('POST', '/directories/sr/performance-20260927-r1/mixed', 412, b'{"error":"exists","path":"/sr/performance-20260927-r1/mixed"}\n')

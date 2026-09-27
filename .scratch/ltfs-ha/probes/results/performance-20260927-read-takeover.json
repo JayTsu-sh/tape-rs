@@ -1,0 +1,19 @@
+{
+  "old_leader": 2,
+  "old_round": 405,
+  "new": {
+    "drives": 2,
+    "executor": {
+      "fenced": true,
+      "node": 3,
+      "round": 436
+    },
+    "id": 3,
+    "last_reclaim": null,
+    "leader": 3,
+    "local": "轮次 436：服务中。IBMtaper2287 (/dev/sg6) [SR2502L8]: gen=18 文件 2614 个 尾部 Complete；可用 77 MiB",
+    "role": "Leader",
+    "serving_round": 436,
+    "term": 28
+  }
+}

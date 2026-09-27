@@ -1,0 +1,179 @@
+{
+  "71": {
+    "pid": 970602,
+    "cluster": {
+      "drives": 2,
+      "executor": {
+        "fenced": true,
+        "node": 3,
+        "round": 436
+      },
+      "id": 1,
+      "last_reclaim": null,
+      "leader": 3,
+      "local": "空闲",
+      "role": "Follower",
+      "serving_round": null,
+      "term": 28
+    },
+    "pools": {
+      "answered_by": 1,
+      "applied_index": 440,
+      "pools": [
+        {
+          "file_limit": 200000,
+          "name": "sr",
+          "tape_details": [
+            {
+              "barcode": "SR2501L8",
+              "bytes_used": 72070619,
+              "bytes_written": 181403648,
+              "files": 4338,
+              "generation": 94,
+              "live_bytes": 72070619,
+              "live_files": 4372,
+              "reclaimable_bytes": 109333029,
+              "state": "full"
+            },
+            {
+              "barcode": "SR2502L8",
+              "bytes_used": 136477976,
+              "bytes_written": 162529280,
+              "files": 2614,
+              "generation": 18,
+              "live_bytes": 136477952,
+              "live_files": 2621,
+              "reclaimable_bytes": 26051328,
+              "state": "appendable"
+            }
+          ],
+          "tapes": [
+            "SR2501L8",
+            "SR2502L8"
+          ],
+          "uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b"
+        }
+      ]
+    },
+    "catalog_rows": 6993,
+    "catalog_sha256": "61ff4ebab3247c8856e9b452638d89f0815e0acbdb5f564801925574cbccd61a"
+  },
+  "72": {
+    "pid": 600694,
+    "cluster": {
+      "drives": 2,
+      "executor": {
+        "fenced": true,
+        "node": 3,
+        "round": 436
+      },
+      "id": 2,
+      "last_reclaim": null,
+      "leader": 3,
+      "local": "空闲",
+      "role": "Follower",
+      "serving_round": null,
+      "term": 28
+    },
+    "pools": {
+      "answered_by": 2,
+      "applied_index": 440,
+      "pools": [
+        {
+          "file_limit": 200000,
+          "name": "sr",
+          "tape_details": [
+            {
+              "barcode": "SR2501L8",
+              "bytes_used": 72070619,
+              "bytes_written": 181403648,
+              "files": 4338,
+              "generation": 94,
+              "live_bytes": 72070619,
+              "live_files": 4372,
+              "reclaimable_bytes": 109333029,
+              "state": "full"
+            },
+            {
+              "barcode": "SR2502L8",
+              "bytes_used": 136477976,
+              "bytes_written": 162529280,
+              "files": 2614,
+              "generation": 18,
+              "live_bytes": 136477952,
+              "live_files": 2621,
+              "reclaimable_bytes": 26051328,
+              "state": "appendable"
+            }
+          ],
+          "tapes": [
+            "SR2501L8",
+            "SR2502L8"
+          ],
+          "uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b"
+        }
+      ]
+    },
+    "catalog_rows": 6993,
+    "catalog_sha256": "61ff4ebab3247c8856e9b452638d89f0815e0acbdb5f564801925574cbccd61a"
+  },
+  "74": {
+    "pid": 67608,
+    "cluster": {
+      "drives": 2,
+      "executor": {
+        "fenced": true,
+        "node": 3,
+        "round": 436
+      },
+      "id": 3,
+      "last_reclaim": null,
+      "leader": 3,
+      "local": "轮次 436：服务中。IBMtaper2287 (/dev/sg6) [SR2502L8]: gen=18 文件 2614 个 尾部 Complete；可用 77 MiB",
+      "role": "Leader",
+      "serving_round": 436,
+      "term": 28
+    },
+    "pools": {
+      "answered_by": 3,
+      "applied_index": 440,
+      "pools": [
+        {
+          "file_limit": 200000,
+          "name": "sr",
+          "tape_details": [
+            {
+              "barcode": "SR2501L8",
+              "bytes_used": 72070619,
+              "bytes_written": 181403648,
+              "files": 4338,
+              "generation": 94,
+              "live_bytes": 72070619,
+              "live_files": 4372,
+              "reclaimable_bytes": 109333029,
+              "state": "full"
+            },
+            {
+              "barcode": "SR2502L8",
+              "bytes_used": 136477976,
+              "bytes_written": 162529280,
+              "files": 2614,
+              "generation": 18,
+              "live_bytes": 136477952,
+              "live_files": 2621,
+              "reclaimable_bytes": 26051328,
+              "state": "appendable"
+            }
+          ],
+          "tapes": [
+            "SR2501L8",
+            "SR2502L8"
+          ],
+          "uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b"
+        }
+      ]
+    },
+    "catalog_rows": 6993,
+    "catalog_sha256": "61ff4ebab3247c8856e9b452638d89f0815e0acbdb5f564801925574cbccd61a"
+  }
+}

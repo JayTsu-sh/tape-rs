@@ -1,0 +1,159 @@
+[2026-09-27T06:37:58Z INFO  tape_rs::changer::commands] 移动介质: 从 0x040a 到 0x0101
+[2026-09-27T06:37:58Z INFO  tape_rs::changer::commands] 移动完成
+[2026-09-27T06:37:58Z INFO  tape_rs::tape::commands] 装载磁带...
+[2026-09-27T06:37:58Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 1 次）
+[2026-09-27T06:37:58Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 2 次）
+[2026-09-27T06:37:58Z INFO  tape_rs::tape::commands] 装载完成
+{"interface": "rust-library", "kind": "load", "barcode": "PF2701L08", "move_seconds": 0.003653324209153652, "total_seconds": 0.06387113616801798, "wall_time": 1790491078.3818007}
+{"bytes": 33554432, "commit_seconds": 0.919887165, "count": 4, "data_seconds": 0.483939425, "generation": 2, "group": "large", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 0.007307168, "total_seconds": 1.4038354690000001, "wall_time": 1790491080.5440652}
+{"bytes": 1048576, "commit_seconds": 1.306885259, "count": 256, "data_seconds": 0.372516483, "generation": 3, "group": "small", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 0.010204794, "total_seconds": 1.6794134189999999, "wall_time": 1790491082.814298}
+{"count": 4, "group": "large", "interface": "rust-library", "kind": "list", "mount_seconds": 0.03465486, "samples_ms": [0.005062, 0.000955, 0.000584, 0.000472, 0.000456, 0.00047999999999999996, 0.00047, 0.000466, 0.000466, 0.000419], "wall_time": 1790491083.5723433}
+{"count": 256, "group": "small", "interface": "rust-library", "kind": "list", "mount_seconds": 0.018324695, "samples_ms": [0.011115, 0.010365, 0.009843000000000001, 0.009630999999999999, 0.009366, 0.009422, 0.009366, 0.009419, 0.009337999999999999, 0.009314], "wall_time": 1790491084.1483345}
+{"bytes": 160000, "commit_seconds": 0.876303991, "count": 2500, "data_seconds": 1.8310648280000001, "generation": 4, "group": "growth", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 0.017915731, "total_seconds": 2.707395891, "wall_time": 1790491087.4675016}
+{"count": 4, "group": "large", "interface": "rust-library", "kind": "list", "mount_seconds": 0.100898666, "samples_ms": [0.0022429999999999998, 0.000339, 0.00025100000000000003, 0.000191, 0.000184, 0.000188, 0.000214, 0.000185, 0.000187, 0.00019], "wall_time": 1790491088.0265749}
+{"count": 256, "group": "small", "interface": "rust-library", "kind": "list", "mount_seconds": 0.101646545, "samples_ms": [0.013294, 0.010256, 0.009798, 0.009574000000000001, 0.00942, 0.009389999999999999, 0.009368000000000001, 0.009367, 0.009395, 0.020274], "wall_time": 1790491088.6818564}
+{"bytes": 131072, "commit_seconds": 0.862419723, "count": 32, "data_seconds": 0.059605728, "generation": 5, "group": "continuous-00", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 0.10638991, "total_seconds": 0.922039187, "wall_time": 1790491090.2974663}
+{"bytes": 131072, "commit_seconds": 1.088231076, "count": 32, "data_seconds": 0.288613195, "generation": 6, "group": "continuous-01", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 0.151333613, "total_seconds": 1.376855825, "wall_time": 1790491092.370554}
+{"bytes": 131072, "commit_seconds": 0.813265233, "count": 32, "data_seconds": 0.081397652, "generation": 7, "group": "continuous-02", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 0.196547949, "total_seconds": 0.89467826, "wall_time": 1790491093.946645}
+{"bytes": 131072, "commit_seconds": 0.847349163, "count": 32, "data_seconds": 0.051010012, "generation": 8, "group": "continuous-03", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 0.250814533, "total_seconds": 0.898370817, "wall_time": 1790491095.6608927}
+{"bytes": 131072, "commit_seconds": 0.803612366, "count": 32, "data_seconds": 0.170917907, "generation": 9, "group": "continuous-04", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 0.2901965, "total_seconds": 0.974541003, "wall_time": 1790491097.489357}
+{"bytes": 131072, "commit_seconds": 0.860206264, "count": 32, "data_seconds": 0.077058688, "generation": 10, "group": "continuous-05", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 0.323744293, "total_seconds": 0.937277446, "wall_time": 1790491099.2924845}
+{"bytes": 131072, "commit_seconds": 0.864994471, "count": 32, "data_seconds": 0.049703943, "generation": 11, "group": "continuous-06", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 0.375087266, "total_seconds": 0.914711355, "wall_time": 1790491101.1231914}
+{"bytes": 131072, "commit_seconds": 0.8129731, "count": 32, "data_seconds": 0.086960244, "generation": 12, "group": "continuous-07", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 0.430435219, "total_seconds": 0.899955324, "wall_time": 1790491102.9865294}
+{"bytes": 131072, "commit_seconds": 0.984400635, "count": 32, "data_seconds": 0.063308996, "generation": 13, "group": "continuous-08", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 0.467302028, "total_seconds": 1.047724372, "wall_time": 1790491105.0634847}
+{"bytes": 131072, "commit_seconds": 1.371468167, "count": 32, "data_seconds": 0.059148134, "generation": 14, "group": "continuous-09", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 0.534099942, "total_seconds": 1.430623894, "wall_time": 1790491107.5858192}
+{"bytes": 131072, "commit_seconds": 0.929570362, "count": 32, "data_seconds": 0.069323349, "generation": 15, "group": "continuous-10", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 0.569999568, "total_seconds": 0.998906928, "wall_time": 1790491109.7057996}
+{"bytes": 131072, "commit_seconds": 1.362148325, "count": 32, "data_seconds": 0.043341156, "generation": 16, "group": "continuous-11", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 0.635503672, "total_seconds": 1.405504565, "wall_time": 1790491112.2997968}
+{"bytes": 2097152, "commit_seconds": 0.879883773, "count": 64, "data_seconds": 1.342068146, "generation": 17, "group": "mixed", "interface": "rust-library", "kind": "write", "mixed_reads": 12, "mount_seconds": 0.726035092, "total_seconds": 2.221968003, "wall_time": 1790491115.8670845}
+[2026-09-27T06:38:35Z INFO  tape_rs::tape::commands] 弹出磁带...
+[2026-09-27T06:38:35Z INFO  tape_rs::tape::commands] 弹出完成
+[2026-09-27T06:38:35Z INFO  tape_rs::changer::commands] 移动介质: 从 0x0101 到 0x040a
+[2026-09-27T06:38:35Z INFO  tape_rs::changer::commands] 移动完成
+{"interface": "rust-library", "kind": "unload", "barcode": "PF2701L08", "unthread_seconds": 0.027289330027997494, "total_seconds": 0.031064199982210994, "wall_time": 1790491115.9021933}
+[2026-09-27T06:38:35Z INFO  tape_rs::changer::commands] 移动介质: 从 0x040a 到 0x0101
+[2026-09-27T06:38:35Z INFO  tape_rs::changer::commands] 移动完成
+[2026-09-27T06:38:35Z INFO  tape_rs::tape::commands] 装载磁带...
+[2026-09-27T06:38:35Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 1 次）
+[2026-09-27T06:38:35Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 2 次）
+[2026-09-27T06:38:35Z INFO  tape_rs::tape::commands] 装载完成
+{"interface": "rust-library", "kind": "load", "barcode": "PF2701L08", "move_seconds": 0.0035598219837993383, "total_seconds": 0.033162604086101055, "wall_time": 1790491115.9386182}
+{"bytes": 38433024, "count": 3208, "group": "all", "interface": "rust-library", "kind": "read", "label": "first", "mount_seconds": 0.806707961, "seconds": 2.670745247, "verified": true, "wall_time": 1790491122.5290396}
+{"bytes": 38433024, "count": 3208, "group": "all", "interface": "rust-library", "kind": "read", "label": "repeat", "mount_seconds": 0.806707961, "seconds": 2.578132691, "verified": true, "wall_time": 1790491122.529216}
+[2026-09-27T06:38:42Z INFO  tape_rs::tape::commands] 弹出磁带...
+[2026-09-27T06:38:42Z INFO  tape_rs::tape::commands] 弹出完成
+[2026-09-27T06:38:42Z INFO  tape_rs::changer::commands] 移动介质: 从 0x0101 到 0x040a
+[2026-09-27T06:38:42Z INFO  tape_rs::changer::commands] 移动完成
+{"interface": "rust-library", "kind": "unload", "barcode": "PF2701L08", "unthread_seconds": 0.038061438826844096, "total_seconds": 0.04249544790945947, "wall_time": 1790491122.575941}
+[2026-09-27T06:38:42Z INFO  tape_rs::changer::commands] 移动介质: 从 0x040b 到 0x0101
+[2026-09-27T06:38:42Z INFO  tape_rs::changer::commands] 移动完成
+[2026-09-27T06:38:42Z INFO  tape_rs::tape::commands] 装载磁带...
+[2026-09-27T06:38:42Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 1 次）
+[2026-09-27T06:38:42Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 2 次）
+[2026-09-27T06:38:42Z INFO  tape_rs::tape::commands] 装载完成
+{"interface": "rust-library", "kind": "load", "barcode": "PF2702L08", "move_seconds": 0.0034384168684482574, "total_seconds": 0.032379650976508856, "wall_time": 1790491122.6115036}
+{"bytes": 134217728, "commit_seconds": 1.068347093, "count": 1, "data_seconds": 1.5673684460000001, "generation": 2, "group": "switch-volume", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 0.006313352, "total_seconds": 2.635722518, "wall_time": 1790491126.0393143}
+{"bytes": 8388608, "commit_seconds": 1.089595552, "count": 1, "data_seconds": 0.130799437, "generation": 3, "group": "switch-read", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 0.00718461, "total_seconds": 1.220400423, "wall_time": 1790491127.319216}
+[2026-09-27T06:38:47Z INFO  tape_rs::tape::commands] 弹出磁带...
+[2026-09-27T06:38:47Z INFO  tape_rs::tape::commands] 弹出完成
+[2026-09-27T06:38:47Z INFO  tape_rs::changer::commands] 移动介质: 从 0x0101 到 0x040b
+[2026-09-27T06:38:47Z INFO  tape_rs::changer::commands] 移动完成
+{"interface": "rust-library", "kind": "unload", "barcode": "PF2702L08", "unthread_seconds": 0.1263121550437063, "total_seconds": 0.1306224949657917, "wall_time": 1790491127.4532168}
+[2026-09-27T06:38:47Z INFO  tape_rs::changer::commands] 移动介质: 从 0x040b 到 0x0101
+[2026-09-27T06:38:47Z INFO  tape_rs::changer::commands] 移动完成
+[2026-09-27T06:38:47Z INFO  tape_rs::tape::commands] 装载磁带...
+[2026-09-27T06:38:47Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 1 次）
+[2026-09-27T06:38:47Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 2 次）
+[2026-09-27T06:38:47Z INFO  tape_rs::tape::commands] 装载完成
+{"interface": "rust-library", "kind": "load", "barcode": "PF2702L08", "move_seconds": 0.0034690541215240955, "total_seconds": 0.18273716908879578, "wall_time": 1790491127.6394272}
+{"bytes": 142606336, "count": 2, "group": "all", "interface": "rust-library", "kind": "read", "label": "first", "mount_seconds": 0.009616308, "seconds": 1.690137566, "verified": true, "wall_time": 1790491130.95858}
+{"bytes": 142606336, "count": 2, "group": "all", "interface": "rust-library", "kind": "read", "label": "repeat", "mount_seconds": 0.009616308, "seconds": 1.615758337, "verified": true, "wall_time": 1790491130.9587724}
+[2026-09-27T06:38:50Z INFO  tape_rs::tape::commands] 弹出磁带...
+[2026-09-27T06:38:51Z INFO  tape_rs::tape::commands] 弹出完成
+[2026-09-27T06:38:51Z INFO  tape_rs::changer::commands] 移动介质: 从 0x0101 到 0x040b
+[2026-09-27T06:38:51Z INFO  tape_rs::changer::commands] 移动完成
+{"interface": "rust-library", "kind": "unload", "barcode": "PF2702L08", "unthread_seconds": 0.062241826904937625, "total_seconds": 0.06646036682650447, "wall_time": 1790491131.029087}
+[2026-09-27T06:38:51Z INFO  tape_rs::changer::commands] 移动介质: 从 0x040a 到 0x0101
+[2026-09-27T06:38:51Z INFO  tape_rs::changer::commands] 移动完成
+[2026-09-27T06:38:51Z INFO  tape_rs::tape::commands] 装载磁带...
+[2026-09-27T06:38:51Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 1 次）
+[2026-09-27T06:38:51Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 2 次）
+[2026-09-27T06:38:51Z INFO  tape_rs::tape::commands] 装载完成
+{"interface": "rust-library", "kind": "load", "barcode": "PF2701L08", "move_seconds": 0.003233647905290127, "total_seconds": 0.03335024300031364, "wall_time": 1790491131.0655377}
+{"bytes": 8388608, "count": 1, "group": "all", "interface": "rust-library", "kind": "read", "label": "first", "mount_seconds": 0.721584929, "seconds": 0.097911052, "verified": true, "wall_time": 1790491132.432506}
+{"interface": "rust-library", "kind": "cross-tape-first-read", "cycle": 0, "barcode": "PF2701L08", "bytes": 8388608, "seconds": 1.4738630398642272, "wall_time": 1790491132.4326868}
+[2026-09-27T06:38:52Z INFO  tape_rs::tape::commands] 弹出磁带...
+[2026-09-27T06:38:52Z INFO  tape_rs::tape::commands] 弹出完成
+[2026-09-27T06:38:52Z INFO  tape_rs::changer::commands] 移动介质: 从 0x0101 到 0x040a
+[2026-09-27T06:38:52Z INFO  tape_rs::changer::commands] 移动完成
+{"interface": "rust-library", "kind": "unload", "barcode": "PF2701L08", "unthread_seconds": 0.055027169175446033, "total_seconds": 0.05886979098431766, "wall_time": 1790491132.4951246}
+[2026-09-27T06:38:52Z INFO  tape_rs::changer::commands] 移动介质: 从 0x040b 到 0x0101
+[2026-09-27T06:38:52Z INFO  tape_rs::changer::commands] 移动完成
+[2026-09-27T06:38:52Z INFO  tape_rs::tape::commands] 装载磁带...
+[2026-09-27T06:38:52Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 1 次）
+[2026-09-27T06:38:52Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 2 次）
+[2026-09-27T06:38:52Z INFO  tape_rs::tape::commands] 装载完成
+{"interface": "rust-library", "kind": "load", "barcode": "PF2702L08", "move_seconds": 0.0036952428054064512, "total_seconds": 0.03317474294453859, "wall_time": 1790491132.5314212}
+{"bytes": 8388608, "count": 1, "group": "all", "interface": "rust-library", "kind": "read", "label": "first", "mount_seconds": 0.010392911, "seconds": 0.097847949, "verified": true, "wall_time": 1790491132.6428418}
+{"interface": "rust-library", "kind": "cross-tape-first-read", "cycle": 1, "barcode": "PF2702L08", "bytes": 8388608, "seconds": 0.21027132403105497, "wall_time": 1790491132.6430013}
+[2026-09-27T06:38:52Z INFO  tape_rs::tape::commands] 弹出磁带...
+[2026-09-27T06:38:52Z INFO  tape_rs::tape::commands] 弹出完成
+[2026-09-27T06:38:52Z INFO  tape_rs::changer::commands] 移动介质: 从 0x0101 到 0x040b
+[2026-09-27T06:38:52Z INFO  tape_rs::changer::commands] 移动完成
+{"interface": "rust-library", "kind": "unload", "barcode": "PF2702L08", "unthread_seconds": 0.02842643205076456, "total_seconds": 0.03189180395565927, "wall_time": 1790491132.6781378}
+[2026-09-27T06:38:52Z INFO  tape_rs::changer::commands] 移动介质: 从 0x040a 到 0x0101
+[2026-09-27T06:38:52Z INFO  tape_rs::changer::commands] 移动完成
+[2026-09-27T06:38:52Z INFO  tape_rs::tape::commands] 装载磁带...
+[2026-09-27T06:38:52Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 1 次）
+[2026-09-27T06:38:52Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 2 次）
+[2026-09-27T06:38:52Z INFO  tape_rs::tape::commands] 装载完成
+{"interface": "rust-library", "kind": "load", "barcode": "PF2701L08", "move_seconds": 0.0031679999083280563, "total_seconds": 0.03348622494377196, "wall_time": 1790491132.7145305}
+{"bytes": 8388608, "count": 1, "group": "all", "interface": "rust-library", "kind": "read", "label": "first", "mount_seconds": 0.722915801, "seconds": 0.096637301, "verified": true, "wall_time": 1790491134.0821397}
+{"interface": "rust-library", "kind": "cross-tape-first-read", "cycle": 2, "barcode": "PF2701L08", "bytes": 8388608, "seconds": 1.4392578639090061, "wall_time": 1790491134.082301}
+[2026-09-27T06:38:54Z INFO  tape_rs::tape::commands] 弹出磁带...
+[2026-09-27T06:38:54Z INFO  tape_rs::tape::commands] 弹出完成
+[2026-09-27T06:38:54Z INFO  tape_rs::changer::commands] 移动介质: 从 0x0101 到 0x040a
+[2026-09-27T06:38:54Z INFO  tape_rs::changer::commands] 移动完成
+{"interface": "rust-library", "kind": "unload", "barcode": "PF2701L08", "unthread_seconds": 0.03836871893145144, "total_seconds": 0.041893244022503495, "wall_time": 1790491134.127552}
+[2026-09-27T06:38:54Z INFO  tape_rs::changer::commands] 移动介质: 从 0x040b 到 0x0101
+[2026-09-27T06:38:54Z INFO  tape_rs::changer::commands] 移动完成
+[2026-09-27T06:38:54Z INFO  tape_rs::tape::commands] 装载磁带...
+[2026-09-27T06:38:54Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 1 次）
+[2026-09-27T06:38:54Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 2 次）
+[2026-09-27T06:38:54Z INFO  tape_rs::tape::commands] 装载完成
+{"interface": "rust-library", "kind": "load", "barcode": "PF2702L08", "move_seconds": 0.0030731940641999245, "total_seconds": 0.0337461419403553, "wall_time": 1790491134.1641545}
+{"bytes": 8388608, "count": 1, "group": "all", "interface": "rust-library", "kind": "read", "label": "first", "mount_seconds": 0.009711829, "seconds": 0.095079129, "verified": true, "wall_time": 1790491134.272034}
+{"interface": "rust-library", "kind": "cross-tape-first-read", "cycle": 3, "barcode": "PF2702L08", "bytes": 8388608, "seconds": 0.1898527939338237, "wall_time": 1790491134.272196}
+[2026-09-27T06:38:54Z INFO  tape_rs::tape::commands] 弹出磁带...
+[2026-09-27T06:38:54Z INFO  tape_rs::tape::commands] 弹出完成
+[2026-09-27T06:38:54Z INFO  tape_rs::changer::commands] 移动介质: 从 0x0101 到 0x040b
+[2026-09-27T06:38:54Z INFO  tape_rs::changer::commands] 移动完成
+{"interface": "rust-library", "kind": "unload", "barcode": "PF2702L08", "unthread_seconds": 0.07371704000979662, "total_seconds": 0.07741177617572248, "wall_time": 1790491134.3528206}
+[2026-09-27T06:38:54Z INFO  tape_rs::changer::commands] 移动介质: 从 0x040a 到 0x0101
+[2026-09-27T06:38:54Z INFO  tape_rs::changer::commands] 移动完成
+[2026-09-27T06:38:54Z INFO  tape_rs::tape::commands] 装载磁带...
+[2026-09-27T06:38:54Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 1 次）
+[2026-09-27T06:38:54Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 2 次）
+[2026-09-27T06:38:54Z INFO  tape_rs::tape::commands] 装载完成
+{"interface": "rust-library", "kind": "load", "barcode": "PF2701L08", "move_seconds": 0.003298870986327529, "total_seconds": 0.06054515088908374, "wall_time": 1790491134.4167757}
+{"bytes": 8388608, "count": 1, "group": "all", "interface": "rust-library", "kind": "read", "label": "first", "mount_seconds": 0.721302675, "seconds": 0.094759714, "verified": true, "wall_time": 1790491135.7742946}
+{"interface": "rust-library", "kind": "cross-tape-first-read", "cycle": 4, "barcode": "PF2701L08", "bytes": 8388608, "seconds": 1.5022417861036956, "wall_time": 1790491135.77448}
+[2026-09-27T06:38:55Z INFO  tape_rs::tape::commands] 弹出磁带...
+[2026-09-27T06:38:55Z INFO  tape_rs::tape::commands] 弹出完成
+[2026-09-27T06:38:55Z INFO  tape_rs::changer::commands] 移动介质: 从 0x0101 到 0x040a
+[2026-09-27T06:38:55Z INFO  tape_rs::changer::commands] 移动完成
+{"interface": "rust-library", "kind": "unload", "barcode": "PF2701L08", "unthread_seconds": 0.028657108079642057, "total_seconds": 0.032281497959047556, "wall_time": 1790491135.8105848}
+[2026-09-27T06:38:55Z INFO  tape_rs::changer::commands] 移动介质: 从 0x040b 到 0x0101
+[2026-09-27T06:38:55Z INFO  tape_rs::changer::commands] 移动完成
+[2026-09-27T06:38:55Z INFO  tape_rs::tape::commands] 装载磁带...
+[2026-09-27T06:38:55Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 1 次）
+[2026-09-27T06:38:55Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 2 次）
+[2026-09-27T06:38:55Z INFO  tape_rs::tape::commands] 装载完成
+{"interface": "rust-library", "kind": "load", "barcode": "PF2702L08", "move_seconds": 0.0034492730628699064, "total_seconds": 0.03346231603063643, "wall_time": 1790491135.847052}
+{"bytes": 8388608, "count": 1, "group": "all", "interface": "rust-library", "kind": "read", "label": "first", "mount_seconds": 0.009114606, "seconds": 0.093711572, "verified": true, "wall_time": 1790491135.9529884}
+{"interface": "rust-library", "kind": "cross-tape-first-read", "cycle": 5, "barcode": "PF2702L08", "bytes": 8388608, "seconds": 0.17860642704181373, "wall_time": 1790491135.9531398}
+[2026-09-27T06:38:55Z INFO  tape_rs::tape::commands] 弹出磁带...
+[2026-09-27T06:38:56Z INFO  tape_rs::tape::commands] 弹出完成
+[2026-09-27T06:38:56Z INFO  tape_rs::changer::commands] 移动介质: 从 0x0101 到 0x040b
+[2026-09-27T06:38:56Z INFO  tape_rs::changer::commands] 移动完成
+{"interface": "rust-library", "kind": "unload", "barcode": "PF2702L08", "unthread_seconds": 0.07548533100634813, "total_seconds": 0.07928788498975337, "wall_time": 1790491136.035848}
+{"kind": "complete", "passed": true, "wall_time": 1790491136.0359926}

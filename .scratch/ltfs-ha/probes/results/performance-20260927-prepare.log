@@ -1,0 +1,16 @@
+Traceback (most recent call last):
+  File "/home/rocky/tape-rs-performance-20260927/performance-20260927.py", line 43, in <module>
+    batch('large',4,8*2**20,1);batch('small',256,4096)
+  File "/home/rocky/tape-rs-performance-20260927/performance-20260927.py", line 30, in batch
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:lat=list(pool.map(wait,rows))
+  File "/usr/lib64/python3.9/concurrent/futures/_base.py", line 609, in result_iterator
+    yield fs.pop().result()
+  File "/usr/lib64/python3.9/concurrent/futures/_base.py", line 446, in result
+    return self.__get_result()
+  File "/usr/lib64/python3.9/concurrent/futures/_base.py", line 391, in __get_result
+    raise self._exception
+  File "/usr/lib64/python3.9/concurrent/futures/thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+  File "/home/rocky/tape-rs-performance-20260927/performance-20260927.py", line 28, in wait
+    code,v=req('GET',f"/tasks/{row['task']}?wait=1");assert code==201 and v['status']=='committed',v
+AssertionError: {'generation': 55, 'status': 'committed', 'task': 3}

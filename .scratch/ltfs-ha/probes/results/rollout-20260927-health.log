@@ -1,0 +1,11 @@
+Node ID  State      Node IP     Drives  Ctrl Node    Library   Node Group  Host Name         
+1        available  10.10.2.71       1  yes(active)  LISA4300  G0          ee1-cluster.ee.lab
+2        available  10.10.2.72       1  no           LISA4300  G0          ee2-cluster.ee.lab
+3        available  10.10.2.74       1  no           LISA4300  G0          ee3-cluster.ee.lab
+No active task found.
+EE f3 unchanged
+
+nine Holo publications ready
+
+client hashes verified; FUSE unmounted/cache empty
+

@@ -1,0 +1,22 @@
+   Compiling tape-rs v0.1.0 (/work/jay/tape-rs-ltfs-recovery-ibm-interop)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.76s
+     Running tests/ltfsd_cluster.rs (/work/cargo-target/debug/deps/ltfsd_cluster-fef60eb6cf3447a6)
+
+running 1 test
+test cached_read_tape_cannot_serve_after_preemption ... FAILED
+
+failures:
+
+---- cached_read_tape_cannot_serve_after_preemption stdout ----
+
+thread 'cached_read_tape_cannot_serve_after_preemption' (3631959) panicked at tests/ltfsd_cluster.rs:1933:38:
+called `Result::unwrap()` on an `Err` value: Rejected { status: 500, body: "{\"detail\":\"PA0001L8 不在库里的存储槽位中\",\"error\":\"read_failed\"}\n" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    cached_read_tape_cannot_serve_after_preemption
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 48 filtered out; finished in 21.13s
+
+error: test failed, to rerun pass `--test ltfsd_cluster`

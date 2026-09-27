@@ -1,0 +1,14 @@
+Tape PF2701L08 has been successfully unassigned.
+Tape PF2702L08 has been successfully unassigned.
+Dedicated comparison cartridges unmounted and unassigned
+
+pf2701l08 archived, final LE data retained
+pf2702l08 archived, final LE data retained
+
+Node ID  State      Node IP     Drives  Ctrl Node    Library   Node Group  Host Name         
+1        available  10.10.2.71       1  yes(active)  LISA4300  G0          ee1-cluster.ee.lab
+2        available  10.10.2.72       1  no           LISA4300  G0          ee2-cluster.ee.lab
+3        available  10.10.2.74       1  no           LISA4300  G0          ee3-cluster.ee.lab
+No active task found.
+Original EE f3 SHA256 unchanged
+

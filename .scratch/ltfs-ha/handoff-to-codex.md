@@ -500,3 +500,11 @@ Holo隔离目录 /home/rocky/tape-rs-namespace-20260927，ltfsd SHA256 104099542
 ## 2026-09-27 新剩余队列第3项完成
 
 见metadata-20260927.md：原生readonly/atime/mtime、固定挂载所有权；FUSE/Client/HTTP贯通，LE双向回写及接管冷FUSE通过。全套221通过7忽略，新增边界1项通过；严格Clippy/fmt/check通过。最新关闭metadata/test-data，node2 round295、1143行，SR1 Full52/SR2 Full3槽8/9；LE SR2501L08Full52未分配。介质备份holo-metadata-20260927。正式恢复node1 term53/round459，原53行及9文件一致，正式未升级。下一项4：性能基线与按证据优化，然后第5项正式发布。
+
+## 2026-09-27 性能修复与新增LE对照任务
+
+详见performance-20260927.md；代码af6bfad，226项通过7忽略，严格Clippy/fmt/check通过。范围查询、旧根回收、只读卷索引复用及接管识别已装载读带修复，3273文件两轮冷挂/接管验证通过。最新关闭performance/test-data 6993行，SR1Full94/SR2Full18归槽8/9；正式旧版已恢复node1term54round464，53行及9文件不变。用户新增LE与直接Rust库性能/换带对照，先完成再执行正式升级；rollout候选已备份暂存未启用。新PF2701L08/PF2702L08槽1034/1035；LE空白格式化失败并已归槽，尚无对照数据。不得覆盖原LE两带。
+
+## 2026-09-27 性能对照与正式升级完成
+
+剩余队列1–5完成。LE/直接库各两轮3210文件全量SHA和每轮6次换带通过，见performance-compare-20260927.md。更正：LE普通sync只保证DP索引，不能直接称与Rust双分区commit同等Full终点；SCSI建议尚未实施、未采命令轨迹。PF两卷已归槽/unassign，LE末态保留。正式af6bfad部署至tape-rs-rollout-20260927，node1 term56/round499，58行三节点一致；新8MiB促使切至TS1000 Full13，原9文件及元数据冷挂/接管通过，详见rollout-20260927.md。FUSE卸载缓存空，隔离performance/test-data是唯一最新关闭数据。物理验收暂缓，无push。

@@ -4,11 +4,19 @@ Last updated: 2026-09-27. Branch: `ltfs-recovery-ibm-interop`. Active worktree: 
 
 Next authorized queue: [remaining implementation](../.scratch/ltfs-ha/remaining-implementation.md), in order: documentation, intermittent directory outcome, LE metadata semantics, performance, formal rollout. The prior 0–5 queue is complete.
 
+## Current completed queue (2026-09-27; supersedes historical state below)
+
+Items 1–5 complete. Formal source **af6bfad** is deployed on .71/.72/.74; .73 has matching FUSE/client. Active deployment `/home/rocky/tape-rs-rollout-20260927`, original data `/home/rocky/ltfsd-data`, ports7400/7401, original startup script now points at this deployment. [Rollout report](../.scratch/ltfs-ha/rollout-20260927.md) records hashes/backups. Final node1 term56/round499;58 identical catalog rows;TS1000L08 Full13 active,TS1001L08 Full120 preserved. Original9 files plus new8MiB/metadata passed fresh-cache and takeover verification. FUSE unmounted/cache empty. No GitHub push.
+
+[HA performance evidence](../.scratch/ltfs-ha/performance-20260927.md):226 tests pass,7 ignored;fmt/check/strictClippy pass. Latest closed isolated data `/home/rocky/tape-rs-performance-20260927/test-data`,6993rows,node3 round436,SR1 Full94/SR2 Full18 in slots8/9;never resume older datasets. Backups `/home/rocky/holo-performance-20260927`.
+
+[LE/direct Rust comparison](../.scratch/ltfs-ha/performance-compare-20260927.md):two runs each,3210files/allSHA plus6swaps per run,on .72 IBMlisa42299. PF2701L08/PF2702L08 slots1034/1035,unmounted/unassigned,finalLEdata retained;empty/native/LE backups `/home/rocky/holo-performance-compare-20260927`. LE normal sync is DP index persistence; Rust commit updates both DP/IP, so earlier “both Full commits” wording was incorrect. No command trace yet; proposed SCSI optimizations are not implemented. EE three nodes available/no tasks/f3 intact,nine publications ready. Preserve original LE SR2501L08/TS1000L8. Physical acceptance deferred.
+
 ## Working agreement
 
 The user requested unattended work on 2026-09-27: proceed through defined tasks, choose and record recommended decisions, and verify each completed task in the actual environment. The available environment is Holo-VTL plus IBM EE/LE; physical tape firmware remains unverified. A failed or unavailable lab check keeps that task incomplete. Preserve the separate formal and isolated pools, and recheck current state before device actions.
 
-## Current implementation and deployment
+## Historical implementation and deployment (superseded above)
 
 The branch contains LTFS full/incremental indexes, recovery/checkpoint behavior, Raft service, client and FUSE operations (directories, rename, xattrs, symlink read/create), and symlink-preserving reclaim. Production source used for this deployment is `cda359d`; later documentation/evidence commits do not rebuild the executable.
 
@@ -27,7 +35,7 @@ Earlier report: [interruption after completed mkltfs](../.scratch/ltfs-ha/holo-r
 
 The reclaim fix routes symlinks through metadata migration rather than reading their targets. Prior two-cartridge Holo reclaim and source-format validation is in [the isolated report](../.scratch/ltfs-ha/holo-symlink-reclaim-20260925.md). Original media were not reformatted or reclaimed by this queue. The separate reclaimed-media LE roundtrip is now verified below.
 
-## Isolated media and next task
+## Historical isolated media and queue (superseded above)
 
 Preserve pool UUID `51cfd06c-bf79-4bbf-ac85-886608a0ab4b` (`sr`) and its two 512MiB cartridges. Latest **closed isolated data** is `/home/rocky/tape-rs-metadata-20260927/test-data` on .71/.72/.74, ports 7500/7501, node2/round295 at shutdown, 1143 rows. Do not resume either older symlink-reclaim or reclaim-cut directory: media have moved forward.
 
