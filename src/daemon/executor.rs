@@ -21,8 +21,8 @@ use crate::error::{Result, TapeError};
 use crate::ltfs::mkltfs::{MkltfsOptions, mkltfs};
 use crate::ltfs::recovery::TailKind;
 use crate::ltfs::volume::{
-    FormatProbe, LtfsVolume, TailPolicy, XATTR_DELETED_PATH, XATTR_POOL_NAME, XATTR_POOL_UUID,
-    XATTR_VERSION, is_tombstone_path, probe_format, tombstone_path,
+    FormatProbe, LtfsVolume, ReadView, TailPolicy, XATTR_DELETED_PATH, XATTR_POOL_NAME,
+    XATTR_POOL_UUID, XATTR_VERSION, is_tombstone_path, probe_format, tombstone_path,
 };
 use crate::scsi::device::ScsiDevice;
 use crate::scsi::inquiry::{enumerate_sg_nodes, read_unit_serial};
@@ -232,7 +232,7 @@ struct Active {
     /// 正在服务的驱动器在 `devices` 里的下标
     drive: Option<usize>,
     /// 为读请求装载的带：驱动器下标、条码、最近一次使用
-    read: Option<(usize, String, Instant)>,
+    read: Option<(usize, String, Instant, Option<ReadView>)>,
     /// 本轮已写下的文件数，同时是版本号里的序号
     seq: u64,
     reclaim: Option<Reclaim>,
@@ -820,6 +820,10 @@ fn ensure_write_tape(
             }
         };
         let di = inv.drives[slot].dev;
+        // 驱动器转为写入用途，旧的只读索引及空闲卸带计时都不再适用。
+        if a.read.as_ref().is_some_and(|(i, ..)| *i == di) {
+            a.read = None;
+        }
         match open_candidate(a, opts, files, tx, c, di)? {
             Ok(mut summary) => {
                 a.drive = Some(di);
@@ -1419,29 +1423,43 @@ fn read_any_inner<W: Write>(
             .map_err(|e| ReadError::device(e, "读取文件失败"));
     }
     // 2. 就在读带上
-    if let Some((i, b, _)) = &a.read
+    if let Some((i, b, last, view)) = &mut a.read
         && *b == barcode
     {
-        let i = *i;
-        let out = read_file(a.devices[i].dev.as_ref(), path, out)
-            .map_err(|e| ReadError::device(e, "读取文件失败"))?;
-        a.read = Some((i, barcode, Instant::now()));
-        return Ok(out);
+        let dev = a.devices[*i].dev.as_ref();
+        // 只读卷未换带、未写入且仍持有预留时，复用首次装载验证的索引。
+        // 失权不能继续使用旧视图；任何读取失败也会清除缓存。
+        let result = reservation::verify_holder(dev, a.key).and_then(|_| match view {
+            Some(view) => view.read_file_to_writer(dev, path.trim_start_matches('/'), out),
+            None => read_file(dev, path, out),
+        });
+        if result.is_err() {
+            *view = None;
+        }
+        *last = Instant::now();
+        return result.map_err(|e| ReadError::device(e, "读取文件失败"));
     }
     // 3. 要装载。先找驱动器
     let inv = inventory(&a.devices).map_err(|e| ReadError::device(e, "读取库存失败"))?;
-    let Some(&from) = inv.slots.get(&barcode) else {
-        return Err(Failed(format!("{} 不在库里的存储槽位中", barcode)));
-    };
     let write_dev = a.drive;
-    let mut target: Option<usize> = None;
+    // 接管后进程内读带状态为空，介质却可能仍在第二驱动器里。
+    let already_loaded = inv
+        .drives
+        .iter()
+        .find(|d| Some(d.dev) != write_dev && d.loaded.as_ref().is_some_and(|(b, _)| b == &barcode))
+        .map(|d| d.dev);
+    let from = inv.slots.get(&barcode).copied();
+    if already_loaded.is_none() && from.is_none() {
+        return Err(Failed(format!("{} 不在库里的存储槽位或驱动器中", barcode)));
+    }
+    let mut target = already_loaded;
     // 3a. 之前的读带占着一个驱动器：卸回去
-    if let Some((i, b, _)) = a.read.take()
+    if let Some((i, b, ..)) = a.read.take()
         && let Some(d) = inv.drives.iter().find(|d| d.dev == i)
     {
         unload_drive(&a.devices, &inv, d)
             .map_err(|e| ReadError::device(e, &format!("卸下读带 {} 失败", b)))?;
-        target = Some(i);
+        target.get_or_insert(i);
     }
     let inv = inventory(&a.devices).map_err(|e| ReadError::device(e, "读取库存失败"))?;
     if target.is_none() {
@@ -1500,9 +1518,16 @@ fn read_any_inner<W: Write>(
         .map(|d| d.addr)
         .ok_or_else(|| Failed("驱动器不在库存里".to_string()))?;
     info!("执行线程: 为读取装载 {} -> {}", barcode, a.devices[i].name);
-    let loaded = move_medium(&a.devices, from, addr)
+    let moved = if already_loaded == Some(i) {
+        Ok(())
+    } else {
+        let from = from.ok_or_else(|| Failed(format!("{} 不在存储槽位中", barcode)))?;
+        move_medium(&a.devices, from, addr)
+    };
+    let loaded = moved
         .and_then(|_| wait_ready(a.devices[i].dev.as_ref()))
         .and_then(|_| LtfsVolume::mount(a.devices[i].dev.as_ref()));
+    let mut read_view = None;
     let result = match loaded {
         Ok(vol) => {
             // 装载了就对账：目录若落后于磁带，以磁带为准
@@ -1528,8 +1553,13 @@ fn read_any_inner<W: Write>(
                 });
             }
             let p = path.trim_start_matches('/');
-            vol.read_file_to_writer(p, out)
-                .map_err(|e| ReadError::device(e, "读取文件失败"))
+            let result = vol
+                .read_file_to_writer(p, out)
+                .map_err(|e| ReadError::device(e, "读取文件失败"));
+            if result.is_ok() && !swapped_write {
+                read_view = Some(vol.read_view());
+            }
+            result
         }
         Err(e) => Err(ReadError::device(e, &format!("装载 {} 读取失败", barcode))),
     };
@@ -1553,7 +1583,7 @@ fn read_any_inner<W: Write>(
             Err(e) => return Err(ReadError::device(e, "读取后恢复写入带失败")),
         }
     } else {
-        a.read = Some((i, barcode, Instant::now()));
+        a.read = Some((i, barcode, Instant::now(), read_view));
     }
     result
 }
@@ -1750,6 +1780,10 @@ fn load_aside(a: &mut Active, barcode: &str) -> Result<usize> {
             return if Some(d.dev) == a.drive {
                 Err(TapeError::NotReady(format!("{} 还在写入驱动器里", barcode)))
             } else {
+                // 回收接管该驱动器，不能保留读取阶段的索引视图或空闲卸带计时。
+                if a.read.as_ref().is_some_and(|(i, ..)| *i == d.dev) {
+                    a.read = None;
+                }
                 Ok(d.dev)
             };
         }
@@ -1758,7 +1792,7 @@ fn load_aside(a: &mut Active, barcode: &str) -> Result<usize> {
             .iter()
             .any(|d| d.loaded.is_none() && Some(d.dev) != a.drive);
         if !free
-            && let Some((i, b, _)) = a.read.take()
+            && let Some((i, b, ..)) = a.read.take()
             && let Some(d) = inv.drives.iter().find(|d| d.dev == i)
         {
             unload_drive(&a.devices, &inv, d)?;
@@ -2221,7 +2255,9 @@ fn abort_reclaim(a: &mut Active, tx: &Sender<ExecEvent>, reason: &str, needs_att
 
 /// 读带空闲太久：卸回槽位，把驱动器腾出来。
 fn unload_idle_read_tape(a: &mut Active, opts: &ExecOptions) {
-    let Some((i, b, last)) = &a.read else { return };
+    let Some((i, b, last, _)) = &a.read else {
+        return;
+    };
     if last.elapsed() < opts.read_idle {
         return;
     }

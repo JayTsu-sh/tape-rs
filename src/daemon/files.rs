@@ -572,7 +572,13 @@ impl FileService {
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // VolumeState 延后销毁旧根；服务操作之间清理，避免整个服务轮次积累历史快照。
+        // reclaim 只释放没有读者的根，持有 Arc 的并发读者仍看到原来的完整状态。
+        if let Some(s) = &g.serving {
+            s.state.reclaim();
+        }
+        g
     }
 
     fn kick(&self) {
@@ -1812,6 +1818,16 @@ impl FileService {
     }
 
     fn list_nodes(&self) -> Result<BTreeMap<String, NodeSummary>, ServiceError> {
+        self.list_nodes_scoped(None)
+    }
+
+    fn list_nodes_scoped(
+        &self,
+        dir: Option<&str>,
+    ) -> Result<BTreeMap<String, NodeSummary>, ServiceError> {
+        let prefix = dir.map(|d| format!("{d}/"));
+        let in_scope =
+            |p: &str| dir.is_none_or(|d| p == d || p.starts_with(prefix.as_deref().unwrap()));
         let (pool, mut out, gone) = {
             let g = self.lock();
             match (&g.serving, &g.read_only) {
@@ -1819,13 +1835,13 @@ impl FileService {
                     s.tape.pool_uuid.clone(),
                     s.recent
                         .iter()
-                        .filter(|(_, st)| !st.deleted)
+                        .filter(|(p, st)| !st.deleted && in_scope(p))
                         .map(|(p, st)| (p.clone(), NodeSummary::new(st.len, &st.metadata)))
                         .collect::<BTreeMap<_, _>>(),
                     // 本轮删掉的路径盖住目录库里可能还没换成墓碑的旧行
                     s.recent
                         .iter()
-                        .filter(|(_, st)| st.deleted)
+                        .filter(|(p, st)| st.deleted && in_scope(p))
                         .map(|(p, _)| p.clone())
                         .collect::<std::collections::HashSet<_>>(),
                 ),
@@ -1834,7 +1850,7 @@ impl FileService {
             }
         };
         let rows = if self.directory_path.is_some() {
-            self.with_reader(|d| Some(d.list_nodes(&pool)))
+            self.with_reader(|d| Some(d.list_nodes_scoped(&pool, dir)))
                 .ok_or_else(|| ServiceError::Io("无法读取命名空间目录".into()))?
                 .map_err(|e| ServiceError::Io(e.to_string()))?
         } else {
@@ -1922,8 +1938,8 @@ impl FileService {
                 },
             }
         }
-        // TODO（目录库）：按前缀查询，而不是取全量再过滤
-        let nodes = self.list_nodes()?;
+        let nodes =
+            self.list_nodes_scoped((prefix != "/").then(|| prefix.trim_end_matches('/')))?;
         let own = nodes.get(prefix.trim_end_matches('/'));
         if own.is_some_and(|n| !n.is_dir) {
             return Err(ServiceError::NotDirectory(dir.into()));
@@ -1944,7 +1960,7 @@ impl FileService {
                     .load()
                     .pending
                     .iter()
-                    .filter(|(p, _)| !s.namespace_pending.contains(*p))
+                    .filter(|(p, _)| p.starts_with(&prefix) && !s.namespace_pending.contains(*p))
                     .map(|(p, e)| (p.clone(), (in_flight_of(e), e.staged_len)))
                     .collect(),
                 None => Vec::new(),
@@ -1969,5 +1985,50 @@ impl FileService {
     /// 当前服务的磁带。
     pub fn tape(&self) -> Option<TapeIdent> {
         self.lock().serving.as_ref().map(|s| s.tape.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_reclaims_old_roots_without_invalidating_readers() {
+        let dir =
+            std::env::temp_dir().join(format!("file-service-reclaim-{}", uuid::Uuid::new_v4()));
+        let files = FileService::new(dir.clone()).unwrap();
+        let index = LtfsIndex::empty(uuid::Uuid::new_v4(), "test".into(), 'b');
+        files.open(
+            1,
+            TapeIdent {
+                barcode: "TEST".into(),
+                pool_uuid: "pool".into(),
+            },
+            TapeLimits {
+                file_limit: 1000,
+                usable_capacity: 1024,
+            },
+            &index,
+            1024,
+            true,
+        );
+        let state = files.lock().serving.as_ref().unwrap().state.clone();
+        let reader = state.load();
+        for i in 0..100 {
+            let handle = files.begin(&format!("/file-{i}"), 1).unwrap();
+            files.ingest(&handle, 1).unwrap();
+            files.abort(handle);
+        }
+        // 下一次服务操作回收无人引用的历史状态，但保留尚在读取的旧根。
+        files.tape();
+        assert_eq!(state.retired_count(), 1);
+        assert!(reader.pending.is_empty());
+        assert!(reader.capability.writable);
+        assert!(state.load().pending.is_empty());
+        drop(reader);
+        files.tape();
+        assert_eq!(state.retired_count(), 0);
+        files.close("test complete");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

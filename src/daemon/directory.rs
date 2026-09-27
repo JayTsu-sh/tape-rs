@@ -528,9 +528,30 @@ impl Directory {
         &self,
         pool_uuid: &str,
     ) -> Result<Vec<(String, super::files::NodeSummary)>> {
-        let mut stmt = self.db.prepare("SELECT path, metadata, length FROM files WHERE pool_uuid = ?1 AND deleted = 0 ORDER BY path").map_err(db_err)?;
+        self.list_nodes_scoped(pool_uuid, None)
+    }
+
+    /// `dir` 是规范化的目录路径；同时查询自身以区分空目录、文件和不存在的路径。
+    pub(crate) fn list_nodes_scoped(
+        &self,
+        pool_uuid: &str,
+        dir: Option<&str>,
+    ) -> Result<Vec<(String, super::files::NodeSummary)>> {
+        let mut values = vec![pool_uuid.to_owned()];
+        let sql = if let Some(dir) = dir {
+            // BINARY 排序下 '/' 的后继是 '0'；不用 LIKE，避免 %、_ 被解释为通配符。
+            // 两个分支分别使用 (pool_uuid, path) 主键的等值和范围查找。
+            values.extend([dir.to_owned(), format!("{dir}/"), format!("{dir}0")]);
+            "SELECT path, metadata, length FROM files WHERE pool_uuid = ?1 AND path = ?2 AND deleted = 0
+             UNION ALL
+             SELECT path, metadata, length FROM files WHERE pool_uuid = ?1 AND path >= ?3 AND path < ?4 AND deleted = 0
+             ORDER BY path"
+        } else {
+            "SELECT path, metadata, length FROM files WHERE pool_uuid = ?1 AND deleted = 0 ORDER BY path"
+        };
+        let mut stmt = self.db.prepare(sql).map_err(db_err)?;
         let rows = stmt
-            .query_map(params![pool_uuid], |r| {
+            .query_map(rusqlite::params_from_iter(values), |r| {
                 let metadata: serde_json::Value = serde_json::from_str(&r.get::<_, String>(1)?)
                     .map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
@@ -588,6 +609,43 @@ impl Directory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_nodes_preserve_boundaries_and_skip_unrelated_metadata() {
+        let d = Directory::open(Path::new(":memory:")).unwrap();
+        for path in [
+            "/a",
+            "/a/child",
+            "/a/nested/文件",
+            "/ab/child",
+            "/a%_/child",
+            "/aXX/child",
+            "/目录/child",
+            "/目录外/child",
+        ] {
+            d.db.execute("INSERT INTO files(pool_uuid,path,barcode,generation,length,sha256,metadata) VALUES('p',?1,'T',1,0,'','null')", [path]).unwrap();
+        }
+        d.db.execute_batch("INSERT INTO files(pool_uuid,path,barcode,generation,length,sha256,metadata,deleted) VALUES
+            ('p','/a/gone','T',1,0,'','invalid',1),
+            ('other','/a/other-pool','T',1,0,'','invalid',0),
+            ('p','/unrelated','T',1,0,'','invalid',0);").unwrap();
+        for (dir, expected) in [
+            ("/a", vec!["/a", "/a/child", "/a/nested/文件"]),
+            ("/a%_", vec!["/a%_/child"]),
+            ("/目录", vec!["/目录/child"]),
+            ("/missing", vec![]),
+        ] {
+            let paths: Vec<_> = d
+                .list_nodes_scoped("p", Some(dir))
+                .unwrap()
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect();
+            assert_eq!(paths, expected);
+        }
+        // 全池接口仍读取全部记录；范围查询不应解析无关目录的 metadata。
+        assert!(d.list_nodes("p").is_err());
+    }
 
     fn script() -> Vec<Command> {
         vec![

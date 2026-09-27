@@ -1901,6 +1901,42 @@ fn reading_from_another_tape_with_a_single_drive_swaps_and_swaps_back() {
 
 /// 有两个驱动器：读带装进第二个驱动器并留在那里，再次读不用重新装载；空闲后卸回槽位。
 #[test]
+fn cached_read_tape_cannot_serve_after_preemption() {
+    use tape_rs::scsi::reservation::{ReservationKey, fence};
+    let lib = SimLibrary::new(2, 6, 1);
+    for (i, b) in ["PA0001L8", "PA0002L8"].iter().enumerate() {
+        lib.insert_cartridge(SimCartridge::blank(b, 64 << 20), i)
+            .unwrap();
+    }
+    let c = Cluster::start_lib(
+        "cached-read-preempt",
+        false,
+        lib,
+        3,
+        &["PA0001L8", "PA0002L8"],
+    );
+    let (leader, round) = c.wait_serving(None, 0);
+    let svc = c.services[&leader].clone();
+    c.wait("文件服务开放", || svc.serving_round() == Some(round));
+    let results = put_until(&svc, "r", 3000, 5, |_| false);
+    let mut cl = Client::new(c.start_http());
+    assert_eq!(cl.get(&results[0].0).unwrap(), body(3000, 0));
+    assert_eq!(cl.get(&results[1].0).unwrap(), body(3000, 1));
+    let drive = (0..2)
+        .find(|i| c.lib.loaded_barcode(*i).as_deref() == Some("PA0001L8"))
+        .unwrap();
+    fence(&c.lib.drive_as(drive, 99), ReservationKey::new(99, round)).unwrap();
+    assert!(
+        c.read_via(leader, &results[0].0).is_err(),
+        "旧执行者不能继续使用缓存索引读取"
+    );
+    assert_eq!(cl.get(&results[0].0).unwrap(), body(3000, 0));
+    let (next, _) = c.wait_serving(Some(leader), round + 1);
+    assert_ne!(next, leader);
+    c.shutdown();
+}
+
+#[test]
 fn a_second_drive_serves_reads_and_idle_read_tapes_are_unloaded() {
     let lib = SimLibrary::new(2, 6, 1);
     for (i, b) in ["PA0001L8", "PA0002L8"].iter().enumerate() {

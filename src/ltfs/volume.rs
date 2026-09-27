@@ -121,6 +121,100 @@ pub struct LtfsVolume<'a> {
     reservation_guard: Option<crate::scsi::reservation::ReservationKey>,
 }
 
+/// 已挂载只读介质的索引快照，不持有设备，也不允许写入。
+pub(crate) struct ReadView {
+    index: LtfsIndex,
+    block_size: u32,
+}
+
+impl ReadView {
+    pub(crate) fn read_file_to_writer<W: Write>(
+        &self,
+        device: &dyn crate::scsi::transport::TapeTransport,
+        path: &str,
+        w: &mut W,
+    ) -> Result<u64> {
+        read_index_file(device, &self.index, self.block_size, path, w)
+    }
+}
+
+fn read_index_file<W: Write>(
+    device: &dyn crate::scsi::transport::TapeTransport,
+    index: &LtfsIndex,
+    block_size: u32,
+    path: &str,
+    w: &mut W,
+) -> Result<u64> {
+    let drive = TapeDrive::new(device);
+    let file = index
+        .find_file(path)
+        .ok_or_else(|| TapeError::Ltfs(format!("文件不存在: {}", path)))?;
+    if let Some(target) = &file.symlink {
+        // IBM EE 的布局：用户路径是符号链接，数据在 .LTFSEE_DATA/<id>。
+        let resolved = resolve_symlink(path, target)
+            .ok_or_else(|| TapeError::Ltfs(format!("符号链接越出卷根: {} -> {}", path, target)))?;
+        let hit = index.find_file(&resolved);
+        return match hit {
+            Some(f) if f.symlink.is_none() => {
+                read_index_file(device, index, block_size, &resolved, w)
+            }
+            _ => Err(TapeError::Ltfs(format!(
+                "符号链接目标不可读: {} -> {}",
+                path, target
+            ))),
+        };
+    }
+    if file.extents.is_empty() {
+        if file.length != 0 {
+            return Err(TapeError::Ltfs(format!("文件 {} 缺少数据 extent", path)));
+        }
+        return Ok(0);
+    }
+
+    let mut total: u64 = 0;
+    let mut buf = vec![0u8; block_size as usize];
+
+    for ext in &file.extents {
+        let partition = partition_char_to_num(ext.partition);
+        drive.locate(partition, ext.start_block, true)?;
+
+        // 从 extent 起始块读起，按 byte_offset / byte_count 精确裁剪。
+        let mut remaining = ext.byte_count;
+        let mut first_block = true;
+        while remaining > 0 {
+            let n = drive.read_block(&mut buf)?;
+            if n == 0 {
+                return Err(TapeError::Ltfs(format!(
+                    "文件 {} 的 extent 提前结束，缺少 {} 字节",
+                    path, remaining
+                )));
+            }
+            let slice_start = if first_block {
+                ext.byte_offset as usize
+            } else {
+                0
+            };
+            let available = n.saturating_sub(slice_start);
+            let take = (remaining as usize).min(available);
+            if take > 0 {
+                w.write_all(&buf[slice_start..slice_start + take])?;
+                total += take as u64;
+                remaining -= take as u64;
+            }
+            first_block = false;
+        }
+    }
+    if total != file.length {
+        return Err(TapeError::Ltfs(format!(
+            "文件 {} 长度不符: 索引 {}，读取 {}",
+            path, file.length, total
+        )));
+    }
+    w.flush()?;
+    info!("读取 {}: {} 字节", path, total);
+    Ok(total)
+}
+
 impl<'a> LtfsVolume<'a> {
     /// 挂载卷：读标签后执行 D02 恢复协议（末索引定位、尾部分类、回指链核验），
     /// 视图取 DP 末索引（可能比 IP 新）。尾部非完整时以只读挂载，不自动修复。
@@ -344,75 +438,17 @@ impl<'a> LtfsVolume<'a> {
         out
     }
 
+    /// 只读驱动器装载期间保留已验证的索引；换带或失去执行资格后必须丢弃。
+    pub(crate) fn read_view(&self) -> ReadView {
+        ReadView {
+            index: self.index.clone(),
+            block_size: self.block_size,
+        }
+    }
+
     /// 读取指定路径的文件内容到 writer，返回写出字节数。
     pub fn read_file_to_writer<W: Write>(&self, path: &str, w: &mut W) -> Result<u64> {
-        let file = self
-            .index
-            .find_file(path)
-            .ok_or_else(|| TapeError::Ltfs(format!("文件不存在: {}", path)))?;
-        if let Some(target) = &file.symlink {
-            // IBM EE 的布局：用户路径是符号链接，数据在 .LTFSEE_DATA/<id>。
-            let resolved = resolve_symlink(path, target).ok_or_else(|| {
-                TapeError::Ltfs(format!("符号链接越出卷根: {} -> {}", path, target))
-            })?;
-            let hit = self.index.find_file(&resolved);
-            return match hit {
-                Some(f) if f.symlink.is_none() => self.read_file_to_writer(&resolved, w),
-                _ => Err(TapeError::Ltfs(format!(
-                    "符号链接目标不可读: {} -> {}",
-                    path, target
-                ))),
-            };
-        }
-        if file.extents.is_empty() {
-            if file.length != 0 {
-                return Err(TapeError::Ltfs(format!("文件 {} 缺少数据 extent", path)));
-            }
-            return Ok(0);
-        }
-
-        let mut total: u64 = 0;
-        let mut buf = vec![0u8; self.block_size as usize];
-
-        for ext in &file.extents {
-            let partition = partition_char_to_num(ext.partition);
-            self.drive.locate(partition, ext.start_block, true)?;
-
-            // 从 extent 起始块读起，按 byte_offset / byte_count 精确裁剪。
-            let mut remaining = ext.byte_count;
-            let mut first_block = true;
-            while remaining > 0 {
-                let n = self.drive.read_block(&mut buf)?;
-                if n == 0 {
-                    return Err(TapeError::Ltfs(format!(
-                        "文件 {} 的 extent 提前结束，缺少 {} 字节",
-                        path, remaining
-                    )));
-                }
-                let slice_start = if first_block {
-                    ext.byte_offset as usize
-                } else {
-                    0
-                };
-                let available = n.saturating_sub(slice_start);
-                let take = (remaining as usize).min(available);
-                if take > 0 {
-                    w.write_all(&buf[slice_start..slice_start + take])?;
-                    total += take as u64;
-                    remaining -= take as u64;
-                }
-                first_block = false;
-            }
-        }
-        if total != file.length {
-            return Err(TapeError::Ltfs(format!(
-                "文件 {} 长度不符: 索引 {}，读取 {}",
-                path, file.length, total
-            )));
-        }
-        w.flush()?;
-        info!("读取 {}: {} 字节", path, total);
-        Ok(total)
+        read_index_file(self.device, &self.index, self.block_size, path, w)
     }
 
     /// 追加文件：从 reader 流式写入 P1 EOD，记录 extent 到内存 index。
@@ -1447,6 +1483,37 @@ mod relocation_tests {
     use super::*;
     use crate::ltfs::mkltfs::{MkltfsOptions, mkltfs};
     use crate::scsi::sim::{SimCartridge, SimLibrary};
+
+    #[test]
+    fn read_view_reuses_index_but_still_reads_and_checks_device_data() {
+        use crate::scsi::cdb::opcode;
+        use crate::scsi::sim::{Fault, FaultAction};
+        let lib = SimLibrary::new(1, 2, 1);
+        lib.insert_cartridge(SimCartridge::blank("READ01L8", 64 << 20), 0)
+            .unwrap();
+        lib.load_into_drive("READ01L8", 0).unwrap();
+        let dev = lib.drive(0);
+        mkltfs(&dev, &MkltfsOptions::default()).unwrap();
+        let mut vol = LtfsVolume::mount(&dev).unwrap();
+        vol.append_file("/data", &mut &b"content"[..]).unwrap();
+        vol.commit().unwrap();
+        let view = vol.read_view();
+        // 只容许一个 READ：重读标签或索引就会在读出数据前失败。
+        dev.inject(Fault {
+            opcode: opcode::READ_6,
+            action: FaultAction::HostError(7),
+            after: 1,
+            remaining: 1,
+        });
+        let mut out = Vec::new();
+        assert_eq!(view.read_file_to_writer(&dev, "data", &mut out).unwrap(), 7);
+        assert_eq!(out, b"content");
+        out.clear();
+        assert!(view.read_file_to_writer(&dev, "data", &mut out).is_err());
+        assert!(out.is_empty());
+        assert_eq!(view.read_file_to_writer(&dev, "data", &mut out).unwrap(), 7);
+        assert_eq!(out, b"content");
+    }
 
     #[test]
     fn relocation_keeps_logical_metadata_but_rebuilds_physical_identity_and_hashes() {

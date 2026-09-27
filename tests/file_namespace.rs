@@ -169,6 +169,25 @@ fn catalog_checks_use_component_boundaries_and_recent_tombstones() {
         1024,
         true,
     );
+    assert_eq!(
+        files
+            .list_dir("/remote", false)
+            .unwrap()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["file"]
+    );
+    assert!(files.list_dir("/ab", false).unwrap().is_none());
+    assert!(matches!(
+        files.list_dir("/blocking", false),
+        Err(ServiceError::NotDirectory(_))
+    ));
+    let pending = files.begin("/remote/new", 1).unwrap();
+    assert_eq!(files.list_dir("/remote", true).unwrap().unwrap().len(), 2);
+    assert_eq!(files.list_dir("/remote", false).unwrap().unwrap().len(), 1);
+    files.abort(pending);
     assert!(matches!(
         files.begin("/remote", 1),
         Err(ServiceError::IsDirectory(_))
@@ -193,7 +212,9 @@ fn catalog_checks_use_component_boundaries_and_recent_tombstones() {
         Err(ServiceError::PathBusy(_))
     ));
     files.batch_done(1, &batch, &uploads, Ok((2, Default::default())));
+    assert!(files.list_dir("/blocking", false).unwrap().is_none());
     let h = files.begin("/blocking/child", 1).unwrap();
+    assert!(files.list_dir("/blocking", true).unwrap().is_some());
     files.abort(h);
     files.close("test completed");
     drop(files);
