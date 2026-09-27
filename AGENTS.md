@@ -2,7 +2,19 @@
 
 本文件适用于整个仓库。目标是让 Codex 和其他 AI Coding Agents 以最小、清晰、可验证的改动维护 `tape-rs`，同时保护真实磁带与机械设备。
 
+## 接续入口：先确认工作树
+
+当前开发接续分支为 `ltfs-recovery-ibm-interop`，本机工作树为 `/work/jay/tape-rs-ltfs-recovery-ibm-interop`；`/work/jay/tape-rs` 的 `feature/docs` 保存早期设计。用户明确指定其他分支时，以用户指定为准。
+
+每次新会话，以及回答“当前进展”或接到“继续”时，先执行 `git worktree list --porcelain`，再在目标工作树执行 `git status --short`、`git branch --show-current` 和 `git log -1 --oneline`。读取目标工作树的 `AGENTS.md` 和 `.scratch/ltfs-ha/handoff-to-codex.md`，按交接记录的最新条目核对实现、测试及部署状态；确认目录、分支、提交与记录一致后再继续。
+
+路径变化时按分支在工作树清单中定位；分支和记录冲突或目标缺失时先查各分支提交及交接文件，仍无法确定再澄清。最新时间戳或当前 cwd 单独都不足以决定接续分支。
+
+后续读取、编辑和验证显式使用已确认的工作树目录。保留其他工作树的未提交内容；无需为接续而 checkout、reset 或复制旧设计覆盖实现。迁移接续分支时同步更新新旧入口及交接记录。
+
 ## 工作原则
+
+- 无人值守约定（2026-09-27）：在已定义功能和已授权实验室范围内逐片自主推进，决策采用推荐方案并记录依据；每项任务完成软件检查后还须现场验证通过。现场不可用或验证失败时保留未完成状态并记录原因，Holo 结果与物理带库结果分开报告。
 
 - 先把请求转成可检查的成功标准，再开始修改。
 - 选择能完整解决问题的最小方案；不添加需求外的功能、抽象、配置项或依赖。
@@ -16,7 +28,7 @@
 
 
 1. 运行 `git status --short`，识别并保护已有改动。
-2. 本仓库已启用 CodeGraph。定位或理解代码时，先运行 `codegraph status .`；索引过期则运行 `codegraph sync .`。优先用 `codegraph explore "<问题或符号>"` 获取源码与调用路径，再按需使用 `rg` 或直接读取文件。
+2. 在已确认的目标工作树检查 `.codegraph/`；存在时先运行 `codegraph status .`，索引过期则运行 `codegraph sync .`，优先用 `codegraph explore "<问题或符号>"` 获取源码与调用路径。不存在时直接使用 `rg` 或读取文件，是否建索引由用户决定。
 3. 涉及 SCSI/SG_IO、CDB、机械手、磁带读写、LTFS、超时或远程硬件流程时，修改或执行命令前完整阅读 `CLAUDE.md` 中对应章节；它是硬件细节和远程开发流程的项目参考。
 4. 检查相关符号的调用方、错误路径和现有测试，确定改动边界与验证方式后再编辑。
 
@@ -60,7 +72,7 @@
 2. 单元与文档测试：`cargo test`。
 3. 编译检查：`cargo check --all-targets`。
 4. 涉及逻辑、API、`unsafe` 或底层协议时：`cargo clippy --all-targets --all-features`，区分新增告警与既有告警。
-5. 修改完成后运行 `codegraph sync .`；用 `codegraph affected <changed-files...>` 或相关符号的 `codegraph explore` 检查受影响调用路径和测试。
+5. 目标工作树已有 `.codegraph/` 时，修改完成后运行 `codegraph sync .`；用 `codegraph affected <changed-files...>` 或相关符号的 `codegraph explore` 检查受影响调用路径和测试。
 
 无法运行某项验证时，不以推测代替结果；说明原因、已完成的替代检查和建议的下一步。真实硬件验证与纯软件验证分开报告。
 

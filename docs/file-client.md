@@ -137,3 +137,5 @@ HTTP POST /xattrs?path=…&name=…&flags=… 的请求体是原始字节，DELE
 2026-09-25部署更新：符号链接创建版已统一发布到原三节点及tsclient，正式程序目录 `/home/rocky/tape-rs-symlink-create-prod-20260925`。实际FUSE创建、链接写入、改名删除、计划接管后全新缓存读回及清理通过，原9文件校验一致；取代上文“尚未正式部署”。见[部署验收](../.scratch/ltfs-ha/holo-symlink-create-upgrade-20260925.md)。
 
 符号链接跨带回收修复（2026-09-25，尚未正式部署）：回收直接迁移链接节点，不解析或读取目标，保留链接目标、时间、只读标记及属性，并在目标卷分配UID。悬空、循环和目录链接不再因目标不可读而中止回收。模拟集群及两盘专用Holo虚拟带完成回收、源带重新格式化、全新FUSE缓存和接管读回；详见[验收记录](../.scratch/ltfs-ha/holo-symlink-reclaim-20260925.md)。
+
+2026-09-27 部署更新：回收修复已统一部署三节点，配套客户端位于 `/home/rocky/tape-rs-symlink-reclaim-prod-20260927`，取代上文“尚未正式部署”。实际FUSE链接操作、计划接管后冷缓存读回、清理及原文件校验通过；本轮未在原数据带执行回收。见[部署验收](../.scratch/ltfs-ha/holo-reclaim-upgrade-20260927.md)。

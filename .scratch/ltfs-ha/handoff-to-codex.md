@@ -1,5 +1,7 @@
 # 交接给 Codex（2026-09-24）
 
+最新接续摘要见 [docs/CLAUDE-HANDOFF.md](../../docs/CLAUDE-HANDOFF.md)。2026-09-27 已部署符号链接回收修复并通过 Holo 正式集群回归；下列旧版本和“尚未部署”描述按末尾最新记录更新。
+
 此前在 Claude Code 里开发，之后改用 Codex。本文件把只存在于 Claude 本地记忆里的约定搬进仓库，并记录交接时的施工状态。
 
 ## 工作约定（原 Claude 记忆）
@@ -401,3 +403,13 @@ copy_one原读取链接目标，最小dangling→missing稳定abandoned。已通
 新测试集群/home/rocky/tape-rs-symlink-reclaim-20260925，7500/7501，独立全新test-data，池sr=51cfd06c-bf79-4bbf-ac85-886608a0ab4b；仅新建SR2501L8/SR2502L8，各512MiB。ltfsd SHA b8496c5bf8de2abb26ffecef81159e5db948437169fa716d5b6e03b31c253025。源Full23→回收后Full2，目标Full4；6类链接及全部XML时间/readonly、HTTP binary xattr、mmap、新缓存、node2 round62接管均通过。测试停止，源槽8、目标槽9，保留备份/holo-symlink-reclaim-20260925及关闭data。不得将此data覆盖正式data。创建/回收确实格式化新带，没有动RT或LE。
 
 原正式程序保持45ca052…（创建版，回收修复尚未发布）。已恢复node2 term40 round350，原TS1001L08正常停机checkpoint由95→96 Complete，19MiB可用。三节点catalog42条，新SHA89691e412db63fe43f18bd3b2ad33ff2f9f12337748f8ca92f5885282c6211c8；旧7d5660…哈希不再适用。原9文件SHA不变，原30条非/rc记录除generation外与升级前备份一致。EE正常/f3一致/9 publications ready。当前程序核验/tmp/symlink-create-prod-node-verify.py仍适用（不固定catalog哈希）；下一步可部署回收修复。本轮开发、报告、探针和筛选后的验收证据已在当前分支整理，最终提交状态以 Git 为准。
+
+## 2026-09-27 回收修复正式升级与无人值守接续
+
+用户明确进入无人值守模式：按推荐决策逐步推进，每项任务完成后须现场验证通过。沿用Holo＋EE/LE现场能力边界，不把它称为物理带库验证。实际实现工作树为 `/work/jay/tape-rs-ltfs-recovery-ibm-interop`；旧feature/docs设计不代表当前实现。
+
+已完成[正式部署与验收](holo-reclaim-upgrade-20260927.md)：目录 `/home/rocky/tape-rs-symlink-reclaim-prod-20260927`，三节点ltfsd SHA `32bd5541…`，tsclient FUSE `ef237d2e…`。原启动入口仅换程序路径，关闭数据备份在各新目录 `pre-upgrade.tgz`（0600）。软件206通过7忽略，check/clippy完成，历史fmt差异保留。
+
+新FUSE创建/链接写入/rename/unlink、node3正常停止后node2接管、冷缓存读回和清理均通过；原9文件长度/SHA/mmap/条码一致。最终node2/term42/round386，三节点catalog53条/applied407一致，TS1001L08实际mount generation119、DP/IP Complete；/cluster.local的110是接管时旧描述。原41条非根记录除generation外保持，目录SHA（本轮排序算法）`1a76875a…`。EE三节点available无任务、f3哈希保持、9 publications ready。FUSE已卸载，隔离带仍槽7/8/9；无格式化/VM断电/物理设备操作。
+
+下一步：隔离SR池的回收中断与接管保真验收，不在原数据带故障注入。本轮没有重复原带回收或新增LE回收往返验证。进度与证据已写入当前分支，最终提交状态以Git为准。

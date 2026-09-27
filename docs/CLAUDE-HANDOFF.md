@@ -1,35 +1,41 @@
-# Claude handoff: LTFS interoperability
+# Claude / Codex handoff: LTFS interoperability
 
-Last updated: 2026-09-25. Branch: `ltfs-recovery-ibm-interop`. GitHub remote: `origin` (`JayTsu-sh/tape-rs`). Read this file before continuing Holo/LE, FUSE, LTFS recovery, or tape reclaim work. `AGENTS.md` is the governing repository and hardware-safety instruction.
+Last updated: 2026-09-27. Branch: `ltfs-recovery-ibm-interop`. Active worktree: `/work/jay/tape-rs-ltfs-recovery-ibm-interop`. GitHub remote: `origin` (`JayTsu-sh/tape-rs`). Follow `AGENTS.md` to verify the worktree before continuing; `/work/jay/tape-rs` on `feature/docs` contains early design, not the current implementation.
 
-## Current state
+## Working agreement
 
-The branch contains the LTFS 2.5.1 full/incremental index work, recovery/checkpoint behavior, client and FUSE namespace operations (directories, rename, xattrs, symlink read/create), and Holo/LE research. Read the chronology in `.scratch/ltfs-ha/handoff-to-codex.md`; domain behavior and error contracts are in `.scratch/ltfs-ha/file-contract.md` and `docs/file-client.md`. Individual `holo-*.md` reports hold procedures and evidence. Probe scripts live in `.scratch/ltfs-ha/probes/` and have explicit environment/path gates; check their assertions and target path before running them.
+The user requested unattended work on 2026-09-27: proceed through defined tasks, choose and record recommended decisions, and verify each completed task in the actual environment. The available environment is Holo-VTL plus IBM EE/LE; physical tape firmware remains unverified. A failed or unavailable lab check keeps that task incomplete. Preserve the separate formal and isolated pools, and recheck current state before device actions.
 
-Current formal cluster is on the symlink-create build, which **does not yet contain the symlink reclaim fix**:
+## Current implementation and deployment
 
-- Branch formal deploy path on `.71/.72/.74`: `/home/rocky/tape-rs-symlink-create-prod-20260925/ltfsd`, SHA256 `45ca052da5867aafcf5e77f15ad7a3b728041ed79c08e0b392c25f87cada405d`.
-- FUSE on `.73`: `/home/rocky/tape-rs-symlink-create-prod-20260925/tape-fuse`, SHA256 `cc8b3c3013819d9122e3345e96bfd266ce207af90e8057c304ae21dc3494c1bb`.
-- Formal startup entry remains `/home/rocky/tape-rs-ltfs25-20260924/start.sh N`; it now points to the create build and retains original ports, data dir, serials, and cluster settings.
-- Last verified formal state: node2, term40/round350; `TS1001L08` generation96, DP/IP `Complete`, 19 MiB free. Generation95→96 was the planned shutdown checkpoint. Three-node directory catalog had 42 rows, SHA256 `89691e412db63fe43f18bd3b2ad33ff2f9f12337748f8ca92f5885282c6211c8`; 9 original files retained their baseline lengths and hashes. EE nodes were available, no active tasks, and `/gpfs/tapers-del/f3` retained its baseline hash.
-- Previous version bundles in each formal node's `/home/rocky/tape-rs-symlink-create-prod-20260925/pre-upgrade.tgz` are mode 0600. They contain closed Raft/catalog data and prior executable/start script. Do not restore their Raft database over the live cluster; binaries/start scripts are separate rollback material.
+The branch contains LTFS full/incremental indexes, recovery/checkpoint behavior, Raft service, client and FUSE operations (directories, rename, xattrs, symlink read/create), and symlink-preserving reclaim. Production source used for this deployment is `cda359d`; later documentation/evidence commits do not rebuild the executable.
 
-An isolated tape-reclaim fix was implemented and tested after the formal create build. It has **not been deployed**:
+The symlink reclaim fix **is now deployed** on the formal Holo three-node cluster:
 
-- Repro: one dangling symlink made reclaim abandon with `符号链接目标不可读`; ordinary reclaim incorrectly read through the link.
-- Fix: `copy_one` routes symlink records through `FileService::relocate_symlink` and `LtfsVolume::add_symlink_with_metadata`. It copies target and node metadata without reading target or extents, allocates a destination-volume UID, and leaves regular-file SHA checks and both source-format gates unchanged.
-- Validation: `cargo test --all-features` passed 206 tests, 7 ignored; `cargo check --all-targets` and `cargo clippy --all-targets --all-features` completed with existing warnings. All 6 symlink kinds passed a simulated cluster reclaim, destination remount, and takeover. A two-cartridge isolated Holo test reclaimed `SR2501L8`→`SR2502L8`; dangling/loop/directory/absolute/chained/Unicode targets, binary xattrs, mtime, readonly flag, target bytes, mmap, fresh-cache readback, and node2 takeover passed. Actual LTFS Full-index XML confirmed six targets and timestamps, with no extents. Source test cartridge was reformatted as part of reclaim.
-- Full report: `.scratch/ltfs-ha/holo-symlink-reclaim-20260925.md`. Evidence prefix: `.scratch/ltfs-ha/probes/results/symlink-reclaim-`.
+- Directory: `/home/rocky/tape-rs-symlink-reclaim-prod-20260927`.
+- `.71/.72/.74` ltfsd SHA256: `32bd5541c0123559b590e9dd94c935753a30dacdb660a3e8efcc2ee3e89f8092`.
+- `.73` tape-fuse SHA256: `ef237d2ea43bfaf182f24d34a3d4a2a3bf9e509e8ba21ead321112e7c87c85d9`.
+- `.73` ltfsctl in the new directory: `90f7d3caee4c16261779b5f5d3608e927dd899657144e3d1c02d4db4ab5ce933`. Other existing client paths were not replaced.
+- Startup remains `bash /home/rocky/tape-rs-ltfs25-20260924/start.sh N`, pointing to the new ltfsd and preserving original ports, data directory, serials and settings.
+- Each server's new directory contains `pre-upgrade.tgz` (0600): closed original data, old binary and startup script; `start.before.sh` is also retained. Never restore old Raft/catalog data over advancing live state.
 
-## Lab state and next step
+Last verified state: node2, term42/round386, three matching catalogs with 53 rows/applied407. `TS1001L08` is generation119; actual mount logs show DP/IP `Complete`, writable. `/cluster.local` still displays takeover-time generation110/12MiB and is not a fresh media-capacity observation. `TS1000L08` remains generation2. Original 9 file lengths/hashes/mmap/barcodes passed; 41 preexisting non-root catalog rows match before upgrade except generation. `/rc` metadata and deleted test tombstones changed as expected.
 
-Two new 512 MiB Holo virtual cartridges were created specifically for the isolated test and remain in TAPERS storage slots 8 and 9:
+Latest report: [formal upgrade and acceptance](../.scratch/ltfs-ha/holo-reclaim-upgrade-20260927.md). Evidence prefix: `.scratch/ltfs-ha/probes/results/reclaim-upgrade-20260927-`. Latest software run: 206 passed, 7 ignored; check and Clippy completed with existing warnings; full fmt still has historical differences. Fresh-cache FUSE checks and planned node3→node2 takeover passed on the actual lab. The temporary `/rc/reclaim-upgrade-20260927` tree was cleaned, FUSE unmounted and cache emptied. EE nodes were available, no active tasks, `/gpfs/tapers-del/f3` retained its baseline hash, and all 9 Holo publications were ready.
 
-- `SR2501L8`: source, reclaimed/reformatted, Full generation2.
-- `SR2502L8`: destination with moved files, Full generation4.
-- They belong only to isolated pool UUID `51cfd06c-bf79-4bbf-ac85-886608a0ab4b` (`sr`) and are not assigned to the formal pool. Keep them separate from formal inventory.
-- Isolated daemons/FUSE were stopped. Original `TS1001L08` is back in drive0 and formal service was restored. LE copy was not used in this reclaim test. Saved Holo cartridge copies are under `/home/rocky/holo-symlink-reclaim-20260925/`.
+The reclaim fix routes symlinks through metadata migration rather than reading their targets. Prior two-cartridge Holo reclaim and source-format validation is in [the isolated report](../.scratch/ltfs-ha/holo-symlink-reclaim-20260925.md). The latest deployment regression did not reformat or reclaim original media, nor add a new LE reclaim roundtrip result.
 
-Next planned task is to deploy the reclaim fix to the formal three-node cluster and FUSE, with closed-data backups, actual executable hashes, a dedicated temporary directory on the existing formal `TS1001L08`, verification after takeover, cleanup, and original-file/EE checks. Before doing so, recheck the live cluster and inventory. Preserve the separate pool and cartridges. Do not copy test `test-data` over `/home/rocky/ltfsd-data`.
+## Isolated media and next task
 
-`cargo fmt --all -- --check` has historical repository-wide failures. Changed snippets were formatted and `git diff --check` passed. `.codegraph/` is absent; do not create it. This handoff is committed with the implementation and evidence. Before any follow-up, check the live branch and working tree; keep subsequent changes on `ltfs-recovery-ibm-interop`.
+Preserve the existing isolated pool UUID `51cfd06c-bf79-4bbf-ac85-886608a0ab4b` (`sr`) and its two 512MiB cartridges:
+
+- `SR2501L8`: storage slot8, source reclaimed/reformatted, Full generation2.
+- `SR2502L8`: slot9, destination containing moved files, Full generation4.
+- `RT2502L8` remains in slot7 and belongs to a different test history. None of these three were touched by the 2026-09-27 upgrade.
+- Original `TS1001L08` remains loaded in the first TAPERS drive; original pool `rc` contains only `TS1000L08` and `TS1001L08`.
+
+Next task: isolated SR-pool reclaim interruption/takeover fidelity, starting with deterministic simulator coverage and then a bounded Holo fault scenario. Recheck the saved isolated data and current media before reuse; never copy test data over `/home/rocky/ltfsd-data`. Keep formal data out of fault injection, and restore/verify formal service and EE after the drill. Hard links, large-directory performance and physical-firmware validation remain open; the earlier intermittent namespace/takeover HTTP500 is not claimed fixed.
+
+Detailed chronology: `.scratch/ltfs-ha/handoff-to-codex.md`; file semantics: `.scratch/ltfs-ha/file-contract.md` and `docs/file-client.md`. Probe scripts have fixed paths and explicit gates: inspect before running. Older deployment status in appended chronology is superseded by this summary and the latest dated entry.
+
+`.codegraph/` is absent in this worktree; do not initialize it. Save subsequent implementation, tests and handoff evidence on this branch. Push only when requested.
