@@ -413,3 +413,13 @@ copy_one原读取链接目标，最小dangling→missing稳定abandoned。已通
 新FUSE创建/链接写入/rename/unlink、node3正常停止后node2接管、冷缓存读回和清理均通过；原9文件长度/SHA/mmap/条码一致。最终node2/term42/round386，三节点catalog53条/applied407一致，TS1001L08实际mount generation119、DP/IP Complete；/cluster.local的110是接管时旧描述。原41条非根记录除generation外保持，目录SHA（本轮排序算法）`1a76875a…`。EE三节点available无任务、f3哈希保持、9 publications ready。FUSE已卸载，隔离带仍槽7/8/9；无格式化/VM断电/物理设备操作。
 
 下一步：隔离SR池的回收中断与接管保真验收，不在原数据带故障注入。本轮没有重复原带回收或新增LE回收往返验证。进度与证据已写入当前分支，最终提交状态以Git为准。
+
+## 2026-09-27 回收在源FORMAT前中断：模拟与Holo接管验收完成
+
+见[holo-reclaim-cut-20260927.md](holo-reclaim-cut-20260927.md)。新增测试transport屏障与回收保真接管用例，无生产算法改动。目标提交后暂停旧FORMAT，新节点接管完成回收，再恢复旧命令，必须报告ownership_lost且介质对象不变；独立重挂完整元数据与后续接管读回通过。最终207通过7忽略，check/clippy完成、fmt历史差异保留。
+
+Holo新隔离目录 `/home/rocky/tape-rs-reclaim-cut-20260927`，从关闭SR数据接续，7500/7501，正式部署版32bd5541…。SR2502→SR2501反向回收，node2 round67完成目标提交后、源FORMAT尚未发出时SIGKILL；node3 round78完成回收，旧节点重启追平。六类链接冷缓存FUSE/内容/mmap/条码/seed通过，13目录记录除条码代数版本外一致；关闭介质Full XML六链接全部元数据保真、无extent。最新SR1槽8 Full4含数据，SR2槽9 Full2空；测试进程/strace/FUSE停止，缓存空。最新关闭test-data在新目录，不能从20260925旧data接续。备份holo:/home/rocky/holo-reclaim-cut-20260927。
+
+正式恢复node1 term43 round409/applied412，TS1001L08正常checkpoint由119→120 DP/IP Complete，可用7MiB。53条原catalog除generation外保持，三副本一致、SHA3339567f…；原9文件length/SHA/mmap/barcode通过。EE三节点available无任务、f3哈希不变、9publications ready。原TS1001第一驱动器、RT/SR1/SR2槽7/8/9。跨主机设备号不同（.71changer sg9，.72sg8），必须按VPD序列号重新核对。
+
+现场覆盖Holo死亡接管，不是物理设备，也没有覆盖FORMAT已成功但完成记录未复制窗口；下一项优先补后者。详细测试编排修正和证据见报告及probes/results/reclaim-cut-20260927-*。按无人值守约定记录推荐决策，未推送远端。

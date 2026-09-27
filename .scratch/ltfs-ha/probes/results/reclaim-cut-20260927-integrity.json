@@ -1,0 +1,273 @@
+{
+  "original_rows": 53,
+  "unchanged_except_generation": true,
+  "generation_changes": [
+    {
+      "path": "/rc",
+      "before": 119,
+      "after": 120
+    },
+    {
+      "path": "/rc/_probe.bin",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/after_reclaim.bin",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/codex-20260924",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/codex-20260924/incremental-http-1208.bin",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/codex-20260924/move-source.bin",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/codex-20260924/move-target.bin",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/codex-20260924/snapshot.bin",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/codex-cached-20260924",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/codex-cached-20260924/external",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/codex-cached-20260924/file",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/codex-cached-final-20260924",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/codex-cached-final-20260924/file",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/directory-upgrade-20260924",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/directory-upgrade-20260924/empty",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/f0.bin",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/f1.bin",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/f2.bin",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/f3.bin",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/f4.bin",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/f5.bin",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/reclaim-upgrade-20260927",
+      "before": 119,
+      "after": 120
+    },
+    {
+      "path": "/rc/reclaim-upgrade-20260927/chain",
+      "before": 116,
+      "after": 120
+    },
+    {
+      "path": "/rc/reclaim-upgrade-20260927/dangling",
+      "before": 112,
+      "after": 120
+    },
+    {
+      "path": "/rc/reclaim-upgrade-20260927/directory",
+      "before": 113,
+      "after": 120
+    },
+    {
+      "path": "/rc/reclaim-upgrade-20260927/loop",
+      "before": 114,
+      "after": 120
+    },
+    {
+      "path": "/rc/reclaim-upgrade-20260927/relative",
+      "before": 111,
+      "after": 120
+    },
+    {
+      "path": "/rc/reclaim-upgrade-20260927/renamed",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/reclaim-upgrade-20260927/subdir",
+      "before": 118,
+      "after": 120
+    },
+    {
+      "path": "/rc/reclaim-upgrade-20260927/target",
+      "before": 117,
+      "after": 120
+    },
+    {
+      "path": "/rc/reclaim-upgrade-20260927/temporary",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/reclaim-upgrade-20260927/中文",
+      "before": 115,
+      "after": 120
+    },
+    {
+      "path": "/rc/rename-upgrade-20260924",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/rename-upgrade-20260924/source",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/rename-upgrade-20260924/source/empty",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/rename-upgrade-20260924/source/file",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/rename-upgrade-20260924/target",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/rename-upgrade-20260924/target/empty",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/rename-upgrade-20260924/target/file",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/rename-upgrade-20260924/target/renamed",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/symlink-prod-20260925",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/symlink-prod-20260925/chain",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/symlink-prod-20260925/dangling",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/symlink-prod-20260925/directory",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/symlink-prod-20260925/loop",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/symlink-prod-20260925/relative",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/symlink-prod-20260925/renamed",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/symlink-prod-20260925/subdir",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/symlink-prod-20260925/target",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/symlink-prod-20260925/temporary",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/symlink-prod-20260925/中文",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/xattr-prod-20260924",
+      "before": 110,
+      "after": 120
+    },
+    {
+      "path": "/rc/xattr-prod-20260924/file",
+      "before": 110,
+      "after": 120
+    }
+  ],
+  "catalog_sha256": "3339567f1c5d8e5f2255ef7fae5557dacf4d60bad2af9b5ea3d03c33f480e6b3",
+  "publications_ready": 9
+}

@@ -19,22 +19,24 @@ The symlink reclaim fix **is now deployed** on the formal Holo three-node cluste
 - Startup remains `bash /home/rocky/tape-rs-ltfs25-20260924/start.sh N`, pointing to the new ltfsd and preserving original ports, data directory, serials and settings.
 - Each server's new directory contains `pre-upgrade.tgz` (0600): closed original data, old binary and startup script; `start.before.sh` is also retained. Never restore old Raft/catalog data over advancing live state.
 
-Last verified state: node2, term42/round386, three matching catalogs with 53 rows/applied407. `TS1001L08` is generation119; actual mount logs show DP/IP `Complete`, writable. `/cluster.local` still displays takeover-time generation110/12MiB and is not a fresh media-capacity observation. `TS1000L08` remains generation2. Original 9 file lengths/hashes/mmap/barcodes passed; 41 preexisting non-root catalog rows match before upgrade except generation. `/rc` metadata and deleted test tombstones changed as expected.
+Last verified state after the interruption drill: node1, term43/round409, three matching catalogs with 53 rows/applied412. `TS1001L08` is generation120, DP/IP `Complete`, writable, 7MiB available; the normal shutdown checkpoint advanced it from119. `TS1000L08` remains generation2. Original 9 file lengths/hashes/mmap/barcodes passed on a fresh FUSE cache; all 53 preexisting catalog rows match before the drill except generation. Current sorted catalog SHA256: `3339567f1c5d8e5f2255ef7fae5557dacf4d60bad2af9b5ea3d03c33f480e6b3`.
 
-Latest report: [formal upgrade and acceptance](../.scratch/ltfs-ha/holo-reclaim-upgrade-20260927.md). Evidence prefix: `.scratch/ltfs-ha/probes/results/reclaim-upgrade-20260927-`. Latest software run: 206 passed, 7 ignored; check and Clippy completed with existing warnings; full fmt still has historical differences. Fresh-cache FUSE checks and planned node3→node2 takeover passed on the actual lab. The temporary `/rc/reclaim-upgrade-20260927` tree was cleaned, FUSE unmounted and cache emptied. EE nodes were available, no active tasks, `/gpfs/tapers-del/f3` retained its baseline hash, and all 9 Holo publications were ready.
+Latest report: [reclaim interruption and takeover](../.scratch/ltfs-ha/holo-reclaim-cut-20260927.md), following [formal deployment acceptance](../.scratch/ltfs-ha/holo-reclaim-upgrade-20260927.md). Latest software run: 207 passed, 7 ignored; check and Clippy completed with existing warnings; full fmt still has historical differences. This task adds test-only FORMAT gating and no production change. Holo SR-pool takeover before source FORMAT passed, including cold-cache FUSE and complete link XML metadata comparison. Formal service and original files were restored and verified; EE nodes available, no active tasks, baseline f3 hash intact, 9 publications ready. FUSE unmounted/cache empty; isolated processes and strace stopped.
 
 The reclaim fix routes symlinks through metadata migration rather than reading their targets. Prior two-cartridge Holo reclaim and source-format validation is in [the isolated report](../.scratch/ltfs-ha/holo-symlink-reclaim-20260925.md). The latest deployment regression did not reformat or reclaim original media, nor add a new LE reclaim roundtrip result.
 
 ## Isolated media and next task
 
-Preserve the existing isolated pool UUID `51cfd06c-bf79-4bbf-ac85-886608a0ab4b` (`sr`) and its two 512MiB cartridges:
+Preserve pool UUID `51cfd06c-bf79-4bbf-ac85-886608a0ab4b` (`sr`) and its two 512MiB cartridges. Latest **closed isolated data** is `/home/rocky/tape-rs-reclaim-cut-20260927/test-data` on .71/.72/.74, ports 7500/7501, node3/round78 at shutdown. Do not resume the older symlink-reclaim directory: media have moved forward.
 
-- `SR2501L8`: storage slot8, source reclaimed/reformatted, Full generation2.
-- `SR2502L8`: slot9, destination containing moved files, Full generation4.
-- `RT2502L8` remains in slot7 and belongs to a different test history. None of these three were touched by the 2026-09-27 upgrade.
-- Original `TS1001L08` remains loaded in the first TAPERS drive; original pool `rc` contains only `TS1000L08` and `TS1001L08`.
+- `SR2501L8`: slot8, current destination, Full generation4 containing the six links and other live files.
+- `SR2502L8`: slot9, source now reclaimed/reformatted, Full generation2 with no files.
+- `RT2502L8`: slot7, separate history, untouched.
+- `TS1001L08`: first TAPERS drive; formal pool `rc` still contains only TS1000L08/TS1001L08.
+- Holo backups: `/home/rocky/holo-reclaim-cut-20260927`, before/after for both SR cartridges with verified hashes.
+- Device mapping differs: TAPERS changer is .71 `/dev/sg9`, .72 `/dev/sg8`. Always verify VPD serial `IBMtaper2287_LL3` and the current holder before device commands.
 
-Next task: isolated SR-pool reclaim interruption/takeover fidelity, starting with deterministic simulator coverage and then a bounded Holo fault scenario. Recheck the saved isolated data and current media before reuse; never copy test data over `/home/rocky/ltfsd-data`. Keep formal data out of fault injection, and restore/verify formal service and EE after the drill. Hard links, large-directory performance and physical-firmware validation remain open; the earlier intermittent namespace/takeover HTTP500 is not claimed fixed.
+Next bounded task: source FORMAT succeeds but `TapeReclaimed` has not committed; add deterministic simulator coverage then a bounded Holo fault check. The completed drill covered **before FORMAT**, not this later window. Keep formal data out of fault injection, preserve the updated SR state, and restore/verify formal service and EE after the drill. Hard links, large-directory performance and physical-firmware validation remain open; the intermittent namespace/takeover HTTP500 is not claimed fixed.
 
 Detailed chronology: `.scratch/ltfs-ha/handoff-to-codex.md`; file semantics: `.scratch/ltfs-ha/file-contract.md` and `docs/file-client.md`. Probe scripts have fixed paths and explicit gates: inspect before running. Older deployment status in appended chronology is superseded by this summary and the latest dated entry.
 

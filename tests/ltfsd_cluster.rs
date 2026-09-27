@@ -71,16 +71,87 @@ impl DirectoryFetch for FileFetch {
     }
 }
 
+// Test-only barrier before the old executor delivers FORMAT MEDIUM. The new
+// executor uses another initiator and can continue; no production fault hook.
+struct FormatPause {
+    initiator: std::sync::atomic::AtomicU32,
+    entered: Sender<()>,
+    resume: Mutex<std::sync::mpsc::Receiver<()>>,
+    returned: Sender<bool>,
+}
+
+struct PausingTransport {
+    inner: tape_rs::scsi::sim::SimTransport,
+    initiator: u32,
+    pause: Option<Arc<FormatPause>>,
+}
+
+impl tape_rs::scsi::transport::TapeTransport for PausingTransport {
+    fn execute_no_data(
+        &self,
+        cdb: &[u8],
+        timeout: u32,
+    ) -> Result<tape_rs::scsi::device::ScsiResult> {
+        use std::sync::atomic::Ordering;
+        let pause = self.pause.as_ref().filter(|p| {
+            cdb.first() == Some(&tape_rs::scsi::cdb::opcode::FORMAT_MEDIUM)
+                && p.initiator
+                    .compare_exchange(self.initiator, 0, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+        });
+        if let Some(p) = pause {
+            let _ = p.entered.send(());
+            p.resume
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(30))
+                .map_err(|e| tape_rs::error::TapeError::NotReady(format!("测试格式化屏障: {e}")))?;
+        }
+        let result = self.inner.execute_no_data(cdb, timeout);
+        if let Some(p) = pause {
+            let _ = p.returned.send(
+                result
+                    .as_ref()
+                    .is_err_and(tape_rs::scsi::reservation::ownership_lost),
+            );
+        }
+        result
+    }
+
+    fn execute_read(
+        &self,
+        cdb: &[u8],
+        buf: &mut [u8],
+        timeout: u32,
+    ) -> Result<tape_rs::scsi::device::ScsiResult> {
+        self.inner.execute_read(cdb, buf, timeout)
+    }
+
+    fn execute_write(
+        &self,
+        cdb: &[u8],
+        buf: &[u8],
+        timeout: u32,
+    ) -> Result<tape_rs::scsi::device::ScsiResult> {
+        self.inner.execute_write(cdb, buf, timeout)
+    }
+
+    fn identity(&self) -> &str {
+        self.inner.identity()
+    }
+}
+
 struct SimProvider {
     lib: SimLibrary,
     initiator: u32,
     drives: usize,
+    format_pause: Option<Arc<FormatPause>>,
 }
 
 impl DeviceProvider for SimProvider {
     fn open_all(&self) -> Result<Vec<ManagedDevice>> {
         let mut v: Vec<ManagedDevice> = (0..self.drives)
-            .map(|i| ManagedDevice { name: format!("drive{}", i), serial: format!("SIMDRV{:04}", i), kind: DeviceKind::Drive, dev: Box::new(self.lib.drive_as(i, self.initiator)) })
+            .map(|i| ManagedDevice { name: format!("drive{}", i), serial: format!("SIMDRV{:04}", i), kind: DeviceKind::Drive, dev: Box::new(PausingTransport { inner: self.lib.drive_as(i, self.initiator), initiator: self.initiator, pause: self.format_pause.clone() }) })
             .collect();
         v.push(ManagedDevice { name: "changer".into(), serial: "SIMLIB0000000001".into(), kind: DeviceKind::Changer, dev: Box::new(self.lib.changer()) });
         Ok(v)
@@ -113,12 +184,12 @@ impl Cluster {
 
     /// 用准备好的模拟库启动三节点集群，建一个池并把 `assign` 里的条码归进去。
     fn start_lib(name: &str, demo_write: bool, lib: SimLibrary, file_limit: u64, assign: &[&str]) -> Self {
-        Self::start_lib_with(name, demo_write, lib, file_limit, assign, None)
+        Self::start_lib_with(name, demo_write, lib, file_limit, assign, None, None)
     }
 
     /// `claimed_drives` 是节点配置里声称的驱动器数（默认与模拟库一致）。故意报多，
     /// 可以让 Leader 的受理检查放行、执行线程在设备上才发现不够。
-    fn start_lib_with(name: &str, demo_write: bool, lib: SimLibrary, file_limit: u64, assign: &[&str], claimed_drives: Option<usize>) -> Self {
+    fn start_lib_with(name: &str, demo_write: bool, lib: SimLibrary, file_limit: u64, assign: &[&str], claimed_drives: Option<usize>, format_pause: Option<Arc<FormatPause>>) -> Self {
 
         let dir = std::env::temp_dir().join(format!("ltfsd-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -142,7 +213,7 @@ impl Cluster {
             status.insert(id, shared.clone());
             let (exec_tx, exec_rx) = channel();
             let (ev_tx, ev_rx) = channel();
-            let provider = Box::new(SimProvider { lib: lib.clone(), initiator: id as u32, drives: lib.drive_count() });
+            let provider = Box::new(SimProvider { lib: lib.clone(), initiator: id as u32, drives: lib.drive_count(), format_pause: format_pause.clone() });
             let eopts = ExecOptions { node_id: id as u8, interval: Duration::from_millis(40), demo_write, salvage: false, block_size: 64 * 1024, read_idle: Duration::from_millis(250) };
             let policy = tape_rs::daemon::files::BatchPolicy { max_bytes: 4 << 20, max_files: 50, idle: Duration::from_millis(25), max_wait: Duration::from_millis(400) };
             let files = tape_rs::daemon::files::FileService::with_options(dir.join(format!("spool-{}", id)), policy, Some(dir.join(format!("directory-{}.db", id)))).unwrap();
@@ -529,7 +600,7 @@ fn lone_executor(name: &str) -> (Sender<ExecRequest>, std::sync::mpsc::Receiver<
     let files = FileService::new(dir).unwrap();
     let opts = ExecOptions { node_id: 1, interval: Duration::from_secs(3600), demo_write: false, salvage: false, block_size: 64 * 1024, read_idle: Duration::from_millis(250) };
     let status: SharedStatus = Arc::new(Mutex::new(NodeStatus::default()));
-    thread::spawn(move || executor::run(Box::new(SimProvider { lib, initiator: 1, drives: 1 }), opts, rx, ev_tx, files, status));
+    thread::spawn(move || executor::run(Box::new(SimProvider { lib, initiator: 1, drives: 1, format_pause: None }), opts, rx, ev_tx, files, status));
     (tx, ev_rx)
 }
 
@@ -1301,7 +1372,7 @@ fn a_reclaim_that_cannot_start_falls_back_to_appendable_with_a_reason() {
         lib.insert_cartridge(SimCartridge::blank(b, 64 << 20), i).unwrap();
     }
     // 节点声称有两台驱动器，模拟库里只有一台
-    let c = Cluster::start_lib_with("reclaim2", false, lib, 10, &["PC0001L8"], Some(2));
+    let c = Cluster::start_lib_with("reclaim2", false, lib, 10, &["PC0001L8"], Some(2), None);
     let (leader, round) = c.wait_serving(None, 0);
     let svc = c.services[&leader].clone();
     c.wait("文件服务开放", || svc.serving_round() == Some(round));
@@ -2229,6 +2300,15 @@ fn symlinks_commit_and_survive_remount_and_takeover() {
 
 #[test]
 fn reclaim_preserves_symlinks_without_resolving_targets() {
+    check_symlink_reclaim(false);
+}
+
+#[test]
+fn reclaim_takeover_before_source_format_preserves_symlinks_and_fences_old_format() {
+    check_symlink_reclaim(true);
+}
+
+fn check_symlink_reclaim(interrupt_before_format: bool) {
     use tape_rs::ltfs::{index::Xattr, volume::LtfsVolume};
     use tape_rs::tapefs::{ClientBackend, ROOT_INO, TapeFs};
     let lib = SimLibrary::new(2, 6, 1);
@@ -2279,22 +2359,112 @@ fn reclaim_preserves_symlinks_without_resolving_targets() {
         vol.commit().unwrap();
         original = vol.index().clone();
     }
-    let c = Cluster::start_lib(
-        "reclaim-symlinks",
+    let (entered_tx, entered_rx) = channel();
+    let (resume_tx, resume_rx) = channel();
+    let (returned_tx, returned_rx) = channel();
+    let pause = Arc::new(FormatPause {
+        initiator: std::sync::atomic::AtomicU32::new(0),
+        entered: entered_tx,
+        resume: Mutex::new(resume_rx),
+        returned: returned_tx,
+    });
+    if interrupt_before_format {
+        // Destination creation must not be mistaken for source reclamation.
+        lib.load_into_drive("PA0002L8", 1).unwrap();
+        mkltfs(
+            &lib.drive_as(1, 50),
+            &MkltfsOptions {
+                volume_id: "DEST".into(),
+                block_size: 64 * 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+    let c = Cluster::start_lib_with(
+        if interrupt_before_format {
+            "reclaim-symlinks-cut"
+        } else {
+            "reclaim-symlinks"
+        },
         false,
         lib,
         100,
         &["PA0001L8", "PA0002L8"],
+        None,
+        interrupt_before_format.then(|| pause.clone()),
     );
-    let (leader, round) = c.wait_serving(None, 0);
+    let (mut leader, mut round) = c.wait_serving(None, 0);
     c.wait("链接服务开放", || {
         c.services[&leader].serving_round() == Some(round)
     });
     let endpoints = c.start_http();
     let mut cl = Client::new(endpoints.clone());
+    if interrupt_before_format {
+        pause
+            .initiator
+            .store(leader as u32, std::sync::atomic::Ordering::SeqCst);
+    }
     c.admin(Command::TapeReclaim {
         barcode: "PA0001L8".into(),
     });
+    if interrupt_before_format {
+        entered_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("未到达源带格式化前屏障");
+        assert_eq!(c.st(leader).tapes["PA0001L8"].state, "reclaiming");
+        // FORMAT has not reached the source. Its original links still exist,
+        // while the destination catalog has already durably moved every path.
+        let source = c.lib.cartridge("PA0001L8").unwrap();
+        let detached = SimLibrary::new(1, 2, 0);
+        detached.insert_cartridge(source, 0).unwrap();
+        detached.load_into_drive("PA0001L8", 0).unwrap();
+        let drive = detached.drive(0);
+        let source = LtfsVolume::mount(&drive).unwrap();
+        for (name, target) in links {
+            assert_eq!(
+                source.index().find_file(name).unwrap().symlink.as_deref(),
+                Some(target)
+            );
+            assert_eq!(
+                cl.stat(&format!("/{name}")).unwrap().unwrap().barcode,
+                "PA0002L8"
+            );
+        }
+        let old = leader;
+        c.isolated.lock().unwrap().insert(old);
+        (leader, round) = c.wait_serving(Some(old), round + 1);
+        c.wait("新执行者完成回收", || {
+            c.st(leader)
+                .last_reclaim
+                .as_ref()
+                .is_some_and(|r| r.outcome == "done")
+        });
+        let finished_source = c.lib.cartridge("PA0001L8").unwrap();
+        resume_tx.send(()).unwrap();
+        // PREEMPT reports reservation-loss UNIT ATTENTION or conflict. Both
+        // stop the production executor, rather than retrying a stale FORMAT.
+        assert!(
+            returned_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            "旧FORMAT未报告执行资格丢失"
+        );
+        // The delayed old command cannot erase the newly formatted source.
+        let after = c.lib.cartridge("PA0001L8").unwrap();
+        assert_eq!(
+            after.partitions[0].objects,
+            finished_source.partitions[0].objects
+        );
+        assert_eq!(
+            after.partitions[1].objects,
+            finished_source.partitions[1].objects
+        );
+        c.isolated.lock().unwrap().clear();
+        let applied = c.st(leader).applied_index;
+        c.wait("旧节点追上源带状态", || {
+            let state = c.st(old);
+            state.applied_index >= applied && state.tapes["PA0001L8"].state == "appendable"
+        });
+    }
     c.wait("链接回收结束", || c.st(leader).last_reclaim.is_some());
     let outcome = c.st(leader).last_reclaim.unwrap();
     assert_eq!(outcome.outcome, "done", "{outcome:?}");
