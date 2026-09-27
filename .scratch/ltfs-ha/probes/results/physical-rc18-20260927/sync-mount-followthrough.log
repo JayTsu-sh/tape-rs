@@ -1,0 +1,53 @@
+SYNC POSITION NATIVE PASSED
+[2026-09-27T11:07:54Z INFO  tape_rs::changer::commands] 移动介质: 从 0x03ef 到 0x0001
+[2026-09-27T11:08:19Z INFO  tape_rs::changer::commands] 移动完成
+[2026-09-27T11:08:20Z INFO  tape_rs::tape::commands] 装载磁带...
+[2026-09-27T11:08:24Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 1 次）
+[2026-09-27T11:08:26Z INFO  tape_rs::tape::commands] 装载完成
+{"interface": "rust-library", "kind": "load", "barcode": "RC0018L9", "move_seconds": 25.419278320972808, "total_seconds": 31.594228541944176, "scsi_io": {"iorequest_cnt": "0x453cc", "iodone_cnt": "0x453cc", "ioerr_cnt": "0x3ed9"}, "wall_time": 1790507306.174305}
+{"chain_depth": 0, "generation": 20, "history_checked": false, "interface": "rust-library", "kind": "mount", "notes": ["\u53cc\u5206\u533a\u6700\u65b0 Full \u6784\u9020\u4e0e\u65b0\u9c9c VCI \u4e00\u81f4\uff1b\u672a\u626b\u63cf\u5386\u53f2 Full \u94fe"], "seconds": 124.856249357, "scsi_io": {"iorequest_cnt": "0x453ee", "iodone_cnt": "0x453ee", "ioerr_cnt": "0x3ede"}, "wall_time": 1790507431.0388567}
+{"bytes": 131072, "commit_seconds": 10.030344287, "count": 32, "data_seconds": 0.152571994, "generation": 21, "group": "mount-fast-0", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 124.856249357, "total_seconds": 10.182920768, "scsi_io": {"iorequest_cnt": "0x4543b", "iodone_cnt": "0x4543b", "ioerr_cnt": "0x3ede"}, "wall_time": 1790507441.222125}
+{"generation": 21, "interface": "rust-library", "kind": "checkpoint", "seconds": 49.772044521, "scsi_io": {"iorequest_cnt": "0x45448", "iodone_cnt": "0x45448", "ioerr_cnt": "0x3ede"}, "wall_time": 1790507490.9941738}
+{"borrowed": false, "interface": "rust-library", "kind": "direct-io", "read": {"direct": 0, "indirect": 15, "mixed": 0}, "store_sha256": false, "write": {"direct": 0, "indirect": 44, "mixed": 0}, "scsi_io": {"iorequest_cnt": "0x45448", "iodone_cnt": "0x45448", "ioerr_cnt": "0x3ede"}, "wall_time": 1790507490.9943366}
+{"interface": "rust-library", "kind": "resource", "mode": "write-groups", "group": "all", "maxrss_kib": 19052, "user_seconds": 0.056039, "system_seconds": 0.013489, "wall_seconds": 184.81797874497715, "scsi_io": {"iorequest_cnt": "0x45448", "iodone_cnt": "0x45448", "ioerr_cnt": "0x3ede"}, "wall_time": 1790507490.9972498}
+[2026-09-27T11:11:31Z INFO  tape_rs::tape::commands] 弹出磁带...
+[2026-09-27T11:13:07Z INFO  tape_rs::tape::commands] 弹出完成
+[2026-09-27T11:13:07Z INFO  tape_rs::changer::commands] 移动介质: 从 0x0001 到 0x03ef
+[2026-09-27T11:13:35Z INFO  tape_rs::changer::commands] 移动完成
+{"interface": "rust-library", "kind": "unload", "barcode": "RC0018L9", "checkpoint_seconds": 49.772044521, "unthread_seconds": 96.15774731594138, "total_seconds": 174.07255181699315, "scsi_io": {"iorequest_cnt": "0x45449", "iodone_cnt": "0x45449", "ioerr_cnt": "0x3ede"}, "wall_time": 1790507615.4298327}
+[2026-09-27T11:13:35Z INFO  tape_rs::changer::commands] 移动介质: 从 0x03ef 到 0x0001
+[2026-09-27T11:14:00Z INFO  tape_rs::changer::commands] 移动完成
+[2026-09-27T11:14:00Z INFO  tape_rs::tape::commands] 装载磁带...
+[2026-09-27T11:14:05Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 1 次）
+[2026-09-27T11:14:07Z INFO  tape_rs::tape::commands] 装载完成
+{"interface": "rust-library", "kind": "load", "barcode": "RC0018L9", "move_seconds": 24.92969944397919, "total_seconds": 31.55665693595074, "scsi_io": {"iorequest_cnt": "0x4544b", "iodone_cnt": "0x4544b", "ioerr_cnt": "0x3edf"}, "wall_time": 1790507647.1465118}
+{"chain_depth": 0, "generation": 21, "history_checked": false, "interface": "rust-library", "kind": "mount", "notes": ["\u53cc\u5206\u533a\u6700\u65b0 Full \u6784\u9020\u4e0e\u65b0\u9c9c VCI \u4e00\u81f4\uff1b\u672a\u626b\u63cf\u5386\u53f2 Full \u94fe"], "seconds": 121.4586429, "scsi_io": {"iorequest_cnt": "0x4546a", "iodone_cnt": "0x45469", "ioerr_cnt": "0x3ee4"}, "wall_time": 1790507768.7749045}
+{"bytes": 18256916736, "count": 3273, "group": "all", "interface": "rust-library", "kind": "read", "label": "first", "mount_seconds": 121.4586429, "seconds": 142.036638831, "verified": true, "scsi_io": {"iorequest_cnt": "0x4f5f7", "iodone_cnt": "0x4f5f6", "ioerr_cnt": "0x4ba8"}, "wall_time": 1790507910.811599}
+{"bytes": 18256916736, "count": 3273, "group": "all", "interface": "rust-library", "kind": "read", "label": "repeat", "mount_seconds": 121.4586429, "seconds": 140.363721279, "verified": true, "scsi_io": {"iorequest_cnt": "0x59783", "iodone_cnt": "0x59783", "ioerr_cnt": "0x586c"}, "wall_time": 1790508051.1753397}
+{"borrowed": false, "interface": "rust-library", "kind": "direct-io", "read": {"direct": 0, "indirect": 76183, "mixed": 0}, "store_sha256": false, "write": {"direct": 0, "indirect": 0, "mixed": 0}, "scsi_io": {"iorequest_cnt": "0x59783", "iodone_cnt": "0x59783", "ioerr_cnt": "0x586c"}, "wall_time": 1790508051.1755207}
+{"interface": "rust-library", "kind": "resource", "mode": "read", "group": "all", "maxrss_kib": 19052, "user_seconds": 34.557508, "system_seconds": 3.740059, "wall_seconds": 404.04014472907875, "scsi_io": {"iorequest_cnt": "0x59783", "iodone_cnt": "0x59783", "ioerr_cnt": "0x586c"}, "wall_time": 1790508051.186842}
+[2026-09-27T11:20:51Z INFO  tape_rs::tape::commands] 弹出磁带...
+[2026-09-27T11:21:54Z INFO  tape_rs::tape::commands] 弹出完成
+[2026-09-27T11:21:54Z INFO  tape_rs::changer::commands] 移动介质: 从 0x0001 到 0x03ef
+[2026-09-27T11:22:27Z INFO  tape_rs::changer::commands] 移动完成
+{"interface": "rust-library", "kind": "unload", "barcode": "RC0018L9", "checkpoint_seconds": 0.0, "unthread_seconds": 63.221013007103465, "total_seconds": 96.59026241104584, "scsi_io": {"iorequest_cnt": "0x59784", "iodone_cnt": "0x59784", "ioerr_cnt": "0x586c"}, "wall_time": 1790508147.908701}
+{"kind": "complete", "passed": true, "scope": "native; LE cross-read follows separately", "scsi_io": {"iorequest_cnt": "0x59784", "iodone_cnt": "0x59784", "ioerr_cnt": "0x586c"}, "wall_time": 1790508147.9088492}
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+{"interface": "IBM-LE-FUSE", "kind": "load", "barcode": "RC0018L9", "move_seconds": 23.02750108507462, "total_seconds": 23.02750248403754, "namespace_seconds": 19.744018942001276, "ltfs_rss_kib": 24148, "ltfs_hwm_kib": 24148, "ltfs_cpu_seconds": 0.28, "probe_hwm_kib": 18240, "probe_cpu_seconds": 0.27579899999999996, "scsi_io": {"iorequest_cnt": "0x1cd24", "iodone_cnt": "0x1cd24", "ioerr_cnt": "0x75"}, "wall_time": 1790508192.7196937}
+{"interface": "IBM-LE-FUSE", "kind": "read", "label": "first", "count": 3273, "bytes": 18256916736, "seconds": 66.06313247908838, "verified": true, "ltfs_rss_kib": 29740, "ltfs_hwm_kib": 29740, "ltfs_cpu_seconds": 7.87, "probe_hwm_kib": 19844, "probe_cpu_seconds": 21.615425000000002, "scsi_io": {"iorequest_cnt": "0x26210", "iodone_cnt": "0x26210", "ioerr_cnt": "0x75"}, "wall_time": 1790508258.783641}
+{"interface": "IBM-LE-FUSE", "kind": "read", "label": "repeat", "count": 3273, "bytes": 18256916736, "seconds": 19.66452933999244, "verified": true, "ltfs_rss_kib": 30344, "ltfs_hwm_kib": 30344, "ltfs_cpu_seconds": 7.99, "probe_hwm_kib": 20044, "probe_cpu_seconds": 41.110868, "scsi_io": {"iorequest_cnt": "0x26210", "iodone_cnt": "0x26210", "ioerr_cnt": "0x75"}, "wall_time": 1790508278.4486632}
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+{"interface": "IBM-LE-FUSE", "kind": "unload", "barcode": "RC0018L9", "total_seconds": 93.67231158004142, "ltfs_rss_kib": 31684, "ltfs_hwm_kib": 31684, "ltfs_cpu_seconds": 8.05, "probe_hwm_kib": 20044, "probe_cpu_seconds": 41.19339399999999, "scsi_io": {"iorequest_cnt": "0x26234", "iodone_cnt": "0x26234", "ioerr_cnt": "0x78"}, "wall_time": 1790508372.1214402}
+{"kind": "complete", "passed": true, "ltfs_rss_kib": 31684, "ltfs_hwm_kib": 31684, "ltfs_cpu_seconds": 8.05, "probe_hwm_kib": 20044, "probe_cpu_seconds": 41.193740999999996, "scsi_io": {"iorequest_cnt": "0x26234", "iodone_cnt": "0x26234", "ioerr_cnt": "0x78"}, "wall_time": 1790508372.1217313}
+[2026-09-27T11:26:14Z INFO  tape_rs::scsi::reservation] /dev/sg3: PERSISTENT RESERVE IN 前越过 UNIT ATTENTION 2a/01
+SYNC/MOUNT ALL PASSED

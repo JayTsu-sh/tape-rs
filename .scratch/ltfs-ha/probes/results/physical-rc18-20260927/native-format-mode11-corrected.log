@@ -1,0 +1,6 @@
+SCSI Status: Check Condition
+
+Sense Information:
+Fixed format, current; Sense key: Recovered Error
+Additional sense: Rounded parameter
+  Field replaceable unit code: 48

@@ -1,0 +1,7 @@
+SCSI Status: Check Condition
+
+Sense Information:
+Fixed format, current; Sense key: Illegal Request
+Additional sense: Invalid field in parameter list
+  Field replaceable unit code: 48
+  Sense Key Specific: Error in Data parameters: byte 10 bit 7

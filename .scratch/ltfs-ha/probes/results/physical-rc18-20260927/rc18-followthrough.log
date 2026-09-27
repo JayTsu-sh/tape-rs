@@ -1,0 +1,94 @@
+[2026-09-27T10:08:46Z INFO  tape_rs::tape::commands] 弹出磁带...
+[2026-09-27T10:09:51Z INFO  tape_rs::tape::commands] 弹出完成
+弹出完成
+
+[2026-09-27T10:09:51Z INFO  tape_rs::changer::commands] 移动介质: 从 0x0001 到 0x03ef
+[2026-09-27T10:10:24Z INFO  tape_rs::changer::commands] 移动完成
+卸载: drive 0 (addr 0x0001) → slot 7 (addr 0x03ef)
+卸载完成
+
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+FORMAT RC0018L9 ONLY: common empty baseline
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+Tape RC0018L9 has been successfully formatted.
+
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+Tape RC0018L9 has been successfully moved.
+
+[2026-09-27T10:13:36Z INFO  tape_rs::scsi::reservation] /dev/sg3: PERSISTENT RESERVE IN 前越过 UNIT ATTENTION 2a/01
+NATIVE PERFORMANCE
+[2026-09-27T10:13:36Z INFO  tape_rs::changer::commands] 移动介质: 从 0x03ef 到 0x0001
+[2026-09-27T10:14:01Z INFO  tape_rs::changer::commands] 移动完成
+[2026-09-27T10:14:01Z INFO  tape_rs::tape::commands] 装载磁带...
+[2026-09-27T10:14:05Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 1 次）
+[2026-09-27T10:14:07Z INFO  tape_rs::tape::commands] 装载完成
+{"interface": "rust-library", "kind": "load", "barcode": "RC0018L9", "move_seconds": 24.979008021065965, "total_seconds": 31.168478815001436, "scsi_io": {"iorequest_cnt": "0x12bee", "iodone_cnt": "0x12bee", "ioerr_cnt": "0xc8a"}, "wall_time": 1790504047.409884}
+{"bytes": 1073741824, "commit_seconds": 10.522932113, "count": 4, "data_seconds": 5.04744148, "generation": 2, "group": "large", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 20.332478401, "total_seconds": 15.570377668999999, "scsi_io": {"iorequest_cnt": "0x1340e", "iodone_cnt": "0x1340e", "ioerr_cnt": "0xc8f"}, "wall_time": 1790504084.6613033}
+{"bytes": 17179869184, "commit_seconds": 10.626832094, "count": 1, "data_seconds": 64.227955708, "generation": 3, "group": "stream", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 20.332478401, "total_seconds": 74.85479386, "scsi_io": {"iorequest_cnt": "0x1b417", "iodone_cnt": "0x1b417", "ioerr_cnt": "0xc8f"}, "wall_time": 1790504177.9872344}
+{"bytes": 1048576, "commit_seconds": 19.929043157, "count": 256, "data_seconds": 26.257778481, "generation": 4, "group": "small", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 20.332478401, "total_seconds": 46.186829967, "scsi_io": {"iorequest_cnt": "0x1b61f", "iodone_cnt": "0x1b61f", "ioerr_cnt": "0xc8f"}, "wall_time": 1790504224.176355}
+{"count": 4, "group": "large", "interface": "rust-library", "kind": "list", "mount_seconds": 20.332478401, "samples_ms": [0.0022819999999999997, 0.00031800000000000003, 0.00026, 0.000209, 0.000212, 0.000211, 0.000211, 0.000214, 0.000245, 0.000237], "scsi_io": {"iorequest_cnt": "0x1b61f", "iodone_cnt": "0x1b61f", "ioerr_cnt": "0xc8f"}, "wall_time": 1790504224.176534}
+{"count": 256, "group": "small", "interface": "rust-library", "kind": "list", "mount_seconds": 20.332478401, "samples_ms": [0.010059, 0.010364, 0.009826999999999999, 0.009608, 0.009534, 0.009736, 0.00956, 0.009754, 0.009764, 0.009488], "scsi_io": {"iorequest_cnt": "0x1b61f", "iodone_cnt": "0x1b61f", "ioerr_cnt": "0xc8f"}, "wall_time": 1790504224.1766567}
+{"bytes": 160000, "commit_seconds": 16.208356608, "count": 2500, "data_seconds": 18.327744876, "generation": 5, "group": "growth", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 20.332478401, "total_seconds": 34.536129099, "scsi_io": {"iorequest_cnt": "0x1c9b3", "iodone_cnt": "0x1c9b3", "ioerr_cnt": "0xc8f"}, "wall_time": 1790504258.7242255}
+{"count": 4, "group": "large", "interface": "rust-library", "kind": "list", "mount_seconds": 20.332478401, "samples_ms": [0.002994, 0.000366, 0.000253, 0.000239, 0.00020800000000000001, 0.000225, 0.000224, 0.000209, 0.00026, 0.000225], "scsi_io": {"iorequest_cnt": "0x1c9b3", "iodone_cnt": "0x1c9b3", "ioerr_cnt": "0xc8f"}, "wall_time": 1790504258.7244282}
+{"count": 256, "group": "small", "interface": "rust-library", "kind": "list", "mount_seconds": 20.332478401, "samples_ms": [0.017652, 0.010775, 0.010142, 0.009801, 0.009602000000000001, 0.010073, 0.010019, 0.009777, 0.009806, 0.009627], "scsi_io": {"iorequest_cnt": "0x1c9b4", "iodone_cnt": "0x1c9b3", "ioerr_cnt": "0xc8f"}, "wall_time": 1790504258.724567}
+{"bytes": 131072, "commit_seconds": 21.094798422, "count": 32, "data_seconds": 13.18938378, "generation": 6, "group": "continuous-00", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 20.332478401, "total_seconds": 34.284188062, "scsi_io": {"iorequest_cnt": "0x1c9ff", "iodone_cnt": "0x1c9ff", "ioerr_cnt": "0xc8f"}, "wall_time": 1790504293.0088868}
+{"bytes": 131072, "commit_seconds": 11.964842187, "count": 32, "data_seconds": 13.316088716, "generation": 7, "group": "continuous-01", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 20.332478401, "total_seconds": 25.280936853, "scsi_io": {"iorequest_cnt": "0x1ca4b", "iodone_cnt": "0x1ca4b", "ioerr_cnt": "0xc8f"}, "wall_time": 1790504318.2901652}
+{"bytes": 131072, "commit_seconds": 15.718415325, "count": 32, "data_seconds": 27.194911684, "generation": 8, "group": "continuous-02", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 20.332478401, "total_seconds": 42.913333527, "scsi_io": {"iorequest_cnt": "0x1ca97", "iodone_cnt": "0x1ca97", "ioerr_cnt": "0xc8f"}, "wall_time": 1790504361.2038467}
+{"bytes": 131072, "commit_seconds": 15.726236552, "count": 32, "data_seconds": 27.591491338, "generation": 9, "group": "continuous-03", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 20.332478401, "total_seconds": 43.317733432, "scsi_io": {"iorequest_cnt": "0x1cae4", "iodone_cnt": "0x1cae4", "ioerr_cnt": "0xc8f"}, "wall_time": 1790504404.5219254}
+{"bytes": 131072, "commit_seconds": 11.937485137, "count": 32, "data_seconds": 13.789448296, "generation": 10, "group": "continuous-04", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 20.332478401, "total_seconds": 25.726939187, "scsi_io": {"iorequest_cnt": "0x1cb31", "iodone_cnt": "0x1cb31", "ioerr_cnt": "0xc8f"}, "wall_time": 1790504430.2492}
+{"bytes": 131072, "commit_seconds": 15.75180719, "count": 32, "data_seconds": 28.336689447, "generation": 11, "group": "continuous-05", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 20.332478401, "total_seconds": 44.088502714, "scsi_io": {"iorequest_cnt": "0x1cb7e", "iodone_cnt": "0x1cb7e", "ioerr_cnt": "0xc8f"}, "wall_time": 1790504474.3380618}
+{"bytes": 131072, "commit_seconds": 16.489860267, "count": 32, "data_seconds": 14.110091266, "generation": 12, "group": "continuous-06", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 20.332478401, "total_seconds": 30.599958165, "scsi_io": {"iorequest_cnt": "0x1cbcb", "iodone_cnt": "0x1cbcb", "ioerr_cnt": "0xc8f"}, "wall_time": 1790504504.9383845}
+{"bytes": 131072, "commit_seconds": 11.955190901, "count": 32, "data_seconds": 14.251409157, "generation": 13, "group": "continuous-07", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 20.332478401, "total_seconds": 26.206605879, "scsi_io": {"iorequest_cnt": "0x1cc18", "iodone_cnt": "0x1cc18", "ioerr_cnt": "0xc8f"}, "wall_time": 1790504531.1453364}
+{"bytes": 131072, "commit_seconds": 15.863105658, "count": 32, "data_seconds": 30.129026476, "generation": 14, "group": "continuous-08", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 20.332478401, "total_seconds": 45.992137747, "scsi_io": {"iorequest_cnt": "0x1cc65", "iodone_cnt": "0x1cc65", "ioerr_cnt": "0xc8f"}, "wall_time": 1790504577.1378484}
+{"bytes": 131072, "commit_seconds": 11.969801984, "count": 32, "data_seconds": 4.501380661, "generation": 15, "group": "continuous-09", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 20.332478401, "total_seconds": 16.47118813, "scsi_io": {"iorequest_cnt": "0x1ccb2", "iodone_cnt": "0x1ccb2", "ioerr_cnt": "0xc8f"}, "wall_time": 1790504593.6093671}
+{"bytes": 131072, "commit_seconds": 11.194755101, "count": 32, "data_seconds": 6.696055419, "generation": 16, "group": "continuous-10", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 20.332478401, "total_seconds": 17.890816276, "scsi_io": {"iorequest_cnt": "0x1ccff", "iodone_cnt": "0x1ccff", "ioerr_cnt": "0xc8f"}, "wall_time": 1790504611.5005708}
+{"bytes": 131072, "commit_seconds": 11.33594556, "count": 32, "data_seconds": 7.644967745, "generation": 17, "group": "continuous-11", "interface": "rust-library", "kind": "write", "mixed_reads": 0, "mount_seconds": 20.332478401, "total_seconds": 18.980919705, "scsi_io": {"iorequest_cnt": "0x1cd4c", "iodone_cnt": "0x1cd4c", "ioerr_cnt": "0xc8f"}, "wall_time": 1790504630.4818318}
+{"generation": 17, "interface": "rust-library", "kind": "checkpoint", "seconds": 49.812000319, "scsi_io": {"iorequest_cnt": "0x1cd59", "iodone_cnt": "0x1cd59", "ioerr_cnt": "0xc8f"}, "wall_time": 1790504680.2938483}
+{"borrowed": false, "interface": "rust-library", "kind": "direct-io", "read": {"direct": 0, "indirect": 5, "mixed": 0}, "store_sha256": false, "write": {"direct": 0, "indirect": 38039, "mixed": 0}, "scsi_io": {"iorequest_cnt": "0x1cd59", "iodone_cnt": "0x1cd59", "ioerr_cnt": "0xc8f"}, "wall_time": 1790504680.294009}
+{"interface": "rust-library", "kind": "resource", "mode": "write-groups", "group": "all", "maxrss_kib": 17088, "user_seconds": 17.269763, "system_seconds": 7.018032, "wall_seconds": 632.8868059760425, "scsi_io": {"iorequest_cnt": "0x1cd59", "iodone_cnt": "0x1cd59", "ioerr_cnt": "0xc8f"}, "wall_time": 1790504680.296947}
+[2026-09-27T10:24:40Z INFO  tape_rs::tape::commands] 弹出磁带...
+[2026-09-27T10:26:15Z INFO  tape_rs::tape::commands] 弹出完成
+[2026-09-27T10:26:15Z INFO  tape_rs::changer::commands] 移动介质: 从 0x0001 到 0x03ef
+[2026-09-27T10:26:48Z INFO  tape_rs::changer::commands] 移动完成
+{"interface": "rust-library", "kind": "unload", "barcode": "RC0018L9", "checkpoint_seconds": 49.812000319, "unthread_seconds": 95.2112993960036, "total_seconds": 177.51186646100751, "scsi_io": {"iorequest_cnt": "0x1cd5a", "iodone_cnt": "0x1cd5a", "ioerr_cnt": "0xc8f"}, "wall_time": 1790504808.130327}
+[2026-09-27T10:26:48Z INFO  tape_rs::changer::commands] 移动介质: 从 0x03ef 到 0x0001
+[2026-09-27T10:27:13Z INFO  tape_rs::changer::commands] 移动完成
+[2026-09-27T10:27:13Z INFO  tape_rs::tape::commands] 装载磁带...
+[2026-09-27T10:27:18Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 1 次）
+[2026-09-27T10:27:20Z INFO  tape_rs::tape::commands] 装载完成
+{"interface": "rust-library", "kind": "load", "barcode": "RC0018L9", "move_seconds": 25.369778065942228, "total_seconds": 31.85274718492292, "scsi_io": {"iorequest_cnt": "0x1cd5c", "iodone_cnt": "0x1cd5c", "ioerr_cnt": "0xc90"}, "wall_time": 1790504840.143593}
+{"bytes": 18256392448, "count": 3145, "group": "all", "interface": "rust-library", "kind": "read", "label": "first", "mount_seconds": 348.412936566, "seconds": 139.276645878, "verified": true, "scsi_io": {"iorequest_cnt": "0x26e70", "iodone_cnt": "0x26e6f", "ioerr_cnt": "0x18f9"}, "wall_time": 1790505327.9900842}
+{"bytes": 18256392448, "count": 3145, "group": "all", "interface": "rust-library", "kind": "read", "label": "repeat", "mount_seconds": 348.412936566, "seconds": 137.162216109, "verified": true, "scsi_io": {"iorequest_cnt": "0x30efc", "iodone_cnt": "0x30efc", "ioerr_cnt": "0x253d"}, "wall_time": 1790505465.1523275}
+{"borrowed": false, "interface": "rust-library", "kind": "direct-io", "read": {"direct": 0, "indirect": 76015, "mixed": 0}, "store_sha256": false, "write": {"direct": 0, "indirect": 0, "mixed": 0}, "scsi_io": {"iorequest_cnt": "0x30efc", "iodone_cnt": "0x30efc", "ioerr_cnt": "0x253d"}, "wall_time": 1790505465.1524987}
+{"interface": "rust-library", "kind": "resource", "mode": "read", "group": "all", "maxrss_kib": 18112, "user_seconds": 34.496581, "system_seconds": 3.612016, "wall_seconds": 625.0180825439747, "scsi_io": {"iorequest_cnt": "0x30efc", "iodone_cnt": "0x30efc", "ioerr_cnt": "0x253d"}, "wall_time": 1790505465.1619222}
+[2026-09-27T10:37:45Z INFO  tape_rs::tape::commands] 弹出磁带...
+[2026-09-27T10:38:49Z INFO  tape_rs::tape::commands] 弹出完成
+[2026-09-27T10:38:49Z INFO  tape_rs::changer::commands] 移动介质: 从 0x0001 到 0x03ef
+[2026-09-27T10:39:23Z INFO  tape_rs::changer::commands] 移动完成
+{"interface": "rust-library", "kind": "unload", "barcode": "RC0018L9", "checkpoint_seconds": 0.0, "unthread_seconds": 64.59945795394015, "total_seconds": 98.4301885770401, "scsi_io": {"iorequest_cnt": "0x30efd", "iodone_cnt": "0x30efd", "ioerr_cnt": "0x253d"}, "wall_time": 1790505563.7206585}
+{"kind": "complete", "passed": true, "scope": "RC18 only; reload measured, cross-tape swap deferred", "scsi_io": {"iorequest_cnt": "0x30efd", "iodone_cnt": "0x30efd", "ioerr_cnt": "0x253d"}, "wall_time": 1790505563.7208068}
+CROSS READ: LE reads Rust data
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+{"interface": "IBM-LE-FUSE", "kind": "load", "barcode": "RC0018L9", "move_seconds": 24.97036834200844, "total_seconds": 24.9703693150077, "namespace_seconds": 18.942049025092274, "ltfs_rss_kib": 20680, "ltfs_hwm_kib": 20680, "ltfs_cpu_seconds": 0.19, "probe_hwm_kib": 17920, "probe_cpu_seconds": 0.27960699999999994, "scsi_io": {"iorequest_cnt": "0x13824", "iodone_cnt": "0x13824", "ioerr_cnt": "0x66"}, "wall_time": 1790505609.6706338}
+{"interface": "IBM-LE-FUSE", "kind": "read", "label": "first", "count": 3145, "bytes": 18256392448, "seconds": 76.60613148589619, "verified": true, "ltfs_rss_kib": 26320, "ltfs_hwm_kib": 26320, "ltfs_cpu_seconds": 7.51, "probe_hwm_kib": 20064, "probe_cpu_seconds": 21.969247, "scsi_io": {"iorequest_cnt": "0x1cc88", "iodone_cnt": "0x1cc88", "ioerr_cnt": "0x66"}, "wall_time": 1790505686.2776556}
+{"interface": "IBM-LE-FUSE", "kind": "read", "label": "repeat", "count": 3145, "bytes": 18256392448, "seconds": 19.740966027020477, "verified": true, "ltfs_rss_kib": 26812, "ltfs_hwm_kib": 26812, "ltfs_cpu_seconds": 7.62, "probe_hwm_kib": 20248, "probe_cpu_seconds": 41.540375, "scsi_io": {"iorequest_cnt": "0x1cc88", "iodone_cnt": "0x1cc88", "ioerr_cnt": "0x66"}, "wall_time": 1790505706.019109}
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+{"interface": "IBM-LE-FUSE", "kind": "unload", "barcode": "RC0018L9", "total_seconds": 94.01059828500729, "ltfs_rss_kib": 28080, "ltfs_hwm_kib": 28080, "ltfs_cpu_seconds": 7.71, "probe_hwm_kib": 20248, "probe_cpu_seconds": 41.619709, "scsi_io": {"iorequest_cnt": "0x1ccac", "iodone_cnt": "0x1ccac", "ioerr_cnt": "0x69"}, "wall_time": 1790505800.0301335}
+{"kind": "complete", "passed": true, "ltfs_rss_kib": 28080, "ltfs_hwm_kib": 28080, "ltfs_cpu_seconds": 7.71, "probe_hwm_kib": 20248, "probe_cpu_seconds": 41.620017999999995, "scsi_io": {"iorequest_cnt": "0x1ccac", "iodone_cnt": "0x1ccac", "ioerr_cnt": "0x69"}, "wall_time": 1790505800.0304067}
+[2026-09-27T10:43:22Z INFO  tape_rs::scsi::reservation] /dev/sg3: PERSISTENT RESERVE IN 前越过 UNIT ATTENTION 2a/01
+ALL RC18 FUNCTIONAL/PERFORMANCE CHECKS PASSED

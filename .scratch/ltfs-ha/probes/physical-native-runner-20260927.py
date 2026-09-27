@@ -47,8 +47,8 @@ assert '存储槽   7 [载带]: RC0018L9' in inv and '存储槽   8 [载带]: RC
 parameter=Path('/sys/module/sg/parameters/allow_dio');old=parameter.read_text()
 (b/'native-allow-dio-before.txt').write_text(old)
 try:
- parameter.write_text('1');assert parameter.read_text().strip()=='1'
+ parameter.write_text('0');assert parameter.read_text().strip()=='0'
  subprocess.run(['python3',str(b/'physical-native-20260927.py')],check=True)
  (b/'physical-native.complete').write_text('Rust full SHA and swaps passed')
 finally:
- parameter.write_text(old);print('allow_dio restored to',old.strip(),flush=True)
+ parameter.write_text('0');print('allow_dio remains disabled (0)',flush=True)

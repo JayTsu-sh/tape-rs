@@ -18,9 +18,9 @@ for barcode in ('RC0018L9','RC0017L9'):
 parameter=Path('/sys/module/sg/parameters/allow_dio');old=parameter.read_text()
 (b/'le-allow-dio-before.txt').write_text(old)
 try:
- parameter.write_text('1');assert parameter.read_text().strip()=='1'
+ parameter.write_text('0');assert parameter.read_text().strip()=='0'
  subprocess.run(['python3',str(b/'physical-le-20260927.py')],check=True)
  (b/'physical-le.complete').write_text('LE full SHA and swaps passed')
 finally:
- parameter.write_text(old)
- print('allow_dio restored to',old.strip(),flush=True)
+ parameter.write_text('0')
+ print('allow_dio remains disabled (0)',flush=True)

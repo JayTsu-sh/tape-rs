@@ -1,12 +1,12 @@
 """与直接库共用清单，LE FUSE 串行数据操作 + 每批显式 LE sync（DP 索引；卸载时更新 IP）；含换带。"""
 import hashlib,json,os,subprocess,time,resource
 from pathlib import Path
-assert os.environ.get('TAPE_RS_PERF_COMPARE')=='RC0018L9-RC0017L9'
+assert os.environ.get('TAPE_RS_PERF_COMPARE')=='RC0018L9'
 base=Path('/root/tape-rs-io-20260927');root=base/'le-mount';leadm='/opt/ibm/ltfsle/bin/leadm';serial='11EB4A80F1'
 assert os.path.ismount(root)
 assert serial in subprocess.check_output([leadm,'drive','list','-s','localhost:17600'],text=True)
-items={b:json.loads((base/(b+'.json')).read_text())['files'] for b in ('RC0018L9','RC0017L9')}
-log=(base/'le-measurements.jsonl').open('x');loaded=None
+items={b:json.loads((base/(b+'.json')).read_text())['files'] for b in ('RC0018L9',)}
+log=(base/'le-rc18-measurements.jsonl').open('x');loaded=None
 ltfs_pids=subprocess.check_output(['pgrep','-x','ltfs'],text=True).split();assert len(ltfs_pids)==1
 ltfs_proc=Path('/proc')/ltfs_pids[0]
 
@@ -14,7 +14,7 @@ def emit(row):
  status=dict(x.split(':',1) for x in (ltfs_proc/'status').read_text().splitlines() if ':' in x)
  stat=(ltfs_proc/'stat').read_text().split();own=resource.getrusage(resource.RUSAGE_SELF);children=resource.getrusage(resource.RUSAGE_CHILDREN)
  row.update(ltfs_rss_kib=int(status['VmRSS'].split()[0]),ltfs_hwm_kib=int(status['VmHWM'].split()[0]),ltfs_cpu_seconds=(int(stat[13])+int(stat[14]))/os.sysconf('SC_CLK_TCK'),probe_hwm_kib=own.ru_maxrss,probe_cpu_seconds=own.ru_utime+own.ru_stime+children.ru_utime+children.ru_stime)
- row['scsi_io']={n:(Path('/sys/class/scsi_device/16:0:0:0/device')/n).read_text().strip() for n in ('iorequest_cnt','iodone_cnt','ioerr_cnt')};row['wall_time']=time.time();s=json.dumps(row);log.write(s+'\n');log.flush();print(s,flush=True)
+ row['scsi_io']={n:(Path('/sys/class/scsi_generic/sg4/device')/n).read_text().strip() for n in ('iorequest_cnt','iodone_cnt','ioerr_cnt')};row['wall_time']=time.time();s=json.dumps(row);log.write(s+'\n');log.flush();print(s,flush=True)
 def command(*args):return subprocess.check_output([leadm,*args,'-s','localhost:17600'],text=True)
 def unload():
  global loaded
@@ -27,7 +27,7 @@ def load(barcode):
  assert loaded is None
  show=json.loads(command('tape','show',barcode));assert show['slot_type']=='SLOT',show
  start=time.monotonic();command('tape','move','-L','drive','-d',serial,barcode);move=time.monotonic()-start
- command('tape','mount','-d',serial,barcode);total=time.monotonic()-start;loaded=barcode
+ total=time.monotonic()-start;loaded=barcode
  # 目录遍历让 LE 建立本卷命名空间；单列，不能把索引缓存命中算作实际读带。
  start=time.monotonic();list(os.scandir(root/barcode));namespace=time.monotonic()-start
  emit(dict(interface='IBM-LE-FUSE',kind='load',barcode=barcode,move_seconds=move,total_seconds=total,namespace_seconds=namespace));return total+namespace
@@ -75,7 +75,10 @@ def listing(group):
   start=time.monotonic();entries=list(os.scandir(root/loaded/'comparison'/group));count=len(entries);samples.append((time.monotonic()-start)*1000)
  emit(dict(interface='IBM-LE-FUSE',kind='list',group=group,count=count,samples_ms=samples))
 
-load('RC0018L9')
+show=json.loads(command('tape','show','RC0018L9'));assert show['slot_type']=='DRIVE',show
+loaded='RC0018L9'
+list(os.scandir(root/loaded))
+emit(dict(interface='IBM-LE-FUSE',kind='initial-manual-load',barcode=loaded,timed=False))
 for group in ['large','stream','small','growth']+[f'continuous-{i:02}' for i in range(12)]:
  write(group)
  if group in ('small','growth'):
@@ -83,17 +86,4 @@ for group in ['large','stream','small','growth']+[f'continuous-{i:02}' for i in 
 unload()
 # 取消分配并重新分配，清除该卷的 FUSE 命名空间后再做首次读。
 command('tape','unassign','RC0018L9');command('tape','assign','RC0018L9');load('RC0018L9');reads();unload()
-load('RC0017L9')
-for group in ('switch-volume','switch-read'):write(group)
-unload();command('tape','unassign','RC0017L9');command('tape','assign','RC0017L9');load('RC0017L9');reads()
-for i in range(2):
- target='RC0018L9' if i%2==0 else 'RC0017L9';path='comparison/large/f00000' if i%2==0 else 'comparison/switch-read/f00000'
- start=time.monotonic();unload();load(target);reads(path)
- emit(dict(interface='IBM-LE-FUSE',kind='cross-tape-first-read',cycle=i,barcode=target,bytes=256*2**20,seconds=time.monotonic()-start))
-unload();emit(dict(kind='complete',passed=True))
-
-# 独立诊断不写入计时JSONL；发生错误则外层不会发布LE完成标记。
-if Path('/sys/module/sg/parameters/allow_dio').read_text().strip()=='1':
- subprocess.run(['python3',str(base/'physical-direct-diagnostic-20260927.py')],check=True)
-else:
- print('SG direct I/O 已关闭，跳过 direct I/O 诊断',flush=True)
+emit(dict(kind='complete',passed=True,scope='RC18 only; reload measured, cross-tape swap deferred'))

@@ -1,0 +1,2 @@
+{"bytes":18256392448,"count":3145,"group":"all","interface":"rust-library","kind":"read","label":"first","mount_seconds":277.521031809,"seconds":134.94662108,"verified":true}
+{"borrowed":false,"interface":"rust-library","kind":"direct-io","read":{"direct":0,"indirect":38035,"mixed":0},"store_sha256":false,"write":{"direct":0,"indirect":0,"mixed":0}}

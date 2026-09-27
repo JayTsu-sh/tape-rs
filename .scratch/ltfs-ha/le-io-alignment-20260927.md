@@ -77,3 +77,28 @@ LE计时完成后另运行physical-direct-diagnostic-20260927.py，单独追踪8
 
 - tape-rs-candidate: `6f8c525209f5a525597d33b588f16d96aea54b3c7b32ed56ce05bf9b94f0eef5`
 - performance_compare: `7f9f6b858554a152b72c5ff2a385a1eba164e13af852ea716812aad2b0b189dc`
+
+
+## 16:16CST 用户改为RC0018L9
+
+用户要求换成RC0018L9。实查RC17的LOAD仍在途（2031776ms，超时7200000ms）。没有强制中断、复位或机械移动。已核验两个性能supervisor均尚未产生子进程/计时文件，仅停止这两个等待进程1107426、1129509。保留正在执行的LE/format-second作业。新supervisor1170428等待format-baseline.complete后核验两盘均在槽位，正常move/mount RC18；结果写switch-to-RC0018L9.log/.complete。当前未确认换带完成，allow_dio=0。不得恢复旧双带测试与此流程竞争。
+
+
+## 16:18CST 显式强制中断授权
+
+用户要求强制中断驱动器换带。已停止所有本轮格式化/自动切换控制器，先SIGSTOP私有LE防止复位后继续格式化，再对同一LU naa.5000e111eb4a80f1执行device-only/no-escalation复位（sg5及sg3，均返回0），SIGKILL私有LE并正常卸载死亡的FUSE。未做总线/HBA复位。原LOAD依然在kernel请求表；TUR先返回复位UA，后返回NOT READY/becoming ready。已通过candidate发出UNLOAD（300s），正在等待，不能视为退带成功。库存RC17仍在drive1，RC18slot7。PR仍为原LEkey/type3，没有抢占。若主机退带失败，需要带库管理地址/登录方式，已询问用户。此前两个性能supervisor及自动换RC18等待任务均已停止。
+
+
+16:25CST结果：主机退带失败，SCSI host error0x0003（超时），实际约326秒。原LE LOAD仍留在内核；没有成功换带，也未向机械手发移动命令。LE及所有自动控制器均停止，私有FUSE已卸载，allow_dio0。等待带库管理IP/登录方式执行驱动器硬复位/强制退带。证据见probes/results/physical-forced-switch-20260927.json。
+
+## 16:59 实机 RC18 重启后验证
+
+RC0018L9 装带已由库存、MAM 条码和 LTFS UUID 三重核实。原配置 allow_dio=0 下，Rust 两次读取空卷 Full1、双分区 Complete 成功。allow_dio=1 时 LE 和 Rust 均无法读取索引；Rust strace 记录 512KiB READ(6) 请求 SG_FLAG_DIRECT_IO，SG_IO 立即返回 EINVAL。尚未证明具体 HBA/页分段根因，不能宣称 direct I/O 在实机验证通过。性能脚本未完成任何写入组；重新读取仍为空卷。LE 正常退出并释放 PR，allow_dio 恢复0，RC18 留在驱动器、RC17 在槽8。证据见 probes/results/physical-rc18-reboot-direct-20260927.json。
+
+## 17:20 用户要求关闭 SG direct I/O
+
+已在 .143 显式设置并回读 allow_dio=0；实机 LE/Rust runner 及 RC18 runner 已改为保持0，不再自动启用，禁用时跳过 direct 专用诊断。后续对照统一使用 indirect I/O。未执行读写或机械命令，未修改启动配置。脚本 Python 语法检查通过。证据：probes/results/physical-sg-direct-disabled-20260927.json。
+
+## 2026-09-27 最终优化轮已通过
+
+源提交344e9b1；259软件测试通过、7硬件测试忽略，严格Clippy/格式/兼容构建通过。RC18原生格式化及3145文件16批写入、卸载重载Rust两轮SHA、LE两轮SHA均成功，完成标志physical-io-final.complete。最终drive空、RC18槽7/RC17槽8、LE退出、PR无持有者、allow_dio0。详细性能、失败及修复证据见[最终验收](physical-rc18-final-validation-20260927.md)。EOD无兼容回退。保留剩余小批sync差距和跨两盘未验收边界，不宣称全面追平LE。

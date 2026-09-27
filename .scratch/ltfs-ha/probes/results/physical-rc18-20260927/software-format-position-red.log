@@ -1,0 +1,22 @@
+   Compiling tape-rs v0.1.0 (/work/jay/tape-rs-ltfs-recovery-ibm-interop)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.72s
+     Running tests/le_sync.rs (/work/cargo-target/debug/deps/le_sync-70a8e2f24cfb5648)
+
+running 1 test
+test reformat_from_data_partition_positions_at_partition_zero_first ... FAILED
+
+failures:
+
+---- reformat_from_data_partition_positions_at_partition_zero_first stdout ----
+
+thread 'reformat_from_data_partition_positions_at_partition_zero_first' (106241) panicked at tests/le_sync.rs:569:87:
+called `Result::unwrap()` on an `Err` value: ScsiCommand { status: 2, sense_key: 5, asc: 59, ascq: 12 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    reformat_from_data_partition_positions_at_partition_zero_first
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 20 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--test le_sync`
