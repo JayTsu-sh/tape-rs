@@ -1,3 +1,15 @@
+## 2026-09-27 21:01 CST — LE API/SCSI轨迹调研及冷读验收完成
+
+活动工作树 `/work/jay/tape-rs-ltfs-recovery-ibm-interop`。本轮只增调研/探针/证据，未改生产Rust。主报告 `.scratch/ltfs-ha/le-api-scsi-direct-io-research-20260927.md`，固定提交源码依据 `le-api-source-paths-20260927.md`；raw/decoded在 `probes/results/physical-le-api-20260927/`。78个分段全部完成，551条LE SG_IO、未解析0；87条读写均请求DIRECT但实际indirect。
+
+实测private LE2.4.8.2 / sync_type=unmount：dirty fsync/fdatasync各仅1次4KiB WRITE6、约13.3s；clean重复无CDB。ltfs.sync / leadm sync才写数据+DP Full/FM/MAM、约27s；无数据时index阶段约13s。clean卷sync只有健康/属性查询；close-only写数据不写index；syncfs无CDB，后续close才刷新。全局sync未实测，IBM官方语义是不自动LE卷同步。热open无CDB；搬入27.134s、cold open按需mount18.461s、first read47.297s分别测量。脏IP卸载175.923s含IP Full；重载后的clean卸载69.100s无index写入。两次UNLOAD也不同，不能把差额全归索引成本。
+
+**真实验收已完成、无进程运行**：.143 `/root/tape-rs-io-20260927/le-api-trace.complete`存在。RC18 UUID仍878f7b34-4910-4d09-9f1f-3e4725ede6d8，新增10×4KiB，无格式化；新清单le-api-new.json，新完整清单le-api-all.json共3155文件，原native-final-manifest.json保留3145基线。LE重载后的read命中缓存，不能当冷读；其后退出LE，Rust cold mount generation28/124.232s，10文件读14.755s、SHA全部通过，21indirect/0direct。验证是在完整卷sync+卸载之后，不是fsync-only掉电验证。
+
+最终库存：RC18槽7、RC17槽8、drive11EB4A80F1空；LE退出/private FUSE卸载，PR generation20注册表空/无持有者；allow_dio保持0。最终状态le-api-final-state.json。旧PID1662927/1662930已结束，不要重跑有新建文件的probe。未操作.209、未推GitHub、未替换正式Holo。SG direct研究区分SG payload复制/FUSE pagecache/驱动器持久化；此前direct1的512KiB READ EINVAL根因未独立证明，无成功direct吞吐A/B，不重新打开。
+
+本轮LE index阶段约13s，旧基线约8s，说明既有Rust约5s差距未归因，不据此删同步屏障。用户不保留不支持EOD兼容性仍有效，生产代码仍直接EOD定位。
+
 ## 2026-09-27 20:23 CST — 最新：本轮全部实机验收通过，设备已收尾
 
 活动工作树 `/work/jay/tape-rs-ltfs-recovery-ibm-interop`，源码/测试提交 **344e9b1**，之前合批测试提交fc4afcb。用户要求EOD不留兼容回退已落实：直接LOCATE EOD，不支持即返回SCSI错误，无BOP/SPACE补救；实际RC18挂载及互读通过。本轮新增原生FORMAT两个实机缺陷也修复：保留MODE SENSE只读分区字段、单位指数9/P0非零；显式定位BOP0。259passed/7ignored、fmt/check/Clippy -D warnings/兼容release全部通过。

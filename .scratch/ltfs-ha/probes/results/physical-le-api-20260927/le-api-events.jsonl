@@ -1,0 +1,156 @@
+{"phase": "leadm-move-to-drive", "event": "begin", "time_ns": 1790513075225007150}
+{"phase": "leadm-move-to-drive", "event": "end", "time_ns": 1790513102358714415, "seconds": 27.133707265}
+{"phase": "open-existing-first", "event": "begin", "time_ns": 1790513102659023851, "path": "comparison/small/f00000"}
+{"phase": "open-existing-first", "event": "end", "time_ns": 1790513121120280605, "seconds": 18.461256754, "path": "comparison/small/f00000"}
+{"phase": "read-existing-first", "event": "begin", "time_ns": 1790513121420567874}
+{"phase": "read-existing-first", "event": "end", "time_ns": 1790513168717436368, "seconds": 47.296868494}
+{"phase": "close-existing-first", "event": "begin", "time_ns": 1790513169017757623}
+{"phase": "close-existing-first", "event": "end", "time_ns": 1790513169018561126, "seconds": 0.000803503}
+{"phase": "open-existing-warm", "event": "begin", "time_ns": 1790513169319155160}
+{"phase": "open-existing-warm", "event": "end", "time_ns": 1790513169319404434, "seconds": 0.000249274}
+{"phase": "fsync-existing-clean", "event": "begin", "time_ns": 1790513169619595261}
+{"phase": "fsync-existing-clean", "event": "end", "time_ns": 1790513169619873046, "seconds": 0.000277785}
+{"phase": "fdatasync-existing-clean", "event": "begin", "time_ns": 1790513169920053972}
+{"phase": "fdatasync-existing-clean", "event": "end", "time_ns": 1790513169920309206, "seconds": 0.000255234}
+{"phase": "close-existing-warm", "event": "begin", "time_ns": 1790513170220489452}
+{"phase": "close-existing-warm", "event": "end", "time_ns": 1790513170221212311, "seconds": 0.000722859}
+{"phase": "create-test-directory", "event": "begin", "time_ns": 1790513170521478677}
+{"phase": "create-test-directory", "event": "end", "time_ns": 1790513170522229609, "seconds": 0.000750932}
+{"phase": "ltfs-sync-baseline", "event": "begin", "time_ns": 1790513170822416808}
+{"phase": "ltfs-sync-baseline", "event": "end", "time_ns": 1790513198062248843, "seconds": 27.239832035}
+{"phase": "fdatasync-0:open-create", "event": "begin", "time_ns": 1790513198362611175}
+{"phase": "fdatasync-0:open-create", "event": "end", "time_ns": 1790513198363955795, "seconds": 0.00134462}
+{"phase": "fdatasync-0:write", "event": "begin", "time_ns": 1790513198664153523, "bytes": 4096}
+{"phase": "fdatasync-0:write", "event": "end", "time_ns": 1790513198664542685, "seconds": 0.000389162, "bytes": 4096}
+{"phase": "fdatasync-0:fdatasync", "event": "begin", "time_ns": 1790513198964738123}
+{"phase": "fdatasync-0:fdatasync", "event": "end", "time_ns": 1790513212202492645, "seconds": 13.237754522}
+{"phase": "fdatasync-0:fdatasync-clean", "event": "begin", "time_ns": 1790513212502784257}
+{"phase": "fdatasync-0:fdatasync-clean", "event": "end", "time_ns": 1790513212503489022, "seconds": 0.000704765}
+{"phase": "fdatasync-0:close", "event": "begin", "time_ns": 1790513212803681976}
+{"phase": "fdatasync-0:close", "event": "end", "time_ns": 1790513212803940512, "seconds": 0.000258536}
+{"phase": "fdatasync-0:settle-ltfs-sync", "event": "begin", "time_ns": 1790513213104124399}
+{"phase": "fdatasync-0:settle-ltfs-sync", "event": "end", "time_ns": 1790513225853420343, "seconds": 12.749295944}
+{"phase": "fdatasync-1:open-create", "event": "begin", "time_ns": 1790513226153796561}
+{"phase": "fdatasync-1:open-create", "event": "end", "time_ns": 1790513226154775821, "seconds": 0.00097926}
+{"phase": "fdatasync-1:write", "event": "begin", "time_ns": 1790513226454977130, "bytes": 4096}
+{"phase": "fdatasync-1:write", "event": "end", "time_ns": 1790513226455353545, "seconds": 0.000376415, "bytes": 4096}
+{"phase": "fdatasync-1:fdatasync", "event": "begin", "time_ns": 1790513226755556605}
+{"phase": "fdatasync-1:fdatasync", "event": "end", "time_ns": 1790513240040786771, "seconds": 13.285230166}
+{"phase": "fdatasync-1:fdatasync-clean", "event": "begin", "time_ns": 1790513240341062802}
+{"phase": "fdatasync-1:fdatasync-clean", "event": "end", "time_ns": 1790513240341759731, "seconds": 0.000696929}
+{"phase": "fdatasync-1:close", "event": "begin", "time_ns": 1790513240641939588}
+{"phase": "fdatasync-1:close", "event": "end", "time_ns": 1790513240642203413, "seconds": 0.000263825}
+{"phase": "fdatasync-1:settle-ltfs-sync", "event": "begin", "time_ns": 1790513240942387998}
+{"phase": "fdatasync-1:settle-ltfs-sync", "event": "end", "time_ns": 1790513253871894136, "seconds": 12.929506138}
+{"phase": "fsync-0:open-create", "event": "begin", "time_ns": 1790513254172280515}
+{"phase": "fsync-0:open-create", "event": "end", "time_ns": 1790513254173268452, "seconds": 0.000987937}
+{"phase": "fsync-0:write", "event": "begin", "time_ns": 1790513254473444568, "bytes": 4096}
+{"phase": "fsync-0:write", "event": "end", "time_ns": 1790513254473842381, "seconds": 0.000397813, "bytes": 4096}
+{"phase": "fsync-0:fsync", "event": "begin", "time_ns": 1790513254774038362}
+{"phase": "fsync-0:fsync", "event": "end", "time_ns": 1790513268085057356, "seconds": 13.311018994}
+{"phase": "fsync-0:fsync-clean", "event": "begin", "time_ns": 1790513268385353405}
+{"phase": "fsync-0:fsync-clean", "event": "end", "time_ns": 1790513268386124878, "seconds": 0.000771473}
+{"phase": "fsync-0:close", "event": "begin", "time_ns": 1790513268686307233}
+{"phase": "fsync-0:close", "event": "end", "time_ns": 1790513268686543059, "seconds": 0.000235826}
+{"phase": "fsync-0:settle-ltfs-sync", "event": "begin", "time_ns": 1790513268986731798}
+{"phase": "fsync-0:settle-ltfs-sync", "event": "end", "time_ns": 1790513281817206004, "seconds": 12.830474206}
+{"phase": "fsync-1:open-create", "event": "begin", "time_ns": 1790513282117571584}
+{"phase": "fsync-1:open-create", "event": "end", "time_ns": 1790513282118586530, "seconds": 0.001014946}
+{"phase": "fsync-1:write", "event": "begin", "time_ns": 1790513282418790871, "bytes": 4096}
+{"phase": "fsync-1:write", "event": "end", "time_ns": 1790513282419160415, "seconds": 0.000369544, "bytes": 4096}
+{"phase": "fsync-1:fsync", "event": "begin", "time_ns": 1790513282719360701}
+{"phase": "fsync-1:fsync", "event": "end", "time_ns": 1790513296127834597, "seconds": 13.408473896}
+{"phase": "fsync-1:fsync-clean", "event": "begin", "time_ns": 1790513296428127754}
+{"phase": "fsync-1:fsync-clean", "event": "end", "time_ns": 1790513296428890270, "seconds": 0.000762516}
+{"phase": "fsync-1:close", "event": "begin", "time_ns": 1790513296729077070}
+{"phase": "fsync-1:close", "event": "end", "time_ns": 1790513296729328890, "seconds": 0.00025182}
+{"phase": "fsync-1:settle-ltfs-sync", "event": "begin", "time_ns": 1790513297029517765}
+{"phase": "fsync-1:settle-ltfs-sync", "event": "end", "time_ns": 1790513309903302171, "seconds": 12.873784406}
+{"phase": "ltfs-sync-0:open-create", "event": "begin", "time_ns": 1790513310203672039}
+{"phase": "ltfs-sync-0:open-create", "event": "end", "time_ns": 1790513310204717116, "seconds": 0.001045077}
+{"phase": "ltfs-sync-0:write", "event": "begin", "time_ns": 1790513310504921678, "bytes": 4096}
+{"phase": "ltfs-sync-0:write", "event": "end", "time_ns": 1790513310505335908, "seconds": 0.00041423, "bytes": 4096}
+{"phase": "ltfs-sync-0:ltfs-sync", "event": "begin", "time_ns": 1790513310805542984}
+{"phase": "ltfs-sync-0:ltfs-sync", "event": "end", "time_ns": 1790513337838837976, "seconds": 27.033294992}
+{"phase": "ltfs-sync-0:ltfs-sync-clean", "event": "begin", "time_ns": 1790513338139098602}
+{"phase": "ltfs-sync-0:ltfs-sync-clean", "event": "end", "time_ns": 1790513338144705795, "seconds": 0.005607193}
+{"phase": "ltfs-sync-0:close", "event": "begin", "time_ns": 1790513338444891145}
+{"phase": "ltfs-sync-0:close", "event": "end", "time_ns": 1790513338445582550, "seconds": 0.000691405}
+{"phase": "ltfs-sync-0:settle-ltfs-sync", "event": "begin", "time_ns": 1790513338745810465}
+{"phase": "ltfs-sync-0:settle-ltfs-sync", "event": "end", "time_ns": 1790513338751348220, "seconds": 0.005537755}
+{"phase": "ltfs-sync-1:open-create", "event": "begin", "time_ns": 1790513339051643895}
+{"phase": "ltfs-sync-1:open-create", "event": "end", "time_ns": 1790513339053000903, "seconds": 0.001357008}
+{"phase": "ltfs-sync-1:write", "event": "begin", "time_ns": 1790513339353199914, "bytes": 4096}
+{"phase": "ltfs-sync-1:write", "event": "end", "time_ns": 1790513339353702657, "seconds": 0.000502743, "bytes": 4096}
+{"phase": "ltfs-sync-1:ltfs-sync", "event": "begin", "time_ns": 1790513339653895872}
+{"phase": "ltfs-sync-1:ltfs-sync", "event": "end", "time_ns": 1790513366853245186, "seconds": 27.199349314}
+{"phase": "ltfs-sync-1:ltfs-sync-clean", "event": "begin", "time_ns": 1790513367153712943}
+{"phase": "ltfs-sync-1:ltfs-sync-clean", "event": "end", "time_ns": 1790513367159581128, "seconds": 0.005868185}
+{"phase": "ltfs-sync-1:close", "event": "begin", "time_ns": 1790513367459814761}
+{"phase": "ltfs-sync-1:close", "event": "end", "time_ns": 1790513367460491627, "seconds": 0.000676866}
+{"phase": "ltfs-sync-1:settle-ltfs-sync", "event": "begin", "time_ns": 1790513367760655963}
+{"phase": "ltfs-sync-1:settle-ltfs-sync", "event": "end", "time_ns": 1790513367766100117, "seconds": 0.005444154}
+{"phase": "leadm-sync-0:open-create", "event": "begin", "time_ns": 1790513368066361797}
+{"phase": "leadm-sync-0:open-create", "event": "end", "time_ns": 1790513368067824932, "seconds": 0.001463135}
+{"phase": "leadm-sync-0:write", "event": "begin", "time_ns": 1790513368368011010, "bytes": 4096}
+{"phase": "leadm-sync-0:write", "event": "end", "time_ns": 1790513368369076312, "seconds": 0.001065302, "bytes": 4096}
+{"phase": "leadm-sync-0:leadm-sync", "event": "begin", "time_ns": 1790513368669272484}
+{"phase": "leadm-sync-0:leadm-sync", "event": "end", "time_ns": 1790513396014252110, "seconds": 27.344979626}
+{"phase": "leadm-sync-0:leadm-sync-clean", "event": "begin", "time_ns": 1790513396314506966}
+{"phase": "leadm-sync-0:leadm-sync-clean", "event": "end", "time_ns": 1790513396571151032, "seconds": 0.256644066}
+{"phase": "leadm-sync-0:close", "event": "begin", "time_ns": 1790513396871417336}
+{"phase": "leadm-sync-0:close", "event": "end", "time_ns": 1790513396872189921, "seconds": 0.000772585}
+{"phase": "leadm-sync-0:settle-ltfs-sync", "event": "begin", "time_ns": 1790513397172395426}
+{"phase": "leadm-sync-0:settle-ltfs-sync", "event": "end", "time_ns": 1790513397178487291, "seconds": 0.006091865}
+{"phase": "leadm-sync-1:open-create", "event": "begin", "time_ns": 1790513397478780762}
+{"phase": "leadm-sync-1:open-create", "event": "end", "time_ns": 1790513397479566930, "seconds": 0.000786168}
+{"phase": "leadm-sync-1:write", "event": "begin", "time_ns": 1790513397779749935, "bytes": 4096}
+{"phase": "leadm-sync-1:write", "event": "end", "time_ns": 1790513397780033447, "seconds": 0.000283512, "bytes": 4096}
+{"phase": "leadm-sync-1:leadm-sync", "event": "begin", "time_ns": 1790513398080211046}
+{"phase": "leadm-sync-1:leadm-sync", "event": "end", "time_ns": 1790513425485244200, "seconds": 27.405033154}
+{"phase": "leadm-sync-1:leadm-sync-clean", "event": "begin", "time_ns": 1790513425785486912}
+{"phase": "leadm-sync-1:leadm-sync-clean", "event": "end", "time_ns": 1790513426043696701, "seconds": 0.258209789}
+{"phase": "leadm-sync-1:close", "event": "begin", "time_ns": 1790513426343949240}
+{"phase": "leadm-sync-1:close", "event": "end", "time_ns": 1790513426344719648, "seconds": 0.000770408}
+{"phase": "leadm-sync-1:settle-ltfs-sync", "event": "begin", "time_ns": 1790513426644900668}
+{"phase": "leadm-sync-1:settle-ltfs-sync", "event": "end", "time_ns": 1790513426651089883, "seconds": 0.006189215}
+{"phase": "close-only-0:open-create", "event": "begin", "time_ns": 1790513426951346638}
+{"phase": "close-only-0:open-create", "event": "end", "time_ns": 1790513426952177116, "seconds": 0.000830478}
+{"phase": "close-only-0:write", "event": "begin", "time_ns": 1790513427252360441, "bytes": 4096}
+{"phase": "close-only-0:write", "event": "end", "time_ns": 1790513427252743600, "seconds": 0.000383159, "bytes": 4096}
+{"phase": "close-only-0:close", "event": "begin", "time_ns": 1790513427552931539}
+{"phase": "close-only-0:close", "event": "end", "time_ns": 1790513441212658458, "seconds": 13.659726919}
+{"phase": "close-only-0:settle-ltfs-sync", "event": "begin", "time_ns": 1790513441512913981}
+{"phase": "close-only-0:settle-ltfs-sync", "event": "end", "time_ns": 1790513454838091275, "seconds": 13.325177294}
+{"phase": "syncfs-0:open-create", "event": "begin", "time_ns": 1790513455138419096}
+{"phase": "syncfs-0:open-create", "event": "end", "time_ns": 1790513455139454755, "seconds": 0.001035659}
+{"phase": "syncfs-0:write", "event": "begin", "time_ns": 1790513455439645474, "bytes": 4096}
+{"phase": "syncfs-0:write", "event": "end", "time_ns": 1790513455440063953, "seconds": 0.000418479, "bytes": 4096}
+{"phase": "syncfs-0:syncfs", "event": "begin", "time_ns": 1790513455740260016}
+{"phase": "syncfs-0:syncfs", "event": "end", "time_ns": 1790513455740583041, "seconds": 0.000323025}
+{"phase": "syncfs-0:close", "event": "begin", "time_ns": 1790513456040752166}
+{"phase": "syncfs-0:close", "event": "end", "time_ns": 1790513469691017384, "seconds": 13.650265218}
+{"phase": "syncfs-0:settle-ltfs-sync", "event": "begin", "time_ns": 1790513469991283896}
+{"phase": "syncfs-0:settle-ltfs-sync", "event": "end", "time_ns": 1790513483282372064, "seconds": 13.291088168}
+{"phase": "metadata:open", "event": "begin", "time_ns": 1790513483582704060}
+{"phase": "metadata:open", "event": "end", "time_ns": 1790513483583486576, "seconds": 0.000782516}
+{"phase": "metadata:chmod", "event": "begin", "time_ns": 1790513483883661165}
+{"phase": "metadata:chmod", "event": "end", "time_ns": 1790513483883887319, "seconds": 0.000226154}
+{"phase": "metadata:fdatasync", "event": "begin", "time_ns": 1790513484184066609}
+{"phase": "metadata:fdatasync", "event": "end", "time_ns": 1790513484184328001, "seconds": 0.000261392}
+{"phase": "metadata:fsync", "event": "begin", "time_ns": 1790513484484510476}
+{"phase": "metadata:fsync", "event": "end", "time_ns": 1790513484484792561, "seconds": 0.000282085}
+{"phase": "metadata:close", "event": "begin", "time_ns": 1790513484784973595}
+{"phase": "metadata:close", "event": "end", "time_ns": 1790513484785708915, "seconds": 0.00073532}
+{"phase": "metadata:ltfs-sync", "event": "begin", "time_ns": 1790513485085887151}
+{"phase": "metadata:ltfs-sync", "event": "end", "time_ns": 1790513485092104315, "seconds": 0.006217164}
+{"phase": "leadm-unload-dirty-ip", "event": "begin", "time_ns": 1790513485392291737}
+{"phase": "leadm-unload-dirty-ip", "event": "end", "time_ns": 1790513661315466673, "seconds": 175.923174936}
+{"phase": "leadm-reload", "event": "begin", "time_ns": 1790513661615697916}
+{"phase": "leadm-reload", "event": "end", "time_ns": 1790513686687215497, "seconds": 25.071517581}
+{"phase": "open-after-reload-and-check", "event": "begin", "time_ns": 1790513686987460587}
+{"phase": "open-after-reload-and-check", "event": "end", "time_ns": 1790513705555040762, "seconds": 18.567580175}
+{"phase": "leadm-unload-clean", "event": "begin", "time_ns": 1790513705855280744}
+{"phase": "leadm-unload-clean", "event": "end", "time_ns": 1790513774955602703, "seconds": 69.100321959}
+{"phase": "le-unmount-and-exit", "event": "begin", "time_ns": 1790513775256243718}
+{"phase": "le-unmount-and-exit", "event": "end", "time_ns": 1790513777348385595, "seconds": 2.092141877}
