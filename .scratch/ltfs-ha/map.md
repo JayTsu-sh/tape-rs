@@ -1,5 +1,7 @@
 # 高可用双接口 LTFS 客户端决策地图
 
+> 状态说明（2026-09-27）：本文保留早期调研与当时的证据边界。当前实施/验收/部署及剩余任务见 [剩余实施队列](remaining-implementation.md)；下文历史“待实现/未部署”不能直接作为当前待办。
+
 Labels: wayfinder:map
 Status: open
 

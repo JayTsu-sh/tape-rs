@@ -2,6 +2,8 @@
 
 Last updated: 2026-09-27. Branch: `ltfs-recovery-ibm-interop`. Active worktree: `/work/jay/tape-rs-ltfs-recovery-ibm-interop`. GitHub remote: `origin` (`JayTsu-sh/tape-rs`). Follow `AGENTS.md` to verify the worktree before continuing; `/work/jay/tape-rs` on `feature/docs` contains early design, not the current implementation.
 
+Next authorized queue: [remaining implementation](../.scratch/ltfs-ha/remaining-implementation.md), in order: documentation, intermittent directory outcome, LE metadata semantics, performance, formal rollout. The prior 0–5 queue is complete.
+
 ## Working agreement
 
 The user requested unattended work on 2026-09-27: proceed through defined tasks, choose and record recommended decisions, and verify each completed task in the actual environment. The available environment is Holo-VTL plus IBM EE/LE; physical tape firmware remains unverified. A failed or unavailable lab check keeps that task incomplete. Preserve the separate formal and isolated pools, and recheck current state before device actions.
