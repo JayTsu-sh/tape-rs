@@ -1,3 +1,7 @@
+## 2026-09-27 — 超越LE性能分析完成，尚未实施
+
+报告 `.scratch/ltfs-ha/exceed-le-performance-plan-20260927.md`。新确认关键差异：benchmark跨批持有vol，但executor process_uploads_limited每批LtfsVolume::mount（1190）；写带上的读也重新mount，第二读驱动器已有ReadView复用。优先P0同口径CDB统计→P1常驻卷会话→P2减少正常挂载分区移动/有条件快速路径→P3小文件控制开销→P4审计最终FM0→P5大目录增量/合批→P6供数流水线。不能直接删EOD验证、PR guard、闭FM或MAM，不承诺未测收益。16GiB已只差约1%，微小文件与服务生命周期更值得优先优化。本轮仅分析/文档，无代码行为变化、无硬件操作；介质状态沿用下方最终检查。
+
 ## 2026-09-27 21:01 CST — LE API/SCSI轨迹调研及冷读验收完成
 
 活动工作树 `/work/jay/tape-rs-ltfs-recovery-ibm-interop`。本轮只增调研/探针/证据，未改生产Rust。主报告 `.scratch/ltfs-ha/le-api-scsi-direct-io-research-20260927.md`，固定提交源码依据 `le-api-source-paths-20260927.md`；raw/decoded在 `probes/results/physical-le-api-20260927/`。78个分段全部完成，551条LE SG_IO、未解析0；87条读写均请求DIRECT但实际indirect。
