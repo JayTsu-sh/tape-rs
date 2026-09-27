@@ -60,8 +60,18 @@ impl<B: Backend> Adapter<B> {
             mtime: a.mtime,
             ctime: UNIX_EPOCH,
             crtime: UNIX_EPOCH,
-            kind: if a.is_symlink { FileType::Symlink } else { kind(a.is_dir) },
-            perm: if a.is_symlink { 0o777 } else if a.is_dir { 0o755 } else { 0o644 },
+            kind: if a.is_symlink {
+                FileType::Symlink
+            } else {
+                kind(a.is_dir)
+            },
+            perm: if a.is_symlink {
+                0o777
+            } else if a.is_dir {
+                0o755
+            } else {
+                0o644
+            },
             nlink: if a.is_dir { 2 } else { 1 },
             uid: self.uid,
             gid: self.gid,
@@ -268,10 +278,16 @@ impl<B: Backend + 'static> Filesystem for Adapter<B> {
                 .unwrap_or("/");
             let mut entries = vec![
                 (".".into(), FileType::Directory, ino.0),
-                ("..".into(), FileType::Directory, self.fs.attr_of(parent)?.ino),
+                (
+                    "..".into(),
+                    FileType::Directory,
+                    self.fs.attr_of(parent)?.ino,
+                ),
             ];
             for (name, dir, child) in self.fs.readdir(ino.0)? {
-                let file_type = if dir { FileType::Directory } else {
+                let file_type = if dir {
+                    FileType::Directory
+                } else {
                     match self.fs.getattr(child) {
                         Ok(a) if a.is_symlink => FileType::Symlink,
                         Ok(_) => FileType::RegularFile,
@@ -477,7 +493,9 @@ mod tests {
         }
         fn rename(&self, from: &str, to: &str, no_replace: bool) -> Res<()> {
             // 故障探针模拟跨卷 EXDEV，随后拒绝 mv 回退的目标上传。
-            if self.reject_upload.load(Ordering::Relaxed) { return Err(libc::EXDEV); }
+            if self.reject_upload.load(Ordering::Relaxed) {
+                return Err(libc::EXDEV);
+            }
             self.inner.rename(from, to, no_replace)
         }
         fn rmdir(&self, p: &str) -> Res<()> {
@@ -1090,7 +1108,11 @@ print('PASS kernel binary/create/replace/remove/directory/dirty-writer/64KiB xat
         assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
         std::fs::remove_dir(&dir).unwrap();
         std::fs::create_dir(mount.join("empty-before-rename")).unwrap();
-        std::fs::rename(mount.join("empty-before-rename"), mount.join("empty-after-remount")).unwrap();
+        std::fs::rename(
+            mount.join("empty-before-rename"),
+            mount.join("empty-after-remount"),
+        )
+        .unwrap();
         session.umount_and_join().unwrap();
         let session = fuser::spawn_mount(Adapter::new(make_fs()), &mount, &config).unwrap();
         let empty = mount.join("empty-after-remount");

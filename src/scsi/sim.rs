@@ -341,7 +341,10 @@ impl SimLibrary {
 
     /// 某个驱动器里装着的磁带条码。
     pub fn loaded_barcode(&self, idx: usize) -> Option<String> {
-        lock(&self.state).drives.get(idx).and_then(|d| d.cartridge.clone())
+        lock(&self.state)
+            .drives
+            .get(idx)
+            .and_then(|d| d.cartridge.clone())
     }
 
     pub fn changer(&self) -> SimTransport {
@@ -863,7 +866,11 @@ fn pr_in(pr: &PrState, cdb: &[u8], out: Option<&mut [u8]>) -> Result<Completion>
 
 fn pr_out(pr: &mut PrState, me: u32, cdb: &[u8], data: Option<&[u8]>) -> Result<Completion> {
     let conflict = || {
-        Ok(Completion { status: 0x18, sense: SenseInfo::from_bytes(&[]), transferred: 0 })
+        Ok(Completion {
+            status: 0x18,
+            sense: SenseInfo::from_bytes(&[]),
+            transferred: 0,
+        })
     };
     let Some(p) = data.filter(|p| p.len() >= 24) else {
         return illegal_request();
@@ -902,7 +909,12 @@ fn pr_out(pr: &mut PrState, me: u32, cdb: &[u8], data: Option<&[u8]>) -> Result<
             }
         }
         0x03 => {
-            let others: Vec<u32> = pr.registrations.keys().copied().filter(|&i| i != me).collect();
+            let others: Vec<u32> = pr
+                .registrations
+                .keys()
+                .copied()
+                .filter(|&i| i != me)
+                .collect();
             for i in others {
                 pr.ua.entry(i).or_default().push((0x2A, 0x03));
             }
@@ -954,13 +966,13 @@ fn drive_command(
         let (asc, ascq) = st.drives[idx].pending_ua.remove(0);
         return check(0x06, asc, ascq);
     }
-    if op != opcode::INQUIRY && op != opcode::REQUEST_SENSE {
-        if let Some(q) = st.drives[idx].pr.ua.get_mut(&initiator) {
-            if !q.is_empty() {
-                let (asc, ascq) = q.remove(0);
-                return check(0x06, asc, ascq);
-            }
-        }
+    if op != opcode::INQUIRY
+        && op != opcode::REQUEST_SENSE
+        && let Some(q) = st.drives[idx].pr.ua.get_mut(&initiator)
+        && !q.is_empty()
+    {
+        let (asc, ascq) = q.remove(0);
+        return check(0x06, asc, ascq);
     }
     match op {
         opcode::PERSISTENT_RESERVE_IN => return pr_in(&st.drives[idx].pr, cdb, out),
@@ -970,14 +982,16 @@ fn drive_command(
         _ => {}
     }
     // Exclusive Access：非持有者的其余命令一律 RESERVATION CONFLICT（INQUIRY 等已在上面放行）
-    if let Some((h, _)) = st.drives[idx].pr.holder {
-        if h != initiator && op != opcode::INQUIRY && op != opcode::REQUEST_SENSE {
-            return Ok(Completion {
-                status: 0x18,
-                sense: SenseInfo::from_bytes(&[]),
-                transferred: 0,
-            });
-        }
+    if let Some((h, _)) = st.drives[idx].pr.holder
+        && h != initiator
+        && op != opcode::INQUIRY
+        && op != opcode::REQUEST_SENSE
+    {
+        return Ok(Completion {
+            status: 0x18,
+            sense: SenseInfo::from_bytes(&[]),
+            transferred: 0,
+        });
     }
     match op {
         opcode::INQUIRY => {

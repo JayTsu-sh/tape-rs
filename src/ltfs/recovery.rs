@@ -233,7 +233,12 @@ fn read_until_fm(
 
 fn looks_like_index(bytes: &[u8]) -> bool {
     let head = &bytes[..bytes.len().min(512)];
-    [b"<ltfsindex".as_slice(), b"<ltfsincrementalindex".as_slice()].iter().any(|tag| head.windows(tag.len()).any(|w| w == *tag))
+    [
+        b"<ltfsindex".as_slice(),
+        b"<ltfsincrementalindex".as_slice(),
+    ]
+    .iter()
+    .any(|tag| head.windows(tag.len()).any(|w| w == *tag))
 }
 
 fn validate_candidate(
@@ -245,7 +250,10 @@ fn validate_candidate(
     if idx.incremental && part_char != label.data_partition {
         return Err("增量索引只允许位于 DP".into());
     }
-    if idx.previous_incremental_location.is_some_and(|p| p.partition != label.data_partition || (part_char == label.data_partition && p.start_block >= start_block)) {
+    if idx.previous_incremental_location.is_some_and(|p| {
+        p.partition != label.data_partition
+            || (part_char == label.data_partition && p.start_block >= start_block)
+    }) {
         return Err("增量回指分区或方向非法".into());
     }
     if idx.volume_uuid != label.volume_uuid {
@@ -596,31 +604,53 @@ pub fn verify_chain(
 
 /// 增量目标必须完整回溯到其 Full 基线，再按正序原子应用；预算不足不能降级成成功。
 fn replay_incremental_chain(
-    drive: &TapeDrive<'_>, label: &LtfsLabel, candidate: &mut IndexCandidate, budget: &RecoveryBudget,
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    candidate: &mut IndexCandidate,
+    budget: &RecoveryBudget,
 ) -> Result<u32> {
     let mut chain = Vec::new();
     let mut current = candidate.index.clone();
     while current.incremental {
         if chain.len() >= budget.max_chain_len as usize {
-            return Err(TapeError::RecoveryRestricted { reason: "增量链重放预算耗尽".into() });
+            return Err(TapeError::RecoveryRestricted {
+                reason: "增量链重放预算耗尽".into(),
+            });
         }
-        let loc = current.previous_incremental_location.or(current.previous_location)
+        let loc = current
+            .previous_incremental_location
+            .or(current.previous_location)
             .ok_or_else(|| TapeError::Ltfs("增量缺少基线位置".into()))?;
-        if loc.partition != label.data_partition || loc.start_block >= current.self_location.start_block {
+        if loc.partition != label.data_partition
+            || loc.start_block >= current.self_location.start_block
+        {
             return Err(TapeError::Ltfs("增量前驱分区或方向非法".into()));
         }
-        let (bytes, ended, _) = read_until_fm(drive, 1, loc.start_block, label.blocksize as usize, budget.max_index_bytes)?;
-        if !ended { return Err(TapeError::Ltfs("增量前驱构造残缺".into())); }
+        let (bytes, ended, _) = read_until_fm(
+            drive,
+            1,
+            loc.start_block,
+            label.blocksize as usize,
+            budget.max_index_bytes,
+        )?;
+        if !ended {
+            return Err(TapeError::Ltfs("增量前驱构造残缺".into()));
+        }
         let prior = LtfsIndex::parse(&bytes)?;
-        validate_candidate(&prior, label, label.data_partition, loc.start_block).map_err(TapeError::Ltfs)?;
-        if prior.generation >= current.generation || prior.incremental != current.previous_incremental_location.is_some() {
+        validate_candidate(&prior, label, label.data_partition, loc.start_block)
+            .map_err(TapeError::Ltfs)?;
+        if prior.generation >= current.generation
+            || prior.incremental != current.previous_incremental_location.is_some()
+        {
             return Err(TapeError::Ltfs("增量前驱类型或代数不符".into()));
         }
         chain.push(current);
         current = prior;
     }
     let count = chain.len() as u32;
-    for delta in chain.iter().rev() { current = current.apply_incremental(delta)?; }
+    for delta in chain.iter().rev() {
+        current = current.apply_incremental(delta)?;
+    }
     candidate.index = current;
     Ok(count)
 }
@@ -698,8 +728,14 @@ pub fn recover(
 
     let mut incremental_depth = 0;
     match replay {
-        Ok(depth) => { incremental_depth = depth; chain_depth += depth; },
-        Err(e) => { chain_ok = false; notes.push(format!("增量链恢复失败: {e}")); }
+        Ok(depth) => {
+            incremental_depth = depth;
+            chain_depth += depth;
+        }
+        Err(e) => {
+            chain_ok = false;
+            notes.push(format!("增量链恢复失败: {e}"));
+        }
     }
     let ip_debt = match (&dp.last_index, &ip.last_index) {
         (Some(d), Some(i)) => i.index.generation < d.index.generation,
@@ -737,7 +773,9 @@ pub fn recover(
         });
     }
     if ip_has_data {
-        report.notes.push("视图中有文件数据位于 IP，提交会重写 IP，不放行追加".to_string());
+        report
+            .notes
+            .push("视图中有文件数据位于 IP，提交会重写 IP，不放行追加".to_string());
     }
     let ip_ok = report.ip.tail == TailKind::Complete
         || (report.dp.last_index.is_some() && report.dp.tail == TailKind::Complete);

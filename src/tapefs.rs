@@ -13,8 +13,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -35,7 +35,13 @@ pub const ROOT_INO: u64 = 1;
 const HIDDEN_AT_ROOT: &[&str] = &[".tapers", "_ltfs_lostandfound"];
 
 /// 只读扩展属性。
-pub const XATTRS: &[&str] = &["user.tape.state", "user.tape.generation", "user.tape.version", "user.tape.barcode", "user.tape.sha256"];
+pub const XATTRS: &[&str] = &[
+    "user.tape.state",
+    "user.tape.generation",
+    "user.tape.version",
+    "user.tape.barcode",
+    "user.tape.sha256",
+];
 
 /// 对 ltfsd 的访问。`ClientBackend` 是实际实现；测试用内存实现。
 pub trait Backend: Send + Sync {
@@ -114,11 +120,17 @@ pub struct ClientBackend {
 
 impl ClientBackend {
     pub fn new(client: Client) -> Self {
-        Self { template: Mutex::new(client) }
+        Self {
+            template: Mutex::new(client),
+        }
     }
 
     fn with<T>(&self, f: impl FnOnce(&mut Client) -> Result<T, ClientError>) -> Res<T> {
-        let mut c = self.template.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut c = self
+            .template
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let r = f(&mut c);
         *self.template.lock().unwrap_or_else(|e| e.into_inner()) = c;
         r.map_err(|e| errno_of(&e))
@@ -143,7 +155,10 @@ impl Backend for ClientBackend {
     }
 
     fn upload(&self, path: &str, local: &Path, create_only: bool, wait: bool) -> Res<bool> {
-        self.with(|c| c.put_file(path, local, create_only, wait).map(|o| o.committed))
+        self.with(|c| {
+            c.put_file(path, local, create_only, wait)
+                .map(|o| o.committed)
+        })
     }
 
     fn delete(&self, path: &str) -> Res<()> {
@@ -197,7 +212,9 @@ impl Drop for CachedFile {
 }
 
 enum Handle {
-    Read { data: Arc<CachedFile> },
+    Read {
+        data: Arc<CachedFile>,
+    },
     Write {
         data: Arc<CachedFile>,
         path: String,
@@ -268,15 +285,26 @@ fn io_errno(e: std::io::Error) -> Errno {
 
 /// 父目录路径 + 名字。
 pub fn join(parent: &str, name: &str) -> String {
-    if parent == "/" { format!("/{}", name) } else { format!("{}/{}", parent, name) }
+    if parent == "/" {
+        format!("/{}", name)
+    } else {
+        format!("{}/{}", parent, name)
+    }
 }
 
 fn xattr_name(key: &str) -> String {
-    if key.starts_with("user.") { key.to_string() } else { format!("user.{key}") }
+    if key.starts_with("user.") {
+        key.to_string()
+    } else {
+        format!("user.{key}")
+    }
 }
 
 fn symlink_target(metadata: &serde_json::Value) -> Res<&str> {
-    metadata["symlink"].as_str().filter(|target| !target.is_empty() && !target.contains('\0')).ok_or(libc::EIO)
+    metadata["symlink"]
+        .as_str()
+        .filter(|target| !target.is_empty() && !target.contains('\0'))
+        .ok_or(libc::EIO)
 }
 
 fn parent_of(path: &str) -> &str {
@@ -331,7 +359,10 @@ impl<B: Backend> TapeFs<B> {
     }
 
     fn file_slot(&self, ino: u64) -> FileSlot {
-        lock(&self.files).entry(ino).or_insert_with(|| Arc::new(Mutex::new(Weak::new()))).clone()
+        lock(&self.files)
+            .entry(ino)
+            .or_insert_with(|| Arc::new(Mutex::new(Weak::new())))
+            .clone()
     }
 
     fn cached(&self, ino: u64) -> Option<Arc<CachedFile>> {
@@ -340,7 +371,9 @@ impl<B: Backend> TapeFs<B> {
 
     fn cached_attr(data: &CachedFile) -> Res<Attr> {
         Ok(Attr {
-            ino: data.ino, is_dir: false, is_symlink: false,
+            ino: data.ino,
+            is_dir: false,
+            is_symlink: false,
             size: data.file.metadata().map_err(io_errno)?.len(),
             mtime: *lock(&data.mtime),
         })
@@ -348,8 +381,20 @@ impl<B: Backend> TapeFs<B> {
 
     fn new_cached(&self, ino: u64, mtime: SystemTime) -> Res<Arc<CachedFile>> {
         let cache = self.cache_path("inode");
-        let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&cache).map_err(io_errno)?;
-        Ok(Arc::new(CachedFile { ino, cache, file, mtime: Mutex::new(mtime), content: Mutex::new(None), source: Mutex::new(None) }))
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&cache)
+            .map_err(io_errno)?;
+        Ok(Arc::new(CachedFile {
+            ino,
+            cache,
+            file,
+            mtime: Mutex::new(mtime),
+            content: Mutex::new(None),
+            source: Mutex::new(None),
+        }))
     }
 
     fn remember_content(data: &CachedFile) -> Res<()> {
@@ -407,7 +452,8 @@ impl<B: Backend> TapeFs<B> {
             return Ok(Attr {
                 mtime: UNIX_EPOCH,
                 ino: ROOT_INO,
-                is_dir: true, is_symlink: false,
+                is_dir: true,
+                is_symlink: false,
                 size: 0,
             });
         }
@@ -415,7 +461,8 @@ impl<B: Backend> TapeFs<B> {
             return Ok(Attr {
                 mtime: UNIX_EPOCH,
                 ino: self.ino_of(path),
-                is_dir: false, is_symlink: false,
+                is_dir: false,
+                is_symlink: false,
                 size: len,
             });
         }
@@ -436,16 +483,29 @@ impl<B: Backend> TapeFs<B> {
                 return Ok(Attr {
                     mtime,
                     ino,
-                    is_dir: true, is_symlink: false,
+                    is_dir: true,
+                    is_symlink: false,
                     size: 0,
                 });
             }
-            if let Some(current) = st.current.as_ref().filter(|c| c.metadata["kind"] == "symlink") {
+            if let Some(current) = st
+                .current
+                .as_ref()
+                .filter(|c| c.metadata["kind"] == "symlink")
+            {
                 let target = symlink_target(&current.metadata)?;
-                let mtime = current.metadata["modify_time"].as_str()
+                let mtime = current.metadata["modify_time"]
+                    .as_str()
                     .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-                    .map(SystemTime::from).unwrap_or(UNIX_EPOCH);
-                return Ok(Attr { ino, is_dir: false, is_symlink: true, size: target.len() as u64, mtime });
+                    .map(SystemTime::from)
+                    .unwrap_or(UNIX_EPOCH);
+                return Ok(Attr {
+                    ino,
+                    is_dir: false,
+                    is_symlink: true,
+                    size: target.len() as u64,
+                    mtime,
+                });
             }
             if let Some(data) = self.cached(ino) {
                 return Self::cached_attr(&data);
@@ -461,7 +521,8 @@ impl<B: Backend> TapeFs<B> {
             return Ok(Attr {
                 mtime,
                 ino: self.ino_of(path),
-                is_dir: false, is_symlink: false,
+                is_dir: false,
+                is_symlink: false,
                 size,
             });
         }
@@ -469,7 +530,8 @@ impl<B: Backend> TapeFs<B> {
             return Ok(Attr {
                 mtime: UNIX_EPOCH,
                 ino: self.ino_of(path),
-                is_dir: true, is_symlink: false,
+                is_dir: true,
+                is_symlink: false,
                 size: 0,
             });
         }
@@ -494,10 +556,14 @@ impl<B: Backend> TapeFs<B> {
     }
 
     fn getattr_inner(&self, ino: u64) -> Res<Attr> {
-        if let Some(data) = self.cached(ino) { return Self::cached_attr(&data); }
+        if let Some(data) = self.cached(ino) {
+            return Self::cached_attr(&data);
+        }
         let p = self.path_of(ino)?;
         let a = self.attr_of_inner(&p)?;
-        if a.ino != ino { return Err(libc::ESTALE); }
+        if a.ino != ino {
+            return Err(libc::ESTALE);
+        }
         Ok(a)
     }
 
@@ -506,9 +572,18 @@ impl<B: Backend> TapeFs<B> {
         let _ns = self.namespace.read().unwrap_or_else(|e| e.into_inner());
         self.check_namespace()?;
         let path = self.path_of(ino)?;
-        if lock(&self.inodes).by_path.get(&path).copied() != Some(ino) { return Err(libc::ESTALE); }
-        let current = self.backend.stat(&path)?.ok_or(libc::ENOENT)?.current.ok_or(libc::EBUSY)?;
-        if current.metadata["kind"] != "symlink" { return Err(libc::EINVAL); }
+        if lock(&self.inodes).by_path.get(&path).copied() != Some(ino) {
+            return Err(libc::ESTALE);
+        }
+        let current = self
+            .backend
+            .stat(&path)?
+            .ok_or(libc::ENOENT)?
+            .current
+            .ok_or(libc::EBUSY)?;
+        if current.metadata["kind"] != "symlink" {
+            return Err(libc::EINVAL);
+        }
         Ok(symlink_target(&current.metadata)?.as_bytes().to_vec())
     }
 
@@ -566,7 +641,16 @@ impl<B: Backend> TapeFs<B> {
             return Err(libc::EEXIST);
         }
         let fh = self.open_for_write(&path, excl, true)?;
-        Ok((Attr { mtime: UNIX_EPOCH, ino: self.ino_of(&path), is_dir: false, is_symlink: false, size: 0 }, fh))
+        Ok((
+            Attr {
+                mtime: UNIX_EPOCH,
+                ino: self.ino_of(&path),
+                is_dir: false,
+                is_symlink: false,
+                size: 0,
+            },
+            fh,
+        ))
     }
 
     fn open_for_write(&self, path: &str, create_only: bool, truncate: bool) -> Res<u64> {
@@ -574,11 +658,15 @@ impl<B: Backend> TapeFs<B> {
         // 非截断写必须先取得完整旧内容。临时读句柄让副本存活到写句柄接管。
         let read = if !truncate && self.cached(ino).is_none() {
             Some(self.open_inner(ino, libc::O_RDONLY)?)
-        } else { None };
+        } else {
+            None
+        };
         let result = (|| {
             let slot = self.file_slot(ino);
             let mut cached = lock(&slot);
-            if lock(&self.inodes).by_path.get(path).copied() != Some(ino) { return Err(libc::ESTALE); }
+            if lock(&self.inodes).by_path.get(path).copied() != Some(ino) {
+                return Err(libc::ESTALE);
+            }
             let mut writers = lock(&self.writers);
             if let Some((fh, _)) = writers.get(path) {
                 let shared = self.handle(*fh)?;
@@ -604,13 +692,20 @@ impl<B: Backend> TapeFs<B> {
             *cached = Arc::downgrade(&data);
             let committed = !truncate && !lock(&self.pending).contains_key(&ino);
             let fh = self.new_fh(Handle::Write {
-                data, path: path.to_string(), len, create_only,
-                dirty: truncate, uploaded: !truncate, committed,
+                data,
+                path: path.to_string(),
+                len,
+                create_only,
+                dirty: truncate,
+                uploaded: !truncate,
+                committed,
             });
             writers.insert(path.to_string(), (fh, len));
             Ok(fh)
         })();
-        if let Some(fh) = read { self.release(fh); }
+        if let Some(fh) = read {
+            self.release(fh);
+        }
         result
     }
 
@@ -626,23 +721,41 @@ impl<B: Backend> TapeFs<B> {
         if lock(&self.inodes).by_path.get(&path).copied() != Some(ino) {
             return Err(libc::ESTALE);
         }
-        if self.attr_of_inner(&path)?.is_symlink { return Err(libc::ELOOP); }
+        if self.attr_of_inner(&path)?.is_symlink {
+            return Err(libc::ELOOP);
+        }
         match flags & libc::O_ACCMODE {
             libc::O_RDONLY => {
                 let slot = self.file_slot(ino);
                 let mut cached = lock(&slot);
-                if lock(&self.inodes).by_path.get(&path).copied() != Some(ino) { return Err(libc::ESTALE); }
+                if lock(&self.inodes).by_path.get(&path).copied() != Some(ino) {
+                    return Err(libc::ESTALE);
+                }
                 if let Some(data) = cached.upgrade() {
                     if self.open_write_len(&path).is_none() {
                         let st = match self.backend.stat(&path)? {
                             Some(st) => st,
-                            None => { lock(&self.pending).remove(&ino); return Err(libc::ENOENT); }
+                            None => {
+                                lock(&self.pending).remove(&ino);
+                                return Err(libc::ENOENT);
+                            }
                         };
-                        if st.state == "committed" { lock(&self.pending).remove(&ino); }
+                        if st.state == "committed" {
+                            lock(&self.pending).remove(&ino);
+                        }
                         let content = lock(&data.content);
                         let (len, sha) = content.as_ref().ok_or(libc::EIO)?;
                         // 在途时本挂载仍可读本地内容。已提交的其他内容不能混入同一 inode 的页缓存。
-                        if st.state == "committed" && !st.current.as_ref().is_some_and(|c| c.length == *len && if c.sha256.is_empty() { lock(&data.source).as_ref() == Some(c) } else { c.sha256 == *sha }) {
+                        if st.state == "committed"
+                            && !st.current.as_ref().is_some_and(|c| {
+                                c.length == *len
+                                    && if c.sha256.is_empty() {
+                                        lock(&data.source).as_ref() == Some(c)
+                                    } else {
+                                        c.sha256 == *sha
+                                    }
+                            })
+                        {
                             return Err(libc::ESTALE);
                         }
                     }
@@ -650,19 +763,26 @@ impl<B: Backend> TapeFs<B> {
                 }
                 let st = self.backend.stat(&path)?.ok_or(libc::ENOENT)?;
                 let current = st.current.ok_or(libc::EBUSY)?;
-                let mtime = current.metadata["modify_time"].as_str()
-                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).map(SystemTime::from).unwrap_or(UNIX_EPOCH);
+                let mtime = current.metadata["modify_time"]
+                    .as_str()
+                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                    .map(SystemTime::from)
+                    .unwrap_or(UNIX_EPOCH);
                 let data = self.new_cached(ino, mtime)?;
                 let mut out = data.file.try_clone().map_err(io_errno)?;
                 self.backend.fetch(&path, &mut out)?;
                 Self::remember_content(&data)?;
                 // stat 与 GET 之间可能发生替换，拒绝把另一版本填入本次缓存。
-                if !lock(&data.content).as_ref().is_some_and(|(len, sha)| *len == current.length && (current.sha256.is_empty() || *sha == current.sha256)) {
+                if !lock(&data.content).as_ref().is_some_and(|(len, sha)| {
+                    *len == current.length && (current.sha256.is_empty() || *sha == current.sha256)
+                }) {
                     return Err(libc::EAGAIN);
                 }
                 if current.sha256.is_empty()
                     && self.backend.stat(&path)?.and_then(|s| s.current).as_ref() != Some(&current)
-                { return Err(libc::EAGAIN); }
+                {
+                    return Err(libc::EAGAIN);
+                }
                 *lock(&data.source) = Some(current);
                 *cached = Arc::downgrade(&data);
                 Ok(self.new_fh(Handle::Read { data }))
@@ -683,7 +803,9 @@ impl<B: Backend> TapeFs<B> {
                 let mut buf = vec![0u8; size as usize];
                 let mut got = 0;
                 while got < buf.len() {
-                    let n = f.read_at(&mut buf[got..], offset + got as u64).map_err(io_errno)?;
+                    let n = f
+                        .read_at(&mut buf[got..], offset + got as u64)
+                        .map_err(io_errno)?;
                     if n == 0 {
                         break;
                     }
@@ -702,9 +824,19 @@ impl<B: Backend> TapeFs<B> {
         let mut g = lock(&h);
         self.check_namespace()?;
         match &mut *g {
-            Handle::Write { path, data: shared, len, dirty, committed, .. } => {
+            Handle::Write {
+                path,
+                data: shared,
+                len,
+                dirty,
+                committed,
+                ..
+            } => {
                 let file = &shared.file;
-                let end = offset.checked_add(data.len() as u64).filter(|n| *n <= i64::MAX as u64).ok_or(libc::EFBIG)?;
+                let end = offset
+                    .checked_add(data.len() as u64)
+                    .filter(|n| *n <= i64::MAX as u64)
+                    .ok_or(libc::EFBIG)?;
                 file.write_all_at(data, offset).map_err(io_errno)?;
                 *lock(&shared.mtime) = SystemTime::now();
                 *lock(&shared.content) = None;
@@ -732,11 +864,26 @@ impl<B: Backend> TapeFs<B> {
         let writer = lock(&self.writers).get(&path).map(|w| w.0);
         if let Some(fh) = writer {
             let h = self.handle(fh)?;
-            if let Handle::Write { data, len, dirty, committed, .. } = &mut *lock(&h) {
+            if let Handle::Write {
+                data,
+                len,
+                dirty,
+                committed,
+                ..
+            } = &mut *lock(&h)
+            {
                 if size == *len {
-                    return Ok(Attr { mtime: UNIX_EPOCH, ino, is_dir: false, is_symlink: false, size });
+                    return Ok(Attr {
+                        mtime: UNIX_EPOCH,
+                        ino,
+                        is_dir: false,
+                        is_symlink: false,
+                        size,
+                    });
                 }
-                if size > i64::MAX as u64 { return Err(libc::EFBIG); }
+                if size > i64::MAX as u64 {
+                    return Err(libc::EFBIG);
+                }
                 data.file.set_len(size).map_err(io_errno)?;
                 *lock(&data.mtime) = SystemTime::now();
                 *lock(&data.content) = None;
@@ -750,10 +897,16 @@ impl<B: Backend> TapeFs<B> {
             }
         }
         let a = self.attr_of_inner(&path)?;
-        if a.is_dir { return Err(libc::EISDIR); }
-        if a.size == size { return Ok(a); }
+        if a.is_dir {
+            return Err(libc::EISDIR);
+        }
+        if a.size == size {
+            return Ok(a);
+        }
         let fh = self.open_for_write(&path, false, false)?;
-        let result = self.truncate_inner(ino, size).and_then(|a| self.flush(fh).map(|_| a));
+        let result = self
+            .truncate_inner(ino, size)
+            .and_then(|a| self.flush(fh).map(|_| a));
         self.release(fh);
         result
     }
@@ -765,19 +918,34 @@ impl<B: Backend> TapeFs<B> {
         let mut g = lock(&h);
         self.check_namespace()?;
         match &mut *g {
-            Handle::Write { path, data, create_only, dirty, uploaded, committed, .. } => {
-                if path.is_empty() { return data.file.sync_data().map_err(io_errno); }
+            Handle::Write {
+                path,
+                data,
+                create_only,
+                dirty,
+                uploaded,
+                committed,
+                ..
+            } => {
+                if path.is_empty() {
+                    return data.file.sync_data().map_err(io_errno);
+                }
                 if !*dirty && *uploaded {
                     return Ok(());
                 }
                 data.file.sync_data().map_err(io_errno)?;
-                let c = self.backend.upload(path, &data.cache, *create_only && !*uploaded, false)?;
+                let c =
+                    self.backend
+                        .upload(path, &data.cache, *create_only && !*uploaded, false)?;
                 Self::remember_content(data)?;
                 *dirty = false;
                 *uploaded = true;
                 *committed = c;
-                if c { lock(&self.pending).remove(&data.ino); }
-                else { lock(&self.pending).insert(data.ino, data.clone()); }
+                if c {
+                    lock(&self.pending).remove(&data.ino);
+                } else {
+                    lock(&self.pending).insert(data.ino, data.clone());
+                }
                 Ok(())
             }
             Handle::Read { .. } => Ok(()),
@@ -793,22 +961,38 @@ impl<B: Backend> TapeFs<B> {
 
     fn sync_handle(&self, h: &mut Handle) -> Res<()> {
         self.check_namespace()?;
-        let Handle::Write { path, data, create_only, dirty, uploaded, committed, .. } = h else {
+        let Handle::Write {
+            path,
+            data,
+            create_only,
+            dirty,
+            uploaded,
+            committed,
+            ..
+        } = h
+        else {
             return Ok(());
         };
-        if path.is_empty() { return data.file.sync_data().map_err(io_errno); }
+        if path.is_empty() {
+            return data.file.sync_data().map_err(io_errno);
+        }
         if *committed && !*dirty {
             return Ok(());
         }
         data.file.sync_data().map_err(io_errno)?;
         if *dirty || !*uploaded {
-            let c = self.backend.upload(path, &data.cache, *create_only && !*uploaded, true)?;
+            let c = self
+                .backend
+                .upload(path, &data.cache, *create_only && !*uploaded, true)?;
             Self::remember_content(data)?;
             *dirty = false;
             *uploaded = true;
             *committed = c;
-            if c { lock(&self.pending).remove(&data.ino); }
-            else { lock(&self.pending).insert(data.ino, data.clone()); }
+            if c {
+                lock(&self.pending).remove(&data.ino);
+            } else {
+                lock(&self.pending).insert(data.ino, data.clone());
+            }
             return if c { Ok(()) } else { Err(libc::EIO) };
         }
         // 已经暂存过、内容没变：等那次上传落带，按哈希确认是这份内容
@@ -837,20 +1021,29 @@ impl<B: Backend> TapeFs<B> {
     }
 
     pub fn release(&self, fh: u64) {
-        let Ok(h) = self.handle(fh) else { return; };
+        let Ok(h) = self.handle(fh) else {
+            return;
+        };
         let ino = match &*lock(&h) {
             Handle::Read { data } | Handle::Write { data, .. } => data.ino,
         };
         // 与 open 的句柄复用串行，不能先删除 writers 指向的句柄再更新该表。
         let slot = self.file_slot(ino);
         let _cached = lock(&slot);
-        if lock(&self.handles).remove(&fh).is_none() { return; }
+        if lock(&self.handles).remove(&fh).is_none() {
+            return;
+        }
         if let Handle::Write { path, .. } = &*lock(&h) {
             let mut w = lock(&self.writers);
             if w.get(path).is_some_and(|e| e.0 == fh) {
-                let next = lock(&self.handles).iter().find_map(|(id, other)| Arc::ptr_eq(&h, other).then_some(*id));
-                if let Some(next) = next { w.get_mut(path).unwrap().0 = next; }
-                else { w.remove(path); }
+                let next = lock(&self.handles)
+                    .iter()
+                    .find_map(|(id, other)| Arc::ptr_eq(&h, other).then_some(*id));
+                if let Some(next) = next {
+                    w.get_mut(path).unwrap().0 = next;
+                } else {
+                    w.remove(path);
+                }
             }
         }
     }
@@ -864,14 +1057,22 @@ impl<B: Backend> TapeFs<B> {
     fn unlink_inner(&self, parent: u64, name: &str) -> Res<()> {
         let path = join(&self.path_of(parent)?, name);
         let attr = self.attr_of_inner(&path)?;
-        if attr.is_dir { return Err(libc::EISDIR); }
+        if attr.is_dir {
+            return Err(libc::EISDIR);
+        }
         let slot = self.file_slot(attr.ino);
         let _cached = lock(&slot);
-        if lock(&self.inodes).by_path.get(&path).copied() != Some(attr.ino) { return Err(libc::ESTALE); }
-        if self.open_write_len(&path).is_some() { return Err(libc::EBUSY); }
+        if lock(&self.inodes).by_path.get(&path).copied() != Some(attr.ino) {
+            return Err(libc::ESTALE);
+        }
+        if self.open_write_len(&path).is_some() {
+            return Err(libc::EBUSY);
+        }
         let old_stat = self.backend.stat(&path)?.and_then(|s| s.current);
         self.backend.delete(&path)?;
-        if let Some(data) = _cached.upgrade() { *lock(&data.source) = old_stat; }
+        if let Some(data) = _cached.upgrade() {
+            *lock(&data.source) = old_stat;
+        }
         // 旧 inode 和引用仍有效；后续同名 create 必须得到新的 inode。
         lock(&self.inodes).by_path.remove(&path);
         lock(&self.pending).remove(&attr.ino);
@@ -949,8 +1150,9 @@ impl<B: Backend> TapeFs<B> {
                 Ok(())
             };
         }
-        let within =
-            |p: &str, root: &str| p == root || p.strip_prefix(root).is_some_and(|r| r.starts_with('/'));
+        let within = |p: &str, root: &str| {
+            p == root || p.strip_prefix(root).is_some_and(|r| r.starts_with('/'))
+        };
         if within(&to, &from) || within(&from, &to) {
             return Err(libc::EINVAL);
         }
@@ -1062,9 +1264,14 @@ impl<B: Backend> TapeFs<B> {
         if lock(&self.inodes).by_path.get(&path).copied() == Some(ino) {
             return self.backend.stat(&path);
         }
-        Ok(self.cached(ino).and_then(|data| lock(&data.source).clone()).map(|c| PathStat {
-            state: "committed".into(), length: c.length, current: Some(c),
-        }))
+        Ok(self
+            .cached(ino)
+            .and_then(|data| lock(&data.source).clone())
+            .map(|c| PathStat {
+                state: "committed".into(),
+                length: c.length,
+                current: Some(c),
+            }))
     }
 
     pub fn change_xattr(&self, ino: u64, name: &str, value: Option<&[u8]>, flags: u32) -> Res<()> {
@@ -1139,23 +1346,37 @@ impl<B: Backend> TapeFs<B> {
         if name == "user.tape.state"
             && let Some(data) = self.cached(ino)
             && lock(&data.content).is_none()
-        { return Ok(b"local".to_vec()); }
+        {
+            return Ok(b"local".to_vec());
+        }
         let st = self.stat_for_inode(ino)?.ok_or(libc::ENODATA)?;
         let cur = st.current.as_ref();
         let v = match name {
             "user.tape.state" => st.state.clone(),
-            "user.tape.version" => cur.map(|c| format!("{}.{}", c.version.0, c.version.1)).ok_or(libc::ENODATA)?,
+            "user.tape.version" => cur
+                .map(|c| format!("{}.{}", c.version.0, c.version.1))
+                .ok_or(libc::ENODATA)?,
             "user.tape.generation" => cur.map(|c| c.generation.to_string()).ok_or(libc::ENODATA)?,
             "user.tape.barcode" => cur.map(|c| c.barcode.clone()).ok_or(libc::ENODATA)?,
             "user.tape.sha256" => cur.map(|c| c.sha256.clone()).ok_or(libc::ENODATA)?,
             _ => {
-                let attrs = cur.and_then(|c| c.metadata["xattrs"].as_array()).ok_or(libc::ENODATA)?;
-                let x = attrs.iter().find(|x| x["key"].as_str().is_some_and(|k| xattr_name(k) == name)).ok_or(libc::ENODATA)?;
+                let attrs = cur
+                    .and_then(|c| c.metadata["xattrs"].as_array())
+                    .ok_or(libc::ENODATA)?;
+                let x = attrs
+                    .iter()
+                    .find(|x| x["key"].as_str().is_some_and(|k| xattr_name(k) == name))
+                    .ok_or(libc::ENODATA)?;
                 let value = x["value"].as_str().ok_or(libc::EIO)?;
                 return if x["base64"].as_bool().unwrap_or(false) {
-                    let encoded: Vec<u8> = value.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-                    base64::engine::general_purpose::STANDARD.decode(encoded).map_err(|_| libc::EIO)
-                } else { Ok(value.as_bytes().to_vec()) };
+                    let encoded: Vec<u8> =
+                        value.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+                    base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .map_err(|_| libc::EIO)
+                } else {
+                    Ok(value.as_bytes().to_vec())
+                };
             }
         };
         Ok(v.into_bytes())
@@ -1175,7 +1396,10 @@ impl<B: Backend> TapeFs<B> {
             && let Some(attrs) = cur.metadata["xattrs"].as_array()
         {
             for x in attrs {
-                if let Some(key) = x["key"].as_str().filter(|k| !k.is_empty() && !k.contains('\0')) {
+                if let Some(key) = x["key"]
+                    .as_str()
+                    .filter(|k| !k.is_empty() && !k.contains('\0'))
+                {
                     names.insert(xattr_name(key));
                 }
             }
@@ -1216,7 +1440,10 @@ pub struct MemState {
 
 fn sha_hex(d: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    Sha256::digest(d).iter().map(|b| format!("{:02x}", b)).collect()
+    Sha256::digest(d)
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
 }
 
 impl MemBackend {
@@ -1363,10 +1590,21 @@ impl Backend for MemBackend {
 
     fn list_dir(&self, dir: &str) -> Res<Option<Vec<DirItem>>> {
         let s = lock(&self.state);
-        let prefix = if dir == "/" { "/".to_string() } else { format!("{}/", dir) };
+        let prefix = if dir == "/" {
+            "/".to_string()
+        } else {
+            format!("{}/", dir)
+        };
         let mut out: BTreeMap<String, DirItem> = BTreeMap::new();
-        for (p, staged) in s.committed.keys().map(|p| (p, false)).chain(s.staged.keys().map(|p| (p, true))) {
-            let Some(rest) = p.strip_prefix(&prefix) else { continue };
+        for (p, staged) in s
+            .committed
+            .keys()
+            .map(|p| (p, false))
+            .chain(s.staged.keys().map(|p| (p, true)))
+        {
+            let Some(rest) = p.strip_prefix(&prefix) else {
+                continue;
+            };
             let (name, is_dir) = match rest.split_once('/') {
                 Some((d, _)) => (d.to_string(), true),
                 None => (rest.to_string(), false),
@@ -1374,22 +1612,47 @@ impl Backend for MemBackend {
             out.entry(name.clone()).or_insert(DirItem {
                 name,
                 is_dir,
-                state: if is_dir { String::new() } else if staged { "staged".into() } else { "committed".into() },
+                state: if is_dir {
+                    String::new()
+                } else if staged {
+                    "staged".into()
+                } else {
+                    "committed".into()
+                },
                 committed_length: None,
                 staged_length: None,
             });
         }
         for p in &s.directories {
-            let Some(rest) = p.strip_prefix(&prefix) else { continue };
+            let Some(rest) = p.strip_prefix(&prefix) else {
+                continue;
+            };
             let name = rest.split('/').next().unwrap_or_default();
-            if !name.is_empty() { out.insert(name.into(), DirItem { name:name.into(), is_dir:true, state:String::new(), committed_length:None, staged_length:None }); }
+            if !name.is_empty() {
+                out.insert(
+                    name.into(),
+                    DirItem {
+                        name: name.into(),
+                        is_dir: true,
+                        state: String::new(),
+                        committed_length: None,
+                        staged_length: None,
+                    },
+                );
+            }
         }
-        if out.is_empty() && dir != "/" && !s.directories.contains(dir) { return Ok(None); }
+        if out.is_empty() && dir != "/" && !s.directories.contains(dir) {
+            return Ok(None);
+        }
         Ok(Some(out.into_values().collect()))
     }
 
     fn fetch(&self, path: &str, out: &mut File) -> Res<u64> {
-        let d = lock(&self.state).committed.get(path).cloned().ok_or(libc::ENOENT)?;
+        let d = lock(&self.state)
+            .committed
+            .get(path)
+            .cloned()
+            .ok_or(libc::ENOENT)?;
         std::io::Write::write_all(out, &d).map_err(io_errno)?;
         Ok(d.len() as u64)
     }
@@ -1463,12 +1726,24 @@ mod tests {
         // fsync：上传并等落带
         let fh = write_file(&t, ROOT_INO, "b.bin", b"durable");
         t.fsync(fh).unwrap();
-        assert_eq!(lock(&t.backend().state).committed.get("/b.bin").map(|v| v.as_slice()), Some(&b"durable"[..]));
+        assert_eq!(
+            lock(&t.backend().state)
+                .committed
+                .get("/b.bin")
+                .map(|v| v.as_slice()),
+            Some(&b"durable"[..])
+        );
         // fsync 之后再写，close 时作为新版本整体上传
         t.write(fh, 7, b"!").unwrap();
         t.flush(fh).unwrap();
         t.release(fh);
-        assert_eq!(lock(&t.backend().state).staged.get("/b.bin").map(|v| v.as_slice()), Some(&b"durable!"[..]));
+        assert_eq!(
+            lock(&t.backend().state)
+                .staged
+                .get("/b.bin")
+                .map(|v| v.as_slice()),
+            Some(&b"durable!"[..])
+        );
     }
 
     /// close 已暂存后再 fsync：等那次上传落带并按哈希确认；暂存作废则 EIO。
@@ -1677,21 +1952,43 @@ mod tests {
         assert!(t.readdir(d.ino).unwrap().is_empty());
         let fh = write_file(&t, d.ino, "f", b"z");
         // 写着的文件在列举里可见
-        assert_eq!(t.readdir(d.ino).unwrap().iter().map(|e| e.0.as_str()).collect::<Vec<_>>(), vec!["f"]);
+        assert_eq!(
+            t.readdir(d.ino)
+                .unwrap()
+                .iter()
+                .map(|e| e.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["f"]
+        );
         assert_eq!(t.rmdir(ROOT_INO, "d"), Err(libc::ENOTEMPTY));
         t.fsync(fh).unwrap();
         t.release(fh);
         // 服务端也有了这个目录
-        let names: Vec<_> = t.readdir(ROOT_INO).unwrap().into_iter().map(|e| (e.0, e.1)).collect();
+        let names: Vec<_> = t
+            .readdir(ROOT_INO)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.0, e.1))
+            .collect();
         assert_eq!(names, vec![("d".to_string(), true)]);
         let e = t.mkdir(d.ino, "empty").unwrap();
         assert_eq!(t.lookup(d.ino, "empty").unwrap().ino, e.ino);
         t.rmdir(d.ino, "empty").unwrap();
         assert_eq!(t.lookup(d.ino, "empty").err(), Some(libc::ENOENT));
-        assert_eq!(t.rename(ROOT_INO, "absent", ROOT_INO, "new", false), Err(libc::ENOENT));
+        assert_eq!(
+            t.rename(ROOT_INO, "absent", ROOT_INO, "new", false),
+            Err(libc::ENOENT)
+        );
         // 根目录下的墓碑与 lost+found 不出现
-        lock(&t.backend().state).committed.insert("/.tapers/deleted/ab".into(), Vec::new());
-        assert!(t.readdir(ROOT_INO).unwrap().iter().all(|e| e.0 != ".tapers"));
+        lock(&t.backend().state)
+            .committed
+            .insert("/.tapers/deleted/ab".into(), Vec::new());
+        assert!(
+            t.readdir(ROOT_INO)
+                .unwrap()
+                .iter()
+                .all(|e| e.0 != ".tapers")
+        );
     }
 
     #[test]
@@ -1725,7 +2022,10 @@ mod tests {
         t.release(w);
         let new = t.lookup(ROOT_INO, "a").unwrap();
         assert_ne!(new.ino, a.ino);
-        assert_eq!(t.getxattr(a.ino, "user.tape.sha256").unwrap(), sha_hex(b"new").as_bytes());
+        assert_eq!(
+            t.getxattr(a.ino, "user.tape.sha256").unwrap(),
+            sha_hex(b"new").as_bytes()
+        );
         assert_eq!(t.getattr(a.ino).unwrap().size, 3);
         assert_eq!(t.read(r, 0, 100).unwrap(), b"new");
         t.release(r);
@@ -1754,10 +2054,14 @@ mod tests {
     #[test]
     fn remote_replace_rejects_mixing_live_cache_then_refreshes_after_close() {
         let t = fs("remote-change");
-        lock(&t.backend().state).committed.insert("/a".into(), b"old".to_vec());
+        lock(&t.backend().state)
+            .committed
+            .insert("/a".into(), b"old".to_vec());
         let a = t.lookup(ROOT_INO, "a").unwrap();
         let r = t.open(a.ino, libc::O_RDONLY).unwrap();
-        lock(&t.backend().state).committed.insert("/a".into(), b"external".to_vec());
+        lock(&t.backend().state)
+            .committed
+            .insert("/a".into(), b"external".to_vec());
         assert_eq!(t.open(a.ino, libc::O_RDONLY), Err(libc::ESTALE));
         assert_eq!(t.read(r, 0, 100).unwrap(), b"old");
         t.release(r);
@@ -1775,7 +2079,9 @@ mod tests {
         t.flush(w).unwrap();
         t.release(w);
         t.backend().commit_all();
-        lock(&t.backend().state).committed.insert("/a".into(), b"remote".to_vec());
+        lock(&t.backend().state)
+            .committed
+            .insert("/a".into(), b"remote".to_vec());
         let a = t.lookup(ROOT_INO, "a").unwrap();
         assert_eq!(t.open(a.ino, libc::O_RDONLY), Err(libc::ESTALE));
         assert!(lock(&t.pending).is_empty());
@@ -1788,7 +2094,9 @@ mod tests {
     #[test]
     fn local_resize_can_reopen_without_another_lookup() {
         let t = fs("local-reopen");
-        lock(&t.backend().state).committed.insert("/a".into(), b"old".to_vec());
+        lock(&t.backend().state)
+            .committed
+            .insert("/a".into(), b"old".to_vec());
         let a = t.lookup(ROOT_INO, "a").unwrap();
         let w = t.open(a.ino, libc::O_WRONLY | libc::O_TRUNC).unwrap();
         t.write(w, 0, b"longer").unwrap();
@@ -1803,9 +2111,13 @@ mod tests {
     fn open_refreshes_size_changed_since_last_attributes() {
         for replacement in [b"longer".as_slice(), b"x".as_slice()] {
             let t = fs("lookup-open-size");
-            lock(&t.backend().state).committed.insert("/a".into(), b"old".to_vec());
+            lock(&t.backend().state)
+                .committed
+                .insert("/a".into(), b"old".to_vec());
             let a = t.lookup(ROOT_INO, "a").unwrap();
-            lock(&t.backend().state).committed.insert("/a".into(), replacement.to_vec());
+            lock(&t.backend().state)
+                .committed
+                .insert("/a".into(), replacement.to_vec());
             let r = t.open(a.ino, libc::O_RDONLY).unwrap();
             assert_eq!(t.getattr(a.ino).unwrap().size, replacement.len() as u64);
             assert_eq!(t.read(r, 0, 100).unwrap(), replacement);
@@ -1817,18 +2129,31 @@ mod tests {
     fn download_rejects_content_changed_between_stat_and_fetch() {
         struct ChangedOnFetch(MemBackend);
         impl Backend for ChangedOnFetch {
-            fn stat(&self, p: &str) -> Res<Option<PathStat>> { self.0.stat(p) }
-            fn list_dir(&self, p: &str) -> Res<Option<Vec<DirItem>>> { self.0.list_dir(p) }
+            fn stat(&self, p: &str) -> Res<Option<PathStat>> {
+                self.0.stat(p)
+            }
+            fn list_dir(&self, p: &str) -> Res<Option<Vec<DirItem>>> {
+                self.0.list_dir(p)
+            }
             fn fetch(&self, p: &str, f: &mut File) -> Res<u64> {
-                lock(&self.0.state).committed.insert(p.into(), b"new".to_vec());
+                lock(&self.0.state)
+                    .committed
+                    .insert(p.into(), b"new".to_vec());
                 self.0.fetch(p, f)
             }
-            fn upload(&self, p: &str, f: &Path, c: bool, w: bool) -> Res<bool> { self.0.upload(p, f, c, w) }
-            fn delete(&self, p: &str) -> Res<()> { self.0.delete(p) }
+            fn upload(&self, p: &str, f: &Path, c: bool, w: bool) -> Res<bool> {
+                self.0.upload(p, f, c, w)
+            }
+            fn delete(&self, p: &str) -> Res<()> {
+                self.0.delete(p)
+            }
         }
         let backend = MemBackend::default();
-        lock(&backend.state).committed.insert("/a".into(), b"old".to_vec());
-        let root = std::env::temp_dir().join(format!("tape-download-race-{}", uuid::Uuid::new_v4()));
+        lock(&backend.state)
+            .committed
+            .insert("/a".into(), b"old".to_vec());
+        let root =
+            std::env::temp_dir().join(format!("tape-download-race-{}", uuid::Uuid::new_v4()));
         let t = TapeFs::new(ChangedOnFetch(backend), root.clone()).unwrap();
         let a = t.lookup(ROOT_INO, "a").unwrap();
         assert_eq!(t.open(a.ino, libc::O_RDONLY), Err(libc::EAGAIN));
@@ -1854,17 +2179,28 @@ mod tests {
                 }
                 Ok(st)
             }
-            fn list_dir(&self, p: &str) -> Res<Option<Vec<DirItem>>> { self.0.list_dir(p) }
-            fn fetch(&self, p: &str, f: &mut File) -> Res<u64> { self.0.fetch(p, f) }
-            fn upload(&self, p: &str, f: &Path, c: bool, w: bool) -> Res<bool> { self.0.upload(p, f, c, w) }
-            fn delete(&self, p: &str) -> Res<()> { self.0.delete(p) }
+            fn list_dir(&self, p: &str) -> Res<Option<Vec<DirItem>>> {
+                self.0.list_dir(p)
+            }
+            fn fetch(&self, p: &str, f: &mut File) -> Res<u64> {
+                self.0.fetch(p, f)
+            }
+            fn upload(&self, p: &str, f: &Path, c: bool, w: bool) -> Res<bool> {
+                self.0.upload(p, f, c, w)
+            }
+            fn delete(&self, p: &str) -> Res<()> {
+                self.0.delete(p)
+            }
         }
         let backend = MemBackend::default();
-        lock(&backend.state).committed.insert("/a".into(), b"data".to_vec());
+        lock(&backend.state)
+            .committed
+            .insert("/a".into(), b"data".to_vec());
         let root = std::env::temp_dir().join(format!("tape-meta-{}", uuid::Uuid::new_v4()));
         let t = TapeFs::new(MetadataBackend(backend), root.clone()).unwrap();
         let a = t.lookup(ROOT_INO, "a").unwrap();
-        let expected = chrono::DateTime::parse_from_rfc3339("2026-09-24T01:02:03.123456789Z").unwrap();
+        let expected =
+            chrono::DateTime::parse_from_rfc3339("2026-09-24T01:02:03.123456789Z").unwrap();
         assert_eq!(a.mtime, SystemTime::from(expected));
         assert_eq!(t.getxattr(a.ino, "user.tape.version").unwrap(), b"7.12");
         assert_eq!(t.getxattr(a.ino, "user.note").unwrap(), "中文".as_bytes());
@@ -1872,26 +2208,47 @@ mod tests {
         assert_eq!(t.getxattr(a.ino, "user.bad"), Err(libc::EIO));
         let names = t.listxattr(a.ino).unwrap();
         assert!(names.split(|b| *b == 0).any(|n| n == b"user.binary"));
-        assert_eq!(names.split(|b| *b == 0).filter(|n| *n == b"user.tape.version").count(), 1);
+        assert_eq!(
+            names
+                .split(|b| *b == 0)
+                .filter(|n| *n == b"user.tape.version")
+                .count(),
+            1
+        );
         drop(t);
         std::fs::remove_dir(root).unwrap();
     }
 
     #[test]
     fn errno_mapping() {
-        let r = |status: u16, body: &str| errno_of(&ClientError::Rejected { status, body: body.into() });
+        let r = |status: u16, body: &str| {
+            errno_of(&ClientError::Rejected {
+                status,
+                body: body.into(),
+            })
+        };
         assert_eq!(r(409, "path_busy"), libc::EBUSY);
         assert_eq!(r(409, r#"{"error":"is_directory"}"#), libc::EISDIR);
         assert_eq!(r(409, r#"{"error":"not_directory"}"#), libc::ENOTDIR);
         assert_eq!(r(409, r#"{"error":"not_empty"}"#), libc::ENOTEMPTY);
-        assert_eq!(r(409, r#"{"error":"path_busy","path":"/is_directory"}"#), libc::EBUSY);
+        assert_eq!(
+            r(409, r#"{"error":"path_busy","path":"/is_directory"}"#),
+            libc::EBUSY
+        );
         assert_eq!(r(412, "exists"), libc::EEXIST);
         assert_eq!(r(503, "read_only"), libc::EROFS);
         assert_eq!(r(503, "not_serving"), libc::EBUSY);
         assert_eq!(r(507, "too_large"), libc::EFBIG);
         assert_eq!(r(507, "no_tape"), libc::ENOSPC);
-        assert_eq!(errno_of(&ClientError::NoLeader(String::new())), libc::EBUSY, "恢复中不是不存在");
-        assert_eq!(errno_of(&ClientError::Indeterminate(String::new())), libc::EIO);
+        assert_eq!(
+            errno_of(&ClientError::NoLeader(String::new())),
+            libc::EBUSY,
+            "恢复中不是不存在"
+        );
+        assert_eq!(
+            errno_of(&ClientError::Indeterminate(String::new())),
+            libc::EIO
+        );
     }
 
     #[test]

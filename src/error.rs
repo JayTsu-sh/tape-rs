@@ -5,7 +5,9 @@ pub enum TapeError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("SCSI command failed: status={status:#04x}, sense_key={sense_key:#04x}, asc={asc:#04x}, ascq={ascq:#04x}")]
+    #[error(
+        "SCSI command failed: status={status:#04x}, sense_key={sense_key:#04x}, asc={asc:#04x}, ascq={ascq:#04x}"
+    )]
     ScsiCommand {
         status: u8,
         sense_key: u8,
@@ -15,8 +17,10 @@ pub enum TapeError {
 
     /// SCSI status 0x18: 另一个 initiator 持有 Persistent Reservation。
     /// 排查：`sg_persist --in -r /dev/sgX` 看 reservation holder key。
-    #[error("SCSI reservation conflict on {device}: another initiator holds the reservation \
-             (run `sg_persist --in -r {device}` to see holder key, then coordinate release)")]
+    #[error(
+        "SCSI reservation conflict on {device}: another initiator holds the reservation \
+             (run `sg_persist --in -r {device}` to see holder key, then coordinate release)"
+    )]
     ReservationConflict { device: String },
 
     /// 持有者自检失败：设备报告的预留持有者不是本轮的键。必须停止，不得自动恢复预留。

@@ -28,13 +28,28 @@ const PR_TIMEOUT_MS: u32 = 30_000;
 /// PR 命令自己的 UNIT ATTENTION 处理：全部越过，包括 2A/03—05。
 /// 这些信号在这里是历史（上一次被抢占时留下的），而本模块接下来读到的注册表才是现状；
 /// `verify_holder` 读到的现状不对就会报失去资格，所以越过它们不会掩盖问题。
-fn through_unit_attention<T>(what: &str, dev: &dyn TapeTransport, mut f: impl FnMut() -> Result<T>) -> Result<T> {
+fn through_unit_attention<T>(
+    what: &str,
+    dev: &dyn TapeTransport,
+    mut f: impl FnMut() -> Result<T>,
+) -> Result<T> {
     let mut seen = 0;
     loop {
         match f() {
-            Err(TapeError::ScsiCommand { sense_key: 0x06, asc, ascq, .. }) if seen < 8 => {
+            Err(TapeError::ScsiCommand {
+                sense_key: 0x06,
+                asc,
+                ascq,
+                ..
+            }) if seen < 8 => {
                 seen += 1;
-                info!("{}: {} 前越过 UNIT ATTENTION {:02x}/{:02x}", dev.identity(), what, asc, ascq);
+                info!(
+                    "{}: {} 前越过 UNIT ATTENTION {:02x}/{:02x}",
+                    dev.identity(),
+                    what,
+                    asc,
+                    ascq
+                );
             }
             other => return other,
         }
@@ -97,19 +112,28 @@ fn pr_out(dev: &dyn TapeTransport, sa: u8, pr_type: u8, key: u64, sa_key: u64) -
 pub fn read_status(dev: &dyn TapeTransport) -> Result<PrStatus> {
     let k = pr_in(dev, SA_IN_READ_KEYS)?;
     if k.len() < 8 {
-        return Err(TapeError::InvalidResponse { expected: 8, actual: k.len() });
+        return Err(TapeError::InvalidResponse {
+            expected: 8,
+            actual: k.len(),
+        });
     }
     let generation = u32::from_be_bytes([k[0], k[1], k[2], k[3]]);
     let add = u32::from_be_bytes([k[4], k[5], k[6], k[7]]) as usize;
     let end = (8 + add).min(k.len());
     let keys = k[8..end]
-        .chunks_exact(8)
-        .map(|c| u64::from_be_bytes(c.try_into().expect("8 bytes")))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .copied()
+        .map(u64::from_be_bytes)
         .collect();
 
     let r = pr_in(dev, SA_IN_READ_RESERVATION)?;
     if r.len() < 8 {
-        return Err(TapeError::InvalidResponse { expected: 8, actual: r.len() });
+        return Err(TapeError::InvalidResponse {
+            expected: 8,
+            actual: r.len(),
+        });
     }
     let add = u32::from_be_bytes([r[4], r[5], r[6], r[7]]) as usize;
     let holder = if add >= 16 && r.len() >= 24 {
@@ -118,7 +142,11 @@ pub fn read_status(dev: &dyn TapeTransport) -> Result<PrStatus> {
     } else {
         None
     };
-    Ok(PrStatus { generation, keys, holder })
+    Ok(PrStatus {
+        generation,
+        keys,
+        holder,
+    })
 }
 
 /// 隔离一个设备的结论。
@@ -129,14 +157,24 @@ pub enum FenceOutcome {
     /// 设备不支持持久预留（ILLEGAL REQUEST）。不算"无法确认"，由上层按设备类型决定。
     Unsupported,
     /// 回读与预期不符。不得据此接管。
-    Unconfirmed { reason: String, status: Option<PrStatus> },
+    Unconfirmed {
+        reason: String,
+        status: Option<PrStatus>,
+    },
     /// 持有者是本系统的键且轮次比本轮高：本轮已被取代，什么也没改。
     /// 轮次来自 Raft，单调递增，所以迟到的旧一轮隔离不会把预留从新一轮手里抢走。
     Superseded { holder: ReservationKey },
 }
 
 fn is_unsupported(e: &TapeError) -> bool {
-    matches!(e, TapeError::ScsiCommand { sense_key: 0x05, asc: 0x20 | 0x24, .. })
+    matches!(
+        e,
+        TapeError::ScsiCommand {
+            sense_key: 0x05,
+            asc: 0x20 | 0x24,
+            ..
+        }
+    )
 }
 
 fn newer_round_holder(st: &PrStatus, key: ReservationKey) -> Option<ReservationKey> {
@@ -155,11 +193,19 @@ pub fn fence(dev: &dyn TapeTransport, key: ReservationKey) -> Result<FenceOutcom
     };
     info!(
         "{}: 预留现状 generation={} keys={:x?} holder={:x?}",
-        dev.identity(), before.generation, before.keys, before.holder
+        dev.identity(),
+        before.generation,
+        before.keys,
+        before.holder
     );
 
     if let Some(newer) = newer_round_holder(&before, key) {
-        warn!("{}: 持有者轮次 {} 高于本轮 {}，放弃隔离", dev.identity(), newer.round(), key.round());
+        warn!(
+            "{}: 持有者轮次 {} 高于本轮 {}，放弃隔离",
+            dev.identity(),
+            newer.round(),
+            key.round()
+        );
         return Ok(FenceOutcome::Superseded { holder: newer });
     }
 
@@ -173,7 +219,13 @@ pub fn fence(dev: &dyn TapeTransport, key: ReservationKey) -> Result<FenceOutcom
     }
     match mid.holder {
         Some((h, _)) if h != key.0 => {
-            pr_out(dev, SA_OUT_PREEMPT_ABORT, PR_TYPE_EXCLUSIVE_ACCESS, key.0, h)?;
+            pr_out(
+                dev,
+                SA_OUT_PREEMPT_ABORT,
+                PR_TYPE_EXCLUSIVE_ACCESS,
+                key.0,
+                h,
+            )?;
         }
         Some((_, t)) if t != PR_TYPE_EXCLUSIVE_ACCESS => {
             pr_out(dev, SA_OUT_RELEASE, t, key.0, 0)?;
@@ -184,7 +236,12 @@ pub fn fence(dev: &dyn TapeTransport, key: ReservationKey) -> Result<FenceOutcom
     }
     // 其余陈旧注册逐个移除（PREEMPT 对非持有者的键只删除注册）。抢占持有者时同键的注册已一并移除。
     let held = mid.holder.map(|(h, _)| h);
-    let mut stale: Vec<u64> = mid.keys.iter().copied().filter(|&k| k != key.0 && Some(k) != held).collect();
+    let mut stale: Vec<u64> = mid
+        .keys
+        .iter()
+        .copied()
+        .filter(|&k| k != key.0 && Some(k) != held)
+        .collect();
     stale.dedup();
     for k in stale {
         pr_out(dev, SA_OUT_PREEMPT, PR_TYPE_EXCLUSIVE_ACCESS, key.0, k)?;
@@ -203,7 +260,10 @@ pub fn fence(dev: &dyn TapeTransport, key: ReservationKey) -> Result<FenceOutcom
     Ok(match reason {
         Some(reason) => {
             warn!("{}: 隔离未能确认: {}", dev.identity(), reason);
-            FenceOutcome::Unconfirmed { reason, status: Some(after) }
+            FenceOutcome::Unconfirmed {
+                reason,
+                status: Some(after),
+            }
         }
         None => FenceOutcome::Fenced { before, after },
     })
@@ -217,7 +277,10 @@ pub fn verify_holder(dev: &dyn TapeTransport, key: ReservationKey) -> Result<()>
     }
     Err(TapeError::OwnershipLost {
         device: dev.identity().to_string(),
-        detail: format!("预留持有者 {:x?}，注册表 {:x?}，本轮键 {:x}", st.holder, st.keys, key.0),
+        detail: format!(
+            "预留持有者 {:x?}，注册表 {:x?}，本轮键 {:x}",
+            st.holder, st.keys, key.0
+        ),
     })
 }
 
@@ -233,8 +296,17 @@ pub fn ownership_lost(e: &TapeError) -> bool {
     match e {
         TapeError::ReservationConflict { .. } | TapeError::OwnershipLost { .. } => true,
         // 2A/03 注册被抢占，2A/04 预留被释放，2A/05 预留被抢占；29/xx 上电或复位（预留可能已丢）
-        TapeError::ScsiCommand { sense_key: 0x06, asc: 0x2A, ascq: 0x03..=0x05, .. } => true,
-        TapeError::ScsiCommand { sense_key: 0x06, asc: 0x29, .. } => true,
+        TapeError::ScsiCommand {
+            sense_key: 0x06,
+            asc: 0x2A,
+            ascq: 0x03..=0x05,
+            ..
+        } => true,
+        TapeError::ScsiCommand {
+            sense_key: 0x06,
+            asc: 0x29,
+            ..
+        } => true,
         _ => false,
     }
 }

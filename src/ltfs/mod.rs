@@ -9,11 +9,11 @@
 //! 挂载通过 VCI 提示或反向扫描定位索引，校验依赖链，从 Full 重放后续增量。
 //! 未索引数据、残缺构造和链断裂按恢复协议限制写入，不自动覆盖尾部。
 
-pub mod index;
 pub mod incremental;
-mod namespace;
+pub mod index;
 pub mod label;
 pub mod mam;
 pub mod mkltfs;
+mod namespace;
 pub mod recovery;
 pub mod volume;

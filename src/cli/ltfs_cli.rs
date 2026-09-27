@@ -87,18 +87,25 @@ pub fn cmd_ltfs_verify(path: &str, name: Option<&str>, show_xattrs: bool) -> Res
         match &verdict {
             HashVerdict::Match { algo } => println!("  一致   {:<10} {}", algo, p),
             HashVerdict::NoHash => println!("  无哈希 {:<10} {}", "-", p),
-            HashVerdict::Mismatch { algo, expected, actual } => {
+            HashVerdict::Mismatch {
+                algo,
+                expected,
+                actual,
+            } => {
                 bad += 1;
                 println!("  不一致 {:<10} {}", algo, p);
                 println!("         索引: {}", expected);
                 println!("         实际: {}", actual);
             }
         }
-        if show_xattrs {
-            if let Some(f) = vol.index().find_file(p) {
-                for x in &f.xattrs {
-                    println!("         {} = {}{}", x.key, x.value, if x.base64 { " (base64)" } else { "" });
-                }
+        if show_xattrs && let Some(f) = vol.index().find_file(p) {
+            for x in &f.xattrs {
+                println!(
+                    "         {} = {}{}",
+                    x.key,
+                    x.value,
+                    if x.base64 { " (base64)" } else { "" }
+                );
             }
         }
     }
@@ -166,7 +173,12 @@ fn print_pr_status(st: &PrStatus) {
     for k in &st.keys {
         let key = ReservationKey(*k);
         if key.is_ours() {
-            println!("  注册键:     {:#018x}  (本系统: 节点 {} 轮次 {})", k, key.node(), key.round());
+            println!(
+                "  注册键:     {:#018x}  (本系统: 节点 {} 轮次 {})",
+                k,
+                key.node(),
+                key.round()
+            );
         } else {
             println!("  注册键:     {:#018x}  (非本系统)", k);
         }
@@ -207,7 +219,10 @@ pub fn cmd_pr_fence(path: &str, node: u8, round: u64) -> Result<()> {
             if let Some(st) = status {
                 print_pr_status(&st);
             }
-            Err(TapeError::Ltfs(format!("隔离未能确认，不得接管: {}", reason)))
+            Err(TapeError::Ltfs(format!(
+                "隔离未能确认，不得接管: {}",
+                reason
+            )))
         }
     }
 }
@@ -219,7 +234,13 @@ pub fn cmd_pr_release(path: &str, node: u8, round: u64) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_ltfs_takeover(path: &str, node: u8, round: u64, salvage: bool, report_only: bool) -> Result<()> {
+pub fn cmd_ltfs_takeover(
+    path: &str,
+    node: u8,
+    round: u64,
+    salvage: bool,
+    report_only: bool,
+) -> Result<()> {
     let dev = ScsiDevice::open(path)?;
     let key = ReservationKey::new(node, round);
     println!("[1/3] 设备层隔离 (节点 {} 轮次 {})", node, round);
@@ -239,7 +260,10 @@ pub fn cmd_ltfs_takeover(path: &str, node: u8, round: u64, salvage: bool, report
             )));
         }
         FenceOutcome::Unconfirmed { reason, .. } => {
-            return Err(TapeError::Ltfs(format!("隔离未能确认，不得接管: {}", reason)));
+            return Err(TapeError::Ltfs(format!(
+                "隔离未能确认，不得接管: {}",
+                reason
+            )));
         }
     }
 
@@ -248,7 +272,11 @@ pub fn cmd_ltfs_takeover(path: &str, node: u8, round: u64, salvage: bool, report
     vol.set_reservation_guard(Some(key));
     let (tail, eod, last_end) = {
         let r = vol.recovery();
-        (r.dp.tail, r.dp.eod, r.dp.last_index.as_ref().map(|c| c.end_block))
+        (
+            r.dp.tail,
+            r.dp.eod,
+            r.dp.last_index.as_ref().map(|c| c.end_block),
+        )
     };
     println!(
         "      视图 gen={}  文件 {} 个  DP 尾部 {:?}  末索引结束于块 {:?}  EOD {}",
@@ -268,8 +296,19 @@ pub fn cmd_ltfs_takeover(path: &str, node: u8, round: u64, salvage: bool, report
         return Ok(());
     }
 
-    println!("[3/3] 收尾：在 EOD 追加索引（{}）", if salvage { "打捞未索引数据" } else { "放弃未索引数据" });
-    let policy = if salvage { TailPolicy::Salvage } else { TailPolicy::Discard };
+    println!(
+        "[3/3] 收尾：在 EOD 追加索引（{}）",
+        if salvage {
+            "打捞未索引数据"
+        } else {
+            "放弃未索引数据"
+        }
+    );
+    let policy = if salvage {
+        TailPolicy::Salvage
+    } else {
+        TailPolicy::Discard
+    };
     let rep = vol.close_tail(policy)?;
     println!(
         "      放弃块 {}..{}  新索引 gen={}  卷可写={}",

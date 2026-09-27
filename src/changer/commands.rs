@@ -3,7 +3,7 @@
 use bytes::BytesMut;
 use log::{debug, info};
 
-use crate::error::{TapeError, Result};
+use crate::error::{Result, TapeError};
 use crate::scsi::cdb;
 use crate::scsi::transport::{TapeTransport, retry_unit_attention};
 
@@ -17,14 +17,19 @@ pub struct MediumChanger<'a> {
 
 impl<'a> MediumChanger<'a> {
     pub fn new(device: &'a dyn TapeTransport) -> Self {
-        Self { device, address_map: None }
+        Self {
+            device,
+            address_map: None,
+        }
     }
 
     /// 获取 element 地址映射（MODE SENSE page 0x1D）
     pub fn load_address_map(&mut self) -> Result<&ElementAddressMap> {
         let cdb_bytes = cdb::mode_sense_10(0x1D, 255);
         let mut buf = [0u8; 255];
-        let result = retry_unit_attention("changer", || self.device.execute_read(&cdb_bytes, &mut buf, 30_000))?;
+        let result = retry_unit_attention("changer", || {
+            self.device.execute_read(&cdb_bytes, &mut buf, 30_000)
+        })?;
 
         // 解析 Mode Parameter Header (10-byte 版本: 8 字节 header)
         // 然后是 Block Descriptor（如果有），然后是 Page 数据
@@ -72,8 +77,9 @@ impl<'a> MediumChanger<'a> {
 
     /// 读取所有 element 状态
     pub fn read_all_status(&self) -> Result<Vec<ElementStatus>> {
-        let map = self.address_map.as_ref()
-            .ok_or_else(|| TapeError::NotReady("address map not loaded, call load_address_map() first".into()))?;
+        let map = self.address_map.as_ref().ok_or_else(|| {
+            TapeError::NotReady("address map not loaded, call load_address_map() first".into())
+        })?;
 
         // 计算总 element 数量和起始地址。用 u32 累加防 u16 溢出
         // （理论上某些大型库房 >65535 元素时的防护）。
@@ -85,7 +91,8 @@ impl<'a> MediumChanger<'a> {
             expected: u16::MAX as usize,
             actual: total_u32 as usize,
         })?;
-        let start = map.transport_start
+        let start = map
+            .transport_start
             .min(map.storage_start)
             .min(map.ie_start)
             .min(map.dt_start);
@@ -96,19 +103,22 @@ impl<'a> MediumChanger<'a> {
         let cdb_bytes = cdb::read_element_status(0, start, total, alloc_len, true, true);
 
         let mut buf = BytesMut::zeroed(alloc_len as usize);
-        let result = retry_unit_attention("changer", || self.device.execute_read(&cdb_bytes, &mut buf, 60_000))?;
+        let result = retry_unit_attention("changer", || {
+            self.device.execute_read(&cdb_bytes, &mut buf, 60_000)
+        })?;
 
         // 检测 kernel 是否把响应截断（用户态 buffer 不够装下 device 想发的所有 element）。
         // 截断时 data 头里的 Byte Count of Report Available 大于实际传回字节数，
         // 部分末尾 element 会被静默丢弃，导致 inventory 少行。
         if result.transferred >= 8 {
-            let advertised =
-                u32::from_be_bytes([0, buf[5], buf[6], buf[7]]) as usize + 8;
+            let advertised = u32::from_be_bytes([0, buf[5], buf[6], buf[7]]) as usize + 8;
             if advertised > result.transferred {
                 log::warn!(
                     "READ ELEMENT STATUS 截断：device 想发 {} 字节，只收到 {}（alloc_len={}），\
                      末尾 element 可能丢失",
-                    advertised, result.transferred, alloc_len
+                    advertised,
+                    result.transferred,
+                    alloc_len
                 );
             }
         }
@@ -119,14 +129,18 @@ impl<'a> MediumChanger<'a> {
 
     /// 移动磁带
     pub fn move_medium(&self, source_addr: u16, dest_addr: u16) -> Result<()> {
-        let map = self.address_map.as_ref()
+        let map = self
+            .address_map
+            .as_ref()
             .ok_or_else(|| TapeError::NotReady("address map not loaded".into()))?;
 
         info!("移动介质: 从 {:#06x} 到 {:#06x}", source_addr, dest_addr);
 
         let cdb_bytes = cdb::move_medium(map.transport_start, source_addr, dest_addr);
         // MOVE MEDIUM 可能需要较长时间（机械操作）
-        retry_unit_attention("changer", || self.device.execute_no_data(&cdb_bytes, 300_000))?;
+        retry_unit_attention("changer", || {
+            self.device.execute_no_data(&cdb_bytes, 300_000)
+        })?;
 
         info!("移动完成");
         Ok(())
@@ -137,7 +151,9 @@ impl<'a> MediumChanger<'a> {
         info!("初始化 element 状态...");
         let cdb_bytes = cdb::initialize_element_status();
         // 初始化可能非常耗时
-        retry_unit_attention("changer", || self.device.execute_no_data(&cdb_bytes, 600_000))?;
+        retry_unit_attention("changer", || {
+            self.device.execute_no_data(&cdb_bytes, 600_000)
+        })?;
         info!("Element 状态初始化完成");
         Ok(())
     }
@@ -149,7 +165,9 @@ impl<'a> MediumChanger<'a> {
         dest1_addr: u16,
         dest2_addr: u16,
     ) -> Result<()> {
-        let map = self.address_map.as_ref()
+        let map = self
+            .address_map
+            .as_ref()
             .ok_or_else(|| TapeError::NotReady("address map not loaded".into()))?;
 
         info!(
@@ -164,19 +182,25 @@ impl<'a> MediumChanger<'a> {
             false,
             false,
         );
-        retry_unit_attention("changer", || self.device.execute_no_data(&cdb_bytes, 600_000))?;
+        retry_unit_attention("changer", || {
+            self.device.execute_no_data(&cdb_bytes, 600_000)
+        })?;
         info!("交换完成");
         Ok(())
     }
 
     /// POSITION TO ELEMENT: 让机械臂定位到指定 element（不搬运介质）
     pub fn position_to_element(&self, dest_addr: u16) -> Result<()> {
-        let map = self.address_map.as_ref()
+        let map = self
+            .address_map
+            .as_ref()
             .ok_or_else(|| TapeError::NotReady("address map not loaded".into()))?;
 
         info!("机械臂定位到 {:#06x}", dest_addr);
         let cdb_bytes = cdb::position_to_element(map.transport_start, dest_addr, false);
-        retry_unit_attention("changer", || self.device.execute_no_data(&cdb_bytes, 120_000))?;
+        retry_unit_attention("changer", || {
+            self.device.execute_no_data(&cdb_bytes, 120_000)
+        })?;
         Ok(())
     }
 
@@ -184,13 +208,17 @@ impl<'a> MediumChanger<'a> {
     pub fn prevent_medium_removal(&self, prevent: bool) -> Result<()> {
         info!("{} 介质移除", if prevent { "禁止" } else { "允许" });
         let cdb_bytes = cdb::prevent_allow_medium_removal(prevent);
-        retry_unit_attention("changer", || self.device.execute_no_data(&cdb_bytes, 10_000))?;
+        retry_unit_attention("changer", || {
+            self.device.execute_no_data(&cdb_bytes, 10_000)
+        })?;
         Ok(())
     }
 
     /// 导入：把 I/E 口中的介质搬到 storage slot
     pub fn import(&self, ie_offset: u16, storage_slot: u16) -> Result<()> {
-        let map = self.address_map.as_ref()
+        let map = self
+            .address_map
+            .as_ref()
             .ok_or_else(|| TapeError::NotReady("address map not loaded".into()))?;
         if ie_offset >= map.ie_count {
             return Err(TapeError::MoveFailed {
@@ -199,22 +227,33 @@ impl<'a> MediumChanger<'a> {
         }
         if storage_slot == 0 || storage_slot > map.storage_count {
             return Err(TapeError::MoveFailed {
-                reason: format!("storage slot {} 越界（可用 1..={}）", storage_slot, map.storage_count),
+                reason: format!(
+                    "storage slot {} 越界（可用 1..={}）",
+                    storage_slot, map.storage_count
+                ),
             });
         }
         let src = map.ie_start + ie_offset;
         let dst = map.storage_start + storage_slot - 1;
-        info!("导入: I/E {} ({:#06x}) → slot {} ({:#06x})", ie_offset, src, storage_slot, dst);
+        info!(
+            "导入: I/E {} ({:#06x}) → slot {} ({:#06x})",
+            ie_offset, src, storage_slot, dst
+        );
         self.move_medium(src, dst)
     }
 
     /// 导出：把 storage slot 介质搬到 I/E 口
     pub fn export(&self, storage_slot: u16, ie_offset: u16) -> Result<()> {
-        let map = self.address_map.as_ref()
+        let map = self
+            .address_map
+            .as_ref()
             .ok_or_else(|| TapeError::NotReady("address map not loaded".into()))?;
         if storage_slot == 0 || storage_slot > map.storage_count {
             return Err(TapeError::MoveFailed {
-                reason: format!("storage slot {} 越界（可用 1..={}）", storage_slot, map.storage_count),
+                reason: format!(
+                    "storage slot {} 越界（可用 1..={}）",
+                    storage_slot, map.storage_count
+                ),
             });
         }
         if ie_offset >= map.ie_count {
@@ -224,10 +263,12 @@ impl<'a> MediumChanger<'a> {
         }
         let src = map.storage_start + storage_slot - 1;
         let dst = map.ie_start + ie_offset;
-        info!("导出: slot {} ({:#06x}) → I/E {} ({:#06x})", storage_slot, src, ie_offset, dst);
+        info!(
+            "导出: slot {} ({:#06x}) → I/E {} ({:#06x})",
+            storage_slot, src, ie_offset, dst
+        );
         self.move_medium(src, dst)
     }
-
 }
 
 /// 解析 READ ELEMENT STATUS 返回数据。
@@ -236,7 +277,10 @@ impl<'a> MediumChanger<'a> {
 ///   [Data header 8B] [Page header 8B][desc × N] [Page header 8B][desc × N] ...
 fn parse_element_status_data(data: &[u8]) -> Result<Vec<ElementStatus>> {
     if data.len() < 8 {
-        return Err(TapeError::InvalidResponse { expected: 8, actual: data.len() });
+        return Err(TapeError::InvalidResponse {
+            expected: 8,
+            actual: data.len(),
+        });
     }
 
     // Data header: byte 5-7 = Byte Count of Report Available（u24 BE）
@@ -264,7 +308,12 @@ fn parse_element_status_data(data: &[u8]) -> Result<Vec<ElementStatus>> {
 
         while offset + desc_len <= page_end {
             let desc = &data[offset..offset + desc_len];
-            elements.push(parse_descriptor(desc, elem_type_code, has_pvoltag, has_avoltag));
+            elements.push(parse_descriptor(
+                desc,
+                elem_type_code,
+                has_pvoltag,
+                has_avoltag,
+            ));
             offset += desc_len;
         }
     }
@@ -288,21 +337,36 @@ fn parse_descriptor(
         None
     };
 
-    let volume_tag = if has_pvoltag { extract_volume_tag(desc) } else { None };
+    let volume_tag = if has_pvoltag {
+        extract_volume_tag(desc)
+    } else {
+        None
+    };
     let element_type = ElementType::from_u8(elem_type_code).unwrap_or(ElementType::Storage);
 
     // DVCID 扩展位于 PVolTag/AVolTag 之后。仅 DTE 元素带有意义的 device identifier。
     // PVolTag/AVolTag 各 36 字节（SMC-3 §6.10.1：32 字节 Volume Identification + 4 字节 Sequence Number）。
     let drive_id = if element_type == ElementType::DataTransfer {
         let mut id_off = 12;
-        if has_pvoltag { id_off += 36; }
-        if has_avoltag { id_off += 36; }
+        if has_pvoltag {
+            id_off += 36;
+        }
+        if has_avoltag {
+            id_off += 36;
+        }
         extract_drive_id(desc, id_off)
     } else {
         None
     };
 
-    ElementStatus { address, element_type, full, volume_tag, source_address, drive_id }
+    ElementStatus {
+        address,
+        element_type,
+        full,
+        volume_tag,
+        source_address,
+        drive_id,
+    }
 }
 
 /// DVCID 扩展（SMC-3）：

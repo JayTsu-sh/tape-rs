@@ -29,7 +29,10 @@ pub enum NodeInput {
     Raft(Box<Message>),
     Exec(ExecEvent),
     /// 管理命令：由 Leader 提交到日志，应用后经 `reply` 回结论。
-    Admin { cmd: super::state::Command, reply: std::sync::mpsc::Sender<AdminReply> },
+    Admin {
+        cmd: super::state::Command,
+        reply: std::sync::mpsc::Sender<AdminReply>,
+    },
     /// 目录库拉取的结果：`Ok((覆盖到的索引, 落地的文件))`。在别的线程上拉，不挡住 Raft 循环。
     Directory(std::result::Result<(u64, PathBuf), String>),
     Shutdown,
@@ -79,21 +82,31 @@ impl TcpNet {
         let listener = TcpListener::bind(listen)?;
         let bound = listener.local_addr()?;
         info!("节点间通信监听 {}", bound);
-        thread::Builder::new().name("ltfsd-accept".into()).spawn(move || {
-            for conn in listener.incoming().flatten() {
-                let inbox = inbox.clone();
-                let snap = directory_snapshot.clone();
-                let _ = thread::Builder::new().name("ltfsd-recv".into()).spawn(move || receive(conn, inbox, snap));
-            }
-        })?;
+        thread::Builder::new()
+            .name("ltfsd-accept".into())
+            .spawn(move || {
+                for conn in listener.incoming().flatten() {
+                    let inbox = inbox.clone();
+                    let snap = directory_snapshot.clone();
+                    let _ = thread::Builder::new()
+                        .name("ltfsd-recv".into())
+                        .spawn(move || receive(conn, inbox, snap));
+                }
+            })?;
         let mut outboxes = HashMap::new();
         for (&id, addr) in peers {
             let (tx, rx) = sync_channel::<Vec<u8>>(1024);
             let addr = addr.clone();
-            thread::Builder::new().name(format!("ltfsd-send-{}", id)).spawn(move || sender(id, addr, rx))?;
+            thread::Builder::new()
+                .name(format!("ltfsd-send-{}", id))
+                .spawn(move || sender(id, addr, rx))?;
             outboxes.insert(id, tx);
         }
-        Ok(Self { outboxes, peers: peers.clone(), bound })
+        Ok(Self {
+            outboxes,
+            peers: peers.clone(),
+            bound,
+        })
     }
 
     /// 实际监听的地址（`--listen` 给 0 端口时用得上）。
@@ -103,7 +116,9 @@ impl TcpNet {
 
     /// 拉目录库用的句柄。它只需要对端地址，所以可以随便跨线程用。
     pub fn fetcher(&self) -> Arc<dyn DirectoryFetch> {
-        Arc::new(TcpFetch { peers: self.peers.clone() })
+        Arc::new(TcpFetch {
+            peers: self.peers.clone(),
+        })
     }
 }
 
@@ -131,15 +146,21 @@ fn io_err(what: &str, e: std::io::Error) -> TapeError {
 
 impl DirectoryFetch for TcpFetch {
     fn fetch(&self, from: u64, min_index: u64, dest: &Path) -> Result<u64> {
-        let addr = self.peers.get(&from).ok_or_else(|| TapeError::Ltfs(format!("不认识节点 {}", from)))?;
+        let addr = self
+            .peers
+            .get(&from)
+            .ok_or_else(|| TapeError::Ltfs(format!("不认识节点 {}", from)))?;
         let sock = addr
             .to_socket_addrs()
             .map_err(|e| io_err("解析地址", e))?
             .next()
             .ok_or_else(|| TapeError::Ltfs(format!("无法解析 {}", addr)))?;
-        let mut c = TcpStream::connect_timeout(&sock, Duration::from_secs(3)).map_err(|e| io_err("连接", e))?;
-        c.set_read_timeout(Some(Duration::from_secs(60))).map_err(|e| io_err("设置超时", e))?;
-        c.set_write_timeout(Some(Duration::from_secs(10))).map_err(|e| io_err("设置超时", e))?;
+        let mut c = TcpStream::connect_timeout(&sock, Duration::from_secs(3))
+            .map_err(|e| io_err("连接", e))?;
+        c.set_read_timeout(Some(Duration::from_secs(60)))
+            .map_err(|e| io_err("设置超时", e))?;
+        c.set_write_timeout(Some(Duration::from_secs(10)))
+            .map_err(|e| io_err("设置超时", e))?;
         let mut req = vec![FRAME_DIRECTORY];
         req.extend_from_slice(&8u32.to_be_bytes());
         req.extend_from_slice(&min_index.to_be_bytes());
@@ -148,12 +169,18 @@ impl DirectoryFetch for TcpFetch {
         let mut head = [0u8; 17]; // 1 状态 + 8 索引 + 8 长度
         c.read_exact(&mut head).map_err(|e| io_err("读应答头", e))?;
         if head[0] != 0 {
-            return Err(TapeError::Ltfs(format!("节点 {} 暂时给不出覆盖到索引 {} 的目录库快照", from, min_index)));
+            return Err(TapeError::Ltfs(format!(
+                "节点 {} 暂时给不出覆盖到索引 {} 的目录库快照",
+                from, min_index
+            )));
         }
         let index = u64::from_be_bytes(head[1..9].try_into().expect("8 字节"));
         let len = u64::from_be_bytes(head[9..17].try_into().expect("8 字节"));
         if index < min_index {
-            return Err(TapeError::Ltfs(format!("节点 {} 的目录库快照只到索引 {}，不够 {}", from, index, min_index)));
+            return Err(TapeError::Ltfs(format!(
+                "节点 {} 的目录库快照只到索引 {}，不够 {}",
+                from, index, min_index
+            )));
         }
         if len > MAX_DIRECTORY {
             return Err(TapeError::Ltfs(format!("目录库快照过大：{} 字节", len)));
@@ -166,7 +193,8 @@ impl DirectoryFetch for TcpFetch {
             let mut buf = vec![0u8; 1 << 20];
             while left > 0 {
                 let n = buf.len().min(left as usize);
-                c.read_exact(&mut buf[..n]).map_err(|e| io_err("读内容", e))?;
+                c.read_exact(&mut buf[..n])
+                    .map_err(|e| io_err("读内容", e))?;
                 hasher.update(&buf[..n]);
                 f.write_all(&buf[..n]).map_err(|e| io_err("写文件", e))?;
                 left -= n as u64;
@@ -213,7 +241,11 @@ fn receive(mut conn: TcpStream, inbox: Sender<NodeInput>, snapshot: Option<PathB
                 }
             },
             FRAME_DIRECTORY => {
-                let min = buf.get(..8).and_then(|b| b.try_into().ok()).map(u64::from_be_bytes).unwrap_or(0);
+                let min = buf
+                    .get(..8)
+                    .and_then(|b| b.try_into().ok())
+                    .map(u64::from_be_bytes)
+                    .unwrap_or(0);
                 if let Err(e) = serve_directory(&mut conn, snapshot.as_deref(), min) {
                     debug!("应答目录库拉取失败: {}", e);
                 }
@@ -229,7 +261,11 @@ fn receive(mut conn: TcpStream, inbox: Sender<NodeInput>, snapshot: Option<PathB
 
 /// 应答目录库拉取。格式：1 字节状态（0 成功，1 给不出）+ 8 字节覆盖到的索引 +
 /// 8 字节长度 + 文件内容 + 32 字节 sha256。
-fn serve_directory(conn: &mut TcpStream, snapshot: Option<&Path>, min_index: u64) -> std::io::Result<()> {
+fn serve_directory(
+    conn: &mut TcpStream,
+    snapshot: Option<&Path>,
+    min_index: u64,
+) -> std::io::Result<()> {
     let _ = conn.set_write_timeout(Some(Duration::from_secs(60)));
     let ready = snapshot.filter(|p| p.exists()).and_then(|p| {
         let index = super::directory::Directory::applied_index_of(p).ok()?;
@@ -247,7 +283,11 @@ fn serve_directory(conn: &mut TcpStream, snapshot: Option<&Path>, min_index: u64
     conn.write_all(&out)?;
     conn.write_all(&bytes)?;
     conn.write_all(&Sha256::digest(&bytes))?;
-    info!("已送出覆盖到索引 {} 的目录库快照（{} 字节）", index, bytes.len());
+    info!(
+        "已送出覆盖到索引 {} 的目录库快照（{} 字节）",
+        index,
+        bytes.len()
+    );
     Ok(())
 }
 
@@ -297,8 +337,15 @@ mod tests {
         let mut ctl = ControlState::default();
         let mut d = Directory::open(&live).unwrap();
         for (i, cmd) in [
-            Command::PoolCreate { uuid: "u-1".into(), name: "archive".into(), file_limit: 10 },
-            Command::TapeAssign { barcode: "T1".into(), pool: "archive".into() },
+            Command::PoolCreate {
+                uuid: "u-1".into(),
+                name: "archive".into(),
+                file_limit: 10,
+            },
+            Command::TapeAssign {
+                barcode: "T1".into(),
+                pool: "archive".into(),
+            },
         ]
         .iter()
         .enumerate()
@@ -313,18 +360,24 @@ mod tests {
 
         // 服务端先起，拿到实际端口后再起客户端，客户端把它当作节点 7
         let (inbox_tx, inbox_rx) = std::sync::mpsc::channel();
-        let server = TcpNet::start("127.0.0.1:0", &HashMap::new(), inbox_tx, Some(snap.clone())).unwrap();
+        let server =
+            TcpNet::start("127.0.0.1:0", &HashMap::new(), inbox_tx, Some(snap.clone())).unwrap();
         let peers = HashMap::from([(7u64, server.local_addr().to_string())]);
         let (client_inbox, _client_rx) = std::sync::mpsc::channel::<NodeInput>();
         let client = TcpNet::start("127.0.0.1:0", &peers, client_inbox, None).unwrap();
 
         // Raft 消息
-        let mut m = Message::default();
-        m.to = 7;
-        m.from = 1;
-        m.term = 42;
+        let m = Message {
+            to: 7,
+            from: 1,
+            term: 42,
+            ..Default::default()
+        };
         client.send(m);
-        match inbox_rx.recv_timeout(Duration::from_secs(5)).expect("收到消息") {
+        match inbox_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("收到消息")
+        {
             NodeInput::Raft(got) => assert_eq!((got.to, got.from, got.term), (7, 1, 42)),
             other => panic!("{:?}", other),
         }
@@ -334,7 +387,14 @@ mod tests {
         let dest = dir.join("pulled.db");
         assert_eq!(fetcher.fetch(7, 2, &dest).unwrap(), 2);
         assert_eq!(std::fs::read(&dest).unwrap(), std::fs::read(&snap).unwrap());
-        assert_eq!(Directory::open_reader(&dest).unwrap().pools().unwrap().len(), 1);
+        assert_eq!(
+            Directory::open_reader(&dest)
+                .unwrap()
+                .pools()
+                .unwrap()
+                .len(),
+            1
+        );
         // 覆盖不到要求的索引时明确拒绝，不给出半份
         let dest2 = dir.join("pulled2.db");
         assert!(fetcher.fetch(7, 99, &dest2).is_err());

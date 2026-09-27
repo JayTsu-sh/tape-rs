@@ -240,12 +240,19 @@ fn append_records_md5_and_sha256_and_verify_detects_corruption() {
     let (lib, dev) = formatted_drive();
     {
         let mut vol = LtfsVolume::mount(&dev).unwrap();
-        vol.append_file("/default.bin", &mut Cursor::new(b"hello".to_vec())).unwrap();
-        vol.set_hash_policy(HashPolicy { md5: true, sha256: true });
+        vol.append_file("/default.bin", &mut Cursor::new(b"hello".to_vec()))
+            .unwrap();
+        vol.set_hash_policy(HashPolicy {
+            md5: true,
+            sha256: true,
+        });
         vol.append_file_with_xattrs(
             "/a.bin",
             &mut Cursor::new(b"hello".to_vec()),
-            &[("user.origin", "/src/a.bin"), (XATTR_MD5, "caller cannot override")],
+            &[
+                ("user.origin", "/src/a.bin"),
+                (XATTR_MD5, "caller cannot override"),
+            ],
         )
         .unwrap();
         vol.commit().unwrap();
@@ -263,7 +270,10 @@ fn append_records_md5_and_sha256_and_verify_detects_corruption() {
     let d = vol.index().find_file("default.bin").unwrap();
     assert!(d.xattr(XATTR_SHA256).is_some());
     assert_eq!(d.xattr(XATTR_MD5), None);
-    assert_eq!(vol.verify_file("a.bin").unwrap(), HashVerdict::Match { algo: "sha256sum" });
+    assert_eq!(
+        vol.verify_file("a.bin").unwrap(),
+        HashVerdict::Match { algo: "sha256sum" }
+    );
     drop(vol);
 
     // 绕过驱动器改一个数据字节：长度不变，只有哈希能发现
@@ -284,7 +294,10 @@ fn append_records_md5_and_sha256_and_verify_detects_corruption() {
         HashVerdict::Mismatch { algo, .. } => assert_eq!(algo, "sha256sum"),
         other => panic!("expected mismatch, got {:?}", other),
     }
-    assert_eq!(vol.verify_file("default.bin").unwrap(), HashVerdict::Match { algo: "sha256sum" });
+    assert_eq!(
+        vol.verify_file("default.bin").unwrap(),
+        HashVerdict::Match { algo: "sha256sum" }
+    );
 }
 
 #[test]
@@ -295,9 +308,12 @@ fn symlink_is_followed_on_read_like_ee_layout() {
     let data = payload(100_000, 3);
     {
         let mut vol = LtfsVolume::mount(&dev).unwrap();
-        vol.append_file("/.LTFSEE_DATA/obj-1", &mut Cursor::new(&data)).unwrap();
-        vol.add_symlink("/gpfs/fs1/a.bin", "../../.LTFSEE_DATA/obj-1").unwrap();
-        vol.add_symlink("/gpfs/escape", "../../../etc/passwd").unwrap();
+        vol.append_file("/.LTFSEE_DATA/obj-1", &mut Cursor::new(&data))
+            .unwrap();
+        vol.add_symlink("/gpfs/fs1/a.bin", "../../.LTFSEE_DATA/obj-1")
+            .unwrap();
+        vol.add_symlink("/gpfs/escape", "../../../etc/passwd")
+            .unwrap();
         vol.commit().unwrap();
     }
     let vol = LtfsVolume::mount(&dev).unwrap();
@@ -305,8 +321,13 @@ fn symlink_is_followed_on_read_like_ee_layout() {
     let mut out = Vec::new();
     vol.read_file_to_writer("gpfs/fs1/a.bin", &mut out).unwrap();
     assert_eq!(out, data);
-    assert_eq!(vol.verify_file("gpfs/fs1/a.bin").unwrap(), HashVerdict::NoHash);
-    let err = vol.read_file_to_writer("gpfs/escape", &mut Vec::new()).unwrap_err();
+    assert_eq!(
+        vol.verify_file("gpfs/fs1/a.bin").unwrap(),
+        HashVerdict::NoHash
+    );
+    let err = vol
+        .read_file_to_writer("gpfs/escape", &mut Vec::new())
+        .unwrap_err();
     assert!(matches!(err, TapeError::Ltfs(_)), "{:?}", err);
 }
 
@@ -317,7 +338,8 @@ fn index_with_unknown_elements_mounts_read_only() {
     let (lib, dev) = formatted_drive();
     {
         let mut vol = LtfsVolume::mount(&dev).unwrap();
-        vol.append_file("/a.bin", &mut Cursor::new(payload(10, 1))).unwrap();
+        vol.append_file("/a.bin", &mut Cursor::new(payload(10, 1)))
+            .unwrap();
         vol.commit().unwrap();
     }
     // 在两个分区的索引里都塞一个本实现不回写的元素。位置和记录数不变。
@@ -328,7 +350,10 @@ fn index_with_unknown_elements_mounts_read_only() {
                     let text = String::from_utf8_lossy(d).to_string();
                     if text.contains("<ltfsindex") {
                         *d = text
-                            .replace("</ltfsindex>", "<futurefeature>1</futurefeature></ltfsindex>")
+                            .replace(
+                                "</ltfsindex>",
+                                "<futurefeature>1</futurefeature></ltfsindex>",
+                            )
                             .into_bytes();
                     }
                 }
@@ -339,8 +364,14 @@ fn index_with_unknown_elements_mounts_read_only() {
     assert_eq!(vol.list().len(), 1, "读不受影响");
     assert!(!vol.writable());
     assert!(vol.restricted_reason().unwrap().contains("futurefeature"));
-    let err = vol.append_file("/b.bin", &mut Cursor::new(vec![1u8])).unwrap_err();
-    assert!(matches!(err, TapeError::RecoveryRestricted { .. }), "{:?}", err);
+    let err = vol
+        .append_file("/b.bin", &mut Cursor::new(vec![1u8]))
+        .unwrap_err();
+    assert!(
+        matches!(err, TapeError::RecoveryRestricted { .. }),
+        "{:?}",
+        err
+    );
 }
 
 /// 反向校准（IBM LTFS 2.4.8.3 读 tape-rs 写的带）暴露的四个格式要求，逐条钉住。
@@ -352,7 +383,8 @@ fn on_tape_layout_matches_what_ibm_ltfs_requires() {
     let (lib, dev) = formatted_drive();
     {
         let mut vol = LtfsVolume::mount(&dev).unwrap();
-        vol.append_file("/d/a.bin", &mut Cursor::new(payload(100, 1))).unwrap();
+        vol.append_file("/d/a.bin", &mut Cursor::new(payload(100, 1)))
+            .unwrap();
         vol.commit().unwrap();
     }
     let c = lib.cartridge(BARCODE).unwrap();
@@ -422,7 +454,8 @@ fn volume_with_file_data_on_index_partition_mounts_read_only() {
     let (lib, dev) = formatted_drive();
     {
         let mut vol = LtfsVolume::mount(&dev).unwrap();
-        vol.append_file("/a.bin", &mut Cursor::new(payload(10, 1))).unwrap();
+        vol.append_file("/a.bin", &mut Cursor::new(payload(10, 1)))
+            .unwrap();
         vol.commit().unwrap();
     }
     lib.with_cartridge_mut(BARCODE, |c| {
@@ -434,7 +467,11 @@ fn volume_with_file_data_on_index_partition_mounts_read_only() {
                         // 把第一个 extent 改成位于 IP（分区 a）
                         let (head, tail) = t.split_at(ext);
                         assert!(tail.contains("<partition>b</partition>"));
-                        let tail = tail.replacen("<partition>b</partition>", "<partition>a</partition>", 1);
+                        let tail = tail.replacen(
+                            "<partition>b</partition>",
+                            "<partition>a</partition>",
+                            1,
+                        );
                         *d = format!("{head}{tail}").into_bytes();
                     }
                 }
@@ -443,7 +480,11 @@ fn volume_with_file_data_on_index_partition_mounts_read_only() {
     });
     let vol = LtfsVolume::mount(&dev).unwrap();
     assert!(!vol.writable());
-    assert!(vol.recovery().notes.iter().any(|n| n.contains("位于 IP")), "{:?}", vol.recovery().notes);
+    assert!(
+        vol.recovery().notes.iter().any(|n| n.contains("位于 IP")),
+        "{:?}",
+        vol.recovery().notes
+    );
 }
 
 /// IBM LTFS 的 <volumelockstate>：locked / permlocked 的卷不得写入，解锁后保留该元素。
@@ -459,14 +500,17 @@ fn locked_volume_mounts_read_only() {
                     if let LogicalObject::Record(d) = o {
                         let t = String::from_utf8_lossy(d).to_string();
                         if t.contains("<ltfsindex") {
-                            let t = match (t.find("<volumelockstate>"), t.find("</volumelockstate>")) {
-                                (Some(a), Some(b)) => format!("{}{}", &t[..a], &t[b + 18..]),
-                                _ => t,
-                            };
+                            let t =
+                                match (t.find("<volumelockstate>"), t.find("</volumelockstate>")) {
+                                    (Some(a), Some(b)) => format!("{}{}", &t[..a], &t[b + 18..]),
+                                    _ => t,
+                                };
                             *d = t
                                 .replace(
                                     "<highestfileuid>",
-                                    &format!("<volumelockstate>{state}</volumelockstate><highestfileuid>"),
+                                    &format!(
+                                        "<volumelockstate>{state}</volumelockstate><highestfileuid>"
+                                    ),
                                 )
                                 .into_bytes();
                         }
@@ -480,7 +524,9 @@ fn locked_volume_mounts_read_only() {
         let mut vol = LtfsVolume::mount(&dev).unwrap();
         assert!(!vol.writable(), "{state}");
         assert!(vol.restricted_reason().unwrap().contains(state));
-        let err = vol.append_file("/x", &mut Cursor::new(vec![1u8])).unwrap_err();
+        let err = vol
+            .append_file("/x", &mut Cursor::new(vec![1u8]))
+            .unwrap_err();
         assert!(matches!(err, TapeError::RecoveryRestricted { .. }));
     }
     set_state("unlocked");
@@ -495,12 +541,15 @@ fn locked_volume_mounts_read_only() {
 fn read_rejects_a_premature_filemark() {
     let (lib, dev) = formatted_drive();
     let mut vol = LtfsVolume::mount(&dev).unwrap();
-    vol.append_file("/truncated", &mut Cursor::new(payload(100_000, 9))).unwrap();
+    vol.append_file("/truncated", &mut Cursor::new(payload(100_000, 9)))
+        .unwrap();
     vol.commit().unwrap();
     let block = vol.index().find_file("truncated").unwrap().extents[0].start_block;
     lib.with_cartridge_mut(BARCODE, |cart| {
         cart.partitions[1].objects[block as usize] = tape_rs::scsi::sim::LogicalObject::Filemark;
     });
-    let err = vol.read_file_to_writer("truncated", &mut std::io::sink()).unwrap_err();
+    let err = vol
+        .read_file_to_writer("truncated", &mut std::io::sink())
+        .unwrap_err();
     assert!(err.to_string().contains("提前结束"), "{err}");
 }

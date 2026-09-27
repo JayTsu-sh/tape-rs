@@ -21,12 +21,13 @@ impl Catalog {
     /// 打开或创建 catalog。自动建目录、开 WAL、启外键、执行迁移。
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    TapeError::Catalog(format!("无法创建目录 {}: {}", parent.display(), e))
-                })?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                TapeError::Catalog(format!("无法创建目录 {}: {}", parent.display(), e))
+            })?;
         }
         let conn = Connection::open(path)?;
         // WAL：多读 + 1 写并发；NORMAL 够：崩溃最坏丢最后一笔事务，不会损坏 DB。
@@ -124,10 +125,10 @@ pub fn resolve_path(override_path: Option<&str>) -> Result<PathBuf> {
     if let Some(p) = override_path {
         return Ok(PathBuf::from(p));
     }
-    if let Ok(p) = std::env::var("TAPE_RS_CATALOG") {
-        if !p.is_empty() {
-            return Ok(PathBuf::from(p));
-        }
+    if let Ok(p) = std::env::var("TAPE_RS_CATALOG")
+        && !p.is_empty()
+    {
+        return Ok(PathBuf::from(p));
     }
     let base = match std::env::var("XDG_DATA_HOME") {
         Ok(p) if !p.is_empty() => PathBuf::from(p),
@@ -149,10 +150,7 @@ mod tests {
 
     #[test]
     fn open_creates_and_migrates() {
-        let path = std::env::temp_dir().join(format!(
-            "tape-rs-catalog-{}.db",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("tape-rs-catalog-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let cat = Catalog::open(&path).unwrap();
         let v: u32 = cat

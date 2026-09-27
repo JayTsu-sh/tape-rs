@@ -441,69 +441,151 @@ fn main() {
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Inquiry { json } => inquiry::cmd_inquiry(json),
-        Commands::Inventory { device, catalog, no_drive_scan } => {
-            changer::cmd_inventory(&device, catalog.as_deref(), no_drive_scan)
-        }
-        Commands::Load { device, slot, drive } => changer::cmd_load(&device, slot, drive),
-        Commands::Unload { device, drive, slot } => changer::cmd_unload(&device, drive, slot),
-        Commands::Move { device, from_slot, to_slot, to_drive } => {
-            changer::cmd_move(&device, from_slot, to_slot, to_drive)
-        }
+        Commands::Inventory {
+            device,
+            catalog,
+            no_drive_scan,
+        } => changer::cmd_inventory(&device, catalog.as_deref(), no_drive_scan),
+        Commands::Load {
+            device,
+            slot,
+            drive,
+        } => changer::cmd_load(&device, slot, drive),
+        Commands::Unload {
+            device,
+            drive,
+            slot,
+        } => changer::cmd_unload(&device, drive, slot),
+        Commands::Move {
+            device,
+            from_slot,
+            to_slot,
+            to_drive,
+        } => changer::cmd_move(&device, from_slot, to_slot, to_drive),
         Commands::Init { device } => changer::cmd_init(&device),
-        Commands::Exchange { device, source, dest1, dest2 } => {
-            changer::cmd_exchange(&device, &source, &dest1, &dest2)
+        Commands::Exchange {
+            device,
+            source,
+            dest1,
+            dest2,
+        } => changer::cmd_exchange(&device, &source, &dest1, &dest2),
+        Commands::PreventRemoval { device, prevent } => {
+            changer::cmd_prevent_removal(&device, prevent)
         }
-        Commands::PreventRemoval { device, prevent } => changer::cmd_prevent_removal(&device, prevent),
         Commands::Import { device, ie, slot } => changer::cmd_import(&device, ie, slot),
         Commands::Export { device, slot, ie } => changer::cmd_export(&device, slot, ie),
         Commands::Rewind { device } => tape::cmd_rewind(&device),
         Commands::Position { device } => tape::cmd_position(&device),
-        Commands::Write { device, file, block_size } => tape::cmd_write(&device, &file, block_size),
-        Commands::Read { device, output, block_size, max_size } => {
-            tape::cmd_read(&device, &output, block_size, max_size)
-        }
+        Commands::Write {
+            device,
+            file,
+            block_size,
+        } => tape::cmd_write(&device, &file, block_size),
+        Commands::Read {
+            device,
+            output,
+            block_size,
+            max_size,
+        } => tape::cmd_read(&device, &output, block_size, max_size),
         Commands::Status { device } => tape::cmd_status(&device),
         Commands::DriveLoad { device } => tape::cmd_drive_load(&device),
         Commands::DriveUnload { device } => tape::cmd_drive_unload(&device),
-        Commands::Space { device, mode, count } => tape::cmd_space(&device, &mode, count),
-        Commands::Locate { device, partition, block, change_partition } => {
-            tape::cmd_locate(&device, partition, block, change_partition)
-        }
+        Commands::Space {
+            device,
+            mode,
+            count,
+        } => tape::cmd_space(&device, &mode, count),
+        Commands::Locate {
+            device,
+            partition,
+            block,
+            change_partition,
+        } => tape::cmd_locate(&device, partition, block, change_partition),
         Commands::Erase { device, long } => tape::cmd_erase(&device, long),
-        Commands::Format { device, mode, verify, yes_destroy } => {
-            tape::cmd_format(&device, mode, verify, yes_destroy)
-        }
+        Commands::Format {
+            device,
+            mode,
+            verify,
+            yes_destroy,
+        } => tape::cmd_format(&device, mode, verify, yes_destroy),
         Commands::LogSense { device, page, raw } => tape::cmd_log_sense(&device, &page, raw),
-        Commands::ReportDensity { device, media_only } => tape::cmd_report_density(&device, media_only),
-        Commands::Diagnostic { device, foreground } => tape::cmd_diagnostic(&device, foreground),
-        Commands::Mkltfs { device, volume_id, owner, block_size, compression, yes_destroy, quick } => {
-            ltfs_cli::cmd_mkltfs(&device, &volume_id, &owner, block_size, compression, yes_destroy, quick)
+        Commands::ReportDensity { device, media_only } => {
+            tape::cmd_report_density(&device, media_only)
         }
+        Commands::Diagnostic { device, foreground } => tape::cmd_diagnostic(&device, foreground),
+        Commands::Mkltfs {
+            device,
+            volume_id,
+            owner,
+            block_size,
+            compression,
+            yes_destroy,
+            quick,
+        } => ltfs_cli::cmd_mkltfs(
+            &device,
+            &volume_id,
+            &owner,
+            block_size,
+            compression,
+            yes_destroy,
+            quick,
+        ),
         Commands::LtfsList { device } => ltfs_cli::cmd_ltfs_list(&device),
         Commands::PrStatus { device } => ltfs_cli::cmd_pr_status(&device),
-        Commands::PrFence { device, node, round } => ltfs_cli::cmd_pr_fence(&device, node, round),
-        Commands::LtfsTakeover { device, node, round, salvage, report_only } => {
-            ltfs_cli::cmd_ltfs_takeover(&device, node, round, salvage, report_only)
-        }
-        Commands::PrRelease { device, node, round } => ltfs_cli::cmd_pr_release(&device, node, round),
-        Commands::LtfsVerify { device, name, xattrs } => ltfs_cli::cmd_ltfs_verify(&device, name.as_deref(), xattrs),
-        Commands::LtfsRead { device, name, output } => ltfs_cli::cmd_ltfs_read(&device, &name, &output),
-        Commands::LtfsWrite { device, file, name, xattrs, md5, guard } => {
-            ltfs_cli::cmd_ltfs_write(&device, &file, &name, &xattrs, md5, guard.as_deref())
-        }
+        Commands::PrFence {
+            device,
+            node,
+            round,
+        } => ltfs_cli::cmd_pr_fence(&device, node, round),
+        Commands::LtfsTakeover {
+            device,
+            node,
+            round,
+            salvage,
+            report_only,
+        } => ltfs_cli::cmd_ltfs_takeover(&device, node, round, salvage, report_only),
+        Commands::PrRelease {
+            device,
+            node,
+            round,
+        } => ltfs_cli::cmd_pr_release(&device, node, round),
+        Commands::LtfsVerify {
+            device,
+            name,
+            xattrs,
+        } => ltfs_cli::cmd_ltfs_verify(&device, name.as_deref(), xattrs),
+        Commands::LtfsRead {
+            device,
+            name,
+            output,
+        } => ltfs_cli::cmd_ltfs_read(&device, &name, &output),
+        Commands::LtfsWrite {
+            device,
+            file,
+            name,
+            xattrs,
+            md5,
+            guard,
+        } => ltfs_cli::cmd_ltfs_write(&device, &file, &name, &xattrs, md5, guard.as_deref()),
         Commands::Catalog { cmd } => run_catalog(cmd),
     }
 }
 
 fn run_catalog(cmd: CatalogCmd) -> Result<()> {
     match cmd {
-        CatalogCmd::Sync { device, catalog, barcode } => {
-            catalog_cli::cmd_catalog_sync(&device, catalog.as_deref(), barcode.as_deref())
-        }
+        CatalogCmd::Sync {
+            device,
+            catalog,
+            barcode,
+        } => catalog_cli::cmd_catalog_sync(&device, catalog.as_deref(), barcode.as_deref()),
         CatalogCmd::List { catalog } => catalog_cli::cmd_catalog_list(catalog.as_deref()),
-        CatalogCmd::Find { pattern, catalog, limit } => {
-            catalog_cli::cmd_catalog_find(&pattern, catalog.as_deref(), limit)
+        CatalogCmd::Find {
+            pattern,
+            catalog,
+            limit,
+        } => catalog_cli::cmd_catalog_find(&pattern, catalog.as_deref(), limit),
+        CatalogCmd::Show { key, catalog } => {
+            catalog_cli::cmd_catalog_show(&key, catalog.as_deref())
         }
-        CatalogCmd::Show { key, catalog } => catalog_cli::cmd_catalog_show(&key, catalog.as_deref()),
     }
 }

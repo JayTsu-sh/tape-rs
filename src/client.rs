@@ -20,7 +20,10 @@ pub enum ClientError {
     /// 在 `retry_for` 之内没有任何节点在服务。
     NoLeader(String),
     /// 服务端明确拒绝：路径冲突、空间不足、路径非法等。重试无益。
-    Rejected { status: u16, body: String },
+    Rejected {
+        status: u16,
+        body: String,
+    },
     NotFound,
     /// 只创建（`put_new`）：路径已有已提交的当前版本。
     Exists(String),
@@ -33,7 +36,9 @@ impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ClientError::NoLeader(s) => write!(f, "没有可用的 Leader: {}", s),
-            ClientError::Rejected { status, body } => write!(f, "服务端拒绝 ({}): {}", status, body),
+            ClientError::Rejected { status, body } => {
+                write!(f, "服务端拒绝 ({}): {}", status, body)
+            }
             ClientError::NotFound => write!(f, "不存在"),
             ClientError::Exists(p) => write!(f, "路径已存在: {}", p),
             ClientError::Indeterminate(s) => write!(f, "结果未定，请核对后再操作: {}", s),
@@ -97,7 +102,10 @@ fn file_stat(j: &Value) -> FileStat {
         round: j["round"].as_u64().unwrap_or(0),
         barcode: j["barcode"].as_str().unwrap_or("").to_string(),
         sha256: j["sha256"].as_str().unwrap_or("").to_string(),
-        version: (j["version"][0].as_u64().unwrap_or(0), j["version"][1].as_u64().unwrap_or(0)),
+        version: (
+            j["version"][0].as_u64().unwrap_or(0),
+            j["version"][1].as_u64().unwrap_or(0),
+        ),
         metadata: j.get("metadata").cloned().unwrap_or(Value::Null),
     }
 }
@@ -156,9 +164,15 @@ impl Body<'_> {
             Body::Mem(b) => conn.write_all(b),
             Body::File(p, n) => {
                 let f = std::fs::File::open(p)?;
-                let copied = std::io::copy(&mut std::io::BufReader::with_capacity(1 << 20, f).take(*n), conn)?;
+                let copied = std::io::copy(
+                    &mut std::io::BufReader::with_capacity(1 << 20, f).take(*n),
+                    conn,
+                )?;
                 if copied != *n {
-                    return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "本地文件在上传途中变短了"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "本地文件在上传途中变短了",
+                    ));
                 }
                 Ok(())
             }
@@ -215,7 +229,13 @@ impl Client {
     }
 
     /// 出错时第一项说明请求是否可能已经到达服务端：连接都没建立起来则为 false。
-    fn request(&self, addr: &str, method: &str, path: &str, body: Option<&[u8]>) -> std::result::Result<Response, (bool, std::io::Error)> {
+    fn request(
+        &self,
+        addr: &str,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+    ) -> std::result::Result<Response, (bool, std::io::Error)> {
         self.request_with(addr, method, path, body.map(Body::Mem), &[], None)
     }
 
@@ -234,8 +254,10 @@ impl Client {
             .map_err(|e| (false, e))?
             .next()
             .ok_or_else(|| (false, std::io::Error::other("地址无法解析")))?;
-        let conn = TcpStream::connect_timeout(&sock, Duration::from_secs(3)).map_err(|e| (false, e))?;
-        self.exchange(conn, addr, method, path, body, headers, sink).map_err(|e| (true, e))
+        let conn =
+            TcpStream::connect_timeout(&sock, Duration::from_secs(3)).map_err(|e| (false, e))?;
+        self.exchange(conn, addr, method, path, body, headers, sink)
+            .map_err(|e| (true, e))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -252,7 +274,13 @@ impl Client {
         conn.set_read_timeout(Some(self.io_timeout))?;
         conn.set_write_timeout(Some(self.io_timeout))?;
         let _ = conn.set_nodelay(true);
-        write!(conn, "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n", method, encode_path(path), addr)?;
+        write!(
+            conn,
+            "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
+            method,
+            encode_path(path),
+            addr
+        )?;
         for (k, v) in headers {
             write!(conn, "{}: {}\r\n", k, v)?;
         }
@@ -285,17 +313,19 @@ impl Client {
             .split_whitespace()
             .nth(1)
             .and_then(|s| s.parse().ok())
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "连接在响应之前关闭"))?;
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "连接在响应之前关闭")
+            })?;
         let mut len: Option<usize> = None;
         loop {
             let mut h = String::new();
             if reader.read_line(&mut h)? == 0 || h == "\r\n" || h == "\n" {
                 break;
             }
-            if let Some((k, v)) = h.split_once(':') {
-                if k.eq_ignore_ascii_case("content-length") {
-                    len = v.trim().parse().ok();
-                }
+            if let Some((k, v)) = h.split_once(':')
+                && k.eq_ignore_ascii_case("content-length")
+            {
+                len = v.trim().parse().ok();
             }
         }
         if let (Some(w), 200) = (sink, status) {
@@ -303,14 +333,20 @@ impl Client {
                 Some(n) => {
                     let copied = std::io::copy(&mut (&mut reader).take(n as u64), w)?;
                     if copied != n as u64 {
-                        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "内容没有传完"));
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "内容没有传完",
+                        ));
                     }
                 }
                 None => {
                     std::io::copy(&mut reader, w)?;
                 }
             }
-            return Ok(Response { status, body: Vec::new() });
+            return Ok(Response {
+                status,
+                body: Vec::new(),
+            });
         }
         let mut body = Vec::new();
         match len {
@@ -327,11 +363,16 @@ impl Client {
 
     /// 向 Leader 发一次请求。503 时跟随提示或换节点，直到 `retry_for` 用完。
     /// 传输层错误原样返回，由调用方决定含义（对上传来说它意味着结果未定）。
-    fn to_leader(&mut self, method: &str, path: &str, body: Option<&[u8]>) -> Result<Response> {
-        self.to_leader_with(method, path, body.map(Body::Mem), &[], None)
+    fn request_leader(
+        &mut self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+    ) -> Result<Response> {
+        self.request_leader_with(method, path, body.map(Body::Mem), &[], None)
     }
 
-    fn to_leader_with<'w>(
+    fn request_leader_with<'w>(
         &mut self,
         method: &str,
         path: &str,
@@ -343,15 +384,31 @@ impl Client {
         let mut last = String::from("尚未尝试");
         loop {
             let mut order: Vec<String> = self.leader.iter().cloned().collect();
-            order.extend(self.endpoints.iter().filter(|e| Some(*e) != self.leader.as_ref()).cloned());
+            order.extend(
+                self.endpoints
+                    .iter()
+                    .filter(|e| Some(*e) != self.leader.as_ref())
+                    .cloned(),
+            );
             let mut i = 0;
             while i < order.len() {
                 let addr = order[i].clone();
                 i += 1;
-                match self.request_with(&addr, method, path, body.clone(), headers, sink.as_deref_mut()) {
+                match self.request_with(
+                    &addr,
+                    method,
+                    path,
+                    body.clone(),
+                    headers,
+                    sink.as_deref_mut(),
+                ) {
                     Ok(r) if r.status == 503 => {
                         let j = r.json();
-                        last = format!("{} 不在服务: {}", addr, j.get("detail").and_then(Value::as_str).unwrap_or(""));
+                        last = format!(
+                            "{} 不在服务: {}",
+                            addr,
+                            j.get("detail").and_then(Value::as_str).unwrap_or("")
+                        );
                         if let Some(url) = j.get("leader_url").and_then(Value::as_str) {
                             let hint = url.trim_start_matches("http://").to_string();
                             if !order[..i].contains(&hint) && !order[i..].contains(&hint) {
@@ -397,16 +454,31 @@ impl Client {
 
     /// 路径的全貌：已提交的当前版本加在途的新版本。`Ok(None)` 表示不存在。
     pub fn stat_path(&mut self, path: &str) -> Result<Option<PathStat>> {
-        let r = self.to_leader("GET", &format!("/stat/{}", path.trim_start_matches('/')), None)?;
+        let r = self.request_leader(
+            "GET",
+            &format!("/stat/{}", path.trim_start_matches('/')),
+            None,
+        )?;
         match r.status {
             200 => {
                 let j = r.json();
                 let state = j["state"].as_str().unwrap_or("committed").to_string();
-                let current = if state == "committed" { Some(file_stat(&j)) } else { j.get("current").map(file_stat) };
-                Ok(Some(PathStat { length: j["length"].as_u64().unwrap_or(0), state, current }))
+                let current = if state == "committed" {
+                    Some(file_stat(&j))
+                } else {
+                    j.get("current").map(file_stat)
+                };
+                Ok(Some(PathStat {
+                    length: j["length"].as_u64().unwrap_or(0),
+                    state,
+                    current,
+                }))
             }
             404 => Ok(None),
-            s => Err(ClientError::Rejected { status: s, body: String::from_utf8_lossy(&r.body).into_owned() }),
+            s => Err(ClientError::Rejected {
+                status: s,
+                body: String::from_utf8_lossy(&r.body).into_owned(),
+            }),
         }
     }
 
@@ -423,65 +495,119 @@ impl Client {
     fn put_inner(&mut self, path: &str, data: &[u8], create_only: bool) -> Result<PutOutcome> {
         let digest: String = {
             use sha2::{Digest, Sha256};
-            Sha256::digest(data).iter().map(|b| format!("{:02x}", b)).collect()
+            Sha256::digest(data)
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect()
         };
         self.put_body(path, Body::Mem(data), &digest, create_only, true)
     }
 
     /// 上传本地文件，内容边读边发，不整个读进内存。`wait` 为假时服务端暂存即返回
     /// （`PutOutcome::committed == false`），这不是归档确认。
-    pub fn put_file(&mut self, path: &str, local: &std::path::Path, create_only: bool, wait: bool) -> Result<PutOutcome> {
+    pub fn put_file(
+        &mut self,
+        path: &str,
+        local: &std::path::Path,
+        create_only: bool,
+        wait: bool,
+    ) -> Result<PutOutcome> {
         let len = std::fs::metadata(local)?.len();
         let digest = sha256_file(local)?;
         self.put_body(path, Body::File(local, len), &digest, create_only, wait)
     }
 
-    fn put_body(&mut self, path: &str, body: Body<'_>, digest: &str, create_only: bool, wait: bool) -> Result<PutOutcome> {
-        let headers: &[(&str, &str)] = if create_only { &[("If-None-Match", "*")] } else { &[] };
-        let route = format!("/files/{}{}", path.trim_start_matches('/'), if wait { "?wait=1" } else { "" });
+    fn put_body(
+        &mut self,
+        path: &str,
+        body: Body<'_>,
+        digest: &str,
+        create_only: bool,
+        wait: bool,
+    ) -> Result<PutOutcome> {
+        let headers: &[(&str, &str)] = if create_only {
+            &[("If-None-Match", "*")]
+        } else {
+            &[]
+        };
+        let route = format!(
+            "/files/{}{}",
+            path.trim_start_matches('/'),
+            if wait { "?wait=1" } else { "" }
+        );
         let len = body.len();
         let deadline = Instant::now() + self.retry_for;
         let mut attempts = 0;
         loop {
             attempts += 1;
-            let uncertain = match self.to_leader_with("PUT", &route, Some(body.clone()), headers, None) {
-                Ok(r) if r.status == 201 => {
-                    return Ok(PutOutcome {
-                        generation: r.json()["generation"].as_u64().unwrap_or(0),
-                        attempts,
-                        resolved_by_query: false,
-                        committed: true,
-                    });
-                }
-                Ok(r) if r.status == 202 && !wait => {
-                    return Ok(PutOutcome { generation: 0, attempts, resolved_by_query: false, committed: false });
-                }
-                // 等待窗口结束仍在暂存：继续查询，不能当拒绝或立即重传。
-                Ok(r) if r.status == 202 => true,
-                // 服务端明确说没落带（仅暂存时执行者更换）：可以直接重传
-                Ok(r) if r.status == 500 && r.json()["status"] == "failed" => false,
-                Ok(r) if r.status == 500 => true,
-                Ok(r) if r.status == 412 => return Err(ClientError::Exists(path.to_string())),
-                Ok(r) => return Err(ClientError::Rejected { status: r.status, body: String::from_utf8_lossy(&r.body).into_owned() }),
-                Err(ClientError::Io(_)) => true,
-                Err(e) => return Err(e),
-            };
+            let uncertain =
+                match self.request_leader_with("PUT", &route, Some(body.clone()), headers, None) {
+                    Ok(r) if r.status == 201 => {
+                        return Ok(PutOutcome {
+                            generation: r.json()["generation"].as_u64().unwrap_or(0),
+                            attempts,
+                            resolved_by_query: false,
+                            committed: true,
+                        });
+                    }
+                    Ok(r) if r.status == 202 && !wait => {
+                        return Ok(PutOutcome {
+                            generation: 0,
+                            attempts,
+                            resolved_by_query: false,
+                            committed: false,
+                        });
+                    }
+                    // 等待窗口结束仍在暂存：继续查询，不能当拒绝或立即重传。
+                    Ok(r) if r.status == 202 => true,
+                    // 服务端明确说没落带（仅暂存时执行者更换）：可以直接重传
+                    Ok(r) if r.status == 500 && r.json()["status"] == "failed" => false,
+                    Ok(r) if r.status == 500 => true,
+                    Ok(r) if r.status == 412 => return Err(ClientError::Exists(path.to_string())),
+                    Ok(r) => {
+                        return Err(ClientError::Rejected {
+                            status: r.status,
+                            body: String::from_utf8_lossy(&r.body).into_owned(),
+                        });
+                    }
+                    Err(ClientError::Io(_)) => true,
+                    Err(e) => return Err(e),
+                };
             if uncertain {
                 // 结果未定：到当前 Leader 上查这个路径。已提交且内容哈希与本次上传相同即视为成功。
                 // 路径上还有在途版本（可能就是这次上传，还在暂存或落带途中）：等它有结论再判定，
                 // 此时重传只会撞上路径预留。
                 let mut st = self.stat_path(path)?;
-                if !wait && st.as_ref().is_some_and(|s| s.state == "staged" && s.length == len) {
+                if !wait
+                    && st
+                        .as_ref()
+                        .is_some_and(|s| s.state == "staged" && s.length == len)
+                {
                     // 只要求暂存：路径上有一个完整暂存、长度相同的版本，按这次上传已暂存处理。
                     // 内容是否就是这次的，要等落带后按哈希确认（FUSE 的 fsync 做这一步）
-                    return Ok(PutOutcome { generation: 0, attempts, resolved_by_query: true, committed: false });
+                    return Ok(PutOutcome {
+                        generation: 0,
+                        attempts,
+                        resolved_by_query: true,
+                        committed: false,
+                    });
                 }
-                while st.as_ref().is_some_and(|s| s.state != "committed") && Instant::now() < deadline {
+                while st.as_ref().is_some_and(|s| s.state != "committed")
+                    && Instant::now() < deadline
+                {
                     std::thread::sleep(Duration::from_millis(300));
                     st = self.stat_path(path)?;
                 }
-                if let Some(cur) = st.and_then(|s| s.current).filter(|s| s.length == len && s.sha256 == digest) {
-                    return Ok(PutOutcome { generation: cur.generation, attempts, resolved_by_query: true, committed: true });
+                if let Some(cur) = st
+                    .and_then(|s| s.current)
+                    .filter(|s| s.length == len && s.sha256 == digest)
+                {
+                    return Ok(PutOutcome {
+                        generation: cur.generation,
+                        attempts,
+                        resolved_by_query: true,
+                        committed: true,
+                    });
                 }
             }
             if Instant::now() >= deadline {
@@ -494,18 +620,27 @@ impl Client {
     /// `Indeterminate`，不按路径重发，避免删掉他人随后创建的新版本。
     pub fn delete(&mut self, path: &str) -> Result<()> {
         let route = format!("/files/{}?wait=1", path.trim_start_matches('/'));
-        let r = self.to_leader("DELETE", &route, None).map_err(|e| match e {
-            ClientError::Io(e) => ClientError::Indeterminate(format!("删除 {}: {}", path, e)),
-            other => other,
-        })?;
+        let r = self
+            .request_leader("DELETE", &route, None)
+            .map_err(|e| match e {
+                ClientError::Io(e) => ClientError::Indeterminate(format!("删除 {}: {}", path, e)),
+                other => other,
+            })?;
         match r.status {
             200 if r.json()["status"] == "committed" => Ok(()),
             404 => Err(ClientError::NotFound),
-            202 | 504 => Err(ClientError::Indeterminate(format!("删除 {} 尚未取得落带确认: {}", path, String::from_utf8_lossy(&r.body)))),
-            500 if r.json()["status"] == "indeterminate" => {
-                Err(ClientError::Indeterminate(format!("删除 {}: {}", path, String::from_utf8_lossy(&r.body))))
-            }
-            s => Err(ClientError::Rejected { status: s, body: String::from_utf8_lossy(&r.body).into_owned() }),
+            202 | 504 => Err(ClientError::Indeterminate(format!(
+                "删除 {} 尚未取得落带确认: {}",
+                path,
+                String::from_utf8_lossy(&r.body)
+            ))),
+            500 if r.json()["status"] == "indeterminate" => Err(ClientError::Indeterminate(
+                format!("删除 {}: {}", path, String::from_utf8_lossy(&r.body)),
+            )),
+            s => Err(ClientError::Rejected {
+                status: s,
+                body: String::from_utf8_lossy(&r.body).into_owned(),
+            }),
         }
     }
 
@@ -566,13 +701,23 @@ impl Client {
         self.namespace_change(method, &route, path, None)
     }
 
-    fn namespace_change(&mut self, method: &str, route: &str, path: &str, body: Option<&[u8]>) -> Result<()> {
+    fn namespace_change(
+        &mut self,
+        method: &str,
+        route: &str,
+        path: &str,
+        body: Option<&[u8]>,
+    ) -> Result<()> {
         let deadline = Instant::now() + self.retry_for;
         loop {
-            let r = self.to_leader(method, route, body).map_err(|e| match e {
-                ClientError::Io(e) => ClientError::Indeterminate(format!("目录操作 {}: {}", path, e)),
-                other => other,
-            })?;
+            let r = self
+                .request_leader(method, route, body)
+                .map_err(|e| match e {
+                    ClientError::Io(e) => {
+                        ClientError::Indeterminate(format!("目录操作 {}: {}", path, e))
+                    }
+                    other => other,
+                })?;
             if r.status == 500 && r.json()["status"] == "failed" && Instant::now() < deadline {
                 // 明确未落带，重试不会删除或覆盖已提交的新对象。
                 self.leader = None;
@@ -599,22 +744,38 @@ impl Client {
     }
 
     pub fn get(&mut self, path: &str) -> Result<Vec<u8>> {
-        let r = self.to_leader("GET", &format!("/files/{}", path.trim_start_matches('/')), None)?;
+        let r = self.request_leader(
+            "GET",
+            &format!("/files/{}", path.trim_start_matches('/')),
+            None,
+        )?;
         match r.status {
             200 => Ok(r.body),
             404 => Err(ClientError::NotFound),
-            s => Err(ClientError::Rejected { status: s, body: String::from_utf8_lossy(&r.body).into_owned() }),
+            s => Err(ClientError::Rejected {
+                status: s,
+                body: String::from_utf8_lossy(&r.body).into_owned(),
+            }),
         }
     }
 
     /// 读出整个文件，边收边写进 `out`，返回字节数。出错时 `out` 里可能已有一部分内容，调用方从头重来。
     pub fn get_to(&mut self, path: &str, out: &mut dyn Write) -> Result<u64> {
         let mut counter = CountingWriter { inner: out, n: 0 };
-        let r = self.to_leader_with("GET", &format!("/files/{}", path.trim_start_matches('/')), None, &[], Some(&mut counter))?;
+        let r = self.request_leader_with(
+            "GET",
+            &format!("/files/{}", path.trim_start_matches('/')),
+            None,
+            &[],
+            Some(&mut counter),
+        )?;
         match r.status {
             200 => Ok(counter.n),
             404 => Err(ClientError::NotFound),
-            s => Err(ClientError::Rejected { status: s, body: String::from_utf8_lossy(&r.body).into_owned() }),
+            s => Err(ClientError::Rejected {
+                status: s,
+                body: String::from_utf8_lossy(&r.body).into_owned(),
+            }),
         }
     }
 
@@ -624,20 +785,38 @@ impl Client {
             return Ok(Vec::new());
         }
         let range = format!("bytes={}-{}", offset, offset + len - 1);
-        let r = self.to_leader_with("GET", &format!("/files/{}", path.trim_start_matches('/')), None, &[("Range", &range)], None)?;
+        let r = self.request_leader_with(
+            "GET",
+            &format!("/files/{}", path.trim_start_matches('/')),
+            None,
+            &[("Range", &range)],
+            None,
+        )?;
         match r.status {
             206 => Ok(r.body),
             // 服务端不认这个 Range 时回整个文件
-            200 => Ok(r.body.into_iter().skip(offset as usize).take(len as usize).collect()),
+            200 => Ok(r
+                .body
+                .into_iter()
+                .skip(offset as usize)
+                .take(len as usize)
+                .collect()),
             404 => Err(ClientError::NotFound),
-            s => Err(ClientError::Rejected { status: s, body: String::from_utf8_lossy(&r.body).into_owned() }),
+            s => Err(ClientError::Rejected {
+                status: s,
+                body: String::from_utf8_lossy(&r.body).into_owned(),
+            }),
         }
     }
 
     /// 目录的直接子项。`pending` 为真时包括只在途、尚未提交的文件。目录不存在时 `NotFound`。
     pub fn list_dir(&mut self, dir: &str, pending: bool) -> Result<Vec<DirItem>> {
-        let q = format!("/list?dir={}{}", encode_query(dir), if pending { "&pending=1" } else { "" });
-        let r = self.to_leader("GET", &q, None)?;
+        let q = format!(
+            "/list?dir={}{}",
+            encode_query(dir),
+            if pending { "&pending=1" } else { "" }
+        );
+        let r = self.request_leader("GET", &q, None)?;
         match r.status {
             200 => Ok(r.json()["entries"]
                 .as_array()
@@ -654,16 +833,23 @@ impl Client {
                 })
                 .unwrap_or_default()),
             404 => Err(ClientError::NotFound),
-            s => Err(ClientError::Rejected { status: s, body: String::from_utf8_lossy(&r.body).into_owned() }),
+            s => Err(ClientError::Rejected {
+                status: s,
+                body: String::from_utf8_lossy(&r.body).into_owned(),
+            }),
         }
     }
 
     pub fn list(&mut self) -> Result<Vec<(String, u64)>> {
-        let r = self.to_leader("GET", "/list", None)?;
+        let r = self.request_leader("GET", "/list", None)?;
         let j = r.json();
         let mut out: Vec<(String, u64)> = j["files"]
             .as_object()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.as_u64().unwrap_or(0))).collect())
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| (k.clone(), v.as_u64().unwrap_or(0)))
+                    .collect()
+            })
             .unwrap_or_default();
         out.sort();
         Ok(out)
@@ -673,17 +859,25 @@ impl Client {
 
     fn admin(&mut self, method: &str, route: &str) -> Result<String> {
         // 带一个空内容：管理命令和上传一样，一旦可能已送达就不能悄悄换节点重发
-        let r = self.to_leader(method, route, Some(b""))?;
+        let r = self.request_leader(method, route, Some(b""))?;
         let j = r.json();
         match r.status {
             200 => Ok(j["result"].as_str().unwrap_or("").to_string()),
-            s => Err(ClientError::Rejected { status: s, body: j["detail"].as_str().map(str::to_string).unwrap_or_else(|| String::from_utf8_lossy(&r.body).into_owned()) }),
+            s => Err(ClientError::Rejected {
+                status: s,
+                body: j["detail"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| String::from_utf8_lossy(&r.body).into_owned()),
+            }),
         }
     }
 
     /// 新建池，返回池 UUID。`file_limit` 为每盘带的文件数软上限，`None` 用默认值。
     pub fn pool_create(&mut self, name: &str, file_limit: Option<u64>) -> Result<String> {
-        let q = file_limit.map(|n| format!("?file_limit={}", n)).unwrap_or_default();
+        let q = file_limit
+            .map(|n| format!("?file_limit={}", n))
+            .unwrap_or_default();
         self.admin("POST", &format!("/admin/pools/{}{}", name, q))
     }
 
@@ -705,8 +899,11 @@ impl Client {
     /// 池与磁带归属。由 `addr` 指定的节点用它已应用的日志回答；`None` 时问 Leader。
     pub fn pools(&mut self, addr: Option<&str>) -> Result<Vec<PoolInfo>> {
         let j = match addr {
-            Some(a) => self.request(a, "GET", "/admin/pools", None).map_err(|(_, e)| e)?.json(),
-            None => self.to_leader("GET", "/admin/pools", None)?.json(),
+            Some(a) => self
+                .request(a, "GET", "/admin/pools", None)
+                .map_err(|(_, e)| e)?
+                .json(),
+            None => self.request_leader("GET", "/admin/pools", None)?.json(),
         };
         Ok(j["pools"]
             .as_array()
@@ -716,7 +913,14 @@ impl Client {
                         uuid: p["uuid"].as_str().unwrap_or("").to_string(),
                         name: p["name"].as_str().unwrap_or("").to_string(),
                         file_limit: p["file_limit"].as_u64().unwrap_or(0),
-                        tapes: p["tapes"].as_array().map(|t| t.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
+                        tapes: p["tapes"]
+                            .as_array()
+                            .map(|t| {
+                                t.iter()
+                                    .filter_map(|x| x.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                         tape_details: p["tape_details"]
                             .as_array()
                             .map(|t| {
@@ -742,7 +946,10 @@ impl Client {
 
     /// 某个节点的自述（不跟随 Leader）。
     pub fn node_status(&self, addr: &str) -> Result<Value> {
-        Ok(self.request(addr, "GET", "/cluster", None).map_err(|(_, e)| e)?.json())
+        Ok(self
+            .request(addr, "GET", "/cluster", None)
+            .map_err(|(_, e)| e)?
+            .json())
     }
 }
 
@@ -768,7 +975,9 @@ fn encode_query(v: &str) -> String {
     let mut out = String::with_capacity(v.len());
     for b in v.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             other => out.push_str(&format!("%{:02X}", other)),
         }
     }
@@ -776,11 +985,16 @@ fn encode_query(v: &str) -> String {
 }
 
 fn encode_path(path: &str) -> String {
-    let (p, q) = path.split_once('?').map(|(p, q)| (p, Some(q))).unwrap_or((path, None));
+    let (p, q) = path
+        .split_once('?')
+        .map(|(p, q)| (p, Some(q)))
+        .unwrap_or((path, None));
     let mut out = String::with_capacity(p.len());
     for b in p.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             other => out.push_str(&format!("%{:02X}", other)),
         }
     }
@@ -804,7 +1018,10 @@ mod tests {
         let server = std::thread::spawn(move || {
             for (method, response) in [
                 ("PUT", serde_json::json!({"status": "staged", "task": 1})),
-                ("GET", serde_json::json!({"state": "committed", "length": 3, "generation": 2, "sha256": format!("{:x}", Sha256::digest(b"abc"))})),
+                (
+                    "GET",
+                    serde_json::json!({"state": "committed", "length": 3, "generation": 2, "sha256": format!("{:x}", Sha256::digest(b"abc"))}),
+                ),
             ] {
                 let (stream, _) = listener.accept().unwrap();
                 let mut reader = BufReader::new(stream);
@@ -814,7 +1031,9 @@ mod tests {
                 loop {
                     line.clear();
                     reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" { break; }
+                    if line == "\r\n" {
+                        break;
+                    }
                 }
                 if method == "PUT" {
                     let mut body = [0; 3];
@@ -822,7 +1041,14 @@ mod tests {
                     assert_eq!(&body, b"abc");
                 }
                 let body = response.to_string();
-                write!(reader.get_mut(), "HTTP/1.1 {} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", if method == "PUT" { 202 } else { 200 }, body.len(), body).unwrap();
+                write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 {} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    if method == "PUT" { 202 } else { 200 },
+                    body.len(),
+                    body
+                )
+                .unwrap();
             }
         });
         let result = client.put("/a", b"abc").unwrap();
@@ -836,7 +1062,10 @@ mod tests {
         let first = TcpListener::bind("127.0.0.1:0").unwrap();
         let second = TcpListener::bind("127.0.0.1:0").unwrap();
         second.set_nonblocking(true).unwrap();
-        let mut client = Client::new(vec![first.local_addr().unwrap().to_string(), second.local_addr().unwrap().to_string()]);
+        let mut client = Client::new(vec![
+            first.local_addr().unwrap().to_string(),
+            second.local_addr().unwrap().to_string(),
+        ]);
         client.retry_for = Duration::ZERO;
         let server = std::thread::spawn(move || {
             let (stream, _) = first.accept().unwrap();
@@ -847,17 +1076,32 @@ mod tests {
             loop {
                 line.clear();
                 reader.read_line(&mut line).unwrap();
-                if line == "\r\n" { break; }
+                if line == "\r\n" {
+                    break;
+                }
             }
             // 模拟已执行删除，但提交响应丢失。
         });
-        assert!(matches!(client.delete("/a"), Err(ClientError::Indeterminate(_))));
+        assert!(matches!(
+            client.delete("/a"),
+            Err(ClientError::Indeterminate(_))
+        ));
         server.join().unwrap();
-        assert_eq!(second.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(
+            second.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
     #[test]
     fn metadata_mutations_with_lost_response_are_not_replayed() {
-        for method in ["POST", "DELETE", "RENAME", "SETXATTR", "REMOVEXATTR", "SYMLINK"] {
+        for method in [
+            "POST",
+            "DELETE",
+            "RENAME",
+            "SETXATTR",
+            "REMOVEXATTR",
+            "SYMLINK",
+        ] {
             let first = TcpListener::bind("127.0.0.1:0").unwrap();
             let second = TcpListener::bind("127.0.0.1:0").unwrap();
             second.set_nonblocking(true).unwrap();
@@ -968,5 +1212,4 @@ mod tests {
             );
         }
     }
-
 }

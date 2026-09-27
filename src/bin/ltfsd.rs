@@ -22,7 +22,10 @@ use tape_rs::daemon::node::{self, NodeConfig, NodeStatus};
 use tape_rs::daemon::store::RaftStore;
 
 #[derive(Parser)]
-#[command(name = "ltfsd", about = "磁带库高可用守护进程（骨架）：Raft 选主 + 设备层隔离 + 自动接管")]
+#[command(
+    name = "ltfsd",
+    about = "磁带库高可用守护进程（骨架）：Raft 选主 + 设备层隔离 + 自动接管"
+)]
 struct Args {
     /// 本节点编号（1..=255，同时写进预留键）
     #[arg(long)]
@@ -103,7 +106,11 @@ extern "C" fn on_stop_signal(_: nix::libc::c_int) {
 /// 装上信号处理，并起一个线程把它转成 `NodeInput::Shutdown`。
 fn install_signal_handler(inbox: std::sync::mpsc::Sender<NodeInput>) {
     use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
-    let action = SigAction::new(SigHandler::Handler(on_stop_signal), SaFlags::empty(), SigSet::empty());
+    let action = SigAction::new(
+        SigHandler::Handler(on_stop_signal),
+        SaFlags::empty(),
+        SigSet::empty(),
+    );
     for sig in [Signal::SIGTERM, Signal::SIGINT] {
         // SAFETY: 处理函数只对一个 AtomicBool 做 swap，失败路径只调 _exit，都是信号安全的
         if let Err(e) = unsafe { sigaction(sig, &action) } {
@@ -143,20 +150,29 @@ fn main() {
     std::fs::create_dir_all(&args.data_dir).expect("创建数据目录");
 
     let (inbox_tx, inbox_rx) = channel::<NodeInput>();
-    let others: HashMap<u64, String> = peers.iter().filter(|(id, _)| **id != me).map(|(i, a)| (*i, a.clone())).collect();
+    let others: HashMap<u64, String> = peers
+        .iter()
+        .filter(|(id, _)| **id != me)
+        .map(|(i, a)| (*i, a.clone()))
+        .collect();
     let directory_file = args.data_dir.join("directory.db");
     let net = TcpNet::start(
         &args.listen,
         &others,
         inbox_tx.clone(),
-        Some(tape_rs::daemon::directory::Directory::snapshot_path(&directory_file)),
+        Some(tape_rs::daemon::directory::Directory::snapshot_path(
+            &directory_file,
+        )),
     )
     .expect("启动节点间通信");
     let fetcher = net.fetcher();
 
     let (exec_tx, exec_rx) = channel();
     let (ev_tx, ev_rx) = channel();
-    let provider = Box::new(SgProvider { changer_serial: args.changer_serial.clone(), drive_serials: args.drive_serials.clone() });
+    let provider = Box::new(SgProvider {
+        changer_serial: args.changer_serial.clone(),
+        drive_serials: args.drive_serials.clone(),
+    });
     let eopts = ExecOptions {
         node_id: args.id,
         interval: Duration::from_millis(args.interval_ms),
@@ -171,15 +187,28 @@ fn main() {
         idle: Duration::from_millis(args.batch_idle_ms),
         max_wait: Duration::from_millis(args.batch_max_wait_ms),
     };
-    let files = FileService::with_options(args.data_dir.join("spool"), policy, Some(directory_file.clone()))
-        .expect("创建暂存区");
+    let files = FileService::with_options(
+        args.data_dir.join("spool"),
+        policy,
+        Some(directory_file.clone()),
+    )
+    .expect("创建暂存区");
     let status = Arc::new(Mutex::new(NodeStatus::default()));
     let status_for_exec = status.clone();
     files.set_executor(exec_tx.clone());
     let files_for_exec = files.clone();
     thread::Builder::new()
         .name("ltfsd-exec".into())
-        .spawn(move || executor::run(provider, eopts, exec_rx, ev_tx, files_for_exec, status_for_exec))
+        .spawn(move || {
+            executor::run(
+                provider,
+                eopts,
+                exec_rx,
+                ev_tx,
+                files_for_exec,
+                status_for_exec,
+            )
+        })
         .expect("执行线程");
     let inbox_for_events = inbox_tx.clone();
     thread::Builder::new()
@@ -213,7 +242,16 @@ fn main() {
     if let Some(listen) = &args.client_listen {
         let client_addrs = peers
             .iter()
-            .map(|(id, addr)| (*id, format!("{}:{}", addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr), args.client_port)))
+            .map(|(id, addr)| {
+                (
+                    *id,
+                    format!(
+                        "{}:{}",
+                        addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr),
+                        args.client_port
+                    ),
+                )
+            })
             .collect();
         let ctx = Arc::new(HttpContext {
             files: files.clone(),
@@ -226,9 +264,16 @@ fn main() {
         http::serve(listen, ctx).expect("启动客户端接口");
     }
     install_signal_handler(inbox_tx.clone());
-    if let Err(e) =
-        node::run_with(cfg, store, Box::new(net), Some(fetcher), Some(inbox_tx.clone()), inbox_rx, exec_tx, status)
-    {
+    if let Err(e) = node::run_with(
+        cfg,
+        store,
+        Box::new(net),
+        Some(fetcher),
+        Some(inbox_tx.clone()),
+        inbox_rx,
+        exec_tx,
+        status,
+    ) {
         eprintln!("ltfsd 退出: {}", e);
         std::process::exit(1);
     }

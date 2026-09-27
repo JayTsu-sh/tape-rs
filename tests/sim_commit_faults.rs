@@ -158,7 +158,13 @@ fn dv02_fault_on_index_partition_dp_already_committed() {
     assert!(r.ip_debt, "IP 仍是 gen 2");
     assert_eq!(vol.index().generation, 3);
     assert_eq!(read(&vol, "beta.bin"), beta);
-    assert!(vol.writable(), "ip_tail={:?} ip_notes={:?} notes={:?}", r.ip.tail, r.ip.notes, r.notes);
+    assert!(
+        vol.writable(),
+        "ip_tail={:?} ip_notes={:?} notes={:?}",
+        r.ip.tail,
+        r.ip.notes,
+        r.notes
+    );
 }
 
 #[test]

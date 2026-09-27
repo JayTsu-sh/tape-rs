@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use tape_rs::catalog::{self, Catalog, CapacitySnapshot};
+use tape_rs::catalog::{self, CapacitySnapshot, Catalog};
 use tape_rs::changer::commands::MediumChanger;
 use tape_rs::changer::element::{ElementAddressMap, ElementStatus, ElementType};
 use tape_rs::error::{Result, TapeError};
@@ -38,7 +38,13 @@ pub fn cmd_inventory(path: &str, catalog_path: Option<&str>, no_drive_scan: bool
     // C: catalog 缓存；允许不存在或为空。
     let cached_capacity = load_cached_capacity(catalog_path);
 
-    print_drive_section(&elements, &map, &realtime_capacity, &cached_capacity, &drive_sg_map);
+    print_drive_section(
+        &elements,
+        &map,
+        &realtime_capacity,
+        &cached_capacity,
+        &drive_sg_map,
+    );
     print_storage_section(&elements, &map, &realtime_capacity, &cached_capacity);
     print_ie_section(&elements, &map, &realtime_capacity, &cached_capacity);
 
@@ -63,7 +69,10 @@ fn print_drive_section(
     drive_sg_map: &HashMap<String, String>,
 ) {
     println!("=== 驱动器 ===");
-    for elem in elements.iter().filter(|e| e.element_type == ElementType::DataTransfer) {
+    for elem in elements
+        .iter()
+        .filter(|e| e.element_type == ElementType::DataTransfer)
+    {
         print!("  {}", format_elem_head(elem, map));
         if let Some(src) = elem.source_address {
             print!("  <- {}", describe_source(map, src));
@@ -90,7 +99,10 @@ fn print_storage_section(
     cached: &HashMap<String, CapacitySnapshot>,
 ) {
     println!("=== 存储槽 ===");
-    for elem in elements.iter().filter(|e| e.element_type == ElementType::Storage) {
+    for elem in elements
+        .iter()
+        .filter(|e| e.element_type == ElementType::Storage)
+    {
         print!("  {}", format_elem_head(elem, map));
         if elem.full {
             print_capacity(elem.volume_tag.as_deref(), realtime, cached);
@@ -107,7 +119,10 @@ fn print_ie_section(
     cached: &HashMap<String, CapacitySnapshot>,
 ) {
     println!("=== I/E 口 ===");
-    for elem in elements.iter().filter(|e| e.element_type == ElementType::ImportExport) {
+    for elem in elements
+        .iter()
+        .filter(|e| e.element_type == ElementType::ImportExport)
+    {
         print!("  {}", format_elem_head(elem, map));
         if elem.full {
             print_capacity(elem.volume_tag.as_deref(), realtime, cached);
@@ -127,7 +142,13 @@ fn format_elem_head(elem: &ElementStatus, map: &ElementAddressMap) -> String {
     };
     let state = if elem.full { "载带" } else { "空" };
     let tag = elem.volume_tag.as_deref().unwrap_or("-");
-    format!("{} {:>3} [{}]: {}", label, friendly_index(elem, map), state, tag)
+    format!(
+        "{} {:>3} [{}]: {}",
+        label,
+        friendly_index(elem, map),
+        state,
+        tag
+    )
 }
 
 /// 把 SCSI element 绝对地址翻成 1-based 用户编号。
@@ -188,6 +209,7 @@ fn format_capacity(cap: CapacitySnapshot, source: &str) -> String {
 /// 扫 `/dev/sg*`，跳过 changer 本身，对每个 sg 节点同时收集：
 ///   1. `barcode → CapacitySnapshot`（仅载带的 drive）
 ///   2. `drive_serial → sg_path`（所有探测到的 tape drive，不论是否载带）
+///
 /// 后者用来把 changer DTE 元素返回的 drive_id 关联回 inquiry 视角的 sg 设备。
 fn scan_drive_capacities_and_sg(
     changer_path: &str,
@@ -205,7 +227,9 @@ fn scan_drive_capacities_and_sg(
 
     let canon_changer = std::fs::canonicalize(changer_path).ok();
     for path in sg_nodes {
-        if canon_changer.as_ref().map(|c| c == &path).unwrap_or(false) || path.to_str() == Some(changer_path) {
+        if canon_changer.as_ref().map(|c| c == &path).unwrap_or(false)
+            || path.to_str() == Some(changer_path)
+        {
             continue;
         }
         let s = match path.to_str() {
@@ -218,7 +242,13 @@ fn scan_drive_capacities_and_sg(
                     sg_map.insert(serial, s.to_string());
                 }
                 if let (Some(barcode), Some(cap)) = (probe.barcode, probe.capacity) {
-                    log::debug!("drive {} barcode={} total={} remaining={}", s, barcode, cap.total, cap.remaining);
+                    log::debug!(
+                        "drive {} barcode={} total={} remaining={}",
+                        s,
+                        barcode,
+                        cap.total,
+                        cap.remaining
+                    );
                     cap_map.insert(barcode, cap);
                 }
             }
@@ -259,27 +289,38 @@ fn probe_tape_drive(path: &str, library_drives: &[String]) -> Result<Option<Driv
     }
 
     let mam_dev = mam::Mam::new(&dev);
-    let barcode = mam_dev.read_attribute(mam::ATTR_BARCODE).ok().flatten().and_then(|a| {
-        let b = std::str::from_utf8(&a.value)
-            .unwrap_or("")
-            .trim_matches(|c: char| c == '\0' || c == ' ')
-            .to_string();
-        if b.is_empty() { None } else { Some(b) }
-    });
+    let barcode = mam_dev
+        .read_attribute(mam::ATTR_BARCODE)
+        .ok()
+        .flatten()
+        .and_then(|a| {
+            let b = std::str::from_utf8(&a.value)
+                .unwrap_or("")
+                .trim_matches(|c: char| c == '\0' || c == ' ')
+                .to_string();
+            if b.is_empty() { None } else { Some(b) }
+        });
 
     let capacity = if barcode.is_some() {
         mam::read_volume_capacity(&dev).ok().and_then(|c| {
             if c.total == 0 {
                 None
             } else {
-                Some(CapacitySnapshot { total: c.total, remaining: c.remaining })
+                Some(CapacitySnapshot {
+                    total: c.total,
+                    remaining: c.remaining,
+                })
             }
         })
     } else {
         None
     };
 
-    Ok(Some(DriveProbe { serial, barcode, capacity }))
+    Ok(Some(DriveProbe {
+        serial,
+        barcode,
+        capacity,
+    }))
 }
 
 /// 容忍 catalog 缺失：打不开 / 查不到就返回空 map，不中断 inventory。
@@ -341,7 +382,11 @@ fn drive_to_addr(map: &ElementAddressMap, drive: u16) -> Result<u16> {
 
 fn parse_addr(s: &str) -> Result<u16> {
     let trimmed = s.trim_start_matches("0x").trim_start_matches("0X");
-    let radix = if s.starts_with("0x") || s.starts_with("0X") { 16 } else { 10 };
+    let radix = if s.starts_with("0x") || s.starts_with("0X") {
+        16
+    } else {
+        10
+    };
     u16::from_str_radix(trimmed, radix).map_err(|e| TapeError::MoveFailed {
         reason: format!("无法解析地址 '{}': {}", s, e),
     })
@@ -389,7 +434,8 @@ fn check_move_result(
              用 `sg_persist --in -r <drive>` 排查。",
             describe_source(map, source_addr),
             describe_source(map, dest_addr),
-            s.full, d.full,
+            s.full,
+            d.full,
         ))),
         _ => Err(TapeError::InconsistentState(format!(
             "MOVE MEDIUM 后无法在 element status 中定位 source {:#06x} 或 dest {:#06x}",
@@ -406,7 +452,10 @@ pub fn cmd_load(changer_path: &str, slot: u16, drive: u16) -> Result<()> {
     let source_addr = slot_to_addr(&map, slot)?;
     let dest_addr = drive_to_addr(&map, drive)?;
 
-    println!("装载: slot {} (addr {:#06x}) → drive {} (addr {:#06x})", slot, source_addr, drive, dest_addr);
+    println!(
+        "装载: slot {} (addr {:#06x}) → drive {} (addr {:#06x})",
+        slot, source_addr, drive, dest_addr
+    );
     changer.move_medium(source_addr, dest_addr)?;
     verify_move_result(&changer, &map, source_addr, dest_addr)?;
     println!("装载完成");
@@ -421,14 +470,22 @@ pub fn cmd_unload(changer_path: &str, drive: u16, slot: u16) -> Result<()> {
     let source_addr = drive_to_addr(&map, drive)?;
     let dest_addr = slot_to_addr(&map, slot)?;
 
-    println!("卸载: drive {} (addr {:#06x}) → slot {} (addr {:#06x})", drive, source_addr, slot, dest_addr);
+    println!(
+        "卸载: drive {} (addr {:#06x}) → slot {} (addr {:#06x})",
+        drive, source_addr, slot, dest_addr
+    );
     changer.move_medium(source_addr, dest_addr)?;
     verify_move_result(&changer, &map, source_addr, dest_addr)?;
     println!("卸载完成");
     Ok(())
 }
 
-pub fn cmd_move(changer_path: &str, from_slot: u16, to_slot: Option<u16>, to_drive: Option<u16>) -> Result<()> {
+pub fn cmd_move(
+    changer_path: &str,
+    from_slot: u16,
+    to_slot: Option<u16>,
+    to_drive: Option<u16>,
+) -> Result<()> {
     let dev = ScsiDevice::open(changer_path)?;
     let mut changer = MediumChanger::new(&dev);
     let map = changer.load_address_map()?.clone();
@@ -506,10 +563,14 @@ mod tests {
 
     fn fixture_map() -> ElementAddressMap {
         ElementAddressMap {
-            transport_start: 0x0000, transport_count: 1,
-            storage_start:   0x03e9, storage_count:   35,
-            ie_start:        0x0065, ie_count:        5,
-            dt_start:        0x0001, dt_count:        2,
+            transport_start: 0x0000,
+            transport_count: 1,
+            storage_start: 0x03e9,
+            storage_count: 35,
+            ie_start: 0x0065,
+            ie_count: 5,
+            dt_start: 0x0001,
+            dt_count: 2,
         }
     }
 
@@ -530,8 +591,8 @@ mod tests {
         let src = 0x03e9;
         let dst = 0x0002;
         let elements = vec![
-            elem(src, ElementType::Storage,      false, None),
-            elem(dst, ElementType::DataTransfer, true,  Some("8A0043L8")),
+            elem(src, ElementType::Storage, false, None),
+            elem(dst, ElementType::DataTransfer, true, Some("8A0043L8")),
         ];
         assert!(check_move_result(&elements, &map, src, dst).is_ok());
     }
@@ -543,7 +604,7 @@ mod tests {
         let dst = 0x0002;
         // 模拟 firmware 静默拒绝: source 仍 Full, dest 仍 Empty
         let elements = vec![
-            elem(src, ElementType::Storage,      true,  Some("8A0043L8")),
+            elem(src, ElementType::Storage, true, Some("8A0043L8")),
             elem(dst, ElementType::DataTransfer, false, None),
         ];
         let err = check_move_result(&elements, &map, src, dst).unwrap_err();
@@ -563,7 +624,7 @@ mod tests {
         let dst = 0x0002;
         // 半成品状态: source 已被取走但 dest 没收到
         let elements = vec![
-            elem(src, ElementType::Storage,      false, None),
+            elem(src, ElementType::Storage, false, None),
             elem(dst, ElementType::DataTransfer, false, None),
         ];
         assert!(matches!(
@@ -578,9 +639,7 @@ mod tests {
         let src = 0x03e9;
         let dst = 0x0002;
         // 模拟 READ ELEMENT STATUS 没返回 source 那一项
-        let elements = vec![
-            elem(dst, ElementType::DataTransfer, true, Some("8A0043L8")),
-        ];
+        let elements = vec![elem(dst, ElementType::DataTransfer, true, Some("8A0043L8"))];
         let err = check_move_result(&elements, &map, src, dst).unwrap_err();
         match err {
             TapeError::InconsistentState(msg) => {

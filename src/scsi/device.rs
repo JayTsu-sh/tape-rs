@@ -5,12 +5,12 @@ use std::os::unix::io::{AsRawFd, OwnedFd};
 
 use log::debug;
 
-use crate::error::{TapeError, Result};
+use crate::error::{Result, TapeError};
 use crate::scsi::sense::SenseInfo;
 use crate::scsi::sg_io::{
-    SG_DXFER_FROM_DEV, SG_DXFER_NONE, SG_DXFER_TO_DEV,
     SCSI_STATUS_BUSY, SCSI_STATUS_CHECK_CONDITION, SCSI_STATUS_GOOD,
-    SCSI_STATUS_RESERVATION_CONFLICT, SCSI_STATUS_TASK_SET_FULL, SgIoHdr,
+    SCSI_STATUS_RESERVATION_CONFLICT, SCSI_STATUS_TASK_SET_FULL, SG_DXFER_FROM_DEV, SG_DXFER_NONE,
+    SG_DXFER_TO_DEV, SgIoHdr,
 };
 
 /// 数据传输方向
@@ -207,18 +207,33 @@ pub(crate) fn finish_command(
             // sense 显示 NO SENSE（filemark / BOP / ILI 等提示），仍按成功对待但保留 status。
         }
         SCSI_STATUS_RESERVATION_CONFLICT => {
-            return Err(TapeError::ReservationConflict { device: device.to_string() });
+            return Err(TapeError::ReservationConflict {
+                device: device.to_string(),
+            });
         }
         SCSI_STATUS_BUSY => {
-            return Err(TapeError::Busy { device: device.to_string() });
+            return Err(TapeError::Busy {
+                device: device.to_string(),
+            });
         }
         SCSI_STATUS_TASK_SET_FULL => {
-            return Err(TapeError::ScsiStatus { device: device.to_string(), status });
+            return Err(TapeError::ScsiStatus {
+                device: device.to_string(),
+                status,
+            });
         }
         _ => {
-            return Err(TapeError::ScsiStatus { device: device.to_string(), status });
+            return Err(TapeError::ScsiStatus {
+                device: device.to_string(),
+                status,
+            });
         }
     }
 
-    Ok(ScsiResult { status, sense, transferred, duration_ms })
+    Ok(ScsiResult {
+        status,
+        sense,
+        transferred,
+        duration_ms,
+    })
 }

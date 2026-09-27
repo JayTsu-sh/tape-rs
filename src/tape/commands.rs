@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use bytes::Bytes;
 use log::{debug, info};
 
-use crate::error::{TapeError, Result};
+use crate::error::{Result, TapeError};
 use crate::scsi::cdb;
 use crate::scsi::transport::{TapeTransport, retry_unit_attention};
 
@@ -24,7 +24,9 @@ fn ensure_space_count(count: i32) -> Result<()> {
         return Err(TapeError::MoveFailed {
             reason: format!(
                 "SPACE count {} 超出 24-bit 有符号范围 [{}, {}]",
-                count, cdb::SPACE_COUNT_MIN, cdb::SPACE_COUNT_MAX
+                count,
+                cdb::SPACE_COUNT_MIN,
+                cdb::SPACE_COUNT_MAX
             ),
         });
     }
@@ -61,9 +63,13 @@ impl<'a> TapeDrive<'a> {
     /// 因此收到 UA 后重发一次 TUR 再判定 ready 状态。
     pub fn test_unit_ready(&self) -> Result<bool> {
         let cdb_bytes = cdb::test_unit_ready();
-        match retry_unit_attention("TEST UNIT READY", || self.device.execute_no_data(&cdb_bytes, 10_000)) {
+        match retry_unit_attention("TEST UNIT READY", || {
+            self.device.execute_no_data(&cdb_bytes, 10_000)
+        }) {
             Ok(_) => Ok(true),
-            Err(TapeError::ScsiCommand { sense_key: 0x02, .. }) => Ok(false),
+            Err(TapeError::ScsiCommand {
+                sense_key: 0x02, ..
+            }) => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -72,7 +78,9 @@ impl<'a> TapeDrive<'a> {
     pub fn rewind(&self) -> Result<()> {
         info!("倒带...");
         let cdb_bytes = cdb::rewind();
-        retry_unit_attention("REWIND", || self.device.execute_no_data(&cdb_bytes, 300_000))?;
+        retry_unit_attention("REWIND", || {
+            self.device.execute_no_data(&cdb_bytes, 300_000)
+        })?;
         info!("倒带完成");
         Ok(())
     }
@@ -81,10 +89,15 @@ impl<'a> TapeDrive<'a> {
     pub fn read_position(&self) -> Result<TapePosition> {
         let cdb_bytes = cdb::read_position();
         let mut buf = [0u8; 20];
-        let result = retry_unit_attention("READ POSITION", || self.device.execute_read(&cdb_bytes, &mut buf, 10_000))?;
+        let result = retry_unit_attention("READ POSITION", || {
+            self.device.execute_read(&cdb_bytes, &mut buf, 10_000)
+        })?;
 
         if result.transferred < 20 {
-            return Err(TapeError::InvalidResponse { expected: 20, actual: result.transferred });
+            return Err(TapeError::InvalidResponse {
+                expected: 20,
+                actual: result.transferred,
+            });
         }
 
         // READ POSITION Short Form（SSC-5 service action 0x00）:
@@ -96,7 +109,12 @@ impl<'a> TapeDrive<'a> {
         let partition = buf[1] as u32;
         let block_number = u64::from(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]));
 
-        Ok(TapePosition { block_number, partition, at_bot, at_eot })
+        Ok(TapePosition {
+            block_number,
+            partition,
+            at_bot,
+            at_eot,
+        })
     }
 
     /// LOAD: 装载磁带
@@ -112,7 +130,9 @@ impl<'a> TapeDrive<'a> {
     pub fn unload(&self) -> Result<()> {
         info!("弹出磁带...");
         let cdb_bytes = cdb::load_unload(false);
-        retry_unit_attention("UNLOAD", || self.device.execute_no_data(&cdb_bytes, 300_000))?;
+        retry_unit_attention("UNLOAD", || {
+            self.device.execute_no_data(&cdb_bytes, 300_000)
+        })?;
         info!("弹出完成");
         Ok(())
     }
@@ -121,12 +141,19 @@ impl<'a> TapeDrive<'a> {
     pub fn write_block(&self, data: &[u8]) -> Result<usize> {
         if data.len() > SCSI_6_TRANSFER_MAX {
             return Err(TapeError::MoveFailed {
-                reason: format!("WRITE(6) 块大小 {} 超过 24-bit 上限 {}", data.len(), SCSI_6_TRANSFER_MAX),
+                reason: format!(
+                    "WRITE(6) 块大小 {} 超过 24-bit 上限 {}",
+                    data.len(),
+                    SCSI_6_TRANSFER_MAX
+                ),
             });
         }
         let cdb_bytes = cdb::write_6(false, data.len() as u32);
         let result = self.device.execute_write(&cdb_bytes, data, 120_000)?;
-        debug!("写入 {} 字节, 耗时 {}ms", result.transferred, result.duration_ms);
+        debug!(
+            "写入 {} 字节, 耗时 {}ms",
+            result.transferred, result.duration_ms
+        );
         Ok(result.transferred)
     }
 
@@ -134,7 +161,11 @@ impl<'a> TapeDrive<'a> {
     pub fn read_block(&self, buf: &mut [u8]) -> Result<usize> {
         if buf.len() > SCSI_6_TRANSFER_MAX {
             return Err(TapeError::MoveFailed {
-                reason: format!("READ(6) 块大小 {} 超过 24-bit 上限 {}", buf.len(), SCSI_6_TRANSFER_MAX),
+                reason: format!(
+                    "READ(6) 块大小 {} 超过 24-bit 上限 {}",
+                    buf.len(),
+                    SCSI_6_TRANSFER_MAX
+                ),
             });
         }
         let requested = buf.len();
@@ -155,7 +186,10 @@ impl<'a> TapeDrive<'a> {
         } else {
             result.transferred
         };
-        debug!("读取 {} 字节 (sg transferred={}), 耗时 {}ms", n, result.transferred, result.duration_ms);
+        debug!(
+            "读取 {} 字节 (sg transferred={}), 耗时 {}ms",
+            n, result.transferred, result.duration_ms
+        );
         Ok(n)
     }
 
@@ -201,7 +235,10 @@ impl<'a> TapeDrive<'a> {
     pub fn write_from_reader<R: Read>(&self, r: &mut R, block_size: usize) -> Result<u64> {
         if block_size == 0 || block_size > SCSI_6_TRANSFER_MAX {
             return Err(TapeError::MoveFailed {
-                reason: format!("block_size {} 越界 [1, {}]", block_size, SCSI_6_TRANSFER_MAX),
+                reason: format!(
+                    "block_size {} 越界 [1, {}]",
+                    block_size, SCSI_6_TRANSFER_MAX
+                ),
             });
         }
         let mut buf = vec![0u8; block_size];
@@ -237,7 +274,9 @@ impl<'a> TapeDrive<'a> {
         info!("定位到 partition={}, block={}", partition, block);
         let cdb_bytes = cdb::locate_16(partition, block, change_partition, false);
         // 大容量带上 LOCATE 可能较慢
-        retry_unit_attention("LOCATE", || self.device.execute_no_data(&cdb_bytes, 600_000))?;
+        retry_unit_attention("LOCATE", || {
+            self.device.execute_no_data(&cdb_bytes, 600_000)
+        })?;
         Ok(())
     }
 
@@ -258,7 +297,9 @@ impl<'a> TapeDrive<'a> {
     pub fn format(&self, format: u8, verify: bool) -> Result<()> {
         info!("格式化介质（format={}, verify={}）...", format, verify);
         let cdb_bytes = cdb::format_medium(format, false, verify);
-        retry_unit_attention("FORMAT MEDIUM", || self.device.execute_no_data(&cdb_bytes, 28_800_000))?;
+        retry_unit_attention("FORMAT MEDIUM", || {
+            self.device.execute_no_data(&cdb_bytes, 28_800_000)
+        })?;
         info!("格式化完成");
         Ok(())
     }
@@ -310,14 +351,17 @@ impl<'a> TapeDrive<'a> {
         })?;
         debug!("MODE SELECT(10): {} bytes", param_len);
         let cdb_bytes = cdb::mode_select_10(true, save, param_len);
-        retry_unit_attention("MODE SELECT", || self.device.execute_write(&cdb_bytes, parameters, 30_000))?;
+        retry_unit_attention("MODE SELECT", || {
+            self.device.execute_write(&cdb_bytes, parameters, 30_000)
+        })?;
         Ok(())
     }
 
     /// REPORT DENSITY SUPPORT: 读取设备/介质支持的 density 列表，返回原始数据
     pub fn report_density_support(&self, media_only: bool) -> Result<Bytes> {
         let mut buf = [0u8; REPORT_DENSITY_BUF_LEN];
-        let cdb_bytes = cdb::report_density_support(media_only, false, REPORT_DENSITY_BUF_LEN as u16);
+        let cdb_bytes =
+            cdb::report_density_support(media_only, false, REPORT_DENSITY_BUF_LEN as u16);
         let result = self.device.execute_read(&cdb_bytes, &mut buf, 30_000)?;
         Ok(Bytes::copy_from_slice(&buf[..result.transferred]))
     }
@@ -366,7 +410,10 @@ impl<'a> TapeDrive<'a> {
     ) -> Result<u64> {
         if block_size == 0 || block_size > SCSI_6_TRANSFER_MAX {
             return Err(TapeError::MoveFailed {
-                reason: format!("block_size {} 越界 [1, {}]", block_size, SCSI_6_TRANSFER_MAX),
+                reason: format!(
+                    "block_size {} 越界 [1, {}]",
+                    block_size, SCSI_6_TRANSFER_MAX
+                ),
             });
         }
         let mut buf = vec![0u8; block_size];
@@ -382,7 +429,11 @@ impl<'a> TapeDrive<'a> {
                 // 剩余空间不超 block_size，但 LTO 变长块仍要求 buffer ≥ 实际块，
                 // 所以至少给一个完整 block_size；如果超限由外层 total 截断。
                 let remain = max_size - total;
-                if remain >= block_size as u64 { block_size } else { remain as usize }
+                if remain >= block_size as u64 {
+                    block_size
+                } else {
+                    remain as usize
+                }
             };
             match self.read_block(&mut buf[..want]) {
                 Ok(0) => break,
@@ -391,9 +442,16 @@ impl<'a> TapeDrive<'a> {
                     total += n as u64;
                 }
                 // BLANK CHECK (sense_key=0x08)：磁带空白区
-                Err(TapeError::ScsiCommand { sense_key: 0x08, .. }) => break,
+                Err(TapeError::ScsiCommand {
+                    sense_key: 0x08, ..
+                }) => break,
                 // FILEMARK detected (NO SENSE + asc=0x00 ascq=0x01)
-                Err(TapeError::ScsiCommand { sense_key: 0x00, asc: 0x00, ascq: 0x01, .. }) => break,
+                Err(TapeError::ScsiCommand {
+                    sense_key: 0x00,
+                    asc: 0x00,
+                    ascq: 0x01,
+                    ..
+                }) => break,
                 Err(e) => return Err(e),
             }
         }

@@ -21,7 +21,9 @@ use crate::error::{Result, TapeError};
 /// LTFS 时间戳（LTFS 2.5.1 §7.1）：`YYYY-MM-DDThh:mm:ss.nnnnnnnnnZ`，9 位小数必填。
 /// IBM LTFS 2.4.8.3 遇到不带小数的时间会拒读卷标（LTFS17034E），整卷无法加载。
 pub fn ltfs_time_now() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string()
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.9fZ")
+        .to_string()
 }
 
 pub const LTFS_VERSION: &str = "2.4.0";
@@ -49,7 +51,10 @@ impl Vol1Label {
             return Err(TapeError::Ltfs(format!("VOL1 长度 {} < 80", buf.len())));
         }
         if &buf[0..4] != b"VOL1" {
-            return Err(TapeError::Ltfs(format!("VOL1 魔数错误: {:02x?}", &buf[0..4])));
+            return Err(TapeError::Ltfs(format!(
+                "VOL1 魔数错误: {:02x?}",
+                &buf[0..4]
+            )));
         }
         if buf[79] != VOL1_LABEL_VERSION {
             return Err(TapeError::Ltfs(format!(
@@ -182,10 +187,10 @@ impl LtfsLabel {
             }
         }
 
-        let volume_uuid = volume_uuid
-            .ok_or_else(|| TapeError::Ltfs("LTFS label 缺少 volumeuuid".into()))?;
-        let location = location
-            .ok_or_else(|| TapeError::Ltfs("LTFS label 缺少 location/partition".into()))?;
+        let volume_uuid =
+            volume_uuid.ok_or_else(|| TapeError::Ltfs("LTFS label 缺少 volumeuuid".into()))?;
+        let location =
+            location.ok_or_else(|| TapeError::Ltfs("LTFS label 缺少 location/partition".into()))?;
         if blocksize == 0 {
             return Err(TapeError::Ltfs("LTFS label blocksize 为 0".into()));
         }
@@ -229,7 +234,11 @@ impl LtfsLabel {
         let mut bs = String::new();
         let _ = write!(bs, "{}", self.blocksize);
         write_text_el(&mut w, "blocksize", &bs)?;
-        write_text_el(&mut w, "compression", if self.compression { "true" } else { "false" })?;
+        write_text_el(
+            &mut w,
+            "compression",
+            if self.compression { "true" } else { "false" },
+        )?;
 
         w.write_event(Event::End(BytesEnd::new("ltfslabel")))?;
         Ok(Bytes::from(out))
@@ -245,7 +254,7 @@ fn write_text_el<W: std::io::Write>(w: &mut Writer<W>, tag: &str, text: &str) ->
 
 fn ascii_trimmed(b: &[u8]) -> Result<String> {
     let s = std::str::from_utf8(b)?;
-    Ok(s.trim_end_matches(|c: char| c == ' ' || c == '\0').to_string())
+    Ok(s.trim_end_matches([' ', '\0']).to_string())
 }
 
 fn pad_ascii(dst: &mut [u8], s: &str) {

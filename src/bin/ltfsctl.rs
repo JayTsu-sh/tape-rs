@@ -93,7 +93,11 @@ fn main() {
                     len,
                     o.generation,
                     o.attempts,
-                    if o.resolved_by_query { "  (经查询判定)" } else { "" }
+                    if o.resolved_by_query {
+                        "  (经查询判定)"
+                    } else {
+                        ""
+                    }
                 );
             }
             Cmd::Get { path, output } => {
@@ -109,12 +113,24 @@ fn main() {
                 None => println!("不存在"),
                 Some(p) => {
                     if p.state != "committed" {
-                        println!("{}  已接收 {} 字节", if p.state == "staged" { "已暂存，等待落带" } else { "上传中" }, p.length);
+                        println!(
+                            "{}  已接收 {} 字节",
+                            if p.state == "staged" {
+                                "已暂存，等待落带"
+                            } else {
+                                "上传中"
+                            },
+                            p.length
+                        );
                     }
                     match p.current {
                         Some(s) => println!(
                             "{}  {} 字节  索引代数 {}  磁带 {}  sha256 {}",
-                            if p.state == "committed" { "已提交" } else { "当前版本" },
+                            if p.state == "committed" {
+                                "已提交"
+                            } else {
+                                "当前版本"
+                            },
                             s.length,
                             s.generation,
                             s.barcode,
@@ -129,23 +145,41 @@ fn main() {
                     println!("{:>12}  {}", n, p);
                 }
             }
-            Cmd::List { dir: Some(d), pending } => {
+            Cmd::List {
+                dir: Some(d),
+                pending,
+            } => {
                 for e in c.list_dir(&d, pending)? {
                     if e.is_dir {
                         println!("{:>12}  {}/", "", e.name);
                     } else {
                         let n = e.committed_length.or(e.staged_length).unwrap_or(0);
-                        let st = if e.state == "committed" { String::new() } else { format!("  ({})", e.state) };
+                        let st = if e.state == "committed" {
+                            String::new()
+                        } else {
+                            format!("  ({})", e.state)
+                        };
                         println!("{:>12}  {}{}", n, e.name, st);
                     }
                 }
             }
-            Cmd::Pool { cmd: PoolCmd::Create { name, file_limit } } => {
-                println!("已创建池 {}  UUID {}", name, c.pool_create(&name, file_limit)?);
+            Cmd::Pool {
+                cmd: PoolCmd::Create { name, file_limit },
+            } => {
+                println!(
+                    "已创建池 {}  UUID {}",
+                    name,
+                    c.pool_create(&name, file_limit)?
+                );
             }
-            Cmd::Pool { cmd: PoolCmd::List { all_nodes } } => {
-                let targets: Vec<Option<String>> =
-                    if all_nodes { args.endpoints.iter().cloned().map(Some).collect() } else { vec![None] };
+            Cmd::Pool {
+                cmd: PoolCmd::List { all_nodes },
+            } => {
+                let targets: Vec<Option<String>> = if all_nodes {
+                    args.endpoints.iter().cloned().map(Some).collect()
+                } else {
+                    vec![None]
+                };
                 for t in targets {
                     if let Some(a) = &t {
                         println!("== {}", a);
@@ -154,7 +188,13 @@ fn main() {
                         Ok(pools) if pools.is_empty() => println!("  (没有池)"),
                         Ok(pools) => {
                             for p in pools {
-                                println!("  {}  {}  文件数上限 {}  磁带 [{}]", p.name, p.uuid, p.file_limit, p.tapes.join(", "));
+                                println!(
+                                    "  {}  {}  文件数上限 {}  磁带 [{}]",
+                                    p.name,
+                                    p.uuid,
+                                    p.file_limit,
+                                    p.tapes.join(", ")
+                                );
                                 for t in &p.tape_details {
                                     println!(
                                         "    {:<10} {:<14} gen={:<5} 文件 {}/{}  已用 {} MiB  可回收 {} MiB",
@@ -173,9 +213,15 @@ fn main() {
                     }
                 }
             }
-            Cmd::Tape { cmd: TapeCmd::Assign { barcode, pool } } => println!("{}", c.tape_assign(&barcode, &pool)?),
-            Cmd::Tape { cmd: TapeCmd::Unassign { barcode } } => println!("{}", c.tape_unassign(&barcode)?),
-            Cmd::Tape { cmd: TapeCmd::Reclaim { barcode } } => println!("{}", c.tape_reclaim(&barcode)?),
+            Cmd::Tape {
+                cmd: TapeCmd::Assign { barcode, pool },
+            } => println!("{}", c.tape_assign(&barcode, &pool)?),
+            Cmd::Tape {
+                cmd: TapeCmd::Unassign { barcode },
+            } => println!("{}", c.tape_unassign(&barcode)?),
+            Cmd::Tape {
+                cmd: TapeCmd::Reclaim { barcode },
+            } => println!("{}", c.tape_reclaim(&barcode)?),
             Cmd::Cluster => {
                 for e in &args.endpoints {
                     match c.node_status(e) {

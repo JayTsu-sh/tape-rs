@@ -364,11 +364,17 @@ fn removal_takes_the_path_out_of_the_view_only_when_published() {
     let before = st.load().ledger.available();
     st.admit_removal(1, "/d/a", 2).unwrap();
     assert_eq!(st.load().ledger.available(), before, "删除不预留预算");
-    assert!(matches!(st.admit(1, "/d/a", 1, 3), Err(StateError::PathBusy(_))));
+    assert!(matches!(
+        st.admit(1, "/d/a", 1, 3),
+        Err(StateError::PathBusy(_))
+    ));
     st.complete("/d/a").unwrap();
     let b = st.freeze(&[]).unwrap();
     assert!(b.cover["/d/a"].removal);
-    assert!(st.load().committed.get("/d/a").is_some(), "发布之前仍是旧视图");
+    assert!(
+        st.load().committed.get("/d/a").is_some(),
+        "发布之前仍是旧视图"
+    );
     st.publish(&b, evidence(&b)).unwrap();
     assert!(st.load().committed.get("/d/a").is_none());
     assert!(st.load().pending.is_empty());

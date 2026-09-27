@@ -18,7 +18,9 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use crate::core::volume_state::{DirNode, FileVersion, FrozenBatch, PendingState, S4Evidence, StateError, VolumeState};
+use crate::core::volume_state::{
+    DirNode, FileVersion, FrozenBatch, PendingState, S4Evidence, StateError, VolumeState,
+};
 use crate::ltfs::index::{DirectoryNode, LtfsIndex};
 use crate::ltfs::volume::{XATTR_DELETED_PATH, XATTR_VERSION, is_tombstone_path};
 
@@ -160,7 +162,12 @@ pub struct BatchPolicy {
 
 impl Default for BatchPolicy {
     fn default() -> Self {
-        Self { max_bytes: 8 << 30, max_files: 20_000, idle: Duration::from_secs(2), max_wait: Duration::from_secs(60) }
+        Self {
+            max_bytes: 8 << 30,
+            max_files: 20_000,
+            idle: Duration::from_secs(2),
+            max_wait: Duration::from_secs(60),
+        }
     }
 }
 
@@ -208,7 +215,10 @@ pub enum ServiceError {
     NoAttribute(String),
     ProtectedAttribute(String),
     AttributeTooLarge,
-    InsufficientCapacity { requested: u64, available: u64 },
+    InsufficientCapacity {
+        requested: u64,
+        available: u64,
+    },
     NotWritable(String),
     BadPath(String),
     Io(String),
@@ -217,7 +227,10 @@ pub enum ServiceError {
     /// 池里没有可写的磁带了。确定的失败，重试无益，需要运维加带。
     NoTape(String),
     /// 文件比单盘磁带还大。确定的失败。
-    TooLarge { requested: u64, tape_capacity: u64 },
+    TooLarge {
+        requested: u64,
+        tape_capacity: u64,
+    },
 }
 
 impl std::fmt::Display for ServiceError {
@@ -234,7 +247,10 @@ impl std::fmt::Display for ServiceError {
             ServiceError::AttributeTooLarge => write!(f, "扩展属性超过65536字节"),
             ServiceError::NotEmpty(p) => write!(f, "目录非空: {}", p),
             ServiceError::NotDirectory(p) => write!(f, "父路径不是目录: {}", p),
-            ServiceError::InsufficientCapacity { requested, available } => {
+            ServiceError::InsufficientCapacity {
+                requested,
+                available,
+            } => {
                 write!(f, "空间不足: 需要 {} 可用 {}", requested, available)
             }
             ServiceError::NotWritable(s) => write!(f, "卷只读: {}", s),
@@ -242,8 +258,15 @@ impl std::fmt::Display for ServiceError {
             ServiceError::Io(e) => write!(f, "暂存区 I/O: {}", e),
             ServiceError::SwitchingTape(s) => write!(f, "正在换带: {}", s),
             ServiceError::NoTape(s) => write!(f, "池里没有可写的磁带: {}", s),
-            ServiceError::TooLarge { requested, tape_capacity } => {
-                write!(f, "文件 {} 字节，超过单盘可用容量 {} 字节", requested, tape_capacity)
+            ServiceError::TooLarge {
+                requested,
+                tape_capacity,
+            } => {
+                write!(
+                    f,
+                    "文件 {} 字节，超过单盘可用容量 {} 字节",
+                    requested, tape_capacity
+                )
             }
         }
     }
@@ -323,7 +346,10 @@ pub struct PathState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirEntry {
     /// `committed` 是已提交版本的长度；`in_flight` 同 `PathState`
-    File { committed: Option<u64>, in_flight: Option<(InFlight, u64)> },
+    File {
+        committed: Option<u64>,
+        in_flight: Option<(InFlight, u64)>,
+    },
     Dir,
 }
 
@@ -361,6 +387,9 @@ struct Inner {
     next_task: u64,
 }
 
+// Cached read-only catalog connection and its device/inode identity.
+type DirectoryReader = (Directory, Option<(u64, u64)>);
+
 pub struct FileService {
     inner: Mutex<Inner>,
     changed: Condvar,
@@ -369,12 +398,17 @@ pub struct FileService {
     policy: BatchPolicy,
     directory_path: Option<PathBuf>,
     /// 只读连接，以及打开时该文件的 (设备号, inode)：文件被换掉就重开
-    reader: Mutex<Option<(Directory, Option<(u64, u64)>)>>,
+    reader: Mutex<Option<DirectoryReader>>,
 }
 
 fn norm(path: &str) -> Result<String, ServiceError> {
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    if parts.is_empty() || parts.iter().any(|p| *p == "." || *p == ".." || p.contains('\0')) || path.ends_with('/') {
+    if parts.is_empty()
+        || parts
+            .iter()
+            .any(|p| *p == "." || *p == ".." || p.contains('\0'))
+        || path.ends_with('/')
+    {
         return Err(ServiceError::BadPath(path.to_string()));
     }
     // 墓碑目录（`ltfs::volume::TOMBSTONE_DIR`）所在的保留目录
@@ -430,9 +464,13 @@ fn in_flight_of(e: &crate::core::volume_state::PendingEntry) -> InFlight {
 fn map_state(e: StateError) -> ServiceError {
     match e {
         StateError::PathBusy(p) => ServiceError::PathBusy(p),
-        StateError::InsufficientCapacity { requested, available } => {
-            ServiceError::InsufficientCapacity { requested, available }
-        }
+        StateError::InsufficientCapacity {
+            requested,
+            available,
+        } => ServiceError::InsufficientCapacity {
+            requested,
+            available,
+        },
         StateError::NotWritable(s) => ServiceError::NotWritable(s),
         other => ServiceError::NotServing(format!("{:?}", other)),
     }
@@ -443,7 +481,14 @@ pub fn committed_view(index: &LtfsIndex) -> Arc<DirNode> {
     fn conv(d: &DirectoryNode) -> DirNode {
         let mut n = DirNode::default();
         for f in &d.files {
-            n.files.insert(f.name.clone(), Arc::new(FileVersion { version: f.meta.file_uid, len: f.length, partial: false }));
+            n.files.insert(
+                f.name.clone(),
+                Arc::new(FileVersion {
+                    version: f.meta.file_uid,
+                    len: f.length,
+                    partial: false,
+                }),
+            );
         }
         for s in &d.subdirs {
             n.subdirs.insert(s.name.clone(), Arc::new(conv(s)));
@@ -457,8 +502,15 @@ impl FileService {
     /// 下载暂存文件创建后立即 unlink，最后一个句柄关闭时由内核回收。
     pub fn read_spool(&self) -> std::io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
-        let path = self.spool_dir.join(format!("read-{}", uuid::Uuid::new_v4()));
-        let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path)?;
+        let path = self
+            .spool_dir
+            .join(format!("read-{}", uuid::Uuid::new_v4()));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
         std::fs::remove_file(path)?;
         Ok(file)
     }
@@ -468,12 +520,23 @@ impl FileService {
     }
 
     /// `directory_path` 是本节点目录库的文件；给了之后 `stat`/`list` 能回答本轮之前提交的文件。
-    pub fn with_options(spool_dir: PathBuf, policy: BatchPolicy, directory_path: Option<PathBuf>) -> std::io::Result<Arc<Self>> {
+    pub fn with_options(
+        spool_dir: PathBuf,
+        policy: BatchPolicy,
+        directory_path: Option<PathBuf>,
+    ) -> std::io::Result<Arc<Self>> {
         // 暂存区不跨进程保留：上一次运行留下的都是未落带的残留
         let _ = std::fs::remove_dir_all(&spool_dir);
         std::fs::create_dir_all(&spool_dir)?;
         Ok(Arc::new(Self {
-            inner: Mutex::new(Inner { serving: None, why_not: "尚未接管".into(), no_tape: false, read_only: None, tasks: HashMap::new(), next_task: 1 }),
+            inner: Mutex::new(Inner {
+                serving: None,
+                why_not: "尚未接管".into(),
+                no_tape: false,
+                read_only: None,
+                tasks: HashMap::new(),
+                next_task: 1,
+            }),
             changed: Condvar::new(),
             spool_dir,
             exec: Mutex::new(None),
@@ -520,7 +583,9 @@ impl FileService {
         for r in catalog_of(index).0 {
             if self.directory_path.is_some() {
                 match self.with_reader(|d| Some(d.lookup(&tape.pool_uuid, &r.path))) {
-                    Some(Ok(Some(old))) if old.barcode != tape.barcode && old.version >= r.version => {
+                    Some(Ok(Some(old)))
+                        if old.barcode != tape.barcode && old.version >= r.version =>
+                    {
                         continue;
                     }
                     Some(Ok(_)) => {}
@@ -587,7 +652,12 @@ impl FileService {
     /// 只有一个驱动器时，只有这时才允许把写入带换下来读别的带。
     pub fn write_side_idle(&self, round: u64) -> bool {
         let g = self.lock();
-        g.serving.as_ref().filter(|s| s.round == round).is_some_and(|s| s.queue.is_empty() && s.in_batch.is_empty() && s.admitted == 0 && s.switch.is_none())
+        g.serving
+            .as_ref()
+            .filter(|s| s.round == round)
+            .is_some_and(|s| {
+                s.queue.is_empty() && s.in_batch.is_empty() && s.admitted == 0 && s.switch.is_none()
+            })
     }
 
     /// 合批策略。回收按它的阈值切分搬迁的批次，与客户端上传共用同一个队列。
@@ -598,7 +668,10 @@ impl FileService {
     /// 队列里已完成、等着落带的 (文件数, 字节数)。
     pub fn queued(&self, round: u64) -> Option<(usize, u64)> {
         let g = self.lock();
-        g.serving.as_ref().filter(|s| s.round == round).map(|s| (s.queue.len(), s.queue_bytes))
+        g.serving
+            .as_ref()
+            .filter(|s| s.round == round)
+            .map(|s| (s.queue.len(), s.queue_bytes))
     }
 
     /// 目录里还指向这盘带的 (文件数, 字节数)。回收在格式化源带之前拿它做最后一道核对；
@@ -609,12 +682,18 @@ impl FileService {
 
     /// 执行线程询问：当前这盘带是否需要换掉，换成什么状态。
     pub fn switch_requested(&self, round: u64) -> Option<&'static str> {
-        self.lock().serving.as_ref().filter(|s| s.round == round).and_then(|s| s.switch)
+        self.lock()
+            .serving
+            .as_ref()
+            .filter(|s| s.round == round)
+            .and_then(|s| s.switch)
     }
 
     /// 关闭新入队入口，保留已完成队列供计划停机落带。
     pub fn drain(&self) {
-        if let Some(s) = self.lock().serving.as_mut() { s.draining = true; }
+        if let Some(s) = self.lock().serving.as_mut() {
+            s.draining = true;
+        }
     }
 
     /// 停止服务。仅暂存的任务判失败，已进入提交批次的判结果未定。
@@ -628,10 +707,20 @@ impl FileService {
         };
         for u in &s.queue {
             let _ = std::fs::remove_file(&u.spool);
-            g.tasks.insert(u.task, TaskStatus::Failed { reason: format!("未落带：{}。请向新 Leader 重传", reason) });
+            g.tasks.insert(
+                u.task,
+                TaskStatus::Failed {
+                    reason: format!("未落带：{}。请向新 Leader 重传", reason),
+                },
+            );
         }
         for t in &s.in_batch {
-            g.tasks.insert(*t, TaskStatus::Indeterminate { reason: format!("提交未确认：{}。请向新 Leader 查询该路径", reason) });
+            g.tasks.insert(
+                *t,
+                TaskStatus::Indeterminate {
+                    reason: format!("提交未确认：{}。请向新 Leader 查询该路径", reason),
+                },
+            );
         }
         g.why_not = reason.to_string();
         g.no_tape = false;
@@ -663,8 +752,12 @@ impl FileService {
             return Some(Duration::ZERO);
         }
         let now = Instant::now();
-        let by_wait = s.oldest.map(|t| (t + p.max_wait).saturating_duration_since(now));
-        let by_idle = s.newest.map(|t| (t + p.idle).saturating_duration_since(now));
+        let by_wait = s
+            .oldest
+            .map(|t| (t + p.max_wait).saturating_duration_since(now));
+        let by_idle = s
+            .newest
+            .map(|t| (t + p.idle).saturating_duration_since(now));
         by_wait.into_iter().chain(by_idle).min()
     }
 
@@ -922,8 +1015,15 @@ impl FileService {
 
     pub fn ingest(&self, h: &UploadHandle, bytes: u64) -> Result<(), ServiceError> {
         let g = self.lock();
-        let s = g.serving.as_ref().filter(|s| s.round == h.round).ok_or(ServiceError::NotServing(g.why_not.clone()))?;
-        s.state.ingest(&h.path, bytes).map(|_| ()).map_err(map_state)
+        let s = g
+            .serving
+            .as_ref()
+            .filter(|s| s.round == h.round)
+            .ok_or(ServiceError::NotServing(g.why_not.clone()))?;
+        s.state
+            .ingest(&h.path, bytes)
+            .map(|_| ())
+            .map_err(map_state)
     }
 
     /// 内容已完整暂存：标记完成并入队，唤醒执行线程。
@@ -957,11 +1057,20 @@ impl FileService {
         }
     }
 
-    pub(crate) fn finish_with_metadata(&self, h: UploadHandle, len: u64, metadata: Option<crate::ltfs::volume::FileMetadata>) -> Result<u64, ServiceError> {
+    pub(crate) fn finish_with_metadata(
+        &self,
+        h: UploadHandle,
+        len: u64,
+        metadata: Option<crate::ltfs::volume::FileMetadata>,
+    ) -> Result<u64, ServiceError> {
         {
             let mut g = self.lock();
             let why = g.why_not.clone();
-            let s = g.serving.as_mut().filter(|s| s.round == h.round).ok_or(ServiceError::NotServing(why))?;
+            let s = g
+                .serving
+                .as_mut()
+                .filter(|s| s.round == h.round)
+                .ok_or(ServiceError::NotServing(why))?;
             if s.draining {
                 let _ = s.state.cancel(h.task);
                 s.admitted = s.admitted.saturating_sub(1);
@@ -969,7 +1078,18 @@ impl FileService {
                 return Err(ServiceError::NotServing("正在停机，请重新上传".into()));
             }
             s.state.complete(&h.path).map_err(map_state)?;
-            s.queue.push_back(Upload { task: h.task, path: h.path.clone(), spool: h.spool.clone(), len, delete: false, symlink_target: None, rename_from: None, xattr_change: None, directory: false, metadata });
+            s.queue.push_back(Upload {
+                task: h.task,
+                path: h.path.clone(),
+                spool: h.spool.clone(),
+                len,
+                delete: false,
+                symlink_target: None,
+                rename_from: None,
+                xattr_change: None,
+                directory: false,
+                metadata,
+            });
             s.queue_bytes += len;
             let now = Instant::now();
             s.oldest.get_or_insert(now);
@@ -1007,7 +1127,11 @@ impl FileService {
             if left.is_zero() {
                 return g.tasks.get(&id).cloned();
             }
-            g = self.changed.wait_timeout(g, left).unwrap_or_else(|e| e.into_inner()).0;
+            g = self
+                .changed
+                .wait_timeout(g, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
     }
 
@@ -1189,7 +1313,9 @@ impl FileService {
                 len: 0,
                 delete: true,
                 directory,
-                symlink_target: None, rename_from: None, xattr_change: None,
+                symlink_target: None,
+                rename_from: None,
+                xattr_change: None,
                 metadata: None,
             });
             let now = Instant::now();
@@ -1281,7 +1407,8 @@ impl FileService {
             len,
             delete: false,
             directory,
-            symlink_target: None, rename_from: None,
+            symlink_target: None,
+            rename_from: None,
             xattr_change: Some((key, attr)),
             metadata: None,
         });
@@ -1519,7 +1646,9 @@ impl FileService {
                 delete: false,
                 directory: *dir,
                 metadata: None,
-                symlink_target: None, rename_from: Some((path.clone(), *path == from)), xattr_change: None,
+                symlink_target: None,
+                rename_from: Some((path.clone(), *path == from)),
+                xattr_change: None,
             });
         }
         let removals: Vec<_> = uploads
@@ -1533,7 +1662,9 @@ impl FileService {
                 delete: true,
                 directory: u.directory,
                 metadata: None,
-                symlink_target: None, rename_from: None, xattr_change: None,
+                symlink_target: None,
+                rename_from: None,
+                xattr_change: None,
             })
             .collect();
         uploads.extend(removals);
@@ -1621,7 +1752,10 @@ impl FileService {
         let path = norm(path)?;
         let committed = self.stat(&path)?;
         let in_flight = self.in_flight(&path);
-        Ok(PathState { committed, in_flight })
+        Ok(PathState {
+            committed,
+            in_flight,
+        })
     }
 
     fn in_flight(&self, path: &str) -> Option<(InFlight, u64)> {
@@ -1730,5 +1864,4 @@ impl FileService {
     pub fn tape(&self) -> Option<TapeIdent> {
         self.lock().serving.as_ref().map(|s| s.tape.clone())
     }
-
 }

@@ -50,20 +50,30 @@ pub struct HttpContext {
 pub fn serve(listen: &str, ctx: Arc<HttpContext>) -> std::io::Result<()> {
     let listener = TcpListener::bind(listen)?;
     info!("客户端接口监听 {}", listen);
-    thread::Builder::new().name("ltfsd-http".into()).spawn(move || {
-        for conn in listener.incoming().flatten() {
-            let ctx = ctx.clone();
-            let _ = thread::Builder::new().name("ltfsd-http-conn".into()).spawn(move || {
-                if let Err(e) = handle(conn, &ctx) {
-                    warn!("HTTP 连接出错: {}", e);
-                }
-            });
-        }
-    })?;
+    thread::Builder::new()
+        .name("ltfsd-http".into())
+        .spawn(move || {
+            for conn in listener.incoming().flatten() {
+                let ctx = ctx.clone();
+                let _ = thread::Builder::new()
+                    .name("ltfsd-http-conn".into())
+                    .spawn(move || {
+                        if let Err(e) = handle(conn, &ctx) {
+                            warn!("HTTP 连接出错: {}", e);
+                        }
+                    });
+            }
+        })?;
     Ok(())
 }
 
-fn respond(conn: &mut TcpStream, code: u16, reason: &str, ctype: &str, body: &[u8]) -> std::io::Result<()> {
+fn respond(
+    conn: &mut TcpStream,
+    code: u16,
+    reason: &str,
+    ctype: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
     write!(
         conn,
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -76,12 +86,29 @@ fn respond(conn: &mut TcpStream, code: u16, reason: &str, ctype: &str, body: &[u
 }
 
 /// 磁带读完后再发送；Range 从磁盘切片，内存不随文件大小增长。
-fn respond_file(conn: &mut TcpStream, mut file: std::fs::File, range: Option<&str>) -> std::io::Result<()> {
+fn respond_file(
+    conn: &mut TcpStream,
+    mut file: std::fs::File,
+    range: Option<&str>,
+) -> std::io::Result<()> {
     let total = file.metadata()?.len();
     let (start, end) = match range.and_then(|r| parse_range(r, total)) {
-        Some(Err(())) => return respond_json(conn, 416, "Range Not Satisfiable", json!({"error": "bad_range", "length": total})),
+        Some(Err(())) => {
+            return respond_json(
+                conn,
+                416,
+                "Range Not Satisfiable",
+                json!({"error": "bad_range", "length": total}),
+            );
+        }
         Some(Ok((start, end))) => {
-            write!(conn, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\n", start, end - 1, total)?;
+            write!(
+                conn,
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\n",
+                start,
+                end - 1,
+                total
+            )?;
             (start, end)
         }
         None => {
@@ -89,11 +116,18 @@ fn respond_file(conn: &mut TcpStream, mut file: std::fs::File, range: Option<&st
             (0, total)
         }
     };
-    write!(conn, "Content-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", end - start)?;
+    write!(
+        conn,
+        "Content-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        end - start
+    )?;
     file.seek(SeekFrom::Start(start))?;
     let copied = std::io::copy(&mut file.take(end - start), conn)?;
     if copied != end - start {
-        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "下载暂存内容不完整"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "下载暂存内容不完整",
+        ));
     }
     conn.flush()
 }
@@ -116,7 +150,11 @@ pub fn parse_range(v: &str, total: u64) -> Option<Result<(u64, u64), ()>> {
         return Some(Ok((total.saturating_sub(n), total)));
     }
     let start: u64 = a.parse().ok()?;
-    let end = if b.is_empty() { total } else { b.parse::<u64>().ok()?.saturating_add(1).min(total) };
+    let end = if b.is_empty() {
+        total
+    } else {
+        b.parse::<u64>().ok()?.saturating_add(1).min(total)
+    };
     if start >= total || end <= start {
         return Some(Err(()));
     }
@@ -134,12 +172,15 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() && s.is_char_boundary(i + 1) && s.is_char_boundary(i + 3) {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && s.is_char_boundary(i + 1)
+            && s.is_char_boundary(i + 3)
+            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(v);
+            i += 3;
+            continue;
         }
         out.push(b[i]);
         i += 1;
@@ -151,72 +192,204 @@ fn service_error(conn: &mut TcpStream, ctx: &HttpContext, e: ServiceError) -> st
     match e {
         ServiceError::NotServing(why) => {
             let leader = ctx.status.lock().unwrap_or_else(|e| e.into_inner()).leader;
-            let url = ctx.client_addrs.get(&leader).map(|a| format!("http://{}", a));
-            respond_json(conn, 503, "Service Unavailable", json!({"error": "not_serving", "detail": why, "leader": leader, "leader_url": url}))
+            let url = ctx
+                .client_addrs
+                .get(&leader)
+                .map(|a| format!("http://{}", a));
+            respond_json(
+                conn,
+                503,
+                "Service Unavailable",
+                json!({"error": "not_serving", "detail": why, "leader": leader, "leader_url": url}),
+            )
         }
         ServiceError::SwitchingTape(why) => {
             // 503 且不给 Leader 提示：客户端库会稍后向同一个节点重试
-            respond_json(conn, 503, "Service Unavailable", json!({"error": "switching_tape", "detail": why}))
+            respond_json(
+                conn,
+                503,
+                "Service Unavailable",
+                json!({"error": "switching_tape", "detail": why}),
+            )
         }
-        ServiceError::NoAttribute(name) => respond_json(conn, 409, "Conflict", json!({"error":"no_attribute", "name":name})),
-        ServiceError::ProtectedAttribute(name) => respond_json(conn, 403, "Forbidden", json!({"error":"protected_attribute", "name":name})),
-        ServiceError::AttributeTooLarge => respond_json(conn, 413, "Payload Too Large", json!({"error":"attribute_too_large"})),
-        ServiceError::CrossDevice(path) => respond_json(conn, 409, "Conflict", json!({"error":"cross_device", "path":path})),
-        ServiceError::NoTape(why) => respond_json(conn, 507, "Insufficient Storage", json!({"error": "no_tape", "detail": why})),
-        ServiceError::TooLarge { requested, tape_capacity } => respond_json(
+        ServiceError::NoAttribute(name) => respond_json(
+            conn,
+            409,
+            "Conflict",
+            json!({"error":"no_attribute", "name":name}),
+        ),
+        ServiceError::ProtectedAttribute(name) => respond_json(
+            conn,
+            403,
+            "Forbidden",
+            json!({"error":"protected_attribute", "name":name}),
+        ),
+        ServiceError::AttributeTooLarge => respond_json(
+            conn,
+            413,
+            "Payload Too Large",
+            json!({"error":"attribute_too_large"}),
+        ),
+        ServiceError::CrossDevice(path) => respond_json(
+            conn,
+            409,
+            "Conflict",
+            json!({"error":"cross_device", "path":path}),
+        ),
+        ServiceError::NoTape(why) => respond_json(
+            conn,
+            507,
+            "Insufficient Storage",
+            json!({"error": "no_tape", "detail": why}),
+        ),
+        ServiceError::TooLarge {
+            requested,
+            tape_capacity,
+        } => respond_json(
             conn,
             507,
             "Insufficient Storage",
             json!({"error": "too_large", "requested": requested, "tape_capacity": tape_capacity}),
         ),
-        ServiceError::NotEmpty(p) => respond_json(conn, 409, "Conflict", json!({"error": "not_empty", "path": p})),
-        ServiceError::IsDirectory(p) => respond_json(conn, 409, "Conflict", json!({"error": "is_directory", "path": p})),
-        ServiceError::NotDirectory(p) => respond_json(conn, 409, "Conflict", json!({"error": "not_directory", "path": p})),
-        ServiceError::PathBusy(p) => respond_json(conn, 409, "Conflict", json!({"error": "path_busy", "path": p})),
-        ServiceError::Exists(p) => respond_json(conn, 412, "Precondition Failed", json!({"error": "exists", "path": p})),
-        ServiceError::NotFound(p) => respond_json(conn, 404, "Not Found", json!({"error": "not_found", "path": p})),
-        ServiceError::InsufficientCapacity { requested, available } => respond_json(
+        ServiceError::NotEmpty(p) => respond_json(
+            conn,
+            409,
+            "Conflict",
+            json!({"error": "not_empty", "path": p}),
+        ),
+        ServiceError::IsDirectory(p) => respond_json(
+            conn,
+            409,
+            "Conflict",
+            json!({"error": "is_directory", "path": p}),
+        ),
+        ServiceError::NotDirectory(p) => respond_json(
+            conn,
+            409,
+            "Conflict",
+            json!({"error": "not_directory", "path": p}),
+        ),
+        ServiceError::PathBusy(p) => respond_json(
+            conn,
+            409,
+            "Conflict",
+            json!({"error": "path_busy", "path": p}),
+        ),
+        ServiceError::Exists(p) => respond_json(
+            conn,
+            412,
+            "Precondition Failed",
+            json!({"error": "exists", "path": p}),
+        ),
+        ServiceError::NotFound(p) => respond_json(
+            conn,
+            404,
+            "Not Found",
+            json!({"error": "not_found", "path": p}),
+        ),
+        ServiceError::InsufficientCapacity {
+            requested,
+            available,
+        } => respond_json(
             conn,
             507,
             "Insufficient Storage",
             json!({"error": "insufficient_capacity", "requested": requested, "available": available}),
         ),
-        ServiceError::NotWritable(why) => respond_json(conn, 503, "Service Unavailable", json!({"error": "read_only", "detail": why})),
-        ServiceError::BadPath(p) => respond_json(conn, 400, "Bad Request", json!({"error": "bad_path", "path": p})),
-        ServiceError::Io(e) => respond_json(conn, 500, "Internal Server Error", json!({"error": "spool_io", "detail": e})),
+        ServiceError::NotWritable(why) => respond_json(
+            conn,
+            503,
+            "Service Unavailable",
+            json!({"error": "read_only", "detail": why}),
+        ),
+        ServiceError::BadPath(p) => respond_json(
+            conn,
+            400,
+            "Bad Request",
+            json!({"error": "bad_path", "path": p}),
+        ),
+        ServiceError::Io(e) => respond_json(
+            conn,
+            500,
+            "Internal Server Error",
+            json!({"error": "spool_io", "detail": e}),
+        ),
     }
 }
 
 fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
-    query.split('&').find_map(|kv| kv.split_once('=').filter(|(k, _)| *k == key).map(|(_, v)| v))
+    query.split('&').find_map(|kv| {
+        kv.split_once('=')
+            .filter(|(k, _)| *k == key)
+            .map(|(_, v)| v)
+    })
 }
 
 /// 把管理命令交给 Raft 循环并等结论。只有 Raft Leader 受理；不是 Leader 时答 503 并指出 Leader。
 fn admin(conn: &mut TcpStream, ctx: &HttpContext, cmd: Command) -> std::io::Result<()> {
     let (tx, rx) = channel();
-    if ctx.node.lock().unwrap_or_else(|e| e.into_inner()).send(NodeInput::Admin { cmd, reply: tx }).is_err() {
-        return respond_json(conn, 503, "Service Unavailable", json!({"error": "node_gone"}));
+    if ctx
+        .node
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .send(NodeInput::Admin { cmd, reply: tx })
+        .is_err()
+    {
+        return respond_json(
+            conn,
+            503,
+            "Service Unavailable",
+            json!({"error": "node_gone"}),
+        );
     }
     match rx.recv_timeout(Duration::from_secs(10)) {
         Ok(AdminReply::Ok(result)) => respond_json(conn, 200, "OK", json!({"result": result})),
-        Ok(AdminReply::Rejected(why)) => respond_json(conn, 409, "Conflict", json!({"error": "rejected", "detail": why})),
+        Ok(AdminReply::Rejected(why)) => respond_json(
+            conn,
+            409,
+            "Conflict",
+            json!({"error": "rejected", "detail": why}),
+        ),
         Ok(AdminReply::NotLeader(leader)) => {
-            let url = ctx.client_addrs.get(&leader).map(|a| format!("http://{}", a));
-            respond_json(conn, 503, "Service Unavailable", json!({"error": "not_leader", "detail": "管理命令只由 Raft Leader 受理", "leader": leader, "leader_url": url}))
+            let url = ctx
+                .client_addrs
+                .get(&leader)
+                .map(|a| format!("http://{}", a));
+            respond_json(
+                conn,
+                503,
+                "Service Unavailable",
+                json!({"error": "not_leader", "detail": "管理命令只由 Raft Leader 受理", "leader": leader, "leader_url": url}),
+            )
         }
         // 超时或 Leader 身份中途丢失：命令可能已提交也可能没有，请调用方查询 /admin/pools 后决定
-        Err(_) => respond_json(conn, 504, "Gateway Timeout", json!({"error": "indeterminate", "detail": "命令结论未知，请查询后决定是否重发"})),
+        Err(_) => respond_json(
+            conn,
+            504,
+            "Gateway Timeout",
+            json!({"error": "indeterminate", "detail": "命令结论未知，请查询后决定是否重发"}),
+        ),
     }
 }
 
 fn task_json(id: u64, st: &TaskStatus) -> (u16, &'static str, Value) {
     match st {
         TaskStatus::Staged => (202, "Accepted", json!({"task": id, "status": "staged"})),
-        TaskStatus::Committed { generation } => (201, "Created", json!({"task": id, "status": "committed", "generation": generation})),
-        TaskStatus::Failed { reason } => (500, "Internal Server Error", json!({"task": id, "status": "failed", "detail": reason})),
-        TaskStatus::Indeterminate { reason } => {
-            (500, "Internal Server Error", json!({"task": id, "status": "indeterminate", "detail": reason}))
-        }
+        TaskStatus::Committed { generation } => (
+            201,
+            "Created",
+            json!({"task": id, "status": "committed", "generation": generation}),
+        ),
+        TaskStatus::Failed { reason } => (
+            500,
+            "Internal Server Error",
+            json!({"task": id, "status": "failed", "detail": reason}),
+        ),
+        TaskStatus::Indeterminate { reason } => (
+            500,
+            "Internal Server Error",
+            json!({"task": id, "status": "indeterminate", "detail": reason}),
+        ),
     }
 }
 
@@ -228,7 +401,12 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
     reader.read_line(&mut line)?;
     let mut parts = line.split_whitespace();
     let (Some(method), Some(target)) = (parts.next(), parts.next()) else {
-        return respond_json(&mut conn, 400, "Bad Request", json!({"error": "bad_request"}));
+        return respond_json(
+            &mut conn,
+            400,
+            "Bad Request",
+            json!({"error": "bad_request"}),
+        );
     };
     let method = method.to_string();
     let (raw_path, query) = target.split_once('?').unwrap_or((target, ""));
@@ -306,11 +484,22 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                     json!({"uuid": p.uuid, "name": p.name, "file_limit": p.file_limit, "tapes": p.tapes, "tape_details": tapes})
                 })
                 .collect();
-            respond_json(&mut conn, 200, "OK", json!({"pools": pools, "applied_index": s.applied_index, "answered_by": s.id}))
+            respond_json(
+                &mut conn,
+                200,
+                "OK",
+                json!({"pools": pools, "applied_index": s.applied_index, "answered_by": s.id}),
+            )
         }
         ("POST", p) if p.starts_with("/admin/pools/") => {
-            let file_limit = query_param(query, "file_limit").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_FILE_LIMIT);
-            let cmd = Command::PoolCreate { uuid: uuid::Uuid::new_v4().to_string(), name: p[13..].to_string(), file_limit };
+            let file_limit = query_param(query, "file_limit")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_FILE_LIMIT);
+            let cmd = Command::PoolCreate {
+                uuid: uuid::Uuid::new_v4().to_string(),
+                name: p[13..].to_string(),
+                file_limit,
+            };
             admin(&mut conn, ctx, cmd)
         }
         ("POST", p) if p.starts_with("/admin/tapes/") && p.ends_with("/reclaim") => {
@@ -318,12 +507,28 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
             admin(&mut conn, ctx, Command::TapeReclaim { barcode })
         }
         ("POST", p) if p.starts_with("/admin/tapes/") => match query_param(query, "pool") {
-            Some(pool) => admin(&mut conn, ctx, Command::TapeAssign { barcode: p[13..].to_string(), pool: percent_decode(pool) }),
-            None => respond_json(&mut conn, 400, "Bad Request", json!({"error": "pool_required"})),
+            Some(pool) => admin(
+                &mut conn,
+                ctx,
+                Command::TapeAssign {
+                    barcode: p[13..].to_string(),
+                    pool: percent_decode(pool),
+                },
+            ),
+            None => respond_json(
+                &mut conn,
+                400,
+                "Bad Request",
+                json!({"error": "pool_required"}),
+            ),
         },
-        ("DELETE", p) if p.starts_with("/admin/tapes/") => {
-            admin(&mut conn, ctx, Command::TapeUnassign { barcode: p[13..].to_string() })
-        }
+        ("DELETE", p) if p.starts_with("/admin/tapes/") => admin(
+            &mut conn,
+            ctx,
+            Command::TapeUnassign {
+                barcode: p[13..].to_string(),
+            },
+        ),
         ("GET", "/list") => match query_param(query, "dir") {
             Some(dir) => {
                 let dir = percent_decode(dir);
@@ -348,7 +553,12 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                             .collect();
                         respond_json(&mut conn, 200, "OK", json!({"dir": dir, "entries": v}))
                     }
-                    Ok(None) => respond_json(&mut conn, 404, "Not Found", json!({"error": "not_found", "dir": dir})),
+                    Ok(None) => respond_json(
+                        &mut conn,
+                        404,
+                        "Not Found",
+                        json!({"error": "not_found", "dir": dir}),
+                    ),
                     Err(e) => service_error(&mut conn, ctx, e),
                 }
             }
@@ -358,12 +568,20 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
             },
         },
         ("GET", p) if p.starts_with("/stat/") => match ctx.files.stat_full(&p[5..]) {
-            Ok(PathState { committed, in_flight }) => {
+            Ok(PathState {
+                committed,
+                in_flight,
+            }) => {
                 let committed_json = committed.as_ref().map(|s| {
                     json!({"length": s.len, "generation": s.generation, "round": s.round, "barcode": s.barcode, "sha256": s.sha256, "version": s.version, "metadata": s.metadata})
                 });
                 match (in_flight, committed_json) {
-                    (None, None) => respond_json(&mut conn, 404, "Not Found", json!({"path": &p[5..], "committed": false})),
+                    (None, None) => respond_json(
+                        &mut conn,
+                        404,
+                        "Not Found",
+                        json!({"path": &p[5..], "committed": false}),
+                    ),
                     // 已提交且没有新版本在途：字段放在顶层（与旧格式相同）
                     (None, Some(mut j)) => {
                         j["path"] = json!(&p[5..]);
@@ -385,25 +603,58 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
         },
         ("GET", p) if p.starts_with("/tasks/") => {
             let Ok(id) = p[7..].parse::<u64>() else {
-                return respond_json(&mut conn, 400, "Bad Request", json!({"error": "bad_task_id"}));
+                return respond_json(
+                    &mut conn,
+                    400,
+                    "Bad Request",
+                    json!({"error": "bad_task_id"}),
+                );
             };
-            let st = if wait { ctx.files.wait_task(id, ctx.wait_timeout) } else { ctx.files.task(id) };
+            let st = if wait {
+                ctx.files.wait_task(id, ctx.wait_timeout)
+            } else {
+                ctx.files.task(id)
+            };
             match st {
                 // 查询本身成功；任务的结论在 JSON 里
                 Some(st) => respond_json(&mut conn, 200, "OK", task_json(id, &st).2),
-                None => respond_json(&mut conn, 404, "Not Found", json!({"error": "unknown_task", "detail": "任务记录不跨节点、不跨进程保留"})),
+                None => respond_json(
+                    &mut conn,
+                    404,
+                    "Not Found",
+                    json!({"error": "unknown_task", "detail": "任务记录不跨节点、不跨进程保留"}),
+                ),
             }
         }
         ("GET", p) if p.starts_with("/files/") => {
             match ctx.files.stat_full(&p[6..]) {
                 Err(e) => return service_error(&mut conn, ctx, e),
-                Ok(PathState { committed: None, in_flight: Some((st, _)) }) => {
-                    return respond_json(&mut conn, 409, "Conflict", json!({"error": "not_committed", "path": &p[6..], "state": st.as_str()}));
+                Ok(PathState {
+                    committed: None,
+                    in_flight: Some((st, _)),
+                }) => {
+                    return respond_json(
+                        &mut conn,
+                        409,
+                        "Conflict",
+                        json!({"error": "not_committed", "path": &p[6..], "state": st.as_str()}),
+                    );
                 }
-                Ok(PathState { committed: None, in_flight: None }) => {
-                    return respond_json(&mut conn, 404, "Not Found", json!({"error": "not_found", "path": &p[6..]}));
+                Ok(PathState {
+                    committed: None,
+                    in_flight: None,
+                }) => {
+                    return respond_json(
+                        &mut conn,
+                        404,
+                        "Not Found",
+                        json!({"error": "not_found", "path": &p[6..]}),
+                    );
                 }
-                Ok(PathState { committed: Some(st), .. }) if super::files::is_directory(&st.metadata) => {
+                Ok(PathState {
+                    committed: Some(st),
+                    ..
+                }) if super::files::is_directory(&st.metadata) => {
                     return service_error(&mut conn, ctx, ServiceError::IsDirectory(p[6..].into()));
                 }
                 Ok(_) => {}
@@ -411,19 +662,52 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
             let (tx, rx) = channel();
             let file = match ctx.files.read_spool() {
                 Ok(file) => file,
-                Err(e) => return respond_json(&mut conn, 500, "Internal Server Error", json!({"error": "spool_io", "detail": e.to_string()})),
+                Err(e) => {
+                    return respond_json(
+                        &mut conn,
+                        500,
+                        "Internal Server Error",
+                        json!({"error": "spool_io", "detail": e.to_string()}),
+                    );
+                }
             };
-            let sent = ctx.exec.lock().unwrap_or_else(|e| e.into_inner()).send(ExecRequest::ReadTo { path: p[6..].to_string(), file, reply: tx });
+            let sent =
+                ctx.exec
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .send(ExecRequest::ReadTo {
+                        path: p[6..].to_string(),
+                        file,
+                        reply: tx,
+                    });
             if sent.is_err() {
-                return respond_json(&mut conn, 503, "Service Unavailable", json!({"error": "executor_gone"}));
+                return respond_json(
+                    &mut conn,
+                    503,
+                    "Service Unavailable",
+                    json!({"error": "executor_gone"}),
+                );
             }
             match rx.recv_timeout(ctx.wait_timeout) {
                 Ok(Ok(file)) => respond_file(&mut conn, file, range.as_deref()),
-                Ok(Err(tape_rs_read_busy @ super::executor::ReadError::Busy(_))) => {
-                    respond_json(&mut conn, 503, "Service Unavailable", json!({"error": "drive_busy", "detail": tape_rs_read_busy.to_string()}))
-                }
-                Ok(Err(e)) => respond_json(&mut conn, 500, "Internal Server Error", json!({"error": "read_failed", "detail": e.to_string()})),
-                Err(_) => respond_json(&mut conn, 504, "Gateway Timeout", json!({"error": "read_timeout"})),
+                Ok(Err(tape_rs_read_busy @ super::executor::ReadError::Busy(_))) => respond_json(
+                    &mut conn,
+                    503,
+                    "Service Unavailable",
+                    json!({"error": "drive_busy", "detail": tape_rs_read_busy.to_string()}),
+                ),
+                Ok(Err(e)) => respond_json(
+                    &mut conn,
+                    500,
+                    "Internal Server Error",
+                    json!({"error": "read_failed", "detail": e.to_string()}),
+                ),
+                Err(_) => respond_json(
+                    &mut conn,
+                    504,
+                    "Gateway Timeout",
+                    json!({"error": "read_timeout"}),
+                ),
             }
         }
         (method @ ("POST" | "DELETE"), "/xattrs") => {
@@ -492,35 +776,75 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
             respond_json(&mut conn, code, reason, body)
         }
         ("POST", "/symlinks") => {
-            let (Some(path), Some(target)) = (query_param(query, "path"), query_param(query, "target")) else {
-                return respond_json(&mut conn, 400, "Bad Request", json!({"error":"missing_path_or_target"}));
+            let (Some(path), Some(target)) =
+                (query_param(query, "path"), query_param(query, "target"))
+            else {
+                return respond_json(
+                    &mut conn,
+                    400,
+                    "Bad Request",
+                    json!({"error":"missing_path_or_target"}),
+                );
             };
-            let task = match ctx.files.symlink(&percent_decode(target), &percent_decode(path)) {
-                Ok(task) => task, Err(e) => return service_error(&mut conn, ctx, e),
+            let task = match ctx
+                .files
+                .symlink(&percent_decode(target), &percent_decode(path))
+            {
+                Ok(task) => task,
+                Err(e) => return service_error(&mut conn, ctx, e),
             };
-            let st = ctx.files.wait_task(task, ctx.wait_timeout).unwrap_or(TaskStatus::Staged);
+            let st = ctx
+                .files
+                .wait_task(task, ctx.wait_timeout)
+                .unwrap_or(TaskStatus::Staged);
             let (code, reason, body) = task_json(task, &st);
             respond_json(&mut conn, code, reason, body)
         }
         ("POST", "/rename") => {
             let Some(from) = query_param(query, "from") else {
-                return respond_json(&mut conn, 400, "Bad Request", json!({"error":"missing_source"}));
+                return respond_json(
+                    &mut conn,
+                    400,
+                    "Bad Request",
+                    json!({"error":"missing_source"}),
+                );
             };
             let Some(to) = query_param(query, "to") else {
-                return respond_json(&mut conn, 400, "Bad Request", json!({"error":"missing_target"}));
+                return respond_json(
+                    &mut conn,
+                    400,
+                    "Bad Request",
+                    json!({"error":"missing_target"}),
+                );
             };
-            let task = match ctx.files.rename(&percent_decode(from), &percent_decode(to), query_param(query, "noreplace") == Some("1")) {
-                Ok(task) => task, Err(e) => return service_error(&mut conn, ctx, e),
+            let task = match ctx.files.rename(
+                &percent_decode(from),
+                &percent_decode(to),
+                query_param(query, "noreplace") == Some("1"),
+            ) {
+                Ok(task) => task,
+                Err(e) => return service_error(&mut conn, ctx, e),
             };
-            let st = ctx.files.wait_task(task, ctx.wait_timeout).unwrap_or(TaskStatus::Staged);
+            let st = ctx
+                .files
+                .wait_task(task, ctx.wait_timeout)
+                .unwrap_or(TaskStatus::Staged);
             let (code, reason, body) = task_json(task, &st);
             respond_json(&mut conn, code, reason, body)
         }
         (method @ ("POST" | "DELETE"), p) if p.starts_with("/directories/") => {
-            let task = match if method == "POST" { ctx.files.mkdir(&p[12..]) } else { ctx.files.rmdir(&p[12..]) } {
-                Ok(task) => task, Err(e) => return service_error(&mut conn, ctx, e),
+            let task = match if method == "POST" {
+                ctx.files.mkdir(&p[12..])
+            } else {
+                ctx.files.rmdir(&p[12..])
+            } {
+                Ok(task) => task,
+                Err(e) => return service_error(&mut conn, ctx, e),
             };
-            let st = ctx.files.wait_task(task, ctx.wait_timeout).unwrap_or(TaskStatus::Staged);
+            let st = ctx
+                .files
+                .wait_task(task, ctx.wait_timeout)
+                .unwrap_or(TaskStatus::Staged);
             let (code, reason, body) = task_json(task, &st);
             respond_json(&mut conn, code, reason, body)
         }
@@ -529,14 +853,27 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                 Ok(task) => task,
                 Err(e) => return service_error(&mut conn, ctx, e),
             };
-            let st = if wait { ctx.files.wait_task(task, ctx.wait_timeout) } else { ctx.files.task(task) };
+            let st = if wait {
+                ctx.files.wait_task(task, ctx.wait_timeout)
+            } else {
+                ctx.files.task(task)
+            };
             let (code, reason, body) = task_json(task, &st.unwrap_or(TaskStatus::Staged));
-            let (code, reason) = if code == 201 { (200, "OK") } else { (code, reason) };
+            let (code, reason) = if code == 201 {
+                (200, "OK")
+            } else {
+                (code, reason)
+            };
             respond_json(&mut conn, code, reason, body)
         }
         ("PUT", p) if p.starts_with("/files/") => {
             let Some(len) = content_length else {
-                return respond_json(&mut conn, 411, "Length Required", json!({"error": "length_required"}));
+                return respond_json(
+                    &mut conn,
+                    411,
+                    "Length Required",
+                    json!({"error": "length_required"}),
+                );
             };
             let h = match ctx.files.begin_with(&p[6..], len, create_only) {
                 Ok(h) => h,
@@ -554,16 +891,20 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                 conn.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
             }
             let spooled = (|| -> Result<(), ServiceError> {
-                let mut f = std::fs::File::create(&h.spool).map_err(|e| ServiceError::Io(e.to_string()))?;
+                let mut f =
+                    std::fs::File::create(&h.spool).map_err(|e| ServiceError::Io(e.to_string()))?;
                 let mut left = len;
                 let mut buf = vec![0u8; 256 * 1024];
                 while left > 0 {
                     let want = buf.len().min(left as usize);
-                    let n = reader.read(&mut buf[..want]).map_err(|e| ServiceError::Io(e.to_string()))?;
+                    let n = reader
+                        .read(&mut buf[..want])
+                        .map_err(|e| ServiceError::Io(e.to_string()))?;
                     if n == 0 {
                         return Err(ServiceError::Io("连接在内容传完之前关闭".into()));
                     }
-                    f.write_all(&buf[..n]).map_err(|e| ServiceError::Io(e.to_string()))?;
+                    f.write_all(&buf[..n])
+                        .map_err(|e| ServiceError::Io(e.to_string()))?;
                     ctx.files.ingest(&h, n as u64)?;
                     left -= n as u64;
                 }
@@ -577,11 +918,20 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                 Ok(t) => t,
                 Err(e) => return service_error(&mut conn, ctx, e),
             };
-            let st = if wait { ctx.files.wait_task(task, ctx.wait_timeout) } else { ctx.files.task(task) };
+            let st = if wait {
+                ctx.files.wait_task(task, ctx.wait_timeout)
+            } else {
+                ctx.files.task(task)
+            };
             let (code, reason, body) = task_json(task, &st.unwrap_or(TaskStatus::Staged));
             respond_json(&mut conn, code, reason, body)
         }
-        _ => respond_json(&mut conn, 404, "Not Found", json!({"error": "no_such_route"})),
+        _ => respond_json(
+            &mut conn,
+            404,
+            "Not Found",
+            json!({"error": "no_such_route"}),
+        ),
     }
 }
 
@@ -593,7 +943,11 @@ mod tests {
     fn range_forms() {
         assert_eq!(parse_range("bytes=0-9", 100), Some(Ok((0, 10))));
         assert_eq!(parse_range("bytes=90-", 100), Some(Ok((90, 100))));
-        assert_eq!(parse_range("bytes=95-200", 100), Some(Ok((95, 100))), "终点越过末尾就截到末尾");
+        assert_eq!(
+            parse_range("bytes=95-200", 100),
+            Some(Ok((95, 100))),
+            "终点越过末尾就截到末尾"
+        );
         assert_eq!(parse_range("bytes=-5", 100), Some(Ok((95, 100))));
         assert_eq!(parse_range("bytes=-500", 100), Some(Ok((0, 100))));
         assert_eq!(parse_range("bytes=100-", 100), Some(Err(())), "起点在末尾");

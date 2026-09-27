@@ -471,7 +471,8 @@ fn ip_ahead_with_back_pointer_to_dp_last_is_consistent() {
         assert!(vol.recovery().ip_ahead());
         assert_eq!(vol.index().generation, 3, "视图取 IP");
         assert!(vol.writable(), "{:?}", vol.recovery().notes);
-        vol.append_file("/b", &mut Cursor::new(payload(1000, 9))).unwrap();
+        vol.append_file("/b", &mut Cursor::new(payload(1000, 9)))
+            .unwrap();
         vol.commit().unwrap();
         assert_eq!(vol.index().generation, 4);
     }

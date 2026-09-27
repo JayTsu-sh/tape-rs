@@ -115,7 +115,7 @@ pub fn mkltfs(device: &dyn TapeTransport, opts: &MkltfsOptions) -> Result<Uuid> 
     write_partition_prologue(
         &drive,
         /*partition=*/ 0,
-        &opts,
+        opts,
         volume_uuid,
         PART_INDEX,
         &format_time,
@@ -145,7 +145,7 @@ pub fn mkltfs(device: &dyn TapeTransport, opts: &MkltfsOptions) -> Result<Uuid> 
     write_partition_prologue(
         &drive,
         /*partition=*/ 1,
-        &opts,
+        opts,
         volume_uuid,
         PART_DATA,
         &format_time,

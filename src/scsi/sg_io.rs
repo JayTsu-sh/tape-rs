@@ -70,6 +70,12 @@ pub struct SgIoHdr {
     pub info: u32,
 }
 
+impl Default for SgIoHdr {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SgIoHdr {
     pub fn new() -> Self {
         Self {

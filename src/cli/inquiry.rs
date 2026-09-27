@@ -3,6 +3,7 @@
 //! 自动模式 (方案 B)：用 VPD page 0x83 (Device Identification) NAA designator 合并：
 //!   * association = SCSI Target Device (10b) → 同一物理带库
 //!   * association = Logical Unit (00b)      → 同一 LU 的多路径
+//!
 //! VPD 0x83 不可用时退回 sysfs H:C:T 分组 + (vendor, product, serial) 比较。
 
 use std::collections::BTreeMap;
@@ -171,9 +172,7 @@ fn paired_changer_path(drive_path: &SgEntry, changer_paths: &[SgEntry]) -> Optio
     changer_paths
         .iter()
         .find(|c| {
-            c.hctl
-                .map(|h| (h.host, h.channel, h.target))
-                == Some((dh.host, dh.channel, dh.target))
+            c.hctl.map(|h| (h.host, h.channel, h.target)) == Some((dh.host, dh.channel, dh.target))
         })
         .map(|c| c.path.clone())
 }
@@ -188,7 +187,9 @@ struct UnionFind {
 
 impl UnionFind {
     fn new(n: usize) -> Self {
-        Self { parent: (0..n).collect() }
+        Self {
+            parent: (0..n).collect(),
+        }
     }
     fn find(&mut self, mut x: usize) -> usize {
         while self.parent[x] != x {
@@ -210,12 +211,15 @@ impl UnionFind {
 ///   1. 同 sysfs (host, channel, target) → 同一 SCSI 控制器下的兄弟 LU，属于同一带库；
 ///   2. 同 VPD 0x83 LU NAA (association = 00b) → 同一 LU 的多条控制路径（CPF / multipath）；
 ///   3. lu_id 缺失时回退到 (vendor, product, serial) 比较（plan-A 兜底）。
+///
 /// 三种关系一起跑 union-find，连通分量 = 物理带库。
 fn build_libraries(entries: &[SgEntry]) -> Vec<Library> {
     let n = entries.len();
     let mut uf = UnionFind::new(n);
 
-    union_by_key(&mut uf, entries, |e| e.hctl.map(|h| (h.host, h.channel, h.target)));
+    union_by_key(&mut uf, entries, |e| {
+        e.hctl.map(|h| (h.host, h.channel, h.target))
+    });
     union_by_key(&mut uf, entries, |e| e.lu_id.clone());
     // 序列号兜底：所有带 serial 的条目都参与，混合固件下（部分路径无 lu_id）
     // 才能跨 lu_id 缺失的边界把同一物理设备连通。
@@ -303,7 +307,11 @@ fn assemble_library(entries: &[SgEntry], idxs: &[usize]) -> Library {
         let paths: Vec<SgEntry> = changer_clusters.into_iter().flat_map(|c| c.paths).collect();
         (Some(info), paths)
     };
-    Library { changer_info, changer_paths, drives: drive_clusters }
+    Library {
+        changer_info,
+        changer_paths,
+        drives: drive_clusters,
+    }
 }
 
 fn add_path_to_cluster(clusters: &mut Vec<DriveCluster>, info: &InquiryInfo, entry: &SgEntry) {
@@ -463,9 +471,7 @@ fn read_hctl(sg_name: &str) -> Option<Hctl> {
     })
 }
 
-fn group_by_sysfs_target(
-    entries: &[SgEntry],
-) -> BTreeMap<Option<(u32, u32, u32)>, Vec<SgEntry>> {
+fn group_by_sysfs_target(entries: &[SgEntry]) -> BTreeMap<Option<(u32, u32, u32)>, Vec<SgEntry>> {
     let mut buckets: BTreeMap<Option<(u32, u32, u32)>, Vec<SgEntry>> = BTreeMap::new();
     for e in entries {
         let key = e.hctl.map(|h| (h.host, h.channel, h.target));
@@ -490,7 +496,10 @@ fn print_library(idx: usize, lib: &Library) {
                 .as_ref()
                 .map(|s| format!("   序列号 {}", s))
                 .unwrap_or_default();
-            println!("┌─ 带库 #{}   {} {}{}", idx, c.vendor, c.product, serial_part);
+            println!(
+                "┌─ 带库 #{}   {} {}{}",
+                idx, c.vendor, c.product, serial_part
+            );
         }
         None => {
             println!("┌─ 独立驱动器 #{}（未检测到 changer）", idx);
@@ -545,17 +554,16 @@ fn print_library(idx: usize, lib: &Library) {
     println!("└─");
 }
 
-fn print_other_target_group(
-    idx: usize,
-    target: Option<(u32, u32, u32)>,
-    group: &[SgEntry],
-) {
+fn print_other_target_group(idx: usize, target: Option<(u32, u32, u32)>, group: &[SgEntry]) {
     let topology = target
         .map(|(h, c, t)| format!("host{}:channel{}:target{}", h, c, t))
         .unwrap_or_else(|| "(sysfs 拓扑未知)".to_string());
     println!("[#{}] {}", idx, topology);
     for e in group {
-        let lun = e.hctl.map(|h| h.lun.to_string()).unwrap_or_else(|| "?".into());
+        let lun = e
+            .hctl
+            .map(|h| h.lun.to_string())
+            .unwrap_or_else(|| "?".into());
         match &e.inquiry {
             Ok(info) => {
                 println!(
@@ -645,7 +653,12 @@ mod tests {
     ) -> SgEntry {
         SgEntry {
             path: PathBuf::from(path),
-            hctl: hctl.map(|(h, c, t, l)| Hctl { host: h, channel: c, target: t, lun: l }),
+            hctl: hctl.map(|(h, c, t, l)| Hctl {
+                host: h,
+                channel: c,
+                target: t,
+                lun: l,
+            }),
             inquiry: Ok(InquiryInfo {
                 peripheral_type: peripheral,
                 vendor: vendor.into(),
@@ -668,14 +681,42 @@ mod tests {
         // 两个 changer LU 共享同一 NAA → 同一物理 changer。
         let changer_naa = vec![0x50, 0x00, 0xe1, 0x11, 0x70, 0x18, 0x60, 0x5e];
         let entries = vec![
-            mk_entry("/dev/sg1", Some((6, 0, 0, 0)), PT_TAPE, "IBM", "ULT3580-HH8", Some("HH8SERIAL"),
-                Some(vec![0x50, 0x00, 0xe1, 0x11, 0x70, 0x18, 0x60, 0x6f])),
-            mk_entry("/dev/sg2", Some((6, 0, 0, 1)), PT_CHANGER, "IBM", "3573-TL", Some("LIBSERIAL"),
-                Some(changer_naa.clone())),
-            mk_entry("/dev/sg3", Some((6, 0, 1, 0)), PT_TAPE, "IBM", "ULT3580-TD8", Some("TD8SERIAL"),
-                Some(vec![0x50, 0x00, 0xe1, 0x11, 0x70, 0x18, 0x60, 0x5b])),
-            mk_entry("/dev/sg4", Some((6, 0, 1, 1)), PT_CHANGER, "IBM", "3573-TL", Some("LIBSERIAL"),
-                Some(changer_naa)),
+            mk_entry(
+                "/dev/sg1",
+                Some((6, 0, 0, 0)),
+                PT_TAPE,
+                "IBM",
+                "ULT3580-HH8",
+                Some("HH8SERIAL"),
+                Some(vec![0x50, 0x00, 0xe1, 0x11, 0x70, 0x18, 0x60, 0x6f]),
+            ),
+            mk_entry(
+                "/dev/sg2",
+                Some((6, 0, 0, 1)),
+                PT_CHANGER,
+                "IBM",
+                "3573-TL",
+                Some("LIBSERIAL"),
+                Some(changer_naa.clone()),
+            ),
+            mk_entry(
+                "/dev/sg3",
+                Some((6, 0, 1, 0)),
+                PT_TAPE,
+                "IBM",
+                "ULT3580-TD8",
+                Some("TD8SERIAL"),
+                Some(vec![0x50, 0x00, 0xe1, 0x11, 0x70, 0x18, 0x60, 0x5b]),
+            ),
+            mk_entry(
+                "/dev/sg4",
+                Some((6, 0, 1, 1)),
+                PT_CHANGER,
+                "IBM",
+                "3573-TL",
+                Some("LIBSERIAL"),
+                Some(changer_naa),
+            ),
         ];
         let libs = build_libraries(&entries);
         assert_eq!(libs.len(), 1, "CPF 应该合并为 1 个 library");
@@ -688,12 +729,33 @@ mod tests {
     fn build_libraries_vtl_no_shared_target_no_merge() {
         // VTL 风格：3 个 sg 各占独立 target，互不相关 LU id。
         let entries = vec![
-            mk_entry("/dev/sg3", Some((4, 0, 0, 0)), PT_CHANGER, "IBM", "03584L32", Some("VTL_CHG"),
-                Some(vec![1, 2, 3])),
-            mk_entry("/dev/sg4", Some((3, 0, 0, 0)), PT_TAPE, "IBM", "ULT3580-TD8", Some("VTL_DRV_A"),
-                Some(vec![4, 5, 6])),
-            mk_entry("/dev/sg5", Some((5, 0, 0, 0)), PT_TAPE, "IBM", "ULT3580-TD8", Some("VTL_DRV_B"),
-                Some(vec![7, 8, 9])),
+            mk_entry(
+                "/dev/sg3",
+                Some((4, 0, 0, 0)),
+                PT_CHANGER,
+                "IBM",
+                "03584L32",
+                Some("VTL_CHG"),
+                Some(vec![1, 2, 3]),
+            ),
+            mk_entry(
+                "/dev/sg4",
+                Some((3, 0, 0, 0)),
+                PT_TAPE,
+                "IBM",
+                "ULT3580-TD8",
+                Some("VTL_DRV_A"),
+                Some(vec![4, 5, 6]),
+            ),
+            mk_entry(
+                "/dev/sg5",
+                Some((5, 0, 0, 0)),
+                PT_TAPE,
+                "IBM",
+                "ULT3580-TD8",
+                Some("VTL_DRV_B"),
+                Some(vec![7, 8, 9]),
+            ),
         ];
         let libs = build_libraries(&entries);
         assert_eq!(libs.len(), 3, "VTL 没法合并，应保留 3 个独立项");
@@ -703,8 +765,24 @@ mod tests {
     fn build_libraries_fallback_by_serial_when_no_lu_id() {
         // 老设备没 VPD 0x83 lu_id：靠 (vendor, product, serial) 兜底合并
         let entries = vec![
-            mk_entry("/dev/sg1", Some((1, 0, 0, 1)), PT_CHANGER, "OLD", "LIB", Some("LIB1"), None),
-            mk_entry("/dev/sg2", Some((1, 0, 1, 1)), PT_CHANGER, "OLD", "LIB", Some("LIB1"), None),
+            mk_entry(
+                "/dev/sg1",
+                Some((1, 0, 0, 1)),
+                PT_CHANGER,
+                "OLD",
+                "LIB",
+                Some("LIB1"),
+                None,
+            ),
+            mk_entry(
+                "/dev/sg2",
+                Some((1, 0, 1, 1)),
+                PT_CHANGER,
+                "OLD",
+                "LIB",
+                Some("LIB1"),
+                None,
+            ),
         ];
         let libs = build_libraries(&entries);
         assert_eq!(libs.len(), 1);
@@ -716,10 +794,24 @@ mod tests {
         // 混合固件场景：一条路径返回 VPD 0x83 LU id，另一条没返回但 serial 相同。
         // 修 fix #1 前会拆成 2 个 library；修后靠 serial 兜底合并。
         let entries = vec![
-            mk_entry("/dev/sg1", Some((1, 0, 0, 1)), PT_CHANGER, "MIX", "LIB", Some("MIXLIB"),
-                Some(vec![0xa, 0xb, 0xc])),
-            mk_entry("/dev/sg2", Some((1, 0, 1, 1)), PT_CHANGER, "MIX", "LIB", Some("MIXLIB"),
-                None),
+            mk_entry(
+                "/dev/sg1",
+                Some((1, 0, 0, 1)),
+                PT_CHANGER,
+                "MIX",
+                "LIB",
+                Some("MIXLIB"),
+                Some(vec![0xa, 0xb, 0xc]),
+            ),
+            mk_entry(
+                "/dev/sg2",
+                Some((1, 0, 1, 1)),
+                PT_CHANGER,
+                "MIX",
+                "LIB",
+                Some("MIXLIB"),
+                None,
+            ),
         ];
         let libs = build_libraries(&entries);
         assert_eq!(libs.len(), 1, "同 serial 应跨 lu_id 缺失合并");

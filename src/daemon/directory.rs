@@ -52,8 +52,11 @@ pub struct PoolRow {
 impl Directory {
     /// 只读连接，给 HTTP 线程查询用。WAL 模式下读不阻塞 Raft 应用线程的写。
     pub fn open_reader(path: &Path) -> Result<Self> {
-        let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)
-            .map_err(db_err)?;
+        let db = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(db_err)?;
         Ok(Self { db, applied: 0 })
     }
 
@@ -87,19 +90,45 @@ impl Directory {
             ("tapes", &["bytes_written"]),
         ] {
             for c in cols {
-                let _ = db.execute(&format!("ALTER TABLE {} ADD COLUMN {} INTEGER NOT NULL DEFAULT 0", t, c), []);
+                let _ = db.execute(
+                    &format!(
+                        "ALTER TABLE {} ADD COLUMN {} INTEGER NOT NULL DEFAULT 0",
+                        t, c
+                    ),
+                    [],
+                );
             }
         }
         for table in ["files", "staging"] {
-            let mut stmt = db.prepare(&format!("PRAGMA table_info({})", table)).map_err(db_err)?;
-            let cols = stmt.query_map([], |r| r.get::<_, String>(1)).map_err(db_err)?.collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)?;
+            let mut stmt = db
+                .prepare(&format!("PRAGMA table_info({})", table))
+                .map_err(db_err)?;
+            let cols = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .map_err(db_err)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(db_err)?;
             if !cols.iter().any(|c| c == "metadata") {
-                db.execute(&format!("ALTER TABLE {} ADD COLUMN metadata TEXT NOT NULL DEFAULT 'null'", table), []).map_err(db_err)?;
+                db.execute(
+                    &format!(
+                        "ALTER TABLE {} ADD COLUMN metadata TEXT NOT NULL DEFAULT 'null'",
+                        table
+                    ),
+                    [],
+                )
+                .map_err(db_err)?;
             }
         }
-        let applied: Option<i64> =
-            db.query_row("SELECT v FROM meta WHERE k = 'applied_index'", [], |r| r.get(0)).optional().map_err(db_err)?;
-        Ok(Self { db, applied: applied.unwrap_or(0) as u64 })
+        let applied: Option<i64> = db
+            .query_row("SELECT v FROM meta WHERE k = 'applied_index'", [], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(db_err)?;
+        Ok(Self {
+            db,
+            applied: applied.unwrap_or(0) as u64,
+        })
     }
 
     /// 已经落库的最后一个日志索引。
@@ -122,7 +151,9 @@ impl Directory {
     pub fn applied_index_of(path: &Path) -> Result<u64> {
         let v: Option<i64> = Self::open_reader(path)?
             .db
-            .query_row("SELECT v FROM meta WHERE k = 'applied_index'", [], |r| r.get(0))
+            .query_row("SELECT v FROM meta WHERE k = 'applied_index'", [], |r| {
+                r.get(0)
+            })
             .optional()
             .map_err(db_err)?;
         Ok(v.unwrap_or(0) as u64)
@@ -136,7 +167,9 @@ impl Directory {
     pub fn write_snapshot(&self, dest: &Path) -> Result<()> {
         let tmp = dest.with_extension("tmp");
         let _ = std::fs::remove_file(&tmp);
-        self.db.execute("VACUUM INTO ?1", params![tmp.to_string_lossy()]).map_err(db_err)?;
+        self.db
+            .execute("VACUUM INTO ?1", params![tmp.to_string_lossy()])
+            .map_err(db_err)?;
         std::fs::rename(&tmp, dest)?;
         Ok(())
     }
@@ -169,7 +202,11 @@ impl Directory {
         let tx = self.db.transaction().map_err(db_err)?;
         if let Applied::Admin(Ok(_)) = outcome {
             match cmd {
-                Command::PoolCreate { uuid, name, file_limit } => {
+                Command::PoolCreate {
+                    uuid,
+                    name,
+                    file_limit,
+                } => {
                     tx.execute(
                         "INSERT OR REPLACE INTO pools (uuid, name, file_limit) VALUES (?1, ?2, ?3)",
                         params![uuid, name, *file_limit as i64],
@@ -179,19 +216,35 @@ impl Directory {
                 Command::TapeAssign { barcode, pool } => {
                     // 命令里可以是池名；落库用 UUID
                     let uuid: String = tx
-                        .query_row("SELECT uuid FROM pools WHERE uuid = ?1 OR name = ?1", params![pool], |r| r.get(0))
+                        .query_row(
+                            "SELECT uuid FROM pools WHERE uuid = ?1 OR name = ?1",
+                            params![pool],
+                            |r| r.get(0),
+                        )
                         .map_err(db_err)?;
-                    tx.execute("INSERT OR REPLACE INTO tapes (barcode, pool_uuid) VALUES (?1, ?2)", params![barcode, uuid])
-                        .map_err(db_err)?;
+                    tx.execute(
+                        "INSERT OR REPLACE INTO tapes (barcode, pool_uuid) VALUES (?1, ?2)",
+                        params![barcode, uuid],
+                    )
+                    .map_err(db_err)?;
                 }
                 Command::TapeUnassign { barcode } => {
-                    tx.execute("DELETE FROM tapes WHERE barcode = ?1", params![barcode]).map_err(db_err)?;
+                    tx.execute("DELETE FROM tapes WHERE barcode = ?1", params![barcode])
+                        .map_err(db_err)?;
                 }
                 _ => {}
             }
         }
         match (cmd, outcome) {
-            (Command::CatalogPart { barcode, generation, part, files }, _) => {
+            (
+                Command::CatalogPart {
+                    barcode,
+                    generation,
+                    part,
+                    files,
+                },
+                _,
+            ) => {
                 let mut ins = tx
                     .prepare(
                         "INSERT INTO staging (barcode, generation, part, path, length, sha256, ver_round, ver_seq, deleted, metadata)
@@ -200,17 +253,49 @@ impl Directory {
                     .map_err(db_err)?;
                 for f in files {
                     ins.execute(params![
-                        barcode, *generation as i64, *part as i64, f.path, f.length as i64, f.sha256,
-                        f.version.0 as i64, f.version.1 as i64, f.deleted as i64, f.metadata.to_string()
+                        barcode,
+                        *generation as i64,
+                        *part as i64,
+                        f.path,
+                        f.length as i64,
+                        f.sha256,
+                        f.version.0 as i64,
+                        f.version.1 as i64,
+                        f.deleted as i64,
+                        f.metadata.to_string()
                     ])
                     .map_err(db_err)?;
                 }
                 if files.is_empty() {
                     // 空片也要留痕，片数才对得上
-                    ins.execute(params![barcode, *generation as i64, *part as i64, "", -1i64, "", 0i64, 0i64, 0i64, "null"]).map_err(db_err)?;
+                    ins.execute(params![
+                        barcode,
+                        *generation as i64,
+                        *part as i64,
+                        "",
+                        -1i64,
+                        "",
+                        0i64,
+                        0i64,
+                        0i64,
+                        "null"
+                    ])
+                    .map_err(db_err)?;
                 }
             }
-            (Command::TapeCommitted { barcode, volume_uuid, generation, files, bytes_used, bytes_written, parts, full }, Applied::CatalogCommitted) => {
+            (
+                Command::TapeCommitted {
+                    barcode,
+                    volume_uuid,
+                    generation,
+                    files,
+                    bytes_used,
+                    bytes_written,
+                    parts,
+                    full,
+                },
+                Applied::CatalogCommitted,
+            ) => {
                 let have: i64 = tx
                     .query_row(
                         "SELECT COUNT(DISTINCT part) FROM staging WHERE barcode = ?1 AND generation = ?2",
@@ -222,7 +307,8 @@ impl Directory {
                 // 该带的目录停在旧代数，等下次装载时按磁带对账补齐。
                 if have == *parts as i64 {
                     if *full {
-                        tx.execute("DELETE FROM files WHERE barcode = ?1", params![barcode]).map_err(db_err)?;
+                        tx.execute("DELETE FROM files WHERE barcode = ?1", params![barcode])
+                            .map_err(db_err)?;
                     }
                     // 同一路径可以同时存在于多盘带上：被重写的旧副本还留在原带上，回收搬迁
                     // 期间新旧两份并存。哪一份算数只看版本，不看合并顺序——否则装载一盘旧带
@@ -253,14 +339,25 @@ impl Directory {
                     )
                     .map_err(db_err)?;
                 }
-                tx.execute("DELETE FROM staging WHERE barcode = ?1 AND generation <= ?2", params![barcode, *generation as i64])
-                    .map_err(db_err)?;
+                tx.execute(
+                    "DELETE FROM staging WHERE barcode = ?1 AND generation <= ?2",
+                    params![barcode, *generation as i64],
+                )
+                .map_err(db_err)?;
             }
-            (Command::TapeReclaimed { barcode, volume_uuid }, Applied::Reclaimed) => {
+            (
+                Command::TapeReclaimed {
+                    barcode,
+                    volume_uuid,
+                },
+                Applied::Reclaimed,
+            ) => {
                 // 带已重新格式化。状态机在应用这条之前已经确认它还在回收中，而执行者在格式化
                 // 之前已经确认目录里没有任何路径还指向它，所以这里删的都是被搬走或被重写的旧副本。
-                tx.execute("DELETE FROM files WHERE barcode = ?1", params![barcode]).map_err(db_err)?;
-                tx.execute("DELETE FROM staging WHERE barcode = ?1", params![barcode]).map_err(db_err)?;
+                tx.execute("DELETE FROM files WHERE barcode = ?1", params![barcode])
+                    .map_err(db_err)?;
+                tx.execute("DELETE FROM staging WHERE barcode = ?1", params![barcode])
+                    .map_err(db_err)?;
                 tx.execute(
                     "UPDATE tapes SET volume_uuid = ?2, generation = 1, files = 0, bytes_used = 0, bytes_written = 0
                      WHERE barcode = ?1",
@@ -282,15 +379,36 @@ impl Directory {
 
     pub fn pools(&self) -> Result<Vec<PoolRow>> {
         let mut out = Vec::new();
-        let mut stmt = self.db.prepare("SELECT uuid, name, file_limit FROM pools ORDER BY name").map_err(db_err)?;
+        let mut stmt = self
+            .db
+            .prepare("SELECT uuid, name, file_limit FROM pools ORDER BY name")
+            .map_err(db_err)?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
             .map_err(db_err)?;
         for row in rows {
             let (uuid, name, file_limit) = row.map_err(db_err)?;
-            let mut t = self.db.prepare("SELECT barcode FROM tapes WHERE pool_uuid = ?1 ORDER BY barcode").map_err(db_err)?;
-            let tapes = t.query_map(params![uuid], |r| r.get::<_, String>(0)).map_err(db_err)?.collect::<std::result::Result<_, _>>().map_err(db_err)?;
-            out.push(PoolRow { uuid, name, file_limit: file_limit as u64, tapes });
+            let mut t = self
+                .db
+                .prepare("SELECT barcode FROM tapes WHERE pool_uuid = ?1 ORDER BY barcode")
+                .map_err(db_err)?;
+            let tapes = t
+                .query_map(params![uuid], |r| r.get::<_, String>(0))
+                .map_err(db_err)?
+                .collect::<std::result::Result<_, _>>()
+                .map_err(db_err)?;
+            out.push(PoolRow {
+                uuid,
+                name,
+                file_limit: file_limit as u64,
+                tapes,
+            });
         }
         Ok(out)
     }
@@ -299,7 +417,11 @@ impl Directory {
     pub fn tape_generation(&self, barcode: &str) -> Result<u64> {
         let g: Option<i64> = self
             .db
-            .query_row("SELECT generation FROM tapes WHERE barcode = ?1", params![barcode], |r| r.get(0))
+            .query_row(
+                "SELECT generation FROM tapes WHERE barcode = ?1",
+                params![barcode],
+                |r| r.get(0),
+            )
             .optional()
             .map_err(db_err)?;
         Ok(g.unwrap_or(0) as u64)
@@ -322,8 +444,13 @@ impl Directory {
 
     /// 回收的工作单：目录里还指向这盘带的全部路径，按路径排序（各节点结论一致，也便于续跑）。
     pub fn paths_on(&self, barcode: &str) -> Result<Vec<String>> {
-        let mut stmt = self.db.prepare("SELECT path FROM files WHERE barcode = ?1 ORDER BY path").map_err(db_err)?;
-        let rows = stmt.query_map(params![barcode], |r| r.get::<_, String>(0)).map_err(db_err)?;
+        let mut stmt = self
+            .db
+            .prepare("SELECT path FROM files WHERE barcode = ?1 ORDER BY path")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![barcode], |r| r.get::<_, String>(0))
+            .map_err(db_err)?;
         rows.collect::<std::result::Result<_, _>>().map_err(db_err)
     }
 
@@ -424,10 +551,20 @@ impl Directory {
             return Ok(false);
         }
         for r in &rows {
-            let Some(p) = ctl.pools.get(&r.uuid) else { return Ok(false) };
-            let mut want: Vec<&String> = ctl.tapes.iter().filter(|(_, u)| **u == r.uuid).map(|(b, _)| b).collect();
+            let Some(p) = ctl.pools.get(&r.uuid) else {
+                return Ok(false);
+            };
+            let mut want: Vec<&String> = ctl
+                .tapes
+                .iter()
+                .filter(|(_, u)| **u == r.uuid)
+                .map(|(b, _)| b)
+                .collect();
             want.sort();
-            if p.name != r.name || p.file_limit != r.file_limit || want != r.tapes.iter().collect::<Vec<_>>() {
+            if p.name != r.name
+                || p.file_limit != r.file_limit
+                || want != r.tapes.iter().collect::<Vec<_>>()
+            {
                 return Ok(false);
             }
         }
@@ -441,12 +578,28 @@ mod tests {
 
     fn script() -> Vec<Command> {
         vec![
-            Command::PoolCreate { uuid: "u-1".into(), name: "archive".into(), file_limit: 100 },
-            Command::PoolCreate { uuid: "u-2".into(), name: "archive".into(), file_limit: 100 }, // 被拒
-            Command::TapeAssign { barcode: "T1".into(), pool: "archive".into() },
-            Command::TapeAssign { barcode: "T2".into(), pool: "u-1".into() },
+            Command::PoolCreate {
+                uuid: "u-1".into(),
+                name: "archive".into(),
+                file_limit: 100,
+            },
+            Command::PoolCreate {
+                uuid: "u-2".into(),
+                name: "archive".into(),
+                file_limit: 100,
+            }, // 被拒
+            Command::TapeAssign {
+                barcode: "T1".into(),
+                pool: "archive".into(),
+            },
+            Command::TapeAssign {
+                barcode: "T2".into(),
+                pool: "u-1".into(),
+            },
             Command::Takeover { node: 1, term: 1 },
-            Command::TapeUnassign { barcode: "T1".into() },
+            Command::TapeUnassign {
+                barcode: "T1".into(),
+            },
         ]
     }
 
@@ -495,7 +648,12 @@ mod tests {
         assert!(d.matches(&ctl2).unwrap());
         assert_eq!(
             d.pools().unwrap(),
-            vec![PoolRow { uuid: "u-1".into(), name: "archive".into(), file_limit: 100, tapes: vec!["T2".into()] }]
+            vec![PoolRow {
+                uuid: "u-1".into(),
+                name: "archive".into(),
+                file_limit: 100,
+                tapes: vec!["T2".into()]
+            }]
         );
         let _ = (ctl, std::fs::remove_dir_all(&dir));
     }
@@ -516,35 +674,114 @@ mod tests {
             d.apply(idx, &c, &out).unwrap();
             out
         };
-        let rec = |p: &str, n: u64| FileRec { metadata: serde_json::Value::Null, path: p.into(), length: n, sha256: format!("{:064x}", n), version: (1, n), deleted: false };
-        run(&mut ctl, &mut d, Command::PoolCreate { uuid: "u".into(), name: "p".into(), file_limit: 10 });
-        run(&mut ctl, &mut d, Command::TapeAssign { barcode: "T1".into(), pool: "p".into() });
+        let rec = |p: &str, n: u64| FileRec {
+            metadata: serde_json::Value::Null,
+            path: p.into(),
+            length: n,
+            sha256: format!("{:064x}", n),
+            version: (1, n),
+            deleted: false,
+        };
+        run(
+            &mut ctl,
+            &mut d,
+            Command::PoolCreate {
+                uuid: "u".into(),
+                name: "p".into(),
+                file_limit: 10,
+            },
+        );
+        run(
+            &mut ctl,
+            &mut d,
+            Command::TapeAssign {
+                barcode: "T1".into(),
+                pool: "p".into(),
+            },
+        );
         let commit = |g: u64, parts: u32, files: u64, full: bool| Command::TapeCommitted {
-            barcode: "T1".into(), volume_uuid: "v".into(), generation: g, files, bytes_used: 100, bytes_written: 100, parts, full,
+            barcode: "T1".into(),
+            volume_uuid: "v".into(),
+            generation: g,
+            files,
+            bytes_used: 100,
+            bytes_written: 100,
+            parts,
+            full,
         };
 
         // 两片的批次：第二片到达、摘要应用之前，一条都不可见
-        run(&mut ctl, &mut d, Command::CatalogPart { barcode: "T1".into(), generation: 2, part: 0, files: vec![rec("/a", 1)] });
+        run(
+            &mut ctl,
+            &mut d,
+            Command::CatalogPart {
+                barcode: "T1".into(),
+                generation: 2,
+                part: 0,
+                files: vec![rec("/a", 1)],
+            },
+        );
         assert_eq!(d.stat("u", "/a").unwrap(), None);
-        run(&mut ctl, &mut d, Command::CatalogPart { barcode: "T1".into(), generation: 2, part: 1, files: vec![rec("/b", 2)] });
-        assert_eq!(run(&mut ctl, &mut d, commit(2, 2, 2, false)), Applied::CatalogCommitted);
-        assert_eq!(d.stat("u", "/a").unwrap().map(|f| (f.barcode, f.generation, f.length)), Some(("T1".into(), 2, 1)));
+        run(
+            &mut ctl,
+            &mut d,
+            Command::CatalogPart {
+                barcode: "T1".into(),
+                generation: 2,
+                part: 1,
+                files: vec![rec("/b", 2)],
+            },
+        );
+        assert_eq!(
+            run(&mut ctl, &mut d, commit(2, 2, 2, false)),
+            Applied::CatalogCommitted
+        );
+        assert_eq!(
+            d.stat("u", "/a")
+                .unwrap()
+                .map(|f| (f.barcode, f.generation, f.length)),
+            Some(("T1".into(), 2, 1))
+        );
         assert_eq!(d.tape_generation("T1").unwrap(), 2);
 
         // 片不齐的批次整批丢弃，目录停在旧代数
-        run(&mut ctl, &mut d, Command::CatalogPart { barcode: "T1".into(), generation: 3, part: 0, files: vec![rec("/c", 3)] });
+        run(
+            &mut ctl,
+            &mut d,
+            Command::CatalogPart {
+                barcode: "T1".into(),
+                generation: 3,
+                part: 0,
+                files: vec![rec("/c", 3)],
+            },
+        );
         run(&mut ctl, &mut d, commit(3, 2, 3, false));
         assert_eq!(d.stat("u", "/c").unwrap(), None);
         assert_eq!(d.tape_generation("T1").unwrap(), 2);
 
         // 完整列表（对账）：替换该带的全部记录；同一路径再次上传覆盖旧记录
-        run(&mut ctl, &mut d, Command::CatalogPart { barcode: "T1".into(), generation: 4, part: 0, files: vec![rec("/a", 9), rec("/c", 3)] });
+        run(
+            &mut ctl,
+            &mut d,
+            Command::CatalogPart {
+                barcode: "T1".into(),
+                generation: 4,
+                part: 0,
+                files: vec![rec("/a", 9), rec("/c", 3)],
+            },
+        );
         run(&mut ctl, &mut d, commit(4, 1, 2, true));
-        assert_eq!(d.list("u").unwrap(), vec![("/a".to_string(), 9), ("/c".to_string(), 3)]);
+        assert_eq!(
+            d.list("u").unwrap(),
+            vec![("/a".to_string(), 9), ("/c".to_string(), 3)]
+        );
         assert_eq!(d.tape_generation("T1").unwrap(), 4);
         // 只读连接看到同样的内容
         let r = Directory::open_reader(&path).unwrap();
-        assert_eq!(r.stat("u", "/c").unwrap().unwrap().sha256, format!("{:064x}", 3));
+        assert_eq!(
+            r.stat("u", "/c").unwrap().unwrap().sha256,
+            format!("{:064x}", 3)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -566,19 +803,72 @@ mod tests {
             let out = ctl.apply(idx, &c);
             d.apply(idx, &c, &out).unwrap();
         };
-        run(&mut ctl, &mut d, Command::PoolCreate { uuid: "u".into(), name: "p".into(), file_limit: 10 });
+        run(
+            &mut ctl,
+            &mut d,
+            Command::PoolCreate {
+                uuid: "u".into(),
+                name: "p".into(),
+                file_limit: 10,
+            },
+        );
         for b in ["T1", "T2"] {
-            run(&mut ctl, &mut d, Command::TapeAssign { barcode: b.into(), pool: "p".into() });
+            run(
+                &mut ctl,
+                &mut d,
+                Command::TapeAssign {
+                    barcode: b.into(),
+                    pool: "p".into(),
+                },
+            );
         }
         // 一整批：一片记录 + 一条摘要
-        let mut batch = |ctl: &mut ControlState, d: &mut Directory, b: &str, g: u64, len: u64, ver: (u64, u64), full: bool| {
-            let f = FileRec { metadata: serde_json::Value::Null, path: "/a".into(), length: len, sha256: String::new(), version: ver, deleted: false };
-            run(ctl, d, Command::CatalogPart { barcode: b.into(), generation: g, part: 0, files: vec![f] });
-            run(ctl, d, Command::TapeCommitted {
-                barcode: b.into(), volume_uuid: "v".into(), generation: g, files: 1, bytes_used: len, bytes_written: len, parts: 1, full,
-            });
+        let mut batch = |ctl: &mut ControlState,
+                         d: &mut Directory,
+                         b: &str,
+                         g: u64,
+                         len: u64,
+                         ver: (u64, u64),
+                         full: bool| {
+            let f = FileRec {
+                metadata: serde_json::Value::Null,
+                path: "/a".into(),
+                length: len,
+                sha256: String::new(),
+                version: ver,
+                deleted: false,
+            };
+            run(
+                ctl,
+                d,
+                Command::CatalogPart {
+                    barcode: b.into(),
+                    generation: g,
+                    part: 0,
+                    files: vec![f],
+                },
+            );
+            run(
+                ctl,
+                d,
+                Command::TapeCommitted {
+                    barcode: b.into(),
+                    volume_uuid: "v".into(),
+                    generation: g,
+                    files: 1,
+                    bytes_used: len,
+                    bytes_written: len,
+                    parts: 1,
+                    full,
+                },
+            );
         };
-        let where_is = |d: &Directory| d.stat("u", "/a").unwrap().map(|f| (f.barcode, f.length)).unwrap();
+        let where_is = |d: &Directory| {
+            d.stat("u", "/a")
+                .unwrap()
+                .map(|f| (f.barcode, f.length))
+                .unwrap()
+        };
 
         // /a 先写在 T1，然后被重写到 T2
         batch(&mut ctl, &mut d, "T1", 2, 10, (1, 1), false);
@@ -589,26 +879,87 @@ mod tests {
         // 装载 T1（选带、读取都会做）→ 它报出自己的完整列表，旧副本还在上面。不能抢回去
         batch(&mut ctl, &mut d, "T1", 3, 10, (1, 1), true);
         assert_eq!(where_is(&d), ("T2".to_string(), 20), "旧版本不得覆盖新版本");
-        assert_eq!(d.live_on("T1").unwrap(), (0, 0), "T1 上已经没有活着的文件，可以回收");
+        assert_eq!(
+            d.live_on("T1").unwrap(),
+            (0, 0),
+            "T1 上已经没有活着的文件，可以回收"
+        );
         assert_eq!(d.live_on("T2").unwrap(), (1, 20));
         assert_eq!(d.paths_on("T2").unwrap(), vec!["/a".to_string()]);
 
         // 反方向也要对：写 T2 的那一届没来得及把目录记进日志，目录还停在 T1；
         // 之后装载 T2 对账，新版本要能纠正过来（PN06 走的就是这条路）
-        let rec = |len: u64, ver: (u64, u64)| FileRec { metadata: serde_json::Value::Null, path: "/b".into(), length: len, sha256: String::new(), version: ver, deleted: false };
-        run(&mut ctl, &mut d, Command::CatalogPart { barcode: "T1".into(), generation: 5, part: 0, files: vec![rec(10, (1, 2))] });
-        run(&mut ctl, &mut d, Command::TapeCommitted {
-            barcode: "T1".into(), volume_uuid: "v".into(), generation: 5, files: 1, bytes_used: 10, bytes_written: 10, parts: 1, full: true,
-        });
+        let rec = |len: u64, ver: (u64, u64)| FileRec {
+            metadata: serde_json::Value::Null,
+            path: "/b".into(),
+            length: len,
+            sha256: String::new(),
+            version: ver,
+            deleted: false,
+        };
+        run(
+            &mut ctl,
+            &mut d,
+            Command::CatalogPart {
+                barcode: "T1".into(),
+                generation: 5,
+                part: 0,
+                files: vec![rec(10, (1, 2))],
+            },
+        );
+        run(
+            &mut ctl,
+            &mut d,
+            Command::TapeCommitted {
+                barcode: "T1".into(),
+                volume_uuid: "v".into(),
+                generation: 5,
+                files: 1,
+                bytes_used: 10,
+                bytes_written: 10,
+                parts: 1,
+                full: true,
+            },
+        );
         assert_eq!(d.stat("u", "/b").unwrap().unwrap().barcode, "T1");
-        run(&mut ctl, &mut d, Command::CatalogPart {
-            barcode: "T2".into(), generation: 6, part: 0,
-            files: vec![FileRec { metadata: serde_json::Value::Null, path: "/a".into(), length: 20, sha256: String::new(), version: (1, 5), deleted: false }, rec(30, (2, 9))],
-        });
-        run(&mut ctl, &mut d, Command::TapeCommitted {
-            barcode: "T2".into(), volume_uuid: "v".into(), generation: 6, files: 2, bytes_used: 50, bytes_written: 50, parts: 1, full: true,
-        });
-        assert_eq!(d.stat("u", "/b").unwrap().map(|f| (f.barcode, f.length)), Some(("T2".to_string(), 30)));
+        run(
+            &mut ctl,
+            &mut d,
+            Command::CatalogPart {
+                barcode: "T2".into(),
+                generation: 6,
+                part: 0,
+                files: vec![
+                    FileRec {
+                        metadata: serde_json::Value::Null,
+                        path: "/a".into(),
+                        length: 20,
+                        sha256: String::new(),
+                        version: (1, 5),
+                        deleted: false,
+                    },
+                    rec(30, (2, 9)),
+                ],
+            },
+        );
+        run(
+            &mut ctl,
+            &mut d,
+            Command::TapeCommitted {
+                barcode: "T2".into(),
+                volume_uuid: "v".into(),
+                generation: 6,
+                files: 2,
+                bytes_used: 50,
+                bytes_written: 50,
+                parts: 1,
+                full: true,
+            },
+        );
+        assert_eq!(
+            d.stat("u", "/b").unwrap().map(|f| (f.barcode, f.length)),
+            Some(("T2".to_string(), 30))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -629,40 +980,119 @@ mod tests {
             let out = ctl.apply(idx, &c);
             d.apply(idx, &c, &out).unwrap();
         };
-        run(&mut ctl, &mut d, Command::PoolCreate { uuid: "u".into(), name: "p".into(), file_limit: 10 });
+        run(
+            &mut ctl,
+            &mut d,
+            Command::PoolCreate {
+                uuid: "u".into(),
+                name: "p".into(),
+                file_limit: 10,
+            },
+        );
         for b in ["T1", "T2"] {
-            run(&mut ctl, &mut d, Command::TapeAssign { barcode: b.into(), pool: "p".into() });
+            run(
+                &mut ctl,
+                &mut d,
+                Command::TapeAssign {
+                    barcode: b.into(),
+                    pool: "p".into(),
+                },
+            );
         }
-        let rec = |len: u64, ver: (u64, u64), deleted: bool| FileRec { metadata: serde_json::Value::Null, path: "/a".into(), length: len, sha256: String::new(), version: ver, deleted };
-        let mut batch = |ctl: &mut ControlState, d: &mut Directory, b: &str, g: u64, files: Vec<FileRec>, full: bool| {
+        let rec = |len: u64, ver: (u64, u64), deleted: bool| FileRec {
+            metadata: serde_json::Value::Null,
+            path: "/a".into(),
+            length: len,
+            sha256: String::new(),
+            version: ver,
+            deleted,
+        };
+        let mut batch = |ctl: &mut ControlState,
+                         d: &mut Directory,
+                         b: &str,
+                         g: u64,
+                         files: Vec<FileRec>,
+                         full: bool| {
             let n = files.len() as u64;
-            run(ctl, d, Command::CatalogPart { barcode: b.into(), generation: g, part: 0, files });
-            run(ctl, d, Command::TapeCommitted {
-                barcode: b.into(), volume_uuid: "v".into(), generation: g, files: n, bytes_used: 0, bytes_written: 0, parts: 1, full,
-            });
+            run(
+                ctl,
+                d,
+                Command::CatalogPart {
+                    barcode: b.into(),
+                    generation: g,
+                    part: 0,
+                    files,
+                },
+            );
+            run(
+                ctl,
+                d,
+                Command::TapeCommitted {
+                    barcode: b.into(),
+                    volume_uuid: "v".into(),
+                    generation: g,
+                    files: n,
+                    bytes_used: 0,
+                    bytes_written: 0,
+                    parts: 1,
+                    full,
+                },
+            );
         };
 
-        batch(&mut ctl, &mut d, "T1", 2, vec![rec(10, (1, 1), false)], false);
-        assert_eq!(d.stat("u", "/a").unwrap().map(|f| f.barcode), Some("T1".into()));
+        batch(
+            &mut ctl,
+            &mut d,
+            "T1",
+            2,
+            vec![rec(10, (1, 1), false)],
+            false,
+        );
+        assert_eq!(
+            d.stat("u", "/a").unwrap().map(|f| f.barcode),
+            Some("T1".into())
+        );
         // 删除：墓碑落在当前写入带 T2 上
         batch(&mut ctl, &mut d, "T2", 2, vec![rec(0, (2, 1), true)], false);
         assert_eq!(d.stat("u", "/a").unwrap(), None);
         assert!(d.list("u").unwrap().is_empty());
         let row = d.lookup("u", "/a").unwrap().unwrap();
         assert!(row.deleted && row.barcode == "T2");
-        assert_eq!(d.live_on("T1").unwrap(), (0, 0), "T1 上的旧副本成了可回收空间");
-        assert_eq!(d.live_on("T2").unwrap(), (1, 0), "墓碑是 T2 上一条活记录，回收要搬它");
+        assert_eq!(
+            d.live_on("T1").unwrap(),
+            (0, 0),
+            "T1 上的旧副本成了可回收空间"
+        );
+        assert_eq!(
+            d.live_on("T2").unwrap(),
+            (1, 0),
+            "墓碑是 T2 上一条活记录，回收要搬它"
+        );
 
         // 装载 T1 做完整对账：旧副本抢不回路径
-        batch(&mut ctl, &mut d, "T1", 3, vec![rec(10, (1, 1), false)], true);
-        assert_eq!(d.stat("u", "/a").unwrap(), None, "被删除的文件不得因对账旧带而复活");
+        batch(
+            &mut ctl,
+            &mut d,
+            "T1",
+            3,
+            vec![rec(10, (1, 1), false)],
+            true,
+        );
+        assert_eq!(
+            d.stat("u", "/a").unwrap(),
+            None,
+            "被删除的文件不得因对账旧带而复活"
+        );
         // T2 自己再对账一次：墓碑还在
         batch(&mut ctl, &mut d, "T2", 3, vec![rec(0, (2, 1), true)], true);
         assert!(d.lookup("u", "/a").unwrap().unwrap().deleted);
 
         // 重新上传到 T2（同一盘带上墓碑被新文件替换）：路径复活
         batch(&mut ctl, &mut d, "T2", 4, vec![rec(7, (2, 4), false)], true);
-        assert_eq!(d.stat("u", "/a").unwrap().map(|f| (f.barcode, f.length)), Some(("T2".into(), 7)));
+        assert_eq!(
+            d.stat("u", "/a").unwrap().map(|f| (f.barcode, f.length)),
+            Some(("T2".into(), 7))
+        );
         assert_eq!(d.list("u").unwrap(), vec![("/a".to_string(), 7)]);
         let _ = std::fs::remove_dir_all(&dir);
     }

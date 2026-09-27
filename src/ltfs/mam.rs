@@ -226,7 +226,9 @@ impl<'a> Mam<'a> {
         const ALLOC: u32 = 512;
         let cdb_bytes = cdb::read_attribute(0x00, self.partition, attr_id, ALLOC);
         let mut buf = [0u8; ALLOC as usize];
-        let result = retry_unit_attention("READ ATTRIBUTE", || self.device.execute_read(&cdb_bytes, &mut buf, 30_000))?;
+        let result = retry_unit_attention("READ ATTRIBUTE", || {
+            self.device.execute_read(&cdb_bytes, &mut buf, 30_000)
+        })?;
 
         if result.transferred < 4 {
             return Ok(None);
@@ -275,7 +277,9 @@ impl<'a> Mam<'a> {
         buf[9..9 + attr.value.len()].copy_from_slice(&attr.value);
 
         let cdb_bytes = cdb::write_attribute(true, self.partition, param_len as u32);
-        retry_unit_attention("WRITE ATTRIBUTE", || self.device.execute_write(&cdb_bytes, &buf, 30_000))?;
+        retry_unit_attention("WRITE ATTRIBUTE", || {
+            self.device.execute_write(&cdb_bytes, &buf, 30_000)
+        })?;
         debug!("MAM write attr {:#06x} {} bytes", attr.id, attr.value.len());
         Ok(())
     }
@@ -412,7 +416,10 @@ mod tests {
             .collect();
         let v = VolumeCoherencyInfo::decode(&raw).unwrap();
         assert_eq!((v.generation, v.block), (3, 0x23));
-        assert_eq!(v.volume_uuid.to_string(), "c0cb5ba8-7ee4-46fe-88d1-7a66240b0655");
+        assert_eq!(
+            v.volume_uuid.to_string(),
+            "c0cb5ba8-7ee4-46fe-88d1-7a66240b0655"
+        );
         // 驱动器的 MAM 0x0009 是 4 字节
         assert!(vcr_matches(&v.vcr, &[0, 0, 0, 0x33]));
         assert!(!vcr_matches(&v.vcr, &[0, 0, 0, 0x34]));
@@ -438,7 +445,10 @@ mod tests {
         assert_eq!(&b[b.len() - 2..], &[0x00, 0x01]);
         let back = VolumeCoherencyInfo::decode(&b).unwrap();
         assert!(vcr_matches(&back.vcr, &v.vcr));
-        assert_eq!((back.generation, back.block, back.volume_uuid), (42, 1632, uuid));
+        assert_eq!(
+            (back.generation, back.block, back.volume_uuid),
+            (42, 1632, uuid)
+        );
         assert!(VolumeCoherencyInfo::decode(&b[..20]).is_err());
         assert!(
             !vcr_is_valid(&[0, 0, 0, 0])

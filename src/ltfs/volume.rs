@@ -27,7 +27,8 @@ use crate::error::{Result, TapeError};
 use crate::tape::commands::TapeDrive;
 
 use super::index::{
-    DirectoryNode, Extent, FileNode, IndexLocation, LtfsIndex, NodeMeta, Xattr, XATTR_MD5, XATTR_SHA256,
+    DirectoryNode, Extent, FileNode, IndexLocation, LtfsIndex, NodeMeta, XATTR_MD5, XATTR_SHA256,
+    Xattr,
 };
 use super::label::{LtfsLabel, PART_INDEX};
 use super::mam::{Mam, VolumeCoherencyInfo};
@@ -60,13 +61,19 @@ impl FileMetadata {
 
 impl From<&DirectoryNode> for FileMetadata {
     fn from(node: &DirectoryNode) -> Self {
-        Self { meta: node.meta.clone(), xattrs: node.xattrs.clone() }
+        Self {
+            meta: node.meta.clone(),
+            xattrs: node.xattrs.clone(),
+        }
     }
 }
 
 impl From<&FileNode> for FileMetadata {
     fn from(node: &FileNode) -> Self {
-        Self { meta: node.meta.clone(), xattrs: node.xattrs.clone() }
+        Self {
+            meta: node.meta.clone(),
+            xattrs: node.xattrs.clone(),
+        }
     }
 }
 
@@ -159,10 +166,27 @@ impl<'a> LtfsVolume<'a> {
         // 3. P1 append point = 恢复报告中的 EOD。
         let p1_write_head = report.dp.eod.max(P1_DATA_START);
         let dp = report.dp.last_index.as_ref();
-        let last_dp_index = dp.and_then(|c| if c.index.incremental { c.index.previous_location } else { Some(c.index.self_location) });
-        let last_dp_incremental = dp.filter(|c| c.index.incremental).map(|c| c.index.self_location);
-        let last_ip = report.ip.last_index.as_ref().map(|c| (c.index.generation, c.start_block));
-        for note in report.notes.iter().chain(&report.dp.notes).chain(&report.ip.notes) {
+        let last_dp_index = dp.and_then(|c| {
+            if c.index.incremental {
+                c.index.previous_location
+            } else {
+                Some(c.index.self_location)
+            }
+        });
+        let last_dp_incremental = dp
+            .filter(|c| c.index.incremental)
+            .map(|c| c.index.self_location);
+        let last_ip = report
+            .ip
+            .last_index
+            .as_ref()
+            .map(|c| (c.index.generation, c.start_block));
+        for note in report
+            .notes
+            .iter()
+            .chain(&report.dp.notes)
+            .chain(&report.ip.notes)
+        {
             debug!("恢复备注: {}", note);
         }
         let lossy = !index.unknown_elements.is_empty();
@@ -253,9 +277,18 @@ impl<'a> LtfsVolume<'a> {
             debug!("VCR 无效（全 0/全 1），跳过 VCI 更新");
             return Ok(());
         }
-        let ip = if self.working.incremental { self.last_ip } else { Some((self.working.generation, P0_INDEX_BLOCK)) };
-        for (partition, entry) in [(0u8, ip), (1u8, Some((self.working.generation, p1_index_block)))] {
-            let Some((generation, block)) = entry else { continue; };
+        let ip = if self.working.incremental {
+            self.last_ip
+        } else {
+            Some((self.working.generation, P0_INDEX_BLOCK))
+        };
+        for (partition, entry) in [
+            (0u8, ip),
+            (1u8, Some((self.working.generation, p1_index_block))),
+        ] {
+            let Some((generation, block)) = entry else {
+                continue;
+            };
             let vci = VolumeCoherencyInfo {
                 vcr: vcr.to_vec(),
                 generation,
@@ -319,12 +352,16 @@ impl<'a> LtfsVolume<'a> {
             .ok_or_else(|| TapeError::Ltfs(format!("文件不存在: {}", path)))?;
         if let Some(target) = &file.symlink {
             // IBM EE 的布局：用户路径是符号链接，数据在 .LTFSEE_DATA/<id>。
-            let resolved = resolve_symlink(path, target)
-                .ok_or_else(|| TapeError::Ltfs(format!("符号链接越出卷根: {} -> {}", path, target)))?;
+            let resolved = resolve_symlink(path, target).ok_or_else(|| {
+                TapeError::Ltfs(format!("符号链接越出卷根: {} -> {}", path, target))
+            })?;
             let hit = self.index.find_file(&resolved);
             return match hit {
                 Some(f) if f.symlink.is_none() => self.read_file_to_writer(&resolved, w),
-                _ => Err(TapeError::Ltfs(format!("符号链接目标不可读: {} -> {}", path, target))),
+                _ => Err(TapeError::Ltfs(format!(
+                    "符号链接目标不可读: {} -> {}",
+                    path, target
+                ))),
             };
         }
         if file.extents.is_empty() {
@@ -347,7 +384,10 @@ impl<'a> LtfsVolume<'a> {
             while remaining > 0 {
                 let n = self.drive.read_block(&mut buf)?;
                 if n == 0 {
-                    return Err(TapeError::Ltfs(format!("文件 {} 的 extent 提前结束，缺少 {} 字节", path, remaining)));
+                    return Err(TapeError::Ltfs(format!(
+                        "文件 {} 的 extent 提前结束，缺少 {} 字节",
+                        path, remaining
+                    )));
                 }
                 let slice_start = if first_block {
                     ext.byte_offset as usize
@@ -365,7 +405,10 @@ impl<'a> LtfsVolume<'a> {
             }
         }
         if total != file.length {
-            return Err(TapeError::Ltfs(format!("文件 {} 长度不符: 索引 {}，读取 {}", path, file.length, total)));
+            return Err(TapeError::Ltfs(format!(
+                "文件 {} 长度不符: 索引 {}，读取 {}",
+                path, file.length, total
+            )));
         }
         w.flush()?;
         info!("读取 {}: {} 字节", path, total);
@@ -398,14 +441,23 @@ impl<'a> LtfsVolume<'a> {
     /// 其他只读原因（回指链断、两分区冲突、索引含未知元素、卷已锁、视图含 IP 数据、
     /// T3 假索引、T4 未知尾部）一律拒绝，仍由人工处理。
     pub fn close_tail(&mut self, policy: TailPolicy) -> Result<CloseTailReport> {
-        let key = self.reservation_guard.ok_or_else(|| TapeError::RecoveryRestricted {
-            reason: "收尾要求先完成设备层隔离并设置预留自检键".to_string(),
-        })?;
+        let key = self
+            .reservation_guard
+            .ok_or_else(|| TapeError::RecoveryRestricted {
+                reason: "收尾要求先完成设备层隔离并设置预留自检键".to_string(),
+            })?;
         crate::scsi::reservation::verify_holder(self.device, key)?;
 
-        let refuse = |why: String| Err(TapeError::RecoveryRestricted { reason: format!("不能自动收尾: {}", why) });
+        let refuse = |why: String| {
+            Err(TapeError::RecoveryRestricted {
+                reason: format!("不能自动收尾: {}", why),
+            })
+        };
         let tail = self.recovery.dp.tail;
-        if !matches!(tail, recovery::TailKind::UnindexedData | recovery::TailKind::TruncatedIndex) {
+        if !matches!(
+            tail,
+            recovery::TailKind::UnindexedData | recovery::TailKind::TruncatedIndex
+        ) {
             return refuse(format!("DP 尾部为 {:?}", tail));
         }
         if let Some(r) = self.recovery.restricted_reason() {
@@ -423,12 +475,18 @@ impl<'a> LtfsVolume<'a> {
         if !self.index.unknown_elements.is_empty() {
             return refuse("索引含不会回写的元素".to_string());
         }
-        if self.index.volume_lock_state.as_deref().is_some_and(|v| v != "unlocked") {
+        if self
+            .index
+            .volume_lock_state
+            .as_deref()
+            .is_some_and(|v| v != "unlocked")
+        {
             return refuse("卷已锁定".to_string());
         }
         let ip_char = self.label.index_partition;
         let mut ip_data = false;
-        self.index.walk_files(|_, f| ip_data |= f.extents.iter().any(|e| e.partition == ip_char));
+        self.index
+            .walk_files(|_, f| ip_data |= f.extents.iter().any(|e| e.partition == ip_char));
         if ip_data {
             return refuse("视图含位于 IP 的文件数据".to_string());
         }
@@ -439,7 +497,10 @@ impl<'a> LtfsVolume<'a> {
         self.drive.locate(1, eod, true)?;
         let pos = self.drive.read_position()?;
         if pos.partition != 1 || pos.block_number != eod {
-            return refuse(format!("LOCATE {} 后位置为 {}@{}", eod, pos.partition, pos.block_number));
+            return refuse(format!(
+                "LOCATE {} 后位置为 {}@{}",
+                eod, pos.partition, pos.block_number
+            ));
         }
 
         let mut report = CloseTailReport {
@@ -453,7 +514,12 @@ impl<'a> LtfsVolume<'a> {
             report.salvaged = self.salvage_tail(first, eod)?;
         }
         // 被放弃的块范围记在卷根，事后可查
-        let range = format!("{}:{}-{}", self.label.data_partition, first, eod.saturating_sub(1));
+        let range = format!(
+            "{}:{}-{}",
+            self.label.data_partition,
+            first,
+            eod.saturating_sub(1)
+        );
         let prev = self
             .working
             .root
@@ -462,14 +528,20 @@ impl<'a> LtfsVolume<'a> {
             .find(|x| x.key == XATTR_ABANDONED)
             .map(|x| format!("{};", x.value))
             .unwrap_or_default();
-        self.working.root.xattrs.retain(|x| x.key != XATTR_ABANDONED);
+        self.working
+            .root
+            .xattrs
+            .retain(|x| x.key != XATTR_ABANDONED);
         self.working.root.xattrs.push(super::index::Xattr {
             key: XATTR_ABANDONED.to_string(),
             value: format!("{prev}{range}"),
             base64: false,
         });
 
-        info!("收尾: DP 尾部 {:?}，放弃块 {}..{}，在 EOD {} 追加索引", tail, first, eod, eod);
+        info!(
+            "收尾: DP 尾部 {:?}，放弃块 {}..{}，在 EOD {} 追加索引",
+            tail, first, eod, eod
+        );
         self.p1_write_head = eod;
         self.writable = true;
         self.restricted_reason = None;
@@ -493,7 +565,9 @@ impl<'a> LtfsVolume<'a> {
             let n = match self.drive.read_block(&mut buf) {
                 Ok(0) => break, // 文件标记：后面是写了一半的索引
                 Ok(n) => n as u64,
-                Err(TapeError::ScsiCommand { sense_key: 0x08, .. }) => break,
+                Err(TapeError::ScsiCommand {
+                    sense_key: 0x08, ..
+                }) => break,
                 Err(e) => return Err(e),
             };
             match open.as_mut() {
@@ -549,14 +623,23 @@ impl<'a> LtfsVolume<'a> {
 
     /// 卷根目录上的扩展属性（已提交视图）。
     pub fn root_xattr(&self, key: &str) -> Option<&str> {
-        self.index.root.xattrs.iter().find(|x| x.key == key).map(|x| x.value.as_str())
+        self.index
+            .root
+            .xattrs
+            .iter()
+            .find(|x| x.key == key)
+            .map(|x| x.value.as_str())
     }
 
     /// 设置卷根目录的文本型扩展属性。下次提交时写入索引。
     pub fn set_root_xattr(&mut self, key: &str, value: &str) -> Result<()> {
         self.ensure_writable()?;
         self.working.root.xattrs.retain(|x| x.key != key);
-        self.working.root.xattrs.push(super::index::Xattr { key: key.to_string(), value: value.to_string(), base64: false });
+        self.working.root.xattrs.push(super::index::Xattr {
+            key: key.to_string(),
+            value: value.to_string(),
+            base64: false,
+        });
         self.dirty = true;
         Ok(())
     }
@@ -644,7 +727,10 @@ impl<'a> LtfsVolume<'a> {
 
     /// 修改只进入工作索引；commit_incremental 将其持久化为标准 DP 增量。
     pub fn create_directory(&mut self, path: &str) -> Result<()> {
-        self.ensure_writable()?; self.working.create_directory(path)?; self.dirty = true; Ok(())
+        self.ensure_writable()?;
+        self.working.create_directory(path)?;
+        self.dirty = true;
+        Ok(())
     }
 
     /// 守护进程已按池内最新视图验证路径可替换后，丢弃本带的旧命名空间副本。
@@ -705,7 +791,10 @@ impl<'a> LtfsVolume<'a> {
     }
 
     pub fn remove_directory(&mut self, path: &str) -> Result<()> {
-        self.ensure_writable()?; self.working.remove_directory(path)?; self.dirty = true; Ok(())
+        self.ensure_writable()?;
+        self.working.remove_directory(path)?;
+        self.dirty = true;
+        Ok(())
     }
 
     pub(crate) fn set_catalog_version(&mut self, path: &str, version: &str) -> Result<()> {
@@ -716,19 +805,38 @@ impl<'a> LtfsVolume<'a> {
     }
 
     pub fn rename_path(&mut self, from: &str, to: &str) -> Result<()> {
-        self.ensure_writable()?; self.working.rename_path(from, to)?; self.dirty = true; Ok(())
+        self.ensure_writable()?;
+        self.working.rename_path(from, to)?;
+        self.dirty = true;
+        Ok(())
     }
 
-    pub fn set_node_xattr(&mut self, path: &str, attr: Xattr, create_only: bool, replace_only: bool) -> Result<()> {
-        self.ensure_writable()?; self.working.set_node_xattr(path, attr, create_only, replace_only)?; self.dirty = true; Ok(())
+    pub fn set_node_xattr(
+        &mut self,
+        path: &str,
+        attr: Xattr,
+        create_only: bool,
+        replace_only: bool,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        self.working
+            .set_node_xattr(path, attr, create_only, replace_only)?;
+        self.dirty = true;
+        Ok(())
     }
 
     pub fn remove_node_xattr(&mut self, path: &str, key: &str) -> Result<()> {
-        self.ensure_writable()?; self.working.remove_node_xattr(path, key)?; self.dirty = true; Ok(())
+        self.ensure_writable()?;
+        self.working.remove_node_xattr(path, key)?;
+        self.dirty = true;
+        Ok(())
     }
 
     pub fn set_node_readonly(&mut self, path: &str, readonly: bool) -> Result<()> {
-        self.ensure_writable()?; self.working.set_node_readonly(path, readonly)?; self.dirty = true; Ok(())
+        self.ensure_writable()?;
+        self.working.set_node_readonly(path, readonly)?;
+        self.dirty = true;
+        Ok(())
     }
 
     /// 读出文件并与索引里的哈希比对。优先 sha256sum，其次 md5sum。
@@ -742,13 +850,24 @@ impl<'a> LtfsVolume<'a> {
             (None, Some(v)) => ("md5sum", v.to_ascii_lowercase()),
             (None, None) => return Ok(HashVerdict::NoHash),
         };
-        let mut sink = HashSink { md5: Md5::new(), sha256: Sha256::new() };
+        let mut sink = HashSink {
+            md5: Md5::new(),
+            sha256: Sha256::new(),
+        };
         self.read_file_to_writer(path, &mut sink)?;
-        let actual = if algo == "sha256sum" { hex(&sink.sha256.finalize()) } else { hex(&sink.md5.finalize()) };
+        let actual = if algo == "sha256sum" {
+            hex(&sink.sha256.finalize())
+        } else {
+            hex(&sink.md5.finalize())
+        };
         Ok(if actual == expected {
             HashVerdict::Match { algo }
         } else {
-            HashVerdict::Mismatch { algo, expected, actual }
+            HashVerdict::Mismatch {
+                algo,
+                expected,
+                actual,
+            }
         })
     }
 
@@ -763,11 +882,23 @@ impl<'a> LtfsVolume<'a> {
         self.append_file_inner(path, r, xattrs, None)
     }
 
-    pub(crate) fn append_relocated_file<R: Read>(&mut self, path: &str, r: &mut R, version: &str, metadata: &FileMetadata) -> Result<u64> {
+    pub(crate) fn append_relocated_file<R: Read>(
+        &mut self,
+        path: &str,
+        r: &mut R,
+        version: &str,
+        metadata: &FileMetadata,
+    ) -> Result<u64> {
         self.append_file_inner(path, r, &[(XATTR_VERSION, version)], Some(metadata))
     }
 
-    fn append_file_inner<R: Read>(&mut self, path: &str, r: &mut R, xattrs: &[(&str, &str)], preserved: Option<&FileMetadata>) -> Result<u64> {
+    fn append_file_inner<R: Read>(
+        &mut self,
+        path: &str,
+        r: &mut R,
+        xattrs: &[(&str, &str)],
+        preserved: Option<&FileMetadata>,
+    ) -> Result<u64> {
         self.ensure_writable()?;
         if path.is_empty() || path.ends_with('/') {
             return Err(TapeError::Ltfs(format!("非法文件路径: {}", path)));
@@ -826,15 +957,21 @@ impl<'a> LtfsVolume<'a> {
         self.working.highest_file_uid += 1;
         let uid = self.working.highest_file_uid;
         let now = crate::ltfs::label::ltfs_time_now();
-        let meta = preserved.map_or_else(|| NodeMeta {
-            readonly: false,
-            creation_time: now.clone(),
-            change_time: now.clone(),
-            modify_time: now.clone(),
-            access_time: now.clone(),
-            backup_time: now,
-            file_uid: uid,
-        }, |m| NodeMeta { file_uid: uid, ..m.meta.clone() });
+        let meta = preserved.map_or_else(
+            || NodeMeta {
+                readonly: false,
+                creation_time: now.clone(),
+                change_time: now.clone(),
+                modify_time: now.clone(),
+                access_time: now.clone(),
+                backup_time: now,
+                file_uid: uid,
+            },
+            |m| NodeMeta {
+                file_uid: uid,
+                ..m.meta.clone()
+            },
+        );
         let extents = if byte_count > 0 {
             vec![Extent {
                 partition: self.label.data_partition,
@@ -868,7 +1005,8 @@ impl<'a> LtfsVolume<'a> {
         }
         // 内容哈希记在扩展属性里（附录 F.3）。放在调用方属性之后，
         // 保证哈希总是按实际写入内容计算；没算的那种也不接受调用方给的值。
-        node.xattrs.retain(|x| x.key != XATTR_MD5 && x.key != XATTR_SHA256);
+        node.xattrs
+            .retain(|x| x.key != XATTR_MD5 && x.key != XATTR_SHA256);
         if let Some(h) = md5 {
             node.set_xattr(XATTR_MD5, &hex(&h.finalize()));
         }
@@ -891,14 +1029,18 @@ impl<'a> LtfsVolume<'a> {
     /// 3. 更新 MAM VCI
     pub fn commit(&mut self) -> Result<()> {
         // 增量之后即便没有新变化，也必须能显式生成完整检查点。
-        if self.index.incremental { self.dirty = true; }
+        if self.index.incremental {
+            self.dirty = true;
+        }
         self.commit_mode(false)
     }
 
     /// LTFS 2.5 提交：通常只追加 DP 增量；连续 5 份（或较小恢复预算）后写 DP/IP Full。
     /// 清洁卸载也会写 Full 检查点，计数跨重新挂载保留。
     pub fn commit_incremental(&mut self) -> Result<()> {
-        if !self.dirty { return Ok(()); }
+        if !self.dirty {
+            return Ok(());
+        }
         if self.incremental_depth >= self.incremental_limit
             || self.index.self_location.partition != self.label.data_partition
         {
@@ -929,7 +1071,10 @@ impl<'a> LtfsVolume<'a> {
     /// `locate` / `opening_fm`（尚未写索引，数据仍在但本卷冻结）、
     /// `index_records` / `closing_fm`（索引残缺，结果未定）、
     /// `index_partition` / `barrier` / `vci`（DP 索引可能已完整，结果未定）。
-    fn commit_inner(&mut self, incremental: bool) -> std::result::Result<(), (&'static str, TapeError)> {
+    fn commit_inner(
+        &mut self,
+        incremental: bool,
+    ) -> std::result::Result<(), (&'static str, TapeError)> {
         // 回指指向 DP 上的前一份 Full（LTFS 2.5.1 §5.4.3）；旧版本曾误指向 IP。
         // 动带之前先自检；失败时介质未被触碰，但为了语义统一仍按提交失败冻结。
         if let Some(key) = self.reservation_guard {
@@ -942,7 +1087,9 @@ impl<'a> LtfsVolume<'a> {
         self.working.previous_location = prev;
         self.working.previous_incremental_location = self.last_dp_incremental;
         self.working.incremental = incremental;
-        if incremental || self.last_dp_incremental.is_some() { self.working.version = "2.5.0".into(); }
+        if incremental || self.last_dp_incremental.is_some() {
+            self.working.version = "2.5.0".into();
+        }
 
         // —— S3：DP 索引构造 [FM][records][FM] —— //
         self.drive
@@ -956,7 +1103,13 @@ impl<'a> LtfsVolume<'a> {
             partition: self.label.data_partition,
             start_block: p1_index_block,
         };
-        let encoded = if incremental { self.working.incremental_since(&self.index).map_err(|e| ("encode", e))? } else { self.working.clone() };
+        let encoded = if incremental {
+            self.working
+                .incremental_since(&self.index)
+                .map_err(|e| ("encode", e))?
+        } else {
+            self.working.clone()
+        };
         let xml = encoded.to_xml().map_err(|e| ("encode", e))?;
         let blocks_written = write_bytes_in_blocks(&self.drive, &xml, self.block_size as usize)
             .map_err(|e| ("index_records", e))?;
@@ -967,31 +1120,30 @@ impl<'a> LtfsVolume<'a> {
 
         // —— IP：同一份 XML，自指针指向 P0 —— //
         if !incremental {
-        let mut p0_index = self.working.clone();
-        p0_index.self_location = IndexLocation {
-            partition: self.label.index_partition,
-            start_block: P0_INDEX_BLOCK,
-        };
-        // 一致卷的定义：IP 末索引回指 DP 上最后一个完整索引，也就是刚写好的同代那份。
-        // 指向上一代的话 IBM LTFS 会判为不一致，挂载时自行补写 IP。
-        p0_index.previous_incremental_location = None;
-        p0_index.previous_location = Some(IndexLocation {
-            partition: self.label.data_partition,
-            start_block: p1_index_block,
-        });
-        let p0_xml = p0_index.to_xml().map_err(|e| ("encode", e))?;
-        self.drive
-            .locate(0, P1_DATA_START, true)
-            .map_err(|e| ("index_partition", e))?;
-        self.drive
-            .write_filemark(1)
-            .map_err(|e| ("index_partition", e))?;
-        write_bytes_in_blocks(&self.drive, &p0_xml, self.block_size as usize)
-            .map_err(|e| ("index_partition", e))?;
-        self.drive
-            .write_filemark(1)
-            .map_err(|e| ("index_partition", e))?;
-
+            let mut p0_index = self.working.clone();
+            p0_index.self_location = IndexLocation {
+                partition: self.label.index_partition,
+                start_block: P0_INDEX_BLOCK,
+            };
+            // 一致卷的定义：IP 末索引回指 DP 上最后一个完整索引，也就是刚写好的同代那份。
+            // 指向上一代的话 IBM LTFS 会判为不一致，挂载时自行补写 IP。
+            p0_index.previous_incremental_location = None;
+            p0_index.previous_location = Some(IndexLocation {
+                partition: self.label.data_partition,
+                start_block: p1_index_block,
+            });
+            let p0_xml = p0_index.to_xml().map_err(|e| ("encode", e))?;
+            self.drive
+                .locate(0, P1_DATA_START, true)
+                .map_err(|e| ("index_partition", e))?;
+            self.drive
+                .write_filemark(1)
+                .map_err(|e| ("index_partition", e))?;
+            write_bytes_in_blocks(&self.drive, &p0_xml, self.block_size as usize)
+                .map_err(|e| ("index_partition", e))?;
+            self.drive
+                .write_filemark(1)
+                .map_err(|e| ("index_partition", e))?;
         }
 
         // —— 屏障前自检：设备报告的预留持有者必须仍是本轮的键 —— //
@@ -1009,8 +1161,7 @@ impl<'a> LtfsVolume<'a> {
         if incremental {
             self.last_dp_incremental = Some(self.working.self_location);
             self.incremental_depth += 1;
-        }
-        else {
+        } else {
             self.last_dp_index = Some(self.working.self_location);
             self.last_dp_incremental = None;
             self.incremental_depth = 0;
@@ -1061,7 +1212,10 @@ pub struct HashPolicy {
 
 impl Default for HashPolicy {
     fn default() -> Self {
-        Self { md5: false, sha256: true }
+        Self {
+            md5: false,
+            sha256: true,
+        }
     }
 }
 
@@ -1082,11 +1236,19 @@ pub fn probe_format(device: &dyn crate::scsi::transport::TapeTransport) -> Resul
     drive.locate(0, VOL1_BLOCK, true)?;
     let mut buf = vec![0u8; DEFAULT_BLOCK_SIZE as usize];
     match drive.read_block(&mut buf) {
-        Err(TapeError::ScsiCommand { sense_key: 0x08, .. }) => Ok(FormatProbe::Blank),
+        Err(TapeError::ScsiCommand {
+            sense_key: 0x08, ..
+        }) => Ok(FormatProbe::Blank),
         Err(e) => Err(e),
         Ok(0) => Ok(FormatProbe::Foreign("带首是文件标记".to_string())),
-        Ok(n) if n >= 28 && &buf[0..4] == b"VOL1" && &buf[24..28] == b"LTFS" => Ok(FormatProbe::Ltfs),
-        Ok(n) => Ok(FormatProbe::Foreign(format!("带首 {} 字节，开头 {:02x?}", n, &buf[..n.min(8)]))),
+        Ok(n) if n >= 28 && &buf[0..4] == b"VOL1" && &buf[24..28] == b"LTFS" => {
+            Ok(FormatProbe::Ltfs)
+        }
+        Ok(n) => Ok(FormatProbe::Foreign(format!(
+            "带首 {} 字节，开头 {:02x?}",
+            n,
+            &buf[..n.min(8)]
+        ))),
     }
 }
 
@@ -1132,7 +1294,9 @@ pub fn tombstone_path(path: &str) -> String {
 
 /// 卷内路径（不以 `/` 开头）是不是墓碑目录下的文件。
 pub fn is_tombstone_path(path: &str) -> bool {
-    path.trim_start_matches('/').strip_prefix(TOMBSTONE_DIR).is_some_and(|rest| rest.starts_with('/'))
+    path.trim_start_matches('/')
+        .strip_prefix(TOMBSTONE_DIR)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// 与 IBM LTFS 的 lost+found 目录同名。
@@ -1153,8 +1317,14 @@ pub struct CloseTailReport {
 /// `verify_file` 的结论。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HashVerdict {
-    Match { algo: &'static str },
-    Mismatch { algo: &'static str, expected: String, actual: String },
+    Match {
+        algo: &'static str,
+    },
+    Mismatch {
+        algo: &'static str,
+        expected: String,
+        actual: String,
+    },
     /// 索引里没有哈希属性（例如符号链接，或不写哈希的实现写的文件）。
     NoHash,
 }
@@ -1270,27 +1440,54 @@ mod relocation_tests {
     #[test]
     fn relocation_keeps_logical_metadata_but_rebuilds_physical_identity_and_hashes() {
         let lib = SimLibrary::new(1, 2, 1);
-        lib.insert_cartridge(SimCartridge::blank("META01L8", 64 << 20), 0).unwrap();
+        lib.insert_cartridge(SimCartridge::blank("META01L8", 64 << 20), 0)
+            .unwrap();
         lib.load_into_drive("META01L8", 0).unwrap();
         let dev = lib.drive(0);
         mkltfs(&dev, &MkltfsOptions::default()).unwrap();
         let when = "2020-01-02T03:04:05.123456789Z".to_string();
         let metadata = FileMetadata {
             meta: NodeMeta {
-                readonly: true, file_uid: 9000, creation_time: when.clone(), change_time: when.clone(),
-                modify_time: when.clone(), access_time: when.clone(), backup_time: when.clone(),
+                readonly: true,
+                file_uid: 9000,
+                creation_time: when.clone(),
+                change_time: when.clone(),
+                modify_time: when.clone(),
+                access_time: when.clone(),
+                backup_time: when.clone(),
             },
             xattrs: vec![
-                Xattr { key: "note".into(), value: "原始文本".into(), base64: false },
-                Xattr { key: "binary".into(), value: "AAEC/w==".into(), base64: true },
-                Xattr { key: XATTR_VERSION.into(), value: "1.1".into(), base64: false },
-                Xattr { key: XATTR_MD5.into(), value: "过期摘要".into(), base64: false },
-                Xattr { key: XATTR_SHA256.into(), value: "过期摘要".into(), base64: false },
+                Xattr {
+                    key: "note".into(),
+                    value: "原始文本".into(),
+                    base64: false,
+                },
+                Xattr {
+                    key: "binary".into(),
+                    value: "AAEC/w==".into(),
+                    base64: true,
+                },
+                Xattr {
+                    key: XATTR_VERSION.into(),
+                    value: "1.1".into(),
+                    base64: false,
+                },
+                Xattr {
+                    key: XATTR_MD5.into(),
+                    value: "过期摘要".into(),
+                    base64: false,
+                },
+                Xattr {
+                    key: XATTR_SHA256.into(),
+                    value: "过期摘要".into(),
+                    base64: false,
+                },
             ],
         };
         let mut vol = LtfsVolume::mount(&dev).unwrap();
         for (path, data) in [("/data", &b"content"[..]), ("/empty", &b""[..])] {
-            vol.append_relocated_file(path, &mut std::io::Cursor::new(data), "9.7", &metadata).unwrap();
+            vol.append_relocated_file(path, &mut std::io::Cursor::new(data), "9.7", &metadata)
+                .unwrap();
         }
         vol.commit().unwrap();
         let vol = LtfsVolume::mount(&dev).unwrap();
@@ -1307,9 +1504,18 @@ mod relocation_tests {
             assert_eq!(node.meta.backup_time, when);
             assert_eq!(node.xattr(XATTR_VERSION), Some("9.7"));
             assert_eq!(node.xattr("note"), Some("原始文本"));
-            assert_eq!(node.xattrs.iter().find(|x| x.key == "binary"), Some(&metadata.xattrs[1]));
-            assert_eq!(node.xattr(XATTR_MD5), Some(hex(&Md5::digest(data)).as_str()));
-            assert_eq!(node.xattr(XATTR_SHA256), Some(hex(&Sha256::digest(data)).as_str()));
+            assert_eq!(
+                node.xattrs.iter().find(|x| x.key == "binary"),
+                Some(&metadata.xattrs[1])
+            );
+            assert_eq!(
+                node.xattr(XATTR_MD5),
+                Some(hex(&Md5::digest(data)).as_str())
+            );
+            assert_eq!(
+                node.xattr(XATTR_SHA256),
+                Some(hex(&Sha256::digest(data)).as_str())
+            );
             let mut read = Vec::new();
             vol.read_file_to_writer(path, &mut read).unwrap();
             assert_eq!(read, data);

@@ -23,7 +23,6 @@ impl ElementType {
             _ => None,
         }
     }
-
 }
 
 /// Element 地址映射（通过 MODE SENSE page 0x1D 获取）
@@ -55,4 +54,3 @@ pub struct ElementStatus {
     /// DTE 元素返回的 device identifier（DVCID 位启用时），通常是驱动器序列号。
     pub drive_id: Option<String>,
 }
-

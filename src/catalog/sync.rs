@@ -81,7 +81,11 @@ pub fn sync_from_volume(
     }
 
     let (cap_total, cap_remaining, cap_sync) = match capacity {
-        Some(c) => (Some(c.total as i64), Some(c.remaining as i64), Some(now.clone())),
+        Some(c) => (
+            Some(c.total as i64),
+            Some(c.remaining as i64),
+            Some(now.clone()),
+        ),
         None => (None, None, None),
     };
 

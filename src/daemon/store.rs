@@ -34,7 +34,10 @@ pub struct SnapshotPolicy {
 impl Default for SnapshotPolicy {
     fn default() -> Self {
         // 目录条目每片约 1 MiB，所以字节数是更有效的那个闸门：256 MiB 约等于 256 片。
-        Self { entries: 2_000, bytes: 256 << 20 }
+        Self {
+            entries: 2_000,
+            bytes: 256 << 20,
+        }
     }
 }
 
@@ -50,7 +53,11 @@ pub struct ControlStorage {
 
 impl ControlStorage {
     fn new(mem: MemStorage) -> Self {
-        Self { mem, latest: Arc::new(Mutex::new(None)), wanted: Arc::new(AtomicU64::new(0)) }
+        Self {
+            mem,
+            latest: Arc::new(Mutex::new(None)),
+            wanted: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     fn publish(&self, snap: Snapshot) {
@@ -97,8 +104,11 @@ impl Storage for ControlStorage {
             Some(s) if s.get_metadata().index >= request_index => Ok(s.clone()),
             _ => {
                 // 记下请求，Raft 循环下一圈现做一份；这一次先让 raft-rs 稍后重试。
-                self.wanted.fetch_max(request_index.max(1), Ordering::SeqCst);
-                Err(raft::Error::Store(StorageError::SnapshotTemporarilyUnavailable))
+                self.wanted
+                    .fetch_max(request_index.max(1), Ordering::SeqCst);
+                Err(raft::Error::Store(
+                    StorageError::SnapshotTemporarilyUnavailable,
+                ))
             }
         }
     }
@@ -142,8 +152,10 @@ impl RaftStore {
 
         // 顺序要紧：先装快照（它会清空内存里的日志并把提交位置推到快照点），
         // 再装快照之后的日志，最后用库里的 HardState 覆盖任期、投票和提交位置。
-        let snap_bytes: Option<Vec<u8>> =
-            db.query_row("SELECT data FROM snapshot WHERE id = 1", [], |r| r.get(0)).optional().map_err(db_err)?;
+        let snap_bytes: Option<Vec<u8>> = db
+            .query_row("SELECT data FROM snapshot WHERE id = 1", [], |r| r.get(0))
+            .optional()
+            .map_err(db_err)?;
         let mut snapshot_index = 0;
         let mut loaded = None;
         if let Some(bytes) = snap_bytes {
@@ -161,8 +173,12 @@ impl RaftStore {
 
         let mut entries = Vec::new();
         {
-            let mut stmt = db.prepare("SELECT data FROM entries WHERE idx > ?1 ORDER BY idx").map_err(db_err)?;
-            let rows = stmt.query_map(params![snapshot_index as i64], |r| r.get::<_, Vec<u8>>(0)).map_err(db_err)?;
+            let mut stmt = db
+                .prepare("SELECT data FROM entries WHERE idx > ?1 ORDER BY idx")
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map(params![snapshot_index as i64], |r| r.get::<_, Vec<u8>>(0))
+                .map_err(db_err)?;
             for row in rows {
                 let bytes = row.map_err(db_err)?;
                 let e = Entry::parse_from_bytes(&bytes)
@@ -170,12 +186,15 @@ impl RaftStore {
                 entries.push(e);
             }
         }
-        let hs: Option<Vec<u8>> =
-            db.query_row("SELECT data FROM hardstate WHERE id = 1", [], |r| r.get(0)).optional().map_err(db_err)?;
+        let hs: Option<Vec<u8>> = db
+            .query_row("SELECT data FROM hardstate WHERE id = 1", [], |r| r.get(0))
+            .optional()
+            .map_err(db_err)?;
         {
             let mut w = store.mem.wl();
             if !entries.is_empty() {
-                w.append(&entries).map_err(|e| TapeError::Ltfs(format!("装入日志失败: {}", e)))?;
+                w.append(&entries)
+                    .map_err(|e| TapeError::Ltfs(format!("装入日志失败: {}", e)))?;
             }
             if let Some(bytes) = hs {
                 let hs = HardState::parse_from_bytes(&bytes)
@@ -229,18 +248,28 @@ impl RaftStore {
         }
         let tx = self.db.transaction().map_err(db_err)?;
         let rolled = tx
-            .execute("DELETE FROM entries WHERE idx >= ?1", params![first.index as i64])
+            .execute(
+                "DELETE FROM entries WHERE idx >= ?1",
+                params![first.index as i64],
+            )
             .map_err(db_err)?;
         for e in ents {
             let bytes = e.write_to_bytes().map_err(pb_err)?;
-            tx.execute("INSERT INTO entries (idx, data) VALUES (?1, ?2)", params![e.index as i64, bytes])
-                .map_err(db_err)?;
+            tx.execute(
+                "INSERT INTO entries (idx, data) VALUES (?1, ?2)",
+                params![e.index as i64, bytes],
+            )
+            .map_err(db_err)?;
         }
         tx.commit().map_err(db_err)?;
         if rolled > 0 {
             log::info!("日志回滚：索引 {} 起的 {} 条被覆写", first.index, rolled);
         }
-        self.store.mem.wl().append(ents).map_err(|e| TapeError::Ltfs(format!("追加日志失败: {}", e)))?;
+        self.store
+            .mem
+            .wl()
+            .append(ents)
+            .map_err(|e| TapeError::Ltfs(format!("追加日志失败: {}", e)))?;
         self.since_entries += ents.len() as u64;
         self.since_bytes += ents.iter().map(|e| e.data.len() as u64).sum::<u64>();
         Ok(())
@@ -262,7 +291,10 @@ impl RaftStore {
 
     /// 用当前状态做一份覆盖到 `index` 的快照。`data` 是状态机自己的内容。
     pub fn build_snapshot(&self, index: u64, data: Vec<u8>) -> Result<Snapshot> {
-        let term = self.store.term(index).map_err(|e| TapeError::Ltfs(format!("取索引 {} 的任期失败: {}", index, e)))?;
+        let term = self
+            .store
+            .term(index)
+            .map_err(|e| TapeError::Ltfs(format!("取索引 {} 的任期失败: {}", index, e)))?;
         let mut snap = Snapshot::default();
         snap.set_data(data.into());
         let meta = snap.mut_metadata();
@@ -280,14 +312,19 @@ impl RaftStore {
         }
         let bytes = snap.write_to_bytes().map_err(pb_err)?;
         let tx = self.db.transaction().map_err(db_err)?;
-        tx.execute("DELETE FROM entries WHERE idx < ?1", params![index as i64]).map_err(db_err)?;
+        tx.execute("DELETE FROM entries WHERE idx < ?1", params![index as i64])
+            .map_err(db_err)?;
         tx.execute(
             "INSERT INTO snapshot (id, data) VALUES (1, ?1) ON CONFLICT(id) DO UPDATE SET data = excluded.data",
             params![bytes],
         )
         .map_err(db_err)?;
         tx.commit().map_err(db_err)?;
-        self.store.mem.wl().compact(index).map_err(|e| TapeError::Ltfs(format!("压缩日志失败: {}", e)))?;
+        self.store
+            .mem
+            .wl()
+            .compact(index)
+            .map_err(|e| TapeError::Ltfs(format!("压缩日志失败: {}", e)))?;
         self.finish_snapshot(snap, index);
         Ok(())
     }
@@ -341,11 +378,12 @@ mod tests {
     use super::*;
 
     fn entry(index: u64, term: u64, data: &[u8]) -> Entry {
-        let mut e = Entry::default();
-        e.index = index;
-        e.term = term;
-        e.data = data.to_vec().into();
-        e
+        Entry {
+            index,
+            term,
+            data: data.to_vec().into(),
+            ..Default::default()
+        }
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -363,10 +401,13 @@ mod tests {
         let path = scratch("restart");
         {
             let mut s = RaftStore::open(&path, &[1, 2, 3]).unwrap();
-            s.append(&[entry(1, 1, b"a"), entry(2, 1, b"b"), entry(3, 2, b"c")]).unwrap();
-            let mut hs = HardState::default();
-            hs.term = 2;
-            hs.vote = 3;
+            s.append(&[entry(1, 1, b"a"), entry(2, 1, b"b"), entry(3, 2, b"c")])
+                .unwrap();
+            let hs = HardState {
+                term: 2,
+                vote: 3,
+                ..Default::default()
+            };
             s.set_hardstate(&hs).unwrap();
             s.set_commit(2).unwrap();
             // 日志回滚：从索引 3 起被新任期的条目覆盖
@@ -375,7 +416,14 @@ mod tests {
         let s = RaftStore::open(&path, &[1, 2, 3]).unwrap();
         let st = s.raft_storage();
         let init = st.initial_state().unwrap();
-        assert_eq!((init.hard_state.term, init.hard_state.vote, init.hard_state.commit), (2, 3, 2));
+        assert_eq!(
+            (
+                init.hard_state.term,
+                init.hard_state.vote,
+                init.hard_state.commit
+            ),
+            (2, 3, 2)
+        );
         assert_eq!(init.conf_state.voters, vec![1, 2, 3]);
         assert_eq!(st.last_index().unwrap(), 3);
         assert_eq!(st.term(3).unwrap(), 3);
@@ -392,11 +440,22 @@ mod tests {
             let ents: Vec<Entry> = (1..=10).map(|i| entry(i, 1, b"x")).collect();
             s.append(&ents).unwrap();
             s.set_commit(10).unwrap();
-            assert!(s.due(&SnapshotPolicy { entries: 10, bytes: u64::MAX }));
+            assert!(s.due(&SnapshotPolicy {
+                entries: 10,
+                bytes: u64::MAX
+            }));
             let snap = s.build_snapshot(8, b"control".to_vec()).unwrap();
             s.compact_to(&snap).unwrap();
-            assert!(!s.due(&SnapshotPolicy { entries: 10, bytes: u64::MAX }), "计数在快照后归零");
-            let n: i64 = s.db.query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0)).unwrap();
+            assert!(
+                !s.due(&SnapshotPolicy {
+                    entries: 10,
+                    bytes: u64::MAX
+                }),
+                "计数在快照后归零"
+            );
+            let n: i64 =
+                s.db.query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
+                    .unwrap();
             assert_eq!(n, 3, "只剩索引 8、9、10");
             // 快照点之前的位置不允许被覆写
             assert!(s.append(&[entry(7, 2, b"y")]).is_err());
@@ -430,7 +489,9 @@ mod tests {
         meta.term = 7;
         meta.set_conf_state(ConfState::from((vec![1u64, 2, 3], vec![])));
         s.install_snapshot(&snap).unwrap();
-        let n: i64 = s.db.query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0)).unwrap();
+        let n: i64 =
+            s.db.query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
+                .unwrap();
         assert_eq!(n, 0);
         assert_eq!(s.snapshot_index(), 50);
         let st = s.raft_storage();
