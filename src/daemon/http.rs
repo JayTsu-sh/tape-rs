@@ -539,8 +539,8 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                             .into_iter()
                             .map(|(name, e)| match e {
                                 DirEntry::Dir => json!({"name": name, "type": "dir"}),
-                                DirEntry::File { committed, in_flight } => {
-                                    let mut j = json!({"name": name, "type": "file", "state": in_flight.map(|f| f.0.as_str()).unwrap_or("committed")});
+                                DirEntry::File { committed, in_flight, is_symlink } => {
+                                    let mut j = json!({"name": name, "type": "file", "is_symlink": is_symlink, "state": in_flight.map(|f| f.0.as_str()).unwrap_or("committed")});
                                     if let Some(n) = committed {
                                         j["committed_length"] = json!(n);
                                     }

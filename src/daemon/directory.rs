@@ -524,12 +524,25 @@ impl Directory {
         Ok(out)
     }
 
-    pub(crate) fn list_nodes(&self, pool_uuid: &str) -> Result<Vec<(String, u64, bool)>> {
+    pub(crate) fn list_nodes(
+        &self,
+        pool_uuid: &str,
+    ) -> Result<Vec<(String, super::files::NodeSummary)>> {
         let mut stmt = self.db.prepare("SELECT path, metadata, length FROM files WHERE pool_uuid = ?1 AND deleted = 0 ORDER BY path").map_err(db_err)?;
         let rows = stmt
             .query_map(params![pool_uuid], |r| {
-                let (p, d) = namespace_row(r)?;
-                Ok((p, r.get::<_, i64>(2)? as u64, d))
+                let metadata: serde_json::Value = serde_json::from_str(&r.get::<_, String>(1)?)
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
+                Ok((
+                    r.get(0)?,
+                    super::files::NodeSummary::new(r.get::<_, i64>(2)? as u64, &metadata),
+                ))
             })
             .map_err(db_err)?;
         rows.collect::<std::result::Result<_, _>>().map_err(db_err)
@@ -539,8 +552,8 @@ impl Directory {
         Ok(self
             .list_nodes(pool_uuid)?
             .into_iter()
-            .filter(|(_, _, d)| !d)
-            .map(|(p, n, _)| (p, n))
+            .filter(|(_, n)| !n.is_dir)
+            .map(|(p, n)| (p, n.length))
             .collect())
     }
 

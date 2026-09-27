@@ -342,11 +342,30 @@ pub struct PathState {
     pub in_flight: Option<(InFlight, u64)>,
 }
 
+/// 目录列举所需的已提交类型与长度，不加载完整文件属性。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NodeSummary {
+    pub length: u64,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+}
+
+impl NodeSummary {
+    pub(crate) fn new(length: u64, metadata: &serde_json::Value) -> Self {
+        Self {
+            length,
+            is_dir: is_directory(metadata),
+            is_symlink: metadata["kind"] == "symlink",
+        }
+    }
+}
+
 /// 目录里的一个直接子项。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirEntry {
     /// `committed` 是已提交版本的长度；`in_flight` 同 `PathState`
     File {
+        is_symlink: bool,
         committed: Option<u64>,
         in_flight: Option<(InFlight, u64)>,
     },
@@ -1705,12 +1724,12 @@ impl FileService {
         Ok(self
             .list_nodes()?
             .into_iter()
-            .filter(|(_, (_, d))| !d)
-            .map(|(p, (n, _))| (p, n))
+            .filter(|(_, n)| !n.is_dir)
+            .map(|(p, n)| (p, n.length))
             .collect())
     }
 
-    fn list_nodes(&self) -> Result<BTreeMap<String, (u64, bool)>, ServiceError> {
+    fn list_nodes(&self) -> Result<BTreeMap<String, NodeSummary>, ServiceError> {
         let (pool, mut out, gone) = {
             let g = self.lock();
             match (&g.serving, &g.read_only) {
@@ -1719,7 +1738,7 @@ impl FileService {
                     s.recent
                         .iter()
                         .filter(|(_, st)| !st.deleted)
-                        .map(|(p, st)| (p.clone(), (st.len, is_directory(&st.metadata))))
+                        .map(|(p, st)| (p.clone(), NodeSummary::new(st.len, &st.metadata)))
                         .collect::<BTreeMap<_, _>>(),
                     // 本轮删掉的路径盖住目录库里可能还没换成墓碑的旧行
                     s.recent
@@ -1739,9 +1758,9 @@ impl FileService {
         } else {
             Vec::new()
         };
-        for (p, n, d) in rows {
+        for (p, n) in rows {
             if !gone.contains(&p) {
-                out.entry(p).or_insert((n, d));
+                out.entry(p).or_insert(n);
             }
         }
         Ok(out)
@@ -1787,7 +1806,7 @@ impl FileService {
             out: &mut BTreeMap<String, DirEntry>,
             prefix: &str,
             path: &str,
-            committed: Option<u64>,
+            committed: Option<NodeSummary>,
             flight: Option<(InFlight, u64)>,
         ) {
             let Some(rest) = path.strip_prefix(prefix) else {
@@ -1801,14 +1820,19 @@ impl FileService {
                     out.entry(sub.to_string()).or_insert(DirEntry::Dir);
                 }
                 None => match out.entry(rest.to_string()).or_insert(DirEntry::File {
+                    is_symlink: false,
                     committed: None,
                     in_flight: None,
                 }) {
                     DirEntry::File {
+                        is_symlink,
                         committed: c,
                         in_flight: f,
                     } => {
-                        *c = c.or(committed);
+                        if let Some(n) = committed {
+                            *c = c.or(Some(n.length));
+                            *is_symlink = n.is_symlink;
+                        }
                         *f = f.or(flight);
                     }
                     // 同名的目录与文件：LTFS 里不会出现，目录优先
@@ -1819,15 +1843,15 @@ impl FileService {
         // TODO（目录库）：按前缀查询，而不是取全量再过滤
         let nodes = self.list_nodes()?;
         let own = nodes.get(prefix.trim_end_matches('/'));
-        if own.is_some_and(|(_, d)| !d) {
+        if own.is_some_and(|n| !n.is_dir) {
             return Err(ServiceError::NotDirectory(dir.into()));
         }
-        let exists = prefix == "/" || own.is_some_and(|(_, d)| *d);
-        for (p, (len, directory)) in &nodes {
-            if *directory {
+        let exists = prefix == "/" || own.is_some_and(|n| n.is_dir);
+        for (p, node) in &nodes {
+            if node.is_dir {
                 add(&mut out, &prefix, &format!("{}/", p), None, None);
             } else {
-                add(&mut out, &prefix, p, Some(*len), None);
+                add(&mut out, &prefix, p, Some(*node), None);
             }
         }
         let flights: Vec<(String, (InFlight, u64))> = {

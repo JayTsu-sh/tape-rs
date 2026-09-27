@@ -89,6 +89,8 @@ pub struct PathStat {
 pub struct DirItem {
     pub name: String,
     pub is_dir: bool,
+    /// 旧服务端没有类型字段时为 None，调用方可回退到 stat。
+    pub is_symlink: Option<bool>,
     /// 文件：`committed`、`uploading` 或 `staged`；目录为空串
     pub state: String,
     pub committed_length: Option<u64>,
@@ -825,6 +827,7 @@ impl Client {
                         .map(|e| DirItem {
                             name: e["name"].as_str().unwrap_or("").to_string(),
                             is_dir: e["type"] == "dir",
+                            is_symlink: e["is_symlink"].as_bool(),
                             state: e["state"].as_str().unwrap_or("").to_string(),
                             committed_length: e["committed_length"].as_u64(),
                             staged_length: e["staged_length"].as_u64(),

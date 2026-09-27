@@ -3309,6 +3309,24 @@ fn symlinks_commit_and_survive_remount_and_takeover() {
     assert!(made.is_symlink);
     assert_eq!(made.size, 6);
     assert_eq!(fs.readlink(made.ino).unwrap(), b"target");
+    let check_listing = |client: &mut Client| {
+        let entries = client.list_dir("/", false).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .find(|e| e.name == "target")
+                .unwrap()
+                .is_symlink,
+            Some(false)
+        );
+        for name in ["link", "dangling", "absolute", "loop", "fused"] {
+            assert_eq!(
+                entries.iter().find(|e| e.name == name).unwrap().is_symlink,
+                Some(true)
+            );
+        }
+    };
+    check_listing(&mut cl);
     drop(fs);
     c.isolated.lock().unwrap().insert(leader);
     let (next, next_round) = c.wait_serving(Some(leader), round + 1);
@@ -3320,6 +3338,7 @@ fn symlinks_commit_and_survive_remount_and_takeover() {
         c.dir.join("link-cache-new"),
     )
     .unwrap();
+    check_listing(&mut cl);
     let link = fs.lookup(ROOT_INO, "fused").unwrap();
     assert!(link.is_symlink);
     assert_eq!(fs.readlink(link.ino).unwrap(), b"target");

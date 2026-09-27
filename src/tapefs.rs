@@ -31,6 +31,14 @@ pub type Res<T> = std::result::Result<T, Errno>;
 
 pub const ROOT_INO: u64 = 1;
 
+/// 单次目录快照中的子项；类型来自同一次列举，旧服务端才逐项查询。
+pub struct DirChild {
+    pub name: String,
+    pub ino: u64,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+}
+
 /// 根目录下不出现在列举里的目录：墓碑与 lost+found。
 const HIDDEN_AT_ROOT: &[&str] = &[".tapers", "_ltfs_lostandfound"];
 
@@ -589,26 +597,33 @@ impl<B: Backend> TapeFs<B> {
 
     /// 目录的子项：(名字, 是否目录, inode)。
     pub fn readdir(&self, ino: u64) -> Res<Vec<(String, bool, u64)>> {
+        Ok(self
+            .readdir_typed(ino)?
+            .into_iter()
+            .map(|e| (e.name, e.is_dir, e.ino))
+            .collect())
+    }
+
+    pub fn readdir_typed(&self, ino: u64) -> Res<Vec<DirChild>> {
         let _ns = self.namespace.read().unwrap_or_else(|e| e.into_inner());
         self.check_namespace()?;
         self.readdir_inner(ino)
     }
 
-    fn readdir_inner(&self, ino: u64) -> Res<Vec<(String, bool, u64)>> {
+    fn readdir_inner(&self, ino: u64) -> Res<Vec<DirChild>> {
         let dir = self.path_of(ino)?;
-        let mut out: BTreeMap<String, bool> = BTreeMap::new();
+        let mut out: BTreeMap<String, (bool, Option<bool>)> = BTreeMap::new();
         let server = self.backend.list_dir(&dir)?;
-        let local_dir = dir == "/";
-        if server.is_none() && !local_dir {
+        if server.is_none() && dir != "/" {
             return Err(libc::ENOENT);
         }
         for e in server.unwrap_or_default() {
-            out.insert(e.name, e.is_dir);
+            out.insert(e.name, (e.is_dir, e.is_symlink));
         }
         for p in self.open_write_paths() {
             if parent_of(&p) == dir {
                 out.entry(p.rsplit('/').next().unwrap_or_default().to_string())
-                    .or_insert(false);
+                    .or_insert((false, Some(false)));
             }
         }
         if dir == "/" {
@@ -616,13 +631,28 @@ impl<B: Backend> TapeFs<B> {
                 out.remove(*h);
             }
         }
-        Ok(out
-            .into_iter()
-            .map(|(n, d)| {
-                let ino = self.ino_of(&join(&dir, &n));
-                (n, d, ino)
-            })
-            .collect())
+        let mut children = Vec::with_capacity(out.len());
+        for (name, (is_dir, known_link)) in out {
+            let ino = self.ino_of(&join(&dir, &name));
+            let is_symlink = if is_dir {
+                false
+            } else if let Some(link) = known_link {
+                link
+            } else {
+                match self.getattr_inner(ino) {
+                    Ok(a) => a.is_symlink,
+                    Err(libc::ENOENT | libc::ESTALE) => continue,
+                    Err(e) => return Err(e),
+                }
+            };
+            children.push(DirChild {
+                name,
+                ino,
+                is_dir,
+                is_symlink,
+            });
+        }
+        Ok(children)
     }
 
     /// 新建文件并以写方式打开。`excl` 对应 `O_EXCL`：只创建。
@@ -1612,6 +1642,7 @@ impl Backend for MemBackend {
             out.entry(name.clone()).or_insert(DirItem {
                 name,
                 is_dir,
+                is_symlink: Some(false),
                 state: if is_dir {
                     String::new()
                 } else if staged {
@@ -1634,6 +1665,7 @@ impl Backend for MemBackend {
                     DirItem {
                         name: name.into(),
                         is_dir: true,
+                        is_symlink: Some(false),
                         state: String::new(),
                         committed_length: None,
                         staged_length: None,
@@ -1703,6 +1735,100 @@ mod tests {
         let (_, fh) = t.create(parent, name, false).unwrap();
         assert_eq!(t.write(fh, 0, data).unwrap() as usize, data.len());
         fh
+    }
+
+    #[test]
+    fn directory_types_avoid_per_entry_stats_and_support_old_servers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Listing {
+            legacy: bool,
+            failure: Option<i32>,
+            stats: AtomicUsize,
+        }
+        impl Backend for Listing {
+            fn list_dir(&self, _: &str) -> Res<Option<Vec<DirItem>>> {
+                Ok(Some(
+                    (0..1000)
+                        .map(|i| DirItem {
+                            name: format!("f{i:04}"),
+                            is_dir: false,
+                            is_symlink: (!self.legacy).then_some(i == 0),
+                            state: "committed".into(),
+                            committed_length: Some(1),
+                            staged_length: None,
+                        })
+                        .collect(),
+                ))
+            }
+            fn stat(&self, p: &str) -> Res<Option<PathStat>> {
+                self.stats.fetch_add(1, Ordering::Relaxed);
+                if let Some(e) = self.failure {
+                    return Err(e);
+                }
+                Ok(Some(PathStat {
+                    state: "committed".into(),
+                    length: 1,
+                    current: Some(crate::client::FileStat {
+                        length: 1,
+                        generation: 1,
+                        round: 1,
+                        barcode: "TEST".into(),
+                        sha256: String::new(),
+                        version: (1, 1),
+                        metadata: serde_json::json!({"kind": if p == "/f0000" { "symlink" } else { "file" }, "symlink": "target"}),
+                    }),
+                }))
+            }
+            fn fetch(&self, _: &str, _: &mut File) -> Res<u64> {
+                Err(libc::EIO)
+            }
+            fn upload(&self, _: &str, _: &Path, _: bool, _: bool) -> Res<bool> {
+                Err(libc::EIO)
+            }
+            fn delete(&self, _: &str) -> Res<()> {
+                Err(libc::EIO)
+            }
+        }
+        for (legacy, failure) in [
+            (false, Some(libc::EIO)),
+            (true, None),
+            (true, Some(libc::ENOENT)),
+            (true, Some(libc::EIO)),
+        ] {
+            let dir = std::env::temp_dir().join(format!("typed-dir-{}", uuid::Uuid::new_v4()));
+            let t = TapeFs::new(
+                Listing {
+                    legacy,
+                    failure,
+                    stats: AtomicUsize::new(0),
+                },
+                dir.clone(),
+            )
+            .unwrap();
+            let result = t.readdir_typed(ROOT_INO);
+            if legacy && failure == Some(libc::EIO) {
+                assert!(matches!(result, Err(libc::EIO)));
+            } else {
+                let entries = result.unwrap();
+                if legacy && failure == Some(libc::ENOENT) {
+                    assert!(entries.is_empty());
+                } else {
+                    assert_eq!(entries.len(), 1000);
+                    assert_eq!(entries.iter().filter(|e| e.is_symlink).count(), 1);
+                    assert_eq!(entries[0].name, "f0000");
+                }
+            }
+            assert_eq!(
+                t.backend().stats.load(Ordering::Relaxed),
+                if legacy {
+                    if failure == Some(libc::EIO) { 1 } else { 1000 }
+                } else {
+                    0
+                }
+            );
+            drop(t);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     /// FC04：close 之后本挂载仍可读暂存内容；fsync 返回 0 才已提交。

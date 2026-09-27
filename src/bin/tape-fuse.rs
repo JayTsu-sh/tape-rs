@@ -284,18 +284,15 @@ impl<B: Backend + 'static> Filesystem for Adapter<B> {
                     self.fs.attr_of(parent)?.ino,
                 ),
             ];
-            for (name, dir, child) in self.fs.readdir(ino.0)? {
-                let file_type = if dir {
+            for child in self.fs.readdir_typed(ino.0)? {
+                let file_type = if child.is_dir {
                     FileType::Directory
+                } else if child.is_symlink {
+                    FileType::Symlink
                 } else {
-                    match self.fs.getattr(child) {
-                        Ok(a) if a.is_symlink => FileType::Symlink,
-                        Ok(_) => FileType::RegularFile,
-                        Err(libc::ENOENT | libc::ESTALE) => continue,
-                        Err(e) => return Err(e),
-                    }
+                    FileType::RegularFile
                 };
-                entries.push((name, file_type, child));
+                entries.push((child.name, file_type, child.ino));
             }
             Ok(entries)
         })();
