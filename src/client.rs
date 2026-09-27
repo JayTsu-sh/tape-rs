@@ -689,6 +689,26 @@ impl Client {
         self.namespace_change("POST", &route, path, None)
     }
 
+    /// 同步当前服务卷的已完成写入与完整索引。请求送出后的失败不自动重放。
+    pub fn sync(&mut self) -> Result<()> {
+        let r = self
+            .request_leader("POST", "/sync", None)
+            .map_err(|e| match e {
+                ClientError::Io(_) => ClientError::Indeterminate(format!("同步响应丢失: {e}")),
+                other => other,
+            })?;
+        match r.status {
+            200 if r.json()["status"] == "synced" => Ok(()),
+            500 | 504 => Err(ClientError::Indeterminate(
+                String::from_utf8_lossy(&r.body).into_owned(),
+            )),
+            status => Err(ClientError::Rejected {
+                status,
+                body: String::from_utf8_lossy(&r.body).into_owned(),
+            }),
+        }
+    }
+
     pub fn mkdir(&mut self, path: &str) -> Result<()> {
         self.directory_change("POST", path)
     }
@@ -1104,6 +1124,7 @@ mod tests {
             "SETXATTR",
             "REMOVEXATTR",
             "SYMLINK",
+            "SYNC",
         ] {
             let first = TcpListener::bind("127.0.0.1:0").unwrap();
             let second = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1118,7 +1139,9 @@ mod tests {
                 let mut reader = BufReader::new(stream);
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
-                if method == "SYMLINK" {
+                if method == "SYNC" {
+                    assert!(line.starts_with("POST /sync "));
+                } else if method == "SYMLINK" {
                     assert!(line.starts_with("POST /symlinks?"));
                 } else if method == "RENAME" {
                     assert!(line.starts_with("POST /rename?"));
@@ -1137,7 +1160,9 @@ mod tests {
                     }
                 }
             });
-            let result = if method == "SYMLINK" {
+            let result = if method == "SYNC" {
+                client.sync()
+            } else if method == "SYMLINK" {
                 client.symlink("target", "/a")
             } else if method == "RENAME" {
                 client.rename("/a", "/b", false)

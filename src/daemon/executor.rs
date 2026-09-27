@@ -114,6 +114,11 @@ pub enum ExecRequest {
         file: std::fs::File,
         reply: Sender<std::result::Result<std::fs::File, ReadError>>,
     },
+    /// 显式同步：提交当前已完成批次并收束索引；轮次改变不能冒充成功。
+    Sync {
+        round: u64,
+        reply: Sender<std::result::Result<(), String>>,
+    },
     /// 计划停机：落带、退带、释放预留，然后经 `done` 回执。见 `shut_down`。
     Shutdown { done: Option<Sender<()>> },
 }
@@ -368,6 +373,36 @@ pub fn run(
                     active = None;
                     let _ = tx.send(ExecEvent::Lost { round, reason });
                 }
+            }
+            Ok(ExecRequest::Sync { round, reply }) => {
+                let result = match active.as_mut().filter(|a| a.serving && a.round == round) {
+                    Some(a) if a.drive.is_some() && files.serving_round() == Some(round) => {
+                        process_uploads_limited(a, &files, &tx, true, 1)
+                            .and_then(|()| {
+                                checkpoint_write_tape(a, &files, &tx).map_err(|e| e.to_string())
+                            })
+                            .and_then(|()| {
+                                if files.serving_round() == Some(round) {
+                                    Ok(())
+                                } else {
+                                    Err("同步期间执行轮次已失效".into())
+                                }
+                            })
+                    }
+                    _ => Err("同步目标未就绪或执行轮次已失效".into()),
+                };
+                if let Err(reason) = &result {
+                    // 不继续使用可能部分提交的卷，也不把换届后的空队列当作旧同步成功。
+                    if active.as_ref().is_some_and(|a| a.round == round) {
+                        files.close(reason);
+                        active = None;
+                        let _ = tx.send(ExecEvent::Lost {
+                            round,
+                            reason: reason.clone(),
+                        });
+                    }
+                }
+                let _ = reply.send(result);
             }
             Ok(ExecRequest::Read { path, reply }) => {
                 let was_serving = active.as_ref().is_some_and(|a| a.serving);
@@ -1129,9 +1164,20 @@ fn process_uploads(
     tx: &Sender<ExecEvent>,
     flush: bool,
 ) -> std::result::Result<(), String> {
+    process_uploads_limited(a, files, tx, flush, usize::MAX)
+}
+
+fn process_uploads_limited(
+    a: &mut Active,
+    files: &FileService,
+    tx: &Sender<ExecEvent>,
+    flush: bool,
+    max_batches: usize,
+) -> std::result::Result<(), String> {
     let Some(i) = a.drive else {
         return Ok(());
     };
+    let mut batches = 0;
     while let Some((batch, uploads)) = if flush {
         files.take_batch_now(a.round)
     } else {
@@ -1279,6 +1325,7 @@ fn process_uploads(
             })
         })();
         a.seq = seq;
+        batches += 1;
         match result {
             Ok(ev) => {
                 if let ExecEvent::Committed {
@@ -1305,6 +1352,9 @@ fn process_uploads(
                 files.batch_done(a.round, &batch, &uploads, Err(e.to_string()));
                 return Err(e.to_string());
             }
+        }
+        if batches >= max_batches {
+            break;
         }
     }
     Ok(())

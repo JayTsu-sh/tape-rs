@@ -486,3 +486,7 @@ Holo隔离目录 /home/rocky/tape-rs-namespace-20260927，ltfsd SHA256 104099542
 ## 2026-09-27 大目录优化通过
 
 见holo-directory-perf-20260927.md；最新关闭directory-perf/test-data，SR1 Full24/SR2 Full3、1132行。正式term50/round444，53行/9文件不变。214测试通过7忽略，严格Clippy通过。下一项5。
+
+## 2026-09-27 无人值守队列0–5完成
+
+见holo-sync-boundary-20260927.md；218软件测试通过7忽略，严格Clippy无告警且无新增屏蔽。同步后Full30、SIGKILL与node3接管冷读通过。最新关闭sync-boundary/test-data，1136行、SR1 Full30/SR2 Full3；LE副本SR2501L08 Full10已与SR1分叉，禁止覆盖。正式恢复node2/term51/round449，53行及原9文件不变；新程序仅隔离验证，未正式升级/推送，物理设备验收暂缓。

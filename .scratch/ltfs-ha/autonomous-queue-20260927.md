@@ -9,7 +9,7 @@
 - [x] 2. namespace/takeover间歇HTTP500：稳定复现与根因定位、最小修复、接管并发与现场回归。
 - [x] 3. 回收介质IBM LE往返：备份、LE读/回写、tape-rs读回，内容/链接/属性保真。
 - [x] 4. 大目录与性能：定义可复现实验规模及基线，测量请求/延迟/资源占用，按实际瓶颈优化并回归。
-- [ ] 5. 功能扩展：先核对LE/标准支持边界，按推荐确定硬链接及user.ltfs.sync的具体语义；实现支持的范围并逐项现场验收，明确标准无法支持的限制。
+- [x] 5. 功能扩展：先核对LE/标准支持边界，按推荐确定硬链接及user.ltfs.sync的具体语义；实现支持的范围并逐项现场验收，明确标准无法支持的限制。
 
 初始基线：bf2b254，208通过7忽略；正式32bd5541…，原TS1001L08 Full120，隔离SR1空Full2/SR2数据Full4；最新关闭SR数据tape-rs-reclaim-formatted-20260927/test-data。
 
@@ -22,3 +22,5 @@
 任务3通过：holo-reclaim-le-20260927.md，LE Full7→8，内容/六种链接/xattr/mtime往返通过。最新关闭reclaim-le/test-data，SR1 Full8/SR2 Full3。下一项4。
 
 任务4通过：holo-directory-perf-20260927.md，1000文件枚举843→18ms、1013→10请求；214测试通过7忽略，冷缓存1100文件及原文件通过。最新关闭directory-perf/test-data，SR1 Full24/SR2 Full3。下一项5。
+
+任务5通过：holo-sync-boundary-20260927.md。硬链接按LTFS/LE支持边界明确不支持；挂载根user.ltfs.sync已实现，218测试通过7忽略，Holo同步后SIGKILL/接管冷读验证通过。最新关闭sync-boundary/test-data，SR1 Full30/SR2 Full3、1136行。任务0–5全部完成；正式仍32bd5541…，新程序只部署隔离集群验证，物理验收暂缓。

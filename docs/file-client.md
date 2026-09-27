@@ -115,7 +115,7 @@ LE 改回曾删除或改名的路径时可能保留 tape-rs 私有墓碑。恢�
 
 Client::setxattr(path, name, value, flags) 与 removexattr(path, name) 已接通 HTTP 和 FUSE。仅支持当前写入卷上的文件与原生目录；其他卷返回 EXDEV。flags=0 表示创建或替换，1（CREATE）遇到已有属性返回 EEXIST，2（REPLACE）以及删除不存在的属性返回 ENODATA。支持空值和二进制值，单值最多 65536 字节，属性名最多 255 字节。
 
-属性名必须属于 user. 命名空间；user.tape.*、user.tapers.*、user.ltfs.* 保留，不能写入或删除。拒绝 user.user.* 别名；合成根目录不支持修改，尚未实现 LE 的 user.ltfs.sync 虚拟控制属性。索引值使用 Base64，元数据通过现有 LTFS 增量索引提交，不重写文件内容，保留 UID、extent、mtime 和内容哈希。正常停机的完整索引策略不变。
+属性名必须属于 user. 命名空间；user.tape.*、user.tapers.*、user.ltfs.* 保留，不能作为普通属性写入或删除。唯一控制例外是挂载根上的 user.ltfs.sync（见下）。拒绝 user.user.* 别名；合成根目录不支持普通属性修改。索引值使用 Base64，元数据通过现有 LTFS 增量索引提交，不重写文件内容，保留 UID、extent、mtime 和内容哈希。正常停机的完整索引策略不变。
 
 HTTP POST /xattrs?path=…&name=…&flags=… 的请求体是原始字节，DELETE 同一路径删除属性。201 才代表提交成功；响应丢失或提交未定返回 Indeterminate，不自动重放。FUSE 修改前同步同一文件的脏句柄，提交结果不确定后阻止继续写回。后续覆盖文件内容继续保留已提交的用户属性。新增接口需要服务端同步升级，旧服务端不支持。
 
@@ -141,3 +141,16 @@ HTTP POST /xattrs?path=…&name=…&flags=… 的请求体是原始字节，DELE
 2026-09-27 部署更新：回收修复已统一部署三节点，配套客户端位于 `/home/rocky/tape-rs-symlink-reclaim-prod-20260927`，取代上文“尚未正式部署”。实际FUSE链接操作、计划接管后冷缓存读回、清理及原文件校验通过；本轮未在原数据带执行回收。见[部署验收](../.scratch/ltfs-ha/holo-reclaim-upgrade-20260927.md)。
 
 目录枚举使用服务器返回的子项类型快照，避免为每个文件单独查询属性；符号链接按链接自身类型返回。旧服务器没有 `is_symlink` 字段时客户端回退到逐项查询。该字段只扩展目录响应，不改变磁带索引或 catalog 持久化格式；目录打开后仍按该次快照分页，后续 lookup/getattr 查询当前状态。
+
+
+显式同步：向 **tape-fuse 挂载根**（例如 `/mnt/tape`，不是其下普通目录 `/mnt/tape/sr`）的 `user.ltfs.sync` 写入任意值或空值，成功表示本挂载已有写句柄的内容、已关闭暂存内容得到确认，并完成当前服务卷的完整索引检查点。后端还覆盖同步执行时已完成接收的上传批次；其他客户端尚未完成的上传、随后到来的写入及尚未同步到服务端的本地缓存不属于此次保证。切换走的旧写入卷已按既有流程做检查点；不扫描或改写库中所有介质。
+
+```python
+os.setxattr('/mnt/tape', 'user.ltfs.sync', b'1')
+```
+
+该控制属性只写、不列举、不存入索引；读取返回 ENODATA，删除返回 EPERM，写在文件或子目录上返回 EACCES。CREATE/REPLACE 均允许；空闲且索引已完整时不会增加代数。调用期间本挂载已有writer被串行化；失败或响应丢失可能已有部分写入完成，调用者需核对，不自动跨节点重放或声称成功。Rust客户端对应 `Client::sync()`；HTTP `POST /sync` 同样只同步服务端已完成接收的写入。旧服务器不支持该操作，应先升级服务器。
+
+现有 fsync 仍提供文件内容与索引归档确认，比 IBM LE 仅刷新数据的 fsync 保证更强；这里没有把暂存成功改称持久化成功。
+
+硬链接不支持：LTFS 2.5.1 没有标准化的共享inode硬链接表示，tape-fuse保留EOPNOTSUPP，目标不会被创建。IBM LE 2.4.8.3实测返回ENOSYS；不以复制或符号链接替代硬链接。符号链接保持现有支持。

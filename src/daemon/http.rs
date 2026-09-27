@@ -439,6 +439,50 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
     }
 
     match (method.as_str(), path.as_str()) {
+        ("POST", "/sync") => {
+            let Some(round) = ctx.files.serving_round() else {
+                return service_error(
+                    &mut conn,
+                    ctx,
+                    ServiceError::NotServing("同步目标尚未接管".into()),
+                );
+            };
+            let (tx, rx) = channel();
+            if ctx
+                .exec
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .send(ExecRequest::Sync { round, reply: tx })
+                .is_err()
+            {
+                return respond_json(
+                    &mut conn,
+                    503,
+                    "Service Unavailable",
+                    json!({"error":"executor_gone"}),
+                );
+            }
+            match rx.recv_timeout(ctx.wait_timeout) {
+                Ok(Ok(())) => respond_json(
+                    &mut conn,
+                    200,
+                    "OK",
+                    json!({"status":"synced","round":round}),
+                ),
+                Ok(Err(reason)) => respond_json(
+                    &mut conn,
+                    500,
+                    "Internal Server Error",
+                    json!({"error":"indeterminate","detail":reason}),
+                ),
+                Err(_) => respond_json(
+                    &mut conn,
+                    504,
+                    "Gateway Timeout",
+                    json!({"error":"indeterminate","detail":"同步结果未定"}),
+                ),
+            }
+        }
         ("GET", "/cluster") => {
             let s = ctx.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
             respond_json(

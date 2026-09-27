@@ -3688,3 +3688,89 @@ fn check_symlink_reclaim(cut: Option<ReclaimCut>) {
     assert_eq!(cl.get("/target").unwrap(), b"target content");
     c.shutdown();
 }
+
+#[test]
+fn explicit_sync_commits_staged_files_and_closes_incremental_index() {
+    use tape_rs::ltfs::volume::LtfsVolume;
+    use tape_rs::tapefs::{ClientBackend, ROOT_INO, TapeFs};
+    let c = Cluster::start_with("explicit-sync", false);
+    let (leader, round) = c.wait_serving(None, 0);
+    c.wait("同步服务开放", || {
+        c.services[&leader].serving_round() == Some(round)
+    });
+    let mut cl = Client::new(c.start_http());
+    let local = c.dir.join("sync-input");
+    std::fs::write(&local, b"staged by another client").unwrap();
+    cl.put_file("/remote", &local, true, false).unwrap();
+    let fs = TapeFs::new(ClientBackend::new(cl.clone()), c.dir.join("sync-cache")).unwrap();
+    let (_, open) = fs.create(ROOT_INO, "open", true).unwrap();
+    fs.write(open, 0, b"open writer").unwrap();
+    let (_, closed) = fs.create(ROOT_INO, "closed", true).unwrap();
+    fs.write(closed, 0, b"closed writer").unwrap();
+    fs.flush(closed).unwrap();
+    fs.release(closed);
+    fs.change_xattr(ROOT_INO, "user.ltfs.sync", Some(b""), 0)
+        .unwrap();
+    let copy = SimLibrary::new(1, 1, 0);
+    copy.insert_cartridge(c.lib.cartridge(BARCODE).unwrap(), 0)
+        .unwrap();
+    copy.load_into_drive(BARCODE, 0).unwrap();
+    let drive = copy.drive(0);
+    let vol = LtfsVolume::mount(&drive).unwrap();
+    assert!(!vol.index().incremental);
+    assert!(vol.writable());
+    for (path, expected) in [
+        ("remote", b"staged by another client".as_slice()),
+        ("open", b"open writer"),
+        ("closed", b"closed writer"),
+    ] {
+        let mut bytes = Vec::new();
+        vol.read_file_to_writer(path, &mut bytes).unwrap();
+        assert_eq!(bytes, expected);
+    }
+    assert!(vol.index().root.xattrs.iter().all(|x| x.key != "ltfs.sync"));
+    let generation = vol.index().generation;
+    cl.sync().unwrap();
+    let copy2 = SimLibrary::new(1, 1, 0);
+    copy2
+        .insert_cartridge(c.lib.cartridge(BARCODE).unwrap(), 0)
+        .unwrap();
+    copy2.load_into_drive(BARCODE, 0).unwrap();
+    assert_eq!(
+        LtfsVolume::mount(&copy2.drive(0))
+            .unwrap()
+            .index()
+            .generation,
+        generation,
+        "无新写入的sync不产生额外索引"
+    );
+    fs.release(open);
+    c.shutdown();
+}
+
+#[test]
+fn explicit_sync_surfaces_checkpoint_failure_without_retrying() {
+    use std::sync::atomic::Ordering;
+    for medium in [false, true] {
+        let c = Cluster::start_with(if medium { "sync-medium" } else { "sync-lost" }, false);
+        let (leader, round) = c.wait_serving(None, 0);
+        c.wait("同步故障服务开放", || {
+            c.services[&leader].serving_round() == Some(round)
+        });
+        let mut cl = Client::new(c.start_http());
+        cl.put("/file", b"data before checkpoint").unwrap();
+        c.checkpoint_fault
+            .medium_error
+            .store(medium, Ordering::SeqCst);
+        c.checkpoint_fault
+            .initiator
+            .store(leader as u32, Ordering::SeqCst);
+        let result = cl.sync();
+        assert_eq!(c.checkpoint_fault.initiator.load(Ordering::SeqCst), 0);
+        assert!(
+            matches!(result, Err(tape_rs::client::ClientError::Indeterminate(_))),
+            "{result:?}"
+        );
+        c.shutdown();
+    }
+}

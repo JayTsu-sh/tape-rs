@@ -429,6 +429,7 @@ impl<B: Backend + 'static> Filesystem for Adapter<B> {
     }
 
     fn link(&self, _: &Request, _: INodeNo, _: INodeNo, _: &OsStr, reply: ReplyEntry) {
+        // LTFS没有共享inode硬链接表示；保留明确的不支持，不伪装成复制。
         reply.error(Errno::EOPNOTSUPP);
     }
 

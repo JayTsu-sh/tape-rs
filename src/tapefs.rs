@@ -62,6 +62,9 @@ pub trait Backend: Send + Sync {
     /// 上传本地文件。`wait` 为真时等到落带；返回是否已落带。
     fn upload(&self, path: &str, local: &Path, create_only: bool, wait: bool) -> Res<bool>;
     fn delete(&self, path: &str) -> Res<()>;
+    fn sync(&self) -> Res<()> {
+        Err(libc::EOPNOTSUPP)
+    }
     fn change_xattr(
         &self,
         _path: &str,
@@ -146,6 +149,10 @@ impl ClientBackend {
 }
 
 impl Backend for ClientBackend {
+    fn sync(&self) -> Res<()> {
+        self.with(Client::sync)
+    }
+
     fn stat(&self, path: &str) -> Res<Option<PathStat>> {
         self.with(|c| c.stat_path(path))
     }
@@ -1307,6 +1314,18 @@ impl<B: Backend> TapeFs<B> {
     pub fn change_xattr(&self, ino: u64, name: &str, value: Option<&[u8]>, flags: u32) -> Res<()> {
         let _ns = self.namespace.write().unwrap_or_else(|e| e.into_inner());
         self.check_namespace()?;
+        if name == "user.ltfs.sync" {
+            if value.is_none() {
+                return Err(libc::EPERM);
+            }
+            if flags > 2 {
+                return Err(libc::EINVAL);
+            }
+            if ino != ROOT_INO {
+                return Err(libc::EACCES);
+            }
+            return self.sync_root();
+        }
         crate::daemon::files::writable_xattr_key(name).map_err(|e| match e {
             crate::daemon::files::ServiceError::ProtectedAttribute(_) => libc::EPERM,
             _ => libc::EINVAL,
@@ -1362,6 +1381,35 @@ impl<B: Backend> TapeFs<B> {
                 .ok()
                 .flatten()
                 .and_then(|s| s.current);
+        }
+        Ok(())
+    }
+
+    // 调用方持有 namespace 写锁；按稳定顺序冻结本挂载已有writer。
+    fn sync_root(&self) -> Res<()> {
+        let mut handles: Vec<_> = lock(&self.handles).values().cloned().collect();
+        handles.sort_by_key(Arc::as_ptr);
+        handles.dedup_by(|a, b| Arc::ptr_eq(a, b));
+        let mut guards: Vec<_> = handles.iter().map(|h| lock(h)).collect();
+        for h in &mut guards {
+            self.sync_handle(h)?;
+        }
+        self.backend.sync()?;
+        // 已close的暂存文件也必须确认，不能把换届丢失的暂存误报为同步成功。
+        let pending: Vec<_> = lock(&self.pending).values().cloned().collect();
+        for data in pending {
+            let path = self.path_of(data.ino)?;
+            let st = self.backend.stat(&path)?.ok_or(libc::EIO)?;
+            if st.state != "committed"
+                || !st.current.is_some_and(|c| {
+                    lock(&data.content)
+                        .as_ref()
+                        .is_some_and(|(n, hash)| c.length == *n && c.sha256 == *hash)
+                })
+            {
+                return Err(libc::EIO);
+            }
+            lock(&self.pending).remove(&data.ino);
         }
         Ok(())
     }
@@ -1486,6 +1534,11 @@ impl MemBackend {
 }
 
 impl Backend for MemBackend {
+    fn sync(&self) -> Res<()> {
+        self.commit_all();
+        Ok(())
+    }
+
     fn change_xattr(&self, path: &str, name: &str, value: Option<&[u8]>, flags: u32) -> Res<()> {
         let mut s = lock(&self.state);
         if !s.committed.contains_key(path) && !s.directories.contains(path) {
@@ -1829,6 +1882,65 @@ mod tests {
             drop(t);
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    #[test]
+    fn virtual_sync_covers_open_and_closed_writers_and_stays_virtual() {
+        let t = fs("virtual-sync");
+        let a = write_file(&t, ROOT_INO, "open", b"open data");
+        let b = write_file(&t, ROOT_INO, "closed", b"closed data");
+        t.flush(b).unwrap();
+        t.release(b);
+        t.change_xattr(ROOT_INO, "user.ltfs.sync", Some(b""), 1)
+            .unwrap();
+        assert!(lock(&t.pending).is_empty());
+        assert_eq!(lock(&t.backend().state).committed["/open"], b"open data");
+        assert_eq!(
+            lock(&t.backend().state).committed["/closed"],
+            b"closed data"
+        );
+        assert_eq!(t.getxattr(ROOT_INO, "user.ltfs.sync"), Err(libc::ENODATA));
+        assert!(
+            !t.listxattr(ROOT_INO)
+                .unwrap()
+                .split(|b| *b == 0)
+                .any(|n| n == b"user.ltfs.sync")
+        );
+        let ino = t.lookup(ROOT_INO, "open").unwrap().ino;
+        assert_eq!(
+            t.change_xattr(ino, "user.ltfs.sync", Some(b"1"), 0),
+            Err(libc::EACCES)
+        );
+        assert_eq!(
+            t.change_xattr(ROOT_INO, "user.ltfs.sync", None, 0),
+            Err(libc::EPERM)
+        );
+        assert_eq!(
+            t.change_xattr(ROOT_INO, "user.ltfs.sync", Some(b"1"), 3),
+            Err(libc::EINVAL)
+        );
+        t.write(a, 0, b"updated").unwrap();
+        t.change_xattr(ROOT_INO, "user.ltfs.sync", Some(b"any value"), 2)
+            .unwrap();
+        assert!(lock(&t.backend().state).xattrs.is_empty());
+        t.release(a);
+    }
+
+    #[test]
+    fn virtual_sync_does_not_acknowledge_lost_or_replaced_staging() {
+        let t = fs("virtual-sync-failed");
+        let h = write_file(&t, ROOT_INO, "lost", b"mine");
+        t.flush(h).unwrap();
+        t.release(h);
+        lock(&t.backend().state).staged.clear();
+        lock(&t.backend().state)
+            .committed
+            .insert("/lost".into(), b"other".to_vec());
+        assert_eq!(
+            t.change_xattr(ROOT_INO, "user.ltfs.sync", Some(b"1"), 0),
+            Err(libc::EIO)
+        );
+        assert!(!lock(&t.pending).is_empty());
     }
 
     /// FC04：close 之后本挂载仍可读暂存内容；fsync 返回 0 才已提交。
