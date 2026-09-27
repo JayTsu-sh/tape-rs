@@ -65,6 +65,13 @@ pub trait Backend: Send + Sync {
     fn sync(&self) -> Res<()> {
         Err(libc::EOPNOTSUPP)
     }
+    fn change_metadata(
+        &self,
+        _path: &str,
+        _change: &crate::ltfs::index::MetadataChange,
+    ) -> Res<()> {
+        Err(libc::EOPNOTSUPP)
+    }
     fn change_xattr(
         &self,
         _path: &str,
@@ -182,6 +189,10 @@ impl Backend for ClientBackend {
     fn rename(&self, from: &str, to: &str, no_replace: bool) -> Res<()> {
         self.with(|c| c.rename(from, to, no_replace))
     }
+    fn change_metadata(&self, path: &str, change: &crate::ltfs::index::MetadataChange) -> Res<()> {
+        self.with(|c| c.change_metadata(path, change))
+    }
+
     fn change_xattr(&self, path: &str, name: &str, value: Option<&[u8]>, flags: u32) -> Res<()> {
         self.with(|c| match value {
             Some(v) => c.setxattr(path, name, v, flags),
@@ -207,6 +218,45 @@ pub struct Attr {
     pub is_symlink: bool,
     pub size: u64,
     pub mtime: SystemTime,
+    pub atime: SystemTime,
+    pub ctime: SystemTime,
+    pub crtime: SystemTime,
+    pub readonly: bool,
+}
+
+impl Default for Attr {
+    fn default() -> Self {
+        Self {
+            ino: 0,
+            is_dir: false,
+            is_symlink: false,
+            size: 0,
+            mtime: UNIX_EPOCH,
+            atime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH,
+            crtime: UNIX_EPOCH,
+            readonly: false,
+        }
+    }
+}
+
+impl Attr {
+    fn from_metadata(meta: &serde_json::Value) -> Self {
+        let time = |name| {
+            meta["node"][name]
+                .as_str()
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .map(SystemTime::from)
+                .unwrap_or(UNIX_EPOCH)
+        };
+        Self {
+            readonly: meta["node"]["readonly"].as_bool().unwrap_or(false),
+            atime: time("access_time"),
+            ctime: time("change_time"),
+            crtime: time("creation_time"),
+            ..Self::default()
+        }
+    }
 }
 
 /// 同一 inode 的所有句柄共享一个本地文件；最后一个引用释放后清理。
@@ -391,6 +441,12 @@ impl<B: Backend> TapeFs<B> {
             is_symlink: false,
             size: data.file.metadata().map_err(io_errno)?.len(),
             mtime: *lock(&data.mtime),
+            ..Attr::from_metadata(
+                &lock(&data.source)
+                    .as_ref()
+                    .map(|s| s.metadata.clone())
+                    .unwrap_or_default(),
+            )
         })
     }
 
@@ -470,15 +526,20 @@ impl<B: Backend> TapeFs<B> {
                 is_dir: true,
                 is_symlink: false,
                 size: 0,
+                ..Attr::default()
             });
         }
         if let Some(len) = self.open_write_len(path) {
+            if let Some(data) = self.cached(self.ino_of(path)) {
+                return Self::cached_attr(&data);
+            }
             return Ok(Attr {
                 mtime: UNIX_EPOCH,
                 ino: self.ino_of(path),
                 is_dir: false,
                 is_symlink: false,
                 size: len,
+                ..Attr::default()
             });
         }
         if let Some(st) = self.backend.stat(path)? {
@@ -501,6 +562,12 @@ impl<B: Backend> TapeFs<B> {
                     is_dir: true,
                     is_symlink: false,
                     size: 0,
+                    ..Attr::from_metadata(
+                        &st.current
+                            .as_ref()
+                            .map(|c| c.metadata.clone())
+                            .unwrap_or_default(),
+                    )
                 });
             }
             if let Some(current) = st
@@ -520,6 +587,12 @@ impl<B: Backend> TapeFs<B> {
                     is_symlink: true,
                     size: target.len() as u64,
                     mtime,
+                    ..Attr::from_metadata(
+                        &st.current
+                            .as_ref()
+                            .map(|c| c.metadata.clone())
+                            .unwrap_or_default(),
+                    )
                 });
             }
             if let Some(data) = self.cached(ino) {
@@ -539,6 +612,12 @@ impl<B: Backend> TapeFs<B> {
                 is_dir: false,
                 is_symlink: false,
                 size,
+                ..Attr::from_metadata(
+                    &st.current
+                        .as_ref()
+                        .map(|c| c.metadata.clone())
+                        .unwrap_or_default(),
+                )
             });
         }
         if self.backend.list_dir(path)?.is_some() {
@@ -548,6 +627,7 @@ impl<B: Backend> TapeFs<B> {
                 is_dir: true,
                 is_symlink: false,
                 size: 0,
+                ..Attr::default()
             });
         }
         Err(libc::ENOENT)
@@ -685,6 +765,7 @@ impl<B: Backend> TapeFs<B> {
                 is_dir: false,
                 is_symlink: false,
                 size: 0,
+                ..Attr::default()
             },
             fh,
         ))
@@ -916,6 +997,7 @@ impl<B: Backend> TapeFs<B> {
                         is_dir: false,
                         is_symlink: false,
                         size,
+                        ..Attr::default()
                     });
                 }
                 if size > i64::MAX as u64 {
@@ -1312,8 +1394,6 @@ impl<B: Backend> TapeFs<B> {
     }
 
     pub fn change_xattr(&self, ino: u64, name: &str, value: Option<&[u8]>, flags: u32) -> Res<()> {
-        let _ns = self.namespace.write().unwrap_or_else(|e| e.into_inner());
-        self.check_namespace()?;
         if name == "user.ltfs.sync" {
             if value.is_none() {
                 return Err(libc::EPERM);
@@ -1324,6 +1404,8 @@ impl<B: Backend> TapeFs<B> {
             if ino != ROOT_INO {
                 return Err(libc::EACCES);
             }
+            let _ns = self.namespace.write().unwrap_or_else(|e| e.into_inner());
+            self.check_namespace()?;
             return self.sync_root();
         }
         crate::daemon::files::writable_xattr_key(name).map_err(|e| match e {
@@ -1336,6 +1418,26 @@ impl<B: Backend> TapeFs<B> {
         if value.is_some_and(|v| v.len() > 65536) {
             return Err(libc::E2BIG);
         }
+        if ino == ROOT_INO {
+            return Err(libc::EOPNOTSUPP);
+        }
+        self.change_node(ino, |path| {
+            self.backend.change_xattr(path, name, value, flags)
+        })
+    }
+
+    pub fn change_metadata(
+        &self,
+        ino: u64,
+        change: &crate::ltfs::index::MetadataChange,
+    ) -> Res<()> {
+        change.validate().map_err(|_| libc::EINVAL)?;
+        self.change_node(ino, |path| self.backend.change_metadata(path, change))
+    }
+
+    fn change_node(&self, ino: u64, operation: impl FnOnce(&str) -> Res<()>) -> Res<()> {
+        let _ns = self.namespace.write().unwrap_or_else(|e| e.into_inner());
+        self.check_namespace()?;
         if ino == ROOT_INO {
             return Err(libc::EOPNOTSUPP);
         }
@@ -1367,7 +1469,7 @@ impl<B: Backend> TapeFs<B> {
                 return Err(libc::EBUSY);
             }
         }
-        if let Err(e) = self.backend.change_xattr(&path, name, value, flags) {
+        if let Err(e) = operation(&path) {
             if e == libc::EIO {
                 self.namespace_uncertain
                     .store(true, std::sync::atomic::Ordering::Release);
@@ -1381,6 +1483,13 @@ impl<B: Backend> TapeFs<B> {
                 .ok()
                 .flatten()
                 .and_then(|s| s.current);
+            if let Some(time) = lock(&data.source)
+                .as_ref()
+                .and_then(|s| s.metadata["modify_time"].as_str())
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            {
+                *lock(&data.mtime) = SystemTime::from(time);
+            }
         }
         Ok(())
     }

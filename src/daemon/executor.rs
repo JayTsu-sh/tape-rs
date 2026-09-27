@@ -1193,6 +1193,12 @@ fn process_uploads_limited(
             for u in &uploads {
                 seq += 1;
                 let ver = format!("{}.{}", round, seq);
+                if let Some(change) = &u.node_change {
+                    vol.change_node_metadata(&u.path, change)?;
+                    vol.set_catalog_version(&u.path, &ver)?;
+                    changed.insert(u.path.clone());
+                    continue;
+                }
                 if let Some((key, attr)) = &u.xattr_change {
                     if let Some(attr) = attr {
                         vol.set_node_xattr(&u.path, attr.clone(), false, false)?;

@@ -1,0 +1,2 @@
+{"mode": "returned", "attrs": {"file": {"mode": "0o444", "atime": 1234567890123456900, "mtime": 1234567891987654543, "uid": 0, "gid": 0}, "dir": {"mode": "0o555", "atime": 1234567890123456900, "mtime": 1234567891987654543, "uid": 0, "gid": 0}, "link": {"mode": "0o777", "atime": 1234567890123456900, "mtime": 1234567891987654543, "uid": 0, "gid": 0}}, "passed": true}
+PASS invalid time EINVAL; previous times retained; mount alive

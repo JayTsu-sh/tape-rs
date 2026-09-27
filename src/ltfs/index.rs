@@ -50,6 +50,38 @@ pub struct NodeMeta {
     pub file_uid: u64,
 }
 
+/// 原生节点属性修改；不包含 UID、extent、所有权或私有权限字段。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetadataChange {
+    pub readonly: Option<bool>,
+    pub access_time: Option<String>,
+    pub modify_time: Option<String>,
+}
+
+impl MetadataChange {
+    pub fn validate(&self) -> crate::error::Result<()> {
+        for t in [&self.access_time, &self.modify_time].into_iter().flatten() {
+            // LTFS UTC 时间使用四位年和九位小数；拒绝截断和非规范输入。
+            if !t.is_ascii()
+                || t.len() != 30
+                || !t.ends_with('Z')
+                || chrono::DateTime::parse_from_rfc3339(t).is_err()
+                || chrono::DateTime::parse_from_rfc3339(t)
+                    .is_ok_and(|v| v.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true) != *t)
+            {
+                return Err(crate::error::TapeError::Ltfs(
+                    "时间必须为四位年份的LTFS UTC纳秒格式".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.readonly.is_none() && self.access_time.is_none() && self.modify_time.is_none()
+    }
+}
+
 /// 扩展属性（LTFS 2.5.1 §9.2.13）。`value` 原样保存索引里的文本；
 /// `base64 == true` 表示索引里带 `type="base64"`，`value` 是编码后的文本。
 /// 原样保存是为了回写时逐字节不变。

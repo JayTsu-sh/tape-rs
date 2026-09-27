@@ -236,6 +236,28 @@ impl LtfsIndex {
         Ok(())
     }
 
+    pub fn change_node_metadata(
+        &mut self,
+        path: &str,
+        change: &super::index::MetadataChange,
+    ) -> Result<()> {
+        change.validate()?;
+        let (meta, _) = self.node_metadata(path)?;
+        if let Some(v) = change.readonly {
+            meta.readonly = v;
+        }
+        if let Some(v) = &change.access_time {
+            meta.access_time = v.clone();
+        }
+        if let Some(v) = &change.modify_time {
+            meta.modify_time = v.clone();
+        }
+        if !change.is_empty() {
+            meta.change_time = super::label::ltfs_time_now();
+        }
+        Ok(())
+    }
+
     pub fn set_node_readonly(&mut self, path: &str, readonly: bool) -> Result<()> {
         let (meta, _) = self.node_metadata(path)?;
         meta.readonly = readonly;

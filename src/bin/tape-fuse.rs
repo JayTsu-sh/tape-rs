@@ -56,10 +56,10 @@ impl<B: Backend> Adapter<B> {
             ino: INodeNo(a.ino),
             size: a.size,
             blocks: a.size.div_ceil(512),
-            atime: UNIX_EPOCH,
+            atime: a.atime,
             mtime: a.mtime,
-            ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH,
+            ctime: a.ctime,
+            crtime: a.crtime,
             kind: if a.is_symlink {
                 FileType::Symlink
             } else {
@@ -67,10 +67,9 @@ impl<B: Backend> Adapter<B> {
             },
             perm: if a.is_symlink {
                 0o777
-            } else if a.is_dir {
-                0o755
             } else {
-                0o644
+                let base = if a.is_dir { 0o755 } else { 0o644 };
+                if a.readonly { base & !0o222 } else { base }
             },
             nlink: if a.is_dir { 2 } else { 1 },
             uid: self.uid,
@@ -80,6 +79,43 @@ impl<B: Backend> Adapter<B> {
             flags: 0,
         }
     }
+}
+
+// Reject out-of-range kernel timestamps before chrono's infallible conversion.
+fn ltfs_timestamp(time: SystemTime) -> Res<String> {
+    let min = UNIX_EPOCH - Duration::from_secs(62_167_219_200);
+    let max = UNIX_EPOCH + Duration::new(253_402_300_799, 999_999_999);
+    if time < min || time > max {
+        return Err(libc::EINVAL);
+    }
+    Ok(chrono::DateTime::<chrono::Utc>::from(time)
+        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
+}
+
+#[test]
+fn ltfs_timestamp_bounds_do_not_panic() {
+    let min = UNIX_EPOCH - Duration::from_secs(62_167_219_200);
+    let max = UNIX_EPOCH + Duration::new(253_402_300_799, 999_999_999);
+    assert_eq!(
+        ltfs_timestamp(min).unwrap(),
+        "0000-01-01T00:00:00.000000000Z"
+    );
+    assert_eq!(
+        ltfs_timestamp(max).unwrap(),
+        "9999-12-31T23:59:59.999999999Z"
+    );
+    assert_eq!(
+        ltfs_timestamp(min - Duration::from_nanos(1)),
+        Err(libc::EINVAL)
+    );
+    assert_eq!(
+        ltfs_timestamp(max + Duration::from_nanos(1)),
+        Err(libc::EINVAL)
+    );
+    assert_eq!(
+        ltfs_timestamp(UNIX_EPOCH + Duration::from_secs(20_000_000_000_000)),
+        Err(libc::EINVAL)
+    );
 }
 
 fn kind(dir: bool) -> FileType {
@@ -159,21 +195,57 @@ impl<B: Backend + 'static> Filesystem for Adapter<B> {
         flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        if mode.is_some()
-            || uid.is_some()
-            || gid.is_some()
-            || atime.is_some()
-            || mtime.is_some()
-            || ctime.is_some()
-            || crtime.is_some()
+        if crtime.is_some()
             || chgtime.is_some()
             || bkuptime.is_some()
             || flags.is_some()
+            || (ctime.is_some()
+                && mode.is_none()
+                && uid.is_none()
+                && gid.is_none()
+                && size.is_none()
+                && atime.is_none()
+                && mtime.is_none())
         {
             reply.error(Errno::EOPNOTSUPP);
             return;
         }
-        match size.map_or_else(|| self.fs.getattr(ino.0), |s| self.fs.truncate(ino.0, s)) {
+        let now = SystemTime::now();
+        let timestamp = |t| {
+            ltfs_timestamp(match t {
+                TimeOrNow::SpecificTime(t) => t,
+                TimeOrNow::Now => now,
+            })
+        };
+        let change = (|| -> Res<_> {
+            Ok(tape_rs::ltfs::index::MetadataChange {
+                readonly: mode.map(|m| m & 0o222 == 0),
+                access_time: atime.map(timestamp).transpose()?,
+                modify_time: mtime.map(timestamp).transpose()?,
+            })
+        })();
+        let change = match change {
+            Ok(change) => change,
+            Err(e) => {
+                reply.error(Errno::from_i32(e));
+                return;
+            }
+        };
+        if change.validate().is_err() {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        let result = (|| {
+            if let Some(size) = size {
+                self.fs.truncate(ino.0, size)?;
+            }
+            if !change.is_empty() {
+                self.fs.change_metadata(ino.0, &change)?;
+            }
+            // LTFS ownership is supplied by the mount, not stored per inode.
+            self.fs.getattr(ino.0)
+        })();
+        match result {
             Ok(a) => reply.attr(&Duration::ZERO, &self.attr(a)),
             Err(e) => reply.error(Errno::from_i32(e)),
         }

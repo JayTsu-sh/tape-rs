@@ -709,6 +709,17 @@ impl Client {
         }
     }
 
+    /// 修改当前写入卷的原生时间/只读标记；未确认结果不重放。
+    pub fn change_metadata(
+        &mut self,
+        path: &str,
+        change: &crate::ltfs::index::MetadataChange,
+    ) -> Result<()> {
+        let body = serde_json::json!({"readonly":change.readonly,"access_time":change.access_time,"modify_time":change.modify_time}).to_string();
+        let route = format!("/metadata?path={}", encode_query(path));
+        self.namespace_change("POST", &route, path, Some(body.as_bytes()))
+    }
+
     pub fn mkdir(&mut self, path: &str) -> Result<()> {
         self.directory_change("POST", path)
     }

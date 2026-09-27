@@ -832,6 +832,17 @@ impl<'a> LtfsVolume<'a> {
         Ok(())
     }
 
+    pub fn change_node_metadata(
+        &mut self,
+        path: &str,
+        change: &super::index::MetadataChange,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        self.working.change_node_metadata(path, change)?;
+        self.dirty |= !change.is_empty();
+        Ok(())
+    }
+
     pub fn set_node_readonly(&mut self, path: &str, readonly: bool) -> Result<()> {
         self.ensure_writable()?;
         self.working.set_node_readonly(path, readonly)?;

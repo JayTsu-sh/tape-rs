@@ -23,7 +23,7 @@ tape-fuse -e 127.0.0.1:7401 --cache-dir /tmp/tape-cache /tmp/tape-mount
 - 写入支持 `O_RDWR`、非截断打开、任意偏移覆盖、`O_APPEND` 和任意长度截断；多个写句柄共享内容及上传状态。非截断写首次需要完整下载旧内容。`O_EXCL` 提供只创建保护。
 - 服务端读取只选择已提交文件；只有服务端在途版本且没有本地文件时返回 `EBUSY`。首次读打开下载整个已提交文件，因此可能等待磁带读取。同一 inode 的本地句柄共享内容，本挂载写入在 fsync/close 前可读；覆盖和截断对旧句柄及映射可见。删除后已有句柄继续引用旧文件，同名重建使用新 inode。
 - `mkdir`/`rmdir` 等待 LTFS 索引提交；空目录跨挂载和节点接管保留。`mkdir` 要求父目录存在，`rmdir` 拒绝非空目录及在途子路径。目录流在打开时取快照。
-- `rename` 支持当前写入卷内的文件和目录原子改名、同类型目标替换，以及 `RENAME_NOREPLACE`；目录替换要求目标为空。保留源 inode、UID、extent、mtime 和 xattr。跨带源/目标或不在当前写入卷的源仍返回 `EXDEV`；复制加删除回退不具备原子性。权限/时间修改仍不支持；符号链接支持创建及读取，已有符号链接可通过 FUSE 的 lstat/readlink 和内核路径解析读取，读取链接目标时仍校验目标文件版本。可写扩展属性的范围见下文。
+- `rename` 支持当前写入卷内的文件和目录原子改名、同类型目标替换，以及 `RENAME_NOREPLACE`；目录替换要求目标为空。保留源 inode、UID、extent、mtime 和 xattr。跨带源/目标或不在当前写入卷的源仍返回 `EXDEV`；复制加删除回退不具备原子性。权限/时间修改的原生映射见下文；符号链接支持创建及读取，已有符号链接可通过 FUSE 的 lstat/readlink 和内核路径解析读取，读取链接目标时仍校验目标文件版本。可写扩展属性的范围见下文。
 
 `user.tape.state=local` 表示本地内容尚未上传，不能据此认为已归档。其他 user.tape 属性描述服务端已提交版本。
 
@@ -73,7 +73,7 @@ mv 的复制和删除不是原子操作，目标 close 成功仍只表示暂存�
 本机内核另有两项显式挂载回归：远端在 LOOKUP 与 OPEN 之间变长/变短后，逐块读取仍得到完整新内容；已有只读映射时外部替换触发新 open 的 ESTALE，旧映射保留内容，全部释放后重开刷新。未保留实验性的“首次 OPEN 与上次属性长度不同即拒绝”限制，因为移除该限制的实际挂载测试同样通过；这不代表提供跨客户端实时一致性。两项测试使用内存后端，尚未在 Rocky 5.14 重跑。
 
 
-LE 后续能力实测及实现进度见 [LE/Holo 能力矩阵](../.scratch/ltfs-ha/le-capabilities-holo-20260924.md)。随机写、原生目录、同写入卷 rename、可写 xattr 和符号链接已实现并部署。LE 权限/时间语义仍待实现；user.ltfs.sync 已隔离验收，普通 fsync 保留更强归档确认，不能称为完全相同的 LE 同步语义。
+LE 后续能力实测及实现进度见 [LE/Holo 能力矩阵](../.scratch/ltfs-ha/le-capabilities-holo-20260924.md)。随机写、原生目录、同写入卷 rename、可写 xattr 和符号链接已实现并部署。LE 权限/时间语义已接通，现场验收状态见交接入口；user.ltfs.sync 已隔离验收，普通 fsync 保留更强归档确认，不能称为完全相同的 LE 同步语义。
 
 ### LTFS 索引持久化（2.5.1）
 
@@ -156,3 +156,14 @@ os.setxattr('/mnt/tape', 'user.ltfs.sync', b'1')
 现有 fsync 仍提供文件内容与索引归档确认，比 IBM LE 仅刷新数据的 fsync 保证更强；这里没有把暂存成功改称持久化成功。
 
 硬链接不支持：LTFS 2.5.1 没有标准化的共享inode硬链接表示，tape-fuse保留EOPNOTSUPP，目标不会被创建。IBM LE 2.4.8.3实测返回ENOSYS；不以复制或符号链接替代硬链接。符号链接保持现有支持。
+
+
+## 原生权限与时间修改
+
+FUSE chmod/fchmod 将任意写位映射为 LTFS readonly=false；没有写位则为 true。文件基准模式保持0644，目录0755；readonly清除全部写位，符号链接仍报告0777。其他 mode 位不写入索引。chown/fchown/lchown 成功但不改变挂载属主 uid/gid，与 LE 的挂载所有权模型一致。创建时的 mode 仍不作为逐文件 POSIX 权限保存；需要只读标志时显式 chmod。合成挂载根不支持原生属性修改。
+
+utime/utimes/utimensat/futimens 的显式 atime/mtime 使用标准 LTFS 纳秒 UTC 字段持久化，未指定字段保留；change_time由服务端更新，creation_time/backup_time/UID/extent/哈希保持。不会因读操作自动提交 atime。FUSE只读标志由内核 default_permissions 检查，root及已打开写句柄仍按Linux权限语义处理；HTTP/Rust接口不提供逐用户POSIX权限检查。
+
+Rust Client::change_metadata(path, MetadataChange) 对应 POST /metadata?path=...，JSON仅接受readonly、access_time、modify_time，可省略或null。时间必须为四位年份、九位小数的UTC规范格式；空修改、未知字段、错误类型和非法时间拒绝。只支持当前写入卷原生文件/目录/链接；跨卷EXDEV，缺失路径ENOENT，在途冲突EBUSY。FUSE修改前同步已有writer；201才表示索引提交，结果未定或响应丢失不重放。
+
+文件catalog metadata新增node对象，沿用已有JSON列与日志字段，没有新表、私有磁带格式或依赖。旧记录在装带对账后补齐；新接口需服务端与客户端统一升级。Attr新增只读与时间字段，直接构造该Rust结构的调用方需适配。内容覆盖保留已知readonly标志，时间仍遵循内容写入规则。

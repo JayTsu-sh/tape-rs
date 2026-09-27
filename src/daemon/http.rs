@@ -819,6 +819,65 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
             let (code, reason, body) = task_json(task, &st);
             respond_json(&mut conn, code, reason, body)
         }
+        ("POST", "/metadata") => {
+            let Some(path) = query_param(query, "path") else {
+                return service_error(&mut conn, ctx, ServiceError::BadPath("缺少路径".into()));
+            };
+            let Some(len) = content_length.filter(|n| *n <= 1024) else {
+                return service_error(
+                    &mut conn,
+                    ctx,
+                    ServiceError::BadPath("属性请求长度非法".into()),
+                );
+            };
+            if expects_continue {
+                conn.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+            }
+            let mut body = vec![0; len as usize];
+            reader.read_exact(&mut body)?;
+            let parsed = (|| -> Option<crate::ltfs::index::MetadataChange> {
+                let value: Value = serde_json::from_slice(&body).ok()?;
+                let fields = value.as_object()?;
+                if fields
+                    .keys()
+                    .any(|k| !matches!(k.as_str(), "readonly" | "access_time" | "modify_time"))
+                {
+                    return None;
+                }
+                let boolean = match value.get("readonly") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(v.as_bool()?),
+                };
+                let time = |name| -> Option<Option<String>> {
+                    match value.get(name) {
+                        None | Some(Value::Null) => Some(None),
+                        Some(v) => Some(Some(v.as_str()?.to_string())),
+                    }
+                };
+                Some(crate::ltfs::index::MetadataChange {
+                    readonly: boolean,
+                    access_time: time("access_time")?,
+                    modify_time: time("modify_time")?,
+                })
+            })();
+            let Some(change) = parsed else {
+                return service_error(
+                    &mut conn,
+                    ctx,
+                    ServiceError::BadPath("属性请求字段非法".into()),
+                );
+            };
+            let task = match ctx.files.change_metadata(&percent_decode(path), &change) {
+                Ok(t) => t,
+                Err(e) => return service_error(&mut conn, ctx, e),
+            };
+            let st = ctx
+                .files
+                .wait_task(task, ctx.wait_timeout)
+                .unwrap_or(TaskStatus::Staged);
+            let (code, reason, body) = task_json(task, &st);
+            respond_json(&mut conn, code, reason, body)
+        }
         ("POST", "/symlinks") => {
             let (Some(path), Some(target)) =
                 (query_param(query, "path"), query_param(query, "target"))

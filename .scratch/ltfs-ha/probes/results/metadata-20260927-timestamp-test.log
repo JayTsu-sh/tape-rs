@@ -1,0 +1,9 @@
+   Compiling tape-rs v0.1.0 (/work/jay/tape-rs-ltfs-recovery-ibm-interop)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.59s
+     Running unittests src/bin/tape-fuse.rs (/work/cargo-target/debug/deps/tape_fuse-b3f8b4f9fc04aa12)
+
+running 1 test
+test ltfs_timestamp_bounds_do_not_panic ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+

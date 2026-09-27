@@ -3815,3 +3815,105 @@ fn directory_commit_failure_preserves_reason_and_is_not_replayed() {
     assert!(fresh.stat("/empty").unwrap().is_none());
     c.shutdown();
 }
+
+#[test]
+fn native_metadata_updates_preserve_data_and_survive_takeover() {
+    use tape_rs::ltfs::index::MetadataChange;
+    use tape_rs::tapefs::{ClientBackend, TapeFs};
+    let c = Cluster::start_with("native-metadata", false);
+    let (leader, round) = c.wait_serving(None, 0);
+    c.wait("属性服务开放", || {
+        c.services[&leader].serving_round() == Some(round)
+    });
+    let endpoints = c.start_http();
+    let mut cl = Client::new(endpoints.clone());
+    cl.put("/file", b"unchanged content").unwrap();
+    cl.mkdir("/dir").unwrap();
+    cl.symlink("file", "/link").unwrap();
+    cl.setxattr("/file", "user.binary", &[0, 255], 0).unwrap();
+    let change = MetadataChange {
+        readonly: Some(true),
+        access_time: Some("2009-02-13T23:31:30.123456789Z".into()),
+        modify_time: Some("2009-02-13T23:31:31.987654321Z".into()),
+    };
+    let old = cl.stat("/file").unwrap().unwrap();
+    for path in ["/file", "/dir", "/link"] {
+        cl.change_metadata(path, &change).unwrap();
+    }
+    let after = cl.stat("/file").unwrap().unwrap();
+    assert_eq!(after.sha256, old.sha256);
+    assert_eq!(after.length, old.length);
+    assert_eq!(
+        after.metadata["node"]["creation_time"],
+        old.metadata["node"]["creation_time"]
+    );
+    assert!(after.version > old.version);
+    assert_eq!(cl.get("/file").unwrap(), b"unchanged content");
+    assert!(
+        cl.change_metadata(
+            "/file",
+            &MetadataChange {
+                modify_time: Some("invalid".into()),
+                ..Default::default()
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(cl.stat("/file").unwrap().unwrap().version, after.version);
+    let fs = TapeFs::new(
+        ClientBackend::new(Client::new(endpoints.clone())),
+        c.dir.join("metadata-cache"),
+    )
+    .unwrap();
+    let a = fs.attr_of("/file").unwrap();
+    assert!(a.readonly);
+    assert_eq!(
+        chrono::DateTime::<chrono::Utc>::from(a.atime)
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        change.access_time.clone().unwrap()
+    );
+    let writer = fs.open(a.ino, nix::libc::O_RDWR).unwrap();
+    fs.write(writer, 0, b"changed").unwrap();
+    fs.change_metadata(a.ino, &change).unwrap();
+    assert!(fs.getattr(a.ino).unwrap().readonly);
+    assert_eq!(
+        chrono::DateTime::<chrono::Utc>::from(fs.getattr(a.ino).unwrap().mtime)
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        change.modify_time.clone().unwrap()
+    );
+    fs.release(writer);
+    drop(fs);
+    c.isolated.lock().unwrap().insert(leader);
+    let (next, next_round) = c.wait_serving(Some(leader), round + 1);
+    c.wait("接管后属性服务开放", || {
+        c.services[&next].serving_round() == Some(next_round)
+    });
+    let mut fresh = Client::new(vec![endpoints[next as usize - 1].clone()]);
+    for path in ["/file", "/dir", "/link"] {
+        let stat = fresh.stat(path).unwrap().unwrap();
+        assert_eq!(stat.metadata["node"]["readonly"], true);
+        assert_eq!(
+            stat.metadata["node"]["access_time"],
+            change.access_time.clone().unwrap()
+        );
+        assert_eq!(
+            stat.metadata["node"]["modify_time"],
+            change.modify_time.clone().unwrap()
+        );
+    }
+    assert_eq!(fresh.get("/file").unwrap(), b"changeded content");
+    fresh
+        .change_metadata(
+            "/file",
+            &MetadataChange {
+                readonly: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        fresh.stat("/file").unwrap().unwrap().metadata["node"]["readonly"],
+        false
+    );
+    c.shutdown();
+}

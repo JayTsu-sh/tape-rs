@@ -496,3 +496,7 @@ Holo隔离目录 /home/rocky/tape-rs-namespace-20260927，ltfsd SHA256 104099542
 用户授权按 remaining-implementation.md 顺序完成文档、目录未定根因、LE权限时间、性能、正式发布。文档 da34019。目录根因见 directory-outcome-20260927.md：旧Leader HTTP窗口的未定是正确语义；持久化测试绑定新节点，另加未定不重放用例，客户端保留服务端原因。219测试通过7忽略、严格Clippy/fmt/check通过；160次复测和实际Holo故障/冷FUSE通过。
 
 最新关闭 /home/rocky/tape-rs-directory-outcome-20260927/test-data，node2/round246，1139行，SR1 Full41/SR2 Full3，slot8/9，备份 holo-directory-outcome-20260927。正式恢复node1 term52/round454，53行逐字段不变，原9文件复验通过；正式二进制未升级。隔离/strace/FUSE已停止缓存空。下一项3：LE权限时间语义。物理设备仍暂缓。
+
+## 2026-09-27 新剩余队列第3项完成
+
+见metadata-20260927.md：原生readonly/atime/mtime、固定挂载所有权；FUSE/Client/HTTP贯通，LE双向回写及接管冷FUSE通过。全套221通过7忽略，新增边界1项通过；严格Clippy/fmt/check通过。最新关闭metadata/test-data，node2 round295、1143行，SR1 Full52/SR2 Full3槽8/9；LE SR2501L08Full52未分配。介质备份holo-metadata-20260927。正式恢复node1 term53/round459，原53行及9文件一致，正式未升级。下一项4：性能基线与按证据优化，然后第5项正式发布。

@@ -44,6 +44,7 @@ pub fn catalog_of(index: &LtfsIndex) -> (Vec<FileRec>, u64) {
             bytes += f.length;
             let mut metadata = serde_json::json!({
                 "modify_time": f.meta.modify_time,
+                "node": {"readonly":f.meta.readonly,"creation_time":f.meta.creation_time,"change_time":f.meta.change_time,"modify_time":f.meta.modify_time,"access_time":f.meta.access_time,"backup_time":f.meta.backup_time},
                 "xattrs": f.xattrs.iter().map(|x| serde_json::json!({"key": x.key, "value": x.value, "base64": x.base64})).collect::<Vec<_>>()
             });
             if let Some(target) = &f.symlink {
@@ -285,6 +286,7 @@ pub struct Upload {
     /// 同卷引用改名：(原路径，是否为整棵子树的根操作)。
     pub(crate) rename_from: Option<(String, bool)>,
     /// (索引属性名，设置值；None表示删除)，只修改原生节点。
+    pub(crate) node_change: Option<crate::ltfs::index::MetadataChange>,
     pub(crate) xattr_change: Option<(String, Option<crate::ltfs::index::Xattr>)>,
     pub(crate) metadata: Option<crate::ltfs::volume::FileMetadata>,
 }
@@ -1065,7 +1067,11 @@ impl FileService {
                     base64: attr["base64"].as_bool().ok_or_else(malformed)?,
                 });
             }
-            Ok(Some(crate::ltfs::volume::FileMetadata::replacement(xattrs)))
+            let mut metadata = crate::ltfs::volume::FileMetadata::replacement(xattrs);
+            metadata.meta.readonly = current.metadata["node"]["readonly"]
+                .as_bool()
+                .unwrap_or(false);
+            Ok(Some(metadata))
         })();
         match metadata {
             Ok(metadata) => self.finish_with_metadata(h, len, metadata),
@@ -1106,6 +1112,7 @@ impl FileService {
                 symlink_target: None,
                 rename_from: None,
                 xattr_change: None,
+                node_change: None,
                 directory: false,
                 metadata,
             });
@@ -1335,6 +1342,7 @@ impl FileService {
                 symlink_target: None,
                 rename_from: None,
                 xattr_change: None,
+                node_change: None,
                 metadata: None,
             });
             let now = Instant::now();
@@ -1429,6 +1437,77 @@ impl FileService {
             symlink_target: None,
             rename_from: None,
             xattr_change: Some((key, attr)),
+            node_change: None,
+            metadata: None,
+        });
+        let now = Instant::now();
+        s.oldest.get_or_insert(now);
+        s.newest = Some(now);
+        g.tasks.insert(task, TaskStatus::Staged);
+        g.next_task += 1;
+        drop(g);
+        self.kick();
+        Ok(task)
+    }
+
+    /// 当前写入卷上的原生权限/时间修改，与其他命名空间变更互斥。
+    pub fn change_metadata(
+        &self,
+        path: &str,
+        change: &crate::ltfs::index::MetadataChange,
+    ) -> Result<u64, ServiceError> {
+        change
+            .validate()
+            .map_err(|e| ServiceError::BadPath(e.to_string()))?;
+        if change.is_empty() {
+            return Err(ServiceError::BadPath("属性修改不能为空".into()));
+        }
+        let path = norm(path)?;
+        let (state, live) = self.namespace_snapshot(&path)?;
+        let mut g = self.lock();
+        let task = g.next_task;
+        let why = g.why_not.clone();
+        let s = g.serving.as_mut().ok_or(ServiceError::NotServing(why))?;
+        if s.draining {
+            return Err(ServiceError::NotServing("正在停机".into()));
+        }
+        let live = Self::admission_view(s, &state, &path, live)?;
+        check_pending(s, &path)?;
+        let directory = *live
+            .get(&path)
+            .ok_or_else(|| ServiceError::NotFound(path.clone()))?;
+        let st = s
+            .recent
+            .get(&path)
+            .filter(|st| !st.deleted && st.barcode == s.tape.barcode)
+            .ok_or_else(|| ServiceError::CrossDevice(path.clone()))?;
+        let len = st.len;
+        if let Some(reason) = s.switch {
+            return Err(ServiceError::SwitchingTape(reason.into()));
+        }
+        s.state.open_session(task, u64::MAX);
+        let admitted = s
+            .state
+            .admit(task, &path, 0, s.opened.elapsed().as_secs())
+            .and_then(|_| s.state.stage_reference(&path, len))
+            .and_then(|_| s.state.complete(&path));
+        if let Err(e) = admitted {
+            let _ = s.state.cancel(task);
+            return Err(map_state(e));
+        }
+        s.namespace_pending.insert(path.clone());
+        s.admitted += 1;
+        s.queue.push_back(Upload {
+            task,
+            path,
+            spool: PathBuf::new(),
+            len,
+            delete: false,
+            directory,
+            symlink_target: None,
+            rename_from: None,
+            xattr_change: None,
+            node_change: Some(change.clone()),
             metadata: None,
         });
         let now = Instant::now();
@@ -1573,6 +1652,7 @@ impl FileService {
             symlink_target,
             rename_from: None,
             xattr_change: None,
+            node_change: None,
             metadata,
         });
         let now = Instant::now();
@@ -1668,6 +1748,7 @@ impl FileService {
                 symlink_target: None,
                 rename_from: Some((path.clone(), *path == from)),
                 xattr_change: None,
+                node_change: None,
             });
         }
         let removals: Vec<_> = uploads
@@ -1684,6 +1765,7 @@ impl FileService {
                 symlink_target: None,
                 rename_from: None,
                 xattr_change: None,
+                node_change: None,
             })
             .collect();
         uploads.extend(removals);

@@ -553,3 +553,52 @@ fn read_rejects_a_premature_filemark() {
         .unwrap_err();
     assert!(err.to_string().contains("提前结束"), "{err}");
 }
+
+#[test]
+fn native_metadata_preserves_uid_extents_and_rejects_invalid_times_atomically() {
+    use tape_rs::ltfs::index::MetadataChange;
+    let (_lib, dev) = formatted_drive();
+    let mut vol = LtfsVolume::mount(&dev).unwrap();
+    vol.append_file("file", &mut Cursor::new(b"same data"))
+        .unwrap();
+    vol.commit().unwrap();
+    let before = vol.index().find_file("file").unwrap().clone();
+    let change = MetadataChange {
+        readonly: Some(true),
+        access_time: Some("0000-01-01T00:00:00.000000000Z".into()),
+        modify_time: Some("9999-12-31T23:59:59.999999999Z".into()),
+    };
+    vol.change_node_metadata("file", &change).unwrap();
+    vol.commit().unwrap();
+    let mut mounted = LtfsVolume::mount(&dev).unwrap();
+    let after = mounted.index().find_file("file").unwrap().clone();
+    assert_eq!(after.extents, before.extents);
+    assert_eq!(after.meta.file_uid, before.meta.file_uid);
+    assert_eq!(after.xattrs, before.xattrs);
+    assert_eq!(after.meta.creation_time, before.meta.creation_time);
+    assert!(after.meta.readonly);
+    assert_eq!(after.meta.modify_time, change.modify_time.unwrap());
+    for bad in [
+        "",
+        "x",
+        "2009-02-30T00:00:00.000000000Z",
+        "2009-01-01T00:00:00Z",
+        "2009-01-01T00:00:00.000000000+00:00",
+        "中文中文中文中文中文",
+    ] {
+        assert!(
+            mounted
+                .change_node_metadata(
+                    "file",
+                    &MetadataChange {
+                        readonly: Some(false),
+                        modify_time: Some(bad.into()),
+                        ..Default::default()
+                    }
+                )
+                .is_err()
+        );
+    }
+    mounted.commit().unwrap();
+    assert_eq!(mounted.index().find_file("file").unwrap(), &after);
+}

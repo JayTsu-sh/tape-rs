@@ -29,9 +29,9 @@ The reclaim fix routes symlinks through metadata migration rather than reading t
 
 ## Isolated media and next task
 
-Preserve pool UUID `51cfd06c-bf79-4bbf-ac85-886608a0ab4b` (`sr`) and its two 512MiB cartridges. Latest **closed isolated data** is `/home/rocky/tape-rs-directory-outcome-20260927/test-data` on .71/.72/.74, ports 7500/7501, node2/round246 at shutdown, 1139 rows. Do not resume either older symlink-reclaim or reclaim-cut directory: media have moved forward.
+Preserve pool UUID `51cfd06c-bf79-4bbf-ac85-886608a0ab4b` (`sr`) and its two 512MiB cartridges. Latest **closed isolated data** is `/home/rocky/tape-rs-metadata-20260927/test-data` on .71/.72/.74, ports 7500/7501, node2/round295 at shutdown, 1143 rows. Do not resume either older symlink-reclaim or reclaim-cut directory: media have moved forward.
 
-- `SR2501L8`: slot8, destination, Full generation41 after directory outcome verification and normal shutdown, six original links, LE file, 1100 benchmark files and three sync files.
+- `SR2501L8`: slot8, destination, Full generation52 after native metadata and LE roundtrip verification, six original links, LE file, 1100 benchmark files and three sync files.
 - `SR2502L8`: slot9, Full generation3 with the deleted checkpoint test file’s superseded copy; the live catalog tombstone is on SR1.
 - `RT2502L8`: slot7, separate history, untouched.
 - `TS1001L08`: first TAPERS drive; formal pool `rc` still contains only TS1000L08/TS1001L08.
@@ -55,3 +55,9 @@ Detailed chronology: `.scratch/ltfs-ha/handoff-to-codex.md`; file semantics: `.s
 Items 1–2 complete: research status consolidated; [directory outcome investigation](../.scratch/ltfs-ha/directory-outcome-20260927.md) identified cached old-leader requests after fencing, corrected the persistence test, and preserved server diagnostics without automatic replay. 219 tests passed, 7 ignored; strict Clippy/fmt/check passed; Holo fault and cold FUSE verification passed. Next: LE permissions/time semantics, then performance and formal rollout.
 
 Latest formal state: node1 term52/round454, original 53 catalog rows unchanged and 9 files verified. Formal binaries remain cda359d deployment. Latest closed isolated data is directory-outcome/test-data (SR1 Full41, SR2 Full3, 1139 rows); use it instead of sync-boundary data. Media backups: /home/rocky/holo-directory-outcome-20260927. All isolated processes/tracers stopped and FUSE unmounted. Physical acceptance remains deferred.
+
+## Latest metadata queue checkpoint (2026-09-27)
+
+Items1–3 complete; [native metadata report](../.scratch/ltfs-ha/metadata-20260927.md) supersedes prior permission/time limitations. Next item4 performance, then item5 formal rollout. Latest closed isolated data /home/rocky/tape-rs-metadata-20260927/test-data: node2 round295,1143 rows,SR1 Full52/SR2 Full3; media backups /home/rocky/holo-metadata-20260927. LE SR2501L08 Full52 unassigned, after verified roundtrip. Formal node1 term53/round459,53 rows unchanged and9files verified; formal binaries remain unchanged. Software221 full-suite passes plus1 subsequent timestamp-boundary pass,7 ignored; strictClippy/fmt/check pass. All isolated/FUSE processes stopped,cacheempty.
+Latest metadata candidate ltfsd SHA256 `e5fe95d960ce606a401eaa4e107cb726bda3b0798a43d8cfa47a8f4a388eefe6`.
+Latest metadata candidate tape-fuse SHA256 `631113b4315ba882cc045274e4f284782cf423a06753d9af8fa41f32610cdf85`.
