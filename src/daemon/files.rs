@@ -1993,6 +1993,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn file_count_triggers_batch_without_capping_its_size() {
+        let dir = std::env::temp_dir().join(format!("file-service-batch-{}", uuid::Uuid::new_v4()));
+        let files = FileService::with_options(
+            dir.clone(),
+            BatchPolicy {
+                max_bytes: u64::MAX,
+                max_files: 50,
+                idle: Duration::from_secs(3600),
+                max_wait: Duration::from_secs(3600),
+            },
+            None,
+        )
+        .unwrap();
+        let index = LtfsIndex::empty(uuid::Uuid::new_v4(), "test".into(), 'b');
+        files.open(
+            1,
+            TapeIdent {
+                barcode: "TEST".into(),
+                pool_uuid: "pool".into(),
+            },
+            TapeLimits {
+                file_limit: 1000,
+                usable_capacity: 1 << 20,
+            },
+            &index,
+            4096,
+            true,
+        );
+        // 不启动执行器：排队和取批由测试显式控制，阈值不依赖线程调度速度。
+        for i in 0..51 {
+            let h = files.begin(&format!("/file-{i}"), 1).unwrap();
+            std::fs::write(&h.spool, b"x").unwrap();
+            files.ingest(&h, 1).unwrap();
+            files.finish(h, 1).unwrap();
+            if i == 48 {
+                assert!(files.due_in(1).unwrap() > Duration::ZERO);
+                assert!(files.take_batch(1).is_none());
+            } else if i >= 49 {
+                assert_eq!(files.due_in(1), Some(Duration::ZERO));
+            }
+        }
+        let (batch, uploads) = files.take_batch(1).unwrap();
+        assert_eq!(uploads.len(), 51);
+        assert_eq!(batch.cover.len(), 51);
+        files.close("test complete");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn service_reclaims_old_roots_without_invalidating_readers() {
         let dir =
             std::env::temp_dir().join(format!("file-service-reclaim-{}", uuid::Uuid::new_v4()));

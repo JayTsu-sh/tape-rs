@@ -1233,7 +1233,7 @@ fn uploads_are_batched_and_catalogued_on_every_node() {
     let base = svc.stat("/nothing").map(|_| ()).is_ok();
     assert!(base);
 
-    // 测试用的策略：每批最多 50 个文件、空闲 25 ms、最长等待 400 ms
+    // 测试策略：50 文件触发、空闲 25 ms、最长等待 400 ms；50 不是硬上限。
     let n = 130usize;
     let gens: Vec<u64> = thread::scope(|sc| {
         (0..n)
@@ -1271,12 +1271,9 @@ fn uploads_are_batched_and_catalogued_on_every_node() {
         "应当合批，而不是每个文件提交一次: {}",
         per_gen.len()
     );
-    // 文件数与字节数是**触发阈值**而不是硬上限：队列达到阈值就提交，取队列时把已到齐的全部带走
-    // （VolumeState 的冻结一次覆盖所有已完成的上传）。所以一批可以超过阈值，但阈值保证了不会无限攒着。
-    assert!(
-        per_gen.values().any(|&k| k >= 50),
-        "突发上传应当凑出达到阈值的批: {per_gen:?}"
-    );
+    // 空闲触发允许批次少于50，操作系统也不保证130个线程在25ms内全部完成上传。
+    // 文件数阈值与非硬上限由 file_count_triggers_batch_without_capping_its_size
+    // 在没有并发消费者的队列上确定性验证；此处验证真实合批与目录复制。
 
     // 一个慢速上传者：每个文件都在空闲触发之内到达，靠"最长等待"封顶
     let t0 = Instant::now();
