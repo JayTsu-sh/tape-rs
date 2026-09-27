@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/home/rocky/reclaim-le-20260927.py", line 18, in <module>
+    assert os.path.islink(p/name) and os.readlink(p/name)==target
+AssertionError

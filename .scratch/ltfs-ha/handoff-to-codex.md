@@ -478,3 +478,7 @@ Holo隔离目录 /home/rocky/tape-rs-namespace-20260927，ltfsd SHA256 104099542
 正式服务恢复node1 term47/round429，53行目录及池摘要完全不变，TS1001L08 Full120/TS1000L08 gen2，原9文件复验通过；正式二进制仍32bd5541…。EE三节点available、无任务、f3哈希不变、九publication ready。隔离进程与strace停止，FUSE卸载缓存清空。无物理设备验收。接续任务3：回收介质IBM LE往返。
 
 可复核材料：probes/namespace-checkpoint-20260927.py、namespace-read-20260927.py 及 results/namespace-20260927-*。生产源码只改错误链与返回分类，测试故障注入仅在测试transport。
+
+## 2026-09-27 回收介质 LE 往返通过
+
+见 holo-reclaim-le-20260927.md。最新关闭reclaim-le/test-data，SR1 Full8/SR2 Full3；正式term49/round439，53行/9文件一致。新LE SR2501L08 Full8取消分配；原TS1000L8恢复。下一项大目录性能。
