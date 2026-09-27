@@ -482,3 +482,7 @@ Holo隔离目录 /home/rocky/tape-rs-namespace-20260927，ltfsd SHA256 104099542
 ## 2026-09-27 回收介质 LE 往返通过
 
 见 holo-reclaim-le-20260927.md。最新关闭reclaim-le/test-data，SR1 Full8/SR2 Full3；正式term49/round439，53行/9文件一致。新LE SR2501L08 Full8取消分配；原TS1000L8恢复。下一项大目录性能。
+
+## 2026-09-27 大目录优化通过
+
+见holo-directory-perf-20260927.md；最新关闭directory-perf/test-data，SR1 Full24/SR2 Full3、1132行。正式term50/round444，53行/9文件不变。214测试通过7忽略，严格Clippy通过。下一项5。

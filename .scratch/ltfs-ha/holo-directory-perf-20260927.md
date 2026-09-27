@@ -20,3 +20,7 @@ Holo 隔离 sr 池，100及1000个独立小文件，每目录另有2个目录及
 兼容构建ltfsd SHA256 11e5512ef8f98f56a096619c1eefdcbd1078857a01f926a1c8a258dab8fbf12a，FUSE a43950d6cfb63551806ef8b23963a944336adfe89cef2a3a34b67d0b6e52a206；部署目录/home/rocky/tape-rs-directory-perf-20260927。正常停机后更换隔离程序，原数据1132行相同，node2/term16/round203，SR1 Full24 Complete。介质备份/home/rocky/holo-directory-perf-20260927，两带SHA校验；各节点before-optimization.tgz保存关闭状态。正式程序保持原32bd5541…。
 
 首次准备探针固定node1但当时node2为leader，503后改为从cluster读取leader重跑；未更改产品。首次全量内容检查的SSH包装58秒到期，未将其计为通过，改为持久化结果并独立执行完整冷缓存检查。
+
+冷缓存1100文件逐字节通过（77.43秒，与目录窗口分开），原LE文件/六种链接/属性/mtime复验通过。正式恢复node1/term50/round444，53行逐行不变，原9文件冷缓存验证通过；EE三节点available无任务、f3原摘要不变、9发布ready。FUSE已卸载、隔离进程停止、SR1 Full24槽8/SR2 Full3槽9。最新关闭数据directory-perf/test-data；下一项5。
+
+收尾首次逐行比较隔离catalog失败：正常停机完整索引及接管把1132行generation统一到24，除此字段外所有路径、内容摘要、版本和metadata逐项一致。正式catalog逐字段完全不变。这个预期索引代数变化明确记录，不把原始全字段比较描述为通过。
