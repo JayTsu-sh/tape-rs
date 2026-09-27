@@ -2948,6 +2948,10 @@ fn persistent_directories_survive_fuse_remount_and_takeover() {
     c.wait("接管后目录服务开放", || {
         c.services[&next].serving_round() == Some(next_round)
     });
+    // This checks persistence on the successor. The isolated old HTTP server can
+    // still accept a cached-leader request until its next ownership check; a
+    // mutation in that window correctly returns Indeterminate, not success.
+    let mut cl = Client::new(vec![endpoints[next as usize - 1].clone()]);
     assert!(cl.list_dir("/empty", false).unwrap().is_empty());
     assert_eq!(
         cl.stat("/empty").unwrap().unwrap().metadata["node"]["creation_time"],
@@ -3773,4 +3777,41 @@ fn explicit_sync_surfaces_checkpoint_failure_without_retrying() {
         );
         c.shutdown();
     }
+}
+
+#[test]
+fn directory_commit_failure_preserves_reason_and_is_not_replayed() {
+    use std::sync::atomic::Ordering;
+    use tape_rs::client::ClientError;
+    let c = Cluster::start_with("directory-commit-failure", false);
+    let (leader, round) = c.wait_serving(None, 0);
+    c.wait("目录服务开放", || {
+        c.services[&leader].serving_round() == Some(round)
+    });
+    let endpoints = c.start_http();
+    let mut cl = Client::new(endpoints.clone());
+    cl.mkdir("/empty").unwrap();
+    let before = cl.stat("/empty").unwrap().unwrap();
+    c.checkpoint_fault
+        .initiator
+        .store(leader as u32, Ordering::SeqCst);
+    let result = cl.rmdir("/empty");
+    assert_eq!(c.checkpoint_fault.initiator.load(Ordering::SeqCst), 0);
+    let Err(ClientError::Indeterminate(reason)) = result else {
+        panic!("未确认的目录提交应返回结果未定: {result:?}");
+    };
+    assert!(
+        reason.contains("sense_key=0x06") && reason.contains("ascq=0x03"),
+        "{reason}"
+    );
+    let (next, next_round) = c.wait_serving(Some(leader), round + 1);
+    c.wait("接管后目录服务开放", || {
+        c.services[&next].serving_round() == Some(next_round)
+    });
+    let mut fresh = Client::new(vec![endpoints[next as usize - 1].clone()]);
+    let recovered = fresh.stat("/empty").unwrap().unwrap();
+    assert_eq!(recovered.version, before.version, "未确认删除不得自动重放");
+    fresh.rmdir("/empty").unwrap();
+    assert!(fresh.stat("/empty").unwrap().is_none());
+    c.shutdown();
 }

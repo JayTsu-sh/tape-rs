@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/home/rocky/tape-rs-directory-outcome-20260927/fault.py", line 63, in <module>
+    assert stat[0]==200,stat
+AssertionError: (404, {'error': 'no_such_route'})

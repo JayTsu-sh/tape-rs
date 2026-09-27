@@ -29,9 +29,9 @@ The reclaim fix routes symlinks through metadata migration rather than reading t
 
 ## Isolated media and next task
 
-Preserve pool UUID `51cfd06c-bf79-4bbf-ac85-886608a0ab4b` (`sr`) and its two 512MiB cartridges. Latest **closed isolated data** is `/home/rocky/tape-rs-sync-boundary-20260927/test-data` on .71/.72/.74, ports 7500/7501, node3/round225 at shutdown, 1136 rows. Do not resume either older symlink-reclaim or reclaim-cut directory: media have moved forward.
+Preserve pool UUID `51cfd06c-bf79-4bbf-ac85-886608a0ab4b` (`sr`) and its two 512MiB cartridges. Latest **closed isolated data** is `/home/rocky/tape-rs-directory-outcome-20260927/test-data` on .71/.72/.74, ports 7500/7501, node2/round246 at shutdown, 1139 rows. Do not resume either older symlink-reclaim or reclaim-cut directory: media have moved forward.
 
-- `SR2501L8`: slot8, destination, Full generation30 after explicit sync and forced executor termination, six original links, LE file, 1100 benchmark files and three sync files.
+- `SR2501L8`: slot8, destination, Full generation41 after directory outcome verification and normal shutdown, six original links, LE file, 1100 benchmark files and three sync files.
 - `SR2502L8`: slot9, Full generation3 with the deleted checkpoint test file’s superseded copy; the live catalog tombstone is on SR1.
 - `RT2502L8`: slot7, separate history, untouched.
 - `TS1001L08`: first TAPERS drive; formal pool `rc` still contains only TS1000L08/TS1001L08.
@@ -49,3 +49,9 @@ Ordered unattended [tasks 0–5](../.scratch/ltfs-ha/autonomous-queue-20260927.m
 Detailed chronology: `.scratch/ltfs-ha/handoff-to-codex.md`; file semantics: `.scratch/ltfs-ha/file-contract.md` and `docs/file-client.md`. Probe scripts have fixed paths and explicit gates: inspect before running. Older deployment status in appended chronology is superseded by this summary and the latest dated entry.
 
 `.codegraph/` is absent in this worktree; do not initialize it. Save subsequent implementation, tests and handoff evidence on this branch. Push only when requested.
+
+## Remaining queue progress (2026-09-27)
+
+Items 1–2 complete: research status consolidated; [directory outcome investigation](../.scratch/ltfs-ha/directory-outcome-20260927.md) identified cached old-leader requests after fencing, corrected the persistence test, and preserved server diagnostics without automatic replay. 219 tests passed, 7 ignored; strict Clippy/fmt/check passed; Holo fault and cold FUSE verification passed. Next: LE permissions/time semantics, then performance and formal rollout.
+
+Latest formal state: node1 term52/round454, original 53 catalog rows unchanged and 9 files verified. Formal binaries remain cda359d deployment. Latest closed isolated data is directory-outcome/test-data (SR1 Full41, SR2 Full3, 1139 rows); use it instead of sync-boundary data. Media backups: /home/rocky/holo-directory-outcome-20260927. All isolated processes/tracers stopped and FUSE unmounted. Physical acceptance remains deferred.

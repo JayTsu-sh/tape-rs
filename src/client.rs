@@ -754,9 +754,13 @@ impl Client {
                     "目录 {} 尚未取得落带确认",
                     path
                 ))),
-                500 if r.json()["status"] == "indeterminate" => Err(ClientError::Indeterminate(
-                    format!("目录 {} 提交结果未定", path),
-                )),
+                500 if r.json()["status"] == "indeterminate" => {
+                    Err(ClientError::Indeterminate(format!(
+                        "目录 {} 提交结果未定: {}",
+                        path,
+                        r.json()["detail"].as_str().unwrap_or("服务端未提供原因")
+                    )))
+                }
                 status => Err(ClientError::Rejected {
                     status,
                     body: String::from_utf8_lossy(&r.body).into_owned(),
