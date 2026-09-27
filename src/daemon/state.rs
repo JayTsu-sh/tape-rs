@@ -399,6 +399,8 @@ pub mod tape_state {
     pub const CHECK: &str = "check";
     /// 正在回收：不再作为写入带候选，带上还活着的文件正在搬到同池的其他带上
     pub const RECLAIMING: &str = "reclaiming";
+    /// 迁出核验已持久化；源带可能已经清空，接管须完成初始化。
+    pub const REFORMATTING: &str = "reformatting";
     pub const ALL: &[&str] = &[
         APPENDABLE,
         DATA_FULL,
@@ -406,6 +408,7 @@ pub mod tape_state {
         LABEL_MISMATCH,
         CHECK,
         RECLAIMING,
+        REFORMATTING,
     ];
 }
 
@@ -498,7 +501,14 @@ impl ControlState {
             }
             Command::TapeUnassign { barcode } => Applied::Admin(self.tape_unassign(barcode)),
             Command::TapeState { barcode, state } => {
-                if self.tapes.contains_key(barcode) && tape_state::ALL.contains(&state.as_str()) {
+                if self.tapes.contains_key(barcode)
+                    && tape_state::ALL.contains(&state.as_str())
+                    && (state != tape_state::REFORMATTING
+                        || self
+                            .tape_state
+                            .get(barcode)
+                            .is_some_and(|s| s == tape_state::RECLAIMING))
+                {
                     self.tape_state.insert(barcode.clone(), state.clone());
                 }
                 Applied::Nothing
@@ -512,7 +522,7 @@ impl ControlState {
                 if self
                     .tape_state
                     .get(barcode)
-                    .is_some_and(|s| s == tape_state::RECLAIMING)
+                    .is_some_and(|s| s == tape_state::RECLAIMING || s == tape_state::REFORMATTING)
                 {
                     // 带被重新格式化了，摘要必须跟着回到第 1 代——这是唯一允许代数回退的地方
                     self.tape_summary.insert(
@@ -625,7 +635,9 @@ impl ControlState {
             .map(String::as_str)
             .unwrap_or(tape_state::APPENDABLE);
         match state {
-            tape_state::RECLAIMING => return Err(format!("{} 已在回收中", barcode)),
+            tape_state::RECLAIMING | tape_state::REFORMATTING => {
+                return Err(format!("{} 已在回收中", barcode));
+            }
             // 这两种状态说明带本身有问题：回收要读它的全部内容再格式化，先人工弄清楚
             tape_state::LABEL_MISMATCH | tape_state::CHECK => {
                 return Err(format!(
@@ -972,6 +984,79 @@ mod tests {
         };
         assert_eq!(restored.apply(8, &next), s.apply(8, &next));
         assert_eq!(restored, s);
+    }
+
+    #[test]
+    fn reformatting_requires_reclaim_and_survives_snapshot_until_completion() {
+        let mut s = ControlState::default();
+        s.apply(
+            1,
+            &Command::PoolCreate {
+                uuid: "p".into(),
+                name: "pool".into(),
+                file_limit: 100,
+            },
+        );
+        for (i, barcode) in ["T1", "T2"].into_iter().enumerate() {
+            s.apply(
+                2 + i as u64,
+                &Command::TapeAssign {
+                    barcode: barcode.into(),
+                    pool: "p".into(),
+                },
+            );
+        }
+        let phase = Command::TapeState {
+            barcode: "T1".into(),
+            state: tape_state::REFORMATTING.into(),
+        };
+        s.apply(4, &phase);
+        assert_ne!(
+            s.tape_state.get("T1").map(String::as_str),
+            Some(tape_state::REFORMATTING)
+        );
+        s.apply(
+            5,
+            &Command::TapeReclaim {
+                barcode: "T1".into(),
+            },
+        );
+        s.apply(6, &phase);
+        assert_eq!(s.tape_state["T1"], tape_state::REFORMATTING);
+        let snapshot = ControlSnapshot {
+            control: s,
+            source: 1,
+            directory_index: 6,
+        };
+        let mut s = ControlSnapshot::decode(&snapshot.encode()).unwrap().control;
+        assert_eq!(s.tape_state["T1"], tape_state::REFORMATTING);
+        for barcode in ["T1", "T2"] {
+            assert!(matches!(
+                s.apply(
+                    7,
+                    &Command::TapeReclaim {
+                        barcode: barcode.into()
+                    }
+                ),
+                Applied::Admin(Err(_))
+            ));
+        }
+        assert_eq!(
+            s.apply(
+                8,
+                &Command::TapeReclaimed {
+                    barcode: "T1".into(),
+                    volume_uuid: "new".into()
+                }
+            ),
+            Applied::Reclaimed
+        );
+        s.apply(9, &phase);
+        assert_eq!(
+            s.tape_state["T1"],
+            tape_state::APPENDABLE,
+            "迟到的初始化请求不能再次清空源带"
+        );
     }
 
     /// 回收会格式化源带，所以入口的校验要严：只对已归属、且状态说明带本身没问题的带受理，

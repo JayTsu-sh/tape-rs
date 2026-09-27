@@ -1516,8 +1516,22 @@ fn pending_reclaim(status: &SharedStatus) -> Option<String> {
     let st = status.lock().unwrap_or_else(|e| e.into_inner());
     st.tapes
         .iter()
-        .find(|(_, t)| t.state == tape_state::RECLAIMING)
+        .find(|(_, t)| {
+            matches!(
+                t.state.as_str(),
+                tape_state::RECLAIMING | tape_state::REFORMATTING
+            )
+        })
         .map(|(b, _)| b.clone())
+}
+
+fn reformatting(status: &SharedStatus, barcode: &str) -> bool {
+    status
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .tapes
+        .get(barcode)
+        .is_some_and(|t| t.state == tape_state::REFORMATTING)
 }
 
 fn pool_of(status: &SharedStatus, barcode: &str) -> Option<(String, String)> {
@@ -1552,7 +1566,9 @@ fn drive_reclaim(
         }
         match start_reclaim(a, opts, files, status, tx, &barcode) {
             Ok(()) => a.reclaim_failures = 0,
-            Err(e) if ownership_lost(&e) => return Err(e.to_string()),
+            Err(e) if ownership_lost(&e) || reformatting(status, &barcode) => {
+                return Err(e.to_string());
+            }
             Err(e) => {
                 // 干不了。驱动器不够是确定的；装不上、没有空驱动器再试几个周期。
                 // 之后都放弃并把带退回可写：留在 reclaiming 上既没有出口，又还会被继续写
@@ -1629,26 +1645,22 @@ fn start_reclaim(
         });
     }
     let drive = load_aside(a, barcode)?;
-    let vol = LtfsVolume::mount(a.devices[drive].dev.as_ref())?;
     let mut todo = Vec::new();
-    vol.index().walk_files(|p, _| todo.push(format!("/{}", p)));
-    vol.index().walk_directories(|p, _| {
-        if p != ".tapers" && !p.starts_with(".tapers/") {
-            todo.push(format!("/{}", p));
-        }
-    });
-    // 字典序搬，从末尾取，所以倒过来放。顺序固定便于换届之后接着看日志
-    todo.sort();
-    todo.reverse();
+    if !reformatting(status, barcode) {
+        let vol = LtfsVolume::mount(a.devices[drive].dev.as_ref())?;
+        vol.index().walk_files(|p, _| todo.push(format!("/{}", p)));
+        vol.index().walk_directories(|p, _| {
+            if p != ".tapers" && !p.starts_with(".tapers/") {
+                todo.push(format!("/{}", p));
+            }
+        });
+        todo.sort();
+        todo.reverse();
+    }
     info!(
-        "执行线程: 开始回收 {}（第 {} 代，带上 {} 个文件）→ 搬到 {}",
+        "执行线程: 恢复回收 {}（待搬迁 {} 个路径）",
         barcode,
-        vol.index().generation,
-        todo.len(),
-        files
-            .tape()
-            .map(|t| t.barcode)
-            .unwrap_or_else(|| "当前写入带".into())
+        todo.len()
     );
     a.reclaim = Some(Reclaim {
         barcode: barcode.to_string(),
@@ -1738,7 +1750,14 @@ fn reclaim_step(
     match finish_reclaim(a, opts, files, status, tx) {
         // 干完了，或者还在等目录把搬迁记录应用上来。两种情况都按正常节奏回来
         Ok(_) => Ok(false),
-        Err(e) if ownership_lost(&e) => Err(e.to_string()),
+        Err(e)
+            if ownership_lost(&e)
+                || a.reclaim
+                    .as_ref()
+                    .is_some_and(|r| reformatting(status, &r.barcode)) =>
+        {
+            Err(e.to_string())
+        }
         Err(e) => {
             let attention = !matches!(e, TapeError::NotReady(_));
             abort_reclaim(a, tx, &e.to_string(), attention);
@@ -1764,6 +1783,10 @@ fn copy_chunk(a: &mut Active, files: &FileService) -> Result<Chunk> {
         let r = a.reclaim.as_ref().expect("回收进行中");
         (r.drive, r.barcode.clone())
     };
+    let r = a.reclaim.as_ref().expect("回收进行中");
+    if r.todo.is_empty() && r.retry.is_empty() {
+        return Ok(Chunk::Done);
+    }
     let vol = LtfsVolume::mount(a.devices[di].dev.as_ref())?;
     loop {
         // 攒够一个批次就回去落带：暂存区同时只放得下一批
@@ -2008,7 +2031,10 @@ fn finish_reclaim(
         (r.drive, r.barcode.clone())
     };
     // 闸门一：目录里不能还有任何一条记录指向源带。目录经 Raft 应用有延迟，等它跟上来
-    if let Some((n, _)) = files.live_on(&source).filter(|(n, _)| *n > 0) {
+    let (n, _) = files
+        .live_on(&source)
+        .ok_or_else(|| TapeError::NotReady(format!("无法核验 {} 的目录引用", source)))?;
+    if n > 0 {
         let r = a.reclaim.as_mut().expect("回收进行中");
         r.waits += 1;
         if r.waits > RECLAIM_MAX_WAITS {
@@ -2022,37 +2048,47 @@ fn finish_reclaim(
     // 闸门二：源带索引里的每个路径，目录给出的当前位置都不在源带上。
     // 闸门一只看目录有什么，这一条还看带上有什么——带上有、目录压根不知道的文件也拦得住。
     let dev = a.devices[di].dev.as_ref();
-    let mut orphans = Vec::new();
-    {
-        let vol = LtfsVolume::mount(dev)?;
-        // 墓碑按它记的被删路径核对：那个路径的当前记录（新文件或搬过去的墓碑）必须在别的带上
-        let mut paths = Vec::new();
-        vol.index().walk_files(|p, f| {
-            if !is_tombstone_path(p) {
-                paths.push(format!("/{}", p));
-            } else if let Some(target) = f.xattr(XATTR_DELETED_PATH) {
-                paths.push(target.to_string());
-            }
-        });
-        vol.index().walk_directories(|p, _| {
-            if p != ".tapers" && !p.starts_with(".tapers/") {
-                paths.push(format!("/{}", p));
-            }
-        });
-        for path in paths {
-            match files.lookup(&path) {
-                Ok(Some(st)) if st.barcode != source => {}
-                _ => orphans.push(path),
+    if !reformatting(status, &source) {
+        let mut orphans = Vec::new();
+        {
+            let vol = LtfsVolume::mount(dev)?;
+            // 墓碑按它记的被删路径核对：那个路径的当前记录（新文件或搬过去的墓碑）必须在别的带上
+            let mut paths = Vec::new();
+            vol.index().walk_files(|p, f| {
+                if !is_tombstone_path(p) {
+                    paths.push(format!("/{}", p));
+                } else if let Some(target) = f.xattr(XATTR_DELETED_PATH) {
+                    paths.push(target.to_string());
+                }
+            });
+            vol.index().walk_directories(|p, _| {
+                if p != ".tapers" && !p.starts_with(".tapers/") {
+                    paths.push(format!("/{}", p));
+                }
+            });
+            for path in paths {
+                match files.lookup(&path) {
+                    Ok(Some(st)) if st.barcode != source => {}
+                    _ => orphans.push(path),
+                }
             }
         }
-    }
-    if let Some(first) = orphans.first() {
-        return Err(TapeError::Ltfs(format!(
-            "{} 上还有 {} 个路径没有着落（例如 {}）",
-            source,
-            orphans.len(),
-            first
-        )));
+        if let Some(first) = orphans.first() {
+            return Err(TapeError::Ltfs(format!(
+                "{} 上还有 {} 个路径没有着落（例如 {}）",
+                source,
+                orphans.len(),
+                first
+            )));
+        }
+
+        // 在销毁源带之前持久化核验结果；只观察已应用的阶段，不凭发出事件就 FORMAT。
+        let _ = tx.send(ExecEvent::TapeState {
+            round: a.round,
+            barcode: source.clone(),
+            state: tape_state::REFORMATTING.into(),
+        });
+        return Ok(false);
     }
 
     let (pool_uuid, pool_name) = pool_of(status, &source)

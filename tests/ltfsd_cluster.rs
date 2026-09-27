@@ -77,6 +77,8 @@ impl DirectoryFetch for FileFetch {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReclaimCut {
     BeforeFormat,
+    BeforeLabels,
+    PartialLabels,
     AfterMkltfs,
 }
 
@@ -84,6 +86,7 @@ struct FormatPause {
     initiator: std::sync::atomic::AtomicU32,
     cut: ReclaimCut,
     formatted: std::sync::atomic::AtomicBool,
+    label_written: std::sync::atomic::AtomicBool,
     entered: Sender<()>,
     resume: Mutex<std::sync::mpsc::Receiver<()>>,
     returned: Sender<bool>,
@@ -134,7 +137,7 @@ impl tape_rs::scsi::transport::TapeTransport for PausingTransport {
         }
         let result = self.inner.execute_no_data(cdb, timeout);
         if let Some(p) = self.pause.as_ref().filter(|p| {
-            p.cut == ReclaimCut::AfterMkltfs
+            p.cut != ReclaimCut::BeforeFormat
                 && is_format
                 && result.is_ok()
                 && p.initiator.load(Ordering::SeqCst) == self.initiator
@@ -180,7 +183,25 @@ impl tape_rs::scsi::transport::TapeTransport for PausingTransport {
         buf: &[u8],
         timeout: u32,
     ) -> Result<tape_rs::scsi::device::ScsiResult> {
-        self.inner.execute_write(cdb, buf, timeout)
+        use std::sync::atomic::Ordering;
+        let pause = self.pause.as_ref().filter(|p| {
+            matches!(p.cut, ReclaimCut::BeforeLabels | ReclaimCut::PartialLabels)
+                && cdb.first() == Some(&tape_rs::scsi::cdb::opcode::WRITE_6)
+                && p.formatted.load(Ordering::SeqCst)
+                && (p.cut == ReclaimCut::BeforeLabels
+                    || p.label_written.swap(true, Ordering::SeqCst))
+                && p.initiator
+                    .compare_exchange(self.initiator, 0, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+        });
+        if let Some(p) = pause {
+            p.wait()?;
+        }
+        let result = self.inner.execute_write(cdb, buf, timeout);
+        if let Some(p) = pause {
+            p.report(&result);
+        }
+        result
     }
 
     fn identity(&self) -> &str {
@@ -3254,6 +3275,16 @@ fn reclaim_takeover_after_mkltfs_before_completion_preserves_symlinks() {
     check_symlink_reclaim(Some(ReclaimCut::AfterMkltfs));
 }
 
+#[test]
+fn reclaim_takeover_after_format_before_labels_preserves_symlinks() {
+    check_symlink_reclaim(Some(ReclaimCut::BeforeLabels));
+}
+
+#[test]
+fn reclaim_takeover_with_partial_labels_preserves_symlinks() {
+    check_symlink_reclaim(Some(ReclaimCut::PartialLabels));
+}
+
 fn check_symlink_reclaim(cut: Option<ReclaimCut>) {
     use tape_rs::ltfs::{index::Xattr, volume::LtfsVolume};
     use tape_rs::tapefs::{ClientBackend, ROOT_INO, TapeFs};
@@ -3312,6 +3343,7 @@ fn check_symlink_reclaim(cut: Option<ReclaimCut>) {
         initiator: std::sync::atomic::AtomicU32::new(0),
         cut: cut.unwrap_or(ReclaimCut::BeforeFormat),
         formatted: std::sync::atomic::AtomicBool::new(false),
+        label_written: std::sync::atomic::AtomicBool::new(false),
         entered: entered_tx,
         resume: Mutex::new(resume_rx),
         returned: returned_tx,
@@ -3334,6 +3366,8 @@ fn check_symlink_reclaim(cut: Option<ReclaimCut>) {
             None => "reclaim-symlinks",
             Some(ReclaimCut::BeforeFormat) => "reclaim-symlinks-cut",
             Some(ReclaimCut::AfterMkltfs) => "reclaim-symlinks-formatted",
+            Some(ReclaimCut::BeforeLabels) => "reclaim-symlinks-blank",
+            Some(ReclaimCut::PartialLabels) => "reclaim-symlinks-partial",
         },
         false,
         lib,
@@ -3360,16 +3394,38 @@ fn check_symlink_reclaim(cut: Option<ReclaimCut>) {
         entered_rx
             .recv_timeout(Duration::from_secs(20))
             .expect("未到达回收中断屏障");
-        assert_eq!(c.st(leader).tapes["PA0001L8"].state, "reclaiming");
+        assert_eq!(c.st(leader).tapes["PA0001L8"].state, "reformatting");
         // Check the actual source medium and the durable destination catalog
         // while completion has not been reported to the replicated state.
         let source = c.lib.cartridge("PA0001L8").unwrap();
         let detached = SimLibrary::new(1, 2, 0);
+        if cut == Some(ReclaimCut::BeforeLabels) {
+            assert!(source.partitions.iter().all(|p| p.objects.is_empty()));
+        }
         detached.insert_cartridge(source, 0).unwrap();
         detached.load_into_drive("PA0001L8", 0).unwrap();
         let drive = detached.drive(0);
-        let source = LtfsVolume::mount(&drive).unwrap();
+        let source = if cut == Some(ReclaimCut::BeforeLabels) {
+            assert!(matches!(
+                tape_rs::ltfs::volume::probe_format(&drive).unwrap(),
+                tape_rs::ltfs::volume::FormatProbe::Blank
+            ));
+            None
+        } else if cut == Some(ReclaimCut::PartialLabels) {
+            assert!(matches!(
+                tape_rs::ltfs::volume::probe_format(&drive).unwrap(),
+                tape_rs::ltfs::volume::FormatProbe::Ltfs
+            ));
+            assert!(
+                LtfsVolume::mount(&drive).is_err(),
+                "只有 VOL1 的源带不能挂载"
+            );
+            None
+        } else {
+            Some(LtfsVolume::mount(&drive).unwrap())
+        };
         if cut == Some(ReclaimCut::AfterMkltfs) {
+            let source = source.as_ref().unwrap();
             assert!(source.writable());
             assert_eq!(source.index().generation, 1);
             assert_ne!(source.label().volume_uuid, original.volume_uuid);
@@ -3381,11 +3437,22 @@ fn check_symlink_reclaim(cut: Option<ReclaimCut>) {
         for (name, target) in links {
             if cut == Some(ReclaimCut::BeforeFormat) {
                 assert_eq!(
-                    source.index().find_file(name).unwrap().symlink.as_deref(),
+                    source
+                        .as_ref()
+                        .unwrap()
+                        .index()
+                        .find_file(name)
+                        .unwrap()
+                        .symlink
+                        .as_deref(),
                     Some(target)
                 );
             } else {
-                assert!(source.index().find_file(name).is_none());
+                assert!(
+                    source
+                        .as_ref()
+                        .is_none_or(|s| s.index().find_file(name).is_none())
+                );
             }
             assert_eq!(
                 cl.stat(&format!("/{name}")).unwrap().unwrap().barcode,
@@ -3402,7 +3469,7 @@ fn check_symlink_reclaim(cut: Option<ReclaimCut>) {
                 .is_some_and(|r| r.outcome == "done")
         });
         let finished_source = c.lib.cartridge("PA0001L8").unwrap();
-        if cut == Some(ReclaimCut::AfterMkltfs) {
+        if cut != Some(ReclaimCut::BeforeFormat) {
             let recovered_lib = SimLibrary::new(1, 2, 0);
             recovered_lib
                 .insert_cartridge(finished_source.clone(), 0)
