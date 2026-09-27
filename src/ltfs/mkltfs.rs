@@ -1,14 +1,13 @@
 //! mkltfs：把一盘 raw LTO 带初始化成 LTFS 格式。
 //!
 //! 流程：
-//! 1. 确认 TUR、REWIND、读 INQUIRY（可选）。
+//! 1. 确认 TUR、定位分区0起点。
 //! 2. 发送 MODE SELECT(10) Page 0x11 (Medium Partition Mode Page) 请求把介质
-//!    划分成 2 个 partition（P0 = Index，P1 = Data）。我们用 **SDP=1** 让驱动器
-//!    选择自己的默认 LTFS-friendly 划分（LTO-7+ 在此模式下会给 P0 一个 wrap
-//!    ≈ 37.5 GiB，其余全给 P1）。
+//!    划分成 2 个 partition（P0 = Index，P1 = Data）。使用 IDP=1、GB 单位，
+//!    P0 size=1 GB 由驱动器向上取整到最小分区，P1 size=0xffff 使用剩余容量。
 //! 3. FORMAT MEDIUM format=1（按 mode page 重新格式化）。
-//! 4. 在 P0 写入 VOL1 → FM → LTFS Label → FM → Index XML → FM。
-//! 5. 在 P1 写入 VOL1 → FM → LTFS Label → FM（数据区本身留空，首次 commit 才写 index）。
+//! 4. 在 P0 写入 VOL1 → FM → LTFS Label → FM → FM → Index XML → FM。
+//! 5. 在 P1 写入 VOL1 → FM → LTFS Label → FM → FM → 初始 Index → FM。
 //! 6. 写 MAM 属性：Application Vendor / Name / Version / Barcode / VCI。
 //!
 //! **所有参数字节的含义都在注释里展开**——mkltfs 是容易写错的一步（写错会毁带），
@@ -91,15 +90,15 @@ pub fn mkltfs(device: &dyn TapeTransport, opts: &MkltfsOptions) -> Result<Uuid> 
         opts.volume_id, volume_uuid
     );
 
-    // 1. TUR + REWIND
+    // 1. FORMAT 要求 BOP 0；REWIND 只回当前分区起点，不能用于这里。
     drive.test_unit_ready()?;
-    drive.rewind()?;
+    drive.locate(0, 0, true)?;
 
     if opts.quick {
         info!("quick 模式：跳过 MODE SELECT + FORMAT MEDIUM，假定磁带已是 LTFS 2-partition 布局");
     } else {
         // 2. 两分区 MODE SELECT(10) 页 0x11
-        apply_two_partition_mode(&drive)?;
+        apply_two_partition_mode(device)?;
 
         // 3. FORMAT MEDIUM format=1（按 mode page 重新分区）
         //    耗时巨大（LTO-8 可能 > 1 小时），已在 TapeDrive::format 里给 8 小时超时。
@@ -185,7 +184,7 @@ pub fn mkltfs(device: &dyn TapeTransport, opts: &MkltfsOptions) -> Result<Uuid> 
         _ => info!("驱动器未提供有效 VCR，跳过 VCI"),
     }
 
-    drive.rewind()?;
+    drive.locate(0, 0, true)?;
     info!("mkltfs 完成: {}", volume_uuid);
     Ok(volume_uuid)
 }
@@ -230,42 +229,55 @@ fn write_partition_prologue(
 /// - 驱动器 MODE SENSE 回读 page length=**0x0E**（4 个 size slot）、flags=**0x3c**
 ///   （IDP=1 | PSUM=11b GB | POFM=1），所以 MODE SELECT 必须匹配这个形状。
 ///
-/// Mode parameter list:
-/// ```text
-/// Header (8 bytes): 全 0（Mode Data Length / Medium Type / Device-Specific / BDL 都写 0）
-///
-/// Page 0x11 (16-byte 整页，body 14 字节):
-///   0  : Page Code   = 0x11
-///   1  : Page Length = 0x0E  (body 2..15 共 14 字节)
-///   2  : Max additional partitions (RO on SELECT, 写 0)
-///   3  : Additional Partitions Defined = 0x01  → P0 + P1
-///   4  : FDP=0 | SDP=0 | IDP=1 | PSUM=11b(GB) | POFM=1 | CLEAR=0 | ADDP=0 = 0x3C
-///   5  : Media Format Recognition (RO, 写 0)
-///   6  : Partition Units (RO, 写 0 → 用 PSUM 默认单位 GB)
-///   7  : reserved
-///   8-9  : P0 size = 0x0000  → "驱动器默认大小"（LTO-8 给 ≈ 37.5 GiB wrap）
-///   10-11: P1 size = 0xFFFF  → "remainder of medium"
-///   12-15: padding（驱动器 max=3，填 0）
-/// ```
-/// 总长 24 字节。
-fn apply_two_partition_mode(drive: &TapeDrive<'_>) -> Result<()> {
-    let params: [u8; 24] = [
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, // page code
-        0x0E, // page length = 14
-        0x00, // max additional (RO)
-        0x01, // additional defined → 2 total
-        0x3C, // IDP=1 | PSUM=11 GB | POFM=1
-        0x00, // media format recognition (RO on select)
-        0x00, // partition units (RO on select)
-        0x00, // reserved
-        0x00, 0x00, // P0 size = default (driver picks ≈37 GiB wrap)
-        0xFF, 0xFF, // P1 size = max remainder
-        0x00, 0x00, // pad
-        0x00, 0x00, // pad
-    ];
-    info!("MODE SELECT page 0x11: 2-partition (IDP=1, PSUM=GB, P0=default, P1=max)");
-    drive.mode_select(&params, /*save=*/ false)?;
-    Ok(())
+/// IBM GA32-0928-08 §6.6.13：保留不可更改字段，IDP 的 P0/P1 大小必须非零。
+/// 与参考 LTFS tape_format 一致，P0=1 GB 向上取整到最小分区，P1=剩余空间。
+fn apply_two_partition_mode(device: &dyn TapeTransport) -> Result<()> {
+    let mut current = [0u8; 64];
+    let cdb = crate::scsi::cdb::mode_sense_10(0x11, current.len() as u16);
+    let result = crate::scsi::transport::retry_unit_attention("MODE SENSE 分区参数", || {
+        device.execute_read(&cdb, &mut current, 30_000)
+    })?;
+    let data = current
+        .get(..result.transferred)
+        .ok_or(TapeError::InvalidResponse {
+            expected: current.len(),
+            actual: result.transferred,
+        })?;
+    let params = two_partition_parameters(data)?;
+    info!("MODE SELECT page 0x11: 2-partition (IDP=1, unit=GB, P0=1GB/minimum, P1=max)");
+    TapeDrive::new(device).mode_select(&params, false)
+}
+
+fn two_partition_parameters(current: &[u8]) -> Result<Vec<u8>> {
+    let invalid = || TapeError::Ltfs("MODE SENSE 分区页缺失、截断或不支持两分区".into());
+    if current.len() < 8 {
+        return Err(invalid());
+    }
+    let end = usize::from(u16::from_be_bytes([current[0], current[1]])) + 2;
+    if end > current.len() || end < 8 {
+        return Err(invalid());
+    }
+    let start = 8 + usize::from(u16::from_be_bytes([current[6], current[7]]));
+    let page = current.get(start..end).ok_or_else(invalid)?;
+    if page.len() < 12 || page[0] & 0x7f != 0x11 {
+        return Err(invalid());
+    }
+    let len = usize::from(page[1]) + 2;
+    if len < 12 || len > page.len() || page[2] < 1 {
+        return Err(invalid());
+    }
+    let mut params = vec![0; 8];
+    // §6.6.1：Buffered Mode=1，Speed=0；省略 block descriptor，不改变块模式。
+    params[3] = 0x10;
+    params.extend_from_slice(&page[..len]);
+    params[8] &= 0x7f;
+    params[11] = 1;
+    params[12] = 0x38 | (params[12] & 0x07); // IDP=1，PSUM=11；保留 POFM 等位。
+    params[14] = 9; // partitioning type=0 自动选择流式；单位10^9字节。
+    params[16..].fill(0);
+    params[17] = 1;
+    params[18..20].copy_from_slice(&[0xff, 0xff]);
+    Ok(params)
 }
 
 fn write_blocks(drive: &TapeDrive<'_>, data: &[u8], block_size: usize) -> Result<()> {
@@ -276,4 +288,51 @@ fn write_blocks(drive: &TapeDrive<'_>, data: &[u8], block_size: usize) -> Result
         drive.write_block(chunk)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod partition_tests {
+    use super::two_partition_parameters;
+
+    fn device_response() -> Vec<u8> {
+        vec![
+            0, 30, 0x98, 0x10, 0, 0, 0, 8, 0x60, 0, 0, 0, 0, 0, 0, 0, 0x11, 14, 3, 1, 0x3c, 3,
+            0x19, 0, 0, 128, 0x44, 0xce, 0, 0, 0, 0,
+        ]
+    }
+
+    #[test]
+    fn partition_parameters_preserve_device_fields_and_use_nonzero_gb_size() {
+        let p = two_partition_parameters(&device_response()).unwrap();
+        assert_eq!(
+            p,
+            [
+                0, 0, 0, 0x10, 0, 0, 0, 0, 0x11, 14, 3, 1, 0x3c, 3, 9, 0, 0, 1, 0xff, 0xff, 0, 0,
+                0, 0
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_partition_page_is_rejected_before_mode_select() {
+        let response = device_response();
+        for n in 0..response.len() {
+            assert!(
+                two_partition_parameters(&response[..n]).is_err(),
+                "length {n}"
+            );
+        }
+        for (offset, value) in [
+            (0, 0xff),
+            (7, 0xff),
+            (16, 0x51),
+            (17, 0xff),
+            (17, 8),
+            (18, 0),
+        ] {
+            let mut bad = response.clone();
+            bad[offset] = value;
+            assert!(two_partition_parameters(&bad).is_err(), "offset {offset}");
+        }
+    }
 }

@@ -5,7 +5,7 @@ use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use log::debug;
+use log::{debug, warn};
 
 use crate::error::{Result, TapeError};
 use crate::scsi::sense::SenseInfo;
@@ -65,6 +65,27 @@ pub struct ScsiDevice {
     failed: AtomicBool,
 }
 
+/// 打开后、发出任何命令前配置；申请失败或不足仍可由 sg 动态分配间接缓冲。
+fn configure_reserved_buffer(fd: &OwnedFd, path: &str) {
+    let requested: i32 = 1024 * 1024;
+    // SAFETY: fd 在本调用期间由 OwnedFd 保持有效；内核同步读取一个有效的 int，
+    // 不保留此指针。此时尚未发布句柄，无并发命令、mmap 或在途 DMA。
+    if let Err(e) = unsafe { crate::scsi::sg_io::sg_set_reserved_size(fd.as_raw_fd(), &requested) }
+    {
+        warn!("{}: SG 预留缓冲申请失败，继续使用内核间接分配: {}", path, e);
+    }
+    let mut actual: i32 = 0;
+    // SAFETY: 同上；actual 为完整、可写且存活至 ioctl 返回的 int。
+    match unsafe { crate::scsi::sg_io::sg_get_reserved_size(fd.as_raw_fd(), &mut actual) } {
+        Ok(_) if actual >= requested => debug!("{}: SG 预留缓冲 {} 字节", path, actual),
+        Ok(_) => warn!(
+            "{}: SG 预留缓冲 {} 字节，小于申请的 {}，大请求使用间接分配",
+            path, actual, requested
+        ),
+        Err(e) => warn!("{}: SG 预留缓冲回读失败，继续使用内核间接分配: {}", path, e),
+    }
+}
+
 impl ScsiDevice {
     /// 打开 SCSI 通用设备（/dev/sg*）
     pub fn open(path: &str) -> Result<Self> {
@@ -86,6 +107,9 @@ impl ScsiDevice {
 
         // direct I/O 的错误返回必须能查询尚未完成的命令，先核实当前 fd 支持 sg v3。
         pending_io(fd.as_raw_fd())?;
+        // 与 LTFS sg 后端一致，按 fd 预留 1MiB，覆盖常用 512KiB 记录。
+        // 仅调整内核缓冲，不改变介质/驱动模式或全机 allow_dio。
+        configure_reserved_buffer(&fd, path);
         Ok(Self {
             fd,
             path: path.to_string(),

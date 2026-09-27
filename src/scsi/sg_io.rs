@@ -136,3 +136,7 @@ pub(crate) struct SgRequestInfo {
 
 pub(crate) const SG_MAX_QUEUE: usize = 16;
 nix::ioctl_read_bad!(sg_get_request_table, 0x2286, [SgRequestInfo; SG_MAX_QUEUE]);
+
+// Linux <scsi/sg.h>：参数均是 int*，每 fd 的间接 I/O 预留缓冲；不是 SG_IO CDB。
+nix::ioctl_write_ptr_bad!(sg_set_reserved_size, 0x2275, i32);
+nix::ioctl_read_bad!(sg_get_reserved_size, 0x2272, i32);

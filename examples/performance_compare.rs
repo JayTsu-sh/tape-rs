@@ -77,8 +77,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("TAPE_RS_PERF_COMPARE").as_deref() != Ok(gate) {
         return Err("缺少专用测试介质门控，拒绝访问设备".into());
     }
-    if !matches!(args.mode.as_str(), "write" | "read" | "list" | "checkpoint") {
-        return Err("mode 必须为 write/read/list/checkpoint".into());
+    if !matches!(
+        args.mode.as_str(),
+        "write" | "write-groups" | "read" | "list" | "checkpoint"
+    ) {
+        return Err("mode 必须为 write/write-groups/read/list/checkpoint".into());
     }
     let value: serde_json::Value = serde_json::from_reader(std::fs::File::open(&args.manifest)?)?;
     let manifest = Manifest {
@@ -135,132 +138,187 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("介质 UUID 不匹配，拒绝继续".into());
     }
     let mount_seconds = start.elapsed().as_secs_f64();
+    println!(
+        "{}",
+        json!({"interface":"rust-library","kind":"mount",
+        "seconds":mount_seconds,"generation":vol.index().generation,
+        "history_checked":vol.recovery().history_checked,
+        "chain_depth":vol.recovery().chain_depth,
+        "notes":vol.recovery().notes})
+    );
     vol.set_hash_policy(HashPolicy {
         md5: false,
         sha256: args.store_sha256,
     });
-    match args.mode.as_str() {
-        "write" => {
-            if !vol.writable() {
-                return Err("卷不可写".into());
+    // 连续写基线与 LE 一样只挂载一次，每个清单分组独立普通 sync。
+    let groups = if args.mode == "write-groups" {
+        let mut groups = Vec::new();
+        for row in &rows {
+            if !groups.contains(&row.group.as_str()) {
+                groups.push(row.group.as_str());
             }
-            // 先验证全部源文件；校验时间不计入设备写入阶段。
-            for row in &rows {
-                if vol.index().find_file(&row.path).is_some() {
-                    return Err("路径已存在，拒绝覆盖".into());
-                }
-                let mut source = std::fs::File::open(args.source.join(&row.path))?;
-                let mut hash = Sha256::new();
-                let mut buffer = [0u8; 64 * 1024];
-                let mut count = 0;
-                loop {
-                    let n = source.read(&mut buffer)?;
-                    if n == 0 {
-                        break;
-                    }
-                    count += n as u64;
-                    hash.update(&buffer[..n]);
-                }
-                if count != row.size || format!("{:x}", hash.finalize()) != row.sha256 {
-                    return Err("源文件摘要不匹配".into());
-                }
-            }
-            let start = Instant::now();
-            let mut mixed_reads = 0;
-            for (i, row) in rows.iter().enumerate() {
-                if args.borrowed {
-                    let source = std::fs::read(args.source.join(&row.path))?;
-                    vol.append_bytes(&row.path, &source)?;
-                } else {
-                    let mut source = std::fs::File::open(args.source.join(&row.path))?;
-                    vol.append_file(&row.path, &mut source)?;
-                }
-                if args.group == "mixed" && (i + 1) % 16 == 0 {
-                    let large: Vec<_> = manifest
-                        .files
-                        .iter()
-                        .filter(|f| f.group == "large")
-                        .collect();
-                    if large.len() != 4 {
-                        return Err("混合负载缺少4个大文件".into());
-                    }
-                    for _ in 0..3 {
-                        let input = large[mixed_reads % 4];
-                        let mut out = CheckedBytes::default();
-                        vol.read_file_to_writer(&input.path, &mut out)?;
-                        if out.count != input.size
-                            || format!("{:x}", out.hash.finalize()) != input.sha256
-                        {
-                            return Err("混合读摘要不匹配".into());
-                        }
-                        mixed_reads += 1;
-                    }
-                }
-            }
-            let data_seconds = start.elapsed().as_secs_f64();
-            let commit = Instant::now();
-            vol.sync()?;
-            let commit_seconds = commit.elapsed().as_secs_f64();
-            println!(
-                "{}",
-                json!({"interface":"rust-library","kind":"write","group":args.group,"count":rows.len(),"bytes":rows.iter().map(|f|f.size).sum::<u64>(),"mount_seconds":mount_seconds,"mixed_reads":mixed_reads,"data_seconds":data_seconds,"commit_seconds":commit_seconds,"total_seconds":start.elapsed().as_secs_f64(),"generation":vol.index().generation})
-            );
         }
-        "read" => {
-            for label in if args.once {
-                &["first"][..]
-            } else {
-                &["first", "repeat"][..]
-            } {
-                let start = Instant::now();
+        groups
+    } else {
+        vec![args.group.as_str()]
+    };
+    for group in groups {
+        let rows: Vec<_> = rows
+            .iter()
+            .copied()
+            .filter(|row| args.mode != "write-groups" || row.group == group)
+            .collect();
+        let mode = if args.mode == "write-groups" {
+            "write"
+        } else {
+            args.mode.as_str()
+        };
+        match mode {
+            "write" => {
+                if !vol.writable() {
+                    return Err("卷不可写".into());
+                }
+                // 先验证全部源文件；校验时间不计入设备写入阶段。
                 for row in &rows {
-                    let mut out = CheckedBytes::default();
-                    vol.read_file_to_writer(&row.path, &mut out)?;
-                    if out.count != row.size || format!("{:x}", out.hash.finalize()) != row.sha256 {
-                        return Err("磁带内容摘要不匹配".into());
+                    if vol.index().find_file(&row.path).is_some() {
+                        return Err("路径已存在，拒绝覆盖".into());
+                    }
+                    let mut source = std::fs::File::open(args.source.join(&row.path))?;
+                    let mut hash = Sha256::new();
+                    let mut buffer = [0u8; 64 * 1024];
+                    let mut count = 0;
+                    loop {
+                        let n = source.read(&mut buffer)?;
+                        if n == 0 {
+                            break;
+                        }
+                        count += n as u64;
+                        hash.update(&buffer[..n]);
+                    }
+                    if count != row.size || format!("{:x}", hash.finalize()) != row.sha256 {
+                        return Err("源文件摘要不匹配".into());
                     }
                 }
+                let start = Instant::now();
+                let mut mixed_reads = 0;
+                for (i, row) in rows.iter().enumerate() {
+                    if args.borrowed {
+                        let source = std::fs::read(args.source.join(&row.path))?;
+                        vol.append_bytes(&row.path, &source)?;
+                    } else {
+                        let mut source = std::fs::File::open(args.source.join(&row.path))?;
+                        vol.append_file(&row.path, &mut source)?;
+                    }
+                    if group == "mixed" && (i + 1) % 16 == 0 {
+                        let large: Vec<_> = manifest
+                            .files
+                            .iter()
+                            .filter(|f| f.group == "large")
+                            .collect();
+                        if large.len() != 4 {
+                            return Err("混合负载缺少4个大文件".into());
+                        }
+                        for _ in 0..3 {
+                            let input = large[mixed_reads % 4];
+                            let mut out = CheckedBytes::default();
+                            vol.read_file_to_writer(&input.path, &mut out)?;
+                            if out.count != input.size
+                                || format!("{:x}", out.hash.finalize()) != input.sha256
+                            {
+                                return Err("混合读摘要不匹配".into());
+                            }
+                            mixed_reads += 1;
+                        }
+                    }
+                }
+                let data_seconds = start.elapsed().as_secs_f64();
+                let commit = Instant::now();
+                vol.sync()?;
+                let commit_seconds = commit.elapsed().as_secs_f64();
                 println!(
                     "{}",
-                    json!({"interface":"rust-library","kind":"read","group":args.group,"label":label,"count":rows.len(),"bytes":rows.iter().map(|f|f.size).sum::<u64>(),"mount_seconds":mount_seconds,"seconds":start.elapsed().as_secs_f64(),"verified":true})
+                    json!({"interface":"rust-library","kind":"write","group":group,"count":rows.len(),"bytes":rows.iter().map(|f|f.size).sum::<u64>(),"mount_seconds":mount_seconds,"mixed_reads":mixed_reads,"data_seconds":data_seconds,"commit_seconds":commit_seconds,"total_seconds":start.elapsed().as_secs_f64(),"generation":vol.index().generation})
                 );
             }
-        }
-        "list" => {
-            let prefix = format!("comparison/{}", args.group);
-            let mut samples = Vec::new();
-            let mut count = 0;
-            for _ in 0..10 {
-                let start = Instant::now();
-                let dir = vol.index().find_directory(&prefix).ok_or("目录不存在")?;
-                let names: Vec<_> = dir
-                    .files
-                    .iter()
-                    .map(|f| f.name.clone())
-                    .chain(dir.subdirs.iter().map(|d| d.name.clone()))
-                    .collect();
-                count = std::hint::black_box(names).len();
-                samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            "read" => {
+                for label in if args.once {
+                    &["first"][..]
+                } else {
+                    &["first", "repeat"][..]
+                } {
+                    let start = Instant::now();
+                    for row in &rows {
+                        let mut out = CheckedBytes::default();
+                        vol.read_file_to_writer(&row.path, &mut out)?;
+                        if out.count != row.size
+                            || format!("{:x}", out.hash.finalize()) != row.sha256
+                        {
+                            return Err("磁带内容摘要不匹配".into());
+                        }
+                    }
+                    println!(
+                        "{}",
+                        json!({"interface":"rust-library","kind":"read","group":group,"label":label,"count":rows.len(),"bytes":rows.iter().map(|f|f.size).sum::<u64>(),"mount_seconds":mount_seconds,"seconds":start.elapsed().as_secs_f64(),"verified":true})
+                    );
+                }
             }
-            println!(
-                "{}",
-                json!({"interface":"rust-library","kind":"list","group":args.group,"count":count,"mount_seconds":mount_seconds,"samples_ms":samples})
-            );
+            "list" => measure_listing(&vol, group, mount_seconds)?,
+            "checkpoint" => {
+                let start = Instant::now();
+                vol.commit()?;
+                println!(
+                    "{}",
+                    json!({"interface":"rust-library","kind":"checkpoint","mount_seconds":mount_seconds,"seconds":start.elapsed().as_secs_f64(),"generation":vol.index().generation})
+                );
+            }
+            _ => unreachable!(),
         }
-        "checkpoint" => {
-            let start = Instant::now();
-            vol.commit()?;
-            println!(
-                "{}",
-                json!({"interface":"rust-library","kind":"checkpoint","mount_seconds":mount_seconds,"seconds":start.elapsed().as_secs_f64(),"generation":vol.index().generation})
-            );
+        if args.mode == "write-groups" && matches!(group, "small" | "growth") {
+            for directory in ["large", "small"] {
+                measure_listing(&vol, directory, mount_seconds)?;
+            }
         }
-        _ => unreachable!(),
+    }
+    if args.mode == "write-groups" {
+        // 会话结束前补齐 IP；与普通 sync 分开计时，供装卸带流程合计。
+        let start = Instant::now();
+        vol.commit()?;
+        println!(
+            "{}",
+            json!({"interface":"rust-library","kind":"checkpoint","seconds":start.elapsed().as_secs_f64(),"generation":vol.index().generation})
+        );
     }
     let stats = dev.direct_io_stats();
     println!(
         "{}",
         json!({"interface":"rust-library","kind":"direct-io","read":{"direct":stats.read.direct,"mixed":stats.read.mixed,"indirect":stats.read.indirect},"write":{"direct":stats.write.direct,"mixed":stats.write.mixed,"indirect":stats.write.indirect},"store_sha256":args.store_sha256,"borrowed":args.borrowed})
+    );
+    Ok(())
+}
+
+fn measure_listing(
+    vol: &LtfsVolume<'_>,
+    group: &str,
+    mount_seconds: f64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let prefix = format!("comparison/{group}");
+    let mut samples = Vec::new();
+    let mut count = 0;
+    for _ in 0..10 {
+        let start = Instant::now();
+        let dir = vol.index().find_directory(&prefix).ok_or("目录不存在")?;
+        let names: Vec<_> = dir
+            .files
+            .iter()
+            .map(|f| f.name.clone())
+            .chain(dir.subdirs.iter().map(|d| d.name.clone()))
+            .collect();
+        count = std::hint::black_box(names).len();
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    println!(
+        "{}",
+        json!({"interface":"rust-library","kind":"list","group":group,"count":count,"mount_seconds":mount_seconds,"samples_ms":samples})
     );
     Ok(())
 }

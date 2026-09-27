@@ -1032,6 +1032,8 @@ fn drive_command(
             page[2] = 3;
             page[3] = st.drives[idx].pending_partitions.saturating_sub(1) as u8;
             page[4] = 0x3C;
+            page[5] = 3; // 支持格式及分区识别，不可更改。
+            page[6] = 0x19; // 流式分区、GB 单位。
             v.extend_from_slice(&page);
             let n = copy_out(out, &v, alloc);
             return good(n);
@@ -1089,14 +1091,11 @@ fn drive_media_command(
             good(0)
         }
         opcode::READ_POSITION => {
-            let p = &cart.partitions[part_idx];
             let mut v = [0u8; 20];
             if d.pos == 0 {
                 v[0] |= 0x80;
             }
-            if d.pos >= p.objects.len() {
-                v[0] |= 0x04; // 自定义：位于 EOD（真实设备无此位，仅供调试）
-            }
+            // 位 2 是 LOLU（位置未知），不能借用它表示 EOD；模拟器位置精确。
             v[1] = d.partition;
             let blk = (d.pos as u32).to_be_bytes();
             v[4..8].copy_from_slice(&blk);
@@ -1178,7 +1177,9 @@ fn drive_media_command(
                 p.objects.push(LogicalObject::Filemark);
             }
             d.pos += count;
-            p.flushed = p.objects.len();
+            if cdb[1] & 1 == 0 {
+                p.flushed = p.objects.len();
+            }
             if count > 0 && !quirks.vcr_never_changes {
                 cart.vcr = cart.vcr.wrapping_add(1).max(1);
             }
@@ -1267,6 +1268,11 @@ fn drive_media_command(
             if target_part >= cart.partitions.len() {
                 return illegal_request();
             }
+            let block = match (cdb[1] >> 3) & 7 {
+                0 => block,
+                3 => cart.partitions[target_part].objects.len() as u64,
+                _ => return illegal_request(),
+            };
             if block > cart.partitions[target_part].objects.len() as u64 {
                 return check(SENSE_KEY_BLANK_CHECK, 0x00, 0x05);
             }
@@ -1287,6 +1293,13 @@ fn drive_media_command(
             good(0)
         }
         opcode::FORMAT_MEDIUM => {
+            // IBM GA32-0928-08 §5.2.3：必须在分区0起点且缓冲已落带。
+            if d.partition != 0
+                || d.pos != 0
+                || cart.partitions.iter().any(|p| p.flushed < p.objects.len())
+            {
+                return check(SENSE_KEY_ILLEGAL_REQUEST, 0x3b, 0x0c);
+            }
             if cart.write_protected {
                 return check(SENSE_KEY_DATA_PROTECT, 0x27, 0x00);
             }
@@ -1476,6 +1489,22 @@ mod tests {
             c.partitions[0].objects,
             vec![LogicalObject::Record(b"a".to_vec())]
         );
+    }
+
+    #[test]
+    fn immediate_filemark_is_not_a_durability_barrier() {
+        for close in [false, true] {
+            let (lib, dev) = one_drive();
+            dev.execute_write(&cdb::write_6(false, 1), b"a", 0).unwrap();
+            dev.execute_no_data(&cdb::write_filemarks_immediate(1), 0)
+                .unwrap();
+            if close {
+                dev.execute_no_data(&cdb::write_filemarks(1), 0).unwrap();
+            }
+            lib.power_cut();
+            let cart = lib.cartridge("T00001L8").unwrap();
+            assert_eq!(cart.partitions[0].objects.len(), if close { 3 } else { 0 });
+        }
     }
 
     #[test]

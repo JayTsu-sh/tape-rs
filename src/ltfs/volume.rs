@@ -4,13 +4,12 @@
 //! - 必须先 `mkltfs::mkltfs(&device)` 初始化介质（或对方工具已初始化过）。
 //! - `LtfsVolume::mount` 读 P0 的 label + index，把整棵目录树加载到内存。
 //! - `append_file` 把 reader 的数据流追加到 P1 EOD，在内存 index 里记录 extent。
-//!   数据尚未持久化；需要 `commit()` 才会把 index 写回 P1 tail + P0，并更新 MAM VCI。
-//! - `commit` 失败时应将 volume 视为未知状态（下次 mount 会退回到上次 commit 的
-//!   generation）。
+//!   数据尚未承诺持久化；`sync()` 写 DP 索引并更新 VCI，`commit()` 还补齐 IP。
+//! - 提交失败后冻结卷；重新挂载依据介质判断结果，不能假定失败就回到旧 generation。
 //!
 //! **磁带布局**（LTO，两 partition 模式）
 //! ```text
-//! P0 (index)    : [VOL1][FM][Label][FM][Index][FM][EOD]
+//! P0 (index)    : [VOL1][FM][Label][FM][FM][Index][FM][EOD]
 //! P1 (data)     : [VOL1][FM][Label][FM][data....][FM][Index_gen_k][FM]
 //!                                                [data....][FM][Index_gen_k+1][FM]
 //!                                                ... EOD
@@ -102,6 +101,8 @@ pub struct LtfsVolume<'a> {
     /// 已发布的已提交视图（S5）：list/read/index() 只服务它。
     index: LtfsIndex,
     block_size: u32,
+    /// 顺序文件流复用对齐缓冲；借用切片写入不分配它。
+    write_buffer: Option<crate::scsi::buffer::TransferBuffer>,
     /// P1 当前可写入位置。commit 后更新。
     p1_write_head: u64,
     dirty: bool,
@@ -177,7 +178,7 @@ fn read_index_file<W: Write>(
 
     for ext in &file.extents {
         let partition = partition_char_to_num(ext.partition);
-        drive.locate(partition, ext.start_block, true)?;
+        drive.locate_if_needed(partition, ext.start_block)?;
 
         // 从 extent 起始块读起，按 byte_offset / byte_count 精确裁剪。
         let mut remaining = ext.byte_count;
@@ -217,16 +218,25 @@ fn read_index_file<W: Write>(
 }
 
 impl<'a> LtfsVolume<'a> {
-    /// 挂载卷：读标签后执行 D02 恢复协议（末索引定位、尾部分类、回指链核验），
+    /// 挂载卷：读取双分区末索引并核验尾部及追加位置；一致 Full 使用正常挂载快速路径，
+    /// 其他状态执行历史链核验。需要完整历史审计时用 `mount_with_budget`。
     /// 视图取 DP 末索引（可能比 IP 新）。尾部非完整时以只读挂载，不自动修复。
     pub fn mount(device: &'a dyn crate::scsi::transport::TapeTransport) -> Result<Self> {
-        Self::mount_with_budget(device, &RecoveryBudget::default())
+        Self::mount_inner(device, &RecoveryBudget::default(), false)
     }
 
-    /// 同 `mount`，但使用指定搜索预算。
+    /// 使用指定搜索预算执行完整历史链核验（不走正常挂载的 Full 快速路径）。
     pub fn mount_with_budget(
         device: &'a dyn crate::scsi::transport::TapeTransport,
         budget: &RecoveryBudget,
+    ) -> Result<Self> {
+        Self::mount_inner(device, budget, true)
+    }
+
+    fn mount_inner(
+        device: &'a dyn crate::scsi::transport::TapeTransport,
+        budget: &RecoveryBudget,
+        verify_history: bool,
     ) -> Result<Self> {
         let drive = TapeDrive::new(device);
         let mam = Mam::new(device);
@@ -241,7 +251,11 @@ impl<'a> LtfsVolume<'a> {
         );
 
         // 2. D02 恢复协议：末索引、尾部、链、追加位置
-        let report = recovery::recover(device, &label, budget)?;
+        let report = if verify_history {
+            recovery::recover(device, &label, budget)?
+        } else {
+            recovery::recover_for_mount(device, &label, budget)?
+        };
         if let Some(reason) = report.restricted_reason() {
             return Err(TapeError::RecoveryRestricted { reason });
         }
@@ -321,6 +335,7 @@ impl<'a> LtfsVolume<'a> {
             working: index.clone(),
             index,
             block_size,
+            write_buffer: None,
             p1_write_head,
             dirty: false,
             last_dp_index,
@@ -949,9 +964,13 @@ impl<'a> LtfsVolume<'a> {
     ) -> Result<u64> {
         let mut source = StreamBlocks {
             reader: r,
-            buffer: crate::scsi::buffer::TransferBuffer::new(self.block_size as usize),
+            buffer: self.write_buffer.take().unwrap_or_else(|| {
+                crate::scsi::buffer::TransferBuffer::new(self.block_size as usize)
+            }),
         };
-        self.append_blocks(path, &mut source, xattrs, preserved)
+        let result = self.append_blocks(path, &mut source, xattrs, preserved);
+        self.write_buffer = Some(source.buffer);
+        result
     }
 
     /// 已在内存中的内容直接按记录借用给 SG_IO，不复制到中间流缓冲区。
@@ -975,8 +994,8 @@ impl<'a> LtfsVolume<'a> {
         // 写第一个字节之前先确认自己仍是预留持有者：陈旧轮次的实例在这里就停下，什么也不落带。
         self.check_reservation_guard()?;
 
-        // 1. LOCATE P1 write head
-        self.drive.locate(1, self.p1_write_head, true)?;
+        // 1. 实时核验 P1 write head，仅在位置不同或不精确时定位。
+        self.drive.locate_if_needed(1, self.p1_write_head)?;
 
         // 2. 源提供完整记录；内存切片无需额外复制。
         let start_block = self.p1_write_head;
@@ -1195,10 +1214,10 @@ impl<'a> LtfsVolume<'a> {
 
         // —— S3：DP 索引构造 [FM][records][FM] —— //
         self.drive
-            .locate(1, self.p1_write_head, true)
+            .locate_if_needed(1, self.p1_write_head)
             .map_err(|e| ("locate", e))?;
         self.drive
-            .write_filemark(1)
+            .write_filemark_immediate(1)
             .map_err(|e| ("opening_fm", e))?;
         let p1_index_block = self.p1_write_head + 1;
         self.working.self_location = IndexLocation {
@@ -1276,7 +1295,7 @@ impl<'a> LtfsVolume<'a> {
             .locate(0, P1_DATA_START, true)
             .map_err(|e| ("index_partition", e))?;
         self.drive
-            .write_filemark(1)
+            .write_filemark_immediate(1)
             .map_err(|e| ("index_partition", e))?;
         write_bytes_in_blocks(&self.drive, &xml, self.block_size as usize)
             .map_err(|e| ("index_partition", e))?;

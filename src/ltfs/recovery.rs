@@ -7,9 +7,10 @@
 //!    自指针不符的按 LTFS 2.5.1 §5.4.2 视为数据 extent，继续向前找。
 //! 2. 末索引之后到 `E` 的区域分类为 T0 完整 / T1 未索引数据 / T2 残缺索引 /
 //!    T3 假索引 / T4 未知。
-//! 3. 沿 `previousgenerationlocation` 核验 DP 回指链（本实现只写 Full 索引）。
-//! 4. 只有 DP 与 IP 尾部都完整、链核验通过、追加位置与末索引位置算术一致且
-//!    LOCATE 后 READ POSITION 复核一致，才判定可以追加。
+//! 3. 增量必须重放到 Full 基线；异常挂载及显式审计沿回指核验历史 Full 链。
+//!    正常挂载只有在双分区新鲜 VCI 与实际最新 Full 构造一致时省去历史扫描。
+//! 4. 检查视图限制、DP 尾部及追加位置算术，并用 LOCATE/READ POSITION 复核后
+//!    才放行追加；IP 落后可作为维护债务，不能冒充已更新。
 //!
 //! 预算耗尽或证据不足时给出受限结论，不猜测、不试写。
 //!
@@ -26,7 +27,7 @@ use crate::tape::commands::TapeDrive;
 
 use super::index::{IndexLocation, LtfsIndex};
 use super::label::LtfsLabel;
-use super::mam::{Mam, vcr_is_valid, vcr_matches};
+use super::mam::{Mam, VolumeCoherencyInfo, vcr_is_valid, vcr_matches};
 use super::volume::P1_DATA_START;
 
 /// 末索引之后区域的分类（协议中的 T0—T4，另加"尚无索引的空数据区"）。
@@ -101,6 +102,8 @@ pub struct RecoveryReport {
     pub dp: PartitionScan,
     pub ip: PartitionScan,
     pub chain_ok: bool,
+    /// 是否实际遍历历史 Full 链；正常一致 Full 挂载可只核验最新双分区构造。
+    pub history_checked: bool,
     /// 已核验的回指深度（不含末索引本身）。
     pub chain_depth: u32,
     /// 最新 DP Full 之后已重放的连续增量数。
@@ -288,8 +291,7 @@ pub fn scan_partition(
     let block_size = label.blocksize as usize;
     let mut notes = Vec::new();
 
-    drive.locate(partition, 0, true)?;
-    drive.space_to_eod()?;
+    drive.locate_eod(partition)?;
     let pos = drive.read_position()?;
     if pos.partition != partition as u32 {
         return Ok(PartitionScan {
@@ -663,7 +665,7 @@ fn vci_hints(
     device: &dyn TapeTransport,
     label: &LtfsLabel,
     notes: &mut Vec<String>,
-) -> [Option<u64>; 2] {
+) -> [Option<VolumeCoherencyInfo>; 2] {
     let vcr = match Mam::with_partition(device, 0).read_vcr() {
         Ok(Some(v)) if vcr_is_valid(&v) => v,
         Ok(Some(_)) => {
@@ -692,7 +694,7 @@ fn vci_hints(
                         "分区 {} VCI 新鲜: gen={} block={}",
                         p, vci.generation, vci.block
                     );
-                    hints[slot] = Some(vci.block);
+                    hints[slot] = Some(vci);
                 }
             }
             Ok(None) => notes.push(format!("分区 {} 无 VCI", p)),
@@ -710,20 +712,92 @@ pub fn recover(
     label: &LtfsLabel,
     budget: &RecoveryBudget,
 ) -> Result<RecoveryReport> {
+    recover_inner(device, label, budget, true)
+}
+
+pub(crate) fn recover_for_mount(
+    device: &dyn TapeTransport,
+    label: &LtfsLabel,
+    budget: &RecoveryBudget,
+) -> Result<RecoveryReport> {
+    recover_inner(device, label, budget, false)
+}
+
+/// Full 自包含最新视图；只有双分区新鲜提示和实际末构造均一致时才省去历史扫描。
+/// 仍读取两个索引、核验 EOD/自指针/追加位置，增量与异常卷不使用此路径。
+fn clean_full_pair(
+    dp: &PartitionScan,
+    ip: &PartitionScan,
+    hints: &[Option<VolumeCoherencyInfo>; 2],
+) -> bool {
+    if !dp.hint_used
+        || !ip.hint_used
+        || dp.tail != TailKind::Complete
+        || ip.tail != TailKind::Complete
+    {
+        return false;
+    }
+    match (&dp.last_index, &ip.last_index) {
+        (Some(d), Some(i)) => {
+            !d.index.incremental
+                && !i.index.incremental
+                && !d.index.materialized
+                && !i.index.materialized
+                && d.index.previous_incremental_location.is_none()
+                && i.index.previous_incremental_location.is_none()
+                && d.index.generation == i.index.generation
+                && hints[1]
+                    .as_ref()
+                    .is_some_and(|h| h.generation == d.index.generation)
+                && hints[0]
+                    .as_ref()
+                    .is_some_and(|h| h.generation == i.index.generation)
+                && i.index.previous_location == Some(d.index.self_location)
+        }
+        _ => false,
+    }
+}
+
+fn recover_inner(
+    device: &dyn TapeTransport,
+    label: &LtfsLabel,
+    budget: &RecoveryBudget,
+    verify_history: bool,
+) -> Result<RecoveryReport> {
     let drive = TapeDrive::new(device);
     let drive = &drive;
     let mut notes = Vec::new();
     let hints = vci_hints(device, label, &mut notes);
-    let mut dp = scan_partition(drive, 1, label.data_partition, label, budget, hints[1])?;
-    let ip = scan_partition(drive, 0, label.index_partition, label, budget, hints[0])?;
+    let mut dp = scan_partition(
+        drive,
+        1,
+        label.data_partition,
+        label,
+        budget,
+        hints[1].as_ref().map(|h| h.block),
+    )?;
+    let ip = scan_partition(
+        drive,
+        0,
+        label.index_partition,
+        label,
+        budget,
+        hints[0].as_ref().map(|h| h.block),
+    )?;
 
+    let history_checked = verify_history || !clean_full_pair(&dp, &ip, &hints);
     let replay = match &mut dp.last_index {
         Some(c) if c.index.incremental => replay_incremental_chain(drive, label, c, budget),
         _ => Ok(0),
     };
-    let (mut chain_ok, mut chain_depth, chain_truncated) = match &dp.last_index {
-        Some(c) => verify_chain(drive, label, c, budget, &mut notes)?,
-        None => (true, 0, false),
+    let (mut chain_ok, mut chain_depth, chain_truncated) = if history_checked {
+        match &dp.last_index {
+            Some(c) => verify_chain(drive, label, c, budget, &mut notes)?,
+            None => (true, 0, false),
+        }
+    } else {
+        notes.push("双分区最新 Full 构造与新鲜 VCI 一致；未扫描历史 Full 链".into());
+        (true, 0, false)
     };
 
     let mut incremental_depth = 0;
@@ -750,6 +824,7 @@ pub fn recover(
         dp,
         ip,
         chain_ok,
+        history_checked,
         chain_depth,
         incremental_depth,
         chain_truncated_by_budget: chain_truncated,

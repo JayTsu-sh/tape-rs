@@ -90,7 +90,7 @@ impl<'a> TapeDrive<'a> {
     }
 
     /// READ POSITION: 读取当前位置
-    pub fn read_position(&self) -> Result<TapePosition> {
+    fn read_position_data(&self) -> Result<[u8; 20]> {
         let cdb_bytes = cdb::read_position();
         let mut buf = [0u8; 20];
         let result = retry_unit_attention("READ POSITION", || {
@@ -104,6 +104,11 @@ impl<'a> TapeDrive<'a> {
             });
         }
 
+        Ok(buf)
+    }
+
+    pub fn read_position(&self) -> Result<TapePosition> {
+        let buf = self.read_position_data()?;
         // READ POSITION Short Form（SSC-5 service action 0x00）:
         // byte 0: flags（BOP/EOP 等）
         // byte 1: 1 字节 partition number
@@ -119,6 +124,19 @@ impl<'a> TapeDrive<'a> {
             at_bot,
             at_eot,
         })
+    }
+
+    /// 用实时位置避免顺序追加之间的重复 LOCATE，不缓存设备位置。
+    pub(crate) fn locate_if_needed(&self, partition: u8, block: u64) -> Result<()> {
+        // SSC Short Form / IBM GA32-0928-08 Table 98：LOLU/PERR 时位置不可靠。
+        // 超出 32 位目标不能与 Short Form 比较，仍执行原有 LOCATE(16)。
+        if block <= u64::from(u32::MAX) {
+            let buf = self.read_position_data()?;
+            if short_position_matches(&buf, partition, block) {
+                return Ok(());
+            }
+        }
+        self.locate(partition, block, true)
     }
 
     /// LOAD: 装载磁带
@@ -207,6 +225,14 @@ impl<'a> TapeDrive<'a> {
         Ok(())
     }
 
+    /// 索引开头 FM 可缓冲；随后必须有非 IMMED 结束 FM / 屏障才能发布提交。
+    pub(crate) fn write_filemark_immediate(&self, count: u32) -> Result<()> {
+        debug!("缓冲写入 {} 个 filemark (IMMED)", count);
+        self.device
+            .execute_no_data(&cdb::write_filemarks_immediate(count), 60_000)?;
+        Ok(())
+    }
+
     /// SPACE: 向前跳过 filemarks
     pub fn space_filemarks(&self, count: i32) -> Result<()> {
         ensure_space_count(count)?;
@@ -281,6 +307,15 @@ impl<'a> TapeDrive<'a> {
         let cdb_bytes = cdb::locate_16(partition, block, change_partition, false);
         // 大容量带上 LOCATE 可能较慢
         retry_unit_attention("LOCATE", || {
+            self.device.execute_no_data(&cdb_bytes, 600_000)
+        })?;
+        Ok(())
+    }
+
+    /// 直接选分区并定位到 EOD，避免先回到 BOP 再向前走。
+    pub(crate) fn locate_eod(&self, partition: u8) -> Result<()> {
+        let cdb_bytes = cdb::locate_eod_16(partition);
+        retry_unit_attention("LOCATE EOD", || {
             self.device.execute_no_data(&cdb_bytes, 600_000)
         })?;
         Ok(())
@@ -465,5 +500,34 @@ impl<'a> TapeDrive<'a> {
         w.flush()?;
         info!("文件读取完成: {} 字节", total);
         Ok(total)
+    }
+}
+
+fn short_position_matches(buf: &[u8; 20], partition: u8, block: u64) -> bool {
+    buf[0] & 0x06 == 0
+        && buf[1] == partition
+        && block <= u64::from(u32::MAX)
+        && u64::from(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]])) == block
+}
+
+#[cfg(test)]
+mod position_tests {
+    use super::short_position_matches;
+
+    #[test]
+    fn short_position_requires_exact_unoverflowed_location_and_partition() {
+        let mut buf = [0; 20];
+        buf[1] = 1;
+        buf[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(short_position_matches(&buf, 1, u64::from(u32::MAX)));
+        assert!(!short_position_matches(&buf, 0, u64::from(u32::MAX)));
+        assert!(!short_position_matches(&buf, 1, u64::from(u32::MAX) + 1));
+        for flag in [0x04, 0x02, 0x06] {
+            buf[0] = flag;
+            assert!(!short_position_matches(&buf, 1, u64::from(u32::MAX)));
+        }
+        // 缓冲区字节/对象数量不精确并不意味着逻辑位置未知。
+        buf[0] = 0x30;
+        assert!(short_position_matches(&buf, 1, u64::from(u32::MAX)));
     }
 }

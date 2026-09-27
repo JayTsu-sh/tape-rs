@@ -198,6 +198,14 @@ pub fn write_filemarks(count: u32) -> [u8; 6] {
     ]
 }
 
+/// WRITE FILEMARKS(6) IMMED=1：仅确认命令接收，不能用作持久化屏障。
+/// IBM GA32-0928-08 §5.2.46：byte1 bit0 为 IMMED。
+pub fn write_filemarks_immediate(count: u32) -> [u8; 6] {
+    let mut cdb = write_filemarks(count);
+    cdb[1] = 0x01;
+    cdb
+}
+
 /// SPACE(6) 的 24-bit 有符号 count 范围。
 pub const SPACE_COUNT_MIN: i32 = -(1 << 23);
 pub const SPACE_COUNT_MAX: i32 = (1 << 23) - 1;
@@ -335,6 +343,14 @@ pub fn locate_16(partition: u8, logical_id: u64, change_partition: bool, immed: 
         0x00,
         0x00,
     ]
+}
+
+/// LOCATE(16) DEST_TYPE=011b（EOD）、CP=1、IMMED=0。
+/// IBM GA32-0928-08 §5.2.7 Table53；LOGICAL IDENTIFIER 在此模式下忽略。
+pub fn locate_eod_16(partition: u8) -> [u8; 16] {
+    let mut cdb = locate_16(partition, 0, true, false);
+    cdb[1] |= 0x18;
+    cdb
 }
 
 /// 构建 ERASE(6) CDB

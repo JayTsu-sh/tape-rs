@@ -80,7 +80,7 @@ fn tp01_after_commits_chain_is_verified() {
     let (_lib, dev) = setup();
     assert_eq!(commit_file(&dev, "/a", 1), 2);
     assert_eq!(commit_file(&dev, "/b", 2), 3);
-    let vol = LtfsVolume::mount(&dev).unwrap();
+    let vol = LtfsVolume::mount_with_budget(&dev, &RecoveryBudget::default()).unwrap();
     let r = vol.recovery();
     assert_eq!(vol.index().generation, 3);
     assert_eq!(r.chain_depth, 2, "gen3 → gen2 → gen1");
@@ -94,8 +94,12 @@ fn tp05_unindexed_data_tail_is_read_only() {
     commit_file(&dev, "/committed", 1);
     {
         let mut vol = LtfsVolume::mount(&dev).unwrap();
-        // 第一个文件的记录被第二次 LOCATE 刷入介质，第二个文件仍在缓冲；然后掉电。
+        // 显式刷出首个未索引文件，第二个文件仍在缓冲；然后掉电。
         vol.append_file("/lost1", &mut Cursor::new(payload(30_000, 2)))
+            .unwrap();
+        // 构造已落带但未发布的尾部，不依赖追加过程中额外 LOCATE 的副作用。
+        tape_rs::tape::commands::TapeDrive::new(&dev)
+            .write_filemark(0)
             .unwrap();
         vol.append_file("/lost2", &mut Cursor::new(payload(30_000, 3)))
             .unwrap();
@@ -217,6 +221,7 @@ fn tp07_ip_lagging_dp_is_debt_not_error() {
     let vol = LtfsVolume::mount(&dev).unwrap();
     let r = vol.recovery();
     assert!(r.ip_debt);
+    assert!(r.history_checked);
     assert_eq!(vol.index().generation, 3, "视图来自 DP");
     assert_eq!(r.ip.last_index.as_ref().unwrap().index.generation, 2);
     assert!(vol.writable());
@@ -256,7 +261,7 @@ fn tp08_locate_failure_at_append_position_blocks_write() {
         .filter(|&&o| o == opcode::LOCATE_16)
         .count();
     {
-        let _vol = LtfsVolume::mount(&dev).unwrap();
+        let _vol = LtfsVolume::mount_with_budget(&dev, &RecoveryBudget::default()).unwrap();
     }
     let n = dev
         .command_log()
@@ -346,6 +351,10 @@ fn tp02_stale_vci_falls_back_to_standard_path() {
         let mut vol = LtfsVolume::mount(&dev).unwrap();
         vol.append_file("/lost1", &mut Cursor::new(payload(30_000, 2)))
             .unwrap();
+        // 构造已落带但未发布的尾部，不依赖追加过程中额外 LOCATE 的副作用。
+        tape_rs::tape::commands::TapeDrive::new(&dev)
+            .write_filemark(0)
+            .unwrap();
         vol.append_file("/lost2", &mut Cursor::new(payload(30_000, 3)))
             .unwrap();
     }
@@ -354,6 +363,7 @@ fn tp02_stale_vci_falls_back_to_standard_path() {
     let vol = LtfsVolume::mount(&dev).unwrap();
     let r = vol.recovery();
     assert!(!r.dp.hint_used && !r.ip.hint_used);
+    assert!(r.history_checked);
     assert!(
         r.notes.iter().any(|n| n.contains("过期")),
         "notes = {:?}",
@@ -428,6 +438,10 @@ fn tp05_under_holo_quirks_still_classifies_unindexed_tail() {
         let mut vol = LtfsVolume::mount(&dev).unwrap();
         vol.append_file("/lost1", &mut Cursor::new(payload(30_000, 2)))
             .unwrap();
+        // 构造已落带但未发布的尾部，不依赖追加过程中额外 LOCATE 的副作用。
+        tape_rs::tape::commands::TapeDrive::new(&dev)
+            .write_filemark(0)
+            .unwrap();
         vol.append_file("/lost2", &mut Cursor::new(payload(30_000, 3)))
             .unwrap();
     }
@@ -481,4 +495,51 @@ fn ip_ahead_with_back_pointer_to_dp_last_is_consistent() {
     assert!(!r.ip_ahead() && !r.ip_debt && r.chain_ok);
     assert_eq!(names(&vol).len(), 2);
     assert!(vol.writable());
+}
+
+#[test]
+fn normal_clean_full_mount_skips_history_but_explicit_audit_checks_it() {
+    let (lib, dev) = setup();
+    commit_file(&dev, "/a", 1);
+    commit_file(&dev, "/b", 2);
+    let vol = LtfsVolume::mount(&dev).unwrap();
+    assert!(!vol.recovery().history_checked);
+    assert_eq!(vol.recovery().chain_depth, 0);
+    assert!(vol.writable());
+    drop(vol);
+    // 最新 Full 自包含；历史损坏由显式历史审计报告，不冒充已经扫描历史。
+    lib.with_cartridge_mut(BARCODE, |c| {
+        for o in &mut c.partitions[1].objects {
+            if let LogicalObject::Record(d) = o
+                && d.windows(20).any(|w| w == b"<generationnumber>2<")
+            {
+                *d = b"broken old history".to_vec();
+            }
+        }
+    });
+    let vol = LtfsVolume::mount(&dev).unwrap();
+    assert!(!vol.recovery().history_checked);
+    for (path, seed) in [("a", 1), ("b", 2)] {
+        let mut data = Vec::new();
+        vol.read_file_to_writer(path, &mut data).unwrap();
+        assert_eq!(data, payload(50_000, seed));
+    }
+    assert!(matches!(
+        mount_err(&dev, &RecoveryBudget::default()),
+        TapeError::RecoveryRestricted { .. }
+    ));
+}
+
+#[test]
+fn normal_mount_audits_history_when_vci_generation_disagrees() {
+    let (_lib, dev) = setup();
+    commit_file(&dev, "/a", 1);
+    let mam = tape_rs::ltfs::mam::Mam::with_partition(&dev, 1);
+    let mut vci = mam.read_vci().unwrap().unwrap();
+    vci.generation += 1;
+    mam.write_vci(&vci).unwrap();
+    let vol = LtfsVolume::mount(&dev).unwrap();
+    assert!(vol.recovery().history_checked);
+    assert_eq!(vol.recovery().chain_depth, 1);
+    assert_eq!(vol.index().generation, 2);
 }

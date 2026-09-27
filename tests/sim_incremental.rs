@@ -51,6 +51,7 @@ fn increments_recover_and_clean_unmount_writes_full_on_both_partitions() {
     vol.read_file_to_writer("/dir/b", &mut bytes).unwrap();
     assert_eq!(bytes, b"new");
     assert!(vol.recovery().ip_debt);
+    assert!(vol.recovery().history_checked);
     vol.unmount().unwrap();
     let vol = LtfsVolume::mount(&dev).unwrap();
     assert!(!vol.index().incremental);

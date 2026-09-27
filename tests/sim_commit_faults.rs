@@ -203,29 +203,42 @@ fn dv02_fault_on_vci_write_keeps_commit_and_partial_fast_path() {
 
 #[test]
 fn dv02_power_cut_after_index_records_before_closing_filemark() {
-    let (lib, dev) = setup();
-    let alpha = archive_alpha(&dev);
-    {
-        let mut vol = LtfsVolume::mount(&dev).unwrap();
-        vol.append_file("/beta.bin", &mut Cursor::new(payload(90_000, 2)))
-            .unwrap();
-        dev.inject(medium_error(opcode::WRITE_FILEMARKS_6, 1));
-        let err = vol.commit().unwrap_err();
-        assert!(matches!(err, TapeError::CommitFailed { ref stage, .. } if stage == "closing_fm"));
-        // 失败后不再发任何会改变位置（从而刷缓冲）的命令，直接掉电：
-        // 开头 FM 已刷入，索引记录仍在驱动器缓冲
+    for data_reached_medium in [false, true] {
+        let (lib, dev) = setup();
+        let alpha = archive_alpha(&dev);
+        let previous_end = lib.cartridge(BARCODE).unwrap().partitions[1].objects.len();
+        {
+            let mut vol = LtfsVolume::mount(&dev).unwrap();
+            vol.append_file("/beta.bin", &mut Cursor::new(payload(90_000, 2)))
+                .unwrap();
+            dev.inject(medium_error(opcode::WRITE_FILEMARKS_6, 1));
+            let err = vol.commit().unwrap_err();
+            assert!(
+                matches!(err, TapeError::CommitFailed { ref stage, .. } if stage == "closing_fm")
+            );
+            // 开头 FM 为 IMMED，不保证落带。分别模拟全部还在缓冲、数据已自行落带。
+            // 失败后不发 LOCATE/SPACE/屏障，避免它们改变待模拟的持久化边界。
+            if data_reached_medium {
+                lib.with_cartridge_mut(BARCODE, |c| {
+                    c.partitions[1].flushed = previous_end + 2; // 90000 字节占两个数据记录
+                });
+            }
+        }
+        lib.power_cut();
+        dev.clear_faults();
+        let vol = recover_fresh(&dev, &alpha);
+        assert_eq!(
+            vol.recovery().dp.tail,
+            if data_reached_medium {
+                TailKind::UnindexedData
+            } else {
+                TailKind::Complete
+            }
+        );
+        assert_eq!(vol.index().generation, 2);
+        assert!(vol.index().find_file("beta.bin").is_none());
+        assert_eq!(vol.writable(), !data_reached_medium);
     }
-    lib.power_cut();
-    dev.clear_faults();
-    let vol = recover_fresh(&dev, &alpha);
-    assert_eq!(
-        vol.recovery().dp.tail,
-        TailKind::UnindexedData,
-        "{:?}",
-        vol.recovery().dp.notes
-    );
-    assert_eq!(vol.index().generation, 2);
-    assert!(!vol.writable());
 }
 
 #[test]
