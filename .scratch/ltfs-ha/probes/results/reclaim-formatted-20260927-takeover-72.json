@@ -1,0 +1,220 @@
+{
+  "pid": 256308,
+  "cluster": {
+    "drives": 2,
+    "executor": {
+      "fenced": true,
+      "node": 2,
+      "round": 95
+    },
+    "id": 2,
+    "last_reclaim": {
+      "barcode": "SR2501L8",
+      "detail": "搬走 0 个文件 / 0 MiB，已重新格式化",
+      "outcome": "done",
+      "round": 95
+    },
+    "leader": 2,
+    "local": "轮次 95：服务中。IBMtaper2287 (/dev/sg10) [SR2502L8]: gen=3 文件 10 个 尾部 Complete；可用 235 MiB",
+    "role": "Leader",
+    "serving_round": 95,
+    "term": 7
+  },
+  "pools": {
+    "answered_by": 2,
+    "applied_index": 99,
+    "pools": [
+      {
+        "file_limit": 200000,
+        "name": "sr",
+        "tape_details": [
+          {
+            "barcode": "SR2501L8",
+            "bytes_used": 0,
+            "bytes_written": 0,
+            "files": 0,
+            "generation": 1,
+            "live_bytes": 0,
+            "live_files": 0,
+            "reclaimable_bytes": 0,
+            "state": "appendable"
+          },
+          {
+            "barcode": "SR2502L8",
+            "bytes_used": 37,
+            "bytes_written": 3145728,
+            "files": 10,
+            "generation": 3,
+            "live_bytes": 37,
+            "live_files": 13,
+            "reclaimable_bytes": 3145691,
+            "state": "appendable"
+          }
+        ],
+        "tapes": [
+          "SR2501L8",
+          "SR2502L8"
+        ],
+        "uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b"
+      }
+    ]
+  },
+  "files": [
+    {
+      "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+      "path": "/sr",
+      "barcode": "SR2502L8",
+      "generation": 3,
+      "length": 0,
+      "sha256": "",
+      "ver_round": 84,
+      "ver_seq": 11,
+      "deleted": 0,
+      "metadata": "{\"kind\":\"directory\",\"modify_time\":\"2026-09-25T01:36:12.543024832Z\",\"node\":{\"access_time\":\"2026-09-25T01:36:03.517503217Z\",\"backup_time\":\"2026-09-25T01:36:03.517503217Z\",\"change_time\":\"2026-09-25T01:36:12.543024832Z\",\"creation_time\":\"2026-09-25T01:36:03.517503217Z\",\"modify_time\":\"2026-09-25T01:36:12.543024832Z\",\"readonly\":false},\"xattrs\":[{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"84.11\"}]}"
+    },
+    {
+      "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+      "path": "/sr/links",
+      "barcode": "SR2502L8",
+      "generation": 3,
+      "length": 0,
+      "sha256": "",
+      "ver_round": 84,
+      "ver_seq": 10,
+      "deleted": 0,
+      "metadata": "{\"kind\":\"directory\",\"modify_time\":\"2026-09-25T01:36:23.674503370Z\",\"node\":{\"access_time\":\"2026-09-25T01:36:12.543020403Z\",\"backup_time\":\"2026-09-25T01:36:12.543020403Z\",\"change_time\":\"2026-09-25T01:36:23.674503370Z\",\"creation_time\":\"2026-09-25T01:36:12.543020403Z\",\"modify_time\":\"2026-09-25T01:36:23.674503370Z\",\"readonly\":false},\"xattrs\":[{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"84.10\"}]}"
+    },
+    {
+      "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+      "path": "/sr/links/chain",
+      "barcode": "SR2502L8",
+      "generation": 3,
+      "length": 0,
+      "sha256": "",
+      "ver_round": 84,
+      "ver_seq": 3,
+      "deleted": 0,
+      "metadata": "{\"kind\":\"symlink\",\"modify_time\":\"2026-09-25T01:36:19.668644300Z\",\"symlink\":\"relative\",\"xattrs\":[{\"base64\":true,\"key\":\"binary\",\"value\":\"AP8=\"},{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"84.3\"}]}"
+    },
+    {
+      "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+      "path": "/sr/links/dangling",
+      "barcode": "SR2502L8",
+      "generation": 3,
+      "length": 0,
+      "sha256": "",
+      "ver_round": 84,
+      "ver_seq": 4,
+      "deleted": 0,
+      "metadata": "{\"kind\":\"symlink\",\"modify_time\":\"2026-09-25T01:36:15.901883741Z\",\"symlink\":\"../absent & 中文%?#\",\"xattrs\":[{\"base64\":true,\"key\":\"binary\",\"value\":\"AP8=\"},{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"84.4\"}]}"
+    },
+    {
+      "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+      "path": "/sr/links/directory",
+      "barcode": "SR2502L8",
+      "generation": 3,
+      "length": 0,
+      "sha256": "",
+      "ver_round": 84,
+      "ver_seq": 5,
+      "deleted": 0,
+      "metadata": "{\"kind\":\"symlink\",\"modify_time\":\"2026-09-25T01:36:17.243491908Z\",\"symlink\":\"subdir\",\"xattrs\":[{\"base64\":true,\"key\":\"binary\",\"value\":\"AP8=\"},{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"84.5\"}]}"
+    },
+    {
+      "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+      "path": "/sr/links/loop",
+      "barcode": "SR2502L8",
+      "generation": 3,
+      "length": 0,
+      "sha256": "",
+      "ver_round": 84,
+      "ver_seq": 6,
+      "deleted": 0,
+      "metadata": "{\"kind\":\"symlink\",\"modify_time\":\"2026-09-25T01:36:18.033323783Z\",\"symlink\":\"loop\",\"xattrs\":[{\"base64\":true,\"key\":\"binary\",\"value\":\"AP8=\"},{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"84.6\"}]}"
+    },
+    {
+      "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+      "path": "/sr/links/relative",
+      "barcode": "SR2502L8",
+      "generation": 3,
+      "length": 0,
+      "sha256": "",
+      "ver_round": 84,
+      "ver_seq": 7,
+      "deleted": 0,
+      "metadata": "{\"kind\":\"symlink\",\"modify_time\":\"2026-09-25T01:36:15.086347064Z\",\"symlink\":\"target\",\"xattrs\":[{\"base64\":true,\"key\":\"binary\",\"value\":\"AP8=\"},{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"84.7\"}]}"
+    },
+    {
+      "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+      "path": "/sr/links/renamed",
+      "barcode": "SR2502L8",
+      "generation": 3,
+      "length": 0,
+      "sha256": "",
+      "ver_round": 84,
+      "ver_seq": 1,
+      "deleted": 1,
+      "metadata": "null"
+    },
+    {
+      "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+      "path": "/sr/links/subdir",
+      "barcode": "SR2502L8",
+      "generation": 3,
+      "length": 0,
+      "sha256": "",
+      "ver_round": 84,
+      "ver_seq": 8,
+      "deleted": 0,
+      "metadata": "{\"kind\":\"directory\",\"modify_time\":\"2026-09-25T01:36:13.350034615Z\",\"node\":{\"access_time\":\"2026-09-25T01:36:13.350034615Z\",\"backup_time\":\"2026-09-25T01:36:13.350034615Z\",\"change_time\":\"2026-09-25T01:36:13.350034615Z\",\"creation_time\":\"2026-09-25T01:36:13.350034615Z\",\"modify_time\":\"2026-09-25T01:36:13.350034615Z\",\"readonly\":false},\"xattrs\":[{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"84.8\"}]}"
+    },
+    {
+      "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+      "path": "/sr/links/target",
+      "barcode": "SR2502L8",
+      "generation": 3,
+      "length": 24,
+      "sha256": "dc233f09e28bbab5f69d0013ea971969d12ae0eb212959075ec4354cd25ef665",
+      "ver_round": 84,
+      "ver_seq": 9,
+      "deleted": 0,
+      "metadata": "{\"modify_time\":\"2026-09-25T01:36:19.936707884Z\",\"xattrs\":[{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"84.9\"},{\"base64\":false,\"key\":\"ltfs.hash.sha256sum\",\"value\":\"dc233f09e28bbab5f69d0013ea971969d12ae0eb212959075ec4354cd25ef665\"}]}"
+    },
+    {
+      "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+      "path": "/sr/links/temporary",
+      "barcode": "SR2502L8",
+      "generation": 3,
+      "length": 0,
+      "sha256": "",
+      "ver_round": 84,
+      "ver_seq": 2,
+      "deleted": 1,
+      "metadata": "null"
+    },
+    {
+      "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+      "path": "/sr/links/中文",
+      "barcode": "SR2502L8",
+      "generation": 3,
+      "length": 0,
+      "sha256": "",
+      "ver_round": 84,
+      "ver_seq": 10,
+      "deleted": 0,
+      "metadata": "{\"kind\":\"symlink\",\"modify_time\":\"2026-09-25T01:36:18.876644659Z\",\"symlink\":\"target\",\"xattrs\":[{\"base64\":true,\"key\":\"binary\",\"value\":\"AP8=\"},{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"84.10\"}]}"
+    },
+    {
+      "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+      "path": "/sr/seed",
+      "barcode": "SR2502L8",
+      "generation": 3,
+      "length": 13,
+      "sha256": "ba3378d7acafca6ec617933b2ea1bdb95bbdb2db4dd4dd6f528ec07cdf827aa7",
+      "ver_round": 84,
+      "ver_seq": 11,
+      "deleted": 0,
+      "metadata": "{\"modify_time\":\"2026-09-25T01:36:03.565876509Z\",\"xattrs\":[{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"84.11\"},{\"base64\":false,\"key\":\"ltfs.hash.sha256sum\",\"value\":\"ba3378d7acafca6ec617933b2ea1bdb95bbdb2db4dd4dd6f528ec07cdf827aa7\"}]}"
+    }
+  ]
+}

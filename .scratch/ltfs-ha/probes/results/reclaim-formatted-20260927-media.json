@@ -1,0 +1,69 @@
+{
+  "summary": {
+    "sr2501l8-before": [
+      {
+        "generation": "4",
+        "uuid": "3c9ce34a-849c-4ae0-82ad-7bf19c81750e",
+        "links": 6,
+        "files": 10
+      },
+      {
+        "generation": "4",
+        "uuid": "3c9ce34a-849c-4ae0-82ad-7bf19c81750e",
+        "links": 6,
+        "files": 10
+      }
+    ],
+    "sr2502l8-before": [
+      {
+        "generation": "2",
+        "uuid": "452c30c6-ccfc-4a99-a396-ca4f45a55e15",
+        "links": 0,
+        "files": 0
+      },
+      {
+        "generation": "2",
+        "uuid": "452c30c6-ccfc-4a99-a396-ca4f45a55e15",
+        "links": 0,
+        "files": 0
+      }
+    ],
+    "sr2501l8-after": [
+      {
+        "generation": "2",
+        "uuid": "f5483a52-3587-4069-bfe1-8ed56a8f0868",
+        "links": 0,
+        "files": 0
+      },
+      {
+        "generation": "2",
+        "uuid": "f5483a52-3587-4069-bfe1-8ed56a8f0868",
+        "links": 0,
+        "files": 0
+      }
+    ],
+    "sr2502l8-after": [
+      {
+        "generation": "4",
+        "uuid": "452c30c6-ccfc-4a99-a396-ca4f45a55e15",
+        "links": 6,
+        "files": 10
+      },
+      {
+        "generation": "4",
+        "uuid": "452c30c6-ccfc-4a99-a396-ca4f45a55e15",
+        "links": 6,
+        "files": 10
+      }
+    ]
+  },
+  "links": {
+    "chain": "<file>\n                <name>chain</name>\n                <length>0</length>\n                <readonly>false</readonly>\n                <creationtime>2026-09-25T01:36:19.668644300Z</creationtime>\n                <changetime>2026-09-25T01:36:46.054166940Z</changetime>\n                <modifytime>2026-09-25T01:36:19.668644300Z</modifytime>\n                <accesstime>2026-09-25T01:36:19.668644300Z</accesstime>\n                <backuptime>2026-09-25T01:36:19.668644300Z</backuptime>\n                <extendedattributes>\n                  <xattr>\n                    <key>binary</key>\n                    <value type=\"base64\">AP8=</value>\n                  </xattr>\n                  </extendedattributes>\n                <symlink>relative</symlink>\n              </file>\n              ",
+    "dangling": "<file>\n                <name>dangling</name>\n                <length>0</length>\n                <readonly>false</readonly>\n                <creationtime>2026-09-25T01:36:15.901883741Z</creationtime>\n                <changetime>2026-09-25T01:36:42.563829288Z</changetime>\n                <modifytime>2026-09-25T01:36:15.901883741Z</modifytime>\n                <accesstime>2026-09-25T01:36:15.901883741Z</accesstime>\n                <backuptime>2026-09-25T01:36:15.901883741Z</backuptime>\n                <extendedattributes>\n                  <xattr>\n                    <key>binary</key>\n                    <value type=\"base64\">AP8=</value>\n                  </xattr>\n                  </extendedattributes>\n                <symlink>../absent &amp; 中文%?#</symlink>\n              </file>\n              ",
+    "directory": "<file>\n                <name>directory</name>\n                <length>0</length>\n                <readonly>false</readonly>\n                <creationtime>2026-09-25T01:36:17.243491908Z</creationtime>\n                <changetime>2026-09-25T01:36:43.375305267Z</changetime>\n                <modifytime>2026-09-25T01:36:17.243491908Z</modifytime>\n                <accesstime>2026-09-25T01:36:17.243491908Z</accesstime>\n                <backuptime>2026-09-25T01:36:17.243491908Z</backuptime>\n                <extendedattributes>\n                  <xattr>\n                    <key>binary</key>\n                    <value type=\"base64\">AP8=</value>\n                  </xattr>\n                  </extendedattributes>\n                <symlink>subdir</symlink>\n              </file>\n              ",
+    "loop": "<file>\n                <name>loop</name>\n                <length>0</length>\n                <readonly>false</readonly>\n                <creationtime>2026-09-25T01:36:18.033323783Z</creationtime>\n                <changetime>2026-09-25T01:36:44.167371088Z</changetime>\n                <modifytime>2026-09-25T01:36:18.033323783Z</modifytime>\n                <accesstime>2026-09-25T01:36:18.033323783Z</accesstime>\n                <backuptime>2026-09-25T01:36:18.033323783Z</backuptime>\n                <extendedattributes>\n                  <xattr>\n                    <key>binary</key>\n                    <value type=\"base64\">AP8=</value>\n                  </xattr>\n                  </extendedattributes>\n                <symlink>loop</symlink>\n              </file>\n              ",
+    "relative": "<file>\n                <name>relative</name>\n                <length>0</length>\n                <readonly>false</readonly>\n                <creationtime>2026-09-25T01:36:15.086347064Z</creationtime>\n                <changetime>2026-09-25T01:36:41.675383376Z</changetime>\n                <modifytime>2026-09-25T01:36:15.086347064Z</modifytime>\n                <accesstime>2026-09-25T01:36:15.086347064Z</accesstime>\n                <backuptime>2026-09-25T01:36:15.086347064Z</backuptime>\n                <extendedattributes>\n                  <xattr>\n                    <key>binary</key>\n                    <value type=\"base64\">AP8=</value>\n                  </xattr>\n                  </extendedattributes>\n                <symlink>target</symlink>\n              </file>\n              ",
+    "中文": "<file>\n                <name>中文</name>\n                <length>0</length>\n                <readonly>false</readonly>\n                <creationtime>2026-09-25T01:36:18.876644659Z</creationtime>\n                <changetime>2026-09-25T01:36:45.279096748Z</changetime>\n                <modifytime>2026-09-25T01:36:18.876644659Z</modifytime>\n                <accesstime>2026-09-25T01:36:18.876644659Z</accesstime>\n                <backuptime>2026-09-25T01:36:18.876644659Z</backuptime>\n                <extendedattributes>\n                  <xattr>\n                    <key>binary</key>\n                    <value type=\"base64\">AP8=</value>\n                  </xattr>\n                  </extendedattributes>\n                <symlink>target</symlink>\n              </file>\n              "
+  },
+  "passed": true
+}

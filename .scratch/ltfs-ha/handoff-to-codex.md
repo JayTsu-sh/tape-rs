@@ -423,3 +423,11 @@ Holo新隔离目录 `/home/rocky/tape-rs-reclaim-cut-20260927`，从关闭SR数�
 正式恢复node1 term43 round409/applied412，TS1001L08正常checkpoint由119→120 DP/IP Complete，可用7MiB。53条原catalog除generation外保持，三副本一致、SHA3339567f…；原9文件length/SHA/mmap/barcode通过。EE三节点available无任务、f3哈希不变、9publications ready。原TS1001第一驱动器、RT/SR1/SR2槽7/8/9。跨主机设备号不同（.71changer sg9，.72sg8），必须按VPD序列号重新核对。
 
 现场覆盖Holo死亡接管，不是物理设备，也没有覆盖FORMAT已成功但完成记录未复制窗口；下一项优先补后者。详细测试编排修正和证据见报告及probes/results/reclaim-cut-20260927-*。按无人值守约定记录推荐决策，未推送远端。
+
+## 2026-09-27 源mkltfs完成、回收完成记录前中断验收完成
+
+用户再次确认无人值守授权，自动执行上一交接下一项。见[holo-reclaim-formatted-20260927.md](holo-reclaim-formatted-20260927.md)。测试transport新增AfterMkltfs：源Full1空/可写、池标记未写、复制状态reclaiming时隔离旧执行者，新节点重做回收得到Full2空/可写且有池UUID，恢复旧操作失权且介质不变。六链接保真和后续接管读回通过。最终208通过7忽略，check/clippy完成，历史fmt差异保留，无生产源码/二进制变更。
+
+新隔离目录 `/home/rocky/tape-rs-reclaim-formatted-20260927`，7500/7501，SR1→SR2回收。node1 round84源mkltfs完成后SIGKILL，trace FORMAT GOOD且无完成的重挂READ，关闭catalog13条均在SR2，仍reclaiming。node2 round95实际挂载新UUID Full1空源带，重做并done。六链接冷缓存FUSE/内容/mmap/seed/条码通过，13目录元数据保真，关闭Full XML六链接除UID/version外一致。最终SR1槽8 Full2空且池属性完整，SR2槽9 Full4有数据；测试/strace/FUSE停止、缓存空。最新关闭test-data在新目录，旧目录不可接续。Holo前后备份 `/home/rocky/holo-reclaim-formatted-20260927`；.71新目录at-cut.tgz为截断证据。
+
+正式恢复node1 term44 round414/applied417，TS1001L08仍120 Complete/7MiB，53条原catalog及池摘要逐字段不变、SHA3339567f…，原9文件length/SHA/mmap/barcode通过。EE available无任务/f3保持/9pub ready。未触及物理带库、未断电、未做LE往返。下一项推荐原始FORMAT成功但LTFS标签/索引未构造完的窗口；本轮不声称覆盖它。证据probes/results/reclaim-formatted-20260927-*，未推送。

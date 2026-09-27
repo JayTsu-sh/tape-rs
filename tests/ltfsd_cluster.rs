@@ -71,13 +71,39 @@ impl DirectoryFetch for FileFetch {
     }
 }
 
-// Test-only barrier before the old executor delivers FORMAT MEDIUM. The new
-// executor uses another initiator and can continue; no production fault hook.
+// Test-only barriers around source formatting; no production fault hook.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReclaimCut {
+    BeforeFormat,
+    AfterMkltfs,
+}
+
 struct FormatPause {
     initiator: std::sync::atomic::AtomicU32,
+    cut: ReclaimCut,
+    formatted: std::sync::atomic::AtomicBool,
     entered: Sender<()>,
     resume: Mutex<std::sync::mpsc::Receiver<()>>,
     returned: Sender<bool>,
+}
+
+impl FormatPause {
+    fn wait(&self) -> Result<()> {
+        let _ = self.entered.send(());
+        self.resume
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|e| tape_rs::error::TapeError::NotReady(format!("测试格式化屏障: {e}")))
+    }
+
+    fn report(&self, result: &Result<tape_rs::scsi::device::ScsiResult>) {
+        let _ = self.returned.send(
+            result
+                .as_ref()
+                .is_err_and(tape_rs::scsi::reservation::ownership_lost),
+        );
+    }
 }
 
 struct PausingTransport {
@@ -93,27 +119,28 @@ impl tape_rs::scsi::transport::TapeTransport for PausingTransport {
         timeout: u32,
     ) -> Result<tape_rs::scsi::device::ScsiResult> {
         use std::sync::atomic::Ordering;
+        let is_format = cdb.first() == Some(&tape_rs::scsi::cdb::opcode::FORMAT_MEDIUM);
         let pause = self.pause.as_ref().filter(|p| {
-            cdb.first() == Some(&tape_rs::scsi::cdb::opcode::FORMAT_MEDIUM)
+            p.cut == ReclaimCut::BeforeFormat
+                && is_format
                 && p.initiator
                     .compare_exchange(self.initiator, 0, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
         });
         if let Some(p) = pause {
-            let _ = p.entered.send(());
-            p.resume
-                .lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(30))
-                .map_err(|e| tape_rs::error::TapeError::NotReady(format!("测试格式化屏障: {e}")))?;
+            p.wait()?;
         }
         let result = self.inner.execute_no_data(cdb, timeout);
+        if let Some(p) = self.pause.as_ref().filter(|p| {
+            p.cut == ReclaimCut::AfterMkltfs
+                && is_format
+                && result.is_ok()
+                && p.initiator.load(Ordering::SeqCst) == self.initiator
+        }) {
+            p.formatted.store(true, Ordering::SeqCst);
+        }
         if let Some(p) = pause {
-            let _ = p.returned.send(
-                result
-                    .as_ref()
-                    .is_err_and(tape_rs::scsi::reservation::ownership_lost),
-            );
+            p.report(&result);
         }
         result
     }
@@ -124,7 +151,25 @@ impl tape_rs::scsi::transport::TapeTransport for PausingTransport {
         buf: &mut [u8],
         timeout: u32,
     ) -> Result<tape_rs::scsi::device::ScsiResult> {
-        self.inner.execute_read(cdb, buf, timeout)
+        use std::sync::atomic::Ordering;
+        // mkltfs performs no READ(6). The first one following its FORMAT is
+        // the remount in finish_reclaim, after both empty indexes are durable.
+        let pause = self.pause.as_ref().filter(|p| {
+            p.cut == ReclaimCut::AfterMkltfs
+                && cdb.first() == Some(&tape_rs::scsi::cdb::opcode::READ_6)
+                && p.formatted.load(Ordering::SeqCst)
+                && p.initiator
+                    .compare_exchange(self.initiator, 0, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+        });
+        if let Some(p) = pause {
+            p.wait()?;
+        }
+        let result = self.inner.execute_read(cdb, buf, timeout);
+        if let Some(p) = pause {
+            p.report(&result);
+        }
+        result
     }
 
     fn execute_write(
@@ -2300,15 +2345,20 @@ fn symlinks_commit_and_survive_remount_and_takeover() {
 
 #[test]
 fn reclaim_preserves_symlinks_without_resolving_targets() {
-    check_symlink_reclaim(false);
+    check_symlink_reclaim(None);
 }
 
 #[test]
 fn reclaim_takeover_before_source_format_preserves_symlinks_and_fences_old_format() {
-    check_symlink_reclaim(true);
+    check_symlink_reclaim(Some(ReclaimCut::BeforeFormat));
 }
 
-fn check_symlink_reclaim(interrupt_before_format: bool) {
+#[test]
+fn reclaim_takeover_after_mkltfs_before_completion_preserves_symlinks() {
+    check_symlink_reclaim(Some(ReclaimCut::AfterMkltfs));
+}
+
+fn check_symlink_reclaim(cut: Option<ReclaimCut>) {
     use tape_rs::ltfs::{index::Xattr, volume::LtfsVolume};
     use tape_rs::tapefs::{ClientBackend, ROOT_INO, TapeFs};
     let lib = SimLibrary::new(2, 6, 1);
@@ -2364,11 +2414,13 @@ fn check_symlink_reclaim(interrupt_before_format: bool) {
     let (returned_tx, returned_rx) = channel();
     let pause = Arc::new(FormatPause {
         initiator: std::sync::atomic::AtomicU32::new(0),
+        cut: cut.unwrap_or(ReclaimCut::BeforeFormat),
+        formatted: std::sync::atomic::AtomicBool::new(false),
         entered: entered_tx,
         resume: Mutex::new(resume_rx),
         returned: returned_tx,
     });
-    if interrupt_before_format {
+    if cut.is_some() {
         // Destination creation must not be mistaken for source reclamation.
         lib.load_into_drive("PA0002L8", 1).unwrap();
         mkltfs(
@@ -2382,17 +2434,17 @@ fn check_symlink_reclaim(interrupt_before_format: bool) {
         .unwrap();
     }
     let c = Cluster::start_lib_with(
-        if interrupt_before_format {
-            "reclaim-symlinks-cut"
-        } else {
-            "reclaim-symlinks"
+        match cut {
+            None => "reclaim-symlinks",
+            Some(ReclaimCut::BeforeFormat) => "reclaim-symlinks-cut",
+            Some(ReclaimCut::AfterMkltfs) => "reclaim-symlinks-formatted",
         },
         false,
         lib,
         100,
         &["PA0001L8", "PA0002L8"],
         None,
-        interrupt_before_format.then(|| pause.clone()),
+        cut.map(|_| pause.clone()),
     );
     let (mut leader, mut round) = c.wait_serving(None, 0);
     c.wait("链接服务开放", || {
@@ -2400,7 +2452,7 @@ fn check_symlink_reclaim(interrupt_before_format: bool) {
     });
     let endpoints = c.start_http();
     let mut cl = Client::new(endpoints.clone());
-    if interrupt_before_format {
+    if cut.is_some() {
         pause
             .initiator
             .store(leader as u32, std::sync::atomic::Ordering::SeqCst);
@@ -2408,24 +2460,37 @@ fn check_symlink_reclaim(interrupt_before_format: bool) {
     c.admin(Command::TapeReclaim {
         barcode: "PA0001L8".into(),
     });
-    if interrupt_before_format {
+    if cut.is_some() {
         entered_rx
             .recv_timeout(Duration::from_secs(20))
-            .expect("未到达源带格式化前屏障");
+            .expect("未到达回收中断屏障");
         assert_eq!(c.st(leader).tapes["PA0001L8"].state, "reclaiming");
-        // FORMAT has not reached the source. Its original links still exist,
-        // while the destination catalog has already durably moved every path.
+        // Check the actual source medium and the durable destination catalog
+        // while completion has not been reported to the replicated state.
         let source = c.lib.cartridge("PA0001L8").unwrap();
         let detached = SimLibrary::new(1, 2, 0);
         detached.insert_cartridge(source, 0).unwrap();
         detached.load_into_drive("PA0001L8", 0).unwrap();
         let drive = detached.drive(0);
         let source = LtfsVolume::mount(&drive).unwrap();
+        if cut == Some(ReclaimCut::AfterMkltfs) {
+            assert!(source.writable());
+            assert_eq!(source.index().generation, 1);
+            assert_ne!(source.label().volume_uuid, original.volume_uuid);
+            source
+                .index()
+                .walk_files(|path, _| panic!("回收源带仍有文件: {path}"));
+            assert!(source.index().root.xattrs.is_empty());
+        }
         for (name, target) in links {
-            assert_eq!(
-                source.index().find_file(name).unwrap().symlink.as_deref(),
-                Some(target)
-            );
+            if cut == Some(ReclaimCut::BeforeFormat) {
+                assert_eq!(
+                    source.index().find_file(name).unwrap().symlink.as_deref(),
+                    Some(target)
+                );
+            } else {
+                assert!(source.index().find_file(name).is_none());
+            }
             assert_eq!(
                 cl.stat(&format!("/{name}")).unwrap().unwrap().barcode,
                 "PA0002L8"
@@ -2441,14 +2506,36 @@ fn check_symlink_reclaim(interrupt_before_format: bool) {
                 .is_some_and(|r| r.outcome == "done")
         });
         let finished_source = c.lib.cartridge("PA0001L8").unwrap();
+        if cut == Some(ReclaimCut::AfterMkltfs) {
+            let recovered_lib = SimLibrary::new(1, 2, 0);
+            recovered_lib
+                .insert_cartridge(finished_source.clone(), 0)
+                .unwrap();
+            recovered_lib.load_into_drive("PA0001L8", 0).unwrap();
+            let recovered_drive = recovered_lib.drive(0);
+            let empty = LtfsVolume::mount(&recovered_drive).unwrap();
+            assert!(empty.writable());
+            assert_eq!(empty.index().generation, 2);
+            empty
+                .index()
+                .walk_files(|path, _| panic!("接管后源带仍有文件: {path}"));
+            assert!(
+                empty
+                    .index()
+                    .root
+                    .xattrs
+                    .iter()
+                    .any(|x| { x.key == "ltfs.mediaPool.uuid" && x.value == POOL })
+            );
+        }
         resume_tx.send(()).unwrap();
         // PREEMPT reports reservation-loss UNIT ATTENTION or conflict. Both
-        // stop the production executor, rather than retrying a stale FORMAT.
+        // stop the old executor before it can write to the source again.
         assert!(
             returned_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
-            "旧FORMAT未报告执行资格丢失"
+            "旧执行者未报告执行资格丢失"
         );
-        // The delayed old command cannot erase the newly formatted source.
+        // Resuming the old operation cannot change the newly formatted source.
         let after = c.lib.cartridge("PA0001L8").unwrap();
         assert_eq!(
             after.partitions[0].objects,
