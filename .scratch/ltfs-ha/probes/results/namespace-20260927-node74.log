@@ -1,0 +1,51 @@
+[2026-09-27T03:50:06Z INFO  tape_rs::daemon::net] 节点间通信监听 0.0.0.0:7500
+[2026-09-27T03:50:06Z INFO  tape_rs::daemon::http] 客户端接口监听 0.0.0.0:7501
+[2026-09-27T03:50:06Z INFO  raft::raft] switched to configuration, raft_id: 3, config: Configuration { voters: Configuration { incoming: Configuration { voters: {1, 2, 3} }, outgoing: Configuration { voters: {} } }, learners: {}, learners_next: {}, auto_leave: false }
+[2026-09-27T03:50:06Z INFO  raft::raft] became follower at term 11, raft_id: 3, term: 11
+[2026-09-27T03:50:06Z INFO  raft::raft] newRaft, raft_id: 3, peers: Configuration { incoming: Configuration { voters: {1, 2, 3} }, outgoing: Configuration { voters: {} } }, last term: 11, last index: 145, applied: 0, commit: 145, term: 11
+[2026-09-27T03:50:06Z INFO  raft::raw_node] RawNode created with id 3., raft_id: 3, id: 3
+[2026-09-27T03:50:06Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 2
+[2026-09-27T03:50:06Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 49
+[2026-09-27T03:50:06Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 62
+[2026-09-27T03:50:06Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 67
+[2026-09-27T03:50:06Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 84
+[2026-09-27T03:50:06Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 95
+[2026-09-27T03:50:06Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 101
+[2026-09-27T03:50:06Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 127
+[2026-09-27T03:50:07Z INFO  raft::raft] starting a new election, raft_id: 3, term: 11
+[2026-09-27T03:50:07Z INFO  raft::raft] became pre-candidate at term 11, raft_id: 3, term: 11
+[2026-09-27T03:50:07Z INFO  raft::raft] broadcasting vote request, raft_id: 3, to: [1, 2], log_index: 145, log_term: 11, term: 11, type: MsgRequestPreVote
+[2026-09-27T03:50:07Z INFO  raft::raft] received votes response, raft_id: 3, term: 11, type: MsgRequestPreVoteResponse, approvals: 2, rejections: 0, from: 1, vote: true
+[2026-09-27T03:50:07Z INFO  raft::raft] became candidate at term 12, raft_id: 3, term: 12
+[2026-09-27T03:50:07Z INFO  raft::raft] broadcasting vote request, raft_id: 3, to: [1, 2], log_index: 145, log_term: 11, term: 12, type: MsgRequestVote
+[2026-09-27T03:50:07Z INFO  raft::raft] received votes response, raft_id: 3, term: 12, type: MsgRequestVoteResponse, approvals: 2, rejections: 0, from: 2, vote: true
+[2026-09-27T03:50:07Z INFO  raft::raft] became leader at term 12, raft_id: 3, term: 12
+[2026-09-27T03:50:07Z INFO  tape_rs::daemon::node] 本节点成为执行者，轮次 147（任期 12）
+[2026-09-27T03:50:07Z INFO  tape_rs::scsi::reservation] /dev/sg6: 预留现状 generation=39 keys=[] holder=None
+[2026-09-27T03:50:07Z INFO  tape_rs::daemon::executor] 执行线程: IBMtaper2287 (/dev/sg6) 已隔离（原持有者 None）
+[2026-09-27T03:50:07Z INFO  tape_rs::scsi::reservation] /dev/sg7: 预留现状 generation=39 keys=[] holder=None
+[2026-09-27T03:50:07Z INFO  tape_rs::daemon::executor] 执行线程: IBMtaper2287_LL3 (/dev/sg7) 已隔离（原持有者 None）
+[2026-09-27T03:50:07Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=0
+[2026-09-27T03:50:07Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=2
+[2026-09-27T03:50:07Z INFO  tape_rs::ltfs::volume] LTFS label: version=2.4.0 uuid=83f0259a-77d6-4788-8399-4e686946022b blocksize=524288 compression=false
+[2026-09-27T03:50:07Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=0
+[2026-09-27T03:50:07Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=12
+[2026-09-27T03:50:07Z INFO  tape_rs::ltfs::recovery] 分区 1 VCI 快速路径命中 gen=3 @ 12..13
+[2026-09-27T03:50:07Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=0
+[2026-09-27T03:50:07Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=5
+[2026-09-27T03:50:07Z INFO  tape_rs::ltfs::recovery] 分区 0 VCI 快速路径命中 gen=3 @ 5..6
+[2026-09-27T03:50:07Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=8
+[2026-09-27T03:50:07Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=5
+[2026-09-27T03:50:07Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=14
+[2026-09-27T03:50:07Z INFO  tape_rs::ltfs::volume] index gen=3 highest_uid=2 (dp_tail=Complete, ip_tail=Complete, writable=true)
+[2026-09-27T03:50:07Z INFO  tape_rs::daemon::node] SR2502L8 目录停在第 1 代，磁带是第 3 代：以磁带为准重写该带的目录
+[2026-09-27T03:50:07Z INFO  tape_rs::daemon::node] 轮次 147 开始服务：IBMtaper2287 (/dev/sg6) [SR2502L8]: gen=3 文件 1 个 尾部 Complete；可用 235 MiB
+[2026-09-27T03:50:30Z INFO  raft::raft] [logterm: 12, index: 150, vote: 3] ignored vote from 2 [logterm: 12, index: 150]: lease is not expired, raft_id: 3, msg type: MsgRequestPreVote, remaining ticks: 6, term: 12, msg_index: 150, msg_term: 12, from: 2, vote: 3, log_index: 150, log_term: 12
+[2026-09-27T03:50:30Z INFO  raft::raft] [logterm: 12, index: 150, vote: 3] ignored vote from 2 [logterm: 12, index: 150]: lease is not expired, raft_id: 3, msg type: MsgRequestVote, remaining ticks: 6, term: 12, msg_index: 150, msg_term: 12, from: 2, vote: 3, log_index: 150, log_term: 12
+[2026-09-27T03:50:30Z INFO  raft::raft] received a message with higher term from 2, raft_id: 3, msg type: MsgAppend, message_term: 13, term: 12, from: 2
+[2026-09-27T03:50:30Z INFO  raft::raft] became follower at term 13, raft_id: 3, term: 13
+[2026-09-27T03:50:30Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 152
+[2026-09-27T03:50:30Z INFO  tape_rs::scsi::reservation] /dev/sg6: PERSISTENT RESERVE IN 前越过 UNIT ATTENTION 2a/05
+[2026-09-27T03:50:31Z ERROR tape_rs::daemon::node] 轮次 147 放弃：写入带检查点失败: 执行资格已失去 (/dev/sg6): 预留持有者 Some((4c02000000000098, 3))，注册表 [4c02000000000098]，本轮键 4c03000000000093
+[2026-09-27T03:52:02Z INFO  ltfsd] 收到停机信号，正在计划停机（再按一次直接退出）
+[2026-09-27T03:52:02Z INFO  tape_rs::daemon::node] 节点 3 停机

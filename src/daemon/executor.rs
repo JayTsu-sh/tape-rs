@@ -1418,7 +1418,13 @@ fn read_any_inner<W: Write>(
                 round: a.round,
                 reason: reason.clone(),
             });
-            return Err(Failed(reason));
+            // 还没有向 HTTP 客户端发布任何读数据。资格丢失可在新执行者安全重读，
+            // 介质或其他检查点错误仍报告失败，不能用重试掩盖。
+            return Err(if ownership_lost(&e) {
+                Busy(reason)
+            } else {
+                Failed(reason)
+            });
         }
         files.close("暂时换带读取");
         if let Some(d) = inv.drives.iter().find(|d| d.dev == w) {

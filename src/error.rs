@@ -80,8 +80,12 @@ pub enum TapeError {
 
     /// 卷提交在某个阶段失败。`stage` 标明设备副作用可能到达的位置：
     /// 索引写入及之后的阶段都意味着"结果未定"，须重新挂载经恢复协议核实。
-    #[error("Commit failed at {stage}: {reason}")]
-    CommitFailed { stage: String, reason: String },
+    #[error("Commit failed at {stage}: {source}")]
+    CommitFailed {
+        stage: String,
+        #[source]
+        source: Box<TapeError>,
+    },
 
     #[error("Catalog error: {0}")]
     Catalog(String),

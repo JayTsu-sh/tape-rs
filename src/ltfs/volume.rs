@@ -1061,7 +1061,7 @@ impl<'a> LtfsVolume<'a> {
                 self.freeze_after_commit_failure(stage, &err);
                 Err(TapeError::CommitFailed {
                     stage: stage.to_string(),
-                    reason: err.to_string(),
+                    source: Box::new(err),
                 })
             }
         }

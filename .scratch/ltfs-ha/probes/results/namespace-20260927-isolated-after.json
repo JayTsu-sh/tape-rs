@@ -1,0 +1,827 @@
+{
+  "71": {
+    "pid": 802087,
+    "cluster": {
+      "drives": 1,
+      "executor": {
+        "fenced": true,
+        "node": 2,
+        "round": 152
+      },
+      "id": 1,
+      "last_reclaim": null,
+      "leader": 2,
+      "local": "空闲",
+      "role": "Follower",
+      "serving_round": null,
+      "term": 13
+    },
+    "pools": {
+      "answered_by": 1,
+      "applied_index": 159,
+      "pools": [
+        {
+          "file_limit": 200000,
+          "name": "sr",
+          "tape_details": [
+            {
+              "barcode": "SR2501L8",
+              "bytes_used": 37,
+              "bytes_written": 4194304,
+              "files": 13,
+              "generation": 5,
+              "live_bytes": 37,
+              "live_files": 17,
+              "reclaimable_bytes": 4194267,
+              "state": "appendable"
+            },
+            {
+              "barcode": "SR2502L8",
+              "bytes_used": 24,
+              "bytes_written": 3145728,
+              "files": 1,
+              "generation": 3,
+              "live_bytes": 24,
+              "live_files": 1,
+              "reclaimable_bytes": 3145704,
+              "state": "appendable"
+            }
+          ],
+          "tapes": [
+            "SR2501L8",
+            "SR2502L8"
+          ],
+          "uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b"
+        }
+      ]
+    },
+    "files": [
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/checkpoint-current",
+        "barcode": "SR2502L8",
+        "generation": 3,
+        "length": 24,
+        "sha256": "e58a08f5e5caef8e247ef2610bb534ae475dcb4f3aa0b3df04d3dc113b870840",
+        "ver_round": 0,
+        "ver_seq": 0,
+        "deleted": 0,
+        "metadata": "{\"modify_time\":\"2026-09-27T03:50:04.607799705Z\",\"xattrs\":[{\"base64\":false,\"key\":\"ltfs.hash.sha256sum\",\"value\":\"e58a08f5e5caef8e247ef2610bb534ae475dcb4f3aa0b3df04d3dc113b870840\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 14,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"directory\",\"modify_time\":\"2026-09-27T03:21:26.416598401Z\",\"node\":{\"access_time\":\"2026-09-25T01:36:03.517503217Z\",\"backup_time\":\"2026-09-25T01:36:03.517503217Z\",\"change_time\":\"2026-09-27T03:21:26.416598401Z\",\"creation_time\":\"2026-09-25T01:36:03.517503217Z\",\"modify_time\":\"2026-09-27T03:21:26.416598401Z\",\"readonly\":false},\"xattrs\":[{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.14\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/cleanup-20260927",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 15,
+        "deleted": 1,
+        "metadata": "{\"kind\":\"directory\"}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/cleanup-20260927/link",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 4,
+        "deleted": 1,
+        "metadata": "null"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/cleanup-20260927/original",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 1,
+        "deleted": 1,
+        "metadata": "null"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/cleanup-20260927/renamed",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 2,
+        "deleted": 1,
+        "metadata": "null"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 13,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"directory\",\"modify_time\":\"2026-09-25T01:36:23.674503370Z\",\"node\":{\"access_time\":\"2026-09-25T01:36:12.543020403Z\",\"backup_time\":\"2026-09-25T01:36:12.543020403Z\",\"change_time\":\"2026-09-25T01:36:23.674503370Z\",\"creation_time\":\"2026-09-25T01:36:12.543020403Z\",\"modify_time\":\"2026-09-25T01:36:23.674503370Z\",\"readonly\":false},\"xattrs\":[{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.13\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/chain",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 6,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"symlink\",\"modify_time\":\"2026-09-25T01:36:19.668644300Z\",\"symlink\":\"relative\",\"xattrs\":[{\"base64\":true,\"key\":\"binary\",\"value\":\"AP8=\"},{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.6\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/dangling",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 7,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"symlink\",\"modify_time\":\"2026-09-25T01:36:15.901883741Z\",\"symlink\":\"../absent & 中文%?#\",\"xattrs\":[{\"base64\":true,\"key\":\"binary\",\"value\":\"AP8=\"},{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.7\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/directory",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 8,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"symlink\",\"modify_time\":\"2026-09-25T01:36:17.243491908Z\",\"symlink\":\"subdir\",\"xattrs\":[{\"base64\":true,\"key\":\"binary\",\"value\":\"AP8=\"},{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.8\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/loop",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 9,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"symlink\",\"modify_time\":\"2026-09-25T01:36:18.033323783Z\",\"symlink\":\"loop\",\"xattrs\":[{\"base64\":true,\"key\":\"binary\",\"value\":\"AP8=\"},{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.9\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/relative",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 10,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"symlink\",\"modify_time\":\"2026-09-25T01:36:15.086347064Z\",\"symlink\":\"target\",\"xattrs\":[{\"base64\":true,\"key\":\"binary\",\"value\":\"AP8=\"},{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.10\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/renamed",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 3,
+        "deleted": 1,
+        "metadata": "null"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/subdir",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 11,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"directory\",\"modify_time\":\"2026-09-25T01:36:13.350034615Z\",\"node\":{\"access_time\":\"2026-09-25T01:36:13.350034615Z\",\"backup_time\":\"2026-09-25T01:36:13.350034615Z\",\"change_time\":\"2026-09-25T01:36:13.350034615Z\",\"creation_time\":\"2026-09-25T01:36:13.350034615Z\",\"modify_time\":\"2026-09-25T01:36:13.350034615Z\",\"readonly\":false},\"xattrs\":[{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.11\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/target",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 24,
+        "sha256": "dc233f09e28bbab5f69d0013ea971969d12ae0eb212959075ec4354cd25ef665",
+        "ver_round": 127,
+        "ver_seq": 12,
+        "deleted": 0,
+        "metadata": "{\"modify_time\":\"2026-09-25T01:36:19.936707884Z\",\"xattrs\":[{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.12\"},{\"base64\":false,\"key\":\"ltfs.hash.sha256sum\",\"value\":\"dc233f09e28bbab5f69d0013ea971969d12ae0eb212959075ec4354cd25ef665\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/temporary",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 5,
+        "deleted": 1,
+        "metadata": "null"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/中文",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 13,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"symlink\",\"modify_time\":\"2026-09-25T01:36:18.876644659Z\",\"symlink\":\"target\",\"xattrs\":[{\"base64\":true,\"key\":\"binary\",\"value\":\"AP8=\"},{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.13\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/seed",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 13,
+        "sha256": "ba3378d7acafca6ec617933b2ea1bdb95bbdb2db4dd4dd6f528ec07cdf827aa7",
+        "ver_round": 127,
+        "ver_seq": 14,
+        "deleted": 0,
+        "metadata": "{\"modify_time\":\"2026-09-25T01:36:03.565876509Z\",\"xattrs\":[{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.14\"},{\"base64\":false,\"key\":\"ltfs.hash.sha256sum\",\"value\":\"ba3378d7acafca6ec617933b2ea1bdb95bbdb2db4dd4dd6f528ec07cdf827aa7\"}]}"
+      }
+    ]
+  },
+  "72": {
+    "pid": 334497,
+    "cluster": {
+      "drives": 1,
+      "executor": {
+        "fenced": true,
+        "node": 2,
+        "round": 152
+      },
+      "id": 2,
+      "last_reclaim": null,
+      "leader": 2,
+      "local": "轮次 152：服务中。IBMtaper2287 (/dev/sg10) [SR2501L8]: gen=5 文件 14 个 尾部 Complete；可用 234 MiB",
+      "role": "Leader",
+      "serving_round": 152,
+      "term": 13
+    },
+    "pools": {
+      "answered_by": 2,
+      "applied_index": 159,
+      "pools": [
+        {
+          "file_limit": 200000,
+          "name": "sr",
+          "tape_details": [
+            {
+              "barcode": "SR2501L8",
+              "bytes_used": 37,
+              "bytes_written": 4194304,
+              "files": 13,
+              "generation": 5,
+              "live_bytes": 37,
+              "live_files": 17,
+              "reclaimable_bytes": 4194267,
+              "state": "appendable"
+            },
+            {
+              "barcode": "SR2502L8",
+              "bytes_used": 24,
+              "bytes_written": 3145728,
+              "files": 1,
+              "generation": 3,
+              "live_bytes": 24,
+              "live_files": 1,
+              "reclaimable_bytes": 3145704,
+              "state": "appendable"
+            }
+          ],
+          "tapes": [
+            "SR2501L8",
+            "SR2502L8"
+          ],
+          "uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b"
+        }
+      ]
+    },
+    "files": [
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/checkpoint-current",
+        "barcode": "SR2502L8",
+        "generation": 3,
+        "length": 24,
+        "sha256": "e58a08f5e5caef8e247ef2610bb534ae475dcb4f3aa0b3df04d3dc113b870840",
+        "ver_round": 0,
+        "ver_seq": 0,
+        "deleted": 0,
+        "metadata": "{\"modify_time\":\"2026-09-27T03:50:04.607799705Z\",\"xattrs\":[{\"base64\":false,\"key\":\"ltfs.hash.sha256sum\",\"value\":\"e58a08f5e5caef8e247ef2610bb534ae475dcb4f3aa0b3df04d3dc113b870840\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 14,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"directory\",\"modify_time\":\"2026-09-27T03:21:26.416598401Z\",\"node\":{\"access_time\":\"2026-09-25T01:36:03.517503217Z\",\"backup_time\":\"2026-09-25T01:36:03.517503217Z\",\"change_time\":\"2026-09-27T03:21:26.416598401Z\",\"creation_time\":\"2026-09-25T01:36:03.517503217Z\",\"modify_time\":\"2026-09-27T03:21:26.416598401Z\",\"readonly\":false},\"xattrs\":[{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.14\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/cleanup-20260927",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 15,
+        "deleted": 1,
+        "metadata": "{\"kind\":\"directory\"}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/cleanup-20260927/link",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 4,
+        "deleted": 1,
+        "metadata": "null"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/cleanup-20260927/original",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 1,
+        "deleted": 1,
+        "metadata": "null"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/cleanup-20260927/renamed",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 2,
+        "deleted": 1,
+        "metadata": "null"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 13,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"directory\",\"modify_time\":\"2026-09-25T01:36:23.674503370Z\",\"node\":{\"access_time\":\"2026-09-25T01:36:12.543020403Z\",\"backup_time\":\"2026-09-25T01:36:12.543020403Z\",\"change_time\":\"2026-09-25T01:36:23.674503370Z\",\"creation_time\":\"2026-09-25T01:36:12.543020403Z\",\"modify_time\":\"2026-09-25T01:36:23.674503370Z\",\"readonly\":false},\"xattrs\":[{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.13\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/chain",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 6,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"symlink\",\"modify_time\":\"2026-09-25T01:36:19.668644300Z\",\"symlink\":\"relative\",\"xattrs\":[{\"base64\":true,\"key\":\"binary\",\"value\":\"AP8=\"},{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.6\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/dangling",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 7,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"symlink\",\"modify_time\":\"2026-09-25T01:36:15.901883741Z\",\"symlink\":\"../absent & 中文%?#\",\"xattrs\":[{\"base64\":true,\"key\":\"binary\",\"value\":\"AP8=\"},{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.7\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/directory",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 8,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"symlink\",\"modify_time\":\"2026-09-25T01:36:17.243491908Z\",\"symlink\":\"subdir\",\"xattrs\":[{\"base64\":true,\"key\":\"binary\",\"value\":\"AP8=\"},{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.8\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/loop",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 9,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"symlink\",\"modify_time\":\"2026-09-25T01:36:18.033323783Z\",\"symlink\":\"loop\",\"xattrs\":[{\"base64\":true,\"key\":\"binary\",\"value\":\"AP8=\"},{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.9\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/relative",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 10,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"symlink\",\"modify_time\":\"2026-09-25T01:36:15.086347064Z\",\"symlink\":\"target\",\"xattrs\":[{\"base64\":true,\"key\":\"binary\",\"value\":\"AP8=\"},{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.10\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/renamed",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 3,
+        "deleted": 1,
+        "metadata": "null"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/subdir",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 11,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"directory\",\"modify_time\":\"2026-09-25T01:36:13.350034615Z\",\"node\":{\"access_time\":\"2026-09-25T01:36:13.350034615Z\",\"backup_time\":\"2026-09-25T01:36:13.350034615Z\",\"change_time\":\"2026-09-25T01:36:13.350034615Z\",\"creation_time\":\"2026-09-25T01:36:13.350034615Z\",\"modify_time\":\"2026-09-25T01:36:13.350034615Z\",\"readonly\":false},\"xattrs\":[{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.11\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/target",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 24,
+        "sha256": "dc233f09e28bbab5f69d0013ea971969d12ae0eb212959075ec4354cd25ef665",
+        "ver_round": 127,
+        "ver_seq": 12,
+        "deleted": 0,
+        "metadata": "{\"modify_time\":\"2026-09-25T01:36:19.936707884Z\",\"xattrs\":[{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.12\"},{\"base64\":false,\"key\":\"ltfs.hash.sha256sum\",\"value\":\"dc233f09e28bbab5f69d0013ea971969d12ae0eb212959075ec4354cd25ef665\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/temporary",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 5,
+        "deleted": 1,
+        "metadata": "null"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/中文",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 13,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"symlink\",\"modify_time\":\"2026-09-25T01:36:18.876644659Z\",\"symlink\":\"target\",\"xattrs\":[{\"base64\":true,\"key\":\"binary\",\"value\":\"AP8=\"},{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.13\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/seed",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 13,
+        "sha256": "ba3378d7acafca6ec617933b2ea1bdb95bbdb2db4dd4dd6f528ec07cdf827aa7",
+        "ver_round": 127,
+        "ver_seq": 14,
+        "deleted": 0,
+        "metadata": "{\"modify_time\":\"2026-09-25T01:36:03.565876509Z\",\"xattrs\":[{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.14\"},{\"base64\":false,\"key\":\"ltfs.hash.sha256sum\",\"value\":\"ba3378d7acafca6ec617933b2ea1bdb95bbdb2db4dd4dd6f528ec07cdf827aa7\"}]}"
+      }
+    ]
+  },
+  "74": {
+    "pid": 4115953,
+    "cluster": {
+      "drives": 1,
+      "executor": {
+        "fenced": true,
+        "node": 2,
+        "round": 152
+      },
+      "id": 3,
+      "last_reclaim": null,
+      "leader": 2,
+      "local": "轮次 147 已放弃：写入带检查点失败: 执行资格已失去 (/dev/sg6): 预留持有者 Some((4c02000000000098, 3))，注册表 [4c02000000000098]，本轮键 4c03000000000093",
+      "role": "Follower",
+      "serving_round": null,
+      "term": 13
+    },
+    "pools": {
+      "answered_by": 3,
+      "applied_index": 159,
+      "pools": [
+        {
+          "file_limit": 200000,
+          "name": "sr",
+          "tape_details": [
+            {
+              "barcode": "SR2501L8",
+              "bytes_used": 37,
+              "bytes_written": 4194304,
+              "files": 13,
+              "generation": 5,
+              "live_bytes": 37,
+              "live_files": 17,
+              "reclaimable_bytes": 4194267,
+              "state": "appendable"
+            },
+            {
+              "barcode": "SR2502L8",
+              "bytes_used": 24,
+              "bytes_written": 3145728,
+              "files": 1,
+              "generation": 3,
+              "live_bytes": 24,
+              "live_files": 1,
+              "reclaimable_bytes": 3145704,
+              "state": "appendable"
+            }
+          ],
+          "tapes": [
+            "SR2501L8",
+            "SR2502L8"
+          ],
+          "uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b"
+        }
+      ]
+    },
+    "files": [
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/checkpoint-current",
+        "barcode": "SR2502L8",
+        "generation": 3,
+        "length": 24,
+        "sha256": "e58a08f5e5caef8e247ef2610bb534ae475dcb4f3aa0b3df04d3dc113b870840",
+        "ver_round": 0,
+        "ver_seq": 0,
+        "deleted": 0,
+        "metadata": "{\"modify_time\":\"2026-09-27T03:50:04.607799705Z\",\"xattrs\":[{\"base64\":false,\"key\":\"ltfs.hash.sha256sum\",\"value\":\"e58a08f5e5caef8e247ef2610bb534ae475dcb4f3aa0b3df04d3dc113b870840\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 14,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"directory\",\"modify_time\":\"2026-09-27T03:21:26.416598401Z\",\"node\":{\"access_time\":\"2026-09-25T01:36:03.517503217Z\",\"backup_time\":\"2026-09-25T01:36:03.517503217Z\",\"change_time\":\"2026-09-27T03:21:26.416598401Z\",\"creation_time\":\"2026-09-25T01:36:03.517503217Z\",\"modify_time\":\"2026-09-27T03:21:26.416598401Z\",\"readonly\":false},\"xattrs\":[{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.14\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/cleanup-20260927",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 15,
+        "deleted": 1,
+        "metadata": "{\"kind\":\"directory\"}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/cleanup-20260927/link",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 4,
+        "deleted": 1,
+        "metadata": "null"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/cleanup-20260927/original",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 1,
+        "deleted": 1,
+        "metadata": "null"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/cleanup-20260927/renamed",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 2,
+        "deleted": 1,
+        "metadata": "null"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 13,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"directory\",\"modify_time\":\"2026-09-25T01:36:23.674503370Z\",\"node\":{\"access_time\":\"2026-09-25T01:36:12.543020403Z\",\"backup_time\":\"2026-09-25T01:36:12.543020403Z\",\"change_time\":\"2026-09-25T01:36:23.674503370Z\",\"creation_time\":\"2026-09-25T01:36:12.543020403Z\",\"modify_time\":\"2026-09-25T01:36:23.674503370Z\",\"readonly\":false},\"xattrs\":[{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.13\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/chain",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 6,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"symlink\",\"modify_time\":\"2026-09-25T01:36:19.668644300Z\",\"symlink\":\"relative\",\"xattrs\":[{\"base64\":true,\"key\":\"binary\",\"value\":\"AP8=\"},{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.6\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/dangling",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 7,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"symlink\",\"modify_time\":\"2026-09-25T01:36:15.901883741Z\",\"symlink\":\"../absent & 中文%?#\",\"xattrs\":[{\"base64\":true,\"key\":\"binary\",\"value\":\"AP8=\"},{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.7\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/directory",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 8,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"symlink\",\"modify_time\":\"2026-09-25T01:36:17.243491908Z\",\"symlink\":\"subdir\",\"xattrs\":[{\"base64\":true,\"key\":\"binary\",\"value\":\"AP8=\"},{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.8\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/loop",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 9,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"symlink\",\"modify_time\":\"2026-09-25T01:36:18.033323783Z\",\"symlink\":\"loop\",\"xattrs\":[{\"base64\":true,\"key\":\"binary\",\"value\":\"AP8=\"},{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.9\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/relative",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 10,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"symlink\",\"modify_time\":\"2026-09-25T01:36:15.086347064Z\",\"symlink\":\"target\",\"xattrs\":[{\"base64\":true,\"key\":\"binary\",\"value\":\"AP8=\"},{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.10\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/renamed",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 3,
+        "deleted": 1,
+        "metadata": "null"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/subdir",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 11,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"directory\",\"modify_time\":\"2026-09-25T01:36:13.350034615Z\",\"node\":{\"access_time\":\"2026-09-25T01:36:13.350034615Z\",\"backup_time\":\"2026-09-25T01:36:13.350034615Z\",\"change_time\":\"2026-09-25T01:36:13.350034615Z\",\"creation_time\":\"2026-09-25T01:36:13.350034615Z\",\"modify_time\":\"2026-09-25T01:36:13.350034615Z\",\"readonly\":false},\"xattrs\":[{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.11\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/target",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 24,
+        "sha256": "dc233f09e28bbab5f69d0013ea971969d12ae0eb212959075ec4354cd25ef665",
+        "ver_round": 127,
+        "ver_seq": 12,
+        "deleted": 0,
+        "metadata": "{\"modify_time\":\"2026-09-25T01:36:19.936707884Z\",\"xattrs\":[{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.12\"},{\"base64\":false,\"key\":\"ltfs.hash.sha256sum\",\"value\":\"dc233f09e28bbab5f69d0013ea971969d12ae0eb212959075ec4354cd25ef665\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/temporary",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 5,
+        "deleted": 1,
+        "metadata": "null"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/links/中文",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 0,
+        "sha256": "",
+        "ver_round": 127,
+        "ver_seq": 13,
+        "deleted": 0,
+        "metadata": "{\"kind\":\"symlink\",\"modify_time\":\"2026-09-25T01:36:18.876644659Z\",\"symlink\":\"target\",\"xattrs\":[{\"base64\":true,\"key\":\"binary\",\"value\":\"AP8=\"},{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.13\"}]}"
+      },
+      {
+        "pool_uuid": "51cfd06c-bf79-4bbf-ac85-886608a0ab4b",
+        "path": "/sr/seed",
+        "barcode": "SR2501L8",
+        "generation": 5,
+        "length": 13,
+        "sha256": "ba3378d7acafca6ec617933b2ea1bdb95bbdb2db4dd4dd6f528ec07cdf827aa7",
+        "ver_round": 127,
+        "ver_seq": 14,
+        "deleted": 0,
+        "metadata": "{\"modify_time\":\"2026-09-25T01:36:03.565876509Z\",\"xattrs\":[{\"base64\":false,\"key\":\"tapers.version\",\"value\":\"127.14\"},{\"base64\":false,\"key\":\"ltfs.hash.sha256sum\",\"value\":\"ba3378d7acafca6ec617933b2ea1bdb95bbdb2db4dd4dd6f528ec07cdf827aa7\"}]}"
+      }
+    ]
+  }
+}

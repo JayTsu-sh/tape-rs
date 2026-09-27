@@ -294,6 +294,7 @@ pub fn release_and_unregister(dev: &dyn TapeTransport, key: ReservationKey) -> R
 /// 不得重试，也不得重新注册或抢占。
 pub fn ownership_lost(e: &TapeError) -> bool {
     match e {
+        TapeError::CommitFailed { source, .. } => ownership_lost(source),
         TapeError::ReservationConflict { .. } | TapeError::OwnershipLost { .. } => true,
         // 2A/03 注册被抢占，2A/04 预留被释放，2A/05 预留被抢占；29/xx 上电或复位（预留可能已丢）
         TapeError::ScsiCommand {

@@ -111,10 +111,17 @@ impl FormatPause {
     }
 }
 
+#[derive(Default)]
+struct CheckpointFault {
+    initiator: std::sync::atomic::AtomicU32,
+    medium_error: std::sync::atomic::AtomicBool,
+}
+
 struct PausingTransport {
     inner: tape_rs::scsi::sim::SimTransport,
     initiator: u32,
     pause: Option<Arc<FormatPause>>,
+    checkpoint_fault: Arc<CheckpointFault>,
 }
 
 impl tape_rs::scsi::transport::TapeTransport for PausingTransport {
@@ -184,6 +191,21 @@ impl tape_rs::scsi::transport::TapeTransport for PausingTransport {
         timeout: u32,
     ) -> Result<tape_rs::scsi::device::ScsiResult> {
         use std::sync::atomic::Ordering;
+        if cdb.first() == Some(&tape_rs::scsi::cdb::opcode::WRITE_6)
+            && self
+                .checkpoint_fault
+                .initiator
+                .compare_exchange(self.initiator, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            let medium = self.checkpoint_fault.medium_error.load(Ordering::SeqCst);
+            return Err(tape_rs::error::TapeError::ScsiCommand {
+                status: 2,
+                sense_key: if medium { 3 } else { 6 },
+                asc: if medium { 0x11 } else { 0x2a },
+                ascq: if medium { 0 } else { 3 },
+            });
+        }
         let pause = self.pause.as_ref().filter(|p| {
             matches!(p.cut, ReclaimCut::BeforeLabels | ReclaimCut::PartialLabels)
                 && cdb.first() == Some(&tape_rs::scsi::cdb::opcode::WRITE_6)
@@ -214,6 +236,7 @@ struct SimProvider {
     initiator: u32,
     drives: usize,
     format_pause: Option<Arc<FormatPause>>,
+    checkpoint_fault: Arc<CheckpointFault>,
 }
 
 impl DeviceProvider for SimProvider {
@@ -227,6 +250,7 @@ impl DeviceProvider for SimProvider {
                     inner: self.lib.drive_as(i, self.initiator),
                     initiator: self.initiator,
                     pause: self.format_pause.clone(),
+                    checkpoint_fault: self.checkpoint_fault.clone(),
                 }),
             })
             .collect();
@@ -242,6 +266,7 @@ impl DeviceProvider for SimProvider {
 
 struct Cluster {
     lib: SimLibrary,
+    checkpoint_fault: Arc<CheckpointFault>,
     status: HashMap<u64, SharedStatus>,
     services: HashMap<u64, Arc<tape_rs::daemon::files::FileService>>,
     execs: HashMap<u64, Sender<tape_rs::daemon::executor::ExecRequest>>,
@@ -308,6 +333,7 @@ impl Cluster {
         let mut status = HashMap::new();
         let mut services = HashMap::new();
         let mut execs = HashMap::new();
+        let checkpoint_fault = Arc::new(CheckpointFault::default());
         for id in ids {
             let shared: SharedStatus = Arc::new(Mutex::new(NodeStatus::default()));
             status.insert(id, shared.clone());
@@ -318,6 +344,7 @@ impl Cluster {
                 initiator: id as u32,
                 drives: lib.drive_count(),
                 format_pause: format_pause.clone(),
+                checkpoint_fault: checkpoint_fault.clone(),
             });
             let eopts = ExecOptions {
                 node_id: id as u8,
@@ -402,6 +429,7 @@ impl Cluster {
         }
         let c = Cluster {
             lib,
+            checkpoint_fault,
             status,
             services,
             execs,
@@ -937,6 +965,7 @@ fn lone_executor(name: &str) -> (Sender<ExecRequest>, std::sync::mpsc::Receiver<
                 initiator: 1,
                 drives: 1,
                 format_pause: None,
+                checkpoint_fault: Arc::new(CheckpointFault::default()),
             }),
             opts,
             rx,
@@ -2736,6 +2765,64 @@ fn overwrites_preserve_xattrs_on_same_and_different_tapes() {
             cl.put("/filler", b"switch tape").unwrap();
             cl.put("/filler2", b"switch tape").unwrap();
         }
+    }
+    c.shutdown();
+}
+
+#[test]
+fn checkpoint_ownership_loss_during_cross_tape_read_is_retried() {
+    check_read_checkpoint_failure(false);
+}
+
+#[test]
+fn checkpoint_medium_error_during_cross_tape_read_is_not_hidden() {
+    check_read_checkpoint_failure(true);
+}
+
+fn check_read_checkpoint_failure(medium: bool) {
+    use std::sync::atomic::Ordering;
+    let c = Cluster::start_lib(
+        if medium {
+            "read-checkpoint-medium"
+        } else {
+            "read-checkpoint-lost"
+        },
+        false,
+        small_tape_library(64),
+        2,
+        &["PA0001L8", "PA0002L8"],
+    );
+    let (leader, round) = c.wait_serving(None, 0);
+    c.wait("文件服务开放", || {
+        c.services[&leader].serving_round() == Some(round)
+    });
+    let mut client = Client::new(c.start_http());
+    for path in ["/first", "/fill", "/second"] {
+        client.put(path, b"preserve").unwrap();
+    }
+    assert_eq!(client.stat("/first").unwrap().unwrap().barcode, "PA0001L8");
+    assert_eq!(client.stat("/second").unwrap().unwrap().barcode, "PA0002L8");
+    c.checkpoint_fault
+        .medium_error
+        .store(medium, Ordering::SeqCst);
+    c.checkpoint_fault
+        .initiator
+        .store(leader as u32, Ordering::SeqCst);
+    let result = client.get("/first");
+    assert_eq!(
+        c.checkpoint_fault.initiator.load(Ordering::SeqCst),
+        0,
+        "没有触发换带检查点故障"
+    );
+    if medium {
+        assert!(
+            matches!(result, Err(tape_rs::client::ClientError::Rejected { status: 500, ref body }) if body.contains("sense_key=0x03")),
+            "{result:?}"
+        );
+    } else {
+        assert_eq!(result.unwrap(), b"preserve");
+        let (_, next_round) = c.wait_serving(Some(leader), round + 1);
+        assert!(next_round > round);
     }
     c.shutdown();
 }
