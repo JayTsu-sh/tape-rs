@@ -1,10 +1,18 @@
-## 2026-09-27 — 最终优化候选等待实机自动接续
+## 2026-09-30 — P1 性能优化实机验收完成（session2），候选待正式发布
 
-前述第一轮监督PID1737927已完成8独立commit和2次真实交错read，挂载仅1次；正在正常停机/冷读/归槽。自动接续PID见远端session-followthrough.pid，日志session-followthrough.log，等待session-native.complete才启动physical-session2-20260927.py；最终监督PID写session2-supervisor.pid，阶段日志session2-run.log。**不要重复启动或替换候选**。
+P1 常驻卷会话优化（含挂载顺序、增量差分、周期DP Full）的实机最终候选 a6a17e27（ltfsd-perf-final）在 .143 全部通过，2026-09-27 22:07。session2：8次4KiB提交合计141.079s（第一候选248.425s）、中途读校验、三节点并发正常停机、Rust冷读3171文件双SHA、归槽、LE互读3171文件SHA全通过；`session2-native.complete`/`session2-interop.complete`。收尾核对：RC18槽7、RC17槽8未动、drive空、allow_dio=0、PR注册表空。周期DP Full 掉电窗口仅模拟器覆盖（先红后绿），物理掉电未独立实测。证据 `probes/results/physical-session-20260927/session2-*`，报告 `performance-implementation-20260927.md` 已补最终结果。
 
-最终候选增加：IP先扫/DP后扫（所有EOD与尾部检查保留）；增量差分避免整树clone和二次方查找；周期Full只写DP、清洁卸载补IP（红→绿恢复/掉电测试）。FM0实机仅1.75–1.82ms，保留；READ POSITION、PR guard和direct0保持。最终all-features262passed/7ignored、strictClippy、兼容构建通过。候选ltfsd-perf-final SHAa6a17e27991afd95f577f0a296bf53b24047223079a99167e2515587aff83853，performance_compare-perf-final SHA317b09ce195156163641dfa0699a4714881b1dd8fce5619740a3ea26d0824738。第一候选旧SHA/文件仍保留。
+软件全套已在本工作树复验：cargo test --all-features 250 passed/0 failed（7 ignored）、check --all-targets、strict Clippy -D warnings、触及文件 fmt 均通过。
 
-最终流程复用session-cluster的原Raft/池状态，不创建不同池UUID；新增8文件comparison/session2-20260927，session2-all.json共3171文件。8提交+中途读→全节点正常退出→新Rust冷挂读全部3171文件→归槽→private LE重新assign清命名空间缓存、读取全部3171并核验UUID→正常卸载退出。session2-native.complete只代表Rust完成，最终需session2-interop.complete。保持RC18同UUID、RC17槽8不动/.209不动，不格式化。阶段2尚未开始时不能报告新优化实机通过。
+**剩余待办**（按此顺序）：
+1. 正式集群（Holo .71/.72/.74 + tsclient FUSE/ltfsctl）从 af6bfad 升级至 a6a17e27 候选——实机已验收，需统一候选版本、备份 pre-upgrade.tgz、原文件/元数据/接管冷读验收（对照 rollout-20260927 流程）。升级前需确认 Holo 三节点当前状态。
+2. sync 剩余约5s差距归因（LE index阶段约13s vs Rust；最终FM0、资格/发布屏障）；不删同步屏障，仅按证据优化。
+3. 跨两盘实机换带仍未覆盖；RC17 不盲目重新初始化。
+4. 物理固件验收清单（real-hardware-checklist.md）：真实断电、机械性能仍暂缓。
+
+代码状态：优化实现已提交（见 git log，P1/perf 系列提交），工作树干净并已推送 GitHub。
+
+最终流程复用session-cluster的原Raft/池状态，不创建不同池UUID；新增8文件comparison/session2-20260927，session2-all.json共3171文件。8提交+中途读→全节点正常退出→新Rust冷挂读全部3171文件→归槽→private LE重新assign清命名空间缓存、读取全部3171并核验UUID→正常卸载退出。保持RC18同UUID、RC17槽8不动/.209不动，不格式化。（阶段2已于2026-09-27 22:07 完成，见上方2026-09-30条目。）
 
 纯内存差分三轮中位：1万文件单修改606.18ms→3.965ms（约153倍）；10万文件约52.3ms，均XML重放相等。证据index-delta-perf-20260927.json；不是总磁带写入倍数。
 

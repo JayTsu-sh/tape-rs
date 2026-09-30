@@ -44,7 +44,9 @@
 
 第一候选已包含常驻卷/读缓冲/计量，未包含新的挂载顺序、增量差分算法和周期DP Full。8次4KiB提交：48.796、18.332、18.489、13.733、18.601、63.302、48.654、18.519秒，合计248.425秒。第一次及第7次从IP回DP；第6次仍是旧周期DP/IP Full。中途两次真实读校验4.773/3.595秒。整个daemon生命周期只mount一次。FM0中位1.7525ms。
 
-第一候选正常停机完成后进行Rust冷读与归槽；最终候选自动接续，由独立目录文件名标识：`session2-*`。最终结果尚待完成后补充，不能把第一候选结果当作最终全部改动的实机验收。
+最终候选（含挂载顺序、增量差分、周期DP Full）由 `session2-*` 独立标识，**2026-09-27 22:07 实机全部通过**：8次4KiB提交 13.324/18.157/18.206/13.416/18.411/18.442/18.414/22.709 秒，合计141.079秒（第一候选248.425秒）；中途两次真实读校验4.979/3.439秒。三节点并发正常停机→重载→Rust冷读3171文件/18256498944字节双SHA通过（mount 312.289s、first read 94.272s，indirect38175/direct0）→归槽（drive 0→slot 7）→私有LE重读全部3171文件SHA通过（92.288s）。完成标志 `session2-native.complete`、`session2-interop.complete`。证据 `probes/results/physical-session-20260927/session2-*`。
+
+收尾只读核对：RC0018L9槽7、RC0017L9槽8（未动）、drive空、`allow_dio=0`、PR generation20注册表空/无持有者、LE未挂载。周期DP Full 掉电窗口仍只覆盖模拟器（`periodic_full_checkpoint_bounds_chain_across_remounts` 先红后绿，11项模拟增量测试通过），物理掉电窗口未独立实测，不宣称已覆盖。
 
 候选哈希：
 - 第一候选ltfsd-session-candidate：5dc253b9e337a75bd3eec32e76a010fe5398386e7a13d85bbe0ceff62dbfdc8f。
