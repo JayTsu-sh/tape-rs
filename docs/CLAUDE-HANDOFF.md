@@ -1,3 +1,21 @@
+## 2026-09-27 — 最终优化候选等待实机自动接续
+
+前述第一轮监督PID1737927已完成8独立commit和2次真实交错read，挂载仅1次；正在正常停机/冷读/归槽。自动接续PID见远端session-followthrough.pid，日志session-followthrough.log，等待session-native.complete才启动physical-session2-20260927.py；最终监督PID写session2-supervisor.pid，阶段日志session2-run.log。**不要重复启动或替换候选**。
+
+最终候选增加：IP先扫/DP后扫（所有EOD与尾部检查保留）；增量差分避免整树clone和二次方查找；周期Full只写DP、清洁卸载补IP（红→绿恢复/掉电测试）。FM0实机仅1.75–1.82ms，保留；READ POSITION、PR guard和direct0保持。最终all-features262passed/7ignored、strictClippy、兼容构建通过。候选ltfsd-perf-final SHAa6a17e27991afd95f577f0a296bf53b24047223079a99167e2515587aff83853，performance_compare-perf-final SHA317b09ce195156163641dfa0699a4714881b1dd8fce5619740a3ea26d0824738。第一候选旧SHA/文件仍保留。
+
+最终流程复用session-cluster的原Raft/池状态，不创建不同池UUID；新增8文件comparison/session2-20260927，session2-all.json共3171文件。8提交+中途读→全节点正常退出→新Rust冷挂读全部3171文件→归槽→private LE重新assign清命名空间缓存、读取全部3171并核验UUID→正常卸载退出。session2-native.complete只代表Rust完成，最终需session2-interop.complete。保持RC18同UUID、RC17槽8不动/.209不动，不格式化。阶段2尚未开始时不能报告新优化实机通过。
+
+纯内存差分三轮中位：1万文件单修改606.18ms→3.965ms（约153倍）；10万文件约52.3ms，均XML重放相等。证据index-delta-perf-20260927.json；不是总磁带写入倍数。
+
+## 2026-09-27 — 实施优化中：P1常驻卷实机验收运行
+
+活动工作树仍 /work/jay/tape-rs-ltfs-recovery-ibm-interop。当前未提交改动：VolumeSession移交owned状态；executor同卷连续批次/写带读复用；transport session_epoch在错误/UA/状态改变前递增，防止后台PR消费UA后复用；保留位置/PR/最终FM0；读缓冲复用、Full编码省一次全树clone；逐CDB原始状态+wall_us日志。全量软件测试通过（新增20独立批次不读index、读写切换、dirty/旧round/reset/已消费UA拒绝），strictClippy、兼容build通过。后续改动需重新验收。
+
+**正在实机运行，禁止重跑/替换运行二进制**：.143 /root/tape-rs-io-20260927/physical-session-20260927.py，监督PID1737927，日志session-run.log、事件session-events.jsonl、节点session-node1/2/3.log、PIDs session-nodes.json。候选ltfsd-session-candidate SHA5dc253b9e337a75bd3eec32e76a010fe5398386e7a13d85bbe0ceff62dbfdc8f。三节点同机隔离端口17700/17710/17720、HTTP17701/17711/17721；node3当选，pool rc18-session UUID98310642-518f-4db9-872a-3ba69933011e，仅分配RC18。本轮不是跨主机HA验收。
+
+介质RC18原UUID878f7b34-4910-4d09-9f1f-3e4725ede6d8，drive11EB4A80F1 sg3（LE同LU sg4），changer55L3A7802K19LL01 sg5；初始空drive/RC18槽7/RC17槽8已核对，allow_dio0。无格式化；daemon会写池标记以及新增8×4KiB comparison/session-20260927/f*.bin，新清单session-new.json和session-all.json共3163文件。流程：8独立commit、2次交错read、并发正常停3节点、Rust冷读8文件、归槽。完成标志session-native.complete只表示daemon+Rust；随后还需LE互读。未操作.209/RC17，不push。
+
 ## 2026-09-27 — 超越LE性能分析完成，尚未实施
 
 报告 `.scratch/ltfs-ha/exceed-le-performance-plan-20260927.md`。新确认关键差异：benchmark跨批持有vol，但executor process_uploads_limited每批LtfsVolume::mount（1190）；写带上的读也重新mount，第二读驱动器已有ReadView复用。优先P0同口径CDB统计→P1常驻卷会话→P2减少正常挂载分区移动/有条件快速路径→P3小文件控制开销→P4审计最终FM0→P5大目录增量/合批→P6供数流水线。不能直接删EOD验证、PR guard、闭FM或MAM，不承诺未测收益。16GiB已只差约1%，微小文件与服务生命周期更值得优先优化。本轮仅分析/文档，无代码行为变化、无硬件操作；介质状态沿用下方最终检查。

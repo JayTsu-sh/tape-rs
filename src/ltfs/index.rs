@@ -168,6 +168,28 @@ pub struct LtfsIndex {
 }
 
 impl LtfsIndex {
+    /// 替换目录树时只复制索引头，避免先克隆整棵旧树再丢弃。
+    pub(crate) fn clone_with_root(&self, root: DirectoryNode) -> Self {
+        Self {
+            incremental: self.incremental,
+            materialized: self.materialized,
+            previous_incremental_location: self.previous_incremental_location,
+            comment: self.comment.clone(),
+            version: self.version.clone(),
+            creator: self.creator.clone(),
+            volume_uuid: self.volume_uuid,
+            generation: self.generation,
+            update_time: self.update_time.clone(),
+            self_location: self.self_location,
+            previous_location: self.previous_location,
+            allow_policy_update: self.allow_policy_update,
+            highest_file_uid: self.highest_file_uid,
+            volume_lock_state: self.volume_lock_state.clone(),
+            unknown_elements: self.unknown_elements.clone(),
+            root,
+        }
+    }
+
     /// 新建一个空索引（首代）。
     pub fn empty(volume_uuid: Uuid, creator: String, data_partition: char) -> Self {
         let now = crate::ltfs::label::ltfs_time_now();

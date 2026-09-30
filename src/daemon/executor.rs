@@ -21,8 +21,9 @@ use crate::error::{Result, TapeError};
 use crate::ltfs::mkltfs::{MkltfsOptions, mkltfs};
 use crate::ltfs::recovery::TailKind;
 use crate::ltfs::volume::{
-    FormatProbe, LtfsVolume, ReadView, TailPolicy, XATTR_DELETED_PATH, XATTR_POOL_NAME,
-    XATTR_POOL_UUID, XATTR_VERSION, is_tombstone_path, probe_format, tombstone_path,
+    FormatProbe, LtfsVolume, ReadView, TailPolicy, VolumeSession, XATTR_DELETED_PATH,
+    XATTR_POOL_NAME, XATTR_POOL_UUID, XATTR_VERSION, is_tombstone_path, probe_format,
+    tombstone_path,
 };
 use crate::scsi::device::ScsiDevice;
 use crate::scsi::inquiry::{enumerate_sg_nodes, read_unit_serial};
@@ -231,6 +232,7 @@ struct Active {
     serving: bool,
     /// 正在服务的驱动器在 `devices` 里的下标
     drive: Option<usize>,
+    write_session: Option<VolumeSession>,
     /// 为读请求装载的带：驱动器下标、条码、最近一次使用
     read: Option<(usize, String, Instant, Option<ReadView>)>,
     /// 本轮已写下的文件数，同时是版本号里的序号
@@ -511,7 +513,7 @@ fn shut_down(mut a: Active, files: &FileService, tx: &Sender<ExecEvent>) {
         return;
     }
     if a.serving
-        && let Err(e) = checkpoint_write_tape(&a, files, tx)
+        && let Err(e) = checkpoint_write_tape(&mut a, files, tx)
     {
         warn!("执行线程: 停机检查点失败: {}；保留介质和预留，等待恢复", e);
         files.close("停机检查点失败");
@@ -585,6 +587,7 @@ fn takeover(provider: &dyn DeviceProvider, opts: &ExecOptions, round: u64) -> Re
         devices,
         serving: false,
         drive: None,
+        write_session: None,
         read: None,
         seq: 0,
         reclaim: None,
@@ -740,6 +743,7 @@ fn ensure_write_tape(
     status: &SharedStatus,
     tx: &Sender<ExecEvent>,
 ) -> Result<String> {
+    a.write_session = None;
     a.drive = None;
     let mut inv = inventory(&a.devices)?;
     let mut cands: Vec<Candidate> = {
@@ -878,7 +882,7 @@ fn ensure_write_tape(
 /// 外层 `Err` 是失去执行资格之类必须中止的错误；内层 `Err` 是"这盘不能用"及应标记的状态。
 #[allow(clippy::type_complexity)]
 fn open_candidate(
-    a: &Active,
+    a: &mut Active,
     opts: &ExecOptions,
     files: &FileService,
     tx: &Sender<ExecEvent>,
@@ -990,6 +994,7 @@ fn open_candidate(
         }
     }
 
+    let session_epoch = dev.session_epoch();
     // 5. 还写得下吗
     let (list, bytes_used) = catalog_of(vol.index());
     let files_now = list.iter().filter(|r| !is_directory(&r.metadata)).count() as u64;
@@ -1043,12 +1048,19 @@ fn open_candidate(
         files: list,
         full: true,
     });
+    if dev.session_epoch() == session_epoch {
+        a.write_session = vol.into_session();
+    }
     summary.push_str(&format!("；可用 {} MiB", (remaining - reserve) >> 20));
     Ok(Ok(summary))
 }
 
 /// 已接纳写入的卷在离开驱动器前收束增量；不触碰读带、拒绝候选或未分配介质。
-fn checkpoint_write_tape(a: &Active, files: &FileService, tx: &Sender<ExecEvent>) -> Result<()> {
+fn checkpoint_write_tape(
+    a: &mut Active,
+    files: &FileService,
+    tx: &Sender<ExecEvent>,
+) -> Result<()> {
     let Some(i) = a.drive else { return Ok(()) };
     let tape = files
         .tape()
@@ -1063,7 +1075,10 @@ fn checkpoint_write_tape(a: &Active, files: &FileService, tx: &Sender<ExecEvent>
         return Err(TapeError::NotReady("卸载检查点的介质与写入卷不符".into()));
     }
     let dev = a.devices[i].dev.as_ref();
-    let mut vol = LtfsVolume::mount(dev)?;
+    let mut vol = match a.write_session.take() {
+        Some(session) => session.resume(dev, a.key)?,
+        None => LtfsVolume::mount(dev)?,
+    };
     if !vol.needs_checkpoint() {
         return Ok(());
     }
@@ -1186,8 +1201,12 @@ fn process_uploads_limited(
         let dev = a.devices[i].dev.as_ref();
         let (round, key) = (a.round, a.key);
         let mut seq = a.seq;
+        let session = a.write_session.take();
         let result = (|| -> Result<ExecEvent> {
-            let mut vol = LtfsVolume::mount(dev)?;
+            let mut vol = match session {
+                Some(session) => session.resume(dev, key)?,
+                None => LtfsVolume::mount(dev)?,
+            };
             vol.set_reservation_guard(Some(key));
             let mut changed = std::collections::BTreeSet::new();
             for u in &uploads {
@@ -1317,7 +1336,8 @@ fn process_uploads_limited(
                 .filter(|r| changed.contains(&r.path))
                 .cloned()
                 .collect();
-            Ok(ExecEvent::Committed {
+            let session_epoch = dev.session_epoch();
+            let event = ExecEvent::Committed {
                 round: a.round,
                 barcode: files.tape().map(|t| t.barcode).unwrap_or_default(),
                 volume_uuid: vol.label().volume_uuid.to_string(),
@@ -1328,7 +1348,11 @@ fn process_uploads_limited(
                 bytes_written: bytes_written_on(dev),
                 files: written,
                 full: false,
-            })
+            };
+            if dev.session_epoch() == session_epoch {
+                a.write_session = vol.into_session();
+            }
+            Ok(event)
         })();
         a.seq = seq;
         batches += 1;
@@ -1415,8 +1439,19 @@ fn read_any_inner<W: Write>(
     if files.tape().is_some_and(|t| t.barcode == barcode)
         && let Some(i) = a.drive
     {
-        return read_file(a.devices[i].dev.as_ref(), path, out)
-            .map_err(|e| ReadError::device(e, "读取文件失败"));
+        let dev = a.devices[i].dev.as_ref();
+        let session = a.write_session.take();
+        let result = (|| -> Result<u64> {
+            let mut vol = match session {
+                Some(session) => session.resume(dev, a.key)?,
+                None => LtfsVolume::mount(dev)?,
+            };
+            vol.set_reservation_guard(Some(a.key));
+            let count = vol.read_file_to_writer(path.trim_start_matches('/'), out)?;
+            a.write_session = vol.into_session();
+            Ok(count)
+        })();
+        return result.map_err(|e| ReadError::device(e, "读取文件失败"));
     }
     // 2. 就在读带上
     if let Some((i, b, last, view)) = &mut a.read
@@ -1501,6 +1536,7 @@ fn read_any_inner<W: Write>(
             unload_drive(&a.devices, &inv, d)
                 .map_err(|e| ReadError::device(e, "卸下写入带失败"))?;
         }
+        a.write_session = None;
         a.drive = None;
         target = Some(w);
         swapped_write = true;
@@ -2273,6 +2309,7 @@ fn unload_idle_read_tape(a: &mut Active, opts: &ExecOptions) {
 fn periodic(a: &mut Active, opts: &ExecOptions) -> std::result::Result<(), String> {
     unload_idle_read_tape(a, opts);
     if let (true, Some(i)) = (opts.demo_write, a.drive) {
+        a.write_session = None;
         let ver = next_version(a);
         let dev = a.devices[i].dev.as_ref();
         let name = format!("/ltfsd-demo/round{:06}-{:04}.txt", a.round, a.seq);

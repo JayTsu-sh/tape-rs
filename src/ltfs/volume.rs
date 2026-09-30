@@ -103,6 +103,40 @@ pub struct LtfsVolume<'a> {
     block_size: u32,
     /// 顺序文件流复用对齐缓冲；借用切片写入不分配它。
     write_buffer: Option<crate::scsi::buffer::TransferBuffer>,
+    read_buffer: std::cell::RefCell<Option<crate::scsi::buffer::TransferBuffer>>,
+    /// P1 当前可写入位置。commit 后更新。
+    p1_write_head: u64,
+    dirty: bool,
+    /// DP 上最新一份索引的位置：commit 时作为 `previousgenerationlocation`。
+    last_dp_index: Option<IndexLocation>,
+    last_dp_incremental: Option<IndexLocation>,
+    last_ip: Option<(u64, u64)>,
+    incremental_depth: u32,
+    incremental_limit: u32,
+    /// 挂载时的恢复报告；`writable == recovery.append_ok`。
+    recovery: RecoveryReport,
+    writable: bool,
+    /// 只读原因：恢复受限或提交失败后的"结果未定"。
+    restricted_reason: Option<String>,
+    hash_policy: HashPolicy,
+    /// 设了之后，每次提交在屏障前核对预留持有者是不是这个键。
+    reservation_guard: Option<crate::scsi::reservation::ReservationKey>,
+}
+
+/// 执行线程保留的已提交卷状态，不持有设备借用。仅能在原设备/预留轮次复用。
+/// 机械操作、外部修改或任何不确定错误后，调用方必须丢弃它。
+pub(crate) struct VolumeSession {
+    identity: String,
+    epoch: u64,
+    label: LtfsLabel,
+    /// 工作索引：包含尚未提交的追加。
+    working: LtfsIndex,
+    /// 已发布的已提交视图（S5）：list/read/index() 只服务它。
+    index: LtfsIndex,
+    block_size: u32,
+    /// 顺序文件流复用对齐缓冲；借用切片写入不分配它。
+    write_buffer: Option<crate::scsi::buffer::TransferBuffer>,
+    read_buffer: std::cell::RefCell<Option<crate::scsi::buffer::TransferBuffer>>,
     /// P1 当前可写入位置。commit 后更新。
     p1_write_head: u64,
     dirty: bool,
@@ -126,6 +160,55 @@ pub struct LtfsVolume<'a> {
 pub(crate) struct ReadView {
     index: LtfsIndex,
     block_size: u32,
+    read_buffer: std::cell::RefCell<Option<crate::scsi::buffer::TransferBuffer>>,
+}
+
+impl VolumeSession {
+    pub(crate) fn resume<'a>(
+        self,
+        device: &'a dyn crate::scsi::transport::TapeTransport,
+        key: crate::scsi::reservation::ReservationKey,
+    ) -> Result<LtfsVolume<'a>> {
+        if self.identity != device.identity() || self.reservation_guard != Some(key) {
+            return Err(TapeError::NotReady("卷会话的设备或执行轮次已改变".into()));
+        }
+        if device.session_epoch() != Some(self.epoch) {
+            return Err(TapeError::NotReady(
+                "设备状态已改变，卷会话必须重新恢复".into(),
+            ));
+        }
+        // 不重试 UA：介质变化/复位必须使会话失效，不能吞掉后沿用旧目录。
+        device.execute_no_data(&crate::scsi::cdb::test_unit_ready(), 10_000)?;
+        crate::scsi::reservation::verify_holder(device, key)?;
+        if device.session_epoch() != Some(self.epoch) {
+            return Err(TapeError::NotReady(
+                "资格检查期间设备状态改变，卷会话已失效".into(),
+            ));
+        }
+        Ok(LtfsVolume {
+            device,
+            drive: TapeDrive::new(device),
+            mam: Mam::new(device),
+            label: self.label,
+            working: self.working,
+            index: self.index,
+            block_size: self.block_size,
+            write_buffer: self.write_buffer,
+            read_buffer: self.read_buffer,
+            p1_write_head: self.p1_write_head,
+            dirty: self.dirty,
+            last_dp_index: self.last_dp_index,
+            last_dp_incremental: self.last_dp_incremental,
+            last_ip: self.last_ip,
+            incremental_depth: self.incremental_depth,
+            incremental_limit: self.incremental_limit,
+            recovery: self.recovery,
+            writable: self.writable,
+            restricted_reason: self.restricted_reason,
+            hash_policy: self.hash_policy,
+            reservation_guard: self.reservation_guard,
+        })
+    }
 }
 
 impl ReadView {
@@ -135,7 +218,14 @@ impl ReadView {
         path: &str,
         w: &mut W,
     ) -> Result<u64> {
-        read_index_file(device, &self.index, self.block_size, path, w)
+        read_index_file(
+            device,
+            &self.index,
+            self.block_size,
+            path,
+            w,
+            &self.read_buffer,
+        )
     }
 }
 
@@ -145,6 +235,7 @@ fn read_index_file<W: Write>(
     block_size: u32,
     path: &str,
     w: &mut W,
+    read_buffer: &std::cell::RefCell<Option<crate::scsi::buffer::TransferBuffer>>,
 ) -> Result<u64> {
     let drive = TapeDrive::new(device);
     let file = index
@@ -157,7 +248,7 @@ fn read_index_file<W: Write>(
         let hit = index.find_file(&resolved);
         return match hit {
             Some(f) if f.symlink.is_none() => {
-                read_index_file(device, index, block_size, &resolved, w)
+                read_index_file(device, index, block_size, &resolved, w, read_buffer)
             }
             _ => Err(TapeError::Ltfs(format!(
                 "符号链接目标不可读: {} -> {}",
@@ -173,8 +264,12 @@ fn read_index_file<W: Write>(
     }
 
     let mut total: u64 = 0;
-    let mut buffer = crate::scsi::buffer::TransferBuffer::new(block_size as usize);
-    let buf = buffer.as_mut_slice();
+    let mut buffer = read_buffer
+        .try_borrow_mut()
+        .map_err(|_| TapeError::NotReady("同一卷的读取尚未完成".into()))?;
+    let buf = buffer
+        .get_or_insert_with(|| crate::scsi::buffer::TransferBuffer::new(block_size as usize))
+        .as_mut_slice();
 
     for ext in &file.extents {
         let partition = partition_char_to_num(ext.partition);
@@ -218,6 +313,35 @@ fn read_index_file<W: Write>(
 }
 
 impl<'a> LtfsVolume<'a> {
+    /// 只保留已提交且受预留保护的卷；移动索引和缓冲，不复制目录树。
+    pub(crate) fn into_session(self) -> Option<VolumeSession> {
+        if self.dirty || !self.writable || self.reservation_guard.is_none() {
+            return None;
+        }
+        Some(VolumeSession {
+            identity: self.device.identity().to_owned(),
+            epoch: self.device.session_epoch()?,
+            label: self.label,
+            working: self.working,
+            index: self.index,
+            block_size: self.block_size,
+            write_buffer: self.write_buffer,
+            read_buffer: self.read_buffer,
+            p1_write_head: self.p1_write_head,
+            dirty: self.dirty,
+            last_dp_index: self.last_dp_index,
+            last_dp_incremental: self.last_dp_incremental,
+            last_ip: self.last_ip,
+            incremental_depth: self.incremental_depth,
+            incremental_limit: self.incremental_limit,
+            recovery: self.recovery,
+            writable: self.writable,
+            restricted_reason: self.restricted_reason,
+            hash_policy: self.hash_policy,
+            reservation_guard: self.reservation_guard,
+        })
+    }
+
     /// 挂载卷：读取双分区末索引并核验尾部及追加位置；一致 Full 使用正常挂载快速路径，
     /// 其他状态执行历史链核验。需要完整历史审计时用 `mount_with_budget`。
     /// 视图取 DP 末索引（可能比 IP 新）。尾部非完整时以只读挂载，不自动修复。
@@ -336,6 +460,7 @@ impl<'a> LtfsVolume<'a> {
             index,
             block_size,
             write_buffer: None,
+            read_buffer: std::cell::RefCell::new(None),
             p1_write_head,
             dirty: false,
             last_dp_index,
@@ -459,12 +584,20 @@ impl<'a> LtfsVolume<'a> {
         ReadView {
             index: self.index.clone(),
             block_size: self.block_size,
+            read_buffer: std::cell::RefCell::new(None),
         }
     }
 
     /// 读取指定路径的文件内容到 writer，返回写出字节数。
     pub fn read_file_to_writer<W: Write>(&self, path: &str, w: &mut W) -> Result<u64> {
-        read_index_file(self.device, &self.index, self.block_size, path, w)
+        read_index_file(
+            self.device,
+            &self.index,
+            self.block_size,
+            path,
+            w,
+            &self.read_buffer,
+        )
     }
 
     /// 追加文件：从 reader 流式写入 P1 EOD，记录 extent 到内存 index。
@@ -1147,16 +1280,18 @@ impl<'a> LtfsVolume<'a> {
         self.commit_mode(false, true)
     }
 
-    /// LTFS 2.5 提交：通常只追加 DP 增量；连续 5 份（或较小恢复预算）后写 DP/IP Full。
+    /// LTFS 2.5 提交：通常只追加 DP 增量；连续 5 份（或较小恢复预算）后写 DP Full。
     /// 清洁卸载也会写 Full 检查点，计数跨重新挂载保留。
     pub fn commit_incremental(&mut self) -> Result<()> {
         if !self.dirty {
             return Ok(());
         }
-        if self.incremental_depth >= self.incremental_limit
-            || self.index.self_location.partition != self.label.data_partition
-        {
+        if self.index.self_location.partition != self.label.data_partition {
             return self.commit();
+        }
+        if self.incremental_depth >= self.incremental_limit {
+            // Full已经截断增量重放链；与普通sync一样留在DP，IP在卸载检查点追平。
+            return self.sync();
         }
         self.commit_mode(true, false)
     }
@@ -1224,14 +1359,15 @@ impl<'a> LtfsVolume<'a> {
             partition: self.label.data_partition,
             start_block: p1_index_block,
         };
-        let encoded = if incremental {
+        let xml = if incremental {
             self.working
                 .incremental_since(&self.index)
                 .map_err(|e| ("encode", e))?
+                .to_xml()
         } else {
-            self.working.clone()
-        };
-        let xml = encoded.to_xml().map_err(|e| ("encode", e))?;
+            self.working.to_xml()
+        }
+        .map_err(|e| ("encode", e))?;
         let blocks_written = write_bytes_in_blocks(&self.drive, &xml, self.block_size as usize)
             .map_err(|e| ("index_records", e))?;
         self.drive
@@ -1615,6 +1751,91 @@ mod relocation_tests {
     use super::*;
     use crate::ltfs::mkltfs::{MkltfsOptions, mkltfs};
     use crate::scsi::sim::{SimCartridge, SimLibrary};
+
+    #[test]
+    fn committed_session_reuses_index_and_survives_read_write_switch() {
+        use crate::scsi::cdb::opcode;
+        use crate::scsi::reservation::{ReservationKey, fence};
+        let lib = SimLibrary::new(1, 2, 1);
+        lib.insert_cartridge(SimCartridge::blank("SESS01L8", 64 << 20), 0)
+            .unwrap();
+        lib.load_into_drive("SESS01L8", 0).unwrap();
+        let dev = lib.drive(0);
+        mkltfs(&dev, &MkltfsOptions::default()).unwrap();
+        let key = ReservationKey::new(1, 1);
+        fence(&dev, key).unwrap();
+        let mut vol = LtfsVolume::mount(&dev).unwrap();
+        vol.set_reservation_guard(Some(key));
+        vol.append_bytes("first", b"first").unwrap();
+        vol.sync().unwrap();
+        let before = dev.command_log().len();
+        let mut vol = vol.into_session().unwrap().resume(&dev, key).unwrap();
+        assert!(!dev.command_log()[before..].contains(&opcode::READ_6));
+        let mut out = Vec::new();
+        vol.read_file_to_writer("first", &mut out).unwrap();
+        assert_eq!(out, b"first");
+        vol.append_bytes("second", b"second").unwrap();
+        vol.commit().unwrap();
+        drop(vol);
+        let recovered = LtfsVolume::mount(&dev).unwrap();
+        out.clear();
+        recovered.read_file_to_writer("second", &mut out).unwrap();
+        assert_eq!(out, b"second");
+    }
+
+    #[test]
+    fn session_rejects_reset_stale_round_and_dirty_state() {
+        use crate::scsi::reservation::{ReservationKey, fence};
+        let lib = SimLibrary::new(1, 2, 1);
+        lib.insert_cartridge(SimCartridge::blank("SESS02L8", 64 << 20), 0)
+            .unwrap();
+        lib.load_into_drive("SESS02L8", 0).unwrap();
+        let dev = lib.drive(0);
+        mkltfs(&dev, &MkltfsOptions::default()).unwrap();
+        let key = ReservationKey::new(1, 1);
+        fence(&dev, key).unwrap();
+        let mounted = || {
+            let mut vol = LtfsVolume::mount(&dev).unwrap();
+            vol.set_reservation_guard(Some(key));
+            vol
+        };
+        assert!(
+            mounted()
+                .into_session()
+                .unwrap()
+                .resume(&dev, ReservationKey::new(1, 2))
+                .is_err()
+        );
+        // 后台PR查询已消费UA，后续TUR正常也不能复用旧会话。
+        let session = mounted().into_session().unwrap();
+        dev.inject(crate::scsi::sim::Fault {
+            opcode: crate::scsi::cdb::opcode::PERSISTENT_RESERVE_IN,
+            action: crate::scsi::sim::FaultAction::CheckCondition {
+                sense_key: 6,
+                asc: 0x28,
+                ascq: 0,
+            },
+            after: 0,
+            remaining: 1,
+        });
+        crate::scsi::reservation::verify_holder(&dev, key).unwrap();
+        assert!(session.resume(&dev, key).is_err());
+        let mut dirty = mounted();
+        dirty.append_bytes("pending", b"uncommitted").unwrap();
+        assert!(dirty.into_session().is_none());
+        // 完成尾部后取得干净会话；复位使其不可复用。
+        let session = {
+            let mut vol = LtfsVolume::mount(&dev).unwrap();
+            // 未提交尾部会只读，不能缓存。
+            assert!(!vol.writable());
+            vol.set_reservation_guard(Some(key));
+            assert!(vol.into_session().is_none());
+            mkltfs(&dev, &MkltfsOptions::default()).unwrap();
+            mounted().into_session().unwrap()
+        };
+        lib.reset_drive(0);
+        assert!(session.resume(&dev, key).is_err());
+    }
 
     #[test]
     fn read_view_reuses_index_but_still_reads_and_checks_device_data() {

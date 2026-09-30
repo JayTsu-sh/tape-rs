@@ -1,0 +1,12 @@
+   Compiling tape-rs v0.1.0 (/work/jay/tape-rs-ltfs-recovery-ibm-interop)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.73s
+     Running unittests src/lib.rs (/work/cargo-target/debug/deps/tape_rs-f922efb6fa53ef95)
+
+running 4 tests
+test scsi::device::tests::direct_io_only_for_nonempty_tape_data_in_matching_direction ... ok
+test scsi::device::tests::interrupted_io_waits_for_completion_without_resubmitting ... ok
+test scsi::device::tests::sg_request_table_matches_linux_64_bit_layout ... ok
+test scsi::device::tests::reject_sg_lengths_before_truncating ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 83 filtered out; finished in 0.00s
+

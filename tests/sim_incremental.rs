@@ -63,6 +63,32 @@ fn increments_recover_and_clean_unmount_writes_full_on_both_partitions() {
 }
 
 #[test]
+fn clean_full_after_incrementals_mounts_without_historical_scan() {
+    let (_lib, dev) = formatted();
+    let mut vol = LtfsVolume::mount(&dev).unwrap();
+    vol.append_file("/one", &mut Cursor::new(b"1")).unwrap();
+    vol.commit_incremental().unwrap();
+    let delta = vol.index().self_location;
+    vol.unmount().unwrap();
+
+    let vol = LtfsVolume::mount(&dev).unwrap();
+    assert!(!vol.index().incremental);
+    assert_eq!(vol.index().previous_incremental_location, Some(delta));
+    assert!(!vol.recovery().ip_debt);
+    assert!(vol.recovery().dp.hint_used && vol.recovery().ip.hint_used);
+    assert!(!vol.recovery().history_checked);
+    let mut data = Vec::new();
+    vol.read_file_to_writer("/one", &mut data).unwrap();
+    assert_eq!(data, b"1");
+    drop(vol);
+
+    let audited = LtfsVolume::mount_with_budget(&dev, &RecoveryBudget::default()).unwrap();
+    assert!(audited.recovery().history_checked);
+    assert!(audited.recovery().chain_ok);
+    assert_eq!(audited.recovery().chain_depth, 1); // 显式核验仍读取前一份 Full
+}
+
+#[test]
 fn delta_is_not_a_full_snapshot_and_partial_chain_is_not_accepted() {
     let (_lib, dev) = formatted();
     let mut vol = LtfsVolume::mount(&dev).unwrap();
@@ -212,19 +238,18 @@ fn periodic_full_checkpoint_bounds_chain_across_remounts() {
         assert_eq!(vol.recovery().incremental_depth, n % 6);
         assert_eq!(vol.list().len(), n as usize);
         if n % 6 == 0 {
-            assert!(!vol.recovery().ip_debt);
-            assert_eq!(
-                vol.recovery()
-                    .ip
-                    .last_index
-                    .as_ref()
-                    .unwrap()
-                    .index
-                    .previous_location,
-                Some(vol.index().self_location)
-            );
+            assert!(vol.recovery().ip_debt, "周期Full只写DP，不应来回切换IP");
+            assert!(vol.needs_checkpoint());
         }
     }
+    let mut vol = LtfsVolume::mount(&dev).unwrap();
+    vol.commit().unwrap();
+    drop(vol);
+    lib.power_cut();
+    let vol = LtfsVolume::mount(&dev).unwrap();
+    assert!(!vol.recovery().ip_debt);
+    assert!(!vol.needs_checkpoint());
+    assert_eq!(vol.list().len(), 13);
 }
 
 #[test]
@@ -263,7 +288,7 @@ fn failed_periodic_checkpoint_freezes_without_publishing_new_generation() {
             asc: 0x0c,
             ascq: 0,
         },
-        after: 2, // Full checkpoint 的 IP 开始处失败，DP 已完整。
+        after: 2, // 周期DP Full的最终屏障失败，闭FM已完成。
         remaining: 1,
     });
     assert!(vol.commit_incremental().is_err());

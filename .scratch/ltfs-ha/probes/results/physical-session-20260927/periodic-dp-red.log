@@ -1,0 +1,22 @@
+   Compiling tape-rs v0.1.0 (/work/jay/tape-rs-ltfs-recovery-ibm-interop)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.61s
+     Running tests/sim_incremental.rs (/work/cargo-target/debug/deps/sim_incremental-907b74a99abc1048)
+
+running 1 test
+test periodic_full_checkpoint_bounds_chain_across_remounts ... FAILED
+
+failures:
+
+---- periodic_full_checkpoint_bounds_chain_across_remounts stdout ----
+
+thread 'periodic_full_checkpoint_bounds_chain_across_remounts' (195721) panicked at tests/sim_incremental.rs:215:13:
+周期Full只写DP，不应来回切换IP
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    periodic_full_checkpoint_bounds_chain_across_remounts
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `--test sim_incremental`

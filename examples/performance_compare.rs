@@ -143,6 +143,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         json!({"interface":"rust-library","kind":"mount",
         "seconds":mount_seconds,"generation":vol.index().generation,
         "history_checked":vol.recovery().history_checked,
+        "dp_full_with_incremental_history":!vol.index().incremental && vol.index().previous_incremental_location.is_some(),
+        "dp_hint_used":vol.recovery().dp.hint_used,"ip_hint_used":vol.recovery().ip.hint_used,
         "chain_depth":vol.recovery().chain_depth,
         "notes":vol.recovery().notes})
     );

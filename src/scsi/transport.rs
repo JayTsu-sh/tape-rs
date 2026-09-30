@@ -22,11 +22,28 @@ pub trait TapeTransport {
     /// 把 `buf` 写入设备。
     fn execute_write(&self, cdb: &[u8], buf: &[u8], timeout_ms: u32) -> Result<ScsiResult>;
 
+    /// 本句柄观察到的状态变化代数；未实现的transport不允许复用可写卷会话。
+    /// 必须在错误/UA被重试层消费前更新；修改或定位命令也使旧快照失效。
+    fn session_epoch(&self) -> Option<u64> {
+        None
+    }
+
     /// 设备身份描述，用于日志与错误信息（真实设备为 `/dev/sg*` 路径）。
     fn identity(&self) -> &str;
 }
 
+pub(crate) fn changes_session(cdb: &[u8]) -> bool {
+    !matches!(
+        cdb.first(),
+        Some(0x00 | 0x05 | 0x08 | 0x12 | 0x1a | 0x34 | 0x4d | 0x5a | 0x5e | 0x8c)
+    )
+}
+
 impl TapeTransport for ScsiDevice {
+    fn session_epoch(&self) -> Option<u64> {
+        Some(self.session_epoch_value())
+    }
+
     fn execute_no_data(&self, cdb: &[u8], timeout_ms: u32) -> Result<ScsiResult> {
         ScsiDevice::execute_no_data(self, cdb, timeout_ms)
     }

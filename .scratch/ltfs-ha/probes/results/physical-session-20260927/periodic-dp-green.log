@@ -1,0 +1,19 @@
+   Compiling tape-rs v0.1.0 (/work/jay/tape-rs-ltfs-recovery-ibm-interop)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.21s
+     Running tests/sim_incremental.rs (/work/cargo-target/debug/deps/sim_incremental-907b74a99abc1048)
+
+running 11 tests
+test shutdown_drain_keeps_completed_queue_and_rejects_late_uploads ... ok
+test failed_incremental_barrier_never_publishes_and_freezes_writer ... ok
+test broken_incremental_predecessor_refuses_mount ... ok
+test failed_periodic_checkpoint_freezes_without_publishing_new_generation ... ok
+test namespace_metadata_survives_incremental_replay_without_copying_file_data ... ok
+test increments_recover_and_clean_unmount_writes_full_on_both_partitions ... ok
+test failed_rename_commit_recovers_a_whole_namespace_after_power_cut ... ok
+test delta_is_not_a_full_snapshot_and_partial_chain_is_not_accepted ... ok
+test checkpoint_limit_respects_smaller_recovery_budget_and_zero_disables_deltas ... ok
+test incremental_barrier_and_partial_vci_failures_recover_metadata_and_allow_next_commit ... ok
+test periodic_full_checkpoint_bounds_chain_across_remounts ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+

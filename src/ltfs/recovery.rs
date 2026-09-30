@@ -725,6 +725,7 @@ pub(crate) fn recover_for_mount(
 
 /// Full 自包含最新视图；只有双分区新鲜提示和实际末构造均一致时才省去历史扫描。
 /// 仍读取两个索引、核验 EOD/自指针/追加位置，增量与异常卷不使用此路径。
+/// DP Full 可带历史增量回指（LTFS 2.5.1 §9.2.4）；Full 自包含，回指不构成重放依赖。
 fn clean_full_pair(
     dp: &PartitionScan,
     ip: &PartitionScan,
@@ -743,7 +744,6 @@ fn clean_full_pair(
                 && !i.index.incremental
                 && !d.index.materialized
                 && !i.index.materialized
-                && d.index.previous_incremental_location.is_none()
                 && i.index.previous_incremental_location.is_none()
                 && d.index.generation == i.index.generation
                 && hints[1]
@@ -768,14 +768,8 @@ fn recover_inner(
     let drive = &drive;
     let mut notes = Vec::new();
     let hints = vci_hints(device, label, &mut notes);
-    let mut dp = scan_partition(
-        drive,
-        1,
-        label.data_partition,
-        label,
-        budget,
-        hints[1].as_ref().map(|h| h.block),
-    )?;
+    // mount先读P0标签；先核验IP再扫DP，最终追加核验仍在DP，避免DP→IP→DP往返。
+    // 校验集合不变：两分区的EOD、VCI候选与异常尾部仍全部检查。
     let ip = scan_partition(
         drive,
         0,
@@ -783,6 +777,14 @@ fn recover_inner(
         label,
         budget,
         hints[0].as_ref().map(|h| h.block),
+    )?;
+    let mut dp = scan_partition(
+        drive,
+        1,
+        label.data_partition,
+        label,
+        budget,
+        hints[1].as_ref().map(|h| h.block),
     )?;
 
     let history_checked = verify_history || !clean_full_pair(&dp, &ip, &hints);

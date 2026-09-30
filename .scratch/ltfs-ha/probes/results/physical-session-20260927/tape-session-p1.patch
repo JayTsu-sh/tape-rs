@@ -1,0 +1,761 @@
+diff --git a/docs/CLAUDE-HANDOFF.md b/docs/CLAUDE-HANDOFF.md
+index 6421a03..026fd57 100644
+--- a/docs/CLAUDE-HANDOFF.md
++++ b/docs/CLAUDE-HANDOFF.md
+@@ -1,3 +1,11 @@
++## 2026-09-27 — 实施优化中：P1常驻卷实机验收运行
++
++活动工作树仍 /work/jay/tape-rs-ltfs-recovery-ibm-interop。当前未提交改动：VolumeSession移交owned状态；executor同卷连续批次/写带读复用；transport session_epoch在错误/UA/状态改变前递增，防止后台PR消费UA后复用；保留位置/PR/最终FM0；读缓冲复用、Full编码省一次全树clone；逐CDB原始状态+wall_us日志。全量软件测试通过（新增20独立批次不读index、读写切换、dirty/旧round/reset/已消费UA拒绝），strictClippy、兼容build通过。后续改动需重新验收。
++
++**正在实机运行，禁止重跑/替换运行二进制**：.143 /root/tape-rs-io-20260927/physical-session-20260927.py，监督PID1737927，日志session-run.log、事件session-events.jsonl、节点session-node1/2/3.log、PIDs session-nodes.json。候选ltfsd-session-candidate SHA5dc253b9e337a75bd3eec32e76a010fe5398386e7a13d85bbe0ceff62dbfdc8f。三节点同机隔离端口17700/17710/17720、HTTP17701/17711/17721；node3当选，pool rc18-session UUID98310642-518f-4db9-872a-3ba69933011e，仅分配RC18。本轮不是跨主机HA验收。
++
++介质RC18原UUID878f7b34-4910-4d09-9f1f-3e4725ede6d8，drive11EB4A80F1 sg3（LE同LU sg4），changer55L3A7802K19LL01 sg5；初始空drive/RC18槽7/RC17槽8已核对，allow_dio0。无格式化；daemon会写池标记以及新增8×4KiB comparison/session-20260927/f*.bin，新清单session-new.json和session-all.json共3163文件。流程：8独立commit、2次交错read、并发正常停3节点、Rust冷读8文件、归槽。完成标志session-native.complete只表示daemon+Rust；随后还需LE互读。未操作.209/RC17，不push。
++
+ ## 2026-09-27 — 超越LE性能分析完成，尚未实施
+ 
+ 报告 `.scratch/ltfs-ha/exceed-le-performance-plan-20260927.md`。新确认关键差异：benchmark跨批持有vol，但executor process_uploads_limited每批LtfsVolume::mount（1190）；写带上的读也重新mount，第二读驱动器已有ReadView复用。优先P0同口径CDB统计→P1常驻卷会话→P2减少正常挂载分区移动/有条件快速路径→P3小文件控制开销→P4审计最终FM0→P5大目录增量/合批→P6供数流水线。不能直接删EOD验证、PR guard、闭FM或MAM，不承诺未测收益。16GiB已只差约1%，微小文件与服务生命周期更值得优先优化。本轮仅分析/文档，无代码行为变化、无硬件操作；介质状态沿用下方最终检查。
+diff --git a/src/daemon/executor.rs b/src/daemon/executor.rs
+index 5003fed..7132638 100644
+--- a/src/daemon/executor.rs
++++ b/src/daemon/executor.rs
+@@ -21,8 +21,9 @@ use crate::error::{Result, TapeError};
+ use crate::ltfs::mkltfs::{MkltfsOptions, mkltfs};
+ use crate::ltfs::recovery::TailKind;
+ use crate::ltfs::volume::{
+-    FormatProbe, LtfsVolume, ReadView, TailPolicy, XATTR_DELETED_PATH, XATTR_POOL_NAME,
+-    XATTR_POOL_UUID, XATTR_VERSION, is_tombstone_path, probe_format, tombstone_path,
++    FormatProbe, LtfsVolume, ReadView, TailPolicy, VolumeSession, XATTR_DELETED_PATH,
++    XATTR_POOL_NAME, XATTR_POOL_UUID, XATTR_VERSION, is_tombstone_path, probe_format,
++    tombstone_path,
+ };
+ use crate::scsi::device::ScsiDevice;
+ use crate::scsi::inquiry::{enumerate_sg_nodes, read_unit_serial};
+@@ -231,6 +232,7 @@ struct Active {
+     serving: bool,
+     /// 正在服务的驱动器在 `devices` 里的下标
+     drive: Option<usize>,
++    write_session: Option<VolumeSession>,
+     /// 为读请求装载的带：驱动器下标、条码、最近一次使用
+     read: Option<(usize, String, Instant, Option<ReadView>)>,
+     /// 本轮已写下的文件数，同时是版本号里的序号
+@@ -511,7 +513,7 @@ fn shut_down(mut a: Active, files: &FileService, tx: &Sender<ExecEvent>) {
+         return;
+     }
+     if a.serving
+-        && let Err(e) = checkpoint_write_tape(&a, files, tx)
++        && let Err(e) = checkpoint_write_tape(&mut a, files, tx)
+     {
+         warn!("执行线程: 停机检查点失败: {}；保留介质和预留，等待恢复", e);
+         files.close("停机检查点失败");
+@@ -585,6 +587,7 @@ fn takeover(provider: &dyn DeviceProvider, opts: &ExecOptions, round: u64) -> Re
+         devices,
+         serving: false,
+         drive: None,
++        write_session: None,
+         read: None,
+         seq: 0,
+         reclaim: None,
+@@ -740,6 +743,7 @@ fn ensure_write_tape(
+     status: &SharedStatus,
+     tx: &Sender<ExecEvent>,
+ ) -> Result<String> {
++    a.write_session = None;
+     a.drive = None;
+     let mut inv = inventory(&a.devices)?;
+     let mut cands: Vec<Candidate> = {
+@@ -878,7 +882,7 @@ fn ensure_write_tape(
+ /// 外层 `Err` 是失去执行资格之类必须中止的错误；内层 `Err` 是"这盘不能用"及应标记的状态。
+ #[allow(clippy::type_complexity)]
+ fn open_candidate(
+-    a: &Active,
++    a: &mut Active,
+     opts: &ExecOptions,
+     files: &FileService,
+     tx: &Sender<ExecEvent>,
+@@ -990,6 +994,7 @@ fn open_candidate(
+         }
+     }
+ 
++    let session_epoch = dev.session_epoch();
+     // 5. 还写得下吗
+     let (list, bytes_used) = catalog_of(vol.index());
+     let files_now = list.iter().filter(|r| !is_directory(&r.metadata)).count() as u64;
+@@ -1043,12 +1048,19 @@ fn open_candidate(
+         files: list,
+         full: true,
+     });
++    if dev.session_epoch() == session_epoch {
++        a.write_session = vol.into_session();
++    }
+     summary.push_str(&format!("；可用 {} MiB", (remaining - reserve) >> 20));
+     Ok(Ok(summary))
+ }
+ 
+ /// 已接纳写入的卷在离开驱动器前收束增量；不触碰读带、拒绝候选或未分配介质。
+-fn checkpoint_write_tape(a: &Active, files: &FileService, tx: &Sender<ExecEvent>) -> Result<()> {
++fn checkpoint_write_tape(
++    a: &mut Active,
++    files: &FileService,
++    tx: &Sender<ExecEvent>,
++) -> Result<()> {
+     let Some(i) = a.drive else { return Ok(()) };
+     let tape = files
+         .tape()
+@@ -1063,7 +1075,10 @@ fn checkpoint_write_tape(a: &Active, files: &FileService, tx: &Sender<ExecEvent>
+         return Err(TapeError::NotReady("卸载检查点的介质与写入卷不符".into()));
+     }
+     let dev = a.devices[i].dev.as_ref();
+-    let mut vol = LtfsVolume::mount(dev)?;
++    let mut vol = match a.write_session.take() {
++        Some(session) => session.resume(dev, a.key)?,
++        None => LtfsVolume::mount(dev)?,
++    };
+     if !vol.needs_checkpoint() {
+         return Ok(());
+     }
+@@ -1186,8 +1201,12 @@ fn process_uploads_limited(
+         let dev = a.devices[i].dev.as_ref();
+         let (round, key) = (a.round, a.key);
+         let mut seq = a.seq;
++        let session = a.write_session.take();
+         let result = (|| -> Result<ExecEvent> {
+-            let mut vol = LtfsVolume::mount(dev)?;
++            let mut vol = match session {
++                Some(session) => session.resume(dev, key)?,
++                None => LtfsVolume::mount(dev)?,
++            };
+             vol.set_reservation_guard(Some(key));
+             let mut changed = std::collections::BTreeSet::new();
+             for u in &uploads {
+@@ -1317,7 +1336,8 @@ fn process_uploads_limited(
+                 .filter(|r| changed.contains(&r.path))
+                 .cloned()
+                 .collect();
+-            Ok(ExecEvent::Committed {
++            let session_epoch = dev.session_epoch();
++            let event = ExecEvent::Committed {
+                 round: a.round,
+                 barcode: files.tape().map(|t| t.barcode).unwrap_or_default(),
+                 volume_uuid: vol.label().volume_uuid.to_string(),
+@@ -1328,7 +1348,11 @@ fn process_uploads_limited(
+                 bytes_written: bytes_written_on(dev),
+                 files: written,
+                 full: false,
+-            })
++            };
++            if dev.session_epoch() == session_epoch {
++                a.write_session = vol.into_session();
++            }
++            Ok(event)
+         })();
+         a.seq = seq;
+         batches += 1;
+@@ -1415,8 +1439,19 @@ fn read_any_inner<W: Write>(
+     if files.tape().is_some_and(|t| t.barcode == barcode)
+         && let Some(i) = a.drive
+     {
+-        return read_file(a.devices[i].dev.as_ref(), path, out)
+-            .map_err(|e| ReadError::device(e, "读取文件失败"));
++        let dev = a.devices[i].dev.as_ref();
++        let session = a.write_session.take();
++        let result = (|| -> Result<u64> {
++            let mut vol = match session {
++                Some(session) => session.resume(dev, a.key)?,
++                None => LtfsVolume::mount(dev)?,
++            };
++            vol.set_reservation_guard(Some(a.key));
++            let count = vol.read_file_to_writer(path.trim_start_matches('/'), out)?;
++            a.write_session = vol.into_session();
++            Ok(count)
++        })();
++        return result.map_err(|e| ReadError::device(e, "读取文件失败"));
+     }
+     // 2. 就在读带上
+     if let Some((i, b, last, view)) = &mut a.read
+@@ -1501,6 +1536,7 @@ fn read_any_inner<W: Write>(
+             unload_drive(&a.devices, &inv, d)
+                 .map_err(|e| ReadError::device(e, "卸下写入带失败"))?;
+         }
++        a.write_session = None;
+         a.drive = None;
+         target = Some(w);
+         swapped_write = true;
+@@ -2273,6 +2309,7 @@ fn unload_idle_read_tape(a: &mut Active, opts: &ExecOptions) {
+ fn periodic(a: &mut Active, opts: &ExecOptions) -> std::result::Result<(), String> {
+     unload_idle_read_tape(a, opts);
+     if let (true, Some(i)) = (opts.demo_write, a.drive) {
++        a.write_session = None;
+         let ver = next_version(a);
+         let dev = a.devices[i].dev.as_ref();
+         let name = format!("/ltfsd-demo/round{:06}-{:04}.txt", a.round, a.seq);
+diff --git a/src/ltfs/volume.rs b/src/ltfs/volume.rs
+index 2b6685d..31f44ed 100644
+--- a/src/ltfs/volume.rs
++++ b/src/ltfs/volume.rs
+@@ -103,6 +103,40 @@ pub struct LtfsVolume<'a> {
+     block_size: u32,
+     /// 顺序文件流复用对齐缓冲；借用切片写入不分配它。
+     write_buffer: Option<crate::scsi::buffer::TransferBuffer>,
++    read_buffer: std::cell::RefCell<Option<crate::scsi::buffer::TransferBuffer>>,
++    /// P1 当前可写入位置。commit 后更新。
++    p1_write_head: u64,
++    dirty: bool,
++    /// DP 上最新一份索引的位置：commit 时作为 `previousgenerationlocation`。
++    last_dp_index: Option<IndexLocation>,
++    last_dp_incremental: Option<IndexLocation>,
++    last_ip: Option<(u64, u64)>,
++    incremental_depth: u32,
++    incremental_limit: u32,
++    /// 挂载时的恢复报告；`writable == recovery.append_ok`。
++    recovery: RecoveryReport,
++    writable: bool,
++    /// 只读原因：恢复受限或提交失败后的"结果未定"。
++    restricted_reason: Option<String>,
++    hash_policy: HashPolicy,
++    /// 设了之后，每次提交在屏障前核对预留持有者是不是这个键。
++    reservation_guard: Option<crate::scsi::reservation::ReservationKey>,
++}
++
++/// 执行线程保留的已提交卷状态，不持有设备借用。仅能在原设备/预留轮次复用。
++/// 机械操作、外部修改或任何不确定错误后，调用方必须丢弃它。
++pub(crate) struct VolumeSession {
++    identity: String,
++    epoch: u64,
++    label: LtfsLabel,
++    /// 工作索引：包含尚未提交的追加。
++    working: LtfsIndex,
++    /// 已发布的已提交视图（S5）：list/read/index() 只服务它。
++    index: LtfsIndex,
++    block_size: u32,
++    /// 顺序文件流复用对齐缓冲；借用切片写入不分配它。
++    write_buffer: Option<crate::scsi::buffer::TransferBuffer>,
++    read_buffer: std::cell::RefCell<Option<crate::scsi::buffer::TransferBuffer>>,
+     /// P1 当前可写入位置。commit 后更新。
+     p1_write_head: u64,
+     dirty: bool,
+@@ -126,6 +160,55 @@ pub struct LtfsVolume<'a> {
+ pub(crate) struct ReadView {
+     index: LtfsIndex,
+     block_size: u32,
++    read_buffer: std::cell::RefCell<Option<crate::scsi::buffer::TransferBuffer>>,
++}
++
++impl VolumeSession {
++    pub(crate) fn resume<'a>(
++        self,
++        device: &'a dyn crate::scsi::transport::TapeTransport,
++        key: crate::scsi::reservation::ReservationKey,
++    ) -> Result<LtfsVolume<'a>> {
++        if self.identity != device.identity() || self.reservation_guard != Some(key) {
++            return Err(TapeError::NotReady("卷会话的设备或执行轮次已改变".into()));
++        }
++        if device.session_epoch() != Some(self.epoch) {
++            return Err(TapeError::NotReady(
++                "设备状态已改变，卷会话必须重新恢复".into(),
++            ));
++        }
++        // 不重试 UA：介质变化/复位必须使会话失效，不能吞掉后沿用旧目录。
++        device.execute_no_data(&crate::scsi::cdb::test_unit_ready(), 10_000)?;
++        crate::scsi::reservation::verify_holder(device, key)?;
++        if device.session_epoch() != Some(self.epoch) {
++            return Err(TapeError::NotReady(
++                "资格检查期间设备状态改变，卷会话已失效".into(),
++            ));
++        }
++        Ok(LtfsVolume {
++            device,
++            drive: TapeDrive::new(device),
++            mam: Mam::new(device),
++            label: self.label,
++            working: self.working,
++            index: self.index,
++            block_size: self.block_size,
++            write_buffer: self.write_buffer,
++            read_buffer: self.read_buffer,
++            p1_write_head: self.p1_write_head,
++            dirty: self.dirty,
++            last_dp_index: self.last_dp_index,
++            last_dp_incremental: self.last_dp_incremental,
++            last_ip: self.last_ip,
++            incremental_depth: self.incremental_depth,
++            incremental_limit: self.incremental_limit,
++            recovery: self.recovery,
++            writable: self.writable,
++            restricted_reason: self.restricted_reason,
++            hash_policy: self.hash_policy,
++            reservation_guard: self.reservation_guard,
++        })
++    }
+ }
+ 
+ impl ReadView {
+@@ -135,7 +218,14 @@ impl ReadView {
+         path: &str,
+         w: &mut W,
+     ) -> Result<u64> {
+-        read_index_file(device, &self.index, self.block_size, path, w)
++        read_index_file(
++            device,
++            &self.index,
++            self.block_size,
++            path,
++            w,
++            &self.read_buffer,
++        )
+     }
+ }
+ 
+@@ -145,6 +235,7 @@ fn read_index_file<W: Write>(
+     block_size: u32,
+     path: &str,
+     w: &mut W,
++    read_buffer: &std::cell::RefCell<Option<crate::scsi::buffer::TransferBuffer>>,
+ ) -> Result<u64> {
+     let drive = TapeDrive::new(device);
+     let file = index
+@@ -157,7 +248,7 @@ fn read_index_file<W: Write>(
+         let hit = index.find_file(&resolved);
+         return match hit {
+             Some(f) if f.symlink.is_none() => {
+-                read_index_file(device, index, block_size, &resolved, w)
++                read_index_file(device, index, block_size, &resolved, w, read_buffer)
+             }
+             _ => Err(TapeError::Ltfs(format!(
+                 "符号链接目标不可读: {} -> {}",
+@@ -173,8 +264,12 @@ fn read_index_file<W: Write>(
+     }
+ 
+     let mut total: u64 = 0;
+-    let mut buffer = crate::scsi::buffer::TransferBuffer::new(block_size as usize);
+-    let buf = buffer.as_mut_slice();
++    let mut buffer = read_buffer
++        .try_borrow_mut()
++        .map_err(|_| TapeError::NotReady("同一卷的读取尚未完成".into()))?;
++    let buf = buffer
++        .get_or_insert_with(|| crate::scsi::buffer::TransferBuffer::new(block_size as usize))
++        .as_mut_slice();
+ 
+     for ext in &file.extents {
+         let partition = partition_char_to_num(ext.partition);
+@@ -221,6 +316,35 @@ impl<'a> LtfsVolume<'a> {
+     /// 挂载卷：读取双分区末索引并核验尾部及追加位置；一致 Full 使用正常挂载快速路径，
+     /// 其他状态执行历史链核验。需要完整历史审计时用 `mount_with_budget`。
+     /// 视图取 DP 末索引（可能比 IP 新）。尾部非完整时以只读挂载，不自动修复。
++    /// 只保留已提交且受预留保护的卷；移动索引和缓冲，不复制目录树。
++    pub(crate) fn into_session(self) -> Option<VolumeSession> {
++        if self.dirty || !self.writable || self.reservation_guard.is_none() {
++            return None;
++        }
++        Some(VolumeSession {
++            identity: self.device.identity().to_owned(),
++            epoch: self.device.session_epoch()?,
++            label: self.label,
++            working: self.working,
++            index: self.index,
++            block_size: self.block_size,
++            write_buffer: self.write_buffer,
++            read_buffer: self.read_buffer,
++            p1_write_head: self.p1_write_head,
++            dirty: self.dirty,
++            last_dp_index: self.last_dp_index,
++            last_dp_incremental: self.last_dp_incremental,
++            last_ip: self.last_ip,
++            incremental_depth: self.incremental_depth,
++            incremental_limit: self.incremental_limit,
++            recovery: self.recovery,
++            writable: self.writable,
++            restricted_reason: self.restricted_reason,
++            hash_policy: self.hash_policy,
++            reservation_guard: self.reservation_guard,
++        })
++    }
++
+     pub fn mount(device: &'a dyn crate::scsi::transport::TapeTransport) -> Result<Self> {
+         Self::mount_inner(device, &RecoveryBudget::default(), false)
+     }
+@@ -336,6 +460,7 @@ impl<'a> LtfsVolume<'a> {
+             index,
+             block_size,
+             write_buffer: None,
++            read_buffer: std::cell::RefCell::new(None),
+             p1_write_head,
+             dirty: false,
+             last_dp_index,
+@@ -459,12 +584,20 @@ impl<'a> LtfsVolume<'a> {
+         ReadView {
+             index: self.index.clone(),
+             block_size: self.block_size,
++            read_buffer: std::cell::RefCell::new(None),
+         }
+     }
+ 
+     /// 读取指定路径的文件内容到 writer，返回写出字节数。
+     pub fn read_file_to_writer<W: Write>(&self, path: &str, w: &mut W) -> Result<u64> {
+-        read_index_file(self.device, &self.index, self.block_size, path, w)
++        read_index_file(
++            self.device,
++            &self.index,
++            self.block_size,
++            path,
++            w,
++            &self.read_buffer,
++        )
+     }
+ 
+     /// 追加文件：从 reader 流式写入 P1 EOD，记录 extent 到内存 index。
+@@ -1224,14 +1357,15 @@ impl<'a> LtfsVolume<'a> {
+             partition: self.label.data_partition,
+             start_block: p1_index_block,
+         };
+-        let encoded = if incremental {
++        let xml = if incremental {
+             self.working
+                 .incremental_since(&self.index)
+                 .map_err(|e| ("encode", e))?
++                .to_xml()
+         } else {
+-            self.working.clone()
+-        };
+-        let xml = encoded.to_xml().map_err(|e| ("encode", e))?;
++            self.working.to_xml()
++        }
++        .map_err(|e| ("encode", e))?;
+         let blocks_written = write_bytes_in_blocks(&self.drive, &xml, self.block_size as usize)
+             .map_err(|e| ("index_records", e))?;
+         self.drive
+@@ -1616,6 +1750,91 @@ mod relocation_tests {
+     use crate::ltfs::mkltfs::{MkltfsOptions, mkltfs};
+     use crate::scsi::sim::{SimCartridge, SimLibrary};
+ 
++    #[test]
++    fn committed_session_reuses_index_and_survives_read_write_switch() {
++        use crate::scsi::cdb::opcode;
++        use crate::scsi::reservation::{ReservationKey, fence};
++        let lib = SimLibrary::new(1, 2, 1);
++        lib.insert_cartridge(SimCartridge::blank("SESS01L8", 64 << 20), 0)
++            .unwrap();
++        lib.load_into_drive("SESS01L8", 0).unwrap();
++        let dev = lib.drive(0);
++        mkltfs(&dev, &MkltfsOptions::default()).unwrap();
++        let key = ReservationKey::new(1, 1);
++        fence(&dev, key).unwrap();
++        let mut vol = LtfsVolume::mount(&dev).unwrap();
++        vol.set_reservation_guard(Some(key));
++        vol.append_bytes("first", b"first").unwrap();
++        vol.sync().unwrap();
++        let before = dev.command_log().len();
++        let mut vol = vol.into_session().unwrap().resume(&dev, key).unwrap();
++        assert!(!dev.command_log()[before..].contains(&opcode::READ_6));
++        let mut out = Vec::new();
++        vol.read_file_to_writer("first", &mut out).unwrap();
++        assert_eq!(out, b"first");
++        vol.append_bytes("second", b"second").unwrap();
++        vol.commit().unwrap();
++        drop(vol);
++        let recovered = LtfsVolume::mount(&dev).unwrap();
++        out.clear();
++        recovered.read_file_to_writer("second", &mut out).unwrap();
++        assert_eq!(out, b"second");
++    }
++
++    #[test]
++    fn session_rejects_reset_stale_round_and_dirty_state() {
++        use crate::scsi::reservation::{ReservationKey, fence};
++        let lib = SimLibrary::new(1, 2, 1);
++        lib.insert_cartridge(SimCartridge::blank("SESS02L8", 64 << 20), 0)
++            .unwrap();
++        lib.load_into_drive("SESS02L8", 0).unwrap();
++        let dev = lib.drive(0);
++        mkltfs(&dev, &MkltfsOptions::default()).unwrap();
++        let key = ReservationKey::new(1, 1);
++        fence(&dev, key).unwrap();
++        let mounted = || {
++            let mut vol = LtfsVolume::mount(&dev).unwrap();
++            vol.set_reservation_guard(Some(key));
++            vol
++        };
++        assert!(
++            mounted()
++                .into_session()
++                .unwrap()
++                .resume(&dev, ReservationKey::new(1, 2))
++                .is_err()
++        );
++        // 后台PR查询已消费UA，后续TUR正常也不能复用旧会话。
++        let session = mounted().into_session().unwrap();
++        dev.inject(crate::scsi::sim::Fault {
++            opcode: crate::scsi::cdb::opcode::PERSISTENT_RESERVE_IN,
++            action: crate::scsi::sim::FaultAction::CheckCondition {
++                sense_key: 6,
++                asc: 0x28,
++                ascq: 0,
++            },
++            after: 0,
++            remaining: 1,
++        });
++        crate::scsi::reservation::verify_holder(&dev, key).unwrap();
++        assert!(session.resume(&dev, key).is_err());
++        let mut dirty = mounted();
++        dirty.append_bytes("pending", b"uncommitted").unwrap();
++        assert!(dirty.into_session().is_none());
++        // 完成尾部后取得干净会话；复位使其不可复用。
++        let session = {
++            let mut vol = LtfsVolume::mount(&dev).unwrap();
++            // 未提交尾部会只读，不能缓存。
++            assert!(!vol.writable());
++            vol.set_reservation_guard(Some(key));
++            assert!(vol.into_session().is_none());
++            mkltfs(&dev, &MkltfsOptions::default()).unwrap();
++            mounted().into_session().unwrap()
++        };
++        lib.reset_drive(0);
++        assert!(session.resume(&dev, key).is_err());
++    }
++
+     #[test]
+     fn read_view_reuses_index_but_still_reads_and_checks_device_data() {
+         use crate::scsi::cdb::opcode;
+diff --git a/src/scsi/device.rs b/src/scsi/device.rs
+index e996ddb..909241a 100644
+--- a/src/scsi/device.rs
++++ b/src/scsi/device.rs
+@@ -63,6 +63,7 @@ pub struct ScsiDevice {
+     indirect: [AtomicU64; 2],
+     command: Mutex<()>,
+     failed: AtomicBool,
++    session_epoch: AtomicU64,
+ }
+ 
+ /// 打开后、发出任何命令前配置；申请失败或不足仍可由 sg 动态分配间接缓冲。
+@@ -118,6 +119,7 @@ impl ScsiDevice {
+             indirect: std::array::from_fn(|_| AtomicU64::new(0)),
+             command: Mutex::new(()),
+             failed: AtomicBool::new(false),
++            session_epoch: AtomicU64::new(0),
+         })
+     }
+ 
+@@ -126,6 +128,10 @@ impl ScsiDevice {
+         &self.path
+     }
+ 
++    pub(crate) fn session_epoch_value(&self) -> u64 {
++        self.session_epoch.load(Ordering::Relaxed)
++    }
++
+     pub fn direct_io_stats(&self) -> DirectIoStats {
+         let counts = |i: usize| IoCounts {
+             direct: self.direct[i].load(Ordering::Relaxed),
+@@ -171,13 +177,37 @@ impl ScsiDevice {
+         };
+         hdr.dxfer_len = dxfer_len;
+         hdr.dxferp = if dxfer_len == 0 { 0 } else { dxferp };
+-        // 只对磁带数据 READ/WRITE 请求 direct I/O。内核自动回退，不重发任何命令。
++        // 只对磁带数据 READ/WRITE 请求 direct I/O；是否采用由内核决定，映射错误不重发。
+         hdr.flags = transfer_flags(cdb, direction, dxfer_len);
+ 
+         // 执行 SG_IO ioctl
+         // SG_IO 可在 EINTR/设备脱离时早于命令完成返回。此时仍保持调用方缓冲区借用，
+         // 只查询请求表直到设备完成，绝不再次提交 CDB；之后冻结本句柄并报告原始错误。
++        let started = std::time::Instant::now();
+         let result = unsafe { crate::scsi::sg_io::sg_io(self.fd.as_raw_fd(), &mut hdr) };
++        debug!(
++            "SG_IO: device={} cdb={:02x?} bytes={} wall_us={} duration_ms={} result={:?} status={:#x} host={:#x} driver={:#x} resid={} info={:#x} sense={:02x?}",
++            self.path,
++            cdb,
++            dxfer_len,
++            started.elapsed().as_micros(),
++            hdr.duration,
++            result,
++            hdr.status,
++            hdr.host_status,
++            hdr.driver_status,
++            hdr.resid,
++            hdr.info,
++            &sense_buf[..usize::from(hdr.sb_len_wr).min(sense_buf.len())]
++        );
++        if result.is_err()
++            || hdr.status != 0
++            || hdr.host_status != 0
++            || hdr.driver_status != 0
++            || crate::scsi::transport::changes_session(cdb)
++        {
++            self.session_epoch.fetch_add(1, Ordering::Relaxed);
++        }
+         if let Err(error) = result {
+             self.failed.store(true, Ordering::Relaxed);
+             wait_for_io_completion(
+diff --git a/src/scsi/sim.rs b/src/scsi/sim.rs
+index e03a741..b06498d 100644
+--- a/src/scsi/sim.rs
++++ b/src/scsi/sim.rs
+@@ -354,6 +354,7 @@ impl SimLibrary {
+             initiator: 0,
+             faults: Mutex::new(Vec::new()),
+             log: Mutex::new(Vec::new()),
++            session_epoch: std::sync::atomic::AtomicU64::new(0),
+             identity: "sim:changer".to_string(),
+         }
+     }
+@@ -371,6 +372,7 @@ impl SimLibrary {
+             initiator,
+             faults: Mutex::new(Vec::new()),
+             log: Mutex::new(Vec::new()),
++            session_epoch: std::sync::atomic::AtomicU64::new(0),
+             identity: format!("sim:drive{}@i{}", idx, initiator),
+         }
+     }
+@@ -441,6 +443,7 @@ pub struct SimTransport {
+     initiator: u32,
+     faults: Mutex<Vec<Fault>>,
+     log: Mutex<Vec<u8>>,
++    session_epoch: std::sync::atomic::AtomicU64,
+     identity: String,
+ }
+ 
+@@ -486,6 +489,23 @@ impl SimTransport {
+         cdb: &[u8],
+         data_in: Option<&[u8]>,
+         data_out: Option<&mut [u8]>,
++    ) -> Result<ScsiResult> {
++        let result = self.dispatch_inner(cdb, data_in, data_out);
++        if result.as_ref().is_err()
++            || result.as_ref().is_ok_and(|r| r.status != 0)
++            || crate::scsi::transport::changes_session(cdb)
++        {
++            self.session_epoch
++                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        }
++        result
++    }
++
++    fn dispatch_inner(
++        &self,
++        cdb: &[u8],
++        data_in: Option<&[u8]>,
++        data_out: Option<&mut [u8]>,
+     ) -> Result<ScsiResult> {
+         let op = *cdb.first().ok_or(TapeError::InvalidResponse {
+             expected: 1,
+@@ -527,6 +547,13 @@ impl SimTransport {
+ }
+ 
+ impl TapeTransport for SimTransport {
++    fn session_epoch(&self) -> Option<u64> {
++        Some(
++            self.session_epoch
++                .load(std::sync::atomic::Ordering::Relaxed),
++        )
++    }
++
+     fn execute_no_data(&self, cdb: &[u8], _timeout_ms: u32) -> Result<ScsiResult> {
+         self.dispatch(cdb, None, None)
+     }
+diff --git a/src/scsi/transport.rs b/src/scsi/transport.rs
+index 36f334e..8ad81c9 100644
+--- a/src/scsi/transport.rs
++++ b/src/scsi/transport.rs
+@@ -22,11 +22,28 @@ pub trait TapeTransport {
+     /// 把 `buf` 写入设备。
+     fn execute_write(&self, cdb: &[u8], buf: &[u8], timeout_ms: u32) -> Result<ScsiResult>;
+ 
++    /// 本句柄观察到的状态变化代数；未实现的transport不允许复用可写卷会话。
++    /// 必须在错误/UA被重试层消费前更新；修改或定位命令也使旧快照失效。
++    fn session_epoch(&self) -> Option<u64> {
++        None
++    }
++
+     /// 设备身份描述，用于日志与错误信息（真实设备为 `/dev/sg*` 路径）。
+     fn identity(&self) -> &str;
+ }
+ 
++pub(crate) fn changes_session(cdb: &[u8]) -> bool {
++    !matches!(
++        cdb.first(),
++        Some(0x00 | 0x05 | 0x08 | 0x12 | 0x1a | 0x34 | 0x4d | 0x5a | 0x5e | 0x8c)
++    )
++}
++
+ impl TapeTransport for ScsiDevice {
++    fn session_epoch(&self) -> Option<u64> {
++        Some(self.session_epoch_value())
++    }
++
+     fn execute_no_data(&self, cdb: &[u8], timeout_ms: u32) -> Result<ScsiResult> {
+         ScsiDevice::execute_no_data(self, cdb, timeout_ms)
+     }
+diff --git a/tests/ltfsd_cluster.rs b/tests/ltfsd_cluster.rs
+index 6688874..8f5192b 100644
+--- a/tests/ltfsd_cluster.rs
++++ b/tests/ltfsd_cluster.rs
+@@ -115,6 +115,7 @@ impl FormatPause {
+ struct CheckpointFault {
+     initiator: std::sync::atomic::AtomicU32,
+     medium_error: std::sync::atomic::AtomicBool,
++    read_commands: std::sync::atomic::AtomicUsize,
+ }
+ 
+ struct PausingTransport {
+@@ -164,6 +165,11 @@ impl tape_rs::scsi::transport::TapeTransport for PausingTransport {
+         timeout: u32,
+     ) -> Result<tape_rs::scsi::device::ScsiResult> {
+         use std::sync::atomic::Ordering;
++        if cdb.first() == Some(&tape_rs::scsi::cdb::opcode::READ_6) {
++            self.checkpoint_fault
++                .read_commands
++                .fetch_add(1, Ordering::SeqCst);
++        }
+         // mkltfs performs no READ(6). The first one following its FORMAT is
+         // the remount in finish_reclaim, after both empty indexes are durable.
+         let pause = self.pause.as_ref().filter(|p| {
+@@ -226,6 +232,10 @@ impl tape_rs::scsi::transport::TapeTransport for PausingTransport {
+         result
+     }
+ 
++    fn session_epoch(&self) -> Option<u64> {
++        self.inner.session_epoch()
++    }
++
+     fn identity(&self) -> &str {
+         self.inner.identity()
+     }
+@@ -1223,6 +1233,39 @@ fn pools_and_tape_assignments_are_replicated_to_every_node() {
+ 
+ /// PN01：并发上传被合成少数几次卷提交；目录记录带着写带时算出的
+ /// sha256 复制到每个节点；带上有文件时不能解除归属。
++#[test]
++fn consecutive_batches_reuse_mounted_write_volume() {
++    let c = Cluster::start_with("mounted-session", false);
++    let (leader, round) = c.wait_serving(None, 0);
++    let svc = &c.services[&leader];
++    c.wait("文件服务开放", || svc.serving_round() == Some(round));
++    let reads = || {
++        c.checkpoint_fault
++            .read_commands
++            .load(std::sync::atomic::Ordering::SeqCst)
++    };
++    let before = reads();
++    // 串行等待保证是20个独立commit，而不是一次并发合批。
++    for i in 0..20 {
++        assert!(matches!(
++            upload(svc, &format!("/session/{i}"), &body(4096, i)).unwrap(),
++            TaskStatus::Committed { .. }
++        ));
++    }
++    assert_eq!(reads() - before, 0, "连续提交不得重新读label/index");
++    let before = reads();
++    assert_eq!(c.read_via(leader, "/session/0").unwrap(), body(4096, 0));
++    assert_eq!(reads() - before, 1, "写带上读取只读文件数据，不重新挂载");
++    assert!(matches!(
++        upload(svc, "/session/after-read", b"after-read").unwrap(),
++        TaskStatus::Committed { .. }
++    ));
++    assert_eq!(
++        c.read_via(leader, "/session/after-read").unwrap(),
++        b"after-read"
++    );
++}
++
+ #[test]
+ fn uploads_are_batched_and_catalogued_on_every_node() {
+     use sha2::{Digest, Sha256};

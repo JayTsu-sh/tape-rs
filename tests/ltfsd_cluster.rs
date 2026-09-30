@@ -115,6 +115,7 @@ impl FormatPause {
 struct CheckpointFault {
     initiator: std::sync::atomic::AtomicU32,
     medium_error: std::sync::atomic::AtomicBool,
+    read_commands: std::sync::atomic::AtomicUsize,
 }
 
 struct PausingTransport {
@@ -164,6 +165,11 @@ impl tape_rs::scsi::transport::TapeTransport for PausingTransport {
         timeout: u32,
     ) -> Result<tape_rs::scsi::device::ScsiResult> {
         use std::sync::atomic::Ordering;
+        if cdb.first() == Some(&tape_rs::scsi::cdb::opcode::READ_6) {
+            self.checkpoint_fault
+                .read_commands
+                .fetch_add(1, Ordering::SeqCst);
+        }
         // mkltfs performs no READ(6). The first one following its FORMAT is
         // the remount in finish_reclaim, after both empty indexes are durable.
         let pause = self.pause.as_ref().filter(|p| {
@@ -224,6 +230,10 @@ impl tape_rs::scsi::transport::TapeTransport for PausingTransport {
             p.report(&result);
         }
         result
+    }
+
+    fn session_epoch(&self) -> Option<u64> {
+        self.inner.session_epoch()
     }
 
     fn identity(&self) -> &str {
@@ -1223,6 +1233,39 @@ fn pools_and_tape_assignments_are_replicated_to_every_node() {
 
 /// PN01：并发上传被合成少数几次卷提交；目录记录带着写带时算出的
 /// sha256 复制到每个节点；带上有文件时不能解除归属。
+#[test]
+fn consecutive_batches_reuse_mounted_write_volume() {
+    let c = Cluster::start_with("mounted-session", false);
+    let (leader, round) = c.wait_serving(None, 0);
+    let svc = &c.services[&leader];
+    c.wait("文件服务开放", || svc.serving_round() == Some(round));
+    let reads = || {
+        c.checkpoint_fault
+            .read_commands
+            .load(std::sync::atomic::Ordering::SeqCst)
+    };
+    let before = reads();
+    // 串行等待保证是20个独立commit，而不是一次并发合批。
+    for i in 0..20 {
+        assert!(matches!(
+            upload(svc, &format!("/session/{i}"), &body(4096, i)).unwrap(),
+            TaskStatus::Committed { .. }
+        ));
+    }
+    assert_eq!(reads() - before, 0, "连续提交不得重新读label/index");
+    let before = reads();
+    assert_eq!(c.read_via(leader, "/session/0").unwrap(), body(4096, 0));
+    assert_eq!(reads() - before, 1, "写带上读取只读文件数据，不重新挂载");
+    assert!(matches!(
+        upload(svc, "/session/after-read", b"after-read").unwrap(),
+        TaskStatus::Committed { .. }
+    ));
+    assert_eq!(
+        c.read_via(leader, "/session/after-read").unwrap(),
+        b"after-read"
+    );
+}
+
 #[test]
 fn uploads_are_batched_and_catalogued_on_every_node() {
     use sha2::{Digest, Sha256};

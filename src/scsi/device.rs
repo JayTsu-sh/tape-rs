@@ -63,6 +63,7 @@ pub struct ScsiDevice {
     indirect: [AtomicU64; 2],
     command: Mutex<()>,
     failed: AtomicBool,
+    session_epoch: AtomicU64,
 }
 
 /// 打开后、发出任何命令前配置；申请失败或不足仍可由 sg 动态分配间接缓冲。
@@ -118,12 +119,17 @@ impl ScsiDevice {
             indirect: std::array::from_fn(|_| AtomicU64::new(0)),
             command: Mutex::new(()),
             failed: AtomicBool::new(false),
+            session_epoch: AtomicU64::new(0),
         })
     }
 
     /// 获取设备路径
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    pub(crate) fn session_epoch_value(&self) -> u64 {
+        self.session_epoch.load(Ordering::Relaxed)
     }
 
     pub fn direct_io_stats(&self) -> DirectIoStats {
@@ -171,22 +177,51 @@ impl ScsiDevice {
         };
         hdr.dxfer_len = dxfer_len;
         hdr.dxferp = if dxfer_len == 0 { 0 } else { dxferp };
-        // 只对磁带数据 READ/WRITE 请求 direct I/O。内核自动回退，不重发任何命令。
+        // 只对磁带数据 READ/WRITE 请求 direct I/O；是否采用由内核决定，映射错误不重发。
         hdr.flags = transfer_flags(cdb, direction, dxfer_len);
 
         // 执行 SG_IO ioctl
         // SG_IO 可在 EINTR/设备脱离时早于命令完成返回。此时仍保持调用方缓冲区借用，
         // 只查询请求表直到设备完成，绝不再次提交 CDB；之后冻结本句柄并报告原始错误。
+        let started = std::time::Instant::now();
         let result = unsafe { crate::scsi::sg_io::sg_io(self.fd.as_raw_fd(), &mut hdr) };
+        let wall_us = started.elapsed().as_micros();
+        if result.is_err()
+            || hdr.status != 0
+            || hdr.host_status != 0
+            || hdr.driver_status != 0
+            || crate::scsi::transport::changes_session(cdb)
+        {
+            self.session_epoch.fetch_add(1, Ordering::Relaxed);
+        }
         if let Err(error) = result {
             self.failed.store(true, Ordering::Relaxed);
             wait_for_io_completion(
                 || pending_io(self.fd.as_raw_fd()),
                 || std::thread::sleep(std::time::Duration::from_millis(10)),
             );
+            debug!(
+                "SG_IO 失败: device={} cdb={:02x?} wall_us={} error={}",
+                self.path, cdb, wall_us, error
+            );
             return Err(error.into());
         }
 
+        debug!(
+            "SG_IO: device={} cdb={:02x?} bytes={} wall_us={} duration_ms={} result={:?} status={:#x} host={:#x} driver={:#x} resid={} info={:#x} sense={:02x?}",
+            self.path,
+            cdb,
+            dxfer_len,
+            wall_us,
+            hdr.duration,
+            result,
+            hdr.status,
+            hdr.host_status,
+            hdr.driver_status,
+            hdr.resid,
+            hdr.info,
+            &sense_buf[..usize::from(hdr.sb_len_wr).min(sense_buf.len())]
+        );
         if hdr.flags & SG_FLAG_DIRECT_IO != 0 {
             let i = usize::from(matches!(direction, Direction::ToDevice));
             let counter = match hdr.info & SG_INFO_DIRECT_IO_MASK {

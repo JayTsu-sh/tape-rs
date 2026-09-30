@@ -1,5 +1,5 @@
 //! LTFS 2.5 §9.2 的增量差分与原子重放。介质定位与链验证由 recovery 负责。
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::index::{DirectoryNode, FileNode, LtfsIndex, NodeMeta};
 use crate::error::{Result, TapeError};
@@ -24,7 +24,7 @@ impl LtfsIndex {
         if self.volume_uuid != base.volume_uuid || self.generation <= base.generation {
             return Err(bad("卷身份或代数不匹配"));
         }
-        let mut delta = self.clone();
+        let mut delta = self.clone_with_root(difference(&self.root, &base.root));
         delta.version = "2.5.0".into();
         delta.incremental = true;
         delta.materialized = false;
@@ -34,7 +34,6 @@ impl LtfsIndex {
             Some(base.self_location)
         };
         delta.previous_incremental_location = base.incremental.then_some(base.self_location);
-        delta.root = difference(&self.root, &base.root);
         delta.validate_incremental()?;
         Ok(delta)
     }
@@ -88,8 +87,7 @@ impl LtfsIndex {
         merge_dir(&mut root, &delta.root, true)?;
         let mut seen = BTreeSet::new();
         validate_uids(&root, delta.highest_file_uid, &mut seen)?;
-        let mut out = delta.clone();
-        out.root = root;
+        let mut out = delta.clone_with_root(root);
         out.materialized = true;
         out.allow_policy_update = self.allow_policy_update;
         Ok(out)
@@ -97,23 +95,41 @@ impl LtfsIndex {
 }
 
 fn difference(new: &DirectoryNode, old: &DirectoryNode) -> DirectoryNode {
-    let mut out = new.clone();
-    out.files.clear();
-    out.subdirs.clear();
+    let mut out = DirectoryNode {
+        delta_fields: None,
+        name: new.name.clone(),
+        meta: new.meta.clone(),
+        xattrs: new.xattrs.clone(),
+        files: Vec::new(),
+        subdirs: Vec::new(),
+    };
+    let old_files: BTreeMap<_, _> = old.files.iter().map(|f| (f.name.as_str(), f)).collect();
+    let old_dirs: BTreeMap<_, _> = old
+        .subdirs
+        .iter()
+        .map(|d| ((d.name.as_str(), d.meta.file_uid), d))
+        .collect();
+    let names: BTreeSet<_> = new
+        .files
+        .iter()
+        .map(|f| f.name.as_str())
+        .chain(new.subdirs.iter().map(|d| d.name.as_str()))
+        .collect();
     if new.meta == old.meta && new.xattrs == old.xattrs {
         out.delta_fields = fields(&["name", "contents"]);
     } else {
         out.delta_fields = None;
     }
     for file in &new.files {
-        if !old.files.iter().any(|f| f == file) {
+        if !old_files
+            .get(file.name.as_str())
+            .is_some_and(|prior| *prior == file)
+        {
             out.files.push(file.clone());
         }
     }
     for file in &old.files {
-        if !new.files.iter().any(|f| f.name == file.name)
-            && !new.subdirs.iter().any(|d| d.name == file.name)
-        {
+        if !names.contains(file.name.as_str()) {
             out.files.push(FileNode {
                 name: file.name.clone(),
                 delta_fields: fields(&["name", "deleted"]),
@@ -122,10 +138,9 @@ fn difference(new: &DirectoryNode, old: &DirectoryNode) -> DirectoryNode {
         }
     }
     for dir in &new.subdirs {
-        match old
-            .subdirs
-            .iter()
-            .find(|d| d.name == dir.name && d.meta.file_uid == dir.meta.file_uid)
+        match old_dirs
+            .get(&(dir.name.as_str(), dir.meta.file_uid))
+            .copied()
         {
             Some(prior) if prior == dir => {}
             Some(prior) => out.subdirs.push(difference(dir, prior)),
@@ -133,9 +148,7 @@ fn difference(new: &DirectoryNode, old: &DirectoryNode) -> DirectoryNode {
         }
     }
     for dir in &old.subdirs {
-        if !new.subdirs.iter().any(|d| d.name == dir.name)
-            && !new.files.iter().any(|f| f.name == dir.name)
-        {
+        if !names.contains(dir.name.as_str()) {
             out.subdirs.push(DirectoryNode {
                 name: dir.name.clone(),
                 delta_fields: fields(&["name", "deleted"]),

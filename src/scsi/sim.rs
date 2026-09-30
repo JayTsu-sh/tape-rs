@@ -354,6 +354,7 @@ impl SimLibrary {
             initiator: 0,
             faults: Mutex::new(Vec::new()),
             log: Mutex::new(Vec::new()),
+            session_epoch: std::sync::atomic::AtomicU64::new(0),
             identity: "sim:changer".to_string(),
         }
     }
@@ -371,6 +372,7 @@ impl SimLibrary {
             initiator,
             faults: Mutex::new(Vec::new()),
             log: Mutex::new(Vec::new()),
+            session_epoch: std::sync::atomic::AtomicU64::new(0),
             identity: format!("sim:drive{}@i{}", idx, initiator),
         }
     }
@@ -441,6 +443,7 @@ pub struct SimTransport {
     initiator: u32,
     faults: Mutex<Vec<Fault>>,
     log: Mutex<Vec<u8>>,
+    session_epoch: std::sync::atomic::AtomicU64,
     identity: String,
 }
 
@@ -487,6 +490,23 @@ impl SimTransport {
         data_in: Option<&[u8]>,
         data_out: Option<&mut [u8]>,
     ) -> Result<ScsiResult> {
+        let result = self.dispatch_inner(cdb, data_in, data_out);
+        if result.as_ref().is_err()
+            || result.as_ref().is_ok_and(|r| r.status != 0)
+            || crate::scsi::transport::changes_session(cdb)
+        {
+            self.session_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn dispatch_inner(
+        &self,
+        cdb: &[u8],
+        data_in: Option<&[u8]>,
+        data_out: Option<&mut [u8]>,
+    ) -> Result<ScsiResult> {
         let op = *cdb.first().ok_or(TapeError::InvalidResponse {
             expected: 1,
             actual: 0,
@@ -527,6 +547,13 @@ impl SimTransport {
 }
 
 impl TapeTransport for SimTransport {
+    fn session_epoch(&self) -> Option<u64> {
+        Some(
+            self.session_epoch
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
     fn execute_no_data(&self, cdb: &[u8], _timeout_ms: u32) -> Result<ScsiResult> {
         self.dispatch(cdb, None, None)
     }
