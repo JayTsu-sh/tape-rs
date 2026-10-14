@@ -18,6 +18,20 @@ code{background:#f1f3f5;padding:.1rem .25rem;border-radius:3px} small{color:#526
 <div class="warn"><b>结论口径：</b>只有“LE 真实存在”且“tape-rs 在真实环境中已运行并确认没有等价结果”的项目才标为已确认 GAP。REA/Ghidra 静态结果只能证明二进制存在代码路径，不能单独证明运行时行为。未完成同条件双侧运行的项目保留为未闭环，不升级为 GAP。</div>
 <div class="note"><b>当前结论：</b>报告识别的 P0 大索引恢复以及 P1 多卷命名空间、assignment/blacklist、自动换带与 load/ready 组合流程均已补全，并在 Rust library 与 FUSE 两种模式完成真实 TS4300 验证；LE 也成功读取补全后写入的大索引卷。最终一次 LE 后 Rust 冷启动回归在读取前遭遇双 FC 端口 <code>Linkdown</code>，因此介质最终位置、PR 状态和最后一轮冷读仍需链路恢复后收尾。</div>
 
+<h2>0. Summary：IBM LE 功能覆盖率</h2>
+<div class="note"><b>总体覆盖率：约 79%（20.5 / 26）。</b>若只计算日常归档核心链路——assignment、挂载、自动换带、读写、目录与元数据、索引、sync、PR 和 HA——覆盖率约为 <b>95%（19 / 20）</b>。因此，这个版本已经可以替代 LE 的主要归档数据路径，但还不能视为 IBM LE 全产品功能的完全替代。</div>
+<p>计算方法：以本报告和 REA 功能清单中可独立验收的 26 个能力组为分母；真实或模拟加真实设备证据证明等价的能力计 1 分，已有实现但接口/策略/实机条件不完整的能力计 0.5 分，缺失或没有正向验证条件的能力计 0 分。结果为 18 项完整、5 项部分、3 项缺失或未验证，即 <code>(18 + 5 × 0.5) / 26 = 78.8%</code>，取整为 79%。这是一项基于当前功能清单的工程覆盖率，不代表 IBM 认证、命令行兼容率或所有硬件/固件组合的兼容率。</p>
+<table>
+<tr><th>能力域</th><th>能力组</th><th>得分</th><th>覆盖率</th><th>主要判断</th></tr>
+<tr><td>管理与控制面</td><td>7</td><td>5.0</td><td>71%</td><td>assignment、mount/unmount、sync 和 HA/fencing 完整；node/library 产品状态与 recover/rollback/list-points 部分覆盖；RAO 未实现。</td></tr>
+<tr><td>多卷 namespace 与数据面</td><td>6</td><td>5.5</td><td>92%</td><td>多卷 FUSE、读写、目录/rename/symlink、xattr/metadata 和自动换带完整；LE 风格持久 cache 生命周期为部分覆盖。</td></tr>
+<tr><td>changer 与机械调度</td><td>4</td><td>4.0</td><td>100%</td><td>设备发现、element map/inventory、MOVE/LOAD/UNLOAD/I-E/robot 和 changer PR 均有实现及真实证据。</td></tr>
+<tr><td>tape / SCSI 数据通路</td><td>5</td><td>4.5</td><td>90%</td><td>读写、定位、filemark、容量/TapeAlert、MAM、sense/retry 完整；特殊诊断模式和完整结果页部分覆盖。</td></tr>
+<tr><td>LTFS 维护与介质安全特性</td><td>4</td><td>1.5</td><td>38%</td><td>标签、索引、大索引、增量与恢复完整；format/erase/unformat 组合部分覆盖；WORM 和硬件加密未完成正向验证。</td></tr>
+<tr><th>合计</th><th>26</th><th>20.5</th><th>79%</th><th>核心归档链路 95%；全产品范围仍受高级维护、安全介质和产品管理功能限制。</th></tr>
+</table>
+<p><b>尚未完全覆盖的功能：</b>IBM <code>leadm</code> 线协议及完整 node/library task 编排、持久 cache 策略、recover/rollback/list-points 管理体验、RAO、完整 unformat/维护流程、WORM、硬件加密，以及特殊诊断结果页。FC <code>Linkdown</code> 后的最终冷读/PR/归槽属于现场验收收尾，不从已完成的功能实现得分中扣除，但在链路恢复前仍保持未闭环状态。</p>
+
 <h2>1. 本次使用的 REA 逆向提示词</h2>
 <p>以下是前一轮 REA promote 提示词与本次任务合并后的执行约束，已经按当前 Codex/REA 会话执行：</p>
 <pre><code>对 IBM Spectrum Archive Library Edition（LE）进行分层逆向与真实环境闭环验证。
