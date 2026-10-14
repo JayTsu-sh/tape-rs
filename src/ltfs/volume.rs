@@ -1430,6 +1430,27 @@ impl<'a> LtfsVolume<'a> {
         self.drive
             .locate(0, P1_DATA_START, true)
             .map_err(|e| ("index_partition", e))?;
+        // 保留 append-only 保护，仅授权已核验 IP 起点的这一次覆盖。
+        // 不重放失败的 WRITE/FM，不授权 FORMAT，也不更改设备 write mode。
+        if self
+            .drive
+            .append_only_mode()
+            .map_err(|e| ("index_partition", e))?
+        {
+            let key = self.reservation_guard.ok_or_else(|| {
+                (
+                    "index_partition",
+                    TapeError::Refused {
+                        reason: "append-only设备重写IP需要已核验PR guard".into(),
+                    },
+                )
+            })?;
+            crate::scsi::reservation::verify_holder(self.device, key)
+                .map_err(|e| ("index_partition", e))?;
+            self.drive
+                .allow_overwrite_current(0, P1_DATA_START)
+                .map_err(|e| ("index_partition", e))?;
+        }
         self.drive
             .write_filemark_immediate(1)
             .map_err(|e| ("index_partition", e))?;

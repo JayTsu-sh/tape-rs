@@ -385,6 +385,55 @@ impl<'a> TapeDrive<'a> {
         Ok(alerts)
     }
 
+    /// 查询 SSC Device Configuration Extension 10h/01h 的 WRITE MODE。
+    /// 不支持此子页的旧设备沿用原写路径；截断/错误页不能猜测模式。
+    pub fn append_only_mode(&self) -> Result<bool> {
+        let cdb_bytes = cdb::mode_sense_10_subpage(0x10, 1, 128);
+        let mut buf = [0; 128];
+        let result = match retry_unit_attention("device write mode", || {
+            self.device.execute_read(&cdb_bytes, &mut buf, 30_000)
+        }) {
+            Ok(v) => v,
+            Err(TapeError::ScsiCommand {
+                sense_key: 0x05,
+                asc: 0x24,
+                ascq: 0,
+                ..
+            }) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        if result.transferred > buf.len() {
+            return Err(TapeError::InvalidResponse {
+                expected: buf.len(),
+                actual: result.transferred,
+            });
+        }
+        Ok(device_write_mode(&buf[..result.transferred])? == 1)
+    }
+
+    /// 一次位置绑定的覆盖授权；不自动重试，调用方必须先核验 PR 与位置。
+    pub fn allow_overwrite_current(&self, partition: u8, block: u64) -> Result<()> {
+        let mut position = [0; 20];
+        // 覆盖授权的定位证据：UA/复位不能被重试吞掉。
+        let got = self
+            .device
+            .execute_read(&cdb::read_position(), &mut position, 10_000)?;
+        if got.transferred < 20 {
+            return Err(TapeError::InvalidResponse {
+                expected: 20,
+                actual: got.transferred,
+            });
+        }
+        if !short_position_matches(&position, partition, block) {
+            return Err(TapeError::InconsistentState(
+                "覆盖授权前位置不精确或不匹配".into(),
+            ));
+        }
+        self.device
+            .execute_no_data(&cdb::allow_overwrite_current(partition, block), 30_000)?;
+        Ok(())
+    }
+
     /// MODE SELECT(10): 下发原始 mode parameter list
     pub fn mode_select(&self, parameters: &[u8], save: bool) -> Result<()> {
         let param_len = u16::try_from(parameters.len()).map_err(|_| TapeError::MoveFailed {
@@ -529,5 +578,63 @@ mod position_tests {
         // 缓冲区字节/对象数量不精确并不意味着逻辑位置未知。
         buf[0] = 0x30;
         assert!(short_position_matches(&buf, 1, u64::from(u32::MAX)));
+    }
+}
+
+/// IBM GA32-0928-08 Table347：SPF页头4字节，WRITE MODE为byte5高半字节。
+fn device_write_mode(data: &[u8]) -> Result<u8> {
+    if data.len() < 8 {
+        return Err(TapeError::InvalidResponse {
+            expected: 8,
+            actual: data.len(),
+        });
+    }
+    let offset = 8 + usize::from(u16::from_be_bytes([data[6], data[7]]));
+    let page = data.get(offset..).ok_or(TapeError::InvalidResponse {
+        expected: offset + 6,
+        actual: data.len(),
+    })?;
+    if page.len() < 6 {
+        return Err(TapeError::InvalidResponse {
+            expected: offset + 6,
+            actual: data.len(),
+        });
+    }
+    let length = 4 + usize::from(u16::from_be_bytes([page[2], page[3]]));
+    if page[0] & 0x7f != 0x50 || page[1] != 1 || length < 6 || length > page.len() {
+        return Err(TapeError::Ltfs(
+            "Device Configuration Extension响应页/长度非法".into(),
+        ));
+    }
+    let mode = page[5] >> 4;
+    if mode > 1 {
+        return Err(TapeError::Refused {
+            reason: format!("不支持的设备WRITE MODE {mode}"),
+        });
+    }
+    Ok(mode)
+}
+
+#[cfg(test)]
+mod write_mode_tests {
+    use super::*;
+    #[test]
+    fn device_extension_write_mode_checks_truncation_page_and_reserved_modes() {
+        let mut data = [0; 48];
+        data[7] = 8;
+        data[16] = 0xd0;
+        data[17] = 1;
+        data[19] = 28;
+        data[21] = 0x12;
+        assert_eq!(device_write_mode(&data).unwrap(), 1);
+        for n in 0..48 {
+            assert!(device_write_mode(&data[..n]).is_err());
+        }
+        data[21] = 2;
+        assert_eq!(device_write_mode(&data).unwrap(), 0);
+        data[21] = 0x22;
+        assert!(device_write_mode(&data).is_err());
+        data[16] = 0x10;
+        assert!(device_write_mode(&data).is_err());
     }
 }

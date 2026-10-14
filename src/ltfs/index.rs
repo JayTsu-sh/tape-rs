@@ -252,7 +252,12 @@ impl LtfsIndex {
 
     /// 解析 XML index。
     pub fn parse(xml: &[u8]) -> Result<Self> {
-        let mut reader = Reader::from_reader(xml);
+        Self::parse_reader(xml)
+    }
+
+    /// 从分段输入解析索引，不保留整份 XML；内存只含事件缓冲与文件树。
+    pub fn parse_reader<R: std::io::BufRead>(input: R) -> Result<Self> {
+        let mut reader = Reader::from_reader(input);
         reader.config_mut().trim_text(false);
         let mut p = IndexParser::new();
         let mut bufv = Vec::new();
@@ -957,8 +962,8 @@ impl IndexParser {
     }
 
     fn finish(mut self) -> Result<LtfsIndex> {
-        if self.incremental && (!self.path.is_empty() || self.self_location.is_none()) {
-            return Err(TapeError::Ltfs("增量 XML 截断或缺少 location".into()));
+        if !self.path.is_empty() || (self.incremental && self.self_location.is_none()) {
+            return Err(TapeError::Ltfs("索引 XML 截断或缺少 location".into()));
         }
         if self.incremental {
             for key in [

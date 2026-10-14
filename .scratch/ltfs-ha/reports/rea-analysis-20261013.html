@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>REA 离线逆向分析报告 - LE 2.4.8.2</title>
+<style>
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.55;max-width:1180px;margin:2rem auto;padding:0 1rem;color:#17202a}h1,h2{color:#123b63}table{border-collapse:collapse;width:100%;margin:1rem 0}th,td{border:1px solid #ccd6e0;padding:.45rem;text-align:left;vertical-align:top}th{background:#eef4f9}code{background:#f1f3f5;padding:.1rem .25rem;border-radius:3px}.obs{border-left:4px solid #2b78c5;padding:.5rem 1rem;background:#f4f8fc}.warn{border-left:4px solid #d9822b;padding:.5rem 1rem;background:#fff8ef}</style>
+</head>
+<body>
+<h1>REA 离线逆向分析报告</h1>
+<p><b>时间：</b>2026-10-13　<b>目标：</b>LE 节点 .209 采集的 IBM Spectrum Archive Library Edition 2.4.8.2-10520 二进制</p>
+<div class="obs"><b>范围：</b>仅分析本地只读副本；未访问实时 SG 设备，未加载/卸载/移动介质，未写入 TS4300 或 LTFS。</div>
+
+<h2>1. 证据与目标</h2>
+<table><tr><th>目标</th><th>SHA-256</th><th>REA 结果</th></tr>
+<tr><td><code>bin/ltfs</code></td><td>f1ee59c6f4a77b9e0a5a5e21a46a7c43becc4a4fc241b5342216a0db23dc12b9</td><td>x86-64 ELF，600 procedures，363 strings；Evidence <code>ev_d2f3cd2a1892ff357e51582e3728f7063779e642d30925ae0326d1bff43c8fc6</code></td></tr>
+<tr><td><code>libtape-sg.so</code></td><td>5c46bf3f6d82f4502ea74a455f0ca97474387af0d9cc4ef06ab078383cf06606</td><td>x86-64 ELF，555 procedures，560 strings；Evidence <code>ev_651a460a47a1221c7ce74e8d21f3dff965fd76e4cce6578a66ae2963129f0830</code></td></tr>
+<tr><td><code>libchanger-sg-ibmchanger.so</code></td><td>b08c7a35ded91852acf45dd13aedb47e6f61f9fa49294367469d861525f3e1ca</td><td>x86-64 ELF，314 procedures，414 strings；Evidence <code>ev_e0257f53ef52dcf3b3646eb8de80f8ea44cbe908113e6b148af2dbf4bc37111f</code></td></tr>
+</table>
+<p>REA Provider：Hopper Disassembler。完整 Evidence bundle 已导出为 <code>rea-evidence-session-20261013.json</code>，60 条记录，约 2.53 MiB。</p>
+
+<h2>2. 已确认的调用链</h2>
+<p><code>ltfs main → library_main / single_drive_main → plugin_load / ltfsprintf_load_plugin → tape/changer backend → sg_issue_cdb_command → ioctl(fd, 0x2285, sg_io_hdr)</code></p>
+<p>主程序静态字符串和调用显示：默认运行模式支持 <code>library</code> 与 <code>single-drive</code>，同时加载 i/o scheduler、dcache 和 changer 配置；版本字符串为 <code>2.4.8.2 (10520)</code>，LTFS 格式版本为 <code>2.4.0</code>。证据：<code>ev_ae094193aed9e607eded37803b4ae7bd2c3b74e17e7e2ccf79c1a1004a8886a0</code>。</p>
+
+<h2>3. 磁带 SG 后端</h2>
+<table><tr><th>过程</th><th>地址</th><th>观察到的行为</th><th>Evidence</th></tr>
+<tr><td><code>sg_issue_cdb_command</code></td><td>0x7fcd</td><td>调用 Linux <code>ioctl</code>，请求号字面值为 <code>0x2285</code>；检查 host/driver status、SCSI status，针对 reservation conflict/timeout/busy 进行重试或错误映射。</td><td><code>ev_6e524cb...</code></td></tr>
+<tr><td><code>sg_open</code></td><td>0xcf8e</td><td>分配约 <code>0x610</code> 字节私有状态，保存设备名，建立 IBM tape key/timeout，执行设备识别与支持性校验。</td><td><code>ev_e361d7d...</code></td></tr>
+<tr><td><code>sg_read</code></td><td>0xed86</td><td>调用内部 READ 路径；遇到定位/读位置相关错误时调用 <code>sg_locate</code>，并有限次恢复；存在传输大小上限逻辑。</td><td><code>ev_d39e68b...</code></td></tr>
+<tr><td><code>sg_write</code></td><td>0xf50b</td><td>调用内部 WRITE(6) 路径；记录 filemark/EOT 类结果，遇到定位类错误读取位置并校验块计数，临时错误进入恢复循环。</td><td><code>ev_7f3b8b9...</code></td></tr>
+<tr><td><code>sg_readpos</code></td><td>0x116dc</td><td>构造 READ POSITION(16)（opcode 0x34），解析两个 64 位位置字段及 BOP/EOP 状态。</td><td><code>ev_3adcaab...</code></td></tr>
+<tr><td><code>sg_modesense</code></td><td>0x12b76</td><td>构造 MODE SENSE(10)（opcode 0x5a）；用于装带后读取介质类型/参数。</td><td><code>ev_03068cf...</code></td></tr>
+<tr><td><code>sg_logsense</code></td><td>0x1280d</td><td>构造 LOG SENSE(10)（opcode 0x4d），最大分配缓冲区为 0xffff，并按响应长度复制结果。</td><td><code>ev_0e297f0...</code></td></tr>
+<tr><td><code>sg_read_attribute</code> / <code>sg_write_attribute</code></td><td>0x1391c / 0x135eb</td><td>使用 READ ATTRIBUTE(16) 0x8c、WRITE ATTRIBUTE(16) 0x8d，并处理 4 字节长度前缀。</td><td><code>ev_d002dee...</code> / <code>ev_b5a45bc...</code></tr>
+</table>
+<p class="warn"><b>重要限制：</b>Hopper 公共 API 未提供完整函数体范围；伪代码是 Provider 生成结果，不是原始源码。CDB 字段的最终位级含义仍需结合指令/字节视图和 T10 标准逐项复核。</p>
+
+<h2>4. IBM changer 后端</h2>
+<table><tr><th>过程</th><th>地址</th><th>观察到的行为</th><th>Evidence</th></tr>
+<tr><td><code>sg_ibmchanger_open</code></td><td>0x92ec</td><td>分配约 <code>0x5b8</code> 字节私有状态及 <code>0x80000</code> 字节响应缓冲区；识别 changer，必要时执行 PRO reserve，校验设备标识。</td><td><code>ev_21c7dc3...</code></td></tr>
+<tr><td><code>sg_ibmchanger_getslots</code></td><td>0xa8a7</td><td>构造 GET SLOT STATUS（opcode 0x1a），解析返回的 8 个 element 地址/计数相关字段。</td><td><code>ev_d61455a...</code></td></tr>
+<tr><td><code>sg_ibmchanger_inventory</code></td><td>0xb5d8</td><td>分段调用内部 <code>_cdb_res</code>（inventory 读取路径），解析 element type 1/2/3/4，填充上层 inventory 结构。</td><td><code>ev_6f94391...</code></td></tr>
+<tr><td><code>sg_ibmchanger_get_devmap</code></td><td>0xc554</td><td>读取 changer device map，确认返回设备数量后分配 <code>0x18</code> 字节条目数组，并解析设备类型、element address 和标识字段。</td><td><code>ev_c0fafbcd...</code></td></tr>
+<tr><td><code>sg_ibmchanger_move_media</code></td><td>0xbe87</td><td>构造 MOVE MEDIUM（opcode 0xa5），对 source/destination 做网络字节序转换，调用统一 SCSI 错误路径。</td><td><code>ev_7ee885c...</code></td></tr>
+<tr><td><code>sg_ibmchanger_reserve_unit</code> / <code>release_unit</code></td><td>0xa540 / 0xa7b0</td><td>使用 PRO reserve/release；reserve 后重新 inquiry 并校验 key/标识。</td><td><code>ev_2fee661.../ev_3aca92...</code></td></tr>
+</table>
+<p>这与当前 .209 现场观察到的“驱动器 SG 节点和 changer SG 节点分离、LTFS 运行期间驱动器被占用”的环境相符；但本报告的 REA 结论来自离线 ELF，不等同于实时硬件执行证明。</p>
+
+<h2>5. 对 tape-rs 的直接落地建议</h2>
+<ol>
+<li>优先完善 <code>SG_IO 0x2285</code> 响应结构与 host/driver/SCSI status 映射，保持原始 sense/status 可诊断。</li>
+<li>以 <code>sg_ibmchanger_get_devmap → inventory/getslots → move_media</code> 为 changer 逆向主线，禁止用固定 element 地址替代 map。</li>
+<li>以 <code>sg_readpos</code>、<code>sg_read</code>、<code>sg_write</code> 为 tape 主线，先做纯函数 CDB/响应测试，再做 Holo/VTL 验证。</li>
+<li>对 reservation conflict、driver busy、timeout、filemark、EOT/BOP/EOP 和 tape alert 建立独立错误矩阵；不可只按 errno 判断。</li>
+<li>下一轮使用 REA 指定地址视图继续核对 <code>sub_e492</code>/<code>sub_f1fa</code> 的完整 CDB 字节，以及 changer 的 <code>sub_70e3</code>/<code>_cdb_res</code> 结构解析。</li>
+</ol>
+
+<h2>6. 未决事项</h2>
+<ul>
+<li>REA 当前使用 Hopper；Ghidra/IDA 尚未配置，跨 Provider 交叉验证未完成。</li>
+<li>部分 Hopper 伪代码出现 <code>xhausted</code> 等反编译占位文本，不能直接当作字段名称。</li>
+<li>尚未对 .209 进行运行时 attach 或 SG_IO trace；由于 LTFS 正在使用设备，这一步保持禁止。</li>
+<li>尚未将任何 REA 结论写入生产代码；本报告仅记录逆向证据和实施顺序。</li>
+</ul>
+</body></html>

@@ -508,3 +508,54 @@ Holo隔离目录 /home/rocky/tape-rs-namespace-20260927，ltfsd SHA256 104099542
 ## 2026-09-27 性能对照与正式升级完成
 
 剩余队列1–5完成。LE/直接库各两轮3210文件全量SHA和每轮6次换带通过，见performance-compare-20260927.md。更正：LE普通sync只保证DP索引，不能直接称与Rust双分区commit同等Full终点；SCSI建议尚未实施、未采命令轨迹。PF两卷已归槽/unassign，LE末态保留。正式af6bfad部署至tape-rs-rollout-20260927，node1 term56/round499，58行三节点一致；新8MiB促使切至TS1000 Full13，原9文件及元数据冷挂/接管通过，详见rollout-20260927.md。FUSE卸载缓存空，隔离performance/test-data是唯一最新关闭数据。物理验收暂缓，无push。
+
+## 2026-09-30 P1 gen13 recovery simulator characterization
+
+新增 `tests/sim_recovery.rs::p1_full_generation_13_direct_eod_matches_legacy_scan`：SimTransport 上 gen13 双分区卷的 LOCATE EOD 与旧 SPACE EOD 位置一致，恢复仍判 DP/IP Complete；focused test 通过，结果见 `/work/tmp/codex-flow-r8ub2k_3/result.json`。这没有复现 `Unknown`：SimTransport 将两种 EOD 定位建模为等价，不能据此证明 IBM 固件语义；未改生产代码。`.209` 现场复现仍受阻：已核实的 LTFS 进程持有 `/dev/sg4`、`/dev/sg7`、`/dev/sg8`，故未执行 SCSI 或介质操作。后续需等 LTFS 工作负载安全释放并确认准确测试介质/设备组，再采每分区 LOCATE EOD completion/sense、READ POSITION 及 recovery notes、VCI 命中和候选索引数据。
+
+## 2026-09-30 `.209` LTFS unmount 状态未确认
+
+用户授权对 `/mnt/smartiq/LTFS_55L3A78011W9LL01` 做一次正常卸载。Hermes A2A execute 任务约 300 秒后 `TASK_STATE_FAILED`，返回 `[agent did not reply in time]`，没有可用工具事件或最终命令证据；因此远程挂载状态及是否已卸载均为 **UNKNOWN**，不得盲目重试。随后只读 Hermes CLI 核查无法认证：BatchMode 被拒，五个候选 key 的 hostname 探针也全部被拒；没有取得远程 mount/PID/users 检查结果或已验证卸载，也没有可确认的 SCSI、介质或服务操作。证据包：[A2A 卸载任务](probes/results/hermes-209-normal-unmount-a2a-20260930/) 与 [CLI 只读状态核查](probes/results/hermes-209-unmount-state-20260930/)。后续须先具备可靠的非交互授权 SSH/A2A，再做只读状态核查；核实现场状态后才可决定是否需要任何后续卸载。
+
+本机随后只执行一次 `ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 root@10.131.7.209 hostname`（外层超时 15 秒），exit 255：`Permission denied (publickey,gssapi-keyex,gssapi-with-mic,password)`；未尝试其他认证方式。结果见 `probes/results/hermes-209-ssh-auth-check-20260930/codex-flow-ks_huzrr/result.json`。
+用户随后已授权使用一次交互密码安装专用受限 root key。`probes/setup-ssh-209-auth.sh` 在单次 SSH 会话中先确认 `hostname=lisa-3`，再成功安装；随后 BatchMode、专用身份及严格主机密钥检查下的 hostname 验证也通过。详见 [SSH 修复与只读状态核查记录](probes/results/hermes-209-ssh-auth-repair-20260930/README.md)。
+
+之后 Hermes A2A 只读挂载/owner 核查任务 `task-620dba6e02524626` 约 300 秒后以 `[agent did not reply in time]` 失败，无 terminal events 或远端命令记录；A2A 结果本身不能确定挂载状态。随后 Codex 使用已验证的受限 key 直接 SSH fallback：21:52:44 CST 只读检查在 lisa-3 确认目标 FUSE mount 存在，`fuser` 无 PID；21:53:44 CST 执行唯一一次普通 `umount /mnt/smartiq/LTFS_55L3A78011W9LL01`，exit 0。之后 `mountpoint` 确认目标已卸载，`findmnt` 解析至根文件系统 `/dev/sda7`。当前目标已确认卸载。此 fallback 未执行任何 SCSI、磁带、驱动器或 changer 操作。保留此前对一次正常卸载的授权；没有额外卸载。证据：[只读挂载检查日志](probes/results/hermes-209-ssh-auth-repair-20260930/codex-readonly-mount-check.log) 和 [正常卸载日志](probes/results/hermes-209-ssh-auth-repair-20260930/codex-normal-unmount.log)。
+
+## 2026-09-30 `.209` A2A 只读 journal 能力核查被本地 consent gate 阻止
+
+Hermes A2A transport 任务 `task-22e82e9712c94178` 已完成并收到 push notification，但本地 consent gate 因 1 分钟内未收到确认，在 SSH session 打开前阻止了 hostname/journalctl 命令；无远端事件或输出，两个命令均未执行。按 gate 要求未重试。证据：[structured-output.json](probes/results/hermes-209-a2a-journal-check-20260930/hermes-worker-s774jpd3/structured-output.json) 及同目录结果文件。
+
+## 2026-10-14 GAP 补全实机验收进行中（不要重跑阶段）
+
+依据 reports/rea-le-tape-rs-integrated-20261014.html，在当前分支 2f49b92 上新增流式索引恢复、library::Library/LibraryBackend、tape-library 管理 CLI、tape-fuse 直接逻辑库模式，以及 library_acceptance/library_gap_fixture 两个 Rust 示例。用户明确要求真实验证并确认库内所有磁带均为测试带；现场用凭据恢复连接（凭据不写入文件）。保留此前 sim_recovery.rs 和本交接已有修改；不修改旧 feature/docs 工作树。
+
+软件：cargo test --all-features 273 passed/8 ignored；cargo test 272 passed/1 ignored；check/all-targets、strict Clippy -D warnings、全仓 fmt 和 diff-check 通过；本机显式 kernel_multi_volume_library 通过（SimTransport，非物理介质）。新夹具 example 随兼容构建和 Clippy 检查通过。Zig 0.16/0.17 不接受 cc-rs generic CPU flags，compat wrapper 将 x86-64/generic 组合映射为明确 -mcpu=baseline；使用 /snap/zig/16117 Zig0.16 完成 glibc2.34 release 构建，失败尝试日志保留。
+
+实机 lisa-3 / 10.131.7.209：changer55L3A78011W9LL01 / sg5（LE另一路sg3），TD8 117018605B / sg4/offset0、HH8 117018606F / sg2/offset1。初始两 drive 空、无 holder/PR/registered keys，node-scheduler inactive；TS4300 changer PR capabilities支持 EA。隔离候选与状态目录 /root/tape-rs-gap-20261014，bin/ 下有 tape-library/tape-fuse/tape-rs/library_acceptance/library_gap_fixture，资源库 library.sqlite，节点250。实际控制轮次2026101400xx。不部署正式 Holo。
+
+活动脚本 gap-real-20261014.py basic（经 SSH 启动，Codex exec session2297），结果 results/basic-run.log、events.jsonl、*.started/*.complete/*.failed，CLI 每命令 stdout/stderr 独立保存。首次 list /test/AA0013L8 已成功（117.696s，含归槽）；现在写 AA0013L8 gap-20261014-basic/marker.bin。所有7数据带已分配到test池，cleaning带不分配。**先查进程/阶段文件/SQLite只读状态，禁止重复启动 basic 或覆盖运行二进制。** 本机SSH复用 socket /tmp/tape-rs-gap-209-20261014.sock；会话过期需可靠认证，不能把认证成功假定为设备状态。
+
+余下顺序：basic完整native两轮SHA → gap-real... fuse（真实FUSE目录/读写/fsync/xattr/rename/link/EXDEV）→ management（blacklist/NEED_ASSIGN/再assign）→ large（追加1040×64KiB root xattr +独立marker，旧二进制64MiB受限对照，新Rust两轮SHA +FUSE大索引）→ gap-le-large-20261014.py（独立LE只读互操作、正常卸载）→新Rust接管再次读回→最终库存/PR/holder复核与取回证据。
+
+脚本无FORMAT/ERASE，不删除原文件。large阶段追加65MiB+标准root xattr，介质最终需明确记录仍保留此夹具；不得以旧百万文件卷（已格式化）的历史结果声称本轮百万文件性能验收。LE脚本只在large.complete门控后启动。每阶段 exclusive *.started 门控防止重复写入；遇到失败须先核实现场，再修复并用新的阶段/证据文件接续，不能删除门控后盲目重跑。
+
+当前没有完成实机验收；docs/library.md说明单进程独占资源库与原HA catalog分离、changer PR不支持时安全拒绝、直接Rust单层卷内相对链接限制。真实证据本机 probes/results/gap-implementation-20261014，后续必须刷新远端results；第一轮试验失败log也保留，不冒充通过。
+
+### 2026-10-14 实机发现 append-only IP 写入缺口，basic 已停止
+
+basic阶段 v1 首次list通过，但fixture-AA0013L8在IP opening FM报DATA PROTECT 07/5A/02；DP Full已写，结果未定，程序正确失败并归槽释放PR。当前basic.failed/started保留，不得重放原脚本。两台drive空，AA0013L8槽1，原perf64m数据未主动修改；新增marker是否已发布要按恢复视图校验。原日志本机results/gap-implementation-20261014/physical-first/，远端results原样保留。
+
+只读sg_modes确定HH8 MP10h/01h byte5=0x12（WRITE MODE1 append-only），TD8=0x02（WRITE MODE0）。IBM GA32-0928-08 §4.2/5.2.1/6.6.12说明AO在非append点返回5A02；不能凭字面把它当整卷物理写保护。新增82h action1、partition0/block4位置绑定一次授权：不提供Format授权、不关闭AO；PR guard必需，READ POSITION不吞UA且检查LOLU/PERR/精确位置；授权后仅第一IP opening FM消耗许可，其后沿EOD写。mode子页不支持24/00沿用旧路径，截断或未知mode拒绝。模拟器先红（同07/5A02）后绿，另覆盖无PR、位置不符、复位UA不重试；新增mode响应边界/CDB端序测试。归槽会清current failure，因此资源库新增last_failure迁移列，保留最近失败阶段/原始错误，close后保留测试通过。
+
+v2兼容构建进行中（exec85753）；下一步部署到独立bin-v2，不覆盖bin/v1，先用新Rust library_acceptance --checkpoint校验已提交marker与原perf64m，再仅补IP，不重放append。gap-real脚本新增resume_basic阶段（一次性.started门控），后续fuse/management/large轮次提升为20261014008x/09x/10x/11x。未开始resume_basic，须待build-v2完成、确认无holder、保存v2 SHA后执行。LE脚本仍在本机，等large.complete之后再部署运行。
+
+### 2026-10-14 GAP 补全实机主体通过，最终清场受 FC Linkdown 阻塞
+
+最终实现与证据汇总见 `reports/gap-implementation-validation-20261014.md`。bin-v3 SHA 保存在远端 `results/v3-sha256.txt`。最终软件 `cargo test --all-features` 为278通过、9忽略、0失败；严格Clippy/fmt/diff-check通过；百万文件显式纯软件测试19.201秒通过。docs/library.md已补缓存状态、append-only和checkpoint语义。
+
+实机：resume_basic通过；真实FUSE基础模式通过7卷namespace、双卷冷读、64MiB SHA、写/fsync/binary xattr/rename/symlink/EXDEV及两卷独有内容；management通过blacklist/NEED_ASSIGN/reassign。大索引夹具在AA0013L8写入1040×64KiB root xattr和marker，旧版按67108864预算失败，新版list、直接Rust两轮四路径SHA（613.763s）、真实FUSE大索引/64KiB xattr均通过。IBM LE列7卷，marker/64MiB SHA/64KiB xattr通过，普通卸载rc0、进程exit0，LE日志明确clean/self pointer IP而跳过index写入。
+
+硬件事件1：大索引DP commit后sg5路径lpfc devloss；用同一TS4300备用sg3、原round/key完成两轮读、checkpoint、归槽和PR释放，未重放65MiB append。硬件事件2：LE成功后post-LE Rust冷读在LOAD上收到host status0x000d，随后HH8/changer ENXIO并从lsscsi消失；WWPN50:00:e1:11:70:18:60:70 devloss。当前host15/host16均Linkdown，无设备/FUSE/LE进程。AA0013物理位置和PR须等链路恢复后核实，不能猜测或盲重试。
+
+链路恢复后：按VPD重新解析sg节点；先库存/PR核查，用失败round202610140130接续清场或确认无旧key后新round；再跑post-LE两轮四文件SHA；最后确认drive空、AA13/AA00槽1/2、两设备无PR、mode状态。远端失败证据 `post-le-native.stderr` 与kernel journal必须保留。

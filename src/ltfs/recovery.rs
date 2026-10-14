@@ -18,8 +18,8 @@
 //! 相等且有效时，其 block number 作为该分区末索引的定位提示——仍要读取并核验
 //! 实际构造，提示无效即退回标准反向搜索。EOD 与尾部分类不因快速路径省略。
 
-use bytes::BytesMut;
 use log::{debug, info, warn};
+use std::io::{BufRead, Read};
 
 use crate::error::{Result, TapeError};
 use crate::scsi::transport::TapeTransport;
@@ -78,7 +78,7 @@ impl Default for RecoveryBudget {
     fn default() -> Self {
         Self {
             max_back_steps: 8,
-            max_index_bytes: 64 << 20,
+            max_index_bytes: 8usize << 30,
             max_chain_len: 64,
         }
     }
@@ -199,43 +199,153 @@ fn back_fm(drive: &TapeDrive<'_>) -> Result<Option<u64>> {
     }
 }
 
-/// 从 `start` 读记录直到文件标记或 EOD。返回 (字节, 是否以文件标记结束, 结束后位置)。
+/// 索引构造的流式读取结果；原始 XML 不进入整个构造大小的缓冲。
+struct IndexConstruct {
+    prefix: Vec<u8>,
+    len: usize,
+    parsed: Option<Result<LtfsIndex>>,
+}
+
+impl IndexConstruct {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn parse(self) -> Result<LtfsIndex> {
+        self.parsed
+            .unwrap_or_else(|| Err(TapeError::Ltfs("构造不是索引".into())))
+    }
+}
+
+/// 一个记录大小的 BufRead；完整保留设备错误，XML 错误不能遮盖 SCSI 错误。
+struct ConstructReader<'a, 'd> {
+    drive: &'a TapeDrive<'d>,
+    buf: Vec<u8>,
+    offset: usize,
+    available: usize,
+    bytes: usize,
+    max_bytes: usize,
+    next: u64,
+    ended: bool,
+    done: bool,
+    error: Option<TapeError>,
+}
+
+impl BufRead for ConstructReader<'_, '_> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.offset == self.available && !self.done {
+            match self.drive.read_block(&mut self.buf) {
+                Ok(0) => {
+                    self.next += 1;
+                    self.ended = true;
+                    self.done = true;
+                }
+                Ok(n) => {
+                    self.next += 1;
+                    self.bytes = self
+                        .bytes
+                        .checked_add(n)
+                        .ok_or_else(|| std::io::Error::other("构造长度溢出"))?;
+                    if self.bytes > self.max_bytes {
+                        self.error = Some(TapeError::RecoveryRestricted {
+                            reason: format!("构造超过预算 {} 字节", self.max_bytes),
+                        });
+                        self.done = true;
+                    } else {
+                        self.offset = 0;
+                        self.available = n;
+                    }
+                }
+                Err(TapeError::ScsiCommand {
+                    sense_key: 0x08, ..
+                }) => {
+                    self.done = true;
+                }
+                Err(e) => {
+                    self.error = Some(e);
+                    self.done = true;
+                }
+            }
+        }
+        if self.error.is_some() {
+            return Err(std::io::Error::other("索引构造读取失败"));
+        }
+        Ok(&self.buf[self.offset..self.available])
+    }
+    fn consume(&mut self, amount: usize) {
+        self.offset = (self.offset + amount).min(self.available);
+    }
+}
+impl Read for ConstructReader<'_, '_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let data = self.fill_buf()?;
+        let n = data.len().min(out.len());
+        out[..n].copy_from_slice(&data[..n]);
+        self.consume(n);
+        Ok(n)
+    }
+}
+
 fn read_until_fm(
     drive: &TapeDrive<'_>,
     partition: u8,
     start: u64,
     block_size: usize,
     max_bytes: usize,
-) -> Result<(BytesMut, bool, u64)> {
+) -> Result<(IndexConstruct, bool, u64)> {
     drive.locate(partition, start, true)?;
-    let mut out = BytesMut::new();
-    let mut buf = vec![0u8; block_size];
-    let mut next = start;
-    loop {
-        match drive.read_block(&mut buf) {
-            Ok(0) => {
-                next += 1;
-                return Ok((out, true, next));
-            }
-            Ok(n) => {
-                out.extend_from_slice(&buf[..n]);
-                next += 1;
-                if out.len() > max_bytes {
-                    return Err(TapeError::RecoveryRestricted {
-                        reason: format!("构造超过预算 {} 字节", max_bytes),
-                    });
-                }
-            }
-            Err(TapeError::ScsiCommand {
-                sense_key: 0x08, ..
-            }) => return Ok((out, false, next)),
-            Err(e) => return Err(e),
+    let mut reader = ConstructReader {
+        drive,
+        buf: vec![0; block_size],
+        offset: 0,
+        available: 0,
+        bytes: 0,
+        max_bytes,
+        next: start,
+        ended: false,
+        done: false,
+        error: None,
+    };
+    // 前缀可跨短记录，解析时将这些字节接回流的开头。
+    let mut prefix = Vec::new();
+    while prefix.len() < 512 {
+        let data = match reader.fill_buf() {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        if data.is_empty() {
+            break;
         }
+        let n = data.len().min(512 - prefix.len());
+        prefix.extend_from_slice(&data[..n]);
+        reader.consume(n);
     }
+    let mut result = IndexConstruct {
+        prefix,
+        len: 0,
+        parsed: None,
+    };
+    if looks_like_index(&result) {
+        result.parsed = Some(LtfsIndex::parse_reader(
+            std::io::Cursor::new(result.prefix.as_slice()).chain(&mut reader),
+        ));
+    }
+    // 解析失败也读到构造边界；扫描的下一次反向步进仍有已知位置。
+    while let Ok(data) = reader.fill_buf() {
+        if data.is_empty() {
+            break;
+        }
+        let n = data.len();
+        reader.consume(n);
+    }
+    if let Some(e) = reader.error {
+        return Err(e);
+    }
+    result.len = reader.bytes;
+    Ok((result, reader.ended, reader.next))
 }
 
-fn looks_like_index(bytes: &[u8]) -> bool {
-    let head = &bytes[..bytes.len().min(512)];
+fn looks_like_index(bytes: &IndexConstruct) -> bool {
+    let head = &bytes.prefix;
     [
         b"<ltfsindex".as_slice(),
         b"<ltfsincrementalindex".as_slice(),
@@ -323,29 +433,27 @@ pub fn scan_partition(
             notes.push(format!("VCI 提示块 {} 超出分区范围 (EOD {})", b, eod));
         } else {
             match read_until_fm(drive, partition, b, block_size, budget.max_index_bytes) {
-                Ok((bytes, true, next)) if looks_like_index(&bytes) => {
-                    match LtfsIndex::parse(&bytes) {
-                        Ok(idx) => match validate_candidate(&idx, label, part_char, b) {
-                            Ok(()) => {
-                                info!(
-                                    "分区 {} VCI 快速路径命中 gen={} @ {}..{}",
-                                    partition,
-                                    idx.generation,
-                                    b,
-                                    next - 1
-                                );
-                                last_index = Some(IndexCandidate {
-                                    start_block: b,
-                                    end_block: next - 1,
-                                    index: idx,
-                                });
-                                hint_used = true;
-                            }
-                            Err(why) => notes.push(format!("VCI 提示 @{} 无效: {}", b, why)),
-                        },
-                        Err(e) => notes.push(format!("VCI 提示 @{} 解析失败: {}", b, e)),
-                    }
-                }
+                Ok((bytes, true, next)) if looks_like_index(&bytes) => match bytes.parse() {
+                    Ok(idx) => match validate_candidate(&idx, label, part_char, b) {
+                        Ok(()) => {
+                            info!(
+                                "分区 {} VCI 快速路径命中 gen={} @ {}..{}",
+                                partition,
+                                idx.generation,
+                                b,
+                                next - 1
+                            );
+                            last_index = Some(IndexCandidate {
+                                start_block: b,
+                                end_block: next - 1,
+                                index: idx,
+                            });
+                            hint_used = true;
+                        }
+                        Err(why) => notes.push(format!("VCI 提示 @{} 无效: {}", b, why)),
+                    },
+                    Err(e) => notes.push(format!("VCI 提示 @{} 解析失败: {}", b, e)),
+                },
                 Ok(_) => notes.push(format!("VCI 提示 @{} 不是完整索引构造", b)),
                 Err(e) => notes.push(format!("VCI 提示 @{} 读取失败: {}", b, e)),
             }
@@ -401,7 +509,7 @@ pub fn scan_partition(
             notes.push(format!("构造 [{}..{}] 边界核对失败", rec_start, up));
             saw_fake = true;
         } else if looks_like_index(&bytes) {
-            match LtfsIndex::parse(&bytes) {
+            match bytes.parse() {
                 Ok(idx) => match validate_candidate(&idx, label, part_char, rec_start) {
                     Ok(()) => {
                         info!(
@@ -579,7 +687,7 @@ pub fn verify_chain(
             notes.push(format!("链 @{} 构造无结束文件标记", loc.start_block));
             return Ok((false, depth, false));
         }
-        let idx = match LtfsIndex::parse(&bytes) {
+        let idx = match bytes.parse() {
             Ok(i) => i,
             Err(e) => {
                 notes.push(format!("链 @{} 解析失败: {}", loc.start_block, e));
@@ -638,7 +746,7 @@ fn replay_incremental_chain(
         if !ended {
             return Err(TapeError::Ltfs("增量前驱构造残缺".into()));
         }
-        let prior = LtfsIndex::parse(&bytes)?;
+        let prior = bytes.parse()?;
         validate_candidate(&prior, label, label.data_partition, loc.start_block)
             .map_err(TapeError::Ltfs)?;
         if prior.generation >= current.generation

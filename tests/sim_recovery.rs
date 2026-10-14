@@ -88,6 +88,38 @@ fn tp01_after_commits_chain_is_verified() {
     assert_eq!(names(&vol).len(), 2);
 }
 
+/// gen13 样式的完整卷上，对照旧 SPACE EOD 与挂载使用的 LOCATE EOD。
+/// SimTransport 将两种 EOD 定位建模为同一位置；此测试只验证模拟器路径一致，
+/// 不代表 IBM 驱动器的 LOCATE(16) DEST_TYPE=EOD 语义已被验证。
+#[test]
+fn p1_full_generation_13_direct_eod_matches_legacy_scan() {
+    let (_lib, dev) = setup();
+    for generation in 2..=13 {
+        assert_eq!(
+            commit_file(&dev, &format!("/f{generation}"), generation as u8),
+            generation
+        );
+    }
+
+    let drive = tape_rs::tape::commands::TapeDrive::new(&dev);
+    let mut legacy_eods = [0u64; 2];
+    for partition in 0..=1 {
+        drive.locate(partition, 0, true).unwrap();
+        drive.space_to_eod().unwrap();
+        let pos = drive.read_position().unwrap();
+        assert_eq!(pos.partition, u32::from(partition));
+        legacy_eods[partition as usize] = pos.block_number;
+    }
+
+    let vol = LtfsVolume::mount(&dev).unwrap();
+    let report = vol.recovery();
+    assert_eq!(vol.index().generation, 13);
+    assert_eq!(report.dp.eod, legacy_eods[1]);
+    assert_eq!(report.ip.eod, legacy_eods[0]);
+    assert_eq!(report.dp.tail, TailKind::Complete, "{:?}", report.dp.notes);
+    assert_eq!(report.ip.tail, TailKind::Complete, "{:?}", report.ip.notes);
+}
+
 #[test]
 fn tp05_unindexed_data_tail_is_read_only() {
     let (lib, dev) = setup();

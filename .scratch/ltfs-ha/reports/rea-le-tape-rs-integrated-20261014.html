@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>REA/LE 与 tape-rs 综合能力、GAP 补全与实机验证报告</title>
+<style>
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.55;max-width:1380px;margin:2rem auto;padding:0 1rem;color:#18222d}
+h1,h2,h3{color:#123b63} table{border-collapse:collapse;width:100%;margin:1rem 0} th,td{border:1px solid #cbd6df;padding:.55rem;vertical-align:top;text-align:left} th{background:#edf4f9}
+.pass{color:#176b39;font-weight:700}.gap{color:#9b1c1c;font-weight:700}.todo{color:#9a5b00;font-weight:700}.static{color:#425b75;font-weight:700}
+.warn{padding:.8rem 1rem;border-left:4px solid #d9822b;background:#fff8ef}.note{padding:.8rem 1rem;border-left:4px solid #2b78c5;background:#f3f8fc}
+code{background:#f1f3f5;padding:.1rem .25rem;border-radius:3px} small{color:#52606d}
+</style>
+</head>
+<body>
+<h1>REA/LE 与 tape-rs 综合能力、GAP 补全与实机验证报告</h1>
+<p><b>报告时间：</b>2026-10-14　<b>补全回归：</b>2026-10-14　<b>目标：</b>IBM Spectrum Archive Library Edition 2.4.8.x 与 tape-rs　<b>真实库：</b>TS4300 10.131.7.220　<b>LE 节点：</b>10.131.7.209 / lisa-3</p>
+
+<div class="warn"><b>结论口径：</b>只有“LE 真实存在”且“tape-rs 在真实环境中已运行并确认没有等价结果”的项目才标为已确认 GAP。REA/Ghidra 静态结果只能证明二进制存在代码路径，不能单独证明运行时行为。未完成同条件双侧运行的项目保留为未闭环，不升级为 GAP。</div>
+<div class="note"><b>当前结论：</b>报告识别的 P0 大索引恢复以及 P1 多卷命名空间、assignment/blacklist、自动换带与 load/ready 组合流程均已补全，并在 Rust library 与 FUSE 两种模式完成真实 TS4300 验证；LE 也成功读取补全后写入的大索引卷。最终一次 LE 后 Rust 冷启动回归在读取前遭遇双 FC 端口 <code>Linkdown</code>，因此介质最终位置、PR 状态和最后一轮冷读仍需链路恢复后收尾。</div>
+
+<h2>1. 本次使用的 REA 逆向提示词</h2>
+<p>以下是前一轮 REA promote 提示词与本次任务合并后的执行约束，已经按当前 Codex/REA 会话执行：</p>
+<pre><code>对 IBM Spectrum Archive Library Edition（LE）进行分层逆向与真实环境闭环验证。
+
+目标范围：
+1. leadm 管理面：node、library、drive、tape、assignment、mount、unmount、recover、rollback、sync、RAO；
+2. LTFS/FUSE：逻辑库根目录、多卷可见性、文件访问、xattr、元数据、缓存、自动换带；
+3. changer：设备发现、element map、inventory、MOVE/LOAD/UNLOAD、I/E、robot、persistent reservation；
+4. tape：TUR、READ POSITION、READ/WRITE、WRITE FILEMARKS、SPACE、LOCATE、LOG SENSE、READ/WRITE ATTRIBUTE、TapeAlert、容量和错误恢复；
+5. 底层：SG_IO 0x2285、opcode/CDB 位域、transfer length、resid、sense、host/driver/SCSI status、超时和重试；
+6. 性能：同一真实介质、同一文件、冷/热缓存下的大文件拷贝、吞吐、命令次数和换带行为；
+7. 对每项能力同时检查 LE 真实结果和 tape-rs 真实结果。
+
+证据规则：
+- 先采集目标身份、版本、SHA-256、设备拓扑和现有状态；
+- REA 静态分析只作为候选/解释，不冒充运行时证据；
+- 任何 GAP 必须有 LE 成功或明确能力证据，以及 tape-rs 真实缺失/失败/行为差异；
+- 对没有同条件双侧运行证据的项目标记“未闭环”；
+- 保留 Evidence ID、原始 CDB、sense、耗时、返回码和环境状态；
+- 不把测试环境当前的超时、清洁带、缓存命中或设备占用误判为软件能力缺失。</code></pre>
+
+<h2>2. 证据与目标身份</h2>
+<table>
+<tr><th>证据类别</th><th>来源</th><th>结论用途</th></tr>
+<tr><td>REA/Ghidra 静态</td><td><code>/tmp/le209-rea.S6OGuF</code>；Ghidra 12.1.4；REA provider available</td><td class="static">确认 LE ELF 中的函数、字符串、调用关系和反编译候选路径</td></tr>
+<tr><td>LE 真实运行时</td><td>10.131.7.209 的 LE/FUSE/leadm、kernel SCSI trace、管理端和既有 2026-10-13 运行记录</td><td class="pass">确认 LE 在 TS4300 上实际完成或返回的行为</td></tr>
+<tr><td>tape-rs 真实运行时</td><td>10.131.7.209 的实际部署二进制，真实 <code>/dev/sg*</code>，既有闭环及本次只读复核</td><td class="pass">确认本项目在真实设备上的实际能力和失败边界</td></tr>
+<tr><td>软件回归</td><td>分支 <code>ltfs-recovery-ibm-interop</code>，<code>cargo test --all-features</code></td><td class="pass">确认当前代码的纯软件/模拟器/集成测试基线</td></tr>
+</table>
+<p>本轮 Ghidra 目标为 <code>libltfsadmin2.so.0.0.0</code>，SHA-256 <code>86e422693299ab87579e16f31b97338df2b7908c82ad0fa16f9241e540f803bb</code>。REA overview 证据为 <code>ev_9a878602387032d726d7414dfb8228b42e0e3aaf9d51b1aba3e8f7c717c9b457</code>：x86-64 ELF、28 个段、5,606 个过程、6,171 个字符串。</p>
+
+<h2>3. 实施前的 2026-10-14 真实环境基线</h2>
+<table>
+<tr><th>项目</th><th>现场结果</th><th>判定</th></tr>
+<tr><td>.209 节点</td><td><code>hostname=lisa-3</code>；当前无 FUSE 挂载、无 <code>ltfs</code>/<code>leadm</code> 进程、无 <code>/dev/sg*</code> holder；<code>node-scheduler=inactive</code>。</td><td class="pass">设备当前空闲，可进行后续受控验证</td></tr>
+<tr><td>设备节点</td><td><code>/dev/sg0</code>–<code>/dev/sg5</code> 存在；历史已核对 `.209` 的 tape/changer 映射为 <code>/dev/sg2</code>/<code>/dev/sg4</code> tape 与 <code>/dev/sg3</code>/<code>/dev/sg5</code> changer。</td><td class="pass">.207 没有 tape/changer 是节点映射差异，不是 TS4300 缺设备</td></tr>
+<tr><td>tape-rs changer inventory</td><td>部署二进制 <code>/tmp/tape-rs-real-validation-20261013</code>，SHA-256 <code>43e2d850f77cef4624e969d8247c7eb45f7a4c197c8c7dfdd8805f93904fd066</code>；真实执行 <code>inventory --device /dev/sg5 --no-drive-scan</code> 返回 0，解析 1 robot、2 drives、35 storage、5 I/E。</td><td class="pass">本次再次通过</td></tr>
+<tr><td>tape-rs drive probe</td><td>真实执行 <code>status/position/log-sense --device /dev/sg2</code>：Ready=Yes、Block=0、BOT=true、EOT=false、TapeAlert 无告警。</td><td class="pass">本次再次通过；属于只读探测</td></tr>
+</table>
+
+<h2>3.1 本次新增：LE FUSE ↔ tape-rs 轮流挂载闭环</h2>
+<div class="note"><b>测试介质：</b><code>AA0013L8</code>，原始 slot 1，目标 drive 0 / <code>/dev/sg4</code>；本节为原始只读轮流挂载证据。后续 3.2 在用户授权下另行执行 FORMAT/WRITE。</div>
+<table>
+<tr><th>阶段</th><th>真实操作</th><th>结果</th></tr>
+<tr><td>LE 第一次挂载</td><td><code>ltfs -o changer_devname=/dev/sg3 -o work_directory=/tmp/rea-le-work-20261014 -o sync_type=unmount -o admin_port=17600 /mnt/rea-le-roundtrip-20261014</code></td><td class="pass">FUSE 挂载成功；LE 版本 2.4.8.2 (10520)，node Available，library 为 2 drives/35 slots/5 I/E/1 robot</td></tr>
+<tr><td>LE 多卷根目录</td><td>读取临时 FUSE 根目录</td><td class="pass">真实看到 7 个卷目录：<code>8A0042L8</code>、<code>8A0043L8</code>、<code>8A0047L8</code>、<code>AA0000L8</code>、<code>AA0013L8</code>、<code>L00284L8</code>、<code>L00285L8</code></td></tr>
+<tr><td>LE 第一次文件读</td><td><code>dd if=AA0013L8/b1</code></td><td class="pass">33,516 bytes；SHA-256 <code>6fdc3ec5848d9368fe35d6270e0fecb66d276d0d03b8df45e0dbce74979c02af</code></td></tr>
+<tr><td>切换到 tape-rs</td><td>LE 正常卸载；因 LE 释放 drive，AA0013L8 回到 slot 1；tape-rs <code>load --device /dev/sg5 --slot 1 --drive 0</code></td><td class="pass">MOVE MEDIUM 成功，约 25 秒；tape-rs status=Ready、position=Block 0/BOT</td></tr>
+<tr><td>tape-rs LTFS 访问</td><td><code>ltfs-list</code> 与 <code>ltfs-read --name b1</code> 使用 <code>/dev/sg4</code></td><td class="gap">均读到 LTFS label（2.4.0，blocksize 524288，compression=true），随后在构造索引时返回 <code>Recovery restricted: 构造超过预算 67108864 字节</code>；返回码 1</td></tr>
+<tr><td>LE 第二次挂载</td><td>tape-rs 退出后，LE 以临时 workdir/port 17601 再次挂载同一卷</td><td class="pass">FUSE 挂载成功，node Available，根目录再次看到 7 个卷目录</td></tr>
+<tr><td>LE 第二次文件读</td><td>再次读取 <code>AA0013L8/b1</code></td><td class="pass">33,516 bytes，SHA-256 与第一次完全相同</td></tr>
+<tr><td>最终清理</td><td>LE 正常卸载；停止残留 LE 进程；tape-rs <code>unload --device /dev/sg5 --drive 0 --slot 1</code></td><td class="pass">AA0013L8 已回 slot 1；无挂载、无 LE/tape-rs 进程、无设备 holder；node-scheduler 保持 inactive</td></tr>
+</table>
+<p>这次实验把“LE 可以挂载并读取”与“tape-rs 可以接管同一 drive/卷”放在同一真实设备状态序列中验证。它确认了切换流程和 LE 数据读回，但也再次复现了 tape-rs 的 64 MiB 索引恢复 GAP。第一次直接调用 tape-rs 时因 LE 卸载已弹出磁带，真实返回 <code>NOT READY / ASC 3A00</code>；随后显式 MOVE/LOAD 后才进入 LTFS 解析，这说明 drive load 是切换前置条件，不是数据格式失败。</p>
+
+<h2>3.2 本次新增：64 MiB 大文件与 CDB 双侧闭环</h2>
+<table><tr><th>阶段</th><th>真实结果</th><th>结论</th></tr>
+<tr><td>tape-rs FORMAT/WRITE</td><td>第二台真实 drive <code>/dev/sg2</code> 成功 FORMAT；写入 <code>perf64m.bin</code> 67108864 bytes，耗时 35.44 s，源 SHA-256 <code>2009f414fa6abf46885f6701a5f454b3f5af29afc1ff47b99bd4f42719d0d8c3</code></td><td class="pass">真实写入成功</td></tr>
+<tr><td>LE 读取</td><td>释放 tape-rs PR 后，LE FUSE 读取同一文件成功，16.75 s，SHA 与源文件一致</td><td class="pass">LE 互操作成功</td></tr>
+<tr><td>tape-rs 读取</td><td>LE 卸载后 tape-rs 接管并读取同一文件成功，18.55 s，返回码 0，SHA 与源文件一致</td><td class="pass">反向互操作成功</td></tr>
+<tr><td>READ CDB</td><td>LE kernel SCSI trace 与 tape-rs debug 日志均为 <code>08 00 08 00 00 00</code>，请求 524288 bytes</td><td class="pass">同条件 READ(6) CDB 已闭环</td></tr></table>
+
+<h2>3.3 本次新增：MAM、density、压缩与诊断验证</h2>
+<table><tr><th>能力</th><th>真实证据</th><th>结论</th></tr>
+<tr><td>MAM 读取/写入</td><td><code>sg_read_attr</code> 读取完整 MAM；真实 <code>WRITE ATTRIBUTE (0x8D)</code> 将 <code>0x0801</code> 写为 <code>REA-MAM-20261014</code>，status Good，随后回读一致；LE 重新挂载成功</td><td class="pass">已闭环</td></tr>
+<tr><td>density/压缩</td><td>真实 density 返回 LTO-7、LTO-8 Type M、LTO-8；当前介质 density <code>0x5e</code>；LTFS label 为 <code>compression=true</code>，64 MiB 双侧读回 SHA 一致</td><td class="pass">当前普通压缩卷已验证</td></tr>
+<tr><td>SEND DIAGNOSTIC</td><td>后台自检真实提交成功；前台模式清除装带 UA 后返回 <code>24/00</code>，说明当前 drive 不接受该前台模式</td><td class="pass">两种真实结果已记录，不能扩大解释为前台成功</td></tr>
+<tr><td>WORM/硬件加密</td><td>当前 MAM medium type <code>0x0</code>、加密位置 <code>ff/unknown</code>；库存无 WORM 介质，未配置可用加密密钥策略</td><td class="candidate">前置条件不足，保持未验证，不判 GAP</td></tr></table>
+
+<h2>3.4 GAP 补全实施与真实设备回归</h2>
+<div class="note"><b>实施范围：</b>当前工作树分支 <code>ltfs-recovery-ibm-interop</code>。补全内容同时覆盖可直接调用的 Rust <code>Library</code> API、<code>tape-fuse</code> 多卷入口和 CLI 管理面；真实验证使用 TS4300、单 drive 轮换以及库内测试带。</div>
+<table>
+<tr><th>原 GAP / 验证面</th><th>补全实现</th><th>真实结果</th></tr>
+<tr><td>大索引恢复</td><td>LTFS XML 索引改为流式解析，构造预算按解析阶段控制，不再要求把完整索引一次性放入固定 64 MiB 缓冲。</td><td class="pass">同一大索引夹具旧二进制稳定返回 <code>构造超过预算 67108864 字节</code>；新实现成功列出。真实 AA0013L8 写入 1,040 个各 65,536-byte 的根 xattr 和 marker，索引超过 64 MiB；Rust、FUSE 和 IBM LE 均成功读取。</td></tr>
+<tr><td>Rust library 模式</td><td>新增多卷 <code>Library</code>、volume resolver、单 drive 调度、reservation、MOVE、drive LOAD、ready polling、缓存与失败清理状态机。</td><td class="pass">AA0013L8/AA0000L8 两卷完成两轮真实切换，四个不同路径均读回；大索引场景两轮耗时 613.763 s。</td></tr>
+<tr><td>FUSE 多卷模式</td><td>逻辑库根目录按 barcode 暴露卷目录，文件、xattr、rename、symlink 和跨卷语义连接到同一调度层。</td><td class="pass">真实根目录同时暴露 7 个卷；完成 AA0013→AA0000→AA0013 切换、64 MiB 文件读取、写入/fsync、二进制 xattr、rename、相对 symlink，并确认跨卷 rename 返回 <code>EXDEV</code>。</td></tr>
+<tr><td>assignment / blacklist</td><td>增加持久化 assignment、blacklist、<code>NEED_ASSIGN</code> 状态与管理 CLI；访问前由同一状态模型进行准入判断。</td><td class="pass">真实验证 blacklist/clear、unassign 后 <code>NEED_ASSIGN</code>、重新 assignment；被拒绝路径没有触发装带。</td></tr>
+<tr><td>append-only IP 提交</td><td>在索引分区提交前发送精确的 ALLOW OVERWRITE，然后只修复 IP，不重放已完成的 DP append。</td><td class="pass">旧实现以 <code>07/5A/02</code> 失败；新实现发送 <code>82 00 01 00 00 00 00 00 00 00 00 04 00 00 00 00</code> 并获 GOOD，成功修复 IP。</td></tr>
+<tr><td>IBM LE 互操作</td><td>用补全后的磁带内容作为 LE 的独立读取端。</td><td class="pass">LE 列出 7 个卷，读取 AA0013L8 的大索引 marker、64 MiB 文件和完整 65,536-byte xattr；正常卸载返回 0，日志确认 self-pointer/clean IP，未重写索引。</td></tr>
+<tr><td>设备路径故障恢复</td><td>所有流程按 VPD 身份核对设备，避免把固定 <code>/dev/sg*</code> 号当作持久身份。</td><td class="pass">原 changer 路径 <code>/dev/sg5</code> devloss 后，通过同一 TS4300 的备用 <code>/dev/sg3</code> 恢复：重复读取 marker/64 MiB 文件、checkpoint，并把介质返回槽位。</td></tr>
+</table>
+<div class="warn"><b>未完成的现场收尾：</b>LE 验证后的 Rust 冷启动回归在显式 LOAD 时先返回 SCSI host status <code>0x000d</code>，随后 changer/drive LUN 消失；内核记录 WWPN <code>50:00:e1:11:70:18:60:70</code> devloss，<code>host15</code> 与 <code>host16</code> 最终均为 <code>Linkdown</code>。失败发生在 LTFS 索引和文件读取之前（<code>reads=[]</code>），不能归因于本次解析或调度实现。最后可见库存显示 AA0013L8 位于 DTE offset 1；需在 FC 恢复后确认实际介质位置、PR 状态并完成最终冷读和归槽。</div>
+
+<h2>4. REA/Ghidra 识别出的 LE 软件能力</h2>
+<table>
+<tr><th>能力层</th><th>静态识别</th><th>真实 LE 证据</th><th>对应原生实现面</th></tr>
+<tr><td>SG tape transport</td><td><code>sg_issue_cdb_command</code>、<code>sg_read</code>、<code>sg_write</code>、<code>sg_readpos</code>、<code>sg_modesense</code>、<code>sg_logsense</code>、<code>sg_read_attribute</code>/<code>sg_write_attribute</code></td><td>LE 启动及大文件读取 trace 真实出现 transport 命令；同一 64 MiB 文件的 READ(6) CDB 与 tape-rs 已完成对照</td><td>READ/WRITE、READ POSITION、MODE SENSE、LOG SENSE、MAM/属性、错误/重试</td></tr>
+<tr><td>changer transport</td><td><code>sg_ibmchanger_open</code>、inventory、device map、move media、reserve/release</td><td>LE trace 真实出现 READ ELEMENT STATUS、MODE SENSE(6)、PR、ALLOW MEDIUM REMOVAL；tape-rs inventory/MOVE/PR 也已真实运行</td><td>机器人、element map、槽位/驱动器/I-E、MOVE、reservation</td></tr>
+<tr><td>逻辑库与多卷</td><td>LE 二进制和 leadm/FUSE 路径包含 library、cartridge、drive、cache、assignment 状态</td><td>真实 mount 后逻辑根目录同时暴露多个卷；node/library/tape JSON 返回 slot、home_slot、assignment、状态字段</td><td>跨卷命名空间、资源调度、逻辑卷到物理 drive 的映射</td></tr>
+<tr><td>挂载/装带状态机</td><td>Ghidra 识别 <code>_admin_mount_tape</code>、<code>library_mount_request_with_retry</code>、<code>ltfs_load_tape</code>、<code>ltfs_wait_device_ready</code></td><td>LE 真实挂载日志显示 Loading cartridge、Ready、Volume mounted successfully；项目真实 MOVE 后需单独 drive LOAD 并等待 ready</td><td>装带、ready transition、重试、cache 保存、失败清理</td></tr>
+<tr><td>LTFS/FUSE 文件面</td><td>leadm mount/unmount/recover/rollback/sync 及 FUSE callbacks</td><td>LE 真实 FUSE 小文件读成功；项目真实多卷 tape-fuse、xattr、元数据、符号链接、读写和恢复均有闭环</td><td>多卷挂载、文件读写、索引、xattr、元数据、尾部恢复</td></tr>
+<tr><td>RAO/维护能力</td><td>REA 字符串/过程识别 <code>ltfsadmin2_cartridge_rao</code>、<code>ltfs_get_rao_list</code>、format/unformat/recovery/list-points/rollback</td><td>rollbacklist 和 recover 已在真实 LE 上取得明确错误/超时终态；RAO/format/unformat 等破坏性操作未在本报告中执行</td><td>RAO、恢复点、回滚、格式化、擦除、维护诊断</td></tr>
+</table>
+<p>本轮 Ghidra 对挂载路径的直接证据：<code>ev_ce75344dff796a1227d6f6509a2a1eb8df005828189892519b136a1d65f85ce1</code>；对 retry/rebuild/reserve 恢复路径的直接证据：<code>ev_5f0fd3e7db38ef995d767f3911d0664828ff0e75c683559efbcec917b80c4da4</code>。REA 搜索还取得 changer、mount、tape、RAO 入口证据：<code>ev_0981a80cda90d0cd2caf9141cbb9ac0aa2dac46500cca7534ea33eaf2f347653</code>、<code>ev_e3b41eea00c986358aaa485499672694b3cfb566d60c2e0cbfbc9915e5ff388c</code>、<code>ev_dc3066a01d8ce7751de7991a3ae532cdebf743814cdf12e6b880c9e4fe466761</code>、<code>ev_9191bb52534650e924a1d1be42748a15958a15f92e34e0ce2c63859ae74ddac2</code>。</p>
+
+<h2>5. tape-rs 与 LE 的真实对照</h2>
+<table>
+<tr><th>功能</th><th>LE 真实结果</th><th>tape-rs 真实/源码结果</th><th>结论</th></tr>
+<tr><td>changer map/inventory/标签</td><td>TS4300 返回 1 robot、2 drives、35 storage、5 I/E；LE 能识别条码和设备状态</td><td>真实 <code>/dev/sg5</code> inventory 成功，map、slot、drive、I/E 和 barcode 解析正确</td><td class="pass">无已确认 GAP</td></tr>
+<tr><td>PR fencing</td><td>LE 使用 PR；真实 trace 有 PR OUT/IN</td><td>项目在真实 drive 上抢占 LE key、注册/回读新 key，并有仿真和 HA 真实验收</td><td class="pass">已覆盖；协议序列差异仍需逐命令解释</td></tr>
+<tr><td>MOVE/LOAD/ready</td><td>LE 将逻辑访问、装带、ready、volume mount 组合为上层动作</td><td>新增 Library 状态机组合 reservation、MOVE、drive LOAD、ready polling、缓存和失败清理；Rust/FUSE 双模式已完成真实多卷切换</td><td class="pass">原 P1 GAP 已补全</td></tr>
+<tr><td>基础 drive probe</td><td>LE 使用 TUR、MODE SENSE、READ POSITION、LOG/attribute 等探测</td><td>项目真实 status、position、LOG SENSE、MAM/VCI 及 READ POSITION 已运行</td><td class="pass">当前场景无已确认 GAP</td></tr>
+<tr><td>READ/FILEMARK/位置</td><td>LE FUSE 小文件和 64 MiB 文件读取成功；LE 大文件窗口已取得原始 READ(6) trace</td><td>项目真实 READ(6) 读取 80 bytes 及 64 MiB 文件，记录 filemark、status/resid 和位置</td><td class="pass">功能与本轮 CDB 字节一致性已闭环</td></tr>
+<tr><td>大索引恢复</td><td>LE 历史上在 AA0013L8 建立约 1,028,281 files 的索引视图；本轮又成功读取新建的 64 MiB+ 索引</td><td>流式解析已替代固定 64 MiB 整体构造；软件百万文件夹具和真实 64 MiB+ 索引均通过</td><td class="pass">原 P0 GAP 已补全</td></tr>
+<tr><td>多卷逻辑库根目录</td><td>LE 根目录真实同时暴露多个卷目录，并能按逻辑卷访问</td><td>tape-fuse 真实暴露 7 个 barcode 目录，并通过单 drive 自动访问 AA0013L8 与 AA0000L8</td><td class="pass">原 P1 GAP 已补全</td></tr>
+<tr><td>assignment/blacklist/node-library 状态</td><td>leadm JSON 真实返回 assignment、NEED_ASSIGN、BLACKLISTED/NON_SUPPORTED_TAPE、node/library 状态</td><td>新增持久化 assignment/blacklist/NEED_ASSIGN 与 CLI；真实拒绝、清除、解绑和重绑均通过</td><td class="pass">原 P1 GAP 已补全</td></tr>
+<tr><td>自动物理 drive 切换</td><td>真实访问逻辑卷可触发目标卷装入对应 drive</td><td>Rust Library 与 FUSE 均在单 drive 上真实完成 AA0013/AA0000 往返切换和文件访问</td><td class="pass">原 P1 调度 GAP 已补全</td></tr>
+<tr><td>xattr、symlink、元数据、恢复尾部</td><td>LE 真实读取本轮写入的 65,536-byte xattr；LE 恢复/rollback 的历史结果分别为 RC124/RC3</td><td>FUSE 真实通过二进制 xattr、相对 symlink、rename、fsync；append-only IP 恢复获 GOOD</td><td class="pass">本轮覆盖扩大，未发现整体能力 GAP</td></tr>
+</table>
+
+<h2>6. SCSI/CDB 与性能结论</h2>
+<table>
+<tr><th>项目</th><th>已获得的真实证据</th><th>结论</th></tr>
+<tr><td>SG_IO 请求号</td><td>LE REA 静态路径和项目约束均指向 Linux <code>ioctl 0x2285</code>；项目真实 SG_IO 已运行</td><td class="pass">基础 transport 一致；需继续比较字段处理</td></tr>
+<tr><td>changer CDB 字节</td><td>LE trace 使用 MODE SENSE(6) 与不同 READ ELEMENT STATUS 参数；项目真实使用 MODE SENSE(10) 与自己的 READ ELEMENT STATUS 参数；双方在本 TS4300 均 GOOD</td><td class="static">已确认字节级差异，但不是已证实功能不兼容 GAP</td></tr>
+<tr><td>tape READ CDB</td><td>同一真实测试带的大文件读取中，LE kernel trace 与 tape-rs debug 均记录 <code>08 00 08 00 00 00</code>、524288-byte transfer；tape-rs 另记录 status/resid</td><td class="pass">已闭环：同条件 READ(6) 一致</td></tr>
+<tr><td>大文件拷贝性能</td><td>同一真实卷、同一 64 MiB 文件：LE 16.75 s；tape-rs 18.55 s；两侧 SHA 一致。本轮为真实单轮性能样本</td><td class="pass">功能与单轮性能已闭环</td></tr>
+<tr><td>性能测试方法</td><td>固定介质、文件、block size、drive，记录大小、耗时、SHA、CDB、transfer length、status/resid；LE/tape-rs 轮流接管完成</td><td class="pass">本轮方法闭环；多轮统计可扩展</td></tr>
+</table>
+
+<h2>7. GAP 补全状态</h2>
+<table>
+<tr><th>原优先级</th><th>原 GAP</th><th>补全结果</th><th>验收状态</th></tr>
+<tr><td>P0</td><td>大 LTFS 索引受固定 64 MiB 构造预算限制</td><td>流式解析；软件百万文件与真实 64 MiB+ 索引覆盖</td><td class="pass">Rust、FUSE、LE 三侧通过</td></tr>
+<tr><td>P1</td><td>LE 风格多卷逻辑库根目录缺失</td><td>Library API 与 tape-fuse barcode 根目录</td><td class="pass">真实 7 卷可见、双卷访问通过</td></tr>
+<tr><td>P1</td><td>assignment、blacklist、NEED_ASSIGN 管理面缺失</td><td>持久化状态模型和管理 CLI</td><td class="pass">真实拒绝和状态转换通过</td></tr>
+<tr><td>P1</td><td>自动换带以及 load/ready 组合流程缺失</td><td>单 drive 多卷调度状态机，统一服务 Rust 与 FUSE</td><td class="pass">真实双卷两轮与 FUSE 往返通过</td></tr>
+<tr><td>跟踪项</td><td>LE 与项目 changer CDB/探测序列字节不同</td><td>保留现有已通过实现，记录差异并纳入 firmware 回归</td><td class="static">字节差异存在，尚无功能不兼容证据</td></tr>
+<tr><td>现场收尾</td><td>LE 后最终 Rust 冷读、PR 检查和归槽</td><td>等待双 FC 端口恢复后按 VPD 重新发现设备并执行</td><td class="todo">外部 FC Linkdown 阻塞</td></tr>
+</table>
+
+<h2>8. 已排除或不应升级的候选项</h2>
+<ul>
+<li><b>基础 inventory/map：</b>真实 tape-rs 已成功，不是 GAP。</li>
+<li><b>PR、MOVE、drive status、position、LOG SENSE、基础 READ：</b>真实项目已运行成功，不能因 LE 有对应函数就判缺失。</li>
+<li><b>rollbacklist/recover：</b>LE 已取得明确 RC3/RC124 终态；当前介质状态下没有成功能力证据，不能把“LE 超时”直接解释成项目 GAP。</li>
+<li><b>WORM、硬件加密：</b>当前库存没有 WORM 介质，也没有已配置的加密密钥策略；真实 MAM 已证明本样本未启用二者，能力正向验证需补充前置条件。</li>
+<li><b>特殊压缩模式、诊断 dump 的完整结果页：</b>普通 compression=true 与后台 SEND DIAGNOSTIC 已验证；其他压缩策略和诊断结果页仍需对应设备/介质条件。</li>
+<li><b>LE 大文件吞吐和底层 READ CDB：</b>本轮已完成真实 64 MiB 双侧闭环；多轮冷/热统计不作为本次 GAP。</li>
+</ul>
+
+<h2>9. 验证记录</h2>
+<table>
+<tr><th>验证</th><th>结果</th></tr>
+<tr><td>REA provider</td><td class="pass">Ghidra 12.1.4、Java 21、native decompiler 均 available；实际打开 LE ELF 并完成分析</td></tr>
+<tr><td>软件测试</td><td class="pass"><code>cargo test</code>：277 passed、2 ignored；<code>cargo test --all-features</code>：278 passed、9 ignored；<code>cargo check --all-targets</code>、严格 clippy、fmt 和 diff check 通过</td></tr>
+<tr><td>百万文件软件压力</td><td class="pass">显式纯软件测试解析 1,000,000 files，耗时 19.201 s</td></tr>
+<tr><td>真实 LE→tape-rs 接管</td><td class="pass">既有 2026-10-13 闭环：LE 挂载/读取同一卷，释放后 tape-rs 接管，TUR/REWIND/READ POSITION/READ/恢复均取得证据</td></tr>
+<tr><td>Rust library 实机</td><td class="pass">双卷两轮、四个不同文件路径通过；大索引 marker、64 MiB 文件和完整 xattr 通过</td></tr>
+<tr><td>FUSE 实机</td><td class="pass">7 卷根目录、双卷往返、64 MiB 读取、写入/fsync、二进制 xattr、rename、相对 symlink 和 EXDEV 通过</td></tr>
+<tr><td>真实大索引回归</td><td class="pass">旧二进制稳定复现 64 MiB budget 失败；新实现对同类 64 MiB+ 索引成功，IBM LE 也成功读取</td></tr>
+<tr><td>append-only IP</td><td class="pass">旧实现复现 <code>07/5A/02</code>；新实现发送 ALLOW OVERWRITE 并获 GOOD，只修复 IP</td></tr>
+<tr><td>最终现场状态</td><td class="todo">LE 回归已正常卸载；随后的 Rust LOAD 遭遇 host status <code>0x000d</code> 与双 FC <code>Linkdown</code>，未进入数据读取；现场收尾待链路恢复</td></tr>
+</table>
+
+<h2>10. 剩余工作</h2>
+<ol>
+<li>恢复 lisa-3 的 <code>host15</code>/<code>host16</code> FC 物理链路；按 VPD/serial 重新解析 tape 与 changer 节点，不沿用旧 <code>/dev/sg*</code> 编号。</li>
+<li>重新读取 inventory 和 PR 状态，确认 AA0013L8 的实际位置；完成 Rust 冷启动读取、释放 PR，并将介质返回 home slot。</li>
+<li>保留 changer CDB 差异的 firmware 回归矩阵；只在出现响应或兼容性证据时调整已通过的 map/探测实现。</li>
+</ol>
+
+<h2>附录：既有报告与证据</h2>
+<p><a href="gap-implementation-validation-20261014.md">GAP 补全实现与软硬件验证详报</a>（原始实机日志保存在工作树与验收主机的证据目录中，未纳入本次 PR）</p>
+<p><a href="rea-roundtrip-20261014.md">本次 LE FUSE ↔ tape-rs 轮流挂载原始证据</a></p>
+<ul>
+<li><a href="rea-runtime-closed-20261013.html">REA 运行时对照闭环报告</a></li>
+<li><a href="rea-gap-analysis-vs-le-20261013.html">真实设备 GAP 报告</a></li>
+<li><a href="rea-le-feature-inventory-20261013.html">LE 功能清单与双侧审计</a></li>
+<li><a href="rea-analysis-20261013.html">REA 原始静态分析</a></li>
+<li><a href="rea-evidence-session-20261013.json">REA Evidence Bundle</a></li>
+</ul>
+<p><small>本更新对应工作树中的生产源码补全，尚未提交或推送。本轮补全验证执行了用户授权测试带上的 WRITE、MOVE/LOAD/UNLOAD、Rust/FUSE/LE 访问和 append-only IP 修复，没有执行 FORMAT 或 ERASE；第 3.1–3.3 节仍保留此前已授权 FORMAT/MAM 等历史基线。最后一次可见库存显示 AA0013L8 位于 DTE offset 1；双 FC 端口 Linkdown 后无法确认最终机械位置和 PR，且当前无 FUSE/LE/验收进程运行。</small></p>
+</body>
+</html>

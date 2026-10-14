@@ -29,6 +29,7 @@ pub mod opcode {
     pub const READ_POSITION: u8 = 0x34;
     pub const REPORT_DENSITY_SUPPORT: u8 = 0x44;
     pub const LOCATE_16: u8 = 0x92;
+    pub const ALLOW_OVERWRITE: u8 = 0x82;
     pub const READ_ATTRIBUTE: u8 = 0x8C;
     pub const WRITE_ATTRIBUTE: u8 = 0x8D;
 
@@ -38,6 +39,24 @@ pub mod opcode {
     pub const MOVE_MEDIUM: u8 = 0xA5;
     pub const EXCHANGE_MEDIUM: u8 = 0xA6;
     pub const READ_ELEMENT_STATUS: u8 = 0xB8;
+}
+
+/// SSC-5 ALLOW OVERWRITE，IBM GA32-0928-08 §5.2.1 Table33/34。
+/// 只授权当前位置一次覆盖；不提供全介质 Format 授权。
+pub fn allow_overwrite_current(partition: u8, block: u64) -> [u8; 16] {
+    let mut cdb = [0; 16];
+    cdb[0] = opcode::ALLOW_OVERWRITE;
+    cdb[2] = 1;
+    cdb[3] = partition;
+    cdb[4..12].copy_from_slice(&block.to_be_bytes());
+    cdb
+}
+
+/// MODE SENSE(10) 当前值子页，保持既有page0入口字节不变。
+pub fn mode_sense_10_subpage(page: u8, subpage: u8, alloc_len: u16) -> [u8; 10] {
+    let mut cdb = mode_sense_10(page, alloc_len);
+    cdb[3] = subpage;
+    cdb
 }
 
 /// 构建 INQUIRY CDB (6 bytes)
@@ -552,4 +571,16 @@ pub fn persistent_reserve_out(service_action: u8, pr_type: u8, param_len: u32) -
     cdb[2] = pr_type & 0x0F;
     cdb[5..9].copy_from_slice(&param_len.to_be_bytes());
     cdb
+}
+
+#[cfg(test)]
+mod overwrite_tests {
+    use super::*;
+    #[test]
+    fn overwrite_current_encodes_only_current_position_in_network_order() {
+        assert_eq!(
+            allow_overwrite_current(2, 0x0102030405060708),
+            [0x82, 0, 1, 2, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0]
+        );
+    }
 }

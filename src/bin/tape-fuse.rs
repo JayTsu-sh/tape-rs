@@ -20,8 +20,15 @@ use tape_rs::tapefs::{Attr, Backend, ClientBackend, Res, TapeFs};
 )]
 struct Args {
     /// 节点的客户端接口地址，可重复指定
-    #[arg(short = 'e', long = "endpoint", required = true)]
+    #[arg(
+        short = 'e',
+        long = "endpoint",
+        required_unless_present = "library_changer",
+        conflicts_with = "library_changer"
+    )]
     endpoints: Vec<String>,
+    #[command(flatten)]
+    library: tape_rs::library_cli::LibraryArgs,
     /// 已存在的挂载目录
     mountpoint: PathBuf,
     /// 本地缓存目录，每次挂载创建独占子目录
@@ -521,11 +528,6 @@ fn main() {
     env_logger::init();
     let args = Args::parse();
     let result = (|| {
-        let fs = TapeFs::new(
-            ClientBackend::new(Client::new(args.endpoints)),
-            args.cache_dir,
-        )?;
-        let adapter = Adapter::new(fs);
         let mut config = Config::default();
         config.mount_options = vec![
             MountOption::FSName("tape-fuse".into()),
@@ -534,7 +536,28 @@ fn main() {
             MountOption::NoDev,
         ];
         config.n_threads = Some(4);
-        fuser::mount(adapter, args.mountpoint, &config)
+        if args.library.library_changer.is_some() {
+            let library = args.library.open().map_err(std::io::Error::other)?;
+            let shared = std::sync::Arc::new(Mutex::new(library));
+            let fs = TapeFs::new(
+                tape_rs::library::LibraryBackend(shared.clone()),
+                args.cache_dir,
+            )?;
+            let mounted = fuser::mount(Adapter::new(fs), args.mountpoint, &config);
+            let closed = shared
+                .lock()
+                .map_err(|_| std::io::Error::other("逻辑库锁失效"))?
+                .close()
+                .map_err(std::io::Error::other);
+            mounted?;
+            closed
+        } else {
+            let fs = TapeFs::new(
+                ClientBackend::new(Client::new(args.endpoints)),
+                args.cache_dir,
+            )?;
+            fuser::mount(Adapter::new(fs), args.mountpoint, &config)
+        }
     })();
     if let Err(e) = result {
         eprintln!("挂载失败: {e}");
@@ -547,6 +570,57 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use tape_rs::tapefs::MemBackend;
+
+    mod library_support {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/library_fixture.rs"
+        ));
+    }
+
+    #[test]
+    #[ignore = "需要 /dev/fuse 和内核挂载权限；介质仅为 SimTransport"]
+    fn kernel_multi_volume_library() {
+        let fixture = library_support::Fixture::new();
+        let shared = std::sync::Arc::new(Mutex::new(fixture.formatted()));
+        let root = fixture.path.with_extension("fuse");
+        let mount = root.join("mount");
+        let cache = root.join("cache");
+        std::fs::create_dir_all(&mount).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let fs = TapeFs::new(tape_rs::library::LibraryBackend(shared.clone()), cache).unwrap();
+        let mut config = Config::default();
+        config.mount_options = vec![
+            MountOption::FSName("tape-library-test".into()),
+            MountOption::DefaultPermissions,
+        ];
+        let session = fuser::spawn_mount(Adapter::new(fs), &mount, &config).unwrap();
+        for barcode in ["LIB001L8", "LIB002L8"] {
+            let dir = mount.join("pool").join(barcode).join("kernel");
+            std::fs::create_dir(&dir).unwrap();
+            let mut f = std::fs::File::create(dir.join("file")).unwrap();
+            f.write_all(barcode.as_bytes()).unwrap();
+            f.sync_all().unwrap();
+            drop(f);
+            std::os::unix::fs::symlink("file", dir.join("link")).unwrap();
+            assert_eq!(std::fs::read(dir.join("link")).unwrap(), barcode.as_bytes());
+        }
+        for barcode in ["LIB001L8", "LIB002L8", "LIB001L8"] {
+            let dir = mount.join("pool").join(barcode).join("kernel");
+            assert_eq!(std::fs::read(dir.join("file")).unwrap(), barcode.as_bytes());
+            std::fs::rename(dir.join("file"), dir.join("renamed")).unwrap();
+            std::fs::rename(dir.join("renamed"), dir.join("file")).unwrap();
+        }
+        let cross = std::fs::rename(
+            mount.join("pool/LIB001L8/kernel/file"),
+            mount.join("pool/LIB002L8/kernel/other"),
+        );
+        assert_eq!(cross.unwrap_err().raw_os_error(), Some(libc::EXDEV));
+        session.umount_and_join().unwrap();
+        shared.lock().unwrap().close().unwrap();
+        assert!(fixture.sim.loaded_barcode(0).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     struct SharedMem {
         inner: std::sync::Arc<MemBackend>,
