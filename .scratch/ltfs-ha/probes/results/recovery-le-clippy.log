@@ -1,0 +1,459 @@
+warning: this `if` statement can be collapsed
+  --> src/catalog/db.rs:24:9
+   |
+24 | /         if let Some(parent) = path.parent() {
+25 | |             if !parent.as_os_str().is_empty() && !parent.exists() {
+26 | |                 std::fs::create_dir_all(parent).map_err(|e| {
+27 | |                     TapeError::Catalog(format!("无法创建目录 {}: {}", parent.display(), e))
+...  |
+30 | |         }
+   | |_________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#collapsible_if
+   = note: `#[warn(clippy::collapsible_if)]` on by default
+help: collapse nested if block
+   |
+24 ~         if let Some(parent) = path.parent()
+25 ~             && !parent.as_os_str().is_empty() && !parent.exists() {
+26 |                 std::fs::create_dir_all(parent).map_err(|e| {
+27 |                     TapeError::Catalog(format!("无法创建目录 {}: {}", parent.display(), e))
+28 |                 })?;
+29 ~             }
+   |
+
+warning: this `if` statement can be collapsed
+   --> src/catalog/db.rs:127:5
+    |
+127 | /     if let Ok(p) = std::env::var("TAPE_RS_CATALOG") {
+128 | |         if !p.is_empty() {
+129 | |             return Ok(PathBuf::from(p));
+130 | |         }
+131 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+127 ~     if let Ok(p) = std::env::var("TAPE_RS_CATALOG")
+128 ~         && !p.is_empty() {
+129 |             return Ok(PathBuf::from(p));
+130 ~         }
+    |
+
+warning: this `if` statement can be collapsed
+   --> src/client.rs:295:13
+    |
+295 | /             if let Some((k, v)) = h.split_once(':') {
+296 | |                 if k.eq_ignore_ascii_case("content-length") {
+297 | |                     len = v.trim().parse().ok();
+298 | |                 }
+299 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+295 ~             if let Some((k, v)) = h.split_once(':')
+296 ~                 && k.eq_ignore_ascii_case("content-length") {
+297 |                     len = v.trim().parse().ok();
+298 ~                 }
+    |
+
+warning: methods with the following characteristics: (`to_*` and `self` type is not `Copy`) usually take `self` by reference
+   --> src/client.rs:330:18
+    |
+330 |     fn to_leader(&mut self, method: &str, path: &str, body: Option<&[u8]>) -> Result<Response> {
+    |                  ^^^^^^^^^
+    |
+    = help: consider choosing a less ambiguous name
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#wrong_self_convention
+    = note: `#[warn(clippy::wrong_self_convention)]` on by default
+
+warning: methods with the following characteristics: (`to_*` and `self` type is not `Copy`) usually take `self` by reference
+   --> src/client.rs:335:9
+    |
+335 |         &mut self,
+    |         ^^^^^^^^^
+    |
+    = help: consider choosing a less ambiguous name
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#wrong_self_convention
+
+warning: this `if` statement can be collapsed
+   --> src/daemon/executor.rs:649:9
+    |
+649 | /         if let Some((b, _)) = &d.loaded {
+650 | |             if !cands.iter().any(|c| c.barcode == *b) {
+651 | |                 notes.push(format!("{} 里的 {} 未归属或不可写，不触碰", a.devices[d.dev].name, b));
+652 | |             }
+653 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+649 ~         if let Some((b, _)) = &d.loaded
+650 ~             && !cands.iter().any(|c| c.barcode == *b) {
+651 |                 notes.push(format!("{} 里的 {} 未归属或不可写，不触碰", a.devices[d.dev].name, b));
+652 ~             }
+    |
+
+warning: this `if` statement can be collapsed
+   --> src/daemon/executor.rs:817:5
+    |
+817 | /     if let Ok(inv) = inventory(&a.devices) {
+818 | |         if let Some(d) = inv.drives.iter().find(|d| d.loaded.as_ref().is_some_and(|(b, _)| *b == barcode)) {
+819 | |             if let Err(e) = unload_drive(&a.devices, &inv, d) {
+820 | |                 warn!("执行线程: 卸带 {} 失败: {}", barcode, e);
+...   |
+823 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+817 ~     if let Ok(inv) = inventory(&a.devices)
+818 ~         && let Some(d) = inv.drives.iter().find(|d| d.loaded.as_ref().is_some_and(|(b, _)| *b == barcode)) {
+819 |             if let Err(e) = unload_drive(&a.devices, &inv, d) {
+820 |                 warn!("执行线程: 卸带 {} 失败: {}", barcode, e);
+821 |             }
+822 ~         }
+    |
+
+warning: this `if` statement can be collapsed
+   --> src/daemon/executor.rs:818:9
+    |
+818 | /         if let Some(d) = inv.drives.iter().find(|d| d.loaded.as_ref().is_some_and(|(b, _)| *b == barcode)) {
+819 | |             if let Err(e) = unload_drive(&a.devices, &inv, d) {
+820 | |                 warn!("执行线程: 卸带 {} 失败: {}", barcode, e);
+821 | |             }
+822 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+818 ~         if let Some(d) = inv.drives.iter().find(|d| d.loaded.as_ref().is_some_and(|(b, _)| *b == barcode))
+819 ~             && let Err(e) = unload_drive(&a.devices, &inv, d) {
+820 |                 warn!("执行线程: 卸带 {} 失败: {}", barcode, e);
+821 ~             }
+    |
+
+warning: this `if` statement can be collapsed
+    --> src/daemon/executor.rs:1057:5
+     |
+1057 | /     if files.tape().is_some_and(|t| t.barcode == barcode) {
+1058 | |         if let Some(i) = a.drive {
+1059 | |             return read_file(a.devices[i].dev.as_ref(), path, out).map_err(|e| ReadError::device(e, "读取文件失败"));
+1060 | |         }
+1061 | |     }
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#collapsible_if
+help: collapse nested if block
+     |
+1057 ~     if files.tape().is_some_and(|t| t.barcode == barcode)
+1058 ~         && let Some(i) = a.drive {
+1059 |             return read_file(a.devices[i].dev.as_ref(), path, out).map_err(|e| ReadError::device(e, "读取文件失败"));
+1060 ~         }
+     |
+
+warning: this `if` statement can be collapsed
+    --> src/daemon/executor.rs:1063:5
+     |
+1063 | /     if let Some((i, b, _)) = &a.read {
+1064 | |         if *b == barcode {
+1065 | |             let i = *i;
+1066 | |             let out = read_file(a.devices[i].dev.as_ref(), path, out).map_err(|e| ReadError::device(e, "读取文件失败"))?;
+...    |
+1070 | |     }
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#collapsible_if
+help: collapse nested if block
+     |
+1063 ~     if let Some((i, b, _)) = &a.read
+1064 ~         && *b == barcode {
+1065 |             let i = *i;
+ ...
+1068 |             return Ok(out);
+1069 ~         }
+     |
+
+warning: this `if` statement can be collapsed
+    --> src/daemon/executor.rs:1079:5
+     |
+1079 | /     if let Some((i, b, _)) = a.read.take() {
+1080 | |         if let Some(d) = inv.drives.iter().find(|d| d.dev == i) {
+1081 | |             unload_drive(&a.devices, &inv, d).map_err(|e| ReadError::device(e, &format!("卸下读带 {} 失败", b)))?;
+1082 | |             target = Some(i);
+1083 | |         }
+1084 | |     }
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#collapsible_if
+help: collapse nested if block
+     |
+1079 ~     if let Some((i, b, _)) = a.read.take()
+1080 ~         && let Some(d) = inv.drives.iter().find(|d| d.dev == i) {
+1081 |             unload_drive(&a.devices, &inv, d).map_err(|e| ReadError::device(e, &format!("卸下读带 {} 失败", b)))?;
+1082 |             target = Some(i);
+1083 ~         }
+     |
+
+warning: this `if` statement can be collapsed
+    --> src/daemon/executor.rs:1689:5
+     |
+1689 | /     if let Ok(inv) = inventory(&a.devices) {
+1690 | |         if let Some(d) = inv.drives.iter().find(|d| d.dev == i) {
+1691 | |             match unload_drive(&a.devices, &inv, d) {
+1692 | |                 Ok(()) => info!("执行线程: 读带 {} 空闲，已卸回槽位", b),
+...    |
+1696 | |     }
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#collapsible_if
+help: collapse nested if block
+     |
+1689 ~     if let Ok(inv) = inventory(&a.devices)
+1690 ~         && let Some(d) = inv.drives.iter().find(|d| d.dev == i) {
+1691 |             match unload_drive(&a.devices, &inv, d) {
+ ...
+1694 |             }
+1695 ~         }
+     |
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> src/daemon/files.rs:366:13
+    |
+366 |     reader: Mutex<Option<(Directory, Option<(u64, u64)>)>>,
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#type_complexity
+    = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: this `if` statement can be collapsed
+   --> src/daemon/http.rs:137:9
+    |
+137 | /         if b[i] == b'%' && i + 2 < b.len() && s.is_char_boundary(i + 1) && s.is_char_boundary(i + 3) {
+138 | |             if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+139 | |                 out.push(v);
+140 | |                 i += 3;
+...   |
+143 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+137 ~         if b[i] == b'%' && i + 2 < b.len() && s.is_char_boundary(i + 1) && s.is_char_boundary(i + 3)
+138 ~             && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+139 |                 out.push(v);
+140 |                 i += 3;
+141 |                 continue;
+142 ~             }
+    |
+
+warning: this `if` statement can be collapsed
+   --> src/ltfs/index.rs:590:9
+    |
+590 | / ...   if self.cur_location.is_some() && (parent == "location" || parent == "previousgenerationlocation" || parent == "previousinc...
+591 | | ...       if let Some(loc) = self.cur_location.as_mut() {
+592 | | ...           match name.as_str() {
+593 | | ...               "partition" => loc.partition = trimmed.chars().next().unwrap_or('b'),
+...   |
+598 | | ...   }
+    | |_______^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+590 ~         if self.cur_location.is_some() && (parent == "location" || parent == "previousgenerationlocation" || parent == "previousincrementallocation")
+591 ~             && let Some(loc) = self.cur_location.as_mut() {
+592 |                 match name.as_str() {
+...
+596 |                 }
+597 ~             }
+    |
+
+warning: this `if` statement can be collapsed
+   --> src/ltfs/index.rs:613:9
+    |
+613 | /         if let Some(ext) = self.cur_extent.as_mut() {
+614 | |             if parent == "extent" {
+615 | |                 match name.as_str() {
+616 | |                     "partition" => ext.partition = trimmed.chars().next().unwrap_or('b'),
+...   |
+624 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+613 ~         if let Some(ext) = self.cur_extent.as_mut()
+614 ~             && parent == "extent" {
+615 |                 match name.as_str() {
+...
+622 |                 }
+623 ~             }
+    |
+
+warning: this `if` statement can be collapsed
+   --> src/ltfs/index.rs:655:9
+    |
+655 | /         if parent == "file" {
+656 | |             if let Some(file) = self.file_stack.last_mut() {
+657 | |                 match name.as_str() {
+658 | |                     "name" => file.name = text.clone(),
+...   |
+665 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+655 ~         if parent == "file"
+656 ~             && let Some(file) = self.file_stack.last_mut() {
+657 |                 match name.as_str() {
+...
+663 |                 }
+664 ~             }
+    |
+
+warning: this `if` statement can be collapsed
+   --> src/ltfs/index.rs:668:9
+    |
+668 | /         if parent == "directory" {
+669 | |             if let Some(dir) = self.dir_stack.last_mut() {
+670 | |                 match name.as_str() {
+671 | |                     "name" => dir.name = text.clone(),
+...   |
+675 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+668 ~         if parent == "directory"
+669 ~             && let Some(dir) = self.dir_stack.last_mut() {
+670 |                 match name.as_str() {
+...
+673 |                 }
+674 ~             }
+    |
+
+warning: this manual char comparison can be written more succinctly
+   --> src/ltfs/label.rs:248:27
+    |
+248 |     Ok(s.trim_end_matches(|c: char| c == ' ' || c == '\0').to_string())
+    |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using an array of `char`: `[' ', '\0']`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#manual_pattern_char_comparison
+    = note: `#[warn(clippy::manual_pattern_char_comparison)]` on by default
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> src/ltfs/mkltfs.rs:118:9
+    |
+118 |         &opts,
+    |         ^^^^^ help: change this to: `opts`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#needless_borrow
+    = note: `#[warn(clippy::needless_borrow)]` on by default
+
+warning: this expression creates a reference which is immediately dereferenced by the compiler
+   --> src/ltfs/mkltfs.rs:148:9
+    |
+148 |         &opts,
+    |         ^^^^^ help: change this to: `opts`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#needless_borrow
+
+warning: you should consider adding a `Default` implementation for `SgIoHdr`
+  --> src/scsi/sg_io.rs:74:5
+   |
+74 | /     pub fn new() -> Self {
+75 | |         Self {
+76 | |             interface_id: b'S' as i32,
+77 | |             dxfer_direction: SG_DXFER_NONE,
+...  |
+99 | |     }
+   | |_____^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#new_without_default
+   = note: `#[warn(clippy::new_without_default)]` on by default
+help: try adding this
+   |
+73 + impl Default for SgIoHdr {
+74 +     fn default() -> Self {
+75 +         Self::new()
+76 +     }
+77 + }
+   |
+
+warning: this `if` statement can be collapsed
+   --> src/scsi/sim.rs:957:5
+    |
+957 | /     if op != opcode::INQUIRY && op != opcode::REQUEST_SENSE {
+958 | |         if let Some(q) = st.drives[idx].pr.ua.get_mut(&initiator) {
+959 | |             if !q.is_empty() {
+960 | |                 let (asc, ascq) = q.remove(0);
+...   |
+964 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+957 ~     if op != opcode::INQUIRY && op != opcode::REQUEST_SENSE
+958 ~         && let Some(q) = st.drives[idx].pr.ua.get_mut(&initiator) {
+959 |             if !q.is_empty() {
+...
+962 |             }
+963 ~         }
+    |
+
+warning: this `if` statement can be collapsed
+   --> src/scsi/sim.rs:958:9
+    |
+958 | /         if let Some(q) = st.drives[idx].pr.ua.get_mut(&initiator) {
+959 | |             if !q.is_empty() {
+960 | |                 let (asc, ascq) = q.remove(0);
+961 | |                 return check(0x06, asc, ascq);
+962 | |             }
+963 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+958 ~         if let Some(q) = st.drives[idx].pr.ua.get_mut(&initiator)
+959 ~             && !q.is_empty() {
+960 |                 let (asc, ascq) = q.remove(0);
+961 |                 return check(0x06, asc, ascq);
+962 ~             }
+    |
+
+warning: this `if` statement can be collapsed
+   --> src/scsi/sim.rs:973:5
+    |
+973 | /     if let Some((h, _)) = st.drives[idx].pr.holder {
+974 | |         if h != initiator && op != opcode::INQUIRY && op != opcode::REQUEST_SENSE {
+975 | |             return Ok(Completion {
+976 | |                 status: 0x18,
+...   |
+981 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+973 ~     if let Some((h, _)) = st.drives[idx].pr.holder
+974 ~         && h != initiator && op != opcode::INQUIRY && op != opcode::REQUEST_SENSE {
+975 |             return Ok(Completion {
+...
+979 |             });
+980 ~         }
+    |
+
+warning: `tape-rs` (lib) generated 25 warnings (run `cargo clippy --fix --lib -p tape-rs -- ` to apply 22 suggestions)
+    Checking tape-rs v0.1.0 (/work/jay/tape-rs-ltfs-recovery-ibm-interop)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.26s

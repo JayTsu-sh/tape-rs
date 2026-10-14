@@ -1,0 +1,4 @@
+{"method": "DELETE", "name": "powercut.binary", "status": 201, "response": "{\"generation\":77,\"status\":\"committed\",\"task\":1}\n"}
+{"method": "DELETE", "name": "powercut.empty", "status": 201, "response": "{\"generation\":78,\"status\":\"committed\",\"task\":2}\n"}
+{"method": "POST", "name": "set", "status": 201, "response": "{\"generation\":79,\"status\":\"committed\",\"task\":3}\n"}
+PASS: original user attributes restored

@@ -1,0 +1,6 @@
+xml_schema_from_file -5030
+LTFS11111E Base64 decoder: empty input.
+LTFS17028E XML parser: base64 decoding failed.
+LTFS17270E XML parser: Detected invalid extendedattributes in a file (file).
+LTFS17012E Cannot parse index from file '/home/rocky/tape-rs-xattr-20260924/xattr-bad.xml' (-5030).
+xml_schema_from_file 0

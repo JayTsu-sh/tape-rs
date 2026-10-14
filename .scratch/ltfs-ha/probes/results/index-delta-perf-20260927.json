@@ -1,0 +1,83 @@
+[
+  {
+    "changed": 1,
+    "files": 10000,
+    "replay_verified": true,
+    "seconds": 0.622853437,
+    "xml_bytes": 1311,
+    "version": "before",
+    "repetition": 0
+  },
+  {
+    "changed": 1,
+    "files": 10000,
+    "replay_verified": true,
+    "seconds": 0.606182462,
+    "xml_bytes": 1311,
+    "version": "before",
+    "repetition": 1
+  },
+  {
+    "changed": 1,
+    "files": 10000,
+    "replay_verified": true,
+    "seconds": 0.6004127,
+    "xml_bytes": 1311,
+    "version": "before",
+    "repetition": 2
+  },
+  {
+    "changed": 1,
+    "files": 10000,
+    "replay_verified": true,
+    "seconds": 0.003952794,
+    "xml_bytes": 1311,
+    "version": "after",
+    "repetition": 0
+  },
+  {
+    "changed": 1,
+    "files": 10000,
+    "replay_verified": true,
+    "seconds": 0.003964625,
+    "xml_bytes": 1311,
+    "version": "after",
+    "repetition": 1
+  },
+  {
+    "changed": 1,
+    "files": 10000,
+    "replay_verified": true,
+    "seconds": 0.004056215,
+    "xml_bytes": 1311,
+    "version": "after",
+    "repetition": 2
+  },
+  {
+    "changed": 1,
+    "files": 100000,
+    "replay_verified": true,
+    "seconds": 0.051734739,
+    "xml_bytes": 1313,
+    "version": "after",
+    "repetition": 0
+  },
+  {
+    "changed": 1,
+    "files": 100000,
+    "replay_verified": true,
+    "seconds": 0.055131882,
+    "xml_bytes": 1313,
+    "version": "after",
+    "repetition": 1
+  },
+  {
+    "changed": 1,
+    "files": 100000,
+    "replay_verified": true,
+    "seconds": 0.052304384,
+    "xml_bytes": 1313,
+    "version": "after",
+    "repetition": 2
+  }
+]

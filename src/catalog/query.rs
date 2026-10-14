@@ -100,7 +100,10 @@ pub fn capacity_by_barcode(catalog: &Catalog) -> Result<HashMap<String, Capacity
         let remaining: i64 = r.get(2)?;
         out.insert(
             barcode,
-            CapacitySnapshot { total: total as u64, remaining: remaining as u64 },
+            CapacitySnapshot {
+                total: total as u64,
+                remaining: remaining as u64,
+            },
         );
     }
     Ok(out)

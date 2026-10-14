@@ -1,0 +1,5 @@
+max_active_device=7  def_reserved_size=32768
+ >>> device=sg3 17:0:0:0   em=0 sg_tablesize=64 excl=0 open_cnt=1
+   FD(1): timeout=60000ms bufflen=1048576 (res)sgat=32 low_dma=0
+   cmd_q=1 f_packid=0 k_orphan=0 closed=0
+     rb>> act: id=0 blen=65536 t_o/elap=120000/840ms sgat=2 op=0x08

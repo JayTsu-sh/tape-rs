@@ -1,0 +1,2 @@
+2026-09-27 06:42:56 GLESL771I: During a node up or down operation, the "eeadm node list" command might report the state of the node as having an error.
+2026-09-27 06:43:04 GLESL656I: Node 2 is enabled.

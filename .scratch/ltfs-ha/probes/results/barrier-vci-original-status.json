@@ -1,0 +1,45 @@
+{
+  "applied_index": 274,
+  "drives": 2,
+  "executor": {
+    "fenced": true,
+    "node": 1,
+    "round": 271,
+    "term": 33
+  },
+  "id": 1,
+  "last_reclaim": null,
+  "leader": 1,
+  "local": "\u8f6e\u6b21 271\uff1a\u670d\u52a1\u4e2d\u3002IBMtaper2287 (/dev/sg10) [TS1001L08]: gen=72 \u6587\u4ef6 27 \u4e2a \u5c3e\u90e8 Complete\uff1b\u53ef\u7528 32 MiB",
+  "pools": [
+    {
+      "file_limit": 50,
+      "name": "rc",
+      "tapes": [
+        "TS1000L08",
+        "TS1001L08"
+      ],
+      "uuid": "0ba1b026-9595-4b86-9056-c54c7858e744"
+    }
+  ],
+  "role": "Leader",
+  "tapes": [
+    {
+      "barcode": "TS1000L08",
+      "bytes_used": 0,
+      "bytes_written": 2097152,
+      "files": 0,
+      "generation": 2,
+      "state": "appendable"
+    },
+    {
+      "barcode": "TS1001L08",
+      "bytes_used": 51450880,
+      "bytes_written": 91226112,
+      "files": 19,
+      "generation": 72,
+      "state": "appendable"
+    }
+  ],
+  "term": 33
+}

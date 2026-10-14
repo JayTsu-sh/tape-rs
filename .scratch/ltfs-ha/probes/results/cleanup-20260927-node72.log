@@ -1,0 +1,22 @@
+[2026-09-27T03:20:38Z INFO  tape_rs::daemon::net] 节点间通信监听 0.0.0.0:7500
+[2026-09-27T03:20:38Z INFO  tape_rs::daemon::http] 客户端接口监听 0.0.0.0:7501
+[2026-09-27T03:20:38Z INFO  raft::raft] switched to configuration, raft_id: 2, config: Configuration { voters: Configuration { incoming: Configuration { voters: {1, 2, 3} }, outgoing: Configuration { voters: {} } }, learners: {}, learners_next: {}, auto_leave: false }
+[2026-09-27T03:20:38Z INFO  raft::raft] became follower at term 7, raft_id: 2, term: 7
+[2026-09-27T03:20:38Z INFO  raft::raft] newRaft, raft_id: 2, peers: Configuration { incoming: Configuration { voters: {1, 2, 3} }, outgoing: Configuration { voters: {} } }, last term: 7, last index: 99, applied: 0, commit: 99, term: 7
+[2026-09-27T03:20:38Z INFO  raft::raw_node] RawNode created with id 2., raft_id: 2, id: 2
+[2026-09-27T03:20:38Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 2
+[2026-09-27T03:20:38Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 49
+[2026-09-27T03:20:38Z INFO  tape_rs::daemon::node] 节点 3 成为执行者，轮次 78
+[2026-09-27T03:20:38Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 84
+[2026-09-27T03:20:40Z INFO  raft::raft] [logterm: 7, index: 99, vote: 2] cast vote for 1 [logterm: 7, index: 99] at term 7, raft_id: 2, msg type: MsgRequestPreVote, term: 7, msg_index: 99, msg_term: 7, from: 1, vote: 2, log_index: 99, log_term: 7
+[2026-09-27T03:20:40Z INFO  raft::raft] received a message with higher term from 1, raft_id: 2, msg type: MsgRequestVote, message_term: 8, term: 7, from: 1
+[2026-09-27T03:20:40Z INFO  raft::raft] became follower at term 8, raft_id: 2, term: 8
+[2026-09-27T03:20:40Z INFO  raft::raft] [logterm: 7, index: 99, vote: 0] cast vote for 1 [logterm: 7, index: 99] at term 8, raft_id: 2, msg type: MsgRequestVote, term: 8, msg_index: 99, msg_term: 7, from: 1, vote: 0, log_index: 99, log_term: 7
+[2026-09-27T03:20:40Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 101
+[2026-09-27T03:21:03Z INFO  raft::raft] [logterm: 8, index: 114, vote: 1] cast vote for 3 [logterm: 8, index: 114] at term 8, raft_id: 2, msg type: MsgRequestPreVote, term: 8, msg_index: 114, msg_term: 8, from: 3, vote: 1, log_index: 114, log_term: 8
+[2026-09-27T03:21:03Z INFO  raft::raft] received a message with higher term from 3, raft_id: 2, msg type: MsgRequestVote, message_term: 9, term: 8, from: 3
+[2026-09-27T03:21:03Z INFO  raft::raft] became follower at term 9, raft_id: 2, term: 9
+[2026-09-27T03:21:03Z INFO  raft::raft] [logterm: 8, index: 114, vote: 0] cast vote for 3 [logterm: 8, index: 114] at term 9, raft_id: 2, msg type: MsgRequestVote, term: 9, msg_index: 114, msg_term: 8, from: 3, vote: 0, log_index: 114, log_term: 8
+[2026-09-27T03:21:03Z INFO  tape_rs::daemon::node] 节点 3 成为执行者，轮次 116
+[2026-09-27T03:22:19Z INFO  ltfsd] 收到停机信号，正在计划停机（再按一次直接退出）
+[2026-09-27T03:22:19Z INFO  tape_rs::daemon::node] 节点 2 停机

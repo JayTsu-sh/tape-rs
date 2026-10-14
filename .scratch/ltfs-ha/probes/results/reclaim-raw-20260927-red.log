@@ -1,0 +1,19 @@
+   Compiling tape-rs v0.1.0 (/work/jay/tape-rs-ltfs-recovery-ibm-interop)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.11s
+     Running tests/ltfsd_cluster.rs (/work/cargo-target/debug/deps/ltfsd_cluster-fef60eb6cf3447a6)
+
+running 1 test
+
+thread 'reclaim_takeover_after_format_before_labels_preserves_symlinks' (3279067) panicked at tests/ltfsd_cluster.rs:504:13:
+等待超时: 新执行者完成回收 [NodeStatus { id: 1, role: "Follower", term: 2, leader: 2, executor: Some(Executor { node: 2, term: 2, round: 16, fenced: true }), local: "空闲", applied_index: 20, pools: [PoolRow { uuid: "00000000-0000-4000-8000-000000000001", name: "pool", file_limit: 100, tapes: ["PA0001L8", "PA0002L8"] }], tapes: {"PA0001L8": TapeRow { state: "appendable", generation: 3, files: 7, bytes_used: 14, bytes_written: 1048576 }, "PA0002L8": TapeRow { state: "appendable", generation: 3, files: 7, bytes_used: 14, bytes_written: 1048576 }}, drives: 2, last_reclaim: None }, NodeStatus { id: 2, role: "Leader", term: 2, leader: 2, executor: Some(Executor { node: 2, term: 2, round: 16, fenced: true }), local: "轮次 16：服务中。drive1 [PA0002L8]: gen=3 文件 7 个 尾部 Complete；可用 56 MiB", applied_index: 20, pools: [PoolRow { uuid: "00000000-0000-4000-8000-000000000001", name: "pool", file_limit: 100, tapes: ["PA0001L8", "PA0002L8"] }], tapes: {"PA0001L8": TapeRow { state: "appendable", generation: 3, files: 7, bytes_used: 14, bytes_written: 1048576 }, "PA0002L8": TapeRow { state: "appendable", generation: 3, files: 7, bytes_used: 14, bytes_written: 1048576 }}, drives: 2, last_reclaim: Some(ReclaimRecord { round: 16, barcode: "PA0001L8", outcome: "abandoned", detail: "SCSI command failed: status=0x02, sense_key=0x08, asc=0x00, ascq=0x05" }) }, NodeStatus { id: 3, role: "PreCandidate", term: 1, leader: 0, executor: Some(Executor { node: 3, term: 1, round: 2, fenced: true }), local: "已停手：不再是 Leader", applied_index: 14, pools: [PoolRow { uuid: "00000000-0000-4000-8000-000000000001", name: "pool", file_limit: 100, tapes: ["PA0001L8", "PA0002L8"] }], tapes: {"PA0001L8": TapeRow { state: "reclaiming", generation: 3, files: 7, bytes_used: 14, bytes_written: 1048576 }, "PA0002L8": TapeRow { state: "appendable", generation: 3, files: 7, bytes_used: 14, bytes_written: 1048576 }}, drives: 2, last_reclaim: None }]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test reclaim_takeover_after_format_before_labels_preserves_symlinks ... FAILED
+
+failures:
+
+failures:
+    reclaim_takeover_after_format_before_labels_preserves_symlinks
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 40 filtered out; finished in 22.09s
+
+error: test failed, to rerun pass `--test ltfsd_cluster`

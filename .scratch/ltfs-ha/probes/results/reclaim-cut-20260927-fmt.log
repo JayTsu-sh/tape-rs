@@ -1,0 +1,91 @@
+cargo fmt --all -- --check: exit 1 (existing repository-wide formatting differences)
+New test blocks were formatted separately. Full local output: /tmp/tape-rs-reclaim-cut-fmt-20260927.log
+Full-output SHA256: ad9022785e967739fb8b69ee6a1c9fa1eda4c38c49e85809bf5f8819abf1f35c
+
+Files with differences:
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/bin/ltfsctl.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/bin/ltfsd.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/bin/tape-fuse.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/catalog/db.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/catalog/query.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/catalog/sync.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/changer/commands.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/changer/element.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/cli/catalog_cli.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/cli/changer.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/cli/inquiry.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/cli/ltfs_cli.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/cli/tape.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/client.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/daemon/directory.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/daemon/executor.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/daemon/files.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/daemon/http.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/daemon/net.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/daemon/node.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/daemon/state.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/daemon/store.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/error.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/ltfs/index.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/ltfs/label.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/ltfs/mam.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/ltfs/mod.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/ltfs/recovery.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/ltfs/volume.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/main.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/scsi/cdb.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/scsi/device.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/scsi/mod.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/scsi/reservation.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/scsi/sim.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/tape/commands.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/src/tapefs.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/tests/ltfsd_cluster.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/tests/sim_close_tail.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/tests/sim_commit_faults.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/tests/sim_fencing.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/tests/sim_ltfs.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/tests/sim_recovery.rs
+/work/jay/tape-rs-ltfs-recovery-ibm-interop/tests/volume_state.rs
+
+First 40 lines of the full output:
+Diff in /work/jay/tape-rs-ltfs-recovery-ibm-interop/src/bin/ltfsctl.rs:93:
+                     len,
+                     o.generation,
+                     o.attempts,
+-                    if o.resolved_by_query { "  (经查询判定)" } else { "" }
++                    if o.resolved_by_query {
++                        "  (经查询判定)"
++                    } else {
++                        ""
++                    }
+                 );
+             }
+             Cmd::Get { path, output } => {
+Diff in /work/jay/tape-rs-ltfs-recovery-ibm-interop/src/bin/ltfsctl.rs:109:
+                 None => println!("不存在"),
+                 Some(p) => {
+                     if p.state != "committed" {
+-                        println!("{}  已接收 {} 字节", if p.state == "staged" { "已暂存，等待落带" } else { "上传中" }, p.length);
++                        println!(
++                            "{}  已接收 {} 字节",
++                            if p.state == "staged" {
++                                "已暂存，等待落带"
++                            } else {
++                                "上传中"
++                            },
++                            p.length
++                        );
+                     }
+                     match p.current {
+                         Some(s) => println!(
+Diff in /work/jay/tape-rs-ltfs-recovery-ibm-interop/src/bin/ltfsctl.rs:116:
+                             "{}  {} 字节  索引代数 {}  磁带 {}  sha256 {}",
+-                            if p.state == "committed" { "已提交" } else { "当前版本" },
++                            if p.state == "committed" {
++                                "已提交"
++                            } else {
++                                "当前版本"
++                            },
+                             s.length,
+                             s.generation,

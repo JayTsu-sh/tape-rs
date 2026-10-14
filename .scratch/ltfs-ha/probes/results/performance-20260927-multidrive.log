@@ -1,0 +1,18 @@
+Traceback (most recent call last):
+  File "/home/rocky/tape-rs-performance-20260927/performance-20260927.py", line 62, in <module>
+    batch('switch-volume',1,128*2**20,1)
+  File "/home/rocky/tape-rs-performance-20260927/performance-20260927.py", line 26, in batch
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:rows=list(pool.map(put,range(count)))
+  File "/usr/lib64/python3.9/concurrent/futures/_base.py", line 609, in result_iterator
+    yield fs.pop().result()
+  File "/usr/lib64/python3.9/concurrent/futures/_base.py", line 446, in result
+    return self.__get_result()
+  File "/usr/lib64/python3.9/concurrent/futures/_base.py", line 391, in __get_result
+    raise self._exception
+  File "/usr/lib64/python3.9/concurrent/futures/thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+  File "/home/rocky/tape-rs-performance-20260927/performance-20260927.py", line 24, in put
+    path=f'{directory}/f{i:05}';data=payload(path,size);start=time.monotonic();status,v=req('PUT','/files'+path,data)
+  File "/home/rocky/tape-rs-performance-20260927/performance-20260927.py", line 9, in req
+    assert status in (200,201,202),(method,path,status,data[:500])
+AssertionError: ('PUT', '/files/sr/performance-20260927-r1/switch-volume/f00000', 503, b'{"detail":"SR2501L8 \xe5\x89\xa9\xe4\xbd\x99 61691268 \xe5\xad\x97\xe8\x8a\x82\xef\xbc\x8c\xe6\x94\xbe\xe4\xb8\x8d\xe4\xb8\x8b 134217728 \xe5\xad\x97\xe8\x8a\x82","error":"switching_tape"}\n')

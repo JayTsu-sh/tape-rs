@@ -1,0 +1,19 @@
+   Compiling tape-rs v0.1.0 (/work/jay/tape-rs-ltfs-recovery-ibm-interop)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.05s
+     Running tests/ltfsd_cluster.rs (/work/cargo-target/debug/deps/ltfsd_cluster-fef60eb6cf3447a6)
+
+running 1 test
+
+thread 'checkpoint_ownership_loss_during_cross_tape_read_is_retried' (3303308) panicked at tests/ltfsd_cluster.rs:2823:27:
+called `Result::unwrap()` on an `Err` value: Rejected { status: 500, body: "{\"detail\":\"写入带检查点失败: Commit failed at index_records: SCSI command failed: status=0x02, sense_key=0x06, asc=0x2a, ascq=0x03\",\"error\":\"read_failed\"}\n" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test checkpoint_ownership_loss_during_cross_tape_read_is_retried ... FAILED
+
+failures:
+
+failures:
+    checkpoint_ownership_loss_during_cross_tape_read_is_retried
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 43 filtered out; finished in 1.10s
+
+error: test failed, to rerun pass `--test ltfsd_cluster`

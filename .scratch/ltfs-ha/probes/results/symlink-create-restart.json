@@ -1,0 +1,1 @@
+{"drives":2,"executor":{"fenced":true,"node":1,"round":302},"id":1,"last_reclaim":null,"leader":1,"local":"轮次 302：服务中。IBMtaper2287 (/dev/sg10) [RT2502L8]: gen=99 文件 36 个 尾部 Complete；可用 62 MiB","role":"Leader","serving_round":302,"term":33}

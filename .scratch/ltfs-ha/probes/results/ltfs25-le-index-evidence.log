@@ -1,0 +1,10 @@
+partitions/partition-1/data_000000.seg offset 52559986 sha256 bdb63bfa3349852da03f7de6bcb8bc0cd90eff40ce45269a5c1afacda531e6f7
+<ltfsindex version="2.4.0">
+
+<creator>IBM LTFS 2.4.8.3 (10521) - Linux - ltfs.tape.library - Sync by EA
+<generationnumber>40
+partitions/partition-0/data_000000.seg offset 502268 sha256 3b591d6f81118ef0c84fb7c6011368623407f71843de270ddd69af5f42d3fd92
+<ltfsindex version="2.4.0">
+
+<creator>IBM LTFS 2.4.8.3 (10521) - Linux - ltfs.tape.library - Unmount - 0
+<generationnumber>40

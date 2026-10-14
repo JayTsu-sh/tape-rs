@@ -1,0 +1,1 @@
+{"mode": "le", "length": 65557, "sha256": "dba4ff0e067063e9713866943bacdc7c603d0024f2cc9e65fd526db5cab227dc", "mtime_ns": 1790482807776757605, "target_mtime_ns": 1790300179936707884, "links": {"relative": "target", "dangling": "../absent & 中文%?#", "directory": "subdir", "loop": "loop", "中文": "target", "chain": "relative"}, "passed": true}

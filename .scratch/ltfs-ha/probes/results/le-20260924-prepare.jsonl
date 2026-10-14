@@ -1,0 +1,12 @@
+{"name": "readonly_mmap", "status": "PASS", "detail": {"bytes": 65536, "sha256": "7daca2095d0438260fa849183dfc67faa459fdf4936e1bc91eec6b281b27e4c2", "shared": true, "private": true, "after_fd_close": true}, "seconds": 0.0712}
+{"name": "file_io", "status": "PASS", "detail": "open/creat/close/read/write/pread/pwrite/readv/writev/lseek/dup/dup2/stat/fstat", "seconds": 0.0015}
+{"name": "multi_writer_append", "status": "PASS", "detail": "two writers; random overwrite and append; closing one preserves the other", "seconds": 0.0025}
+{"name": "truncate_sparse_64bit", "status": "PASS", "detail": "shrink/grow/zero-filled holes; 64-bit offset >4 GiB; final size 16", "seconds": 0.0031}
+{"name": "rename_file_unlink_open", "status": "PASS", "detail": "overwrite preserves source inode; old target fd preserved; write after rename; unlink open writer", "seconds": 0.0059}
+{"name": "directory_operations", "status": "PASS", "detail": {"nonempty_rename_errno": 39, "directory_inode_preserved": true}, "seconds": 0.0051}
+{"name": "chroot_child", "status": "PASS", "detail": "chroot restricted to child process", "seconds": 0.0019}
+{"name": "symlink_readlink_lstat_lchown", "status": "PASS", "detail": {"link_uid": 0, "link_gid": 0}, "seconds": 0.001}
+{"name": "permissions", "status": "FAIL", "error": "expected failure", "errno": null, "traceback": "Traceback (most recent call last):\n  File \"/tmp/codex-le-capabilities-20260924.py\", line 27, in check\n    detail = fn()\n  File \"/tmp/codex-le-capabilities-20260924.py\", line 207, in permissions\n    detail['readonly_errno'] = expect_errno(try_write,(errno.EACCES,errno.EPERM,errno.EROFS))\n  File \"/tmp/codex-le-capabilities-20260924.py\", line 41, in expect_errno\n    raise AssertionError('expected failure')\nAssertionError: expected failure\n", "seconds": 0.002}
+{"name": "xattrs", "status": "PASS", "detail": {"create_existing_errno": 17, "removed_errno": 61}, "seconds": 0.0015}
+{"name": "statfs_fstatfs", "status": "PASS", "detail": {"block_size": 524288, "blocks": 4294967295, "free": 4294967295}, "seconds": 0.0005}
+{"name": "sync_boundaries", "status": "PASS", "detail": {"before": "6", "after_fdatasync": "6", "after_fsync": "6", "after_sync": "6", "after_ltfs_sync": "7"}, "seconds": 0.3556}

@@ -1,0 +1,165 @@
+18a0be LTFS14000I LTFS starting, LTFS version 2.4.8.2 (10520), log level 2.
+18a0be LTFS14058I LTFS Format Specification version 2.4.0.
+18a0be LTFS14104I Launched by "/opt/ibm/ltfsle/bin/ltfs /root/tape-rs-io-20260927/le-mount -f -o changer_devname=/dev/sg5 -o work_directory=/root/tape-rs-io-20260927/le-work -o admin_port=17600 -o sync_type=unmount -o volser_only_folder".
+18a0be LTFS14105I This binary is built for Linux (x86_64).
+18a0be LTFS14106I GCC version is 11.5.0 20240719 (Red Hat 11.5.0-5).
+18a0be LTFS17087I Kernel version: Linux version 5.14.0-611.5.1.el9_7.x86_64 (mockbuild@iad1-prod-build001.bld.equ.rockylinux.org) (gcc (GCC) 11.5.0 20240719 (Red Hat 11.5.0-11), GNU ld version 2.35.2-67.el9) #1 SMP PREEMPT_DYNAMIC Tue Nov 11 22:20:27 UTC 2025 i386.
+18a0be LTFS17089I Distribution: NAME="Rocky Linux".
+18a0be LTFS17089I Distribution: Rocky Linux release 9.7 (Blue Onyx).
+18a0be LTFS17089I Distribution: Rocky Linux release 9.7 (Blue Onyx).
+18a0be LTFS17089I Distribution: Rocky Linux release 9.7 (Blue Onyx).
+18a0be LTFS14064I Sync type is "unmount".
+18a0be LTFS17085I Plugin: Loading "sg" tape backend.
+18a0be LTFS17085I Plugin: Loading "unified" iosched backend.
+18a0be LTFS17085I Plugin: Loading "sg" changer backend.
+18a0be LTFS17085I Plugin: Loading "ondemand" dcache backend.
+18a0be LTFS17085I Plugin: Loading "memory" crepos backend.
+18a0be LTFS11593I LTFS starts with a product license version (20130412_2702).
+18a0be LTFS40245I Opening a changer device through sg-changer driver (/dev/sg5).
+18a0be LTFS40252I Opened SCSI changer device 17.0.0.1 (/dev/sg5).
+18a0be LTFS40249I Vendor ID is IBM     .
+18a0be LTFS40250I Product ID is 3573-TL         .
+18a0be LTFS40214I Firmware revision is 1711.
+18a0be LTFS40215I Changer serial is 55L3A7802K19LL01.
+18a0be LTFS40205I INQUIRY LOW (0x12) returns -20501.
+18a0be LTFS30209I Opening a device through sg-ibmtape driver (11EB4A80F1).
+18a0be LTFS30288I Opening a tape device for drive serial 11EB4A80F1.
+18a0be LTFS30250I Opened the SCSI tape device 16.0.0.0 (/dev/sg4).
+18a0be LTFS30207I Vendor ID is IBM     .
+18a0be LTFS30208I Product ID is ULT3580-TD9     .
+18a0be LTFS30214I Firmware revision is R3G0.
+18a0be LTFS30215I Drive serial is 11EB4A80F1.
+18a0be LTFS30205I TEST_UNIT_READY (0x00) returns -20209.
+18a0be LTFS30290I Changer /dev/sg4 isn't reserved from any nodes.
+18a0be LTFS30285I The reserved buffer size of 11EB4A80F1 is 1048576.
+18a0be LTFS30294I Setting up timeout values from RSOC.
+18a0be LTFS30205I TEST_UNIT_READY (0x00) returns -20209.
+18a0be LTFS17160I Maximum device block size is 1048576.
+18a0be LTFS16500I Cartridge repository plugin is initialized (memory, /root/tape-rs-io-20260927/le-work/55L3A7802K19LL01).
+18a0be LTFS11545I Rebuilding the cartridge inventory.
+18a0be LTFS11627I Getting Inventory - 55L3A7802K19LL01.
+18a0be LTFS11629I Aqcuireing MoveLock - 55L3A7802K19LL01.
+18a0be LTFS11630I Aqcuired Move Lock (6) - 55L3A7802K19LL01.
+18a0be LTFS11628I Got Inventory - 55L3A7802K19LL01.
+18a0be LTFS11637I Reset the cartridge link against the drive 11EB4A80F1.
+18a0be LTFS11638I Cartridge CLNU03L1 was unassigned because it is in a IE slot.
+18a0be LTFS11571I State of tape 'CLNU03L1' in slot 0x66 is changed from 'INIT' to 'NON_SUPPORTED_TAPE'.
+18a0be LTFS11571I State of tape 'AA0017L8' in slot 0x3e9 is changed from 'INIT' to 'NOT_MOUNTED_YET'.
+18a0be LTFS11571I State of tape 'AA0018L8' in slot 0x3ea is changed from 'INIT' to 'NOT_MOUNTED_YET'.
+18a0be LTFS11571I State of tape 'AA0014L8' in slot 0x3eb is changed from 'INIT' to 'NOT_MOUNTED_YET'.
+18a0be LTFS11571I State of tape 'AA0015L8' in slot 0x3ec is changed from 'INIT' to 'NOT_MOUNTED_YET'.
+18a0be LTFS11571I State of tape 'AA0016L8' in slot 0x3ed is changed from 'INIT' to 'NOT_MOUNTED_YET'.
+18a0be LTFS11571I State of tape 'L00283L8' in slot 0x3ee is changed from 'INIT' to 'NOT_MOUNTED_YET'.
+18a0be LTFS11571I State of tape 'RC0018L9' in slot 0x3ef is changed from 'INIT' to 'WRITABLE'.
+18a0be LTFS11571I State of tape 'RC0017L9' in slot 0x3f0 is changed from 'INIT' to 'NOT_MOUNTED_YET'.
+18a0be LTFS11720I Built the cartridge inventory (0).
+18a0be LTFS11774I Starting volume cache cleaning.
+18a0be LTFS11775I Volume cache cleaning is finished
+18a0be LTFS16566I Starting repos file cleaning.
+18a0be LTFS16567I Repos file cleaning is finished.
+18a0be LTFS11776I Starting volume cache load.
+18a0be LTFS11732I Loading cache for cartridge RC0018L9.
+18a0be LTFS11733I Loading volume cache for cartridge RC0018L9.
+18a0be LTFS11743I Reading index of RC0018L9 from volume cache (3276 files).
+18a0be LTFS11745I Read index of RC0018L9 from volume cache.
+18a0be LTFS11777I Loaded required volume caches.
+18a0be LTFS14708I LTFS admin server version 2 is starting on port 17600.
+18a0be LTFS14111I Initial setup completed successfully.
+18a0be LTFS14112I Invoke 'mount' command to check the result of final setup.
+18a0be LTFS14113I Specified mount point is listed if succeeded.
+18a0dd LTFS14029I Ready to receive file system requests.
+18a0e7 LTFS14784I Removing cartridge RC0018L9.
+18a0e7 LTFS11638I Cartridge RC0018L9 was unassigned because an error happens in a file system operation or it is unassigned from OOB.
+18a0e7 LTFS11632I Remove volume cache files - RC0018L9.
+18a0e7 LTFS11571I State of tape 'RC0018L9' in slot 0x3ef is changed from 'WRITABLE' to 'NEED_ASSIGN'.
+18a0e7 LTFS14785I Cartridge RC0018L9 is removed successfully.
+18a0ef LTFS14781I Adding cartridge RC0018L9.
+18a0ef LTFS11571I State of tape 'RC0018L9' in slot 0x3ef is changed from 'NEED_ASSIGN' to 'WRITABLE'.
+18a0ef LTFS14782I Cartridge RC0018L9 is added successfully.
+18a11e LTFS14802I Moving cartridge RC0018L9.
+18a11e LTFS14812I Moving cartridge RC0018L9 from 1007 to 1 - 55L3A7802K19LL01 .
+18a11e LTFS11629I Aqcuireing MoveLock - 55L3A7802K19LL01.
+18a11e LTFS11630I Aqcuired Move Lock (10) - 55L3A7802K19LL01.
+18a11e LTFS14813I Moved cartridge RC0018L9 to 1 successfully - 55L3A7802K19LL01.
+18a11e LTFS11635I Link the drive 11EB4A80F1 to the cartridge RC0018L9.
+18a11e LTFS14803I Cartridge RC0018L9 is moved successfully.
+18a0dd LTFS11616I Mounting cartridge RC0018L9.
+18a0dd LTFS11613I Moving cartridge RC0018L9 to drive 11EB4A80F1.
+18a0dd LTFS11626I Cartridge RC0018L9 is already in drive 11EB4A80F1.
+18a0dd LTFS11746I Mounting RC0018L9 on 11EB4A80F1.
+18a0dd LTFS11330I Loading cartridge.
+18a0dd LTFS30205I LOAD_UNLOAD (0x1b) returns -20601.
+18a0dd LTFS30252I Logical block protection is disabled.
+18a0dd LTFS11332I Load successful.
+18a0dd LTFS17157I Changing the drive setting to append-only mode.
+18a0dd LTFS11005I Mounting the volume.
+18a0dd LTFS30252I Logical block protection is disabled.
+18a0dd LTFS30205I READ_ATTR (0x8c) returns -20501.
+18a0dd LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg4.
+18a0dd LTFS30233I Cannot read attribute (-20501).
+18a0dd LTFS11336I The attribute does not exist. Ignore the expected error.
+18a0dd LTFS30205I READ_ATTR (0x8c) returns -20501.
+18a0dd LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg4.
+18a0dd LTFS30205I READ_ATTR (0x8c) returns -20501.
+18a0dd LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg4.
+18a0dd LTFS30205I READ_ATTR (0x8c) returns -20501.
+18a0dd LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg4.
+18a0dd LTFS30233I Cannot read attribute (-20501).
+18a0dd LTFS30205I READ_ATTR (0x8c) returns -20501.
+18a0dd LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg4.
+18a0dd LTFS30233I Cannot read attribute (-20501).
+18a0dd LTFS17227I Tape attribute: Vendor = tap.
+18a0dd LTFS17227I Tape attribute: Application Name = tap.
+18a0dd LTFS17227I Tape attribute: Application Version = 0.1.
+18a0dd LTFS17227I Tape attribute: Medium Label = .
+18a0dd LTFS17228I Tape attribute: Text Localization ID = 0x00.
+18a0dd LTFS17227I Tape attribute: Barcode = RC0.
+18a0dd LTFS17227I Tape attribute: Application Format Version = 2.4.
+18a0dd LTFS17228I Tape attribute: Volume Lock Status = 0x00.
+18a0dd LTFS17227I Tape attribute: Media Pool name = .
+18a0dd LTFS11031I Volume mounted successfully. RC0018 : Gen = 17 / (a, 5) -> (b, 38065) / 11EB4A80F1.
+18a0dd LTFS11664I Cartridge 'RC0018L9' is mounted on node 'lisa-143'.
+18a0dd LTFS11741I Writing index of RC0018L9 to volume cache (Reason: (null), 3145 files).
+18a0dd LTFS11410I Wrote index cache of RC0018L9.
+18a0dd LTFS30205I READ_ATTR (0x8c) returns -20501.
+18a0dd LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg4.
+18a0dd LTFS30233I Cannot read attribute (-20501).
+18a0dd LTFS11336I The attribute does not exist. Ignore the expected error.
+18a0dd LTFS30205I READ_ATTR (0x8c) returns -20501.
+18a0dd LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg4.
+18a0dd LTFS30233I Cannot read attribute (-20501).
+18a0dd LTFS11336I The attribute does not exist. Ignore the expected error.
+18a0dd LTFS11747I Mounted RC0018L9 on 11EB4A80F1.
+18a0dd LTFS11617I Mounted cartridge RC0018L9 successfully.
+18b137 LTFS14802I Moving cartridge RC0018L9.
+18b137 LTFS11748I Unmounting RC0018L9 from 11EB4A80F1.
+18b137 LTFS30205I READ_ATTR (0x8c) returns -20501.
+18b137 LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg4.
+18b137 LTFS30233I Cannot read attribute (-20501).
+18b137 LTFS11336I The attribute does not exist. Ignore the expected error.
+18b137 LTFS30205I READ_ATTR (0x8c) returns -20501.
+18b137 LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg4.
+18b137 LTFS30233I Cannot read attribute (-20501).
+18b137 LTFS11336I The attribute does not exist. Ignore the expected error.
+18b137 LTFS17265I Skip writing the index because of the volume is not dirty and current self pointer points IP.
+18b137 LTFS11034I Volume unmounted successfully.
+18b137 LTFS30205I READ_ATTR (0x8c) returns -20501.
+18b137 LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg4.
+18b137 LTFS30233I Cannot read attribute (-20501).
+18b137 LTFS11336I The attribute does not exist. Ignore the expected error.
+18b137 LTFS11787I Capturing cartridge statistics for RC0018L9.
+18b137 LTFS11289I Ejecting cartridge.
+18b137 LTFS12022I Unloading medium.
+18b137 LTFS11291I Eject successful.
+18b137 LTFS11749I Unmounted RC0018L9 from 11EB4A80F1.
+18b137 LTFS14812I Moving cartridge RC0018L9 from 1 to 1007 - 55L3A7802K19LL01 .
+18b137 LTFS11629I Aqcuireing MoveLock - 55L3A7802K19LL01.
+18b137 LTFS11630I Aqcuired Move Lock (10) - 55L3A7802K19LL01.
+18b137 LTFS11636I Unlink the drive 11EB4A80F1 from the cartridge RC0018L9.
+18b137 LTFS14813I Moved cartridge RC0018L9 to 1007 successfully - 55L3A7802K19LL01.
+18b137 LTFS14803I Cartridge RC0018L9 is moved successfully.
+18a0be LTFS16501I Cartridge repository plugin is uninitialized (memory).
+18a0be LTFS30205I TEST_UNIT_READY (0x00) returns -20209.
+18a0be LTFS30205I TEST_UNIT_READY (0x00) returns -20209.
+18a0be LTFS30205I TEST_UNIT_READY (0x00) returns -20209.
+18a0be LTFS30252I Logical block protection is disabled.

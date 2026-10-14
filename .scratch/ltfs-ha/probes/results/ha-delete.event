@@ -1,0 +1,1 @@
+{"method": "DELETE", "path": "/files/rc/ha-delete.bin?wait=1", "mode": "response", "status": 200, "body": "{\"generation\":11,\"status\":\"committed\",\"task\":1}\n", "upstream": "10.131.9.72"}

@@ -1,0 +1,5 @@
+10.131.9.71:7401  {"drives":2,"executor":{"fenced":true,"node":1,"round":109},"id":1,"last_reclaim":null,"leader":1,"local":"轮次 109：服务中。IBMtaper2287 (/dev/sg10) [TS1001L08]: gen=39 文件 15 个 尾部 Complete；可用 48 MiB","role":"Leader","serving_round":109,"term":9}
+10.131.9.72:7401  {"drives":2,"executor":{"fenced":true,"node":1,"round":109},"id":2,"last_reclaim":null,"leader":1,"local":"空闲","role":"Follower","serving_round":null,"term":9}
+10.131.9.74:7401  {"drives":2,"executor":{"fenced":true,"node":1,"round":109},"id":3,"last_reclaim":null,"leader":1,"local":"空闲","role":"Follower","serving_round":null,"term":9}
+rc/_probe.bin -> /tmp/ltfs25-restored-probe.bin (1024 字节)
+49abd65bbf7f7e40c7055093ed2e3fd75f2f602f2c5fcf955c213e3135eb03f7  /tmp/ltfs25-restored-probe.bin

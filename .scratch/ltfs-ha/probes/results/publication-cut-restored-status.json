@@ -1,0 +1,137 @@
+[
+  {
+    "applied_index": 264,
+    "drives": 2,
+    "executor": {
+      "fenced": true,
+      "node": 3,
+      "round": 261,
+      "term": 31
+    },
+    "id": 1,
+    "last_reclaim": null,
+    "leader": 3,
+    "local": "空闲",
+    "pools": [
+      {
+        "file_limit": 50,
+        "name": "rc",
+        "tapes": [
+          "TS1000L08",
+          "TS1001L08"
+        ],
+        "uuid": "0ba1b026-9595-4b86-9056-c54c7858e744"
+      }
+    ],
+    "role": "Follower",
+    "tapes": [
+      {
+        "barcode": "TS1000L08",
+        "bytes_used": 0,
+        "bytes_written": 2097152,
+        "files": 0,
+        "generation": 2,
+        "state": "appendable"
+      },
+      {
+        "barcode": "TS1001L08",
+        "bytes_used": 51450880,
+        "bytes_written": 91226112,
+        "files": 19,
+        "generation": 72,
+        "state": "appendable"
+      }
+    ],
+    "term": 31
+  },
+  {
+    "applied_index": 264,
+    "drives": 2,
+    "executor": {
+      "fenced": true,
+      "node": 3,
+      "round": 261,
+      "term": 31
+    },
+    "id": 2,
+    "last_reclaim": null,
+    "leader": 3,
+    "local": "空闲",
+    "pools": [
+      {
+        "file_limit": 50,
+        "name": "rc",
+        "tapes": [
+          "TS1000L08",
+          "TS1001L08"
+        ],
+        "uuid": "0ba1b026-9595-4b86-9056-c54c7858e744"
+      }
+    ],
+    "role": "Follower",
+    "tapes": [
+      {
+        "barcode": "TS1000L08",
+        "bytes_used": 0,
+        "bytes_written": 2097152,
+        "files": 0,
+        "generation": 2,
+        "state": "appendable"
+      },
+      {
+        "barcode": "TS1001L08",
+        "bytes_used": 51450880,
+        "bytes_written": 91226112,
+        "files": 19,
+        "generation": 72,
+        "state": "appendable"
+      }
+    ],
+    "term": 31
+  },
+  {
+    "applied_index": 264,
+    "drives": 2,
+    "executor": {
+      "fenced": true,
+      "node": 3,
+      "round": 261,
+      "term": 31
+    },
+    "id": 3,
+    "last_reclaim": null,
+    "leader": 3,
+    "local": "轮次 261：服务中。IBMtaper2287 (/dev/sg6) [TS1001L08]: gen=72 文件 27 个 尾部 Complete；可用 32 MiB",
+    "pools": [
+      {
+        "file_limit": 50,
+        "name": "rc",
+        "tapes": [
+          "TS1000L08",
+          "TS1001L08"
+        ],
+        "uuid": "0ba1b026-9595-4b86-9056-c54c7858e744"
+      }
+    ],
+    "role": "Leader",
+    "tapes": [
+      {
+        "barcode": "TS1000L08",
+        "bytes_used": 0,
+        "bytes_written": 2097152,
+        "files": 0,
+        "generation": 2,
+        "state": "appendable"
+      },
+      {
+        "barcode": "TS1001L08",
+        "bytes_used": 51450880,
+        "bytes_written": 91226112,
+        "files": 19,
+        "generation": 72,
+        "state": "appendable"
+      }
+    ],
+    "term": 31
+  }
+]

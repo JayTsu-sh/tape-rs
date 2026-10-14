@@ -1,0 +1,12 @@
+{
+  "time": "2026-09-27T17:20:32.753690",
+  "host": "lisa-143",
+  "allow_dio_before": "0",
+  "allow_dio_after": "0",
+  "modified_runners": [
+    "physical-le-runner-20260927.py",
+    "physical-native-runner-20260927.py",
+    "physical-le-20260927.py",
+    "run-le-rc18.py"
+  ]
+}

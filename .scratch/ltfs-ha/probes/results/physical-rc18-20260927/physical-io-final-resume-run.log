@@ -1,0 +1,19 @@
+FORMAT RC0018L9 ONLY: native MODE SELECT + FORMAT MEDIUM; old UUID 0bf1c655-7a6f-4822-bed0-218b864ac1c6
+[2026-09-27T11:54:30Z INFO  tape_rs::ltfs::mkltfs] mkltfs 开始: volume_id=RC0018 uuid=606a6cc0-4cbc-49bd-a32c-f6605cfc7339
+[2026-09-27T11:54:30Z INFO  tape_rs::tape::commands] 倒带...
+[2026-09-27T11:54:30Z INFO  tape_rs::tape::commands] 倒带完成
+[2026-09-27T11:54:30Z INFO  tape_rs::ltfs::mkltfs] MODE SELECT page 0x11: 2-partition (IDP=1, unit=GB, P0=1GB/minimum, P1=max)
+[2026-09-27T11:54:30Z INFO  tape_rs::ltfs::mkltfs] 格式化介质（2-partition）...
+[2026-09-27T11:54:30Z INFO  tape_rs::tape::commands] 格式化介质（format=1, verify=false）...
+[2026-09-27T11:54:30Z ERROR tape_rs] 错误: SCSI command failed: status=0x02, sense_key=0x05, asc=0x3b, ascq=0x0c
+Traceback (most recent call last):
+  File "/root/tape-rs-io-20260927/physical-io-final-resume-20260927.py", line 64, in <module>
+    result = command('mkltfs', '--device', drive, '--volume-id', 'RC0018',
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "native-final-helpers", line 17, in command
+  File "/usr/lib64/python3.11/subprocess.py", line 466, in check_output
+    return run(*popenargs, stdout=PIPE, timeout=timeout, check=True,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib64/python3.11/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['/root/tape-rs-io-20260927/tape-rs-io-final', 'mkltfs', '--device', '/dev/sg3', '--volume-id', 'RC0018', '--block-size', '524288', '--compression', '--yes-destroy']' returned non-zero exit status 1.

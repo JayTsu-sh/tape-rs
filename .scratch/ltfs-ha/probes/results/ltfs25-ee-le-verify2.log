@@ -1,0 +1,4 @@
+{"file": "f1", "bytes": 65536, "sha256": "916b144867c340614f515c7b0e5415c74832d899c05264ded2a277a6e81d81ff", "readonly_mmap": "PASS"}
+{"file": "f2", "bytes": 65536, "sha256": "da1acff5c9defdd68bfa1435c4b43e8d43ed10fcc7cbcb77a85c4482d5f5bda3", "readonly_mmap": "PASS"}
+{"file": "f3", "bytes": 65536, "sha256": "3af3f1d870212fe8fcfe6eb321fd14d009bccc953fce3f59f698f0c446a1a39a", "readonly_mmap": "PASS"}
+PASS empty_directory symlink binary_xattr original_probe

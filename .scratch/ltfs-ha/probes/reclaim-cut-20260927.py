@@ -1,0 +1,72 @@
+"""专用 SR 池：完成目标提交后、源 FORMAT 前终止隔离执行者。"""
+import json
+import os
+from pathlib import Path
+import signal
+import sqlite3
+import subprocess
+import time
+import urllib.request
+
+BASE = Path('/home/rocky/tape-rs-reclaim-cut-20260927')
+assert os.environ.get('TAPE_RS_RECLAIM_CUT') == 'SR2502L8-to-SR2501L8'
+pids = subprocess.check_output(['pgrep', '-x', 'ltfsd'], text=True).split()
+assert len(pids) == 1
+pid = int(pids[0])
+assert os.readlink(f'/proc/{pid}/exe') == str(BASE / 'ltfsd')
+args = Path(f'/proc/{pid}/cmdline').read_bytes().split(bytes([0]))
+assert str(BASE / 'test-data').encode() in args
+status = json.loads((BASE / 'test-data/status.json').read_text())
+with urllib.request.urlopen('http://127.0.0.1:7501/cluster', timeout=5) as r:
+    serving = json.load(r)
+assert status['role'] == 'Leader' and serving['serving_round'] == status['executor']['round']
+assert len(status['pools']) == 1
+assert set(status['pools'][0]['tapes']) == {'SR2501L8', 'SR2502L8'}
+assert status['pools'][0]['uuid'] == '51cfd06c-bf79-4bbf-ac85-886608a0ab4b'
+tids = [int(p.name) for p in Path(f'/proc/{pid}/task').iterdir()
+        if (p / 'comm').read_text().strip() == 'ltfsd-exec']
+assert len(tids) == 1
+assert not (BASE / 'cut.ready').exists()
+log_offset = (BASE / 'ltfsd.log').stat().st_size
+trace = BASE / 'cut.trace'
+with (BASE / 'cut-strace.log').open('w') as log:
+    tracer = subprocess.Popen([
+        str(BASE / 'strace'), '-p', str(tids[0]), '-e', 'trace=ioctl',
+        '-e', 'inject=ioctl:delay_enter=500ms', '-v', '-xx', '-s', '96',
+        '-tt', '-T', '-o', str(trace)], stdout=log, stderr=log)
+    try:
+        deadline = time.monotonic() + 10
+        while f'TracerPid:\t{tracer.pid}' not in Path(f'/proc/{pid}/task/{tids[0]}/status').read_text():
+            assert time.monotonic() < deadline
+            time.sleep(.02)
+        (BASE / 'cut.ready').write_text(json.dumps({'pid': pid, 'tid': tids[0], 'round': status['executor']['round']}))
+        deadline = time.monotonic() + 240
+        while time.monotonic() < deadline:
+            with (BASE / 'ltfsd.log').open('rb') as f:
+                f.seek(log_offset)
+                lines = f.read().decode().splitlines()
+            marker = [s for s in lines if 'SR2502L8 上的内容已全部有着落' in s and '重新格式化' in s]
+            if marker:
+                before = trace.read_text()
+                assert 'cmdp="\\x04' not in before, 'FORMAT observed; no kill performed'
+                os.kill(pid, signal.SIGKILL)
+                tracer.wait(timeout=10)
+                after = trace.read_text()
+                assert 'cmdp="\\x04' not in after, 'cut did not precede FORMAT'
+                db = sqlite3.connect('file:' + str(BASE / 'test-data/directory.db') + '?mode=ro', uri=True)
+                db.row_factory = sqlite3.Row
+                rows = [dict(r) for r in db.execute('select * from files order by path')]
+                # All current paths, including tombstones, must have moved.
+                assert rows and {r['barcode'] for r in rows} == {'SR2501L8'}
+                event = {'pid': pid, 'round': status['executor']['round'], 'marker': marker,
+                         'files': rows, 'trace_at_kill': before, 'trace_after_exit': after}
+                (BASE / 'cut.event.json').write_text(json.dumps(event, ensure_ascii=False, indent=2))
+                print('PASS destination catalog committed; killed before source FORMAT', flush=True)
+                break
+            time.sleep(.01)
+        else:
+            raise TimeoutError('format gate not observed; no kill performed')
+    finally:
+        if tracer.poll() is None:
+            tracer.terminate()
+        tracer.wait(timeout=10)

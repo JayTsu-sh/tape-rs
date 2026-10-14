@@ -1,0 +1,4 @@
+READY 7594 10.131.9.71
+REQUEST GET /stat/rc/keep.bin target False
+REQUEST DELETE /xattrs?path=rc%2Fxattr-fault-20260925&name=user.delete target True
+EVENT {"method": "DELETE", "path": "/xattrs?path=rc%2Fxattr-fault-20260925&name=user.delete", "mode": "response", "status": 201, "body": "{\"generation\":66,\"status\":\"committed\",\"task\":1}\n", "upstream": "10.131.9.71"}

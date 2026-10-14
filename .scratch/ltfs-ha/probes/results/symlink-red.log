@@ -1,0 +1,25 @@
+   Compiling tape-rs v0.1.0 (/work/jay/tape-rs-ltfs-recovery-ibm-interop)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.68s
+     Running unittests src/bin/tape-fuse.rs (/work/cargo-target/debug/deps/tape_fuse-92916ff6d17ef2f3)
+
+running 1 test
+test tests::kernel_existing_symlinks ... FAILED
+
+failures:
+
+---- tests::kernel_existing_symlinks stdout ----
+
+thread 'tests::kernel_existing_symlinks' (4013629) panicked at src/bin/tape-fuse.rs:867:9:
+Traceback (most recent call last):
+  File "<string>", line 4, in <module>
+AssertionError
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::kernel_existing_symlinks
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.15s
+
+error: test failed, to rerun pass `--bin tape-fuse`

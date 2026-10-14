@@ -1,0 +1,9 @@
+[2026-09-24T14:57:30Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=283
+[2026-09-24T14:57:30Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=4
+[2026-09-24T14:57:31Z INFO  tape_rs::ltfs::volume] commit: gen 53 @ P0 5, P1 284
+[2026-09-24T14:57:31Z INFO  tape_rs::tape::commands] 弹出磁带...
+[2026-09-24T14:57:31Z INFO  tape_rs::tape::commands] 弹出完成
+[2026-09-24T14:57:31Z INFO  tape_rs::daemon::executor] 执行线程: IBMtaper2287_LL3 (/dev/sg9) 的预留已释放
+[2026-09-24T14:57:31Z INFO  tape_rs::daemon::executor] 执行线程: IBMtaper2287 (/dev/sg10) 的预留已释放
+[2026-09-24T14:57:31Z INFO  tape_rs::daemon::executor] 执行线程: IBMtaper3D5E (/dev/sg11) 的预留已释放
+[2026-09-24T14:57:31Z INFO  tape_rs::daemon::node] 节点 1 停机

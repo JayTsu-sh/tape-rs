@@ -1,0 +1,14 @@
+Traceback (most recent call last):
+  File "/home/rocky/holo-runtime-current.py", line 34, in <module>
+    assert not any(pub in p['args'] for p in processes()), pub
+AssertionError: pub-34eb08e2a56e033e21ba6a94327b52c0
+pub-34eb08e2a56e033e21ba6a94327b52c0 restored
+pub-4b301952bc4d2692f89ab71be7979867 restored
+pub-6408ab408bf4cd61a3e3859efd04e10d restored
+pub-860d24740a2ce4be1b3dcdd9bc4dd517 restored
+pub-c51b85552ced91c7d1d4ad27dc6b83af restored
+pub-d86333c3df97a7246c4cd1c648eb3923 restored
+pub-f42e69f6b4c88164cbf75f3da20a171c restored
+pub-b30de809c3e0f21be34c75c88a11e8d7 restored
+pub-0a89503818fd2d5aab165010cdb860f2 restored
+profiles restored: 9

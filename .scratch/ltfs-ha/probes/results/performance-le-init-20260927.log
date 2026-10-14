@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/tmp/performance-le-init.py", line 3, in <module>
+    print(m.remote('71',m.PRE+'''
+          ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/performance-ops.py", line 11, in remote
+    if p.returncode:raise RuntimeError((h,p.returncode,p.stdout,p.stderr))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: ('71', 1, 'Tape PF2701L08 has been successfully moved.\nRemove Drive: f0755 LTFSI9998E System error: Device or resource busy (16).\nError closing drive IBMlisa41D6C\n', 'Traceback (most recent call last):\n  File "<stdin>", line 26, in <module>\n  File "/usr/lib64/python3.9/subprocess.py", line 528, in run\n    raise CalledProcessError(retcode, process.args,\nsubprocess.CalledProcessError: Command \'[\'/opt/ibm/ltfsle/bin/leadm\', \'drive\', \'close\', \'IBMlisa41D6C\']\' returned non-zero exit status 3.\n')

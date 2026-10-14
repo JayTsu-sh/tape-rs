@@ -1,0 +1,4 @@
+{"method": "POST", "name": "powercut.binary", "status": 201, "response": "{\"generation\":74,\"status\":\"committed\",\"task\":1}\n"}
+{"method": "POST", "name": "powercut.empty", "status": 201, "response": "{\"generation\":75,\"status\":\"committed\",\"task\":2}\n"}
+{"method": "DELETE", "name": "set", "status": 201, "response": "{\"generation\":76,\"status\":\"committed\",\"task\":3}\n"}
+ACK: three incremental commits, generation 76

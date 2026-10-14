@@ -1,0 +1,5 @@
+# 内置 SQLite 等 C 代码用基线 x86-64 指令集编译。
+# 有些发行版的 gcc 默认 -march=x86-64-v3（AVX2），产物在不带 AVX 的虚拟 CPU 上会因非法指令崩溃
+# （实验室的 QEMU VM 就是这样）。Rust 代码本身默认就是基线 x86-64，不受影响。
+[env]
+CFLAGS_x86_64_unknown_linux_gnu = "-march=x86-64 -mtune=generic"

@@ -14,6 +14,8 @@ pub mod opcode {
     pub const RECEIVE_DIAGNOSTIC_RESULTS: u8 = 0x1C;
     pub const PREVENT_ALLOW_MEDIUM_REMOVAL: u8 = 0x1E;
     pub const LOG_SENSE: u8 = 0x4D;
+    pub const PERSISTENT_RESERVE_IN: u8 = 0x5E;
+    pub const PERSISTENT_RESERVE_OUT: u8 = 0x5F;
 
     // 磁带机命令
     pub const REWIND: u8 = 0x01;
@@ -27,6 +29,7 @@ pub mod opcode {
     pub const READ_POSITION: u8 = 0x34;
     pub const REPORT_DENSITY_SUPPORT: u8 = 0x44;
     pub const LOCATE_16: u8 = 0x92;
+    pub const ALLOW_OVERWRITE: u8 = 0x82;
     pub const READ_ATTRIBUTE: u8 = 0x8C;
     pub const WRITE_ATTRIBUTE: u8 = 0x8D;
 
@@ -36,6 +39,24 @@ pub mod opcode {
     pub const MOVE_MEDIUM: u8 = 0xA5;
     pub const EXCHANGE_MEDIUM: u8 = 0xA6;
     pub const READ_ELEMENT_STATUS: u8 = 0xB8;
+}
+
+/// SSC-5 ALLOW OVERWRITE，IBM GA32-0928-08 §5.2.1 Table33/34。
+/// 只授权当前位置一次覆盖；不提供全介质 Format 授权。
+pub fn allow_overwrite_current(partition: u8, block: u64) -> [u8; 16] {
+    let mut cdb = [0; 16];
+    cdb[0] = opcode::ALLOW_OVERWRITE;
+    cdb[2] = 1;
+    cdb[3] = partition;
+    cdb[4..12].copy_from_slice(&block.to_be_bytes());
+    cdb
+}
+
+/// MODE SENSE(10) 当前值子页，保持既有page0入口字节不变。
+pub fn mode_sense_10_subpage(page: u8, subpage: u8, alloc_len: u16) -> [u8; 10] {
+    let mut cdb = mode_sense_10(page, alloc_len);
+    cdb[3] = subpage;
+    cdb
 }
 
 /// 构建 INQUIRY CDB (6 bytes)
@@ -73,10 +94,12 @@ pub fn test_unit_ready() -> [u8; 6] {
 pub fn mode_sense_10(page_code: u8, alloc_len: u16) -> [u8; 10] {
     [
         opcode::MODE_SENSE_10,
-        0x00,                          // DBD=0
-        page_code & 0x3F,              // page code, PC=0 (current values)
-        0x00,                          // subpage
-        0x00, 0x00, 0x00,
+        0x00,             // DBD=0
+        page_code & 0x3F, // page code, PC=0 (current values)
+        0x00,             // subpage
+        0x00,
+        0x00,
+        0x00,
         (alloc_len >> 8) as u8,
         (alloc_len & 0xFF) as u8,
         0x00,
@@ -139,7 +162,14 @@ pub fn move_medium(transport_addr: u16, source_addr: u16, dest_addr: u16) -> [u8
 
 /// 构建 INITIALIZE ELEMENT STATUS CDB (6 bytes)
 pub fn initialize_element_status() -> [u8; 6] {
-    [opcode::INITIALIZE_ELEMENT_STATUS, 0x00, 0x00, 0x00, 0x00, 0x00]
+    [
+        opcode::INITIALIZE_ELEMENT_STATUS,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+    ]
 }
 
 /// 构建 REWIND CDB (6 bytes)
@@ -187,6 +217,14 @@ pub fn write_filemarks(count: u32) -> [u8; 6] {
     ]
 }
 
+/// WRITE FILEMARKS(6) IMMED=1：仅确认命令接收，不能用作持久化屏障。
+/// IBM GA32-0928-08 §5.2.46：byte1 bit0 为 IMMED。
+pub fn write_filemarks_immediate(count: u32) -> [u8; 6] {
+    let mut cdb = write_filemarks(count);
+    cdb[1] = 0x01;
+    cdb
+}
+
 /// SPACE(6) 的 24-bit 有符号 count 范围。
 pub const SPACE_COUNT_MIN: i32 = -(1 << 23);
 pub const SPACE_COUNT_MAX: i32 = (1 << 23) - 1;
@@ -223,7 +261,18 @@ pub fn load_unload(load: bool) -> [u8; 6] {
 
 /// 构建 READ POSITION CDB (10 bytes)
 pub fn read_position() -> [u8; 10] {
-    [opcode::READ_POSITION, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    [
+        opcode::READ_POSITION,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+    ]
 }
 
 /// 构建 EXCHANGE MEDIUM CDB (12 bytes)
@@ -293,25 +342,41 @@ pub fn prevent_allow_medium_removal(prevent: bool) -> [u8; 6] {
 /// change_partition: 是否切换 partition
 /// immed: 立即返回（后台完成）
 pub fn locate_16(partition: u8, logical_id: u64, change_partition: bool, immed: bool) -> [u8; 16] {
-    let byte1 = (if change_partition { 0x02 } else { 0x00 })
-        | (if immed { 0x01 } else { 0x00 });
+    let byte1 = (if change_partition { 0x02 } else { 0x00 }) | (if immed { 0x01 } else { 0x00 });
     let id = logical_id.to_be_bytes();
     [
         opcode::LOCATE_16,
         byte1,
         0x00,
         partition,
-        id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7],
-        0x00, 0x00, 0x00, 0x00,
+        id[0],
+        id[1],
+        id[2],
+        id[3],
+        id[4],
+        id[5],
+        id[6],
+        id[7],
+        0x00,
+        0x00,
+        0x00,
+        0x00,
     ]
+}
+
+/// LOCATE(16) DEST_TYPE=011b（EOD）、CP=1、IMMED=0。
+/// IBM GA32-0928-08 §5.2.7 Table53；LOGICAL IDENTIFIER 在此模式下忽略。
+pub fn locate_eod_16(partition: u8) -> [u8; 16] {
+    let mut cdb = locate_16(partition, 0, true, false);
+    cdb[1] |= 0x18;
+    cdb
 }
 
 /// 构建 ERASE(6) CDB
 /// long_erase: true=整带 erase（耗时），false=短 erase
 /// immed: 立即返回
 pub fn erase_6(long_erase: bool, immed: bool) -> [u8; 6] {
-    let byte1 = (if long_erase { 0x01 } else { 0x00 })
-        | (if immed { 0x02 } else { 0x00 });
+    let byte1 = (if long_erase { 0x01 } else { 0x00 }) | (if immed { 0x02 } else { 0x00 });
     [opcode::ERASE_6, byte1, 0x00, 0x00, 0x00, 0x00]
 }
 
@@ -320,9 +385,15 @@ pub fn erase_6(long_erase: bool, immed: bool) -> [u8; 6] {
 /// immed: 立即返回
 /// verify: 格式化后校验
 pub fn format_medium(format: u8, immed: bool, verify: bool) -> [u8; 6] {
-    let byte1 = (if immed { 0x01 } else { 0x00 })
-        | (if verify { 0x02 } else { 0x00 });
-    [opcode::FORMAT_MEDIUM, byte1, format & 0x0F, 0x00, 0x00, 0x00]
+    let byte1 = (if immed { 0x01 } else { 0x00 }) | (if verify { 0x02 } else { 0x00 });
+    [
+        opcode::FORMAT_MEDIUM,
+        byte1,
+        format & 0x0F,
+        0x00,
+        0x00,
+        0x00,
+    ]
 }
 
 /// 构建 LOG SENSE CDB (10 bytes)
@@ -338,7 +409,8 @@ pub fn log_sense(page_code: u8, subpage: u8, alloc_len: u16) -> [u8; 10] {
         byte2,
         subpage,
         0x00,
-        0x00, 0x00, // parameter pointer
+        0x00,
+        0x00, // parameter pointer
         (alloc_len >> 8) as u8,
         (alloc_len & 0xFF) as u8,
         0x00,
@@ -354,7 +426,11 @@ pub fn mode_select_10(pf: bool, sp: bool, param_len: u16) -> [u8; 10] {
     [
         opcode::MODE_SELECT_10,
         byte1,
-        0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
         (param_len >> 8) as u8,
         (param_len & 0xFF) as u8,
         0x00,
@@ -369,7 +445,11 @@ pub fn report_density_support(media: bool, medium_type: bool, alloc_len: u16) ->
     [
         opcode::REPORT_DENSITY_SUPPORT,
         byte1,
-        0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
         (alloc_len >> 8) as u8,
         (alloc_len & 0xFF) as u8,
         0x00,
@@ -382,12 +462,7 @@ pub fn report_density_support(media: bool, medium_type: bool, alloc_len: u16) ->
 /// pf: Page Format
 /// self_test: 触发默认自检
 /// param_len: 参数列表长度
-pub fn send_diagnostic(
-    self_test_code: u8,
-    pf: bool,
-    self_test: bool,
-    param_len: u16,
-) -> [u8; 6] {
+pub fn send_diagnostic(self_test_code: u8, pf: bool, self_test: bool, param_len: u16) -> [u8; 6] {
     let byte1 = ((self_test_code & 0x07) << 5)
         | (if pf { 0x10 } else { 0x00 })
         | (if self_test { 0x04 } else { 0x00 });
@@ -406,24 +481,34 @@ pub fn send_diagnostic(
 /// partition: MAM 所在 partition（VCI 等卷级属性通常都在 partition 0）
 /// first_attr: 起始 attribute id
 /// alloc_len: 返回缓冲区长度
-pub fn read_attribute(service_action: u8, partition: u8, first_attr: u16, alloc_len: u32) -> [u8; 16] {
+pub fn read_attribute(
+    service_action: u8,
+    partition: u8,
+    first_attr: u16,
+    alloc_len: u32,
+) -> [u8; 16] {
     let id = first_attr.to_be_bytes();
     let len = alloc_len.to_be_bytes();
     // SPC-5 Table 236：partition 位于 byte 7，byte 6 是 Logical Volume Number / reserved。
     // 旧代码曾把 partition 误放在 byte 6，于是对 partition=1 的请求被 drive 解释成非法
     // volume number + partition=0，表现为 CHECK CONDITION ILLEGAL REQUEST (0x05/0x24/0x00)。
     [
-        opcode::READ_ATTRIBUTE,          // 0
-        service_action & 0x1F,            // 1: service action
-        0x00, 0x00,                       // 2-3: element address
-        0x00,                             // 4: volume number
-        0x00,                             // 5: reserved
-        0x00,                             // 6: reserved
-        partition,                        // 7: partition number
-        id[0], id[1],                     // 8-9: first attribute id
-        len[0], len[1], len[2], len[3],   // 10-13: allocation length
-        0x00,                             // 14: cache flag
-        0x00,                             // 15: control
+        opcode::READ_ATTRIBUTE, // 0
+        service_action & 0x1F,  // 1: service action
+        0x00,
+        0x00,      // 2-3: element address
+        0x00,      // 4: volume number
+        0x00,      // 5: reserved
+        0x00,      // 6: reserved
+        partition, // 7: partition number
+        id[0],
+        id[1], // 8-9: first attribute id
+        len[0],
+        len[1],
+        len[2],
+        len[3], // 10-13: allocation length
+        0x00,   // 14: cache flag
+        0x00,   // 15: control
     ]
 }
 
@@ -435,17 +520,22 @@ pub fn write_attribute(wtc: bool, partition: u8, param_len: u32) -> [u8; 16] {
     let len = param_len.to_be_bytes();
     // 同 READ ATTRIBUTE：partition 在 byte 7，不是 byte 6。
     [
-        opcode::WRITE_ATTRIBUTE,         // 0
-        if wtc { 0x01 } else { 0x00 },   // 1: WTC bit
-        0x00, 0x00,                      // 2-3: element address
-        0x00,                            // 4: volume number
-        0x00,                            // 5: reserved
-        0x00,                            // 6: reserved
-        partition,                       // 7: partition number
-        0x00, 0x00,                      // 8-9: reserved
-        len[0], len[1], len[2], len[3],  // 10-13: parameter list length
-        0x00,                            // 14: reserved
-        0x00,                            // 15: control
+        opcode::WRITE_ATTRIBUTE,       // 0
+        if wtc { 0x01 } else { 0x00 }, // 1: WTC bit
+        0x00,
+        0x00,      // 2-3: element address
+        0x00,      // 4: volume number
+        0x00,      // 5: reserved
+        0x00,      // 6: reserved
+        partition, // 7: partition number
+        0x00,
+        0x00, // 8-9: reserved
+        len[0],
+        len[1],
+        len[2],
+        len[3], // 10-13: parameter list length
+        0x00,   // 14: reserved
+        0x00,   // 15: control
     ]
 }
 
@@ -462,4 +552,35 @@ pub fn receive_diagnostic_results(pcv: bool, page_code: u8, alloc_len: u16) -> [
         (alloc_len & 0xFF) as u8,
         0x00,
     ]
+}
+
+/// PERSISTENT RESERVE IN (SPC-4 6.13)。`service_action`：0 READ KEYS，1 READ RESERVATION。
+pub fn persistent_reserve_in(service_action: u8, alloc_len: u16) -> [u8; 10] {
+    let mut cdb = [0u8; 10];
+    cdb[0] = opcode::PERSISTENT_RESERVE_IN;
+    cdb[1] = service_action & 0x1F;
+    cdb[7..9].copy_from_slice(&alloc_len.to_be_bytes());
+    cdb
+}
+
+/// PERSISTENT RESERVE OUT (SPC-4 6.14)。作用域固定 LU_SCOPE；参数表 24 字节由调用方给出。
+pub fn persistent_reserve_out(service_action: u8, pr_type: u8, param_len: u32) -> [u8; 10] {
+    let mut cdb = [0u8; 10];
+    cdb[0] = opcode::PERSISTENT_RESERVE_OUT;
+    cdb[1] = service_action & 0x1F;
+    cdb[2] = pr_type & 0x0F;
+    cdb[5..9].copy_from_slice(&param_len.to_be_bytes());
+    cdb
+}
+
+#[cfg(test)]
+mod overwrite_tests {
+    use super::*;
+    #[test]
+    fn overwrite_current_encodes_only_current_position_in_network_order() {
+        assert_eq!(
+            allow_overwrite_current(2, 0x0102030405060708),
+            [0x82, 0, 1, 2, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0]
+        );
+    }
 }

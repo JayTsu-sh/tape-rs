@@ -1,0 +1,9 @@
+   Compiling tape-rs v0.1.0 (/work/jay/tape-rs-ltfs-recovery-ibm-interop)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.97s
+     Running tests/ltfsd_cluster.rs (/work/cargo-target/debug/deps/ltfsd_cluster-fef60eb6cf3447a6)
+
+running 2 tests
+test checkpoint_medium_error_during_cross_tape_read_is_not_hidden ... ok
+test checkpoint_ownership_loss_during_cross_tape_read_is_retried ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 1.75s

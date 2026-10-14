@@ -1,0 +1,190 @@
+   Compiling tape-rs v0.1.0 (/work/jay/tape-rs-ltfs-recovery-ibm-interop)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.54s
+     Running unittests src/lib.rs (/work/cargo-target/debug/deps/tape_rs-6101616ea0774cc7)
+
+running 68 tests
+test core::volume_state::namespace_tests::directory_publication_is_atomic_and_does_not_create_a_file ... ok
+test client::tests::delete_with_lost_response_is_not_replayed ... ok
+test core::volume_state::namespace_tests::rename_reference_uses_no_capacity_and_removals_do_not_recreate_ancestors ... ok
+test daemon::http::tests::range_forms ... ok
+test daemon::executor::read_error_tests::ownership_errors_are_distinct_from_medium_errors ... ok
+test client::tests::read_failure_does_not_replay_partial_output_or_generic_server_errors ... ok
+test daemon::state::tests::admin_commands_roundtrip_and_are_validated_deterministically ... ok
+test daemon::state::tests::a_snapshot_restores_the_whole_control_state ... ok
+test client::tests::waiting_upload_queries_after_staged_response ... ok
+test daemon::state::tests::fenced_after_a_newer_takeover_is_superseded ... ok
+test daemon::state::tests::reclaim_is_only_accepted_for_an_assigned_healthy_tape ... ok
+test daemon::state::tests::commands_roundtrip ... ok
+test daemon::state::tests::summaries_only_move_forward_and_block_unassign ... ok
+test daemon::state::tests::takeover_history_is_bounded ... ok
+test daemon::state::tests::round_is_the_log_index_of_the_takeover ... ok
+test ltfs::incremental::tests::export_xml_for_schema_validation ... ignored, 为独立 XSD 校验输出 XML，不属于默认测试
+test ltfs::incremental::tests::invalid_dependencies_and_partial_creation_are_rejected_atomically ... ok
+test ltfs::incremental::tests::partial_metadata_keeps_data_and_replaces_xattr_set ... ok
+test ltfs::incremental::tests::empty_delta_and_absent_delete_are_valid ... ok
+test ltfs::index::tests::empty_roundtrip ... ok
+test ltfs::label::tests::ltfs_label_roundtrip ... ok
+test ltfs::index::tests::one_file_roundtrip ... ok
+test ltfs::mam::tests::decodes_vci_written_by_ibm_ltfs ... ok
+test ltfs::index::tests::unknown_elements_are_reported_once ... ok
+test ltfs::incremental::tests::rename_delete_and_recreate_roundtrip ... ok
+test client::tests::metadata_mutations_with_lost_response_are_not_replayed ... ok
+test ltfs::mam::tests::vci_roundtrip ... ok
+test ltfs::index::tests::walk_files_collects_paths ... ok
+test ltfs::label::tests::vol1_roundtrip ... ok
+test scsi::sim::tests::fault_injection_once ... ok
+test scsi::sim::tests::mode_select_then_format_creates_partitions ... ok
+test scsi::sim::tests::write_read_filemark_and_eod ... ok
+test scsi::sim::tests::power_cut_drops_unflushed ... ok
+test scsi::sim::tests::space_eod_and_back_filemark ... ok
+test ltfs::index::tests::ibm_style_index_roundtrips_xattrs_symlink_and_lockstate ... ok
+test ltfs::index::tests::empty_base64_xattr_uses_ibm_compatible_empty_element ... ok
+test tapefs::tests::errno_mapping ... ok
+test tapefs::tests::cache_directory_is_private_and_preserves_existing_files ... ok
+test tapefs::tests::index_metadata_reaches_attributes_and_binary_xattrs ... ok
+test tapefs::tests::download_rejects_content_changed_between_stat_and_fetch ... ok
+test tapefs::tests::open_refreshes_size_changed_since_last_attributes ... ok
+test tapefs::tests::remote_replace_rejects_mixing_live_cache_then_refreshes_after_close ... ok
+test ltfs::volume::relocation_tests::relocation_keeps_logical_metadata_but_rebuilds_physical_identity_and_hashes ... ok
+test tapefs::tests::uncertain_xattr_blocks_further_uploads ... ok
+test tapefs::tests::exclusive_create ... ok
+test tapefs::tests::directories_and_rename ... ok
+test tapefs::tests::uncertain_rename_blocks_old_path_uploads ... ok
+test tapefs::tests::local_resize_can_reopen_without_another_lookup ... ok
+test tapefs::tests::superseded_staging_does_not_pin_stale_cache_forever ... ok
+test tapefs::tests::local_writer_is_visible_before_upload_and_truncates_existing_readers ... ok
+test tapefs::tests::unlink_rules ... ok
+test tapefs::tests::close_stages_and_fsync_commits ... ok
+test tapefs::tests::rename_preserves_open_writers_readers_and_directory_inodes ... ok
+test tapefs::tests::readers_share_overwrite_but_unlink_recreate_has_new_inode ... ok
+test tapefs::tests::random_writes_multiple_writers_and_resize_share_content ... ok
+test daemon::store::tests::an_unavailable_snapshot_is_recorded_as_a_request ... ok
+test catalog::db::tests::open_creates_and_migrates ... ok
+test daemon::store::tests::term_vote_and_log_survive_a_restart ... ok
+test daemon::store::tests::installing_a_snapshot_rolls_the_whole_log_back ... ok
+test daemon::store::tests::compaction_bounds_the_log_and_survives_a_restart ... ok
+test daemon::directory::tests::a_tombstone_outranks_older_copies_and_a_newer_upload_outranks_it ... ok
+test daemon::directory::tests::a_batch_becomes_visible_atomically_and_incomplete_batches_are_dropped ... ok
+test daemon::directory::tests::the_newest_version_wins_whatever_order_the_tapes_are_reconciled_in ... ok
+test daemon::directory::tests::replay_after_restart_is_idempotent_and_matches_the_state_machine ... ok
+test daemon::directory::tests::older_directory_migrates_without_losing_versions ... ok
+test daemon::net::tests::both_frame_kinds_work_over_one_listener ... ok
+test tapefs::tests::fsync_after_close_waits_for_the_staged_upload ... ok
+test daemon::state::tests::catalog_commands_roundtrip_and_split ... ok
+
+test result: ok. 67 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.68s
+
+     Running unittests src/bin/ltfsctl.rs (/work/cargo-target/debug/deps/ltfsctl-fccdbf917f7bfcea)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/ltfsd.rs (/work/cargo-target/debug/deps/ltfsd-4fbbb3b02a96e387)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/tape-fuse.rs (/work/cargo-target/debug/deps/tape_fuse-92916ff6d17ef2f3)
+
+running 6 tests
+test tests::kernel_cached_visibility ... ignored, 需要本机 FUSE 和 python3
+test tests::kernel_existing_symlinks ... ignored, 需要本机 FUSE 挂载权限
+test tests::kernel_file_operations ... ignored, 需要本机 FUSE 挂载权限
+test tests::kernel_mv_and_mmap ... ignored, 需要本机 FUSE、mv 和 python3
+test tests::kernel_remote_replace_preserves_mapping_until_release ... ignored, 需要本机 FUSE 和 python3
+test tests::kernel_remote_resize_between_lookup_and_open ... ignored, 需要本机 FUSE 挂载权限
+
+test result: ok. 0 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (/work/cargo-target/debug/deps/tape_rs-a6ab5b91502e38cb)
+
+running 13 tests
+test cli::changer::tests::check_move_result_inconsistent_when_only_source_emptied ... ok
+test cli::changer::tests::check_move_result_ok_when_source_empty_dest_full ... ok
+test cli::changer::tests::check_move_result_inconsistent_when_states_unchanged ... ok
+test cli::changer::tests::check_move_result_inconsistent_when_element_missing ... ok
+test cli::inquiry::tests::build_libraries_empty ... ok
+test cli::inquiry::tests::build_libraries_fallback_by_serial_when_no_lu_id ... ok
+test cli::inquiry::tests::build_libraries_mixed_lu_id_and_no_lu_id_same_serial_merges ... ok
+test cli::inquiry::tests::build_libraries_ts4300_cpf_merges_to_one ... ok
+test cli::inquiry::tests::build_libraries_vtl_no_shared_target_no_merge ... ok
+test cli::inquiry::tests::parse_vpd83_one_naa_lu_designator ... ok
+test cli::inquiry::tests::parse_vpd83_empty_page_returns_empty ... ok
+test cli::inquiry::tests::parse_vpd83_truncated_designator_dropped ... ok
+test cli::inquiry::tests::parse_vpd83_zero_length_designator_kept_then_filtered_in_lu_id_pick ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/file_namespace.rs (/work/cargo-target/debug/deps/file_namespace-8260b5805871569b)
+
+running 10 tests
+test nul_is_rejected_before_any_reservation ... ok
+test file_ancestors_and_native_empty_directories_cannot_be_overwritten ... ok
+test directory_tasks_publish_only_after_commit_and_failed_batches_stay_unknown ... ok
+test pending_ancestors_and_descendants_conflict_but_siblings_do_not ... ok
+test pending_directory_creation_is_not_a_durable_success_on_close ... ok
+test foreign_rename_back_keeps_native_nodes_visible_over_private_tombstones ... ok
+test xattr_changes_reserve_metadata_without_data_capacity_and_fail_closed ... ok
+test simultaneous_parent_and_child_admission_has_exactly_one_winner ... ok
+test rename_reserves_both_subtrees_and_rejects_invalid_targets ... ok
+test catalog_checks_use_component_boundaries_and_recent_tombstones ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/ltfsd_cluster.rs (/work/cargo-target/debug/deps/ltfsd_cluster-2f10038727b1c88c)
+
+running 36 tests
+test a_late_stop_for_an_older_round_does_not_cancel_the_newer_round ... ok
+test a_planned_shutdown_commits_the_queue_and_releases_every_reservation ... ok
+test client_read_retries_after_executor_reports_preemption ... ok
+test leader_takes_over_the_library_and_serves ... ok
+test a_reclaim_that_cannot_start_falls_back_to_appendable_with_a_reason ... ok
+test pools_and_tape_assignments_are_replicated_to_every_node ... ok
+test a_tape_holding_foreign_data_is_never_formatted ... ok
+test recover_for_an_unknown_round_is_reported_not_ignored ... ok
+test leader_that_loses_its_reservation_yields_and_another_node_takes_over ... ok
+test reading_from_another_tape_with_a_single_drive_swaps_and_swaps_back ... ok
+test a_directory_ahead_of_the_tape_marks_the_tape_for_checking ... ok
+test file_count_limit_switches_to_the_next_tape ... ok
+test file_contract_create_only_in_flight_state_range_and_directories ... ok
+test overwrites_preserve_xattrs_on_same_and_different_tapes ... ok
+test a_second_drive_serves_reads_and_idle_read_tapes_are_unloaded ... ok
+test atomic_rename_preserves_native_nodes_and_survives_takeover ... ok
+test file_metadata_survives_catalog_publication_and_takeover ... ok
+test namespace_conflicts_across_tapes_and_takeover ... FAILED
+test committed_uploads_survive_failover_and_unconfirmed_ones_never_corrupt ... ok
+test file_deletion_is_committed_and_survives_takeover ... ok
+test directory_tombstones_survive_reconciling_an_old_tape ... ok
+test partitioned_leader_is_fenced_by_the_new_leader ... ok
+test persistent_directories_survive_fuse_remount_and_takeover ... ok
+test a_lagging_node_catches_up_from_a_snapshot_and_pulls_the_directory ... ok
+test upload_is_committed_to_tape_and_only_the_executor_serves ... ok
+test reclaim_is_refused_synchronously_when_the_node_has_one_drive ... ok
+test reclaiming_a_tape_moves_the_live_files_away_and_reformats_it ... ok
+test reclaim_preserves_file_metadata_with_a_new_version ... ok
+test reclaim_preserves_tombstones ... ok
+test reclaim_preserves_native_empty_directories_and_their_metadata ... ok
+test user_xattrs_commit_without_rewriting_data_and_survive_takeover ... ok
+test uploads_are_batched_and_catalogued_on_every_node ... ok
+test blank_tapes_are_formatted_on_first_use_and_full_tapes_are_switched ... ok
+test client_library_hides_failover_from_the_application ... ok
+test rejected_large_uploads_get_a_clean_answer_over_http ... ok
+test streaming_download_above_256_mib ... ok
+
+failures:
+
+---- namespace_conflicts_across_tapes_and_takeover stdout ----
+
+thread 'namespace_conflicts_across_tapes_and_takeover' (4017260) panicked at tests/ltfsd_cluster.rs:1750:40:
+called `Result::unwrap()` on an `Err` value: Rejected { status: 500, body: "{\"detail\":\"写入带检查点失败: 执行资格已失去 (sim:drive0@i2): 预留持有者 Some((4c0100000000001c, 3))，注册表 [4c0100000000001c]，本轮键 4c02000000000002\",\"error\":\"read_failed\"}\n" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    namespace_conflicts_across_tapes_and_takeover
+
+test result: FAILED. 35 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 42.37s
+
+error: test failed, to rerun pass `--test ltfsd_cluster`

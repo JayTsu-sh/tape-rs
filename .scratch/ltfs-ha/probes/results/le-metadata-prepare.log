@@ -1,0 +1,8 @@
+Tape SR2501L08 has been successfully assigned.
+Drive serial is required to mount a cartridge
+Traceback (most recent call last):
+  File "/home/rocky/le-metadata-20260927.py", line 10, in <module>
+    p.mkdir();(p/'file').write_bytes(b'metadata proof');(p/'dir').mkdir();os.symlink('file',p/'link')
+  File "/usr/lib64/python3.9/pathlib.py", line 1323, in mkdir
+    self._accessor.mkdir(self, mode)
+OSError: [Errno 16] Device or resource busy: '/ltfs/SR2501L08/sr/metadata-20260927'

@@ -1,0 +1,2 @@
+DELETE Err(Indeterminate("删除 rc/ha-delete.bin: 连接在响应之前关闭"))
+PASS uncertain delete not replayed; newer version preserved

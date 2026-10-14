@@ -1,0 +1,56 @@
+[
+  {
+    "path": "/rc/_probe.bin",
+    "barcode": "TS1001L08",
+    "length": 1024,
+    "sha256": "49abd65bbf7f7e40c7055093ed2e3fd75f2f602f2c5fcf955c213e3135eb03f7"
+  },
+  {
+    "path": "/rc/after_reclaim.bin",
+    "barcode": "TS1001L08",
+    "length": 1048576,
+    "sha256": "5986a0300dc5557c81700137eeb656a0f8ca72f843e269ab0dcb935d49212971"
+  },
+  {
+    "path": "/rc/codex-20260924/move-target.bin",
+    "barcode": "TS1001L08",
+    "length": 69632,
+    "sha256": "d064c6fd6064551fe0aa780315acab0d16d5747fa04bf470ab6a2b3d421795e4"
+  },
+  {
+    "path": "/rc/f0.bin",
+    "barcode": "TS1001L08",
+    "length": 8388608,
+    "sha256": "fae7a2394a0e29275650dedf761aca19c6fa89bc3c7bba0b522e742fb1c87977"
+  },
+  {
+    "path": "/rc/f1.bin",
+    "barcode": "TS1001L08",
+    "length": 8388608,
+    "sha256": "89e49cb928d592752b2e54af5f77496e278d969064337566d75bdddf50020593"
+  },
+  {
+    "path": "/rc/f2.bin",
+    "barcode": "TS1001L08",
+    "length": 8388608,
+    "sha256": "682100f01a75fe74038c6b8bd68bf004b14a37a99adcc024141bf70583cd8cbb"
+  },
+  {
+    "path": "/rc/f3.bin",
+    "barcode": "TS1001L08",
+    "length": 8388608,
+    "sha256": "8960b05ee5d8d18630846579c8e24fcfb4b06871c1febdada1eb21add4dd1205"
+  },
+  {
+    "path": "/rc/f4.bin",
+    "barcode": "TS1001L08",
+    "length": 8388608,
+    "sha256": "5bd5c9918020a34bd55e870807c47eb982b704e65b43172d623cfe1040611747"
+  },
+  {
+    "path": "/rc/f5.bin",
+    "barcode": "TS1001L08",
+    "length": 8388608,
+    "sha256": "9bf60098be66a4785f607e18c8ba1c6e42bdaac1cb128844338202b9578cacdf"
+  }
+]

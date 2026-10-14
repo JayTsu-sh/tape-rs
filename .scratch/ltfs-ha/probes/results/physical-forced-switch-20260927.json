@@ -1,0 +1,14 @@
+{
+  "time": "2026-09-27 16:26:00",
+  "sg": "max_active_device=7  def_reserved_size=32768\n >>> device=sg3 16:0:0:0   em=0 sg_tablesize=64 excl=0 open_cnt=0\n   FD(1): timeout=60000ms bufflen=1048576 (res)sgat=32 low_dma=0\n   cmd_q=1 f_packid=0 k_orphan=0 closed=0\n     act: id=0 blen=0 t_o/elap=7200000/2620560ms sgat=0 op=0x1b\n",
+  "logs": {
+    "forced-reset.log": "returncode=0\nsg_reset: starting device reset\nsg_reset: completed device reset\n",
+    "forced-reset-canonical.log": "returncode=0\nsg_reset: starting device reset\nsg_reset: completed device reset\n",
+    "forced-tur.log": "6\n    test unit ready cdb: [00 00 00 00 00 00]\ntest unit ready:\nFixed format, current; Sense key: Unit Attention\nAdditional sense: Power on, reset, or bus device reset occurred\n  Field replaceable unit code: 99\n",
+    "forced-tur-after-ua.log": "2\n    test unit ready cdb: [00 00 00 00 00 00]\ntest unit ready:\nFixed format, current; Sense key: Not Ready\nAdditional sense: Logical unit is in process of becoming ready\n  Field replaceable unit code: 99\n",
+    "forced-pr.log": "0\n  generation: 1438\n  注册键:     0x400000000a83048f  (非本系统)\n  持有者:     0x400000000a83048f  类型 0x3\n",
+    "forced-unload.log": "1\n[2026-09-27T08:20:00Z INFO  tape_rs::tape::commands] 弹出磁带...\n[2026-09-27T08:25:26Z ERROR tape_rs] 错误: SCSI host error: 0x0003\n",
+    "forced-inventory.txt": "0\n库布局：1 机械手 · 1 驱动器 · 35 存储槽 · 5 I/E 口\n\n=== 驱动器 ===\n  驱动器   1 [载带]: RC0017L9  <- 存储槽 8   [serial 11EB4A80F1, 设备 ?]\n\n=== 存储槽 ===\n  存储槽   1 [载带]: AA0017L8\n  存储槽   2 [载带]: AA0018L8\n  存储槽   3 [载带]: AA0014L8\n  存储槽   4 [载带]: AA0015L8\n  存储槽   5 [载带]: AA0016L8\n  存储槽   6 [载带]: L00283L8\n  存储槽   7 [载带]: RC0018L9\n  存储槽   8 [空]: -\n  存储槽   9 [空]: -\n  存储槽  10 [空]: -\n  存储槽  11 [空]: -\n  存储槽  12 [空]: -\n  存储槽  13 [空]: -\n  存储槽  14 [空]: -\n  存储槽  15 [空]: -\n  存储槽  16 [空]: -\n  存储槽  17 [空]: -\n  存储槽  18 [空]: -\n  存储槽  19 [空]: -\n  存储槽  20 [空]: -\n  存储槽  21 [空]: -\n  存储槽  22 [空]: -\n  存储槽  23 [空]: -\n  存储槽  24 [空]: -\n  存储槽  25 [空]: -\n  存储槽  26 [空]: -\n  存储槽  27 [空]: -\n  存储槽  28 [空]: -\n  存储槽  29 [空]: -\n  存储槽  30 [空]: -\n  存储槽  31 [空]: -\n  存储槽  32 [空]: -\n  存储槽  33 [空]: -\n  存储槽  34 [空]: -\n  存储槽  35 [空]: -\n\n=== I/E 口 ===\n  I/E 口   1 [空]: -\n  I/E 口   2 [载带]: CLNU03L1\n  I/E 口   3 [空]: -\n  I/E 口   4 [空]: -\n  I/E 口   5 [空]: -\n[2026-09-27T08:19:39Z WARN  tape_rs::scsi::transport] changer: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 1 次）\n"
+  },
+  "allow_dio": "0\n"
+}

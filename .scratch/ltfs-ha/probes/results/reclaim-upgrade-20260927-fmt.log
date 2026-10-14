@@ -1,0 +1,41 @@
+cargo fmt --all -- --check: exit 1; repository-wide historical formatting differences.
+No production Rust source was changed in this deployment.
+Full local output: /tmp/tape-rs-resume-fmt-20260927.log
+Full output SHA256: 27e4873ff7183db470c263b7c10f83910d58eae03e283491c217b3ddd875491c
+
+First reported differences:
+Diff in /work/jay/tape-rs-ltfs-recovery-ibm-interop/src/bin/ltfsctl.rs:93:
+                     len,
+                     o.generation,
+                     o.attempts,
+-                    if o.resolved_by_query { "  (经查询判定)" } else { "" }
++                    if o.resolved_by_query {
++                        "  (经查询判定)"
++                    } else {
++                        ""
++                    }
+                 );
+             }
+             Cmd::Get { path, output } => {
+Diff in /work/jay/tape-rs-ltfs-recovery-ibm-interop/src/bin/ltfsctl.rs:109:
+                 None => println!("不存在"),
+                 Some(p) => {
+                     if p.state != "committed" {
+-                        println!("{}  已接收 {} 字节", if p.state == "staged" { "已暂存，等待落带" } else { "上传中" }, p.length);
++                        println!(
++                            "{}  已接收 {} 字节",
++                            if p.state == "staged" {
++                                "已暂存，等待落带"
++                            } else {
++                                "上传中"
++                            },
++                            p.length
++                        );
+                     }
+                     match p.current {
+                         Some(s) => println!(
+Diff in /work/jay/tape-rs-ltfs-recovery-ibm-interop/src/bin/ltfsctl.rs:116:
+                             "{}  {} 字节  索引代数 {}  磁带 {}  sha256 {}",
+-                            if p.state == "committed" { "已提交" } else { "当前版本" },
++                            if p.state == "committed" {
++                                "已提交"

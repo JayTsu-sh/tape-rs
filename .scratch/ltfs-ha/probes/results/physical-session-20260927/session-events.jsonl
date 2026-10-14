@@ -1,0 +1,24 @@
+{"phase": "leader", "node": 3, "time_ns": 1790515527368323455}
+{"phase": "admin", "path": "/admin/pools/rc18-session", "status": 200, "response": "{\"result\":\"98310642-518f-4db9-872a-3ba69933011e\"}\n", "time_ns": 1790515527369707404}
+{"phase": "admin", "path": "/admin/tapes/RC0018L9?pool=rc18-session", "status": 200, "response": "{\"result\":\"RC0018L9 \u5df2\u5f52\u5165\u6c60 rc18-session\"}\n", "time_ns": 1790515527370948920}
+{"phase": "serving", "state": {"drives": 1, "executor": {"fenced": true, "node": 3, "round": 2}, "id": 3, "last_reclaim": null, "leader": 3, "local": "\u8f6e\u6b21 2\uff1a\u670d\u52a1\u4e2d\u300211EB4A80F1 (/dev/sg3) [RC0018L9]: gen=28 \u6587\u4ef6 3155 \u4e2a \u5c3e\u90e8 Complete\uff1b\u5df2\u5199\u5165\u6c60\u6807\u8bb0\uff1b\u53ef\u7528 16444102 MiB", "role": "Leader", "serving_round": 2, "term": 1}, "time_ns": 1790515743445706632}
+{"phase": "put-begin", "path": "comparison/session-20260927/f0.bin", "time_ns": 1790515743445865943}
+{"phase": "put", "path": "comparison/session-20260927/f0.bin", "seconds": 48.79550201399252, "status": 201, "response": "{\"generation\":30,\"status\":\"committed\",\"task\":1}\n", "time_ns": 1790515792241369281}
+{"phase": "put-begin", "path": "comparison/session-20260927/f1.bin", "time_ns": 1790515792241511494}
+{"phase": "put", "path": "comparison/session-20260927/f1.bin", "seconds": 18.331587392021902, "status": 201, "response": "{\"generation\":31,\"status\":\"committed\",\"task\":2}\n", "time_ns": 1790515810573102333}
+{"phase": "put-begin", "path": "comparison/session-20260927/f2.bin", "time_ns": 1790515810573225754}
+{"phase": "put", "path": "comparison/session-20260927/f2.bin", "seconds": 18.488724944996648, "status": 201, "response": "{\"generation\":32,\"status\":\"committed\",\"task\":3}\n", "time_ns": 1790515829061952385}
+{"phase": "read-between-batches", "seconds": 4.77311271301005, "verified": true, "time_ns": 1790515833835139085}
+{"phase": "put-begin", "path": "comparison/session-20260927/f3.bin", "time_ns": 1790515833835263739}
+{"phase": "put", "path": "comparison/session-20260927/f3.bin", "seconds": 13.733000834006816, "status": 201, "response": "{\"generation\":33,\"status\":\"committed\",\"task\":4}\n", "time_ns": 1790515847568265844}
+{"phase": "put-begin", "path": "comparison/session-20260927/f4.bin", "time_ns": 1790515847568407250}
+{"phase": "put", "path": "comparison/session-20260927/f4.bin", "seconds": 18.600941911921836, "status": 201, "response": "{\"generation\":34,\"status\":\"committed\",\"task\":5}\n", "time_ns": 1790515866169351110}
+{"phase": "put-begin", "path": "comparison/session-20260927/f5.bin", "time_ns": 1790515866169504515}
+{"phase": "put", "path": "comparison/session-20260927/f5.bin", "seconds": 63.30215348501224, "status": 201, "response": "{\"generation\":35,\"status\":\"committed\",\"task\":6}\n", "time_ns": 1790515929471659719}
+{"phase": "put-begin", "path": "comparison/session-20260927/f6.bin", "time_ns": 1790515929471788771}
+{"phase": "put", "path": "comparison/session-20260927/f6.bin", "seconds": 48.65419331507292, "status": 201, "response": "{\"generation\":36,\"status\":\"committed\",\"task\":7}\n", "time_ns": 1790515978125983256}
+{"phase": "put-begin", "path": "comparison/session-20260927/f7.bin", "time_ns": 1790515978126116404}
+{"phase": "put", "path": "comparison/session-20260927/f7.bin", "seconds": 18.518863644916564, "status": 201, "response": "{\"generation\":37,\"status\":\"committed\",\"task\":8}\n", "time_ns": 1790515996644982354}
+{"phase": "read-between-batches", "seconds": 3.5950480870669708, "verified": true, "time_ns": 1790516000240104247}
+{"phase": "shutdown-begin", "time_ns": 1790516000240163570}
+{"phase": "shutdown-complete", "time_ns": 1790516159393193926}

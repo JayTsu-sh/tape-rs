@@ -1,0 +1,14 @@
+partitions/partition-1/data_000000.seg ltfsincrementalindex {'version': '2.5.0'} generation 5
+FILE edit.bin mtime 2026-09-24T12:51:26.152524592Z xattrs [('tapers.version', '2.2'), ('ltfs.hash.sha256sum', '3c2f1b0ed0090d476885163291f3fddecd4ac4d3d73453175c960e160a7015b2')]
+partitions/partition-1/data_000000.seg ltfsincrementalindex {'version': '2.5.0'} generation 6
+FILE new.bin mtime 2026-09-24T12:51:28.591221779Z xattrs [('tapers.version', '2.3'), ('ltfs.hash.sha256sum', '75ad67ecf8c747a39fa87f1c2449a2cd06c2af93248e40b02f56805491560096')]
+partitions/partition-1/data_000000.seg ltfsindex {'version': '2.5.0'} generation 7
+FILE keep.bin mtime 2026-09-23T21:46:40.123456789Z xattrs [('roundtrip.binary', 'AP9MRS1yb3VuZHRyaXA=')]
+FILE link mtime 2026-09-24T12:50:09.360734887Z xattrs [('ltfs.vendor.IBM.prefixLength', '0')]
+FILE edit.bin mtime 2026-09-24T12:51:26.152524592Z xattrs [('tapers.version', '2.2'), ('ltfs.hash.sha256sum', '3c2f1b0ed0090d476885163291f3fddecd4ac4d3d73453175c960e160a7015b2')]
+FILE new.bin mtime 2026-09-24T12:51:28.591221779Z xattrs [('tapers.version', '2.3'), ('ltfs.hash.sha256sum', '75ad67ecf8c747a39fa87f1c2449a2cd06c2af93248e40b02f56805491560096')]
+partitions/partition-0/data_000000.seg ltfsindex {'version': '2.5.0'} generation 7
+FILE keep.bin mtime 2026-09-23T21:46:40.123456789Z xattrs [('roundtrip.binary', 'AP9MRS1yb3VuZHRyaXA=')]
+FILE link mtime 2026-09-24T12:50:09.360734887Z xattrs [('ltfs.vendor.IBM.prefixLength', '0')]
+FILE edit.bin mtime 2026-09-24T12:51:26.152524592Z xattrs [('tapers.version', '2.2'), ('ltfs.hash.sha256sum', '3c2f1b0ed0090d476885163291f3fddecd4ac4d3d73453175c960e160a7015b2')]
+FILE new.bin mtime 2026-09-24T12:51:28.591221779Z xattrs [('tapers.version', '2.3'), ('ltfs.hash.sha256sum', '75ad67ecf8c747a39fa87f1c2449a2cd06c2af93248e40b02f56805491560096')]

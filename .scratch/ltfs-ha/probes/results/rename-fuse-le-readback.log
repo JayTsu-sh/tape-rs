@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/home/rocky/tape-rs-rename-20260924/rename-fuse.py", line 47, in <module>
+    assert digest(original)==expected['sha256']
+  File "/home/rocky/tape-rs-rename-20260924/rename-fuse.py", line 8, in digest
+    def digest(path):return hashlib.sha256(open(path,'rb').read()).hexdigest()
+FileNotFoundError: [Errno 2] No such file or directory: '/home/rocky/tape-rs-rename-20260924/mnt/rc/edit.bin'

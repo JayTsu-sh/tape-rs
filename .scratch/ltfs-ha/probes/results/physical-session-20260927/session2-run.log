@@ -1,0 +1,45 @@
+{"phase": "leader", "node": 1, "time_ns": 1790516659546763229}
+{"phase": "serving", "state": {"drives": 1, "executor": {"fenced": true, "node": 1, "round": 26}, "id": 1, "last_reclaim": null, "leader": 1, "local": "\u8f6e\u6b21 26\uff1a\u9694\u79bb\u5df2\u83b7\u591a\u6570\u6d3e\u786e\u8ba4\uff0c\u6b63\u5728\u6062\u590d\u5377", "role": "Leader", "serving_round": 26, "term": 2}, "time_ns": 1790516947649159580}
+{"phase": "put-begin", "path": "comparison/session2-20260927/f0.bin", "time_ns": 1790516947649303967}
+{"phase": "put", "path": "comparison/session2-20260927/f0.bin", "seconds": 13.324366174987517, "status": 201, "response": "{\"generation\":39,\"status\":\"committed\",\"task\":1}\n", "time_ns": 1790516960973672953}
+{"phase": "put-begin", "path": "comparison/session2-20260927/f1.bin", "time_ns": 1790516960973824492}
+{"phase": "put", "path": "comparison/session2-20260927/f1.bin", "seconds": 18.156974827987142, "status": 201, "response": "{\"generation\":40,\"status\":\"committed\",\"task\":2}\n", "time_ns": 1790516979130801351}
+{"phase": "put-begin", "path": "comparison/session2-20260927/f2.bin", "time_ns": 1790516979130940315}
+{"phase": "put", "path": "comparison/session2-20260927/f2.bin", "seconds": 18.205685002962127, "status": 201, "response": "{\"generation\":41,\"status\":\"committed\",\"task\":3}\n", "time_ns": 1790516997336629013}
+{"phase": "read-between-batches", "seconds": 4.979318690951914, "verified": true, "time_ns": 1790517002316029939}
+{"phase": "put-begin", "path": "comparison/session2-20260927/f3.bin", "time_ns": 1790517002316153360}
+{"phase": "put", "path": "comparison/session2-20260927/f3.bin", "seconds": 13.416153133031912, "status": 201, "response": "{\"generation\":42,\"status\":\"committed\",\"task\":4}\n", "time_ns": 1790517015732308887}
+{"phase": "put-begin", "path": "comparison/session2-20260927/f4.bin", "time_ns": 1790517015732464214}
+{"phase": "put", "path": "comparison/session2-20260927/f4.bin", "seconds": 18.411458474001847, "status": 201, "response": "{\"generation\":43,\"status\":\"committed\",\"task\":5}\n", "time_ns": 1790517034143923788}
+{"phase": "put-begin", "path": "comparison/session2-20260927/f5.bin", "time_ns": 1790517034144054166}
+{"phase": "put", "path": "comparison/session2-20260927/f5.bin", "seconds": 18.442322172923014, "status": 201, "response": "{\"generation\":44,\"status\":\"committed\",\"task\":6}\n", "time_ns": 1790517052586377624}
+{"phase": "put-begin", "path": "comparison/session2-20260927/f6.bin", "time_ns": 1790517052586514436}
+{"phase": "put", "path": "comparison/session2-20260927/f6.bin", "seconds": 18.413729200023226, "status": 201, "response": "{\"generation\":45,\"status\":\"committed\",\"task\":7}\n", "time_ns": 1790517071000244894}
+{"phase": "put-begin", "path": "comparison/session2-20260927/f7.bin", "time_ns": 1790517071000375112}
+{"phase": "put", "path": "comparison/session2-20260927/f7.bin", "seconds": 22.709150539012626, "status": 201, "response": "{\"generation\":46,\"status\":\"committed\",\"task\":8}\n", "time_ns": 1790517093709528076}
+{"phase": "read-between-batches", "seconds": 3.4385010950500146, "verified": true, "time_ns": 1790517097148102468}
+{"phase": "shutdown-begin", "time_ns": 1790517097148161855}
+{"phase": "shutdown-complete", "time_ns": 1790517252827853423}
+[2026-09-27T13:54:12Z INFO  tape_rs::tape::commands] 装载磁带...
+[2026-09-27T13:54:19Z INFO  tape_rs::tape::commands] 装载完成
+装载完成
+{"phase": "native-cold-read", "verified": true, "time_ns": 1790517666192462982}
+[2026-09-27T14:01:06Z INFO  tape_rs::tape::commands] 弹出磁带...
+[2026-09-27T14:02:08Z INFO  tape_rs::tape::commands] 弹出完成
+弹出完成
+卸载: drive 0 (addr 0x0001) → slot 7 (addr 0x03ef)
+[2026-09-27T14:02:08Z INFO  tape_rs::changer::commands] 移动介质: 从 0x0001 到 0x03ef
+[2026-09-27T14:02:38Z INFO  tape_rs::changer::commands] 移动完成
+卸载完成
+{"phase": "complete", "time_ns": 1790517758893764613}
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+{"phase": "le-all-files-read", "count": 3171, "seconds": 92.28785965207499, "verified": true, "time_ns": 1790517876454396370}
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+[2026-09-27T14:07:18Z INFO  tape_rs::scsi::reservation] /dev/sg3: PERSISTENT RESERVE IN 前越过 UNIT ATTENTION 2a/01
+{"phase": "interop-complete", "time_ns": 1790518039243651536}

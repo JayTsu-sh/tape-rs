@@ -1,0 +1,155 @@
+173296 LTFS14000I LTFS starting, LTFS version 2.4.8.2 (10520), log level 2.
+173296 LTFS14058I LTFS Format Specification version 2.4.0.
+173296 LTFS14104I Launched by "/opt/ibm/ltfsle/bin/ltfs /root/tape-rs-io-20260927/le-mount -f -o changer_devname=/dev/sg5 -o work_directory=/root/tape-rs-io-20260927/le-work -o admin_port=17600 -o sync_type=unmount -o volser_only_folder".
+173296 LTFS14105I This binary is built for Linux (x86_64).
+173296 LTFS14106I GCC version is 11.5.0 20240719 (Red Hat 11.5.0-5).
+173296 LTFS17087I Kernel version: Linux version 5.14.0-611.5.1.el9_7.x86_64 (mockbuild@iad1-prod-build001.bld.equ.rockylinux.org) (gcc (GCC) 11.5.0 20240719 (Red Hat 11.5.0-11), GNU ld version 2.35.2-67.el9) #1 SMP PREEMPT_DYNAMIC Tue Nov 11 22:20:27 UTC 2025 i386.
+173296 LTFS17089I Distribution: NAME="Rocky Linux".
+173296 LTFS17089I Distribution: Rocky Linux release 9.7 (Blue Onyx).
+173296 LTFS17089I Distribution: Rocky Linux release 9.7 (Blue Onyx).
+173296 LTFS17089I Distribution: Rocky Linux release 9.7 (Blue Onyx).
+173296 LTFS14064I Sync type is "unmount".
+173296 LTFS17085I Plugin: Loading "sg" tape backend.
+173296 LTFS17085I Plugin: Loading "unified" iosched backend.
+173296 LTFS17085I Plugin: Loading "sg" changer backend.
+173296 LTFS17085I Plugin: Loading "ondemand" dcache backend.
+173296 LTFS17085I Plugin: Loading "memory" crepos backend.
+173296 LTFS11593I LTFS starts with a product license version (20130412_2702).
+173296 LTFS40245I Opening a changer device through sg-changer driver (/dev/sg5).
+173296 LTFS40252I Opened SCSI changer device 17.0.0.1 (/dev/sg5).
+173296 LTFS40249I Vendor ID is IBM     .
+173296 LTFS40250I Product ID is 3573-TL         .
+173296 LTFS40214I Firmware revision is 1711.
+173296 LTFS40215I Changer serial is 55L3A7802K19LL01.
+173296 LTFS40205I INQUIRY LOW (0x12) returns -20501.
+173296 LTFS30209I Opening a device through sg-ibmtape driver (11EB4A80F1).
+173296 LTFS30288I Opening a tape device for drive serial 11EB4A80F1.
+173296 LTFS30250I Opened the SCSI tape device 16.0.0.0 (/dev/sg4).
+173296 LTFS30207I Vendor ID is IBM     .
+173296 LTFS30208I Product ID is ULT3580-TD9     .
+173296 LTFS30214I Firmware revision is R3G0.
+173296 LTFS30215I Drive serial is 11EB4A80F1.
+173296 LTFS30205I TEST_UNIT_READY (0x00) returns -20209.
+173296 LTFS30290I Changer /dev/sg4 isn't reserved from any nodes.
+173296 LTFS30285I The reserved buffer size of 11EB4A80F1 is 1048576.
+173296 LTFS30294I Setting up timeout values from RSOC.
+173296 LTFS30205I TEST_UNIT_READY (0x00) returns -20209.
+173296 LTFS17160I Maximum device block size is 1048576.
+173296 LTFS16500I Cartridge repository plugin is initialized (memory, /root/tape-rs-io-20260927/le-work/55L3A7802K19LL01).
+173296 LTFS11545I Rebuilding the cartridge inventory.
+173296 LTFS11627I Getting Inventory - 55L3A7802K19LL01.
+173296 LTFS11629I Aqcuireing MoveLock - 55L3A7802K19LL01.
+173296 LTFS11630I Aqcuired Move Lock (6) - 55L3A7802K19LL01.
+173296 LTFS11628I Got Inventory - 55L3A7802K19LL01.
+173296 LTFS11637I Reset the cartridge link against the drive 11EB4A80F1.
+173296 LTFS11638I Cartridge CLNU03L1 was unassigned because it is in a IE slot.
+173296 LTFS11571I State of tape 'CLNU03L1' in slot 0x66 is changed from 'INIT' to 'NON_SUPPORTED_TAPE'.
+173296 LTFS11571I State of tape 'AA0017L8' in slot 0x3e9 is changed from 'INIT' to 'NOT_MOUNTED_YET'.
+173296 LTFS11571I State of tape 'AA0018L8' in slot 0x3ea is changed from 'INIT' to 'NOT_MOUNTED_YET'.
+173296 LTFS11571I State of tape 'AA0014L8' in slot 0x3eb is changed from 'INIT' to 'NOT_MOUNTED_YET'.
+173296 LTFS11571I State of tape 'AA0015L8' in slot 0x3ec is changed from 'INIT' to 'NOT_MOUNTED_YET'.
+173296 LTFS11571I State of tape 'AA0016L8' in slot 0x3ed is changed from 'INIT' to 'NOT_MOUNTED_YET'.
+173296 LTFS11571I State of tape 'L00283L8' in slot 0x3ee is changed from 'INIT' to 'NOT_MOUNTED_YET'.
+173296 LTFS11571I State of tape 'RC0018L9' in slot 0x3ef is changed from 'INIT' to 'WRITABLE'.
+173296 LTFS11571I State of tape 'RC0017L9' in slot 0x3f0 is changed from 'INIT' to 'NOT_MOUNTED_YET'.
+173296 LTFS11720I Built the cartridge inventory (0).
+173296 LTFS11774I Starting volume cache cleaning.
+173296 LTFS11775I Volume cache cleaning is finished
+173296 LTFS16566I Starting repos file cleaning.
+173296 LTFS16567I Repos file cleaning is finished.
+173296 LTFS11776I Starting volume cache load.
+173296 LTFS11732I Loading cache for cartridge RC0018L9.
+173296 LTFS11733I Loading volume cache for cartridge RC0018L9.
+173296 LTFS11743I Reading index of RC0018L9 from volume cache (3273 files).
+173296 LTFS11745I Read index of RC0018L9 from volume cache.
+173296 LTFS11777I Loaded required volume caches.
+173296 LTFS14708I LTFS admin server version 2 is starting on port 17600.
+173296 LTFS14111I Initial setup completed successfully.
+173296 LTFS14112I Invoke 'mount' command to check the result of final setup.
+173296 LTFS14113I Specified mount point is listed if succeeded.
+1732ea LTFS14029I Ready to receive file system requests.
+173345 LTFS14784I Removing cartridge RC0018L9.
+173345 LTFS11638I Cartridge RC0018L9 was unassigned because an error happens in a file system operation or it is unassigned from OOB.
+173345 LTFS11632I Remove volume cache files - RC0018L9.
+173345 LTFS11571I State of tape 'RC0018L9' in slot 0x3ef is changed from 'WRITABLE' to 'NEED_ASSIGN'.
+173345 LTFS14785I Cartridge RC0018L9 is removed successfully.
+173353 LTFS14781I Adding cartridge RC0018L9.
+173353 LTFS11571I State of tape 'RC0018L9' in slot 0x3ef is changed from 'NEED_ASSIGN' to 'WRITABLE'.
+173353 LTFS14782I Cartridge RC0018L9 is added successfully.
+1733a6 LTFS14802I Moving cartridge RC0018L9.
+1733a6 LTFS14812I Moving cartridge RC0018L9 from 1007 to 1 - 55L3A7802K19LL01 .
+1733a6 LTFS11629I Aqcuireing MoveLock - 55L3A7802K19LL01.
+1733a6 LTFS11630I Aqcuired Move Lock (10) - 55L3A7802K19LL01.
+1733a6 LTFS14813I Moved cartridge RC0018L9 to 1 successfully - 55L3A7802K19LL01.
+1733a6 LTFS11635I Link the drive 11EB4A80F1 to the cartridge RC0018L9.
+1733a6 LTFS14803I Cartridge RC0018L9 is moved successfully.
+1732ea LTFS11616I Mounting cartridge RC0018L9.
+1732ea LTFS11613I Moving cartridge RC0018L9 to drive 11EB4A80F1.
+1732ea LTFS11626I Cartridge RC0018L9 is already in drive 11EB4A80F1.
+1732ea LTFS11746I Mounting RC0018L9 on 11EB4A80F1.
+1732ea LTFS11330I Loading cartridge.
+1732ea LTFS30205I LOAD_UNLOAD (0x1b) returns -20601.
+1732ea LTFS30252I Logical block protection is disabled.
+1732ea LTFS11332I Load successful.
+1732ea LTFS17157I Changing the drive setting to append-only mode.
+1732ea LTFS11005I Mounting the volume.
+1732ea LTFS30252I Logical block protection is disabled.
+1732ea LTFS17227I Tape attribute: Vendor = IBM.
+1732ea LTFS17227I Tape attribute: Application Name = LTF.
+1732ea LTFS17227I Tape attribute: Application Version = 2.4.
+1732ea LTFS17227I Tape attribute: Medium Label = tapðY.
+1732ea LTFS17228I Tape attribute: Text Localization ID = 0x81.
+1732ea LTFS17227I Tape attribute: Barcode = RC0.
+1732ea LTFS17227I Tape attribute: Application Format Version = 2.4.
+1732ea LTFS17228I Tape attribute: Volume Lock Status = 0x00.
+1732ea LTFS17227I Tape attribute: Media Pool name = .
+1732ea LTFS11031I Volume mounted successfully. RC0018 : Gen = 21 / (a, 5) -> (b, 38225) / 11EB4A80F1.
+1732ea LTFS11664I Cartridge 'RC0018L9' is mounted on node 'lisa-143'.
+1732ea LTFS11741I Writing index of RC0018L9 to volume cache (Reason: (null), 3273 files).
+1732ea LTFS11410I Wrote index cache of RC0018L9.
+1732ea LTFS11747I Mounted RC0018L9 on 11EB4A80F1.
+1732ea LTFS11617I Mounted cartridge RC0018L9 successfully.
+1732ea LTFS11337I Update index-dirty flag (1) - RC0018 (0x0x7f04f400b7f0).
+1736a5 LTFS11338I Syncing index of RC0018 11EB4A80F1.
+1736a5 LTFS17068I Syncing index of RC0018 (Reason: Sync by EA) 11EB4A80F1.
+1736a5 LTFS17235I Writing index of RC0018 to b (Reason: Sync by EA, 3274 files) 11EB4A80F1.
+1736a5 LTFS17236I Wrote index of RC0018 (Gen = 22, Part = b, Pos = 38234, 11EB4A80F1).
+1736a5 LTFS11337I Update index-dirty flag (0) - RC0018 (0x0x7f04f400b7f0).
+1736a5 LTFS17070I Synced index of RC0018 (0) 11EB4A80F1.
+1732ea LTFS11337I Update index-dirty flag (1) - RC0018 (0x0x7f04f400b7f0).
+1732ea LTFS11338I Syncing index of RC0018 11EB4A80F1.
+1732ea LTFS17068I Syncing index of RC0018 (Reason: Sync by EA) 11EB4A80F1.
+1732ea LTFS17235I Writing index of RC0018 to b (Reason: Sync by EA, 3275 files) 11EB4A80F1.
+1732ea LTFS17236I Wrote index of RC0018 (Gen = 23, Part = b, Pos = 38241, 11EB4A80F1).
+1732ea LTFS11337I Update index-dirty flag (0) - RC0018 (0x0x7f04f400b7f0).
+1732ea LTFS17070I Synced index of RC0018 (0) 11EB4A80F1.
+1736a5 LTFS11337I Update index-dirty flag (1) - RC0018 (0x0x7f04f400b7f0).
+1732ea LTFS11338I Syncing index of RC0018 11EB4A80F1.
+1732ea LTFS17068I Syncing index of RC0018 (Reason: Sync by EA) 11EB4A80F1.
+1732ea LTFS17235I Writing index of RC0018 to b (Reason: Sync by EA, 3276 files) 11EB4A80F1.
+1732ea LTFS17236I Wrote index of RC0018 (Gen = 24, Part = b, Pos = 38248, 11EB4A80F1).
+1732ea LTFS11337I Update index-dirty flag (0) - RC0018 (0x0x7f04f400b7f0).
+1732ea LTFS17070I Synced index of RC0018 (0) 11EB4A80F1.
+17435b LTFS14802I Moving cartridge RC0018L9.
+17435b LTFS11748I Unmounting RC0018L9 from 11EB4A80F1.
+17435b LTFS17235I Writing index of RC0018 to a (Reason: Unmount - 0, 3276 files) 11EB4A80F1.
+17435b LTFS17236I Wrote index of RC0018 (Gen = 24, Part = a, Pos = 5, 11EB4A80F1).
+17435b LTFS11034I Volume unmounted successfully.
+17435b LTFS11741I Writing index of RC0018L9 to volume cache (Reason: Unmount - 0, 3276 files).
+17435b LTFS11410I Wrote index cache of RC0018L9.
+17435b LTFS11787I Capturing cartridge statistics for RC0018L9.
+17435b LTFS11289I Ejecting cartridge.
+17435b LTFS12022I Unloading medium.
+17435b LTFS11291I Eject successful.
+17435b LTFS11749I Unmounted RC0018L9 from 11EB4A80F1.
+17435b LTFS14812I Moving cartridge RC0018L9 from 1 to 1007 - 55L3A7802K19LL01 .
+17435b LTFS11629I Aqcuireing MoveLock - 55L3A7802K19LL01.
+17435b LTFS11630I Aqcuired Move Lock (10) - 55L3A7802K19LL01.
+17435b LTFS11636I Unlink the drive 11EB4A80F1 from the cartridge RC0018L9.
+17435b LTFS14813I Moved cartridge RC0018L9 to 1007 successfully - 55L3A7802K19LL01.
+17435b LTFS14803I Cartridge RC0018L9 is moved successfully.
+173296 LTFS16501I Cartridge repository plugin is uninitialized (memory).
+173296 LTFS30205I TEST_UNIT_READY (0x00) returns -20209.
+173296 LTFS30205I TEST_UNIT_READY (0x00) returns -20209.
+173296 LTFS30205I TEST_UNIT_READY (0x00) returns -20209.
+173296 LTFS30252I Logical block protection is disabled.

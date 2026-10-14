@@ -1,0 +1,2 @@
+STAT FileStat { length: 65569, generation: 40, round: 6, barcode: "LD2502L08", sha256: "", version: (0, 0), metadata: Object {"modify_time": String("2026-09-24T12:38:04.419335445Z"), "xattrs": Array [Object {"base64": Bool(true), "key": String("interop.binary"), "value": String("AP9MRTI0")}]} }
+PASS Client stat/stat_path/get/get_to/get_range/list/list_dir/pools/404/416

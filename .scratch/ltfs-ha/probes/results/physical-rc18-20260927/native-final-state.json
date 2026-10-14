@@ -1,0 +1,15 @@
+{
+  "completed": true,
+  "allow_dio": "0",
+  "ltfs_running": false,
+  "volume_uuid": "878f7b34-4910-4d09-9f1f-3e4725ede6d8",
+  "inventory": [
+    "库布局：1 机械手 · 1 驱动器 · 35 存储槽 · 5 I/E 口",
+    "=== 驱动器 ===",
+    "  驱动器   1 [空]: -   [serial 11EB4A80F1, 设备 ?]",
+    "  存储槽   7 [载带]: RC0018L9",
+    "  存储槽   8 [载带]: RC0017L9"
+  ],
+  "pr_status": "  generation: 18\n  注册表:     (空)\n  持有者:     (无)\n",
+  "wall_time": 1790511803.831285
+}

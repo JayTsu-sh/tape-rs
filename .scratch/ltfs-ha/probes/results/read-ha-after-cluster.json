@@ -1,0 +1,47 @@
+[
+  {
+    "drives": 2,
+    "executor": {
+      "fenced": true,
+      "node": 2,
+      "round": 124
+    },
+    "id": 1,
+    "last_reclaim": null,
+    "leader": 2,
+    "local": "空闲",
+    "role": "Follower",
+    "serving_round": null,
+    "term": 13
+  },
+  {
+    "drives": 2,
+    "executor": {
+      "fenced": true,
+      "node": 2,
+      "round": 124
+    },
+    "id": 2,
+    "last_reclaim": null,
+    "leader": 2,
+    "local": "轮次 124：服务中。IBMtaper2287 (/dev/sg10) [RT2502L8]: gen=46 文件 24 个 尾部 Complete；可用 90 MiB",
+    "role": "Leader",
+    "serving_round": 124,
+    "term": 13
+  },
+  {
+    "drives": 2,
+    "executor": {
+      "fenced": true,
+      "node": 2,
+      "round": 124
+    },
+    "id": 3,
+    "last_reclaim": null,
+    "leader": 2,
+    "local": "轮次 119 已放弃：读取文件失败: SCSI command failed: status=0x02, sense_key=0x06, asc=0x2a, ascq=0x05",
+    "role": "Follower",
+    "serving_round": null,
+    "term": 13
+  }
+]

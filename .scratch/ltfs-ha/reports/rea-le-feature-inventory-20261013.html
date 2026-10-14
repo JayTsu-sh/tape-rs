@@ -1,0 +1,41 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REA：LE 功能 GAP 双侧真实验证审计</title><style>body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.55;max-width:1320px;margin:2rem auto;padding:0 1rem;color:#18222d}h1,h2{color:#123b63}table{border-collapse:collapse;width:100%;margin:1rem 0}th,td{border:1px solid #cad5df;padding:.55rem;vertical-align:top;text-align:left}th{background:#edf4f9}.gap{color:#9b1c1c;font-weight:700}.candidate{color:#725400;font-weight:700}.warn{padding:.8rem 1rem;border-left:4px solid #d9822b;background:#fff8ef}code{background:#f2f4f6;padding:.1rem .25rem;border-radius:3px}</style></head><body>
+<h1>REA：LE 功能 GAP 双侧真实验证审计</h1>
+<p><b>日期：</b>2026-10-13　<b>LE：</b>IBM LTFS LE 2.4.8.2 (10520)　<b>节点：</b>10.131.7.209 / lisa-3　<b>库：</b>TS4300 3573-TL firmware 1621</p>
+<div class="warn"><b>审计规则：</b>只有同时满足“LE 上有真实运行证据”和“tape-rs 已在真实环境执行/检查，确认当前没有等价能力”的项目，才标为“已确认 GAP”。REA 静态 procedure、help、字符串只能证明候选功能面。未执行 format、erase、write、MAM write、assign/unassign、recover、rollback 等有状态操作。</div>
+<h2>1. 已确认 GAP：两侧证据均闭环</h2>
+<table><tr><th>GAP</th><th>LE 真实证据</th><th>tape-rs 真实对照</th><th>结论</th></tr>
+<tr><td>多卷逻辑库 FUSE 根目录</td><td>LE 真实 mount 后，<code>/mnt/smartiq/LTFS_55L3A78011W9LL01</code> 同时列出六个卷目录：<code>8A0042L8</code>、<code>8A0047L8</code>、<code>AA0000L8</code>、<code>AA0013L8</code>、<code>L00284L8</code>、<code>L00285L8</code>。</td><td>真实运行只完成单 drive/tape 的 changer、LTFS volume、catalog 和 tape-fuse 路径；源码/CLI 没有把多个卷暴露在一个逻辑库 FUSE 根目录的等价模型。</td><td class="gap">已确认功能 GAP</td></tr>
+<tr><td>逻辑库资源与 assignment 状态模型</td><td>LE 真实 <code>leadm node/library/tape list -o json</code> 返回 node/library 状态、slot/home_slot、drive、assignment、<code>NEED_ASSIGN</code>、<code>BLACKLISTED/NON_SUPPORTED_TAPE</code> 等资源字段。</td><td>真实 inventory 只验证 SCSI element address map、transport/drive/slot/I-E 和 barcode；项目没有真实运行得到或实现 LE 的 assigned/unassigned/blacklisted 资源策略及 node/library 状态 API。</td><td class="gap">已确认功能 GAP</td></tr>
+<tr><td>按逻辑卷访问的自动物理 drive 切换</td><td>LE 初始 drive 2 为 <code>L00285L8</code>；访问逻辑卷 <code>8A0047L8</code> 后，真实 <code>leadm drive list</code> 变为 drive 2=<code>8A0047L8</code>，其 <code>home_slot=1001</code>，并报告 drive/handling 状态。</td><td>真实 tape-rs 流程要求显式 changer MOVE/drive LOAD，再对指定设备执行读写；没有逻辑目录访问到物理 drive 调度的等价实现。LE 目标文件的完整数据读取本次未在窗口内完成，因此只确认“切换行为 GAP”，不宣称完整读链路已闭环。</td><td class="gap">已确认调度 GAP；读完成仍待补测</td></tr>
+</table>
+<h2>2. 已真实观察但不应新增为 GAP 的项目</h2>
+<table><tr><th>功能面</th><th>LE 证据</th><th>项目证据/判断</th></tr>
+<tr><td>底层 tape/changer SCSI</td><td>LE 运行日志与 kernel SCSI tracepoint 真实捕获 Inquiry、PR、MODE SENSE(6)、READ ELEMENT STATUS、TUR、装载相关命令。</td><td>tape-rs 真实 inventory/load/PR/status/position/LOG SENSE/READ 已执行，日志捕获 MODE SENSE(10) 与 RES。存在真实 CDB 字节差异，但尚未证明功能结果不等价，故这是协议差异待解释，不是当前 GAP。</td></tr>
+<tr><td>容量、TapeAlert、位置、EOD/MAM</td><td>LE <code>tape list/show</code> 真实返回 total/remaining capacity、TapeAlert、valid blocks 等字段。</td><td>tape-rs 已真实执行 LOG SENSE/TapeAlert、position、MAM/volume capacity 与 EOD 相关路径；能力边界和字段语义仍需逐项对照，不能声称项目完全没有。</td></tr>
+<tr><td>单卷 LTFS/FUSE、xattr、恢复</td><td>REA 静态识别 LE FUSE callbacks 与 xattr；LE mount/目录访问真实成功。</td><td>项目有真实单卷 LTFS/tape-fuse、xattr、读写与 recovery 代码/测试；差异是多卷逻辑库编排，不是这些基础能力整体缺失。</td></tr>
+<tr><td>大索引恢复能力</td><td>LE 真实启动加载多卷 cache，观察到卷索引包含数百万文件并成功进入 Available。</td><td>tape-rs 真实 <code>ltfs-list</code> 在 AA0013L8 因 64 MiB recovery budget 报 <code>Recovery restricted</code>；这是运行时闭环报告已确认的独立 GAP。</td></tr>
+</table>
+<h2>3. 候选项清理结果</h2>
+<p><b>清理规则：</b>候选项必须通过真实 LE 终态和 tape-rs 对照后才能升级为 GAP；若真实场景已经得到明确成功、明确错误或明确超时，则该场景不再作为“未闭环候选”保留。</p>
+<p>本轮已将 cache 访问、assignment/cache retention、数据读、rollbacklist、recover、当前 mount/cache 配置和介质属性全部执行到明确终态。没有新增“项目缺失”的 GAP；因此本节不再保留泛化候选项。</p>
+<h2>4. 本轮候选项实际验证结果</h2>
+<table><tr><th>候选项</th><th>本轮 LE 真实结果</th><th>本轮 tape-rs 对照/结论</th></tr>
+<tr><td>cache 加载/逻辑目录访问</td><td>LE 重启真实加载五卷以上百万级索引并进入 Available；根目录列出六卷；storage slot 中的 AA0000L8 目录读取成功且不换带。对 AA0013L8/b1 发起真实数据读取，明确以 RC 124 超时结束。</td><td>LE cache/逻辑目录和数据面失败边界已得到终态；项目已有单卷 catalog/recovery，但没有 LE 多卷调度层。仅将多卷调度保留为 GAP，不再保留泛化 cache 生命周期候选。</td></tr>
+<tr><td>mount/cache 配置</td><td>真实读取 <code>ltfs.conf</code>：<code>dcache disabled</code>、<code>crepos memory</code>、sync 示例未启用；node JSON 为 manual/empty-handed false。</td><td>已得到当前环境的明确配置事实；没有证据表明 tape-rs 缺少一个当前启用的等价功能，因此不升级 GAP。</td></tr>
+<tr><td>rollbacklist</td><td>真实执行返回 <code>LTFSI1090E This cartridge is not included in the file system</code>，退出码 3。</td><td>该场景已得到明确 LE 错误终态；不能把错误前置条件当作项目 GAP。</td></tr>
+<tr><td>recover</td><td>真实执行 120 秒后以 RC 124 超时；无成功恢复结果。</td><td>已得到明确 LE 超时终态；没有成功功能结果，不能宣布项目缺失。</td></tr>
+<tr><td>WORM/加密/保护属性</td><td>所有当前介质真实返回 <code>is_worm=false</code>、<code>is_encrypted=false</code>、<code>write_protect=NONE</code>、TapeAlert 可读。</td><td>当前测试库存没有启用 WORM/加密场景；项目也已有部分只读/告警/底层能力，不形成可确认 GAP，移出候选。</td></tr>
+<tr><td>xattr/文件访问</td><td>LE 根目录 xattr 查询成功但没有属性；对逻辑卷文件访问取得明确终态：目录访问成功，数据读取受控 RC124 超时。</td><td>项目单卷 tape-fuse/xattr 已有真实实现；没有证明 xattr 兼容性 GAP。文件读取失败已记录为 LE 当前设备状态下的数据面终态，不再作为候选。</td></tr>
+</table>
+<h2>5. 本轮状态改变验证结果</h2>
+<table><tr><th>项目</th><th>真实 LE 结果</th><th>结论</th></tr>
+<tr><td>数据读取触发自动换带</td><td>目录访问不换带；对 AA0013L8/b1 发起后台 4 KiB 读取，drive 1 切换到 AA0013L8，随后受控 timeout 30 秒返回 RC 124。另一次 AA0000L8 读取触发 cleaning 状态并未返回。</td><td>自动物理装载/drive 复用触发条件和数据面失败终态均已闭环；完整成功读取不是 LE 当前环境中可复现的结果。</td></tr>
+<tr><td>assignment 与逻辑可见性</td><td><code>8A0043L8</code> 从 IE slot 移到 storage slot 后，<code>assign</code> 成功并出现在逻辑根目录；<code>unassign --keep-cache VALID</code> 成功，逻辑目录消失且 cache/stat 文件保留。LE 重启后 storage slot 库存重建又将其置为 ASSIGNED。</td><td>assignment、逻辑可见性和 cache retention 均为真实功能；已支持原有 assignment GAP，不新增重复 GAP。</td></tr>
+<tr><td>rollbacklist / recover</td><td><code>rollbacklist</code> 返回 LTFSI1090E/RC3；<code>recover</code> 受控 120 秒后 RC124。二者均已取得终态。</td><td>已闭环为 LE 当前介质/状态下的错误与超时行为，不能作为新的项目 GAP。</td></tr>
+<tr><td>mount/cache 配置</td><td>真实读取 <code>ltfs.conf</code>：默认 <code>dcache disabled</code>、<code>crepos memory</code>，sync 策略示例未启用；volume cache 仍由 LE workdir 使用。</td><td>确认当前实现配置，不等于已验证策略切换后的行为；cache 生命周期候选保留。</td></tr>
+</table>
+<h2>6. 真实验证记录摘要</h2>
+<ul><li>LE：node Available；library 为 2 drives/35 slots/5 I-E/1 robot；真实 FUSE mount 成功。</li><li>LE：目录访问可从 cache 返回；真实数据读取触发 drive 切换但以 RC124 超时，AA0000L8 另有 Cleaning tape installed 终态。</li><li>LE：rollbacklist 返回 LTFSI1090E/RC3；recover 返回 RC124；assignment、unassign/cache retention 已成功验证。</li><li>tape-rs：真实 changer inventory、PR fencing/release、MOVE/load、status、position、LOG SENSE、AA0013L8 raw READ 和 <code>ltfs-list</code> 均已执行。</li><li>证据包：<code>.scratch/ltfs-ha/reports/rea-evidence-session-20261013.json</code>；运行时闭环：<a href="rea-runtime-closed-20261013.html">rea-runtime-closed-20261013.html</a>。</li></ul>
+<h2>7. 结论</h2>
+<p>按“LE 真实存在 + tape-rs 真实确认没有等价能力”的严格口径，本次仍只保留三类新增 GAP：多卷逻辑库 FUSE 根目录、LE 资源 assignment/blacklist 状态模型、逻辑卷访问驱动的自动物理 drive 调度。候选场景已全部取得真实成功、错误或超时终态；没有任何候选项在本轮形成新的项目 GAP。LE 数据面在当前库存上以明确超时/清洁状态失败，不应被描述为成功能力。</p>
+<p><a href="rea-runtime-closed-20261013.html">运行时对照闭环报告</a>　<a href="rea-analysis-20261013.html">REA 静态报告</a>　<a href="rea-evidence-session-20261013.json">REA Evidence Bundle</a></p></body></html>

@@ -1,0 +1,1341 @@
+2026-09-25T00:25:15.035633+00:00 ee1 ltfs[1164206]: 1d070d LTFS14781I Adding cartridge TS1000L8.
+2026-09-25T00:25:15.036146+00:00 ee1 ltfs[1164206]: 1d070d LTFS11571I State of tape 'TS1000L8' in slot 0x408 is changed from 'NEED_ASSIGN' to 'WRITABLE'.
+2026-09-25T00:25:15.038260+00:00 ee1 ltfs[1164206]: 1d070d LTFS14782I Cartridge TS1000L8 is added successfully.
+2026-09-25T00:25:15.318606+00:00 ee1 ltfs[1164206]: 1d0716 LTFS14814I Mounting cartridge TS1000L8.
+2026-09-25T00:25:15.327970+00:00 ee1 ltfs[1164206]: 1d0716 LTFS14812I Moving cartridge TS1000L8 from 1032 to 256 - IBMlisa41D6C_LL3 .
+2026-09-25T00:25:15.328058+00:00 ee1 ltfs[1164206]: 1d0716 LTFS11629I Aqcuireing MoveLock - IBMlisa41D6C_LL3.
+2026-09-25T00:25:15.328216+00:00 ee1 ltfs[1164206]: 1d0716 LTFS11630I Aqcuired Move Lock (14) - IBMlisa41D6C_LL3.
+2026-09-25T00:25:15.329140+00:00 ee1 ltfs[1164206]: 1d0716 LTFS14813I Moved cartridge TS1000L8 to 256 successfully - IBMlisa41D6C_LL3.
+2026-09-25T00:25:15.329233+00:00 ee1 ltfs[1164206]: 1d0716 LTFS11635I Link the drive IBMlisa41D6C to the cartridge TS1000L8.
+2026-09-25T00:25:15.329285+00:00 ee1 ltfs[1164206]: 1d0716 LTFS11330I Loading cartridge.
+2026-09-25T00:25:15.397374+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30205I LOAD_UNLOAD (0x1b) returns -20601.
+2026-09-25T00:25:15.397594+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30205I READPOS (0x34) returns -20601.
+2026-09-25T00:25:15.397656+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30263I READPOS returns Not Ready to Ready Transition, Medium May Have Changed (-20601) /dev/sg5.
+2026-09-25T00:25:15.397728+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30262I Forcing drive dump.
+2026-09-25T00:25:15.397980+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0925_002515_f.dmp.
+2026-09-25T00:25:15.400641+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30252I Logical block protection is disabled.
+2026-09-25T00:25:15.402160+00:00 ee1 ltfs[1164206]: 1d0716 LTFS11332I Load successful.
+2026-09-25T00:25:15.402466+00:00 ee1 ltfs[1164206]: 1d0716 LTFS11746I Mounting TS1000L8 on IBMlisa41D6C.
+2026-09-25T00:25:15.402527+00:00 ee1 ltfs[1164206]: 1d0716 LTFS11330I Loading cartridge.
+2026-09-25T00:25:15.404442+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30252I Logical block protection is disabled.
+2026-09-25T00:25:15.405715+00:00 ee1 ltfs[1164206]: 1d0716 LTFS11332I Load successful.
+2026-09-25T00:25:15.407280+00:00 ee1 ltfs[1164206]: 1d0716 LTFS17157I Changing the drive setting to append-only mode.
+2026-09-25T00:25:15.411840+00:00 ee1 ltfs[1164206]: 1d0716 LTFS11005I Mounting the volume.
+2026-09-25T00:25:15.414226+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30252I Logical block protection is disabled.
+2026-09-25T00:25:15.424196+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-25T00:25:15.424282+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T00:25:15.424334+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30233I Cannot read attribute (-20501).
+2026-09-25T00:25:15.424406+00:00 ee1 ltfs[1164206]: 1d0716 LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-25T00:25:15.429423+00:00 ee1 ltfs[1164206]: 1d0716 LTFS17096W The index read from the tape uses a newer version of the LTFS format than the one supported by this software. Some functionality might be unavailable. If this tape is modified, the index downgrades format version to 2.4.0 from 2.5.0.
+2026-09-25T00:25:15.434234+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-25T00:25:15.434303+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T00:25:15.434340+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30233I Cannot read attribute (-20501).
+2026-09-25T00:25:15.434568+00:00 ee1 ltfs[1164206]: 1d0716 LTFS17227I Tape attribute: Vendor =         .
+2026-09-25T00:25:15.434623+00:00 ee1 ltfs[1164206]: 1d0716 LTFS17227I Tape attribute: Application Name =                                 .
+2026-09-25T00:25:15.434676+00:00 ee1 ltfs[1164206]: 1d0716 LTFS17227I Tape attribute: Application Version =         .
+2026-09-25T00:25:15.434720+00:00 ee1 ltfs[1164206]: 1d0716 LTFS17227I Tape attribute: Medium Label =                                                                                                                                                                 .
+2026-09-25T00:25:15.434770+00:00 ee1 ltfs[1164206]: 1d0716 LTFS17228I Tape attribute: Text Localization ID = 0x00.
+2026-09-25T00:25:15.434813+00:00 ee1 ltfs[1164206]: 1d0716 LTFS17227I Tape attribute: Barcode =                                 .
+2026-09-25T00:25:15.434851+00:00 ee1 ltfs[1164206]: 1d0716 LTFS17227I Tape attribute: Application Format Version =                 .
+2026-09-25T00:25:15.434916+00:00 ee1 ltfs[1164206]: 1d0716 LTFS17228I Tape attribute: Volume Lock Status = 0x00.
+2026-09-25T00:25:15.434964+00:00 ee1 ltfs[1164206]: 1d0716 LTFS17227I Tape attribute: Media Pool name =                                                                                                                                                                 .
+2026-09-25T00:25:15.435032+00:00 ee1 ltfs[1164206]: 1d0716 LTFS11031I Volume mounted successfully. TS1000 : Gen = 84 / (a, 5) -> (b, 285) / IBMlisa41D6C.
+2026-09-25T00:25:15.435076+00:00 ee1 ltfs[1164206]: 1d0716 LTFS11664I Cartridge 'TS1000L8' is mounted on node 'ee1.ee.lab'.
+2026-09-25T00:25:15.435755+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.435806+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.435848+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.435893+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.435929+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.435963+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436010+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436061+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436100+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436135+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436189+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436240+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436275+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436305+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436343+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436373+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436415+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436453+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436496+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436531+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436577+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436618+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436649+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436683+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436732+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436780+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436816+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436850+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436893+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436927+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.436977+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437029+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437065+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437103+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437138+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437186+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437232+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437282+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437321+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437362+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437396+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437434+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437463+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437512+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437546+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437593+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437633+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437672+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437703+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437736+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437772+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437813+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437843+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437893+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437937+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.437970+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.438008+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.438048+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.438085+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.438130+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.438182+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.438219+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.438252+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.438289+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:15.438319+00:00 ee1 ltfs[1164206]: 1d0716 LTFS11741I Writing index of TS1000L8 to volume cache (Reason: (null), 26 files).
+2026-09-25T00:25:15.440393+00:00 ee1 ltfs[1164206]: 1d0716 LTFS11410I Wrote index cache of TS1000L8.
+2026-09-25T00:25:15.442351+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-25T00:25:15.442407+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T00:25:15.442463+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30233I Cannot read attribute (-20501).
+2026-09-25T00:25:15.442498+00:00 ee1 ltfs[1164206]: 1d0716 LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-25T00:25:15.468138+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-25T00:25:15.468260+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T00:25:15.468308+00:00 ee1 ltfs[1164206]: 1d0716 LTFS30233I Cannot read attribute (-20501).
+2026-09-25T00:25:15.468342+00:00 ee1 ltfs[1164206]: 1d0716 LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-25T00:25:15.468371+00:00 ee1 ltfs[1164206]: 1d0716 LTFS11747I Mounted TS1000L8 on IBMlisa41D6C.
+2026-09-25T00:25:15.470319+00:00 ee1 ltfs[1164206]: 1d0716 LTFS14815I Cartridge TS1000L8 is mounted successfully.
+2026-09-25T00:25:55.085379+00:00 ee1 ltfs[1164206]: 11c3b1 LTFS11337I Update index-dirty flag (1) - TS1000 (0x0x7f28dc002de0).
+2026-09-25T00:25:55.132167+00:00 ee1 ltfs[1164206]: 120e8b LTFS11338I Syncing index of TS1000 IBMlisa41D6C.
+2026-09-25T00:25:55.132384+00:00 ee1 ltfs[1164206]: 120e8b LTFS17068I Syncing index of TS1000 (Reason: Sync by EA) IBMlisa41D6C.
+2026-09-25T00:25:55.132665+00:00 ee1 ltfs[1164206]: 120e8b LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-25T00:25:55.132725+00:00 ee1 ltfs[1164206]: 120e8b LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T00:25:55.132763+00:00 ee1 ltfs[1164206]: 120e8b LTFS30233I Cannot read attribute (-20501).
+2026-09-25T00:25:55.132811+00:00 ee1 ltfs[1164206]: 120e8b LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-25T00:25:55.133089+00:00 ee1 ltfs[1164206]: 120e8b LTFS17235I Writing index of TS1000 to b (Reason: Sync by EA, 27 files) IBMlisa41D6C.
+2026-09-25T00:25:55.515694+00:00 ee1 ltfs[1164206]: 120e8b LTFS17236I Wrote index of TS1000 (Gen = 85, Part = b, Pos = 289, IBMlisa41D6C).
+2026-09-25T00:25:55.515876+00:00 ee1 ltfs[1164206]: 120e8b LTFS11337I Update index-dirty flag (0) - TS1000 (0x0x7f28dc002de0).
+2026-09-25T00:25:55.515945+00:00 ee1 ltfs[1164206]: 120e8b LTFS17070I Synced index of TS1000 (0) IBMlisa41D6C.
+2026-09-25T00:25:55.516753+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.516823+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.516862+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.516912+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.516953+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.516988+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517032+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517067+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517102+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517137+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517193+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517232+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517266+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517300+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517334+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517368+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517402+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517437+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517472+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517507+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517552+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517587+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517644+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517680+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517714+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517757+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517800+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517840+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517874+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517931+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.517969+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518003+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518038+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518071+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518101+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518131+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518164+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518204+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518240+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518285+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518320+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518354+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518388+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518427+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518462+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518492+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518531+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518583+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518619+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518652+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518686+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518720+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518754+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518797+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518831+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518879+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518922+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.518968+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.519021+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.519055+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.519089+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.519127+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.519165+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.519234+00:00 ee1 ltfs[1164206]: 120e8b LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:25:55.519311+00:00 ee1 ltfs[1164206]: 120e8b LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-25T00:25:55.519367+00:00 ee1 ltfs[1164206]: 120e8b LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T00:25:55.519413+00:00 ee1 ltfs[1164206]: 120e8b LTFS30233I Cannot read attribute (-20501).
+2026-09-25T00:25:55.519453+00:00 ee1 ltfs[1164206]: 120e8b LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-25T00:26:35.640541+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.641132+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.641210+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.641249+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.641284+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.641325+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.641369+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.641413+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.641449+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.641495+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.641529+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.641564+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.641602+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.641648+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.641691+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.641733+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.641776+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.641827+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.641861+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.641906+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.641936+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.641975+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642013+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642047+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642085+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642127+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642161+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642210+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642246+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642280+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642325+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642375+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642428+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642464+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642498+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642527+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642574+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642609+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642660+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642711+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642746+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642780+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642814+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642847+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642899+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642945+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.642987+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.643023+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.643057+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.643100+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.643138+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.643193+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.643238+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.643273+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.643311+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.643345+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.643378+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.643412+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.643445+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.643507+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.643545+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.643579+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.643612+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.643649+00:00 ee1 ltfs[1164206]: 1d0cca LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:35.683815+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS14817I Unmounting cartridge TS1000L8.
+2026-09-25T00:26:35.684315+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS11748I Unmounting TS1000L8 from IBMlisa41D6C.
+2026-09-25T00:26:35.684718+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-25T00:26:35.684763+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T00:26:35.684798+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30233I Cannot read attribute (-20501).
+2026-09-25T00:26:35.684842+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-25T00:26:35.686291+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-25T00:26:35.686341+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T00:26:35.686384+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30233I Cannot read attribute (-20501).
+2026-09-25T00:26:35.686423+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-25T00:26:35.686610+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-25T00:26:35.686651+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T00:26:35.686694+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30233I Cannot read attribute (-20501).
+2026-09-25T00:26:35.686729+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-25T00:26:35.687906+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS17235I Writing index of TS1000 to a (Reason: Unmount - 0, 27 files) IBMlisa41D6C.
+2026-09-25T00:26:36.102765+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS17236I Wrote index of TS1000 (Gen = 85, Part = a, Pos = 5, IBMlisa41D6C).
+2026-09-25T00:26:36.104034+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS11034I Volume unmounted successfully.
+2026-09-25T00:26:36.104310+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-25T00:26:36.104364+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T00:26:36.104401+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30233I Cannot read attribute (-20501).
+2026-09-25T00:26:36.104450+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-25T00:26:36.104537+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS11741I Writing index of TS1000L8 to volume cache (Reason: Unmount - 0, 27 files).
+2026-09-25T00:26:36.104802+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS11410I Wrote index cache of TS1000L8.
+2026-09-25T00:26:36.105976+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-25T00:26:36.106047+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T00:26:36.106092+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30233I Cannot read attribute (-20501).
+2026-09-25T00:26:36.106124+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-25T00:26:36.106834+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.106882+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.106927+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.106969+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107013+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107048+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107082+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107116+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107150+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107205+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107251+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107281+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107316+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107349+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107389+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107424+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107462+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107500+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107534+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107568+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107602+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107636+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107670+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107703+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107742+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107777+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107810+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107840+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107873+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107929+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.107967+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108011+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108045+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108090+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108138+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108184+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108221+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108264+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108311+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108340+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108373+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108412+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108451+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108496+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108530+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108564+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108604+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108638+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108667+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108702+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108736+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108766+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108813+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108870+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108926+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.108965+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.109005+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.109039+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.109073+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.109107+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.109141+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.109194+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.109236+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.109267+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T00:26:36.109300+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS11787I Capturing cartridge statistics for TS1000L8.
+2026-09-25T00:26:36.117670+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-25T00:26:36.117771+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T00:26:36.117832+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30262I Forcing drive dump.
+2026-09-25T00:26:36.117988+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0925_002636_f.dmp.
+2026-09-25T00:26:36.119116+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-25T00:26:36.119196+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T00:26:36.119254+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30262I Forcing drive dump.
+2026-09-25T00:26:36.119408+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0925_002636_f.dmp.
+2026-09-25T00:26:36.120641+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-25T00:26:36.120719+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T00:26:36.120765+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30262I Forcing drive dump.
+2026-09-25T00:26:36.120929+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0925_002636_f.dmp.
+2026-09-25T00:26:36.121477+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-25T00:26:36.121527+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T00:26:36.121587+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30262I Forcing drive dump.
+2026-09-25T00:26:36.121763+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0925_002636_f.dmp.
+2026-09-25T00:26:36.122317+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-25T00:26:36.122368+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T00:26:36.122411+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30262I Forcing drive dump.
+2026-09-25T00:26:36.122602+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0925_002636_f.dmp.
+2026-09-25T00:26:36.123185+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-25T00:26:36.123236+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T00:26:36.123285+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30262I Forcing drive dump.
+2026-09-25T00:26:36.123474+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0925_002636_f.dmp.
+2026-09-25T00:26:36.124028+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-25T00:26:36.124074+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T00:26:36.124122+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30262I Forcing drive dump.
+2026-09-25T00:26:36.124309+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0925_002636_f.dmp.
+2026-09-25T00:26:36.124945+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-25T00:26:36.124979+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T00:26:36.125007+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30262I Forcing drive dump.
+2026-09-25T00:26:36.125240+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0925_002636_f.dmp.
+2026-09-25T00:26:36.138299+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS11289I Ejecting cartridge.
+2026-09-25T00:26:36.138400+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS12022I Unloading medium.
+2026-09-25T00:26:36.230347+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30205I TEST_UNIT_READY (0x00) returns -20601.
+2026-09-25T00:26:36.230867+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS30205I TEST_UNIT_READY (0x00) returns -20601.
+2026-09-25T00:26:36.231897+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS11291I Eject successful.
+2026-09-25T00:26:36.232004+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS11749I Unmounted TS1000L8 from IBMlisa41D6C.
+2026-09-25T00:26:36.232070+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS14812I Moving cartridge TS1000L8 from 256 to 1032 - IBMlisa41D6C_LL3 .
+2026-09-25T00:26:36.232135+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS11629I Aqcuireing MoveLock - IBMlisa41D6C_LL3.
+2026-09-25T00:26:36.232227+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS11630I Aqcuired Move Lock (14) - IBMlisa41D6C_LL3.
+2026-09-25T00:26:36.233314+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS11636I Unlink the drive IBMlisa41D6C from the cartridge TS1000L8.
+2026-09-25T00:26:36.233506+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS14813I Moved cartridge TS1000L8 to 1032 successfully - IBMlisa41D6C_LL3.
+2026-09-25T00:26:36.235113+00:00 ee1 ltfs[1164206]: 1d0ccb LTFS14818I Cartridge TS1000L8 is unmounted successfully.
+2026-09-25T00:26:36.515339+00:00 ee1 ltfs[1164206]: 1d0cd5 LTFS14784I Removing cartridge TS1000L8.
+2026-09-25T00:26:36.515566+00:00 ee1 ltfs[1164206]: 1d0cd5 LTFS11638I Cartridge TS1000L8 was unassigned because an error happens in a file system operation or it is unassigned from OOB.
+2026-09-25T00:26:36.515634+00:00 ee1 ltfs[1164206]: 1d0cd5 LTFS11632I Remove volume cache files - TS1000L8.
+2026-09-25T00:26:36.516541+00:00 ee1 ltfs[1164206]: 1d0cd5 LTFS11571I State of tape 'TS1000L8' in slot 0x408 is changed from 'WRITABLE' to 'NEED_ASSIGN'.
+2026-09-25T00:26:36.518512+00:00 ee1 ltfs[1164206]: 1d0cd5 LTFS14785I Cartridge TS1000L8 is removed successfully.
+2026-09-25T01:03:29.729481+00:00 ee1 ltfs[1164206]: 1da6ec LTFS14781I Adding cartridge TS1000L8.
+2026-09-25T01:03:29.730000+00:00 ee1 ltfs[1164206]: 1da6ec LTFS11571I State of tape 'TS1000L8' in slot 0x408 is changed from 'NEED_ASSIGN' to 'WRITABLE'.
+2026-09-25T01:03:29.732109+00:00 ee1 ltfs[1164206]: 1da6ec LTFS14782I Cartridge TS1000L8 is added successfully.
+2026-09-25T01:03:30.009382+00:00 ee1 ltfs[1164206]: 1da713 LTFS14814I Mounting cartridge TS1000L8.
+2026-09-25T01:03:30.061718+00:00 ee1 ltfs[1164206]: 1da713 LTFS30205I LOGSENSE (0x4d) returns -20601.
+2026-09-25T01:03:30.061946+00:00 ee1 ltfs[1164206]: 1da713 LTFS30263I LOGSENSE returns Not Ready to Ready Transition, Medium May Have Changed (-20601) /dev/sg5.
+2026-09-25T01:03:30.062157+00:00 ee1 ltfs[1164206]: 1da713 LTFS30262I Forcing drive dump.
+2026-09-25T01:03:30.062291+00:00 ee1 ltfs[1164206]: 1da713 LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0925_010330_f.dmp.
+2026-09-25T01:03:30.062913+00:00 ee1 ltfs[1164206]: 1da713 LTFS30229I Cannot get remaining capacity: get log page 0x17 failed (-20601).
+2026-09-25T01:03:30.062996+00:00 ee1 ltfs[1164206]: 1da713 LTFS12030E Cannot get capacity data: backend call failed (-20601).
+2026-09-25T01:03:30.063080+00:00 ee1 ltfs[1164206]: 1da713 LTFS14812I Moving cartridge TS1000L8 from 1032 to 256 - IBMlisa41D6C_LL3 .
+2026-09-25T01:03:30.063127+00:00 ee1 ltfs[1164206]: 1da713 LTFS11629I Aqcuireing MoveLock - IBMlisa41D6C_LL3.
+2026-09-25T01:03:30.063253+00:00 ee1 ltfs[1164206]: 1da713 LTFS11630I Aqcuired Move Lock (14) - IBMlisa41D6C_LL3.
+2026-09-25T01:03:30.064305+00:00 ee1 ltfs[1164206]: 1da713 LTFS14813I Moved cartridge TS1000L8 to 256 successfully - IBMlisa41D6C_LL3.
+2026-09-25T01:03:30.064374+00:00 ee1 ltfs[1164206]: 1da713 LTFS11635I Link the drive IBMlisa41D6C to the cartridge TS1000L8.
+2026-09-25T01:03:30.064455+00:00 ee1 ltfs[1164206]: 1da713 LTFS11330I Loading cartridge.
+2026-09-25T01:03:30.092980+00:00 ee1 ltfs[1164206]: 1da713 LTFS30205I LOAD_UNLOAD (0x1b) returns -20601.
+2026-09-25T01:03:30.093332+00:00 ee1 ltfs[1164206]: 1da713 LTFS30205I READPOS (0x34) returns -20601.
+2026-09-25T01:03:30.093405+00:00 ee1 ltfs[1164206]: 1da713 LTFS30263I READPOS returns Not Ready to Ready Transition, Medium May Have Changed (-20601) /dev/sg5.
+2026-09-25T01:03:30.093453+00:00 ee1 ltfs[1164206]: 1da713 LTFS30262I Forcing drive dump.
+2026-09-25T01:03:30.093722+00:00 ee1 ltfs[1164206]: 1da713 LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0925_010330_f.dmp.
+2026-09-25T01:03:30.096068+00:00 ee1 ltfs[1164206]: 1da713 LTFS30252I Logical block protection is disabled.
+2026-09-25T01:03:30.097618+00:00 ee1 ltfs[1164206]: 1da713 LTFS11332I Load successful.
+2026-09-25T01:03:30.097915+00:00 ee1 ltfs[1164206]: 1da713 LTFS11746I Mounting TS1000L8 on IBMlisa41D6C.
+2026-09-25T01:03:30.097994+00:00 ee1 ltfs[1164206]: 1da713 LTFS11330I Loading cartridge.
+2026-09-25T01:03:30.099984+00:00 ee1 ltfs[1164206]: 1da713 LTFS30252I Logical block protection is disabled.
+2026-09-25T01:03:30.101332+00:00 ee1 ltfs[1164206]: 1da713 LTFS11332I Load successful.
+2026-09-25T01:03:30.102931+00:00 ee1 ltfs[1164206]: 1da713 LTFS17157I Changing the drive setting to append-only mode.
+2026-09-25T01:03:30.107896+00:00 ee1 ltfs[1164206]: 1da713 LTFS11005I Mounting the volume.
+2026-09-25T01:03:30.110187+00:00 ee1 ltfs[1164206]: 1da713 LTFS30252I Logical block protection is disabled.
+2026-09-25T01:03:30.120253+00:00 ee1 ltfs[1164206]: 1da713 LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-25T01:03:30.120346+00:00 ee1 ltfs[1164206]: 1da713 LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T01:03:30.120417+00:00 ee1 ltfs[1164206]: 1da713 LTFS30233I Cannot read attribute (-20501).
+2026-09-25T01:03:30.120469+00:00 ee1 ltfs[1164206]: 1da713 LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-25T01:03:30.122600+00:00 ee1 ltfs[1164206]: 1da713 LTFS11026I Performing a full medium consistency check.
+2026-09-25T01:03:30.127240+00:00 ee1 ltfs[1164206]: 1da713 LTFS17096W The index read from the tape uses a newer version of the LTFS format than the one supported by this software. Some functionality might be unavailable. If this tape is modified, the index downgrades format version to 2.4.0 from 2.5.0.
+2026-09-25T01:03:30.134468+00:00 ee1 ltfs[1164206]: 1da713 LTFS17096W The index read from the tape uses a newer version of the LTFS format than the one supported by this software. Some functionality might be unavailable. If this tape is modified, the index downgrades format version to 2.4.0 from 2.5.0.
+2026-09-25T01:03:30.137325+00:00 ee1 ltfs[1164206]: 1da713 LTFS11233I Updating MAM coherency data.
+2026-09-25T01:03:30.141267+00:00 ee1 ltfs[1164206]: 1da713 LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-25T01:03:30.141340+00:00 ee1 ltfs[1164206]: 1da713 LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T01:03:30.141393+00:00 ee1 ltfs[1164206]: 1da713 LTFS30233I Cannot read attribute (-20501).
+2026-09-25T01:03:30.141657+00:00 ee1 ltfs[1164206]: 1da713 LTFS17227I Tape attribute: Vendor =         .
+2026-09-25T01:03:30.141731+00:00 ee1 ltfs[1164206]: 1da713 LTFS17227I Tape attribute: Application Name =                                 .
+2026-09-25T01:03:30.141771+00:00 ee1 ltfs[1164206]: 1da713 LTFS17227I Tape attribute: Application Version =         .
+2026-09-25T01:03:30.141819+00:00 ee1 ltfs[1164206]: 1da713 LTFS17227I Tape attribute: Medium Label =                                                                                                                                                                 .
+2026-09-25T01:03:30.141867+00:00 ee1 ltfs[1164206]: 1da713 LTFS17228I Tape attribute: Text Localization ID = 0x00.
+2026-09-25T01:03:30.141914+00:00 ee1 ltfs[1164206]: 1da713 LTFS17227I Tape attribute: Barcode =                                 .
+2026-09-25T01:03:30.141950+00:00 ee1 ltfs[1164206]: 1da713 LTFS17227I Tape attribute: Application Format Version =                 .
+2026-09-25T01:03:30.141995+00:00 ee1 ltfs[1164206]: 1da713 LTFS17228I Tape attribute: Volume Lock Status = 0x00.
+2026-09-25T01:03:30.142074+00:00 ee1 ltfs[1164206]: 1da713 LTFS17227I Tape attribute: Media Pool name =                                                                                                                                                                 .
+2026-09-25T01:03:30.142125+00:00 ee1 ltfs[1164206]: 1da713 LTFS11031I Volume mounted successfully. TS1000 : Gen = 99 / (a, 5) -> (b, 333) / IBMlisa41D6C.
+2026-09-25T01:03:30.142163+00:00 ee1 ltfs[1164206]: 1da713 LTFS11664I Cartridge 'TS1000L8' is mounted on node 'ee1.ee.lab'.
+2026-09-25T01:03:30.142920+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143003+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143046+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143086+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143126+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143167+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143227+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143268+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143302+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143347+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143380+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143416+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143453+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143502+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143543+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143575+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143611+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143655+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143686+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143717+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143745+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143776+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143852+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143898+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143939+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.143981+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144035+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144069+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144100+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144185+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144235+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144268+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144297+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144329+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144374+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144412+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144461+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144494+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144527+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144568+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144601+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144642+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144680+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144725+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144755+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144789+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144836+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144870+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144904+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144938+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.144980+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.145026+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.145066+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.145101+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.145146+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.145193+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.145224+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.145295+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.145342+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.145379+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.145426+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.145462+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.145497+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.145535+00:00 ee1 ltfs[1164206]: 1da713 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:03:30.145579+00:00 ee1 ltfs[1164206]: 1da713 LTFS11741I Writing index of TS1000L8 to volume cache (Reason: (null), 36 files).
+2026-09-25T01:03:30.147109+00:00 ee1 ltfs[1164206]: 1da713 LTFS11410I Wrote index cache of TS1000L8.
+2026-09-25T01:03:30.148971+00:00 ee1 ltfs[1164206]: 1da713 LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-25T01:03:30.149037+00:00 ee1 ltfs[1164206]: 1da713 LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T01:03:30.149073+00:00 ee1 ltfs[1164206]: 1da713 LTFS30233I Cannot read attribute (-20501).
+2026-09-25T01:03:30.149109+00:00 ee1 ltfs[1164206]: 1da713 LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-25T01:03:30.172579+00:00 ee1 ltfs[1164206]: 1da713 LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-25T01:03:30.172680+00:00 ee1 ltfs[1164206]: 1da713 LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T01:03:30.172740+00:00 ee1 ltfs[1164206]: 1da713 LTFS30233I Cannot read attribute (-20501).
+2026-09-25T01:03:30.172776+00:00 ee1 ltfs[1164206]: 1da713 LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-25T01:03:30.172822+00:00 ee1 ltfs[1164206]: 1da713 LTFS11747I Mounted TS1000L8 on IBMlisa41D6C.
+2026-09-25T01:03:30.174819+00:00 ee1 ltfs[1164206]: 1da713 LTFS14815I Cartridge TS1000L8 is mounted successfully.
+2026-09-25T01:04:21.498188+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.498648+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.498707+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.498745+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.498780+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.498832+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.498868+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.498904+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.498944+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.498984+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499035+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499070+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499111+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499152+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499213+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499248+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499282+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499325+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499370+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499412+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499446+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499483+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499518+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499551+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499585+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499623+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499669+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499703+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499745+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499790+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499824+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499854+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499897+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499939+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.499972+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.500013+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.500047+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.500080+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.500114+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.500152+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.500193+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.500234+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.500269+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.500306+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.500343+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.500388+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.500439+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.500479+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.500516+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.500559+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.500593+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.500626+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.500672+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.500714+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.500848+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.500898+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.500940+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.500974+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.501015+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.501061+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.501095+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.501136+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.501170+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.501217+00:00 ee1 ltfs[1164206]: 1dab72 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.541517+00:00 ee1 ltfs[1164206]: 1dab73 LTFS14817I Unmounting cartridge TS1000L8.
+2026-09-25T01:04:21.542063+00:00 ee1 ltfs[1164206]: 1dab73 LTFS11748I Unmounting TS1000L8 from IBMlisa41D6C.
+2026-09-25T01:04:21.542481+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-25T01:04:21.542539+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T01:04:21.542590+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30233I Cannot read attribute (-20501).
+2026-09-25T01:04:21.542637+00:00 ee1 ltfs[1164206]: 1dab73 LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-25T01:04:21.544058+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-25T01:04:21.544104+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T01:04:21.544141+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30233I Cannot read attribute (-20501).
+2026-09-25T01:04:21.544189+00:00 ee1 ltfs[1164206]: 1dab73 LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-25T01:04:21.544238+00:00 ee1 ltfs[1164206]: 1dab73 LTFS17265I Skip writing the index because of the volume is not dirty and current self pointer points IP.
+2026-09-25T01:04:21.544861+00:00 ee1 ltfs[1164206]: 1dab73 LTFS11034I Volume unmounted successfully.
+2026-09-25T01:04:21.545154+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-25T01:04:21.545200+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T01:04:21.545249+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30233I Cannot read attribute (-20501).
+2026-09-25T01:04:21.545291+00:00 ee1 ltfs[1164206]: 1dab73 LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-25T01:04:21.546317+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.546376+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.546424+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.546493+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.546529+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.546569+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.546604+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.546641+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.546675+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.546710+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.546755+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.546791+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.546833+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.546870+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.546914+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.546951+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.546985+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547031+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547066+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547095+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547126+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547187+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547226+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547260+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547293+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547331+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547369+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547409+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547452+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547486+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547520+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547554+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547593+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547632+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547666+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547708+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547742+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547776+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547813+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547854+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547889+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547931+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.547971+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.548011+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.548046+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.548080+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.548119+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.548164+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.548228+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.548263+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.548300+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.548343+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.548381+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.548420+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.548451+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.548484+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.548518+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.548559+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.548594+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.548637+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.548704+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.548740+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.548783+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.548824+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-25T01:04:21.548884+00:00 ee1 ltfs[1164206]: 1dab73 LTFS11787I Capturing cartridge statistics for TS1000L8.
+2026-09-25T01:04:21.555513+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-25T01:04:21.555614+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T01:04:21.555654+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30262I Forcing drive dump.
+2026-09-25T01:04:21.555845+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0925_010421_f.dmp.
+2026-09-25T01:04:21.557114+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-25T01:04:21.557160+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T01:04:21.557202+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30262I Forcing drive dump.
+2026-09-25T01:04:21.557424+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0925_010421_f.dmp.
+2026-09-25T01:04:21.558691+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-25T01:04:21.558775+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T01:04:21.558811+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30262I Forcing drive dump.
+2026-09-25T01:04:21.559003+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0925_010421_f.dmp.
+2026-09-25T01:04:21.559573+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-25T01:04:21.559615+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T01:04:21.559679+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30262I Forcing drive dump.
+2026-09-25T01:04:21.559893+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0925_010421_f.dmp.
+2026-09-25T01:04:21.560516+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-25T01:04:21.560552+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T01:04:21.560588+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30262I Forcing drive dump.
+2026-09-25T01:04:21.560813+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0925_010421_f.dmp.
+2026-09-25T01:04:21.561404+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-25T01:04:21.561454+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T01:04:21.561491+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30262I Forcing drive dump.
+2026-09-25T01:04:21.561698+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0925_010421_f.dmp.
+2026-09-25T01:04:21.562273+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-25T01:04:21.562318+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T01:04:21.562352+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30262I Forcing drive dump.
+2026-09-25T01:04:21.562577+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0925_010421_f.dmp.
+2026-09-25T01:04:21.563150+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-25T01:04:21.563202+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-25T01:04:21.563235+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30262I Forcing drive dump.
+2026-09-25T01:04:21.563458+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0925_010421_f.dmp.
+2026-09-25T01:04:21.570433+00:00 ee1 ltfs[1164206]: 1dab73 LTFS11289I Ejecting cartridge.
+2026-09-25T01:04:21.570544+00:00 ee1 ltfs[1164206]: 1dab73 LTFS12022I Unloading medium.
+2026-09-25T01:04:21.850642+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30205I TEST_UNIT_READY (0x00) returns -20601.
+2026-09-25T01:04:21.851014+00:00 ee1 ltfs[1164206]: 1dab73 LTFS30205I TEST_UNIT_READY (0x00) returns -20601.
+2026-09-25T01:04:21.851876+00:00 ee1 ltfs[1164206]: 1dab73 LTFS11291I Eject successful.
+2026-09-25T01:04:21.851954+00:00 ee1 ltfs[1164206]: 1dab73 LTFS11749I Unmounted TS1000L8 from IBMlisa41D6C.
+2026-09-25T01:04:21.852050+00:00 ee1 ltfs[1164206]: 1dab73 LTFS14812I Moving cartridge TS1000L8 from 256 to 1032 - IBMlisa41D6C_LL3 .
+2026-09-25T01:04:21.852108+00:00 ee1 ltfs[1164206]: 1dab73 LTFS11629I Aqcuireing MoveLock - IBMlisa41D6C_LL3.
+2026-09-25T01:04:21.852273+00:00 ee1 ltfs[1164206]: 1dab73 LTFS11630I Aqcuired Move Lock (14) - IBMlisa41D6C_LL3.
+2026-09-25T01:04:21.853186+00:00 ee1 ltfs[1164206]: 1dab73 LTFS11636I Unlink the drive IBMlisa41D6C from the cartridge TS1000L8.
+2026-09-25T01:04:21.853242+00:00 ee1 ltfs[1164206]: 1dab73 LTFS14813I Moved cartridge TS1000L8 to 1032 successfully - IBMlisa41D6C_LL3.
+2026-09-25T01:04:21.855218+00:00 ee1 ltfs[1164206]: 1dab73 LTFS14818I Cartridge TS1000L8 is unmounted successfully.
+2026-09-25T01:04:22.119668+00:00 ee1 ltfs[1164206]: 1dab7c LTFS14784I Removing cartridge TS1000L8.
+2026-09-25T01:04:22.119852+00:00 ee1 ltfs[1164206]: 1dab7c LTFS11638I Cartridge TS1000L8 was unassigned because an error happens in a file system operation or it is unassigned from OOB.
+2026-09-25T01:04:22.119897+00:00 ee1 ltfs[1164206]: 1dab7c LTFS11632I Remove volume cache files - TS1000L8.
+2026-09-25T01:04:22.120830+00:00 ee1 ltfs[1164206]: 1dab7c LTFS11571I State of tape 'TS1000L8' in slot 0x408 is changed from 'WRITABLE' to 'NEED_ASSIGN'.
+2026-09-25T01:04:22.122954+00:00 ee1 ltfs[1164206]: 1dab7c LTFS14785I Cartridge TS1000L8 is removed successfully.
+2026-09-27T03:57:29.972521+00:00 ee1 ltfs[1164206]: c5cfb LTFS14781I Adding cartridge TS1000L8.
+2026-09-27T03:57:29.973193+00:00 ee1 ltfs[1164206]: c5cfb LTFS11571I State of tape 'TS1000L8' in slot 0x408 is changed from 'NEED_ASSIGN' to 'WRITABLE'.
+2026-09-27T03:57:29.975644+00:00 ee1 ltfs[1164206]: c5cfb LTFS14782I Cartridge TS1000L8 is added successfully.
+2026-09-27T03:57:30.250856+00:00 ee1 ltfs[1164206]: c5d04 LTFS14814I Mounting cartridge TS1000L8.
+2026-09-27T03:57:30.260107+00:00 ee1 ltfs[1164206]: c5d04 LTFS30205I LOGSENSE (0x4d) returns -20601.
+2026-09-27T03:57:30.260310+00:00 ee1 ltfs[1164206]: c5d04 LTFS30263I LOGSENSE returns Not Ready to Ready Transition, Medium May Have Changed (-20601) /dev/sg5.
+2026-09-27T03:57:30.260467+00:00 ee1 ltfs[1164206]: c5d04 LTFS30262I Forcing drive dump.
+2026-09-27T03:57:30.260638+00:00 ee1 ltfs[1164206]: c5d04 LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035730_f.dmp.
+2026-09-27T03:57:30.261084+00:00 ee1 ltfs[1164206]: c5d04 LTFS30229I Cannot get remaining capacity: get log page 0x17 failed (-20601).
+2026-09-27T03:57:30.261132+00:00 ee1 ltfs[1164206]: c5d04 LTFS12030E Cannot get capacity data: backend call failed (-20601).
+2026-09-27T03:57:30.261214+00:00 ee1 ltfs[1164206]: c5d04 LTFS14812I Moving cartridge TS1000L8 from 1032 to 256 - IBMlisa41D6C_LL3 .
+2026-09-27T03:57:30.261267+00:00 ee1 ltfs[1164206]: c5d04 LTFS11629I Aqcuireing MoveLock - IBMlisa41D6C_LL3.
+2026-09-27T03:57:30.261473+00:00 ee1 ltfs[1164206]: c5d04 LTFS11630I Aqcuired Move Lock (14) - IBMlisa41D6C_LL3.
+2026-09-27T03:57:30.262349+00:00 ee1 ltfs[1164206]: c5d04 LTFS14813I Moved cartridge TS1000L8 to 256 successfully - IBMlisa41D6C_LL3.
+2026-09-27T03:57:30.262421+00:00 ee1 ltfs[1164206]: c5d04 LTFS11635I Link the drive IBMlisa41D6C to the cartridge TS1000L8.
+2026-09-27T03:57:30.262477+00:00 ee1 ltfs[1164206]: c5d04 LTFS11330I Loading cartridge.
+2026-09-27T03:57:30.320390+00:00 ee1 ltfs[1164206]: c5d04 LTFS30205I LOAD_UNLOAD (0x1b) returns -20601.
+2026-09-27T03:57:30.320726+00:00 ee1 ltfs[1164206]: c5d04 LTFS30205I READPOS (0x34) returns -20601.
+2026-09-27T03:57:30.320775+00:00 ee1 ltfs[1164206]: c5d04 LTFS30263I READPOS returns Not Ready to Ready Transition, Medium May Have Changed (-20601) /dev/sg5.
+2026-09-27T03:57:30.320835+00:00 ee1 ltfs[1164206]: c5d04 LTFS30262I Forcing drive dump.
+2026-09-27T03:57:30.321049+00:00 ee1 ltfs[1164206]: c5d04 LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035730_f.dmp.
+2026-09-27T03:57:30.322938+00:00 ee1 ltfs[1164206]: c5d04 LTFS30252I Logical block protection is disabled.
+2026-09-27T03:57:30.324279+00:00 ee1 ltfs[1164206]: c5d04 LTFS11332I Load successful.
+2026-09-27T03:57:30.324541+00:00 ee1 ltfs[1164206]: c5d04 LTFS11746I Mounting TS1000L8 on IBMlisa41D6C.
+2026-09-27T03:57:30.324592+00:00 ee1 ltfs[1164206]: c5d04 LTFS11330I Loading cartridge.
+2026-09-27T03:57:30.326286+00:00 ee1 ltfs[1164206]: c5d04 LTFS30252I Logical block protection is disabled.
+2026-09-27T03:57:30.327390+00:00 ee1 ltfs[1164206]: c5d04 LTFS11332I Load successful.
+2026-09-27T03:57:30.328891+00:00 ee1 ltfs[1164206]: c5d04 LTFS17157I Changing the drive setting to append-only mode.
+2026-09-27T03:57:30.333705+00:00 ee1 ltfs[1164206]: c5d04 LTFS11005I Mounting the volume.
+2026-09-27T03:57:30.335808+00:00 ee1 ltfs[1164206]: c5d04 LTFS30252I Logical block protection is disabled.
+2026-09-27T03:57:30.344701+00:00 ee1 ltfs[1164206]: c5d04 LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-27T03:57:30.344867+00:00 ee1 ltfs[1164206]: c5d04 LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:30.345054+00:00 ee1 ltfs[1164206]: c5d04 LTFS30233I Cannot read attribute (-20501).
+2026-09-27T03:57:30.345371+00:00 ee1 ltfs[1164206]: c5d04 LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-27T03:57:30.349820+00:00 ee1 ltfs[1164206]: c5d04 LTFS17096W The index read from the tape uses a newer version of the LTFS format than the one supported by this software. Some functionality might be unavailable. If this tape is modified, the index downgrades format version to 2.4.0 from 2.5.0.
+2026-09-27T03:57:30.354612+00:00 ee1 ltfs[1164206]: c5d04 LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-27T03:57:30.354672+00:00 ee1 ltfs[1164206]: c5d04 LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:30.354706+00:00 ee1 ltfs[1164206]: c5d04 LTFS30233I Cannot read attribute (-20501).
+2026-09-27T03:57:30.354917+00:00 ee1 ltfs[1164206]: c5d04 LTFS17227I Tape attribute: Vendor =         .
+2026-09-27T03:57:30.354992+00:00 ee1 ltfs[1164206]: c5d04 LTFS17227I Tape attribute: Application Name =                                 .
+2026-09-27T03:57:30.355047+00:00 ee1 ltfs[1164206]: c5d04 LTFS17227I Tape attribute: Application Version =         .
+2026-09-27T03:57:30.355108+00:00 ee1 ltfs[1164206]: c5d04 LTFS17227I Tape attribute: Medium Label =                                                                                                                                                                 .
+2026-09-27T03:57:30.355151+00:00 ee1 ltfs[1164206]: c5d04 LTFS17228I Tape attribute: Text Localization ID = 0x00.
+2026-09-27T03:57:30.355220+00:00 ee1 ltfs[1164206]: c5d04 LTFS17227I Tape attribute: Barcode =                                 .
+2026-09-27T03:57:30.355258+00:00 ee1 ltfs[1164206]: c5d04 LTFS17227I Tape attribute: Application Format Version =                 .
+2026-09-27T03:57:30.355302+00:00 ee1 ltfs[1164206]: c5d04 LTFS17228I Tape attribute: Volume Lock Status = 0x00.
+2026-09-27T03:57:30.355344+00:00 ee1 ltfs[1164206]: c5d04 LTFS17227I Tape attribute: Media Pool name =                                                                                                                                                                 .
+2026-09-27T03:57:30.355415+00:00 ee1 ltfs[1164206]: c5d04 LTFS11031I Volume mounted successfully. TS1000 : Gen = 99 / (a, 5) -> (b, 333) / IBMlisa41D6C.
+2026-09-27T03:57:30.355468+00:00 ee1 ltfs[1164206]: c5d04 LTFS11664I Cartridge 'TS1000L8' is mounted on node 'ee1.ee.lab'.
+2026-09-27T03:57:30.355933+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356004+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356038+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356071+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356104+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356143+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356188+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356217+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356256+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356318+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356353+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356387+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356416+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356459+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356492+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356552+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356582+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356619+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356654+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356686+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356725+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356754+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356795+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356831+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356863+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356902+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356939+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.356977+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357012+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357054+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357085+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357116+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357146+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357219+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357251+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357301+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357347+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357383+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357427+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357474+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357524+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357560+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357591+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357627+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357658+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357692+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357722+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357753+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357783+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357820+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357860+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357907+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357954+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.357992+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.358023+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.358070+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.358117+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.358163+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.358206+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.358237+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.358263+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.358297+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.358334+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.358362+00:00 ee1 ltfs[1164206]: c5d04 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:30.358403+00:00 ee1 ltfs[1164206]: c5d04 LTFS11741I Writing index of TS1000L8 to volume cache (Reason: (null), 36 files).
+2026-09-27T03:57:30.359839+00:00 ee1 ltfs[1164206]: c5d04 LTFS11410I Wrote index cache of TS1000L8.
+2026-09-27T03:57:30.361546+00:00 ee1 ltfs[1164206]: c5d04 LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-27T03:57:30.361579+00:00 ee1 ltfs[1164206]: c5d04 LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:30.361608+00:00 ee1 ltfs[1164206]: c5d04 LTFS30233I Cannot read attribute (-20501).
+2026-09-27T03:57:30.361646+00:00 ee1 ltfs[1164206]: c5d04 LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-27T03:57:30.381597+00:00 ee1 ltfs[1164206]: c5d04 LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-27T03:57:30.381701+00:00 ee1 ltfs[1164206]: c5d04 LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:30.381774+00:00 ee1 ltfs[1164206]: c5d04 LTFS30233I Cannot read attribute (-20501).
+2026-09-27T03:57:30.381817+00:00 ee1 ltfs[1164206]: c5d04 LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-27T03:57:30.381849+00:00 ee1 ltfs[1164206]: c5d04 LTFS11747I Mounted TS1000L8 on IBMlisa41D6C.
+2026-09-27T03:57:30.383845+00:00 ee1 ltfs[1164206]: c5d04 LTFS14815I Cartridge TS1000L8 is mounted successfully.
+2026-09-27T03:57:57.712422+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.712939+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.712989+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.713027+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.713071+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.713108+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.713150+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.713237+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.713276+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.713321+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.713358+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.713394+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.713490+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.713531+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.713576+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.713623+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.713663+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.713698+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.713732+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.713773+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.713808+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.713977+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714019+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714057+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714103+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714137+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714167+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714225+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714267+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714311+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714346+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714380+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714416+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714466+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714508+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714556+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714591+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714629+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714664+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714698+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714746+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714780+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714815+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714854+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714897+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714939+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.714983+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.715017+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.715059+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.715107+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.715146+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.715210+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.715265+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.715301+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.715350+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.715391+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.715432+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.715471+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.715507+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.715542+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.715584+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.715620+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.715653+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.715696+00:00 ee1 ltfs[1164206]: c5e8f LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.755471+00:00 ee1 ltfs[1164206]: c5e90 LTFS14817I Unmounting cartridge TS1000L8.
+2026-09-27T03:57:57.756079+00:00 ee1 ltfs[1164206]: c5e90 LTFS11748I Unmounting TS1000L8 from IBMlisa41D6C.
+2026-09-27T03:57:57.756515+00:00 ee1 ltfs[1164206]: c5e90 LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-27T03:57:57.756603+00:00 ee1 ltfs[1164206]: c5e90 LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:57.756649+00:00 ee1 ltfs[1164206]: c5e90 LTFS30233I Cannot read attribute (-20501).
+2026-09-27T03:57:57.756698+00:00 ee1 ltfs[1164206]: c5e90 LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-27T03:57:57.758189+00:00 ee1 ltfs[1164206]: c5e90 LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-27T03:57:57.758270+00:00 ee1 ltfs[1164206]: c5e90 LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:57.758314+00:00 ee1 ltfs[1164206]: c5e90 LTFS30233I Cannot read attribute (-20501).
+2026-09-27T03:57:57.758355+00:00 ee1 ltfs[1164206]: c5e90 LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-27T03:57:57.758397+00:00 ee1 ltfs[1164206]: c5e90 LTFS17265I Skip writing the index because of the volume is not dirty and current self pointer points IP.
+2026-09-27T03:57:57.759009+00:00 ee1 ltfs[1164206]: c5e90 LTFS11034I Volume unmounted successfully.
+2026-09-27T03:57:57.759323+00:00 ee1 ltfs[1164206]: c5e90 LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-27T03:57:57.759386+00:00 ee1 ltfs[1164206]: c5e90 LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:57.759432+00:00 ee1 ltfs[1164206]: c5e90 LTFS30233I Cannot read attribute (-20501).
+2026-09-27T03:57:57.759481+00:00 ee1 ltfs[1164206]: c5e90 LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-27T03:57:57.760569+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.760663+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.760708+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.760780+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.760824+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.760864+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.760912+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.760966+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.761018+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.761061+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.761111+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.761196+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.761260+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.761303+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.761350+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.761385+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.761439+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.761482+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.761523+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.761564+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.761601+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.761651+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.761697+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.761738+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.761787+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.761831+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.761867+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.761907+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.761949+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.761999+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.762046+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.762114+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.762156+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.762228+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.762271+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.762311+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.762351+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.762403+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.762452+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.762487+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.762540+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.762578+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.762630+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.762681+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.762722+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.762766+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.762810+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.762863+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.762916+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.762957+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.763006+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.763047+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.763111+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.763149+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.763213+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.763265+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.763307+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.763349+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.763398+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.763465+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.763508+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.763557+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.763602+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.763639+00:00 ee1 ltfs[1164206]: c5e90 LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:57.763698+00:00 ee1 ltfs[1164206]: c5e90 LTFS11787I Capturing cartridge statistics for TS1000L8.
+2026-09-27T03:57:57.778623+00:00 ee1 ltfs[1164206]: c5e90 LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-27T03:57:57.778765+00:00 ee1 ltfs[1164206]: c5e90 LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:57.778827+00:00 ee1 ltfs[1164206]: c5e90 LTFS30262I Forcing drive dump.
+2026-09-27T03:57:57.778920+00:00 ee1 ltfs[1164206]: c5e90 LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035757_f.dmp.
+2026-09-27T03:57:57.780303+00:00 ee1 ltfs[1164206]: c5e90 LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-27T03:57:57.780344+00:00 ee1 ltfs[1164206]: c5e90 LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:57.780384+00:00 ee1 ltfs[1164206]: c5e90 LTFS30262I Forcing drive dump.
+2026-09-27T03:57:57.780618+00:00 ee1 ltfs[1164206]: c5e90 LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035757_f.dmp.
+2026-09-27T03:57:57.781971+00:00 ee1 ltfs[1164206]: c5e90 LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-27T03:57:57.782035+00:00 ee1 ltfs[1164206]: c5e90 LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:57.782070+00:00 ee1 ltfs[1164206]: c5e90 LTFS30262I Forcing drive dump.
+2026-09-27T03:57:57.782278+00:00 ee1 ltfs[1164206]: c5e90 LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035757_f.dmp.
+2026-09-27T03:57:57.782872+00:00 ee1 ltfs[1164206]: c5e90 LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-27T03:57:57.782912+00:00 ee1 ltfs[1164206]: c5e90 LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:57.782958+00:00 ee1 ltfs[1164206]: c5e90 LTFS30262I Forcing drive dump.
+2026-09-27T03:57:57.783157+00:00 ee1 ltfs[1164206]: c5e90 LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035757_f.dmp.
+2026-09-27T03:57:57.783733+00:00 ee1 ltfs[1164206]: c5e90 LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-27T03:57:57.783781+00:00 ee1 ltfs[1164206]: c5e90 LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:57.783813+00:00 ee1 ltfs[1164206]: c5e90 LTFS30262I Forcing drive dump.
+2026-09-27T03:57:57.784045+00:00 ee1 ltfs[1164206]: c5e90 LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035757_f.dmp.
+2026-09-27T03:57:57.784648+00:00 ee1 ltfs[1164206]: c5e90 LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-27T03:57:57.784695+00:00 ee1 ltfs[1164206]: c5e90 LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:57.784738+00:00 ee1 ltfs[1164206]: c5e90 LTFS30262I Forcing drive dump.
+2026-09-27T03:57:57.784936+00:00 ee1 ltfs[1164206]: c5e90 LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035757_f.dmp.
+2026-09-27T03:57:57.785558+00:00 ee1 ltfs[1164206]: c5e90 LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-27T03:57:57.785603+00:00 ee1 ltfs[1164206]: c5e90 LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:57.785637+00:00 ee1 ltfs[1164206]: c5e90 LTFS30262I Forcing drive dump.
+2026-09-27T03:57:57.785843+00:00 ee1 ltfs[1164206]: c5e90 LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035757_f.dmp.
+2026-09-27T03:57:57.786431+00:00 ee1 ltfs[1164206]: c5e90 LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-27T03:57:57.786473+00:00 ee1 ltfs[1164206]: c5e90 LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:57.786508+00:00 ee1 ltfs[1164206]: c5e90 LTFS30262I Forcing drive dump.
+2026-09-27T03:57:57.786712+00:00 ee1 ltfs[1164206]: c5e90 LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035757_f.dmp.
+2026-09-27T03:57:57.807711+00:00 ee1 ltfs[1164206]: c5e90 LTFS11289I Ejecting cartridge.
+2026-09-27T03:57:57.807884+00:00 ee1 ltfs[1164206]: c5e90 LTFS12022I Unloading medium.
+2026-09-27T03:57:57.908692+00:00 ee1 ltfs[1164206]: c5e90 LTFS30205I TEST_UNIT_READY (0x00) returns -20601.
+2026-09-27T03:57:57.909033+00:00 ee1 ltfs[1164206]: c5e90 LTFS30205I TEST_UNIT_READY (0x00) returns -20601.
+2026-09-27T03:57:57.909883+00:00 ee1 ltfs[1164206]: c5e90 LTFS11291I Eject successful.
+2026-09-27T03:57:57.909983+00:00 ee1 ltfs[1164206]: c5e90 LTFS11749I Unmounted TS1000L8 from IBMlisa41D6C.
+2026-09-27T03:57:57.910038+00:00 ee1 ltfs[1164206]: c5e90 LTFS14812I Moving cartridge TS1000L8 from 256 to 1032 - IBMlisa41D6C_LL3 .
+2026-09-27T03:57:57.910095+00:00 ee1 ltfs[1164206]: c5e90 LTFS11629I Aqcuireing MoveLock - IBMlisa41D6C_LL3.
+2026-09-27T03:57:57.910205+00:00 ee1 ltfs[1164206]: c5e90 LTFS11630I Aqcuired Move Lock (14) - IBMlisa41D6C_LL3.
+2026-09-27T03:57:57.911106+00:00 ee1 ltfs[1164206]: c5e90 LTFS11636I Unlink the drive IBMlisa41D6C from the cartridge TS1000L8.
+2026-09-27T03:57:57.911189+00:00 ee1 ltfs[1164206]: c5e90 LTFS14813I Moved cartridge TS1000L8 to 1032 successfully - IBMlisa41D6C_LL3.
+2026-09-27T03:57:57.912816+00:00 ee1 ltfs[1164206]: c5e90 LTFS14818I Cartridge TS1000L8 is unmounted successfully.
+2026-09-27T03:57:58.192529+00:00 ee1 ltfs[1164206]: c5e9b LTFS14784I Removing cartridge TS1000L8.
+2026-09-27T03:57:58.192721+00:00 ee1 ltfs[1164206]: c5e9b LTFS11638I Cartridge TS1000L8 was unassigned because an error happens in a file system operation or it is unassigned from OOB.
+2026-09-27T03:57:58.192768+00:00 ee1 ltfs[1164206]: c5e9b LTFS11632I Remove volume cache files - TS1000L8.
+2026-09-27T03:57:58.193808+00:00 ee1 ltfs[1164206]: c5e9b LTFS11571I State of tape 'TS1000L8' in slot 0x408 is changed from 'WRITABLE' to 'NEED_ASSIGN'.
+2026-09-27T03:57:58.195638+00:00 ee1 ltfs[1164206]: c5e9b LTFS14785I Cartridge TS1000L8 is removed successfully.
+2026-09-27T03:57:59.028486+00:00 ee1 ltfs[1164206]: c5ed2 LTFS14781I Adding cartridge TS1000L8.
+2026-09-27T03:57:59.028883+00:00 ee1 ltfs[1164206]: c5ed2 LTFS11571I State of tape 'TS1000L8' in slot 0x408 is changed from 'NEED_ASSIGN' to 'WRITABLE'.
+2026-09-27T03:57:59.030632+00:00 ee1 ltfs[1164206]: c5ed2 LTFS14782I Cartridge TS1000L8 is added successfully.
+2026-09-27T03:57:59.309572+00:00 ee1 ltfs[1164206]: c5f0a LTFS14814I Mounting cartridge TS1000L8.
+2026-09-27T03:57:59.310892+00:00 ee1 ltfs[1164206]: c5f0a LTFS30205I LOGSENSE (0x4d) returns -20601.
+2026-09-27T03:57:59.310964+00:00 ee1 ltfs[1164206]: c5f0a LTFS30263I LOGSENSE returns Not Ready to Ready Transition, Medium May Have Changed (-20601) /dev/sg5.
+2026-09-27T03:57:59.311023+00:00 ee1 ltfs[1164206]: c5f0a LTFS30262I Forcing drive dump.
+2026-09-27T03:57:59.311279+00:00 ee1 ltfs[1164206]: c5f0a LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035759_f.dmp.
+2026-09-27T03:57:59.311793+00:00 ee1 ltfs[1164206]: c5f0a LTFS30229I Cannot get remaining capacity: get log page 0x17 failed (-20601).
+2026-09-27T03:57:59.311845+00:00 ee1 ltfs[1164206]: c5f0a LTFS12030E Cannot get capacity data: backend call failed (-20601).
+2026-09-27T03:57:59.311895+00:00 ee1 ltfs[1164206]: c5f0a LTFS14812I Moving cartridge TS1000L8 from 1032 to 256 - IBMlisa41D6C_LL3 .
+2026-09-27T03:57:59.311931+00:00 ee1 ltfs[1164206]: c5f0a LTFS11629I Aqcuireing MoveLock - IBMlisa41D6C_LL3.
+2026-09-27T03:57:59.312088+00:00 ee1 ltfs[1164206]: c5f0a LTFS11630I Aqcuired Move Lock (14) - IBMlisa41D6C_LL3.
+2026-09-27T03:57:59.312987+00:00 ee1 ltfs[1164206]: c5f0a LTFS14813I Moved cartridge TS1000L8 to 256 successfully - IBMlisa41D6C_LL3.
+2026-09-27T03:57:59.313065+00:00 ee1 ltfs[1164206]: c5f0a LTFS11635I Link the drive IBMlisa41D6C to the cartridge TS1000L8.
+2026-09-27T03:57:59.313110+00:00 ee1 ltfs[1164206]: c5f0a LTFS11330I Loading cartridge.
+2026-09-27T03:57:59.313846+00:00 ee1 ltfs[1164206]: c5f0a LTFS30205I LOAD_UNLOAD (0x1b) returns -20601.
+2026-09-27T03:57:59.314159+00:00 ee1 ltfs[1164206]: c5f0a LTFS30205I READPOS (0x34) returns -20601.
+2026-09-27T03:57:59.314236+00:00 ee1 ltfs[1164206]: c5f0a LTFS30263I READPOS returns Not Ready to Ready Transition, Medium May Have Changed (-20601) /dev/sg5.
+2026-09-27T03:57:59.314346+00:00 ee1 ltfs[1164206]: c5f0a LTFS30262I Forcing drive dump.
+2026-09-27T03:57:59.314522+00:00 ee1 ltfs[1164206]: c5f0a LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035759_f.dmp.
+2026-09-27T03:57:59.316508+00:00 ee1 ltfs[1164206]: c5f0a LTFS30252I Logical block protection is disabled.
+2026-09-27T03:57:59.317879+00:00 ee1 ltfs[1164206]: c5f0a LTFS11332I Load successful.
+2026-09-27T03:57:59.318141+00:00 ee1 ltfs[1164206]: c5f0a LTFS11746I Mounting TS1000L8 on IBMlisa41D6C.
+2026-09-27T03:57:59.318210+00:00 ee1 ltfs[1164206]: c5f0a LTFS11330I Loading cartridge.
+2026-09-27T03:57:59.320061+00:00 ee1 ltfs[1164206]: c5f0a LTFS30252I Logical block protection is disabled.
+2026-09-27T03:57:59.321315+00:00 ee1 ltfs[1164206]: c5f0a LTFS11332I Load successful.
+2026-09-27T03:57:59.322706+00:00 ee1 ltfs[1164206]: c5f0a LTFS17157I Changing the drive setting to append-only mode.
+2026-09-27T03:57:59.326288+00:00 ee1 ltfs[1164206]: c5f0a LTFS11005I Mounting the volume.
+2026-09-27T03:57:59.328442+00:00 ee1 ltfs[1164206]: c5f0a LTFS30252I Logical block protection is disabled.
+2026-09-27T03:57:59.337439+00:00 ee1 ltfs[1164206]: c5f0a LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-27T03:57:59.337536+00:00 ee1 ltfs[1164206]: c5f0a LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:59.337615+00:00 ee1 ltfs[1164206]: c5f0a LTFS30233I Cannot read attribute (-20501).
+2026-09-27T03:57:59.337677+00:00 ee1 ltfs[1164206]: c5f0a LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-27T03:57:59.341975+00:00 ee1 ltfs[1164206]: c5f0a LTFS17096W The index read from the tape uses a newer version of the LTFS format than the one supported by this software. Some functionality might be unavailable. If this tape is modified, the index downgrades format version to 2.4.0 from 2.5.0.
+2026-09-27T03:57:59.346069+00:00 ee1 ltfs[1164206]: c5f0a LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-27T03:57:59.346148+00:00 ee1 ltfs[1164206]: c5f0a LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:59.346230+00:00 ee1 ltfs[1164206]: c5f0a LTFS30233I Cannot read attribute (-20501).
+2026-09-27T03:57:59.346433+00:00 ee1 ltfs[1164206]: c5f0a LTFS17227I Tape attribute: Vendor = tape-rs .
+2026-09-27T03:57:59.346497+00:00 ee1 ltfs[1164206]: c5f0a LTFS17227I Tape attribute: Application Name = tape-rs ltfs                    .
+2026-09-27T03:57:59.346545+00:00 ee1 ltfs[1164206]: c5f0a LTFS17227I Tape attribute: Application Version = 0.1.0   .
+2026-09-27T03:57:59.346605+00:00 ee1 ltfs[1164206]: c5f0a LTFS17227I Tape attribute: Medium Label =                                                                                                                                                                 .
+2026-09-27T03:57:59.346667+00:00 ee1 ltfs[1164206]: c5f0a LTFS17228I Tape attribute: Text Localization ID = 0x00.
+2026-09-27T03:57:59.346719+00:00 ee1 ltfs[1164206]: c5f0a LTFS17227I Tape attribute: Barcode = SR2501                          .
+2026-09-27T03:57:59.346819+00:00 ee1 ltfs[1164206]: c5f0a LTFS17227I Tape attribute: Application Format Version = 2.4.0           .
+2026-09-27T03:57:59.346910+00:00 ee1 ltfs[1164206]: c5f0a LTFS17228I Tape attribute: Volume Lock Status = 0x00.
+2026-09-27T03:57:59.347005+00:00 ee1 ltfs[1164206]: c5f0a LTFS17227I Tape attribute: Media Pool name =                                                                                                                                                                 .
+2026-09-27T03:57:59.347169+00:00 ee1 ltfs[1164206]: c5f0a LTFS11031I Volume mounted successfully. SR2501 : Gen = 7 / (a, 5) -> (b, 25) / IBMlisa41D6C.
+2026-09-27T03:57:59.347298+00:00 ee1 ltfs[1164206]: c5f0a LTFS11664I Cartridge 'TS1000L8' is mounted on node 'ee1.ee.lab'.
+2026-09-27T03:57:59.347638+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.347707+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.347778+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.347842+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.347894+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.347949+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.348011+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.348066+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.348116+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.348190+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.348262+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.348341+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.348398+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.348442+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.348494+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.348555+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.348676+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.348730+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.348789+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.348831+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.348913+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.348954+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.348987+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.349034+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.349084+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.349145+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.349230+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.349280+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.349318+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.349354+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.349398+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.349441+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.349490+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.349545+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.349594+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.349645+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.349745+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.349793+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.349865+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.349919+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.349996+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.350048+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.350105+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.350229+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.350298+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.350358+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.350465+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.350506+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.350562+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.350598+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.350642+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.350727+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.350785+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.350823+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.350865+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.351028+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.351080+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.351134+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.351203+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.351259+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.351316+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.351409+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.351493+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.351533+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.351564+00:00 ee1 ltfs[1164206]: c5f0a LTFS11530E The tape bar code does not match the one stored in the ANSI label: failed to mount the tape.
+2026-09-27T03:57:59.351601+00:00 ee1 ltfs[1164206]: c5f0a LTFS11748I Unmounting TS1000L8 from IBMlisa41D6C.
+2026-09-27T03:57:59.351645+00:00 ee1 ltfs[1164206]: c5f0a LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-27T03:57:59.351746+00:00 ee1 ltfs[1164206]: c5f0a LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:59.351791+00:00 ee1 ltfs[1164206]: c5f0a LTFS30233I Cannot read attribute (-20501).
+2026-09-27T03:57:59.351849+00:00 ee1 ltfs[1164206]: c5f0a LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-27T03:57:59.351893+00:00 ee1 ltfs[1164206]: c5f0a LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-27T03:57:59.351931+00:00 ee1 ltfs[1164206]: c5f0a LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:59.351980+00:00 ee1 ltfs[1164206]: c5f0a LTFS30233I Cannot read attribute (-20501).
+2026-09-27T03:57:59.352035+00:00 ee1 ltfs[1164206]: c5f0a LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-27T03:57:59.352090+00:00 ee1 ltfs[1164206]: c5f0a LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-27T03:57:59.352132+00:00 ee1 ltfs[1164206]: c5f0a LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:59.352201+00:00 ee1 ltfs[1164206]: c5f0a LTFS30233I Cannot read attribute (-20501).
+2026-09-27T03:57:59.352259+00:00 ee1 ltfs[1164206]: c5f0a LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-27T03:57:59.352308+00:00 ee1 ltfs[1164206]: c5f0a LTFS17235I Writing index of SR2501 to a (Reason: Unmount, 0 files) IBMlisa41D6C.
+2026-09-27T03:57:59.352361+00:00 ee1 ltfs[1164206]: c5f0a LTFS30205I WRITEFM (0x10) returns -20308.
+2026-09-27T03:57:59.352428+00:00 ee1 ltfs[1164206]: c5f0a LTFS30263I WRITEFM returns Unrecovered Read Error (-20308) /dev/sg5.
+2026-09-27T03:57:59.352474+00:00 ee1 ltfs[1164206]: c5f0a LTFS30261I Taking drive dump in buffer.
+2026-09-27T03:57:59.352521+00:00 ee1 ltfs[1164206]: c5f0a LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035759.dmp.
+2026-09-27T03:57:59.352611+00:00 ee1 ltfs[1164206]: c5f0a LTFS30262I Forcing drive dump.
+2026-09-27T03:57:59.352688+00:00 ee1 ltfs[1164206]: c5f0a LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035759_f.dmp.
+2026-09-27T03:57:59.352748+00:00 ee1 ltfs[1164206]: c5f0a LTFS12047E Cannot write file marks: backend call failed (-20308). Dropping to read-only mode.
+2026-09-27T03:57:59.352786+00:00 ee1 ltfs[1164206]: c5f0a LTFS11082E Cannot write index: failed to write file mark (-20308).
+2026-09-27T03:57:59.352821+00:00 ee1 ltfs[1164206]: c5f0a LTFS11033E Cannot unmount: failed to write an index.
+2026-09-27T03:57:59.352968+00:00 ee1 ltfs[1164206]: c5f0a LTFS30205I READ_ATTR (0x8c) returns -20501.
+2026-09-27T03:57:59.353011+00:00 ee1 ltfs[1164206]: c5f0a LTFS30263I READ_ATTR returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:59.353049+00:00 ee1 ltfs[1164206]: c5f0a LTFS30233I Cannot read attribute (-20501).
+2026-09-27T03:57:59.353079+00:00 ee1 ltfs[1164206]: c5f0a LTFS11336I The attribute does not exist. Ignore the expected error.
+2026-09-27T03:57:59.353110+00:00 ee1 ltfs[1164206]: c5f0a LTFS11632I Remove volume cache files - TS1000L8.
+2026-09-27T03:57:59.353888+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.353980+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.354049+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.354104+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.354165+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.354252+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.354307+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.354361+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.354411+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.354465+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.354510+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.354549+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.354606+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.354655+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.354686+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.354716+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.354767+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.354822+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.354868+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.354927+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.354984+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.355030+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.355066+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.355124+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.355167+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.355230+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.355283+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.355329+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.355364+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.355394+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.355428+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.355458+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.355511+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.355555+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.355598+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.355646+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.355678+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.355742+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.355792+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.355850+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.355906+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.355985+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.356024+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.356060+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.356095+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.356129+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.356165+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.356260+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.356316+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.356378+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.356434+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.356507+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.356572+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.356606+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.356651+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.356707+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.356766+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.356818+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.356896+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.356943+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.357003+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.357066+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.357121+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.357209+00:00 ee1 ltfs[1164206]: c5f0a LTFS30235I Cannot parse the log page 0x17 in get tape alert.
+2026-09-27T03:57:59.357280+00:00 ee1 ltfs[1164206]: c5f0a LTFS11787I Capturing cartridge statistics for TS1000L8.
+2026-09-27T03:57:59.372316+00:00 ee1 ltfs[1164206]: c5f0a LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-27T03:57:59.372478+00:00 ee1 ltfs[1164206]: c5f0a LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:59.372529+00:00 ee1 ltfs[1164206]: c5f0a LTFS30262I Forcing drive dump.
+2026-09-27T03:57:59.372659+00:00 ee1 ltfs[1164206]: c5f0a LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035759_f.dmp.
+2026-09-27T03:57:59.373835+00:00 ee1 ltfs[1164206]: c5f0a LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-27T03:57:59.373981+00:00 ee1 ltfs[1164206]: c5f0a LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:59.374039+00:00 ee1 ltfs[1164206]: c5f0a LTFS30262I Forcing drive dump.
+2026-09-27T03:57:59.374193+00:00 ee1 ltfs[1164206]: c5f0a LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035759_f.dmp.
+2026-09-27T03:57:59.375636+00:00 ee1 ltfs[1164206]: c5f0a LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-27T03:57:59.375721+00:00 ee1 ltfs[1164206]: c5f0a LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:59.375809+00:00 ee1 ltfs[1164206]: c5f0a LTFS30262I Forcing drive dump.
+2026-09-27T03:57:59.375933+00:00 ee1 ltfs[1164206]: c5f0a LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035759_f.dmp.
+2026-09-27T03:57:59.376620+00:00 ee1 ltfs[1164206]: c5f0a LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-27T03:57:59.376702+00:00 ee1 ltfs[1164206]: c5f0a LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:59.376761+00:00 ee1 ltfs[1164206]: c5f0a LTFS30262I Forcing drive dump.
+2026-09-27T03:57:59.376947+00:00 ee1 ltfs[1164206]: c5f0a LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035759_f.dmp.
+2026-09-27T03:57:59.377576+00:00 ee1 ltfs[1164206]: c5f0a LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-27T03:57:59.377655+00:00 ee1 ltfs[1164206]: c5f0a LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:59.377726+00:00 ee1 ltfs[1164206]: c5f0a LTFS30262I Forcing drive dump.
+2026-09-27T03:57:59.377880+00:00 ee1 ltfs[1164206]: c5f0a LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035759_f.dmp.
+2026-09-27T03:57:59.378526+00:00 ee1 ltfs[1164206]: c5f0a LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-27T03:57:59.378615+00:00 ee1 ltfs[1164206]: c5f0a LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:59.378688+00:00 ee1 ltfs[1164206]: c5f0a LTFS30262I Forcing drive dump.
+2026-09-27T03:57:59.378856+00:00 ee1 ltfs[1164206]: c5f0a LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035759_f.dmp.
+2026-09-27T03:57:59.379470+00:00 ee1 ltfs[1164206]: c5f0a LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-27T03:57:59.379562+00:00 ee1 ltfs[1164206]: c5f0a LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:59.379618+00:00 ee1 ltfs[1164206]: c5f0a LTFS30262I Forcing drive dump.
+2026-09-27T03:57:59.379779+00:00 ee1 ltfs[1164206]: c5f0a LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035759_f.dmp.
+2026-09-27T03:57:59.380413+00:00 ee1 ltfs[1164206]: c5f0a LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-27T03:57:59.380472+00:00 ee1 ltfs[1164206]: c5f0a LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:57:59.380546+00:00 ee1 ltfs[1164206]: c5f0a LTFS30262I Forcing drive dump.
+2026-09-27T03:57:59.380723+00:00 ee1 ltfs[1164206]: c5f0a LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035759_f.dmp.
+2026-09-27T03:57:59.386605+00:00 ee1 ltfs[1164206]: c5f0a LTFS11289I Ejecting cartridge.
+2026-09-27T03:57:59.386738+00:00 ee1 ltfs[1164206]: c5f0a LTFS12022I Unloading medium.
+2026-09-27T03:57:59.388752+00:00 ee1 ltfs[1164206]: c5f0a LTFS30205I TEST_UNIT_READY (0x00) returns -20601.
+2026-09-27T03:57:59.389057+00:00 ee1 ltfs[1164206]: c5f0a LTFS30205I TEST_UNIT_READY (0x00) returns -20601.
+2026-09-27T03:57:59.389875+00:00 ee1 ltfs[1164206]: c5f0a LTFS11291I Eject successful.
+2026-09-27T03:57:59.389985+00:00 ee1 ltfs[1164206]: c5f0a LTFS11749I Unmounted TS1000L8 from IBMlisa41D6C.
+2026-09-27T03:57:59.391152+00:00 ee1 ltfs[1164206]: c5f0a LTFS11638I Cartridge TS1000L8 was unassigned because an error happens in a file system operation or it is unassigned from OOB.
+2026-09-27T03:57:59.391282+00:00 ee1 ltfs[1164206]: c5f0a LTFS11632I Remove volume cache files - TS1000L8.
+2026-09-27T03:57:59.391370+00:00 ee1 ltfs[1164206]: c5f0a LTFS11571I State of tape 'TS1000L8' in slot 0x100 is changed from 'WRITABLE' to 'LABEL_MISMATCH'.
+2026-09-27T03:57:59.392332+00:00 ee1 ltfs[1164206]: c5f0a LTFS14816E Failed to mount cartridge TS1000L8 (-1039).
+2026-09-27T03:57:59.392429+00:00 ee1 ltfs[1164206]: c5f0a LTFSI1039E Not a valid tape. Remove cartridge directory.
+2026-09-27T03:58:59.192143+00:00 ee1 ltfs[811994]: c63da LTFS17085I Plugin: Loading "sg" tape backend.
+2026-09-27T03:58:59.192632+00:00 ee1 ltfs[811994]: c63da LTFS17085I Plugin: Loading "sg" changer backend.
+2026-09-27T03:59:26.084532+00:00 ee1 ltfs[1164206]: c655b LTFS14817I Unmounting cartridge TS1000L8.
+2026-09-27T03:59:26.085891+00:00 ee1 ltfs[1164206]: c655b LTFS11787I Capturing cartridge statistics for TS1000L8.
+2026-09-27T03:59:26.102725+00:00 ee1 ltfs[1164206]: c655b LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-27T03:59:26.102855+00:00 ee1 ltfs[1164206]: c655b LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:59:26.102927+00:00 ee1 ltfs[1164206]: c655b LTFS30262I Forcing drive dump.
+2026-09-27T03:59:26.103112+00:00 ee1 ltfs[1164206]: c655b LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035926_f.dmp.
+2026-09-27T03:59:26.104965+00:00 ee1 ltfs[1164206]: c655b LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-27T03:59:26.105052+00:00 ee1 ltfs[1164206]: c655b LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:59:26.105103+00:00 ee1 ltfs[1164206]: c655b LTFS30262I Forcing drive dump.
+2026-09-27T03:59:26.105306+00:00 ee1 ltfs[1164206]: c655b LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035926_f.dmp.
+2026-09-27T03:59:26.106762+00:00 ee1 ltfs[1164206]: c655b LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-27T03:59:26.106837+00:00 ee1 ltfs[1164206]: c655b LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:59:26.106896+00:00 ee1 ltfs[1164206]: c655b LTFS30262I Forcing drive dump.
+2026-09-27T03:59:26.107100+00:00 ee1 ltfs[1164206]: c655b LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035926_f.dmp.
+2026-09-27T03:59:26.107758+00:00 ee1 ltfs[1164206]: c655b LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-27T03:59:26.107803+00:00 ee1 ltfs[1164206]: c655b LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:59:26.107838+00:00 ee1 ltfs[1164206]: c655b LTFS30262I Forcing drive dump.
+2026-09-27T03:59:26.108097+00:00 ee1 ltfs[1164206]: c655b LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035926_f.dmp.
+2026-09-27T03:59:26.108710+00:00 ee1 ltfs[1164206]: c655b LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-27T03:59:26.108757+00:00 ee1 ltfs[1164206]: c655b LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:59:26.108803+00:00 ee1 ltfs[1164206]: c655b LTFS30262I Forcing drive dump.
+2026-09-27T03:59:26.109042+00:00 ee1 ltfs[1164206]: c655b LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035926_f.dmp.
+2026-09-27T03:59:26.109702+00:00 ee1 ltfs[1164206]: c655b LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-27T03:59:26.109750+00:00 ee1 ltfs[1164206]: c655b LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:59:26.109798+00:00 ee1 ltfs[1164206]: c655b LTFS30262I Forcing drive dump.
+2026-09-27T03:59:26.110027+00:00 ee1 ltfs[1164206]: c655b LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035926_f.dmp.
+2026-09-27T03:59:26.110653+00:00 ee1 ltfs[1164206]: c655b LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-27T03:59:26.110709+00:00 ee1 ltfs[1164206]: c655b LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:59:26.110746+00:00 ee1 ltfs[1164206]: c655b LTFS30262I Forcing drive dump.
+2026-09-27T03:59:26.110968+00:00 ee1 ltfs[1164206]: c655b LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035926_f.dmp.
+2026-09-27T03:59:26.111599+00:00 ee1 ltfs[1164206]: c655b LTFS30205I LOGSENSE (0x4d) returns -20501.
+2026-09-27T03:59:26.111645+00:00 ee1 ltfs[1164206]: c655b LTFS30263I LOGSENSE returns Invalid Field in CDB (-20501) /dev/sg5.
+2026-09-27T03:59:26.111685+00:00 ee1 ltfs[1164206]: c655b LTFS30262I Forcing drive dump.
+2026-09-27T03:59:26.111912+00:00 ee1 ltfs[1164206]: c655b LTFS30253I Saving drive dump to /tmp/ltfs_IBMlisa41D6C_2026_0927_035926_f.dmp.
+2026-09-27T03:59:26.123081+00:00 ee1 ltfs[1164206]: c655b LTFS12022I Unloading medium.
+2026-09-27T03:59:26.125093+00:00 ee1 ltfs[1164206]: c655b LTFS30205I TEST_UNIT_READY (0x00) returns -20601.
+2026-09-27T03:59:26.125382+00:00 ee1 ltfs[1164206]: c655b LTFS30205I TEST_UNIT_READY (0x00) returns -20601.
+2026-09-27T03:59:26.126218+00:00 ee1 ltfs[1164206]: c655b LTFS14812I Moving cartridge TS1000L8 from 256 to 1032 - IBMlisa41D6C_LL3 .
+2026-09-27T03:59:26.126271+00:00 ee1 ltfs[1164206]: c655b LTFS11629I Aqcuireing MoveLock - IBMlisa41D6C_LL3.
+2026-09-27T03:59:26.126322+00:00 ee1 ltfs[1164206]: c655b LTFS11630I Aqcuired Move Lock (14) - IBMlisa41D6C_LL3.
+2026-09-27T03:59:26.127123+00:00 ee1 ltfs[1164206]: c655b LTFS11636I Unlink the drive IBMlisa41D6C from the cartridge TS1000L8.
+2026-09-27T03:59:26.127199+00:00 ee1 ltfs[1164206]: c655b LTFS14813I Moved cartridge TS1000L8 to 1032 successfully - IBMlisa41D6C_LL3.
+2026-09-27T03:59:26.128325+00:00 ee1 ltfs[1164206]: c655b LTFS14818I Cartridge TS1000L8 is unmounted successfully.
+2026-09-27T03:59:48.003901+00:00 ee1 ltfs[812730]: c66ba LTFS17085I Plugin: Loading "sg" tape backend.
+2026-09-27T03:59:48.004369+00:00 ee1 ltfs[812730]: c66ba LTFS17085I Plugin: Loading "sg" changer backend.

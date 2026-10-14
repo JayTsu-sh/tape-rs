@@ -1,0 +1,40 @@
+{
+  "unchanged_original_rows": 41,
+  "rows": 53,
+  "catalog_sha256": "1a76875af7cac4e057e5fe80ab66d654348800f22b9c07ca5681f83a32762634",
+  "pools": [
+    {
+      "file_limit": 50,
+      "name": "rc",
+      "tape_details": [
+        {
+          "barcode": "TS1000L08",
+          "bytes_used": 0,
+          "bytes_written": 2097152,
+          "files": 0,
+          "generation": 2,
+          "live_bytes": 0,
+          "live_files": 0,
+          "reclaimable_bytes": 2097152,
+          "state": "appendable"
+        },
+        {
+          "barcode": "TS1001L08",
+          "bytes_used": 51450880,
+          "bytes_written": 117440512,
+          "files": 37,
+          "generation": 119,
+          "live_bytes": 51450880,
+          "live_files": 53,
+          "reclaimable_bytes": 65989632,
+          "state": "appendable"
+        }
+      ],
+      "tapes": [
+        "TS1000L08",
+        "TS1001L08"
+      ],
+      "uuid": "0ba1b026-9595-4b86-9056-c54c7858e744"
+    }
+  ]
+}

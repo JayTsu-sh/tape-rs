@@ -1,0 +1,6 @@
+{'createdAt': '2026-09-27T06:22:59.502886631Z', 'updatedAt': '2026-09-27T06:22:59.502887125Z', 'cartridgeId': 'PF2701L08', 'poolId': 'pool1', 'libraryId': 'lisa4300', 'barcode': 'PF2701L08', 'capacityBytes': 536870912, 'usedBytes': 0, 'lifecycleState': 'available', 'retentionState': 'none', 'assignedSlotAddress': 1034}
+{'createdAt': '2026-09-27T06:23:01.457151703Z', 'updatedAt': '2026-09-27T06:23:01.457151997Z', 'cartridgeId': 'PF2702L08', 'poolId': 'pool1', 'libraryId': 'lisa4300', 'barcode': 'PF2702L08', 'capacityBytes': 536870912, 'usedBytes': 0, 'lifecycleState': 'available', 'retentionState': 'none', 'assignedSlotAddress': 1035}
+restored pub-5ca0dd9c6da12258a97c38633951717a iqn.2026-04.cloud.backupnext.holo:library-lisa4300-ee3
+restored pub-443ee5d963223209ee2eef6a65cc71ed iqn.2026-04.cloud.backupnext.holo:library-lisa4300-ee2
+nine publication IQNs restored
+

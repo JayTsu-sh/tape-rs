@@ -1,0 +1,19 @@
+   Compiling tape-rs v0.1.0 (/work/jay/tape-rs-ltfs-recovery-ibm-interop)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.84s
+     Running tests/ltfsd_cluster.rs (/work/cargo-target/debug/deps/ltfsd_cluster-fef60eb6cf3447a6)
+
+running 1 test
+
+thread 'directory_commit_failure_preserves_reason_and_is_not_replayed' (3462602) panicked at tests/ltfsd_cluster.rs:3801:5:
+目录 /empty 提交结果未定
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test directory_commit_failure_preserves_reason_and_is_not_replayed ... FAILED
+
+failures:
+
+failures:
+    directory_commit_failure_preserves_reason_and_is_not_replayed
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 46 filtered out; finished in 0.89s
+
+error: test failed, to rerun pass `--test ltfsd_cluster`

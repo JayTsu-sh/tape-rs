@@ -5,7 +5,9 @@ pub enum TapeError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("SCSI command failed: status={status:#04x}, sense_key={sense_key:#04x}, asc={asc:#04x}, ascq={ascq:#04x}")]
+    #[error(
+        "SCSI command failed: status={status:#04x}, sense_key={sense_key:#04x}, asc={asc:#04x}, ascq={ascq:#04x}"
+    )]
     ScsiCommand {
         status: u8,
         sense_key: u8,
@@ -15,9 +17,15 @@ pub enum TapeError {
 
     /// SCSI status 0x18: 另一个 initiator 持有 Persistent Reservation。
     /// 排查：`sg_persist --in -r /dev/sgX` 看 reservation holder key。
-    #[error("SCSI reservation conflict on {device}: another initiator holds the reservation \
-             (run `sg_persist --in -r {device}` to see holder key, then coordinate release)")]
+    #[error(
+        "SCSI reservation conflict on {device}: another initiator holds the reservation \
+             (run `sg_persist --in -r {device}` to see holder key, then coordinate release)"
+    )]
     ReservationConflict { device: String },
+
+    /// 持有者自检失败：设备报告的预留持有者不是本轮的键。必须停止，不得自动恢复预留。
+    #[error("执行资格已失去 ({device}): {detail}")]
+    OwnershipLost { device: String, detail: String },
 
     /// SCSI status 0x08: 目标暂忙（例如机械手或 drive 正在执行其它命令）。
     #[error("SCSI target busy on {device}")]
@@ -65,6 +73,19 @@ pub enum TapeError {
     /// `?` 操作符从 `quick_xml::Error` 自动归到这里。
     #[error("XML parse error")]
     XmlSource(#[from] quick_xml::Error),
+
+    /// 恢复协议无法建立可信视图或安全追加资格；不自动修复，交由运维处置。
+    #[error("Recovery restricted: {reason}")]
+    RecoveryRestricted { reason: String },
+
+    /// 卷提交在某个阶段失败。`stage` 标明设备副作用可能到达的位置：
+    /// 索引写入及之后的阶段都意味着"结果未定"，须重新挂载经恢复协议核实。
+    #[error("Commit failed at {stage}: {source}")]
+    CommitFailed {
+        stage: String,
+        #[source]
+        source: Box<TapeError>,
+    },
 
     #[error("Catalog error: {0}")]
     Catalog(String),

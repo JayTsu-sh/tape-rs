@@ -36,7 +36,10 @@ pub fn cmd_write(path: &str, file_path: &str, block_size: usize) -> Result<()> {
     let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mut reader = BufReader::with_capacity(block_size.max(64 * 1024), file);
 
-    println!("写入文件: {} ({} 字节, 块大小 {} 字节)", file_path, file_size, block_size);
+    println!(
+        "写入文件: {} ({} 字节, 块大小 {} 字节)",
+        file_path, file_size, block_size
+    );
     let written = drive.write_from_reader(&mut reader, block_size)?;
     println!("写入完成: {} 字节", written);
     Ok(())
@@ -49,8 +52,15 @@ pub fn cmd_read(path: &str, output_path: &str, block_size: usize, max_size: u64)
     let file = File::create(output_path)?;
     let mut writer = BufWriter::with_capacity(block_size.max(64 * 1024), file);
 
-    let limit_label = if max_size == 0 { "无上限".to_string() } else { format!("{} 字节", max_size) };
-    println!("读取磁带 → {} (块大小 {}, 上限 {})", output_path, block_size, limit_label);
+    let limit_label = if max_size == 0 {
+        "无上限".to_string()
+    } else {
+        format!("{} 字节", max_size)
+    };
+    println!(
+        "读取磁带 → {} (块大小 {}, 上限 {})",
+        output_path, block_size, limit_label
+    );
     let total = drive.read_to_writer(&mut writer, block_size, max_size)?;
     println!("读取完成: {} 字节 → {}", total, output_path);
     Ok(())
@@ -113,7 +123,10 @@ pub fn cmd_space(path: &str, mode: &str, count: i32) -> Result<()> {
         }
         other => {
             return Err(TapeError::MoveFailed {
-                reason: format!("未知的 space 模式 '{}'（可选 block / filemark / eod）", other),
+                reason: format!(
+                    "未知的 space 模式 '{}'（可选 block / filemark / eod）",
+                    other
+                ),
             });
         }
     }
@@ -125,7 +138,10 @@ pub fn cmd_locate(path: &str, partition: u8, block: u64, change_partition: bool)
     let drive = TapeDrive::new(&dev);
     drive.locate(partition, block, change_partition)?;
     let pos = drive.read_position()?;
-    println!("已定位: partition={}, block={}", pos.partition, pos.block_number);
+    println!(
+        "已定位: partition={}, block={}",
+        pos.partition, pos.block_number
+    );
     Ok(())
 }
 
@@ -195,7 +211,10 @@ pub fn cmd_report_density(path: &str, media_only: bool) -> Result<()> {
     let data = drive.report_density_support(media_only)?;
 
     if data.len() < 4 {
-        return Err(TapeError::InvalidResponse { expected: 4, actual: data.len() });
+        return Err(TapeError::InvalidResponse {
+            expected: 4,
+            actual: data.len(),
+        });
     }
     let avail_len = u16::from_be_bytes([data[0], data[1]]) as usize;
     let end = (4 + avail_len).min(data.len());
@@ -209,19 +228,33 @@ pub fn cmd_report_density(path: &str, media_only: bool) -> Result<()> {
         let wrtok = (data[offset + 2] & 0x80) != 0;
         let dup = (data[offset + 2] & 0x40) != 0;
         let deflt = (data[offset + 2] & 0x20) != 0;
-        let bits_per_mm = u32::from_be_bytes([0, data[offset + 5], data[offset + 6], data[offset + 7]]);
+        let bits_per_mm =
+            u32::from_be_bytes([0, data[offset + 5], data[offset + 6], data[offset + 7]]);
         let tracks = u16::from_be_bytes([data[offset + 8], data[offset + 9]]);
         let capacity = u32::from_be_bytes([
-            data[offset + 10], data[offset + 11], data[offset + 12], data[offset + 13],
+            data[offset + 10],
+            data[offset + 11],
+            data[offset + 12],
+            data[offset + 13],
         ]);
-        let vendor = String::from_utf8_lossy(&data[offset + 14..offset + 22]).trim().to_string();
-        let desc = String::from_utf8_lossy(&data[offset + 22..offset + 30]).trim().to_string();
-        let name = String::from_utf8_lossy(&data[offset + 30..offset + 52]).trim().to_string();
+        let vendor = String::from_utf8_lossy(&data[offset + 14..offset + 22])
+            .trim()
+            .to_string();
+        let desc = String::from_utf8_lossy(&data[offset + 22..offset + 30])
+            .trim()
+            .to_string();
+        let name = String::from_utf8_lossy(&data[offset + 30..offset + 52])
+            .trim()
+            .to_string();
 
-        println!("  - code={:#04x} secondary={:#04x} wrtok={} dup={} default={}",
-            code, secondary, wrtok, dup, deflt);
-        println!("    bits/mm={} tracks={} capacity={}MB vendor={} desc={} name={}",
-            bits_per_mm, tracks, capacity, vendor, desc, name);
+        println!(
+            "  - code={:#04x} secondary={:#04x} wrtok={} dup={} default={}",
+            code, secondary, wrtok, dup, deflt
+        );
+        println!(
+            "    bits/mm={} tracks={} capacity={}MB vendor={} desc={} name={}",
+            bits_per_mm, tracks, capacity, vendor, desc, name
+        );
         offset += 52;
     }
     Ok(())
@@ -231,7 +264,14 @@ pub fn cmd_diagnostic(path: &str, foreground: bool) -> Result<()> {
     let dev = ScsiDevice::open(path)?;
     let drive = TapeDrive::new(&dev);
     drive.send_diagnostic(foreground)?;
-    println!("自检已{}", if foreground { "完成" } else { "提交（后台运行）" });
+    println!(
+        "自检已{}",
+        if foreground {
+            "完成"
+        } else {
+            "提交（后台运行）"
+        }
+    );
 
     if foreground {
         match drive.receive_diagnostic_results(None) {

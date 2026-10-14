@@ -1,0 +1,119 @@
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+{"phase": "leadm-move-to-drive", "event": "end", "time_ns": 1790513102358714415, "seconds": 27.133707265}
+{"phase": "open-existing-first", "event": "end", "time_ns": 1790513121120280605, "seconds": 18.461256754, "path": "comparison/small/f00000"}
+{"phase": "read-existing-first", "event": "end", "time_ns": 1790513168717436368, "seconds": 47.296868494}
+{"phase": "close-existing-first", "event": "end", "time_ns": 1790513169018561126, "seconds": 0.000803503}
+{"phase": "open-existing-warm", "event": "end", "time_ns": 1790513169319404434, "seconds": 0.000249274}
+{"phase": "fsync-existing-clean", "event": "end", "time_ns": 1790513169619873046, "seconds": 0.000277785}
+{"phase": "fdatasync-existing-clean", "event": "end", "time_ns": 1790513169920309206, "seconds": 0.000255234}
+{"phase": "close-existing-warm", "event": "end", "time_ns": 1790513170221212311, "seconds": 0.000722859}
+{"phase": "create-test-directory", "event": "end", "time_ns": 1790513170522229609, "seconds": 0.000750932}
+{"phase": "ltfs-sync-baseline", "event": "end", "time_ns": 1790513198062248843, "seconds": 27.239832035}
+{"phase": "fdatasync-0:open-create", "event": "end", "time_ns": 1790513198363955795, "seconds": 0.00134462}
+{"phase": "fdatasync-0:write", "event": "end", "time_ns": 1790513198664542685, "seconds": 0.000389162, "bytes": 4096}
+{"phase": "fdatasync-0:fdatasync", "event": "end", "time_ns": 1790513212202492645, "seconds": 13.237754522}
+{"phase": "fdatasync-0:fdatasync-clean", "event": "end", "time_ns": 1790513212503489022, "seconds": 0.000704765}
+{"phase": "fdatasync-0:close", "event": "end", "time_ns": 1790513212803940512, "seconds": 0.000258536}
+{"phase": "fdatasync-0:settle-ltfs-sync", "event": "end", "time_ns": 1790513225853420343, "seconds": 12.749295944}
+{"phase": "fdatasync-1:open-create", "event": "end", "time_ns": 1790513226154775821, "seconds": 0.00097926}
+{"phase": "fdatasync-1:write", "event": "end", "time_ns": 1790513226455353545, "seconds": 0.000376415, "bytes": 4096}
+{"phase": "fdatasync-1:fdatasync", "event": "end", "time_ns": 1790513240040786771, "seconds": 13.285230166}
+{"phase": "fdatasync-1:fdatasync-clean", "event": "end", "time_ns": 1790513240341759731, "seconds": 0.000696929}
+{"phase": "fdatasync-1:close", "event": "end", "time_ns": 1790513240642203413, "seconds": 0.000263825}
+{"phase": "fdatasync-1:settle-ltfs-sync", "event": "end", "time_ns": 1790513253871894136, "seconds": 12.929506138}
+{"phase": "fsync-0:open-create", "event": "end", "time_ns": 1790513254173268452, "seconds": 0.000987937}
+{"phase": "fsync-0:write", "event": "end", "time_ns": 1790513254473842381, "seconds": 0.000397813, "bytes": 4096}
+{"phase": "fsync-0:fsync", "event": "end", "time_ns": 1790513268085057356, "seconds": 13.311018994}
+{"phase": "fsync-0:fsync-clean", "event": "end", "time_ns": 1790513268386124878, "seconds": 0.000771473}
+{"phase": "fsync-0:close", "event": "end", "time_ns": 1790513268686543059, "seconds": 0.000235826}
+{"phase": "fsync-0:settle-ltfs-sync", "event": "end", "time_ns": 1790513281817206004, "seconds": 12.830474206}
+{"phase": "fsync-1:open-create", "event": "end", "time_ns": 1790513282118586530, "seconds": 0.001014946}
+{"phase": "fsync-1:write", "event": "end", "time_ns": 1790513282419160415, "seconds": 0.000369544, "bytes": 4096}
+{"phase": "fsync-1:fsync", "event": "end", "time_ns": 1790513296127834597, "seconds": 13.408473896}
+{"phase": "fsync-1:fsync-clean", "event": "end", "time_ns": 1790513296428890270, "seconds": 0.000762516}
+{"phase": "fsync-1:close", "event": "end", "time_ns": 1790513296729328890, "seconds": 0.00025182}
+{"phase": "fsync-1:settle-ltfs-sync", "event": "end", "time_ns": 1790513309903302171, "seconds": 12.873784406}
+{"phase": "ltfs-sync-0:open-create", "event": "end", "time_ns": 1790513310204717116, "seconds": 0.001045077}
+{"phase": "ltfs-sync-0:write", "event": "end", "time_ns": 1790513310505335908, "seconds": 0.00041423, "bytes": 4096}
+{"phase": "ltfs-sync-0:ltfs-sync", "event": "end", "time_ns": 1790513337838837976, "seconds": 27.033294992}
+{"phase": "ltfs-sync-0:ltfs-sync-clean", "event": "end", "time_ns": 1790513338144705795, "seconds": 0.005607193}
+{"phase": "ltfs-sync-0:close", "event": "end", "time_ns": 1790513338445582550, "seconds": 0.000691405}
+{"phase": "ltfs-sync-0:settle-ltfs-sync", "event": "end", "time_ns": 1790513338751348220, "seconds": 0.005537755}
+{"phase": "ltfs-sync-1:open-create", "event": "end", "time_ns": 1790513339053000903, "seconds": 0.001357008}
+{"phase": "ltfs-sync-1:write", "event": "end", "time_ns": 1790513339353702657, "seconds": 0.000502743, "bytes": 4096}
+{"phase": "ltfs-sync-1:ltfs-sync", "event": "end", "time_ns": 1790513366853245186, "seconds": 27.199349314}
+{"phase": "ltfs-sync-1:ltfs-sync-clean", "event": "end", "time_ns": 1790513367159581128, "seconds": 0.005868185}
+{"phase": "ltfs-sync-1:close", "event": "end", "time_ns": 1790513367460491627, "seconds": 0.000676866}
+{"phase": "ltfs-sync-1:settle-ltfs-sync", "event": "end", "time_ns": 1790513367766100117, "seconds": 0.005444154}
+{"phase": "leadm-sync-0:open-create", "event": "end", "time_ns": 1790513368067824932, "seconds": 0.001463135}
+{"phase": "leadm-sync-0:write", "event": "end", "time_ns": 1790513368369076312, "seconds": 0.001065302, "bytes": 4096}
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+{"phase": "leadm-sync-0:leadm-sync", "event": "end", "time_ns": 1790513396014252110, "seconds": 27.344979626}
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+{"phase": "leadm-sync-0:leadm-sync-clean", "event": "end", "time_ns": 1790513396571151032, "seconds": 0.256644066}
+{"phase": "leadm-sync-0:close", "event": "end", "time_ns": 1790513396872189921, "seconds": 0.000772585}
+{"phase": "leadm-sync-0:settle-ltfs-sync", "event": "end", "time_ns": 1790513397178487291, "seconds": 0.006091865}
+{"phase": "leadm-sync-1:open-create", "event": "end", "time_ns": 1790513397479566930, "seconds": 0.000786168}
+{"phase": "leadm-sync-1:write", "event": "end", "time_ns": 1790513397780033447, "seconds": 0.000283512, "bytes": 4096}
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+{"phase": "leadm-sync-1:leadm-sync", "event": "end", "time_ns": 1790513425485244200, "seconds": 27.405033154}
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+{"phase": "leadm-sync-1:leadm-sync-clean", "event": "end", "time_ns": 1790513426043696701, "seconds": 0.258209789}
+{"phase": "leadm-sync-1:close", "event": "end", "time_ns": 1790513426344719648, "seconds": 0.000770408}
+{"phase": "leadm-sync-1:settle-ltfs-sync", "event": "end", "time_ns": 1790513426651089883, "seconds": 0.006189215}
+{"phase": "close-only-0:open-create", "event": "end", "time_ns": 1790513426952177116, "seconds": 0.000830478}
+{"phase": "close-only-0:write", "event": "end", "time_ns": 1790513427252743600, "seconds": 0.000383159, "bytes": 4096}
+{"phase": "close-only-0:close", "event": "end", "time_ns": 1790513441212658458, "seconds": 13.659726919}
+{"phase": "close-only-0:settle-ltfs-sync", "event": "end", "time_ns": 1790513454838091275, "seconds": 13.325177294}
+{"phase": "syncfs-0:open-create", "event": "end", "time_ns": 1790513455139454755, "seconds": 0.001035659}
+{"phase": "syncfs-0:write", "event": "end", "time_ns": 1790513455440063953, "seconds": 0.000418479, "bytes": 4096}
+{"phase": "syncfs-0:syncfs", "event": "end", "time_ns": 1790513455740583041, "seconds": 0.000323025}
+{"phase": "syncfs-0:close", "event": "end", "time_ns": 1790513469691017384, "seconds": 13.650265218}
+{"phase": "syncfs-0:settle-ltfs-sync", "event": "end", "time_ns": 1790513483282372064, "seconds": 13.291088168}
+{"phase": "metadata:open", "event": "end", "time_ns": 1790513483583486576, "seconds": 0.000782516}
+{"phase": "metadata:chmod", "event": "end", "time_ns": 1790513483883887319, "seconds": 0.000226154}
+{"phase": "metadata:fdatasync", "event": "end", "time_ns": 1790513484184328001, "seconds": 0.000261392}
+{"phase": "metadata:fsync", "event": "end", "time_ns": 1790513484484792561, "seconds": 0.000282085}
+{"phase": "metadata:close", "event": "end", "time_ns": 1790513484785708915, "seconds": 0.00073532}
+{"phase": "metadata:ltfs-sync", "event": "end", "time_ns": 1790513485092104315, "seconds": 0.006217164}
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+{"phase": "leadm-unload-dirty-ip", "event": "end", "time_ns": 1790513661315466673, "seconds": 175.923174936}
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+{"phase": "leadm-reload", "event": "end", "time_ns": 1790513686687215497, "seconds": 25.071517581}
+{"phase": "open-after-reload-and-check", "event": "end", "time_ns": 1790513705555040762, "seconds": 18.567580175}
+/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead
+  t.setDaemon(True)
+{"phase": "leadm-unload-clean", "event": "end", "time_ns": 1790513774955602703, "seconds": 69.100321959}
+[2026-09-27T12:56:17Z INFO  tape_rs::scsi::reservation] /dev/sg3: PERSISTENT RESERVE IN 前越过 UNIT ATTENTION 2a/01
+{"phase": "le-unmount-and-exit", "event": "end", "time_ns": 1790513777348385595, "seconds": 2.092141877}
+[2026-09-27T12:56:17Z INFO  tape_rs::changer::commands] 移动介质: 从 0x03ef 到 0x0001
+[2026-09-27T12:56:44Z INFO  tape_rs::changer::commands] 移动完成
+装载: slot 7 (addr 0x03ef) → drive 0 (addr 0x0001)
+装载完成
+
+[2026-09-27T12:56:44Z INFO  tape_rs::tape::commands] 装载磁带...
+[2026-09-27T12:56:49Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 1 次）
+[2026-09-27T12:56:51Z INFO  tape_rs::tape::commands] 装载完成
+装载完成
+
+[2026-09-27T12:59:10Z INFO  tape_rs::tape::commands] 弹出磁带...
+[2026-09-27T13:00:12Z INFO  tape_rs::tape::commands] 弹出完成
+弹出完成
+
+[2026-09-27T13:00:12Z INFO  tape_rs::changer::commands] 移动介质: 从 0x0001 到 0x03ef
+[2026-09-27T13:00:41Z INFO  tape_rs::changer::commands] 移动完成
+卸载: drive 0 (addr 0x0001) → slot 7 (addr 0x03ef)
+卸载完成
+
+LE API TRACE COMPLETE

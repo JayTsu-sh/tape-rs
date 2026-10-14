@@ -12,16 +12,16 @@ fn open_catalog(override_path: Option<&str>) -> Result<Catalog> {
     Catalog::open(&path)
 }
 
-pub fn cmd_catalog_sync(device_path: &str, catalog_path: Option<&str>, barcode: Option<&str>) -> Result<()> {
+pub fn cmd_catalog_sync(
+    device_path: &str,
+    catalog_path: Option<&str>,
+    barcode: Option<&str>,
+) -> Result<()> {
     let mut cat = open_catalog(catalog_path)?;
     let dev = ScsiDevice::open(device_path)?;
     let stats = catalog::sync_from_device(&mut cat, &dev, barcode)?;
     let cap_note = match stats.capacity {
-        Some(c) => format!(
-            " used={}/{}",
-            format_size(c.used()),
-            format_size(c.total),
-        ),
+        Some(c) => format!(" used={}/{}", format_size(c.used()), format_size(c.total),),
         None => String::new(),
     };
     println!(
@@ -32,7 +32,11 @@ pub fn cmd_catalog_sync(device_path: &str, catalog_path: Option<&str>, barcode: 
         stats.files,
         stats.extents,
         cap_note,
-        if stats.replaced_previous { "（覆盖旧快照）" } else { "" }
+        if stats.replaced_previous {
+            "（覆盖旧快照）"
+        } else {
+            ""
+        }
     );
     Ok(())
 }
@@ -45,8 +49,8 @@ pub fn cmd_catalog_list(catalog_path: Option<&str>) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<8}  {:<36}  {:>6}  {:>10}  {:>10}  {:>8}  {:>8}  {}",
-        "BARCODE", "UUID", "GEN", "FILES", "SIZE", "USED", "TOTAL", "LAST SYNC"
+        "{:<8}  {:<36}  {:>6}  {:>10}  {:>10}  {:>8}  {:>8}  LAST SYNC",
+        "BARCODE", "UUID", "GEN", "FILES", "SIZE", "USED", "TOTAL"
     );
     for r in rows {
         let (used_s, total_s) = match (r.total_capacity, r.remaining_capacity) {
@@ -75,7 +79,7 @@ pub fn cmd_catalog_find(pattern: &str, catalog_path: Option<&str>, limit: usize)
         println!("  (无匹配)");
         return Ok(());
     }
-    println!("{:<8}  {:>12}  {:<20}  {}", "BARCODE", "SIZE", "MTIME", "PATH");
+    println!("{:<8}  {:>12}  {:<20}  PATH", "BARCODE", "SIZE", "MTIME");
     for h in hits {
         println!(
             "{:<8}  {:>12}  {:<20}  {}",
@@ -97,10 +101,7 @@ pub fn cmd_catalog_show(key: &str, catalog_path: Option<&str>) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
-    println!(
-        "{:>12}  {:>4}  {:>10}  {}",
-        "SIZE", "PART", "BLOCK", "PATH"
-    );
+    println!("{:>12}  {:>4}  {:>10}  PATH", "SIZE", "PART", "BLOCK");
     for r in rows {
         println!(
             "{:>12}  {:>4}  {:>10}  {}",

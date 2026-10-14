@@ -1,0 +1,65 @@
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=8
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=5
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=489
+[2026-09-27T01:11:14Z INFO  tape_rs::ltfs::volume] index gen=119 highest_uid=115 (dp_tail=Complete, ip_tail=Complete, writable=true)
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=77
+[2026-09-27T01:11:14Z INFO  tape_rs::ltfs::volume] 读取 rc/f4.bin: 8388608 字节
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=2
+[2026-09-27T01:11:14Z INFO  tape_rs::ltfs::volume] LTFS label: version=2.4.0 uuid=295fe36b-1154-437c-a1e9-a3205030fb75 blocksize=524288 compression=false
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=0
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=487
+[2026-09-27T01:11:14Z INFO  tape_rs::ltfs::recovery] 分区 1 VCI 快速路径命中 gen=119 @ 487..488
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=0
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=5
+[2026-09-27T01:11:14Z INFO  tape_rs::ltfs::recovery] 分区 0 VCI 快速路径命中 gen=116 @ 5..6
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=484
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=481
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=478
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=478
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=460
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=454
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=435
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=416
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=404
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=386
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=380
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=361
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=342
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=327
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=318
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=299
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=284
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=278
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=258
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=249
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=240
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=234
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=219
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=213
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=206
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=200
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=176
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=173
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=169
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=166
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=162
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=158
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=155
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=151
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=147
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=144
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=140
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=137
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=133
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=129
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=125
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=121
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=118
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=114
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=110
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=8
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=5
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=489
+[2026-09-27T01:11:14Z INFO  tape_rs::ltfs::volume] index gen=119 highest_uid=115 (dp_tail=Complete, ip_tail=Complete, writable=true)
+[2026-09-27T01:11:14Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=93
+[2026-09-27T01:11:14Z INFO  tape_rs::ltfs::volume] 读取 rc/f5.bin: 8388608 字节

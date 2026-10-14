@@ -1,0 +1,46 @@
+[2026-09-25T00:16:03Z INFO  tape_rs::daemon::net] 节点间通信监听 0.0.0.0:7500
+[2026-09-25T00:16:03Z INFO  tape_rs::daemon::http] 客户端接口监听 0.0.0.0:7501
+[2026-09-25T00:16:03Z INFO  raft::raft] switched to configuration, raft_id: 3, config: Configuration { voters: Configuration { incoming: Configuration { voters: {1, 2, 3} }, outgoing: Configuration { voters: {} } }, learners: {}, learners_next: {}, auto_leave: false }
+[2026-09-25T00:16:03Z INFO  raft::raft] became follower at term 26, raft_id: 3, term: 26
+[2026-09-25T00:16:03Z INFO  raft::raft] newRaft, raft_id: 3, peers: Configuration { incoming: Configuration { voters: {1, 2, 3} }, outgoing: Configuration { voters: {} } }, last term: 26, last index: 240, applied: 0, commit: 240, term: 26
+[2026-09-25T00:16:03Z INFO  raft::raw_node] RawNode created with id 3., raft_id: 3, id: 3
+[2026-09-25T00:16:04Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 2
+[2026-09-25T00:16:04Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 14
+[2026-09-25T00:16:04Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 21
+[2026-09-25T00:16:04Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 31
+[2026-09-25T00:16:04Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 54
+[2026-09-25T00:16:04Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 59
+[2026-09-25T00:16:04Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 109
+[2026-09-25T00:16:04Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 114
+[2026-09-25T00:16:04Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 124
+[2026-09-25T00:16:04Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 129
+[2026-09-25T00:16:04Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 157
+[2026-09-25T00:16:04Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 162
+[2026-09-25T00:16:04Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 184
+[2026-09-25T00:16:04Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 191
+[2026-09-25T00:16:04Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 201
+[2026-09-25T00:16:04Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 210
+[2026-09-25T00:16:04Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 215
+[2026-09-25T00:16:04Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 220
+[2026-09-25T00:16:04Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 231
+[2026-09-25T00:16:04Z INFO  raft::raft] [logterm: 26, index: 240, vote: 1] cast vote for 2 [logterm: 26, index: 240] at term 26, raft_id: 3, msg type: MsgRequestPreVote, term: 26, msg_index: 240, msg_term: 26, from: 2, vote: 1, log_index: 240, log_term: 26
+[2026-09-25T00:16:04Z INFO  raft::raft] received a message with higher term from 2, raft_id: 3, msg type: MsgRequestVote, message_term: 27, term: 26, from: 2
+[2026-09-25T00:16:04Z INFO  raft::raft] became follower at term 27, raft_id: 3, term: 27
+[2026-09-25T00:16:04Z INFO  raft::raft] [logterm: 26, index: 240, vote: 0] cast vote for 2 [logterm: 26, index: 240] at term 27, raft_id: 3, msg type: MsgRequestVote, term: 27, msg_index: 240, msg_term: 26, from: 2, vote: 0, log_index: 240, log_term: 26
+[2026-09-25T00:16:04Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 242
+[2026-09-25T00:18:01Z INFO  raft::raft] [logterm: 27, index: 245, vote: 2] cast vote for 1 [logterm: 27, index: 245] at term 27, raft_id: 3, msg type: MsgRequestPreVote, term: 27, msg_index: 245, msg_term: 27, from: 1, vote: 2, log_index: 245, log_term: 27
+[2026-09-25T00:18:01Z INFO  raft::raft] received a message with higher term from 1, raft_id: 3, msg type: MsgRequestVote, message_term: 28, term: 27, from: 1
+[2026-09-25T00:18:01Z INFO  raft::raft] became follower at term 28, raft_id: 3, term: 28
+[2026-09-25T00:18:01Z INFO  raft::raft] [logterm: 27, index: 245, vote: 0] cast vote for 1 [logterm: 27, index: 245] at term 28, raft_id: 3, msg type: MsgRequestVote, term: 28, msg_index: 245, msg_term: 27, from: 1, vote: 0, log_index: 245, log_term: 27
+[2026-09-25T00:18:01Z INFO  tape_rs::daemon::node] 节点 1 成为执行者，轮次 247
+[2026-09-25T00:19:11Z INFO  raft::raft] [logterm: 28, index: 250, vote: 1] cast vote for 2 [logterm: 28, index: 250] at term 28, raft_id: 3, msg type: MsgRequestPreVote, term: 28, msg_index: 250, msg_term: 28, from: 2, vote: 1, log_index: 250, log_term: 28
+[2026-09-25T00:19:11Z INFO  raft::raft] starting a new election, raft_id: 3, term: 28
+[2026-09-25T00:19:11Z INFO  raft::raft] became pre-candidate at term 28, raft_id: 3, term: 28
+[2026-09-25T00:19:11Z INFO  raft::raft] broadcasting vote request, raft_id: 3, to: [1, 2], log_index: 250, log_term: 28, term: 28, type: MsgRequestPreVote
+[2026-09-25T00:19:12Z INFO  raft::raft] [logterm: 28, index: 250, vote: 1] cast vote for 2 [logterm: 28, index: 250] at term 28, raft_id: 3, msg type: MsgRequestPreVote, term: 28, msg_index: 250, msg_term: 28, from: 2, vote: 1, log_index: 250, log_term: 28
+[2026-09-25T00:19:12Z INFO  raft::raft] received a message with higher term from 2, raft_id: 3, msg type: MsgRequestVote, message_term: 29, term: 28, from: 2
+[2026-09-25T00:19:12Z INFO  raft::raft] became follower at term 29, raft_id: 3, term: 29
+[2026-09-25T00:19:12Z INFO  raft::raft] [logterm: 28, index: 250, vote: 0] cast vote for 2 [logterm: 28, index: 250] at term 29, raft_id: 3, msg type: MsgRequestVote, term: 29, msg_index: 250, msg_term: 28, from: 2, vote: 0, log_index: 250, log_term: 28
+[2026-09-25T00:19:12Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 252
+[2026-09-25T00:20:31Z INFO  ltfsd] 收到停机信号，正在计划停机（再按一次直接退出）
+[2026-09-25T00:20:31Z INFO  tape_rs::daemon::node] 节点 3 停机

@@ -1,6 +1,12 @@
 pub mod catalog;
 pub mod changer;
+pub mod client;
+pub mod core;
+pub mod daemon;
 pub mod error;
+pub mod library;
+pub mod library_cli;
 pub mod ltfs;
 pub mod scsi;
 pub mod tape;
+pub mod tapefs;

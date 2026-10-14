@@ -1,0 +1,19 @@
+
+running 1 test
+[2026-09-27T05:20:51Z ERROR tape_rs::daemon::executor] 执行线程: 轮次 2 失去执行资格: SCSI command failed: status=0x02, sense_key=0x06, asc=0x2a, ascq=0x03
+[DEBUG-directory-outcome] leader=Some("127.0.0.1:34791") method=DELETE path=/empty body={"detail":"SCSI command failed: status=0x02, sense_key=0x06, asc=0x2a, ascq=0x03","status":"indeterminate","task":9}
+
+
+thread 'persistent_directories_survive_fuse_remount_and_takeover' (3459329) panicked at tests/ltfsd_cluster.rs:2959:24:
+called `Result::unwrap()` on an `Err` value: Indeterminate("目录 /empty 提交结果未定")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+[2026-09-27T05:20:51Z ERROR tape_rs::daemon::node] 轮次 2 放弃：SCSI command failed: status=0x02, sense_key=0x06, asc=0x2a, ascq=0x03
+test persistent_directories_survive_fuse_remount_and_takeover ... FAILED
+
+failures:
+
+failures:
+    persistent_directories_survive_fuse_remount_and_takeover
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 45 filtered out; finished in 1.39s
+

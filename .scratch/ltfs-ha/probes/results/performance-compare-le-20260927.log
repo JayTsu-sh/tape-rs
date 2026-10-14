@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/home/rocky/tape-rs-le-compare-20260927/performance-compare-le-20260927.py", line 77, in <module>
+    load('PF2701L08')
+  File "/home/rocky/tape-rs-le-compare-20260927/performance-compare-le-20260927.py", line 31, in load
+    start=time.monotonic();list(os.scandir(root/barcode));namespace=time.monotonic()-start
+OSError: [Errno 16] Device or resource busy: '/ltfs/PF2701L08'

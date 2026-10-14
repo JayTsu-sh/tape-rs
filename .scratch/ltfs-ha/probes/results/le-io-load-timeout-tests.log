@@ -1,0 +1,17 @@
+   Compiling tape-rs v0.1.0 (/work/jay/tape-rs-ltfs-recovery-ibm-interop)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.98s
+     Running tests/le_sync.rs (/work/cargo-target/debug/deps/le_sync-70a8e2f24cfb5648)
+
+running 9 tests
+test load_allows_lto9_initialization_without_resubmitting_the_command ... ok
+test clean_sync_does_not_touch_the_tape ... ok
+test short_write_freezes_volume_without_publishing_or_retrying ... ok
+test ordinary_sync_index_failure_keeps_the_previous_view_and_freezes ... ok
+test ip_checkpoint_failure_preserves_the_already_synced_dp_generation ... ok
+test data_write_failure_freezes_borrowed_append_without_publishing ... ok
+test source_error_after_a_record_freezes_the_unindexed_tail ... ok
+test ordinary_sync_leaves_ip_then_unmount_checkpoints_without_new_dp_generation ... ok
+test borrowed_append_passes_original_slices_to_transport_without_a_copy ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+

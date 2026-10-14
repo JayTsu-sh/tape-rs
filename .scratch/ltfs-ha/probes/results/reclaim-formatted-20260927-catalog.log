@@ -1,0 +1,2 @@
+PASS 13 catalog rows: type, target, timestamp, xattrs, length, hash and tombstones preserved
+PASS source FORMAT GOOD, mkltfs complete, no remount READ completed and reclaiming at cut

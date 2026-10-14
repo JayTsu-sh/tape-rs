@@ -1,0 +1,4 @@
+Stopping elected leader 72 round 469
+normal stop complete
+
+Takeover serving {"drives": 2, "executor": {"fenced": true, "node": 1, "round": 499}, "id": 1, "last_reclaim": null, "leader": 1, "local": "轮次 499：服务中。IBMtaper2287 (/dev/sg10) [TS1000L08]: gen=13 文件 3 个 尾部 Complete；可用 103 MiB", "role": "Leader", "serving_round": 499, "term": 56}

@@ -1,0 +1,7 @@
+[2026-09-24T15:18:14Z INFO  tape_rs::ltfs::volume] index gen=58 highest_uid=67 (dp_tail=Complete, ip_tail=Complete, writable=true)
+[2026-09-24T15:18:14Z INFO  tape_rs::tape::commands] 弹出磁带...
+[2026-09-24T15:18:14Z INFO  tape_rs::tape::commands] 弹出完成
+[2026-09-24T15:18:14Z INFO  tape_rs::daemon::executor] 执行线程: IBMtaper2287_LL3 (/dev/sg9) 的预留已释放
+[2026-09-24T15:18:14Z INFO  tape_rs::daemon::executor] 执行线程: IBMtaper2287 (/dev/sg10) 的预留已释放
+[2026-09-24T15:18:14Z INFO  tape_rs::daemon::executor] 执行线程: IBMtaper3D5E (/dev/sg11) 的预留已释放
+[2026-09-24T15:18:14Z INFO  tape_rs::daemon::node] 节点 1 停机

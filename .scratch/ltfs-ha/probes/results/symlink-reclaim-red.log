@@ -1,0 +1,21 @@
+   Compiling tape-rs v0.1.0 (/work/jay/tape-rs-ltfs-recovery-ibm-interop)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.13s
+     Running tests/ltfsd_cluster.rs (/work/cargo-target/debug/deps/ltfsd_cluster-0df699d40388ecd6)
+
+running 1 test
+
+thread 'reclaim_preserves_symlinks_without_resolving_targets' (4043632) panicked at tests/ltfsd_cluster.rs:2261:5:
+assertion `left == right` failed
+  left: "abandoned"
+ right: "done"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test reclaim_preserves_symlinks_without_resolving_targets ... FAILED
+
+failures:
+
+failures:
+    reclaim_preserves_symlinks_without_resolving_targets
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 37 filtered out; finished in 1.10s
+
+error: test failed, to rerun pass `--test ltfsd_cluster`

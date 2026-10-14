@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/bin/tape-fuse.rs (/work/cargo-target/debug/deps/tape_fuse-92916ff6d17ef2f3)
+
+running 6 tests
+test tests::kernel_remote_resize_between_lookup_and_open ... ok
+test tests::kernel_remote_replace_preserves_mapping_until_release ... ok
+test tests::kernel_mv_and_mmap ... ok
+test tests::kernel_existing_symlinks ... ok
+test tests::kernel_cached_visibility ... ok
+test tests::kernel_file_operations ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+

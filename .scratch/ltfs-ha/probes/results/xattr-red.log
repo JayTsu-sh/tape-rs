@@ -1,0 +1,19 @@
+   Compiling tape-rs v0.1.0 (/work/jay/tape-rs-ltfs-recovery-ibm-interop)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.14s
+     Running tests/ltfsd_cluster.rs (/work/cargo-target/debug/deps/ltfsd_cluster-0df699d40388ecd6)
+
+running 1 test
+
+thread 'overwrites_preserve_xattrs_on_same_and_different_tapes' (3770457) panicked at tests/ltfsd_cluster.rs:1643:9:
+assertion failed: attrs.iter().any(|x| x["key"] == "note" && x["value"] == "原始属性")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test overwrites_preserve_xattrs_on_same_and_different_tapes ... FAILED
+
+failures:
+
+failures:
+    overwrites_preserve_xattrs_on_same_and_different_tapes
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 28 filtered out; finished in 0.71s
+
+error: test failed, to rerun pass `--test ltfsd_cluster`

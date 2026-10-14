@@ -1,0 +1,5 @@
+10.131.9.71:7401  {"drives":2,"executor":{"fenced":true,"node":3,"round":115},"id":1,"last_reclaim":null,"leader":3,"local":"空闲","role":"Follower","serving_round":null,"term":11}
+10.131.9.72:7401  {"drives":2,"executor":{"fenced":true,"node":3,"round":115},"id":2,"last_reclaim":null,"leader":3,"local":"空闲","role":"Follower","serving_round":null,"term":11}
+10.131.9.74:7401  {"drives":2,"executor":{"fenced":true,"node":3,"round":115},"id":3,"last_reclaim":null,"leader":3,"local":"轮次 115：服务中。IBMtaper2287 (/dev/sg6) [TS1001L08]: gen=39 文件 15 个 尾部 Complete；可用 48 MiB","role":"Leader","serving_round":115,"term":11}
+rc/_probe.bin -> /tmp/xattr-original-probe.bin (1024 字节)
+49abd65bbf7f7e40c7055093ed2e3fd75f2f602f2c5fcf955c213e3135eb03f7  /tmp/xattr-original-probe.bin

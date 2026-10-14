@@ -5,9 +5,13 @@ use std::io::{Read, Write};
 use bytes::Bytes;
 use log::{debug, info};
 
-use crate::error::{TapeError, Result};
+use crate::error::{Result, TapeError};
 use crate::scsi::cdb;
-use crate::scsi::device::ScsiDevice;
+use crate::scsi::transport::{TapeTransport, retry_unit_attention};
+
+// LTO-9 首次装带可能执行最长两小时的介质优化；实机 LE 的 LOAD 同样使用7200000ms。
+// IBM TS4300 Media optimization：不要用普通机械操作的五分钟限制中断初始化。
+const LOAD_TIMEOUT_MS: u32 = 7_200_000;
 
 /// LOG SENSE 响应缓冲区长度（大多数 log page ≤ 8 KiB）。
 const LOG_SENSE_BUF_LEN: usize = 8 * 1024;
@@ -24,7 +28,9 @@ fn ensure_space_count(count: i32) -> Result<()> {
         return Err(TapeError::MoveFailed {
             reason: format!(
                 "SPACE count {} 超出 24-bit 有符号范围 [{}, {}]",
-                count, cdb::SPACE_COUNT_MIN, cdb::SPACE_COUNT_MAX
+                count,
+                cdb::SPACE_COUNT_MIN,
+                cdb::SPACE_COUNT_MAX
             ),
         });
     }
@@ -46,11 +52,11 @@ pub struct TapePosition {
 
 /// 磁带机高层封装
 pub struct TapeDrive<'a> {
-    device: &'a ScsiDevice,
+    device: &'a dyn TapeTransport,
 }
 
 impl<'a> TapeDrive<'a> {
-    pub fn new(device: &'a ScsiDevice) -> Self {
+    pub fn new(device: &'a dyn TapeTransport) -> Self {
         Self { device }
     }
 
@@ -61,16 +67,13 @@ impl<'a> TapeDrive<'a> {
     /// 因此收到 UA 后重发一次 TUR 再判定 ready 状态。
     pub fn test_unit_ready(&self) -> Result<bool> {
         let cdb_bytes = cdb::test_unit_ready();
-        match self.device.execute_no_data(&cdb_bytes, 10_000) {
+        match retry_unit_attention("TEST UNIT READY", || {
+            self.device.execute_no_data(&cdb_bytes, 10_000)
+        }) {
             Ok(_) => Ok(true),
-            Err(TapeError::ScsiCommand { sense_key: 0x02, .. }) => Ok(false),
-            Err(TapeError::ScsiCommand { sense_key: 0x06, .. }) => {
-                match self.device.execute_no_data(&cdb_bytes, 10_000) {
-                    Ok(_) => Ok(true),
-                    Err(TapeError::ScsiCommand { sense_key: 0x02, .. }) => Ok(false),
-                    Err(e) => Err(e),
-                }
-            }
+            Err(TapeError::ScsiCommand {
+                sense_key: 0x02, ..
+            }) => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -79,21 +82,33 @@ impl<'a> TapeDrive<'a> {
     pub fn rewind(&self) -> Result<()> {
         info!("倒带...");
         let cdb_bytes = cdb::rewind();
-        self.device.execute_no_data(&cdb_bytes, 300_000)?;
+        retry_unit_attention("REWIND", || {
+            self.device.execute_no_data(&cdb_bytes, 300_000)
+        })?;
         info!("倒带完成");
         Ok(())
     }
 
     /// READ POSITION: 读取当前位置
-    pub fn read_position(&self) -> Result<TapePosition> {
+    fn read_position_data(&self) -> Result<[u8; 20]> {
         let cdb_bytes = cdb::read_position();
         let mut buf = [0u8; 20];
-        let result = self.device.execute_read(&cdb_bytes, &mut buf, 10_000)?;
+        let result = retry_unit_attention("READ POSITION", || {
+            self.device.execute_read(&cdb_bytes, &mut buf, 10_000)
+        })?;
 
         if result.transferred < 20 {
-            return Err(TapeError::InvalidResponse { expected: 20, actual: result.transferred });
+            return Err(TapeError::InvalidResponse {
+                expected: 20,
+                actual: result.transferred,
+            });
         }
 
+        Ok(buf)
+    }
+
+    pub fn read_position(&self) -> Result<TapePosition> {
+        let buf = self.read_position_data()?;
         // READ POSITION Short Form（SSC-5 service action 0x00）:
         // byte 0: flags（BOP/EOP 等）
         // byte 1: 1 字节 partition number
@@ -103,14 +118,34 @@ impl<'a> TapeDrive<'a> {
         let partition = buf[1] as u32;
         let block_number = u64::from(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]));
 
-        Ok(TapePosition { block_number, partition, at_bot, at_eot })
+        Ok(TapePosition {
+            block_number,
+            partition,
+            at_bot,
+            at_eot,
+        })
+    }
+
+    /// 用实时位置避免顺序追加之间的重复 LOCATE，不缓存设备位置。
+    pub(crate) fn locate_if_needed(&self, partition: u8, block: u64) -> Result<()> {
+        // SSC Short Form / IBM GA32-0928-08 Table 98：LOLU/PERR 时位置不可靠。
+        // 超出 32 位目标不能与 Short Form 比较，仍执行原有 LOCATE(16)。
+        if block <= u64::from(u32::MAX) {
+            let buf = self.read_position_data()?;
+            if short_position_matches(&buf, partition, block) {
+                return Ok(());
+            }
+        }
+        self.locate(partition, block, true)
     }
 
     /// LOAD: 装载磁带
     pub fn load(&self) -> Result<()> {
         info!("装载磁带...");
         let cdb_bytes = cdb::load_unload(true);
-        self.device.execute_no_data(&cdb_bytes, 300_000)?;
+        retry_unit_attention("LOAD", || {
+            self.device.execute_no_data(&cdb_bytes, LOAD_TIMEOUT_MS)
+        })?;
         info!("装载完成");
         Ok(())
     }
@@ -119,7 +154,9 @@ impl<'a> TapeDrive<'a> {
     pub fn unload(&self) -> Result<()> {
         info!("弹出磁带...");
         let cdb_bytes = cdb::load_unload(false);
-        self.device.execute_no_data(&cdb_bytes, 300_000)?;
+        retry_unit_attention("UNLOAD", || {
+            self.device.execute_no_data(&cdb_bytes, 300_000)
+        })?;
         info!("弹出完成");
         Ok(())
     }
@@ -128,12 +165,19 @@ impl<'a> TapeDrive<'a> {
     pub fn write_block(&self, data: &[u8]) -> Result<usize> {
         if data.len() > SCSI_6_TRANSFER_MAX {
             return Err(TapeError::MoveFailed {
-                reason: format!("WRITE(6) 块大小 {} 超过 24-bit 上限 {}", data.len(), SCSI_6_TRANSFER_MAX),
+                reason: format!(
+                    "WRITE(6) 块大小 {} 超过 24-bit 上限 {}",
+                    data.len(),
+                    SCSI_6_TRANSFER_MAX
+                ),
             });
         }
         let cdb_bytes = cdb::write_6(false, data.len() as u32);
         let result = self.device.execute_write(&cdb_bytes, data, 120_000)?;
-        debug!("写入 {} 字节, 耗时 {}ms", result.transferred, result.duration_ms);
+        debug!(
+            "写入 {} 字节, 耗时 {}ms",
+            result.transferred, result.duration_ms
+        );
         Ok(result.transferred)
     }
 
@@ -141,13 +185,36 @@ impl<'a> TapeDrive<'a> {
     pub fn read_block(&self, buf: &mut [u8]) -> Result<usize> {
         if buf.len() > SCSI_6_TRANSFER_MAX {
             return Err(TapeError::MoveFailed {
-                reason: format!("READ(6) 块大小 {} 超过 24-bit 上限 {}", buf.len(), SCSI_6_TRANSFER_MAX),
+                reason: format!(
+                    "READ(6) 块大小 {} 超过 24-bit 上限 {}",
+                    buf.len(),
+                    SCSI_6_TRANSFER_MAX
+                ),
             });
         }
-        let cdb_bytes = cdb::read_6(false, buf.len() as u32);
+        let requested = buf.len();
+        let cdb_bytes = cdb::read_6(false, requested as u32);
         let result = self.device.execute_read(&cdb_bytes, buf, 120_000)?;
-        debug!("读取 {} 字节, 耗时 {}ms", result.transferred, result.duration_ms);
-        Ok(result.transferred)
+        // 以 sense 标志为准（st 驱动与 IBM LTFS 的做法），不单靠 residual：
+        // - FILEMARK 位：读到文件标记，返回 0 字节。Holo-VTL 此时不报 residual
+        //   （sg 层看起来"传输了整个缓冲区"）且 ASC/ASCQ 为 00/00，只能靠 FM 位识别。
+        // - ILI + 有效的 INFORMATION：实际记录长度 = 请求长度 − INFORMATION。
+        let n = if result.sense.filemark {
+            0
+        } else if result.sense.ili
+            && let Some(info) = result.sense.information
+            && info > 0
+            && (info as usize) <= requested
+        {
+            requested - info as usize
+        } else {
+            result.transferred
+        };
+        debug!(
+            "读取 {} 字节 (sg transferred={}), 耗时 {}ms",
+            n, result.transferred, result.duration_ms
+        );
+        Ok(n)
     }
 
     /// WRITE FILEMARKS: 写入文件标记
@@ -155,6 +222,14 @@ impl<'a> TapeDrive<'a> {
         debug!("写入 {} 个 filemark", count);
         let cdb_bytes = cdb::write_filemarks(count);
         self.device.execute_no_data(&cdb_bytes, 60_000)?;
+        Ok(())
+    }
+
+    /// 索引开头 FM 可缓冲；随后必须有非 IMMED 结束 FM / 屏障才能发布提交。
+    pub(crate) fn write_filemark_immediate(&self, count: u32) -> Result<()> {
+        debug!("缓冲写入 {} 个 filemark (IMMED)", count);
+        self.device
+            .execute_no_data(&cdb::write_filemarks_immediate(count), 60_000)?;
         Ok(())
     }
 
@@ -192,7 +267,10 @@ impl<'a> TapeDrive<'a> {
     pub fn write_from_reader<R: Read>(&self, r: &mut R, block_size: usize) -> Result<u64> {
         if block_size == 0 || block_size > SCSI_6_TRANSFER_MAX {
             return Err(TapeError::MoveFailed {
-                reason: format!("block_size {} 越界 [1, {}]", block_size, SCSI_6_TRANSFER_MAX),
+                reason: format!(
+                    "block_size {} 越界 [1, {}]",
+                    block_size, SCSI_6_TRANSFER_MAX
+                ),
             });
         }
         let mut buf = vec![0u8; block_size];
@@ -228,7 +306,18 @@ impl<'a> TapeDrive<'a> {
         info!("定位到 partition={}, block={}", partition, block);
         let cdb_bytes = cdb::locate_16(partition, block, change_partition, false);
         // 大容量带上 LOCATE 可能较慢
-        self.device.execute_no_data(&cdb_bytes, 600_000)?;
+        retry_unit_attention("LOCATE", || {
+            self.device.execute_no_data(&cdb_bytes, 600_000)
+        })?;
+        Ok(())
+    }
+
+    /// 直接选分区并定位到 EOD，避免先回到 BOP 再向前走。
+    pub(crate) fn locate_eod(&self, partition: u8) -> Result<()> {
+        let cdb_bytes = cdb::locate_eod_16(partition);
+        retry_unit_attention("LOCATE EOD", || {
+            self.device.execute_no_data(&cdb_bytes, 600_000)
+        })?;
         Ok(())
     }
 
@@ -249,7 +338,9 @@ impl<'a> TapeDrive<'a> {
     pub fn format(&self, format: u8, verify: bool) -> Result<()> {
         info!("格式化介质（format={}, verify={}）...", format, verify);
         let cdb_bytes = cdb::format_medium(format, false, verify);
-        self.device.execute_no_data(&cdb_bytes, 28_800_000)?;
+        retry_unit_attention("FORMAT MEDIUM", || {
+            self.device.execute_no_data(&cdb_bytes, 28_800_000)
+        })?;
         info!("格式化完成");
         Ok(())
     }
@@ -294,6 +385,55 @@ impl<'a> TapeDrive<'a> {
         Ok(alerts)
     }
 
+    /// 查询 SSC Device Configuration Extension 10h/01h 的 WRITE MODE。
+    /// 不支持此子页的旧设备沿用原写路径；截断/错误页不能猜测模式。
+    pub fn append_only_mode(&self) -> Result<bool> {
+        let cdb_bytes = cdb::mode_sense_10_subpage(0x10, 1, 128);
+        let mut buf = [0; 128];
+        let result = match retry_unit_attention("device write mode", || {
+            self.device.execute_read(&cdb_bytes, &mut buf, 30_000)
+        }) {
+            Ok(v) => v,
+            Err(TapeError::ScsiCommand {
+                sense_key: 0x05,
+                asc: 0x24,
+                ascq: 0,
+                ..
+            }) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        if result.transferred > buf.len() {
+            return Err(TapeError::InvalidResponse {
+                expected: buf.len(),
+                actual: result.transferred,
+            });
+        }
+        Ok(device_write_mode(&buf[..result.transferred])? == 1)
+    }
+
+    /// 一次位置绑定的覆盖授权；不自动重试，调用方必须先核验 PR 与位置。
+    pub fn allow_overwrite_current(&self, partition: u8, block: u64) -> Result<()> {
+        let mut position = [0; 20];
+        // 覆盖授权的定位证据：UA/复位不能被重试吞掉。
+        let got = self
+            .device
+            .execute_read(&cdb::read_position(), &mut position, 10_000)?;
+        if got.transferred < 20 {
+            return Err(TapeError::InvalidResponse {
+                expected: 20,
+                actual: got.transferred,
+            });
+        }
+        if !short_position_matches(&position, partition, block) {
+            return Err(TapeError::InconsistentState(
+                "覆盖授权前位置不精确或不匹配".into(),
+            ));
+        }
+        self.device
+            .execute_no_data(&cdb::allow_overwrite_current(partition, block), 30_000)?;
+        Ok(())
+    }
+
     /// MODE SELECT(10): 下发原始 mode parameter list
     pub fn mode_select(&self, parameters: &[u8], save: bool) -> Result<()> {
         let param_len = u16::try_from(parameters.len()).map_err(|_| TapeError::MoveFailed {
@@ -301,14 +441,17 @@ impl<'a> TapeDrive<'a> {
         })?;
         debug!("MODE SELECT(10): {} bytes", param_len);
         let cdb_bytes = cdb::mode_select_10(true, save, param_len);
-        self.device.execute_write(&cdb_bytes, parameters, 30_000)?;
+        retry_unit_attention("MODE SELECT", || {
+            self.device.execute_write(&cdb_bytes, parameters, 30_000)
+        })?;
         Ok(())
     }
 
     /// REPORT DENSITY SUPPORT: 读取设备/介质支持的 density 列表，返回原始数据
     pub fn report_density_support(&self, media_only: bool) -> Result<Bytes> {
         let mut buf = [0u8; REPORT_DENSITY_BUF_LEN];
-        let cdb_bytes = cdb::report_density_support(media_only, false, REPORT_DENSITY_BUF_LEN as u16);
+        let cdb_bytes =
+            cdb::report_density_support(media_only, false, REPORT_DENSITY_BUF_LEN as u16);
         let result = self.device.execute_read(&cdb_bytes, &mut buf, 30_000)?;
         Ok(Bytes::copy_from_slice(&buf[..result.transferred]))
     }
@@ -357,7 +500,10 @@ impl<'a> TapeDrive<'a> {
     ) -> Result<u64> {
         if block_size == 0 || block_size > SCSI_6_TRANSFER_MAX {
             return Err(TapeError::MoveFailed {
-                reason: format!("block_size {} 越界 [1, {}]", block_size, SCSI_6_TRANSFER_MAX),
+                reason: format!(
+                    "block_size {} 越界 [1, {}]",
+                    block_size, SCSI_6_TRANSFER_MAX
+                ),
             });
         }
         let mut buf = vec![0u8; block_size];
@@ -373,7 +519,11 @@ impl<'a> TapeDrive<'a> {
                 // 剩余空间不超 block_size，但 LTO 变长块仍要求 buffer ≥ 实际块，
                 // 所以至少给一个完整 block_size；如果超限由外层 total 截断。
                 let remain = max_size - total;
-                if remain >= block_size as u64 { block_size } else { remain as usize }
+                if remain >= block_size as u64 {
+                    block_size
+                } else {
+                    remain as usize
+                }
             };
             match self.read_block(&mut buf[..want]) {
                 Ok(0) => break,
@@ -382,9 +532,16 @@ impl<'a> TapeDrive<'a> {
                     total += n as u64;
                 }
                 // BLANK CHECK (sense_key=0x08)：磁带空白区
-                Err(TapeError::ScsiCommand { sense_key: 0x08, .. }) => break,
+                Err(TapeError::ScsiCommand {
+                    sense_key: 0x08, ..
+                }) => break,
                 // FILEMARK detected (NO SENSE + asc=0x00 ascq=0x01)
-                Err(TapeError::ScsiCommand { sense_key: 0x00, asc: 0x00, ascq: 0x01, .. }) => break,
+                Err(TapeError::ScsiCommand {
+                    sense_key: 0x00,
+                    asc: 0x00,
+                    ascq: 0x01,
+                    ..
+                }) => break,
                 Err(e) => return Err(e),
             }
         }
@@ -392,5 +549,92 @@ impl<'a> TapeDrive<'a> {
         w.flush()?;
         info!("文件读取完成: {} 字节", total);
         Ok(total)
+    }
+}
+
+fn short_position_matches(buf: &[u8; 20], partition: u8, block: u64) -> bool {
+    buf[0] & 0x06 == 0
+        && buf[1] == partition
+        && block <= u64::from(u32::MAX)
+        && u64::from(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]])) == block
+}
+
+#[cfg(test)]
+mod position_tests {
+    use super::short_position_matches;
+
+    #[test]
+    fn short_position_requires_exact_unoverflowed_location_and_partition() {
+        let mut buf = [0; 20];
+        buf[1] = 1;
+        buf[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(short_position_matches(&buf, 1, u64::from(u32::MAX)));
+        assert!(!short_position_matches(&buf, 0, u64::from(u32::MAX)));
+        assert!(!short_position_matches(&buf, 1, u64::from(u32::MAX) + 1));
+        for flag in [0x04, 0x02, 0x06] {
+            buf[0] = flag;
+            assert!(!short_position_matches(&buf, 1, u64::from(u32::MAX)));
+        }
+        // 缓冲区字节/对象数量不精确并不意味着逻辑位置未知。
+        buf[0] = 0x30;
+        assert!(short_position_matches(&buf, 1, u64::from(u32::MAX)));
+    }
+}
+
+/// IBM GA32-0928-08 Table347：SPF页头4字节，WRITE MODE为byte5高半字节。
+fn device_write_mode(data: &[u8]) -> Result<u8> {
+    if data.len() < 8 {
+        return Err(TapeError::InvalidResponse {
+            expected: 8,
+            actual: data.len(),
+        });
+    }
+    let offset = 8 + usize::from(u16::from_be_bytes([data[6], data[7]]));
+    let page = data.get(offset..).ok_or(TapeError::InvalidResponse {
+        expected: offset + 6,
+        actual: data.len(),
+    })?;
+    if page.len() < 6 {
+        return Err(TapeError::InvalidResponse {
+            expected: offset + 6,
+            actual: data.len(),
+        });
+    }
+    let length = 4 + usize::from(u16::from_be_bytes([page[2], page[3]]));
+    if page[0] & 0x7f != 0x50 || page[1] != 1 || length < 6 || length > page.len() {
+        return Err(TapeError::Ltfs(
+            "Device Configuration Extension响应页/长度非法".into(),
+        ));
+    }
+    let mode = page[5] >> 4;
+    if mode > 1 {
+        return Err(TapeError::Refused {
+            reason: format!("不支持的设备WRITE MODE {mode}"),
+        });
+    }
+    Ok(mode)
+}
+
+#[cfg(test)]
+mod write_mode_tests {
+    use super::*;
+    #[test]
+    fn device_extension_write_mode_checks_truncation_page_and_reserved_modes() {
+        let mut data = [0; 48];
+        data[7] = 8;
+        data[16] = 0xd0;
+        data[17] = 1;
+        data[19] = 28;
+        data[21] = 0x12;
+        assert_eq!(device_write_mode(&data).unwrap(), 1);
+        for n in 0..48 {
+            assert!(device_write_mode(&data[..n]).is_err());
+        }
+        data[21] = 2;
+        assert_eq!(device_write_mode(&data).unwrap(), 0);
+        data[21] = 0x22;
+        assert!(device_write_mode(&data).is_err());
+        data[16] = 0x10;
+        assert!(device_write_mode(&data).is_err());
     }
 }

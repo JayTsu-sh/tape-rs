@@ -1,0 +1,15 @@
+{"drives":2,"executor":{"fenced":true,"node":2,"round":124},"id":1,"last_reclaim":null,"leader":2,"local":"空闲","role":"Follower","serving_round":null,"term":14}
+Node ID  State      Node IP     Drives  Ctrl Node    Library   Node Group  Host Name         
+1        available  10.10.2.71       1  yes(active)  LISA4300  G0          ee1-cluster.ee.lab
+2        available  10.10.2.72       1  no           LISA4300  G0          ee2-cluster.ee.lab
+3        available  10.10.2.74       1  no           LISA4300  G0          ee3-cluster.ee.lab
+***** redirecting from "ltfsee info nodes" to "eeadm node list" *****
+ERR: Given command is not found or no more supported by ltfsee CLI command.
+ERR: ltfsee command is replaced by eeadm, run "eeadm -h" to see new syntax
+cd5c2a3513cfef51485baeddfeda2009269e2bb53944aa469512f4dc2ca2779e  /gpfs/tapers-del/f3
+curl: (22) The requested URL returned error: 503
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  -
+{"drives":2,"executor":{"fenced":true,"node":2,"round":124},"id":2,"last_reclaim":null,"leader":2,"local":"轮次 124：服务中。IBMtaper2287 (/dev/sg10) [TS1001L08]: gen=39 文件 15 个 尾部 Complete；可用 48 MiB","role":"Leader","serving_round":124,"term":14}
+49abd65bbf7f7e40c7055093ed2e3fd75f2f602f2c5fcf955c213e3135eb03f7  /tmp/dirs-restored-probe.bin
+No active task found.
+Holo publications {'ready': 9}

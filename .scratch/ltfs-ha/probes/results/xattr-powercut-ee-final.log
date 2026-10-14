@@ -1,0 +1,10 @@
+Node ID  State      Node IP     Drives  Ctrl Node    Library   Node Group  Host Name         
+1        available  10.10.2.71       1  yes(active)  LISA4300  G0          ee1-cluster.ee.lab
+2        available  10.10.2.72       1  no           LISA4300  G0          ee2-cluster.ee.lab
+3        available  10.10.2.74       1  no           LISA4300  G0          ee3-cluster.ee.lab
+No active task found.
+cd5c2a3513cfef51485baeddfeda2009269e2bb53944aa469512f4dc2ca2779e  /gpfs/tapers-del/f3
+Serial                 Device            Model       Status  Tape
+IBMlisa41D6C         /dev/sg5    [ULT3580-TD8]    Available  -       
+IBMlisa42299                -    [ULT3580-TD8]  Unavailable  -       
+IBMlisa4260A                -    [ULT3580-TD8]  Unavailable  -       

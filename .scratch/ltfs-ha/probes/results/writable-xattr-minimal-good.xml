@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ltfsindex version="2.5.0">
+  <creator>IBM LTFS 2.4.8.3 (10521) - Linux - ltfs.tape.library - Sync by EA</creator>
+  <volumeuuid>26aefb84-fbc8-4c4a-a500-c85264ba2d29</volumeuuid>
+  <generationnumber>55</generationnumber>
+  <updatetime>2026-09-24T15:41:47.381925622Z</updatetime>
+  <location>
+    <partition>a</partition>
+    <startblock>5</startblock>
+  </location>
+  <previousgenerationlocation>
+    <partition>b</partition>
+    <startblock>193</startblock>
+  </previousgenerationlocation>
+  <allowpolicyupdate>true</allowpolicyupdate>
+  <volumelockstate>unlocked</volumelockstate>
+  <highestfileuid>55</highestfileuid>
+  <directory>
+    <name />
+    <readonly>false</readonly>
+    <creationtime>2026-09-22T03:25:13.109135251Z</creationtime>
+    <changetime>2026-09-24T12:50:09.308199778Z</changetime>
+    <modifytime>2026-09-24T12:50:09.308199778Z</modifytime>
+    <accesstime>2026-09-22T03:25:13.109135251Z</accesstime>
+    <backuptime>2026-09-22T03:25:13.109135251Z</backuptime>
+    <fileuid>1</fileuid>
+    <extendedattributes>
+      <xattr>
+        <key>ltfs.mediaPool.uuid</key>
+        <value>0ba1b026-9595-4b86-9056-c54c7858e744</value>
+      </xattr>
+      <xattr>
+        <key>ltfs.mediaPool.name</key>
+        <value>rc</value>
+      </xattr>
+    </extendedattributes>
+    <contents><file>
+                    <name>file</name>
+                    <length>0</length>
+                    <readonly>false</readonly>
+                    <creationtime>2026-09-24T14:40:01.102465224Z</creationtime>
+                    <changetime>2026-09-24T14:40:01.102465224Z</changetime>
+                    <modifytime>2026-09-24T14:40:01.102465224Z</modifytime>
+                    <accesstime>2026-09-24T14:42:24.161611725Z</accesstime>
+                    <backuptime>2026-09-24T14:40:01.102465224Z</backuptime>
+                    <fileuid>33</fileuid>
+                    <extendedattributes><xattr><key>empty</key><value type="base64" /></xattr></extendedattributes></file>
+                  </contents></directory>
+</ltfsindex>

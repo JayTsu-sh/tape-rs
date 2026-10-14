@@ -1,0 +1,10 @@
+{"mode": "before", "files": 100, "repeat": 0, "seconds": 0.1055422411300242, "requests": {"stat": 112, "list": 1}, "cpu_ticks": 1, "rss_kib": 5824}
+{"mode": "before", "files": 100, "repeat": 1, "seconds": 0.10405704914592206, "requests": {"stat": 112, "list": 1}, "cpu_ticks": 1, "rss_kib": 5824}
+{"mode": "before", "files": 100, "repeat": 2, "seconds": 0.10769832809455693, "requests": {"stat": 112, "list": 1}, "cpu_ticks": 1, "rss_kib": 7744}
+{"mode": "before", "files": 100, "repeat": 3, "seconds": 0.10733254812657833, "requests": {"stat": 112, "list": 1}, "cpu_ticks": 1, "rss_kib": 7744}
+{"mode": "before", "files": 100, "repeat": 4, "seconds": 0.10300012701191008, "requests": {"stat": 112, "list": 1}, "cpu_ticks": 2, "rss_kib": 7744}
+{"mode": "before", "files": 1000, "repeat": 0, "seconds": 0.8564995960332453, "requests": {"stat": 1012, "list": 1}, "cpu_ticks": 9, "rss_kib": 8768}
+{"mode": "before", "files": 1000, "repeat": 1, "seconds": 0.854025669163093, "requests": {"stat": 1012, "list": 1}, "cpu_ticks": 10, "rss_kib": 9920}
+{"mode": "before", "files": 1000, "repeat": 2, "seconds": 0.8431196280289441, "requests": {"stat": 1012, "list": 1}, "cpu_ticks": 10, "rss_kib": 10944}
+{"mode": "before", "files": 1000, "repeat": 3, "seconds": 0.8255793489515781, "requests": {"stat": 1012, "list": 1}, "cpu_ticks": 10, "rss_kib": 11968}
+{"mode": "before", "files": 1000, "repeat": 4, "seconds": 0.8239128300920129, "requests": {"stat": 1012, "list": 1}, "cpu_ticks": 10, "rss_kib": 12352}

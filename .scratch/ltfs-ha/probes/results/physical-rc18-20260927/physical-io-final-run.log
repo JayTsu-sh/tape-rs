@@ -1,0 +1,23 @@
+[2026-09-27T11:44:30Z INFO  tape_rs::changer::commands] 移动介质: 从 0x03ef 到 0x0001
+[2026-09-27T11:44:56Z INFO  tape_rs::changer::commands] 移动完成
+[2026-09-27T11:44:56Z INFO  tape_rs::tape::commands] 装载磁带...
+[2026-09-27T11:45:00Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 1 次）
+[2026-09-27T11:45:02Z INFO  tape_rs::tape::commands] 装载完成
+{"interface": "rust-library", "kind": "load", "barcode": "RC0018L9", "move_seconds": 26.340699361055158, "total_seconds": 32.43229746306315, "scsi_io": {"iorequest_cnt": "0x597a4", "iodone_cnt": "0x597a4", "ioerr_cnt": "0x586f"}, "wall_time": 1790509502.8096857}
+FORMAT RC0018L9 ONLY: native MODE SELECT + FORMAT MEDIUM; old UUID 0bf1c655-7a6f-4822-bed0-218b864ac1c6
+[2026-09-27T11:47:16Z INFO  tape_rs::ltfs::mkltfs] mkltfs 开始: volume_id=RC0018 uuid=8772d068-bdfc-4c87-a837-695f442fb0ac
+[2026-09-27T11:47:16Z INFO  tape_rs::tape::commands] 倒带...
+[2026-09-27T11:47:53Z INFO  tape_rs::tape::commands] 倒带完成
+[2026-09-27T11:47:53Z INFO  tape_rs::ltfs::mkltfs] MODE SELECT page 0x11: 2-partition (IDP=1, PSUM=GB, P0=default, P1=max)
+[2026-09-27T11:47:53Z ERROR tape_rs] 错误: SCSI command failed: status=0x02, sense_key=0x05, asc=0x26, ascq=0x00
+Traceback (most recent call last):
+  File "/root/tape-rs-io-20260927/physical-io-final-20260927.py", line 70, in <module>
+    result = command('mkltfs', '--device', drive, '--volume-id', 'RC0018',
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "native-final-helpers", line 17, in command
+  File "/usr/lib64/python3.11/subprocess.py", line 466, in check_output
+    return run(*popenargs, stdout=PIPE, timeout=timeout, check=True,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib64/python3.11/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['/root/tape-rs-io-20260927/tape-rs-io-final', 'mkltfs', '--device', '/dev/sg3', '--volume-id', 'RC0018', '--block-size', '524288', '--compression', '--yes-destroy']' returned non-zero exit status 1.

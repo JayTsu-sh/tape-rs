@@ -1,0 +1,28 @@
+[2026-09-25T01:34:08Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=118
+[2026-09-25T01:34:08Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=114
+[2026-09-25T01:34:08Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=110
+[2026-09-25T01:34:08Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=8
+[2026-09-25T01:34:08Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=5
+[2026-09-25T01:34:08Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=415
+[2026-09-25T01:34:08Z INFO  tape_rs::ltfs::volume] index gen=95 highest_uid=93 (dp_tail=Complete, ip_tail=Complete, writable=true)
+[2026-09-25T01:34:08Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=415
+[2026-09-25T01:34:08Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=4
+[2026-09-25T01:34:09Z INFO  tape_rs::ltfs::volume] commit: gen 96 @ P0 5, P1 416
+[2026-09-25T01:34:09Z INFO  tape_rs::tape::commands] 弹出磁带...
+[2026-09-25T01:34:09Z INFO  tape_rs::tape::commands] 弹出完成
+[2026-09-25T01:34:09Z INFO  tape_rs::daemon::executor] 执行线程: IBMtaper2287 (/dev/sg6) 的预留已释放
+[2026-09-25T01:34:09Z INFO  tape_rs::daemon::executor] 执行线程: IBMtaper2287_LL3 (/dev/sg7) 的预留已释放
+[2026-09-25T01:34:09Z INFO  tape_rs::daemon::executor] 执行线程: IBMtaper3D5E (/dev/sg8) 的预留已释放
+[2026-09-25T01:34:09Z INFO  tape_rs::daemon::node] 节点 3 停机
+[2026-09-25T01:40:17Z INFO  tape_rs::daemon::net] 节点间通信监听 0.0.0.0:7400
+[2026-09-25T01:40:17Z INFO  tape_rs::daemon::http] 客户端接口监听 0.0.0.0:7401
+[2026-09-25T01:40:17Z INFO  raft::raft] switched to configuration, raft_id: 3, config: Configuration { voters: Configuration { incoming: Configuration { voters: {1, 2, 3} }, outgoing: Configuration { voters: {} } }, learners: {}, learners_next: {}, auto_leave: false }
+[2026-09-25T01:40:17Z INFO  raft::raft] became follower at term 39, raft_id: 3, term: 39
+[2026-09-25T01:40:17Z INFO  raft::raft] newRaft, raft_id: 3, peers: Configuration { incoming: Configuration { voters: {1, 2, 3} }, outgoing: Configuration { voters: {} } }, last term: 39, last index: 348, applied: 334, commit: 348, term: 39
+[2026-09-25T01:40:17Z INFO  raft::raw_node] RawNode created with id 3., raft_id: 3, id: 3
+[2026-09-25T01:40:17Z INFO  tape_rs::daemon::node] 从索引 334 的快照恢复控制状态
+[2026-09-25T01:40:18Z INFO  raft::raft] [logterm: 39, index: 348, vote: 3] cast vote for 2 [logterm: 39, index: 348] at term 39, raft_id: 3, msg type: MsgRequestPreVote, term: 39, msg_index: 348, msg_term: 39, from: 2, vote: 3, log_index: 348, log_term: 39
+[2026-09-25T01:40:18Z INFO  raft::raft] received a message with higher term from 2, raft_id: 3, msg type: MsgRequestVote, message_term: 40, term: 39, from: 2
+[2026-09-25T01:40:18Z INFO  raft::raft] became follower at term 40, raft_id: 3, term: 40
+[2026-09-25T01:40:18Z INFO  raft::raft] [logterm: 39, index: 348, vote: 0] cast vote for 2 [logterm: 39, index: 348] at term 40, raft_id: 3, msg type: MsgRequestVote, term: 40, msg_index: 348, msg_term: 39, from: 2, vote: 0, log_index: 348, log_term: 39
+[2026-09-25T01:40:18Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 350

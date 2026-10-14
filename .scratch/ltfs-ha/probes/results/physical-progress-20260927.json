@@ -1,0 +1,7 @@
+{
+  "time": "2026-09-27 15:58:15",
+  "sg": "max_active_device=7  def_reserved_size=32768\n >>> device=sg3 16:0:0:0   em=0 sg_tablesize=64 excl=1 open_cnt=1\n   FD(1): timeout=60000ms bufflen=1048576 (res)sgat=32 low_dma=0\n   cmd_q=1 f_packid=0 k_orphan=0 closed=0\n     act: id=0 blen=0 t_o/elap=7200000/955076ms sgat=0 op=0x1b\n >>> device=sg4 16:0:0:1   em=0 sg_tablesize=64 excl=1 open_cnt=1\n   FD(1): timeout=60000ms bufflen=32768 (res)sgat=1 low_dma=0\n   cmd_q=1 f_packid=0 k_orphan=0 closed=0\n     No requests active\n",
+  "format": "<ltfslabel version=\"2.4.0\">\n    <creator>IBM LTFS 2.4.8.2 (10520) - Linux - ltfs.tape.library</creator>\n    <formattime>2026-09-27T07:38:24.151137099Z</formattime>\n    <volumeuuid>33356bae-954a-4c1a-9310-54958eab43d1</volumeuuid>\n    <location>\n        <partition>a</partition>\n    </location>\n    <partitions>\n        <index>a</index>\n        <data>b</data>\n    </partitions>\n    <blocksize>524288</blocksize>\n    <compression>true</compression>\n</ltfslabel>\nSTART ['tape', 'move', '-L', 'homeslot', 'RC0018L9']\n/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead\n  t.setDaemon(True)\nTape RC0018L9 has been successfully moved.\nDONE 0 64.55379491101485\nSTART ['tape', 'format', '--force', '--drive-serial', '11EB4A80F1', '--volume-name', 'tape-rs-benchmark', 'RC0017L9']\n/opt/ibm/ltfsle/bin/leadm:2502: DeprecationWarning: setDaemon() is deprecated, set the daemon attribute instead\n  t.setDaemon(True)\n",
+  "LE": "",
+  "native": ""
+}

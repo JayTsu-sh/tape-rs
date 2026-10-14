@@ -1,0 +1,188 @@
+{
+  "/sr/links/relative": {
+    "barcode": "SR2502L8",
+    "committed": true,
+    "generation": 3,
+    "length": 0,
+    "metadata": {
+      "kind": "symlink",
+      "modify_time": "2026-09-25T01:36:15.086347064Z",
+      "symlink": "target",
+      "xattrs": [
+        {
+          "base64": true,
+          "key": "binary",
+          "value": "AP8="
+        },
+        {
+          "base64": false,
+          "key": "tapers.version",
+          "value": "49.7"
+        }
+      ]
+    },
+    "path": "/sr/links/relative",
+    "round": 49,
+    "sha256": "",
+    "state": "committed",
+    "version": [
+      49,
+      7
+    ]
+  },
+  "/sr/links/dangling": {
+    "barcode": "SR2502L8",
+    "committed": true,
+    "generation": 3,
+    "length": 0,
+    "metadata": {
+      "kind": "symlink",
+      "modify_time": "2026-09-25T01:36:15.901883741Z",
+      "symlink": "../absent & 中文%?#",
+      "xattrs": [
+        {
+          "base64": true,
+          "key": "binary",
+          "value": "AP8="
+        },
+        {
+          "base64": false,
+          "key": "tapers.version",
+          "value": "49.4"
+        }
+      ]
+    },
+    "path": "/sr/links/dangling",
+    "round": 49,
+    "sha256": "",
+    "state": "committed",
+    "version": [
+      49,
+      4
+    ]
+  },
+  "/sr/links/directory": {
+    "barcode": "SR2502L8",
+    "committed": true,
+    "generation": 3,
+    "length": 0,
+    "metadata": {
+      "kind": "symlink",
+      "modify_time": "2026-09-25T01:36:17.243491908Z",
+      "symlink": "subdir",
+      "xattrs": [
+        {
+          "base64": true,
+          "key": "binary",
+          "value": "AP8="
+        },
+        {
+          "base64": false,
+          "key": "tapers.version",
+          "value": "49.5"
+        }
+      ]
+    },
+    "path": "/sr/links/directory",
+    "round": 49,
+    "sha256": "",
+    "state": "committed",
+    "version": [
+      49,
+      5
+    ]
+  },
+  "/sr/links/loop": {
+    "barcode": "SR2502L8",
+    "committed": true,
+    "generation": 3,
+    "length": 0,
+    "metadata": {
+      "kind": "symlink",
+      "modify_time": "2026-09-25T01:36:18.033323783Z",
+      "symlink": "loop",
+      "xattrs": [
+        {
+          "base64": true,
+          "key": "binary",
+          "value": "AP8="
+        },
+        {
+          "base64": false,
+          "key": "tapers.version",
+          "value": "49.6"
+        }
+      ]
+    },
+    "path": "/sr/links/loop",
+    "round": 49,
+    "sha256": "",
+    "state": "committed",
+    "version": [
+      49,
+      6
+    ]
+  },
+  "/sr/links/中文": {
+    "barcode": "SR2502L8",
+    "committed": true,
+    "generation": 3,
+    "length": 0,
+    "metadata": {
+      "kind": "symlink",
+      "modify_time": "2026-09-25T01:36:18.876644659Z",
+      "symlink": "target",
+      "xattrs": [
+        {
+          "base64": true,
+          "key": "binary",
+          "value": "AP8="
+        },
+        {
+          "base64": false,
+          "key": "tapers.version",
+          "value": "49.10"
+        }
+      ]
+    },
+    "path": "/sr/links/中文",
+    "round": 49,
+    "sha256": "",
+    "state": "committed",
+    "version": [
+      49,
+      10
+    ]
+  },
+  "/sr/links/chain": {
+    "barcode": "SR2502L8",
+    "committed": true,
+    "generation": 3,
+    "length": 0,
+    "metadata": {
+      "kind": "symlink",
+      "modify_time": "2026-09-25T01:36:19.668644300Z",
+      "symlink": "relative",
+      "xattrs": [
+        {
+          "base64": true,
+          "key": "binary",
+          "value": "AP8="
+        },
+        {
+          "base64": false,
+          "key": "tapers.version",
+          "value": "49.3"
+        }
+      ]
+    },
+    "path": "/sr/links/chain",
+    "round": 49,
+    "sha256": "",
+    "state": "committed",
+    "version": [
+      49,
+      3
+    ]
+  }
+}

@@ -1,0 +1,40 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>REA 运行时对照闭环报告</title><style>body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.55;max-width:1280px;margin:2rem auto;padding:0 1rem;color:#18222d}h1,h2{color:#123b63}table{border-collapse:collapse;width:100%;margin:1rem 0}th,td{border:1px solid #cad5df;padding:.55rem;vertical-align:top;text-align:left}th{background:#edf4f9}.pass{color:#176b39;font-weight:700}.gap{color:#9b1c1c;font-weight:700}.todo{color:#a45b00;font-weight:700}.warn{padding:.8rem 1rem;border-left:4px solid #d9822b;background:#fff8ef}code{background:#f2f4f6;padding:.1rem .25rem;border-radius:3px}</style></head><body>
+<h1>REA 运行时对照闭环报告</h1>
+<p><b>日期：</b>2026-10-13　<b>真实库：</b>TS4300 10.131.7.220　<b>LE/tape-rs 节点：</b>10.131.7.209（<code>lisa-3</code>）　<b>测试卷：</b>AA0013L8　<b>drive：</b><code>/dev/sg2</code> / serial <code>117018605B</code></p>
+<div class="warn"><b>主机映射纠正：</b>10.131.7.207 当前是 <code>lisa-1</code>，只有 RAID/SES 的 <code>/dev/sg0</code>、<code>/dev/sg1</code>，没有 tape/changer；真实 tape/changer 和 LE 实际在 10.131.7.209（<code>lisa-3</code>）。此前在 .207 看到的“没有设备”是节点映射错误，不是 TS4300 没有设备。</div>
+
+<h2>1. LE 运行时证据</h2>
+<table><tr><th>项目</th><th>实测结果</th><th>结论</th></tr>
+<tr><td>LE 启动</td><td>在 `.209` 使用原生命令 `/opt/ibm/ltfsle/bin/ltfs -o changer_devname=/dev/sg3 /mnt/smartiq/LTFS_55L3A78011W9LL01`；进程 PID 1374157，管理端口 `0.0.0.0:7600` 监听。</td><td class="pass">LE 运行时启动闭环。</td></tr>
+<tr><td>LE 挂载</td><td>FUSE 挂载 `ltfs:/dev/sg3`；日志显示 AA0013L8 已在 drive serial 117018605B，`Volume mounted successfully`，generation 225；索引缓存记录 1,028,281 files。</td><td class="pass">LE 能在该真实卷上完成完整挂载和索引建立。</td></tr>
+<tr><td>LE 管理状态</td><td><code>leadm tape list -a -o json</code> 返回 AA0013L8：WRITABLE/OK/UNMOUNTED（库对象状态）、drive slot 1、total_blocks 3,911,182、valid_blocks 3,668,020、total_dp 11,168,993、remaining_dp 9,967,806。</td><td class="pass">LE 管理面和库状态读取正常。</td></tr>
+<tr><td>LE 文件读取</td><td>同一挂载卷读取 `b1..b5`：33,516、27,021、4,693、6,867、5,789 字节均成功；热读耗时分别 1.653、1.543、1.391、1.420、1.588 ms。各文件 SHA-256 已记录。</td><td class="pass">LE FUSE 文件数据路径正常。</td></tr>
+</table>
+
+<h2>2. tape-rs 运行时证据</h2>
+<table><tr><th>项目</th><th>实测结果</th><th>结论</th></tr>
+<tr><td>设备接管</td><td>LE 卸载/终止后，项目 PR 查询显示 generation 0x9，旧 key 仍注册；项目可打开 `/dev/sg2` 并执行 TUR 成功。</td><td class="pass">LE→tape-rs 切换成功，设备没有被残留 holder 阻塞。</td></tr>
+<tr><td>BOT/位置</td><td>项目 REWIND(6) `[01 00 00 00 00 00]` GOOD，约 4 ms；READ POSITION(10) `[34 00 00 00 00 00 00 00 00 00]` 返回 block 0/BOT。</td><td class="pass">项目可以在 LE 使用同一卷后重新定位。</td></tr>
+<tr><td>首段读取</td><td>项目 READ(6) `[08 00 08 00 00 00]` 请求 524,288 字节；第一次 status 0x02，resid 524,208，实际 80 字节，约 5 ms；第二次相同 CDB status 0x02，ASC/ASCQ 00/01 filemark，实际 0 字节；最终文件 80 字节，READ POSITION 为 block 2。</td><td class="pass">项目底层 READ(6)、resid、filemark 和位置语义均有真实证据。</td></tr>
+<tr><td>LTFS 恢复</td><td>项目随后已在该卷读到 LTFS label/MAM/VCI，但持续恢复索引时返回 `Recovery restricted: 构造超过预算 67108864 字节`，位置 block 298。</td><td class="gap">项目无法像 LE 一样完成该卷的完整索引恢复/文件树构造。</td></tr>
+</table>
+
+<h2>3. 闭环 GAP 判定</h2>
+<table><tr><th>GAP</th><th>双侧运行时事实</th><th>定级</th></tr>
+<tr><td class="gap">大索引恢复能力</td><td>LE 真实挂载成功并建立 1,028,281 文件索引；tape-rs 在同一卷真实恢复到 64 MiB 预算时失败。项目源码默认 <code>max_index_bytes = 64 &lt;&lt; 20</code>。</td><td class="gap">已确认 P0 功能 GAP，不再是静态猜测。</td></tr>
+<tr><td class="gap">组合 load/ready 流程</td><td>tape-rs changer MOVE 后仍需单独 drive LOAD，并经历 04/02→04/01→Ready；LE mount 日志显示其内部执行“Loading cartridge”并完成后续 volume mount。</td><td class="gap">已确认 P1 流程/接口 GAP；若上层要求一次 load 达到可读状态，需要补组合状态机。</td></tr>
+<tr><td class="gap">changer CDB/探测序列不一致</td><td>LE 内核 trace：changer LUN 使用 <code>MODE SENSE(6) 1a 08 1d 00 18 00</code>，并先后使用 <code>READ ELEMENT STATUS b8 04 00 01 ff ff 01 08 00 00 00 00</code>、<code>b8 10 00 00 ff ff 00 08 00 00 00 00</code>。项目真实日志：使用 <code>MODE SENSE(10) 5a 00 1d 00 00 00 00 00 ff 00</code>，以及 <code>READ ELEMENT STATUS b8 10 00 00 00 2b 01 00 20 88 00 00</code>。</td><td class="gap">已确认字节级 CDB/序列 GAP；当前两边在此 TS4300 都返回 GOOD，不能据此断言功能不兼容。后续需比较响应解析、边界库和多库 firmware 行为。</td></tr>
+<tr><td>底层首段 READ CDB</td><td>tape-rs 真实记录了 READ(6) 两次、固定 24-bit transfer length 0x000008、filemark 和 sense；LE 本次从 FUSE 层成功读取已缓存/已索引文件，但未取得 LE 的 SG_IO CDB 原始 trace。</td><td class="todo">功能结果闭环；CDB 字节级等价仍未闭环，不能声称 LE 发送了相同 CDB。</td></tr>
+<tr><td>大文件吞吐</td><td>LE 只完成了 4.7–33.5 KiB 小文件热读；项目首段是 80 字节，且完整索引失败。没有同一大文件的两侧冷读/热读样本。</td><td class="todo">性能 GAP 未定级。需要真实大文件或已知数据文件的同文件冷读实验。</td></tr>
+<tr><td>LE 专用 IBM procedure</td><td>REA 静态发现 capacity/health/xattr/EOD/compression/WORM/key/dump 等能力；本次运行未通过管理接口或同场景调用逐项触发。</td><td class="todo">功能覆盖候选，尚非运行时确认 GAP。</td></tr>
+</table>
+
+<h2>4. 内核 SCSI tracepoint 补充</h2>
+<p>在 `.209` 的 <code>/sys/kernel/debug/tracing/events/scsi</code> 上启用了 <code>scsi_dispatch_cmd_start/done</code>，对 LE 启动阶段取得了真实 CDB 原始字节。已观测到：<code>INQUIRY 12 00 00 00 ff 00</code>、VPD <code>12 01 80 00 ff 00</code>/<code>12 01 fa 00 ff 00</code>/<code>12 01 d0 00 ff 00</code>/<code>12 01 d1 00 ff 00</code>、<code>TEST UNIT READY 00 00 00 00 00 00</code>、<code>PR OUT 5f 06 ... 18 00</code>、<code>PR OUT 5f 01 03 ... 18 00</code>、<code>PR IN 5e 03 ... f8 00</code>、<code>MODE SENSE(6) 1a 08 1d 00 18 00</code>、<code>READ ELEMENT STATUS b8 04 00 01 ff ff 01 08 00 00 00 00</code>、<code>REPORT SUPPORTED OPERATION CODES a3 0c 80 ... 10 00 00 00</code> 和 <code>ALLOW MEDIUM REMOVAL 1e 00 00 00 00 00</code>。命令完成事件显示这些启动/库探测命令为 GOOD，除一次 VPD 0xd1 Inquiry 为 CHECK CONDITION。</p>
+<p>该 trace 还确认 LE 启动时会按库级路径枚举并加载多个卷缓存；本次第二次采集在加载 1,079,912、2,092,653、2,863,151 和 4,436,182 文件索引缓存时耗时较长，未在采集窗口内进入 AA0013L8 的文件 READ。因此，LE 文件读取的 CDB 字节仍不能从这次 trace 推断；此前已完成的 LE FUSE 文件读取结果仍有效。</p>
+<h2>5. 证据摘要</h2>
+<ul><li>LE：PID 1374157；FUSE `ltfs:/dev/sg3`；管理端口 7600；AA0013L8；generation 225；1,028,281 files。</li><li>项目：`/dev/sg2`；READ(6) CDB `[08 00 08 00 00 00]`；第一次 80 bytes；第二次 filemark 00/01；block 0→2。</li><li>切换：LE 退出后项目可 TUR/REWIND/READ；当前为避免 scheduler 自动重新占用设备，`.209` 的 <code>node-scheduler</code> 已暂停，LE 已停止、FUSE 已卸载。</li><li>未执行：写带、WRITE FILEMARK、MAM write、FORMAT、ERASE、库 MOVE/EXCHANGE/IMPORT/EXPORT。</li></ul>
+
+<h2>6. 结论和下一步</h2>
+<p>本轮已经完成“LE 正常运行 → 同一真实卷读取 → 释放设备 → tape-rs 接管 → 同一卷原始读取/位置验证”的运行时闭环。最明确的真实 GAP 是 tape-rs 无法恢复 LE 已成功挂载的超大 LTFS 索引；这是当前必须优先修复的兼容性问题。底层 CDB 完全一致性和大文件性能仍需要额外的 SG_IO 观测/同文件实验，不能由本轮 FUSE 结果推断。</p>
+<p><a href="rea-le-gap-continuation-20261013.html">GAP 持续分析</a>　<a href="rea-gap-real-runtime-20261013.html">真实运行时基础报告</a>　<a href="rea-analysis-20261013.html">REA 静态报告</a>　<a href="rea-evidence-session-20261013.json">REA Evidence Bundle</a></p></body></html>

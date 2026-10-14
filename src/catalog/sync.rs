@@ -14,7 +14,7 @@ use crate::error::Result;
 use crate::ltfs::index::FileNode;
 use crate::ltfs::mam::{ATTR_BARCODE, Mam, VolumeCapacity, read_volume_capacity};
 use crate::ltfs::volume::LtfsVolume;
-use crate::scsi::device::ScsiDevice;
+use crate::scsi::transport::TapeTransport;
 
 use super::db::Catalog;
 
@@ -34,7 +34,7 @@ pub struct SyncStats {
 /// `barcode_override` 用于手工校正（老带条 MAM 没写或写错时）；`None` 则读 MAM 0x0806。
 pub fn sync_from_device(
     catalog: &mut Catalog,
-    device: &ScsiDevice,
+    device: &dyn TapeTransport,
     barcode_override: Option<&str>,
 ) -> Result<SyncStats> {
     let vol = LtfsVolume::mount(device)?;
@@ -81,7 +81,11 @@ pub fn sync_from_volume(
     }
 
     let (cap_total, cap_remaining, cap_sync) = match capacity {
-        Some(c) => (Some(c.total as i64), Some(c.remaining as i64), Some(now.clone())),
+        Some(c) => (
+            Some(c.total as i64),
+            Some(c.remaining as i64),
+            Some(now.clone()),
+        ),
         None => (None, None, None),
     };
 
@@ -198,7 +202,7 @@ fn nonempty(s: &str) -> Option<&str> {
 }
 
 /// 从 MAM 0x0806 读 barcode，去掉 ASCII 空格填充。失败或空返回 `Ok(None)`。
-fn read_barcode(device: &ScsiDevice) -> Result<Option<String>> {
+fn read_barcode(device: &dyn TapeTransport) -> Result<Option<String>> {
     let mam = Mam::new(device);
     let attr = match mam.read_attribute(ATTR_BARCODE)? {
         Some(a) => a,

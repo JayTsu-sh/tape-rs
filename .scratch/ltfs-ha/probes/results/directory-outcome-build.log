@@ -1,0 +1,10 @@
+   Compiling tape-rs v0.1.0 (/work/jay/tape-rs-ltfs-recovery-ibm-interop)
+warning: linker stderr: ignoring deprecated linker optimization setting '1'
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `tape-rs` (bin "ltfsctl") generated 1 warning
+warning: `tape-rs` (bin "ltfsd") generated 1 warning (1 duplicate)
+warning: `tape-rs` (bin "tape-fuse") generated 1 warning (1 duplicate)
+warning: `tape-rs` (bin "tape-rs") generated 1 warning (1 duplicate)
+    Finished `release` profile [optimized] target(s) in 13.76s

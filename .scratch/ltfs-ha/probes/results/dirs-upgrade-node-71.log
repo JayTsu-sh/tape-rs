@@ -1,0 +1,151 @@
+[2026-09-24T14:14:26Z INFO  tape_rs::daemon::net] 节点间通信监听 0.0.0.0:7400
+[2026-09-24T14:14:26Z INFO  tape_rs::daemon::http] 客户端接口监听 0.0.0.0:7401
+[2026-09-24T14:14:26Z INFO  raft::raft] switched to configuration, raft_id: 1, config: Configuration { voters: Configuration { incoming: Configuration { voters: {1, 2, 3} }, outgoing: Configuration { voters: {} } }, learners: {}, learners_next: {}, auto_leave: false }
+[2026-09-24T14:14:26Z INFO  raft::raft] became follower at term 14, raft_id: 1, term: 14
+[2026-09-24T14:14:26Z INFO  raft::raft] newRaft, raft_id: 1, peers: Configuration { incoming: Configuration { voters: {1, 2, 3} }, outgoing: Configuration { voters: {} } }, last term: 14, last index: 125, applied: 124, commit: 125, term: 14
+[2026-09-24T14:14:26Z INFO  raft::raw_node] RawNode created with id 1., raft_id: 1, id: 1
+[2026-09-24T14:14:26Z INFO  tape_rs::daemon::node] 从索引 124 的快照恢复控制状态
+[2026-09-24T14:14:27Z INFO  raft::raft] [logterm: 14, index: 125, vote: 2] cast vote for 2 [logterm: 14, index: 125] at term 14, raft_id: 1, msg type: MsgRequestPreVote, term: 14, msg_index: 125, msg_term: 14, from: 2, vote: 2, log_index: 125, log_term: 14
+[2026-09-24T14:14:27Z INFO  raft::raft] received a message with higher term from 2, raft_id: 1, msg type: MsgRequestVote, message_term: 15, term: 14, from: 2
+[2026-09-24T14:14:27Z INFO  raft::raft] became follower at term 15, raft_id: 1, term: 15
+[2026-09-24T14:14:27Z INFO  raft::raft] [logterm: 14, index: 125, vote: 0] cast vote for 2 [logterm: 14, index: 125] at term 15, raft_id: 1, msg type: MsgRequestVote, term: 15, msg_index: 125, msg_term: 14, from: 2, vote: 0, log_index: 125, log_term: 14
+[2026-09-24T14:14:27Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 127
+[2026-09-24T14:14:49Z INFO  ltfsd] 收到停机信号，正在计划停机（再按一次直接退出）
+[2026-09-24T14:14:49Z INFO  tape_rs::daemon::node] 节点 1 停机
+[2026-09-24T14:14:50Z INFO  tape_rs::daemon::net] 节点间通信监听 0.0.0.0:7400
+[2026-09-24T14:14:50Z INFO  tape_rs::daemon::http] 客户端接口监听 0.0.0.0:7401
+[2026-09-24T14:14:50Z INFO  raft::raft] switched to configuration, raft_id: 1, config: Configuration { voters: Configuration { incoming: Configuration { voters: {1, 2, 3} }, outgoing: Configuration { voters: {} } }, learners: {}, learners_next: {}, auto_leave: false }
+[2026-09-24T14:14:50Z INFO  raft::raft] became follower at term 15, raft_id: 1, term: 15
+[2026-09-24T14:14:50Z INFO  raft::raft] newRaft, raft_id: 1, peers: Configuration { incoming: Configuration { voters: {1, 2, 3} }, outgoing: Configuration { voters: {} } }, last term: 15, last index: 130, applied: 124, commit: 130, term: 15
+[2026-09-24T14:14:50Z INFO  raft::raw_node] RawNode created with id 1., raft_id: 1, id: 1
+[2026-09-24T14:14:50Z INFO  tape_rs::daemon::node] 从索引 124 的快照恢复控制状态
+[2026-09-24T14:14:50Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 127
+[2026-09-24T14:14:52Z INFO  raft::raft] [logterm: 15, index: 130, vote: 2] cast vote for 3 [logterm: 15, index: 130] at term 15, raft_id: 1, msg type: MsgRequestPreVote, term: 15, msg_index: 130, msg_term: 15, from: 3, vote: 2, log_index: 130, log_term: 15
+[2026-09-24T14:14:52Z INFO  raft::raft] received a message with higher term from 3, raft_id: 1, msg type: MsgRequestVote, message_term: 16, term: 15, from: 3
+[2026-09-24T14:14:52Z INFO  raft::raft] became follower at term 16, raft_id: 1, term: 16
+[2026-09-24T14:14:52Z INFO  raft::raft] [logterm: 15, index: 130, vote: 0] cast vote for 3 [logterm: 15, index: 130] at term 16, raft_id: 1, msg type: MsgRequestVote, term: 16, msg_index: 130, msg_term: 15, from: 3, vote: 0, log_index: 130, log_term: 15
+[2026-09-24T14:14:52Z INFO  tape_rs::daemon::node] 节点 3 成为执行者，轮次 132
+[2026-09-24T14:15:49Z INFO  ltfsd] 收到停机信号，正在计划停机（再按一次直接退出）
+[2026-09-24T14:15:49Z INFO  tape_rs::daemon::node] 节点 1 停机
+[2026-09-24T14:16:07Z INFO  tape_rs::daemon::net] 节点间通信监听 0.0.0.0:7400
+[2026-09-24T14:16:07Z INFO  tape_rs::daemon::http] 客户端接口监听 0.0.0.0:7401
+[2026-09-24T14:16:07Z INFO  raft::raft] switched to configuration, raft_id: 1, config: Configuration { voters: Configuration { incoming: Configuration { voters: {1, 2, 3} }, outgoing: Configuration { voters: {} } }, learners: {}, learners_next: {}, auto_leave: false }
+[2026-09-24T14:16:07Z INFO  raft::raft] became follower at term 16, raft_id: 1, term: 16
+[2026-09-24T14:16:07Z INFO  raft::raft] newRaft, raft_id: 1, peers: Configuration { incoming: Configuration { voters: {1, 2, 3} }, outgoing: Configuration { voters: {} } }, last term: 16, last index: 139, applied: 124, commit: 139, term: 16
+[2026-09-24T14:16:07Z INFO  raft::raw_node] RawNode created with id 1., raft_id: 1, id: 1
+[2026-09-24T14:16:07Z INFO  tape_rs::daemon::node] 从索引 124 的快照恢复控制状态
+[2026-09-24T14:16:07Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 127
+[2026-09-24T14:16:07Z INFO  tape_rs::daemon::node] 节点 3 成为执行者，轮次 132
+[2026-09-24T14:16:09Z INFO  raft::raft] [logterm: 16, index: 139, vote: 3] cast vote for 2 [logterm: 16, index: 139] at term 16, raft_id: 1, msg type: MsgRequestPreVote, term: 16, msg_index: 139, msg_term: 16, from: 2, vote: 3, log_index: 139, log_term: 16
+[2026-09-24T14:16:09Z INFO  raft::raft] received a message with higher term from 2, raft_id: 1, msg type: MsgRequestVote, message_term: 17, term: 16, from: 2
+[2026-09-24T14:16:09Z INFO  raft::raft] became follower at term 17, raft_id: 1, term: 17
+[2026-09-24T14:16:09Z INFO  raft::raft] [logterm: 16, index: 139, vote: 0] cast vote for 2 [logterm: 16, index: 139] at term 17, raft_id: 1, msg type: MsgRequestVote, term: 17, msg_index: 139, msg_term: 16, from: 2, vote: 0, log_index: 139, log_term: 16
+[2026-09-24T14:16:09Z INFO  tape_rs::daemon::node] 节点 2 成为执行者，轮次 141
+[2026-09-24T14:16:09Z INFO  tape_rs::daemon::node] 已做快照并压缩日志到索引 142（目录库到 142）
+[2026-09-24T14:16:31Z INFO  ltfsd] 收到停机信号，正在计划停机（再按一次直接退出）
+[2026-09-24T14:16:31Z INFO  tape_rs::daemon::node] 节点 1 停机
+[2026-09-24T14:16:48Z INFO  tape_rs::daemon::net] 节点间通信监听 0.0.0.0:7400
+[2026-09-24T14:16:48Z INFO  tape_rs::daemon::http] 客户端接口监听 0.0.0.0:7401
+[2026-09-24T14:16:48Z INFO  raft::raft] switched to configuration, raft_id: 1, config: Configuration { voters: Configuration { incoming: Configuration { voters: {1, 2, 3} }, outgoing: Configuration { voters: {} } }, learners: {}, learners_next: {}, auto_leave: false }
+[2026-09-24T14:16:48Z INFO  raft::raft] became follower at term 17, raft_id: 1, term: 17
+[2026-09-24T14:16:48Z INFO  raft::raft] newRaft, raft_id: 1, peers: Configuration { incoming: Configuration { voters: {1, 2, 3} }, outgoing: Configuration { voters: {} } }, last term: 17, last index: 148, applied: 142, commit: 148, term: 17
+[2026-09-24T14:16:48Z INFO  raft::raw_node] RawNode created with id 1., raft_id: 1, id: 1
+[2026-09-24T14:16:48Z INFO  tape_rs::daemon::node] 从索引 142 的快照恢复控制状态
+[2026-09-24T14:16:49Z INFO  raft::raft] starting a new election, raft_id: 1, term: 17
+[2026-09-24T14:16:49Z INFO  raft::raft] became pre-candidate at term 17, raft_id: 1, term: 17
+[2026-09-24T14:16:49Z INFO  raft::raft] broadcasting vote request, raft_id: 1, to: [2, 3], log_index: 148, log_term: 17, term: 17, type: MsgRequestPreVote
+[2026-09-24T14:16:49Z INFO  raft::raft] received votes response, raft_id: 1, term: 17, type: MsgRequestPreVoteResponse, approvals: 2, rejections: 0, from: 3, vote: true
+[2026-09-24T14:16:49Z INFO  raft::raft] became candidate at term 18, raft_id: 1, term: 18
+[2026-09-24T14:16:49Z INFO  raft::raft] broadcasting vote request, raft_id: 1, to: [2, 3], log_index: 148, log_term: 17, term: 18, type: MsgRequestVote
+[2026-09-24T14:16:49Z INFO  raft::raft] received votes response, raft_id: 1, term: 18, type: MsgRequestVoteResponse, approvals: 2, rejections: 0, from: 3, vote: true
+[2026-09-24T14:16:49Z INFO  raft::raft] became leader at term 18, raft_id: 1, term: 18
+[2026-09-24T14:16:49Z INFO  tape_rs::daemon::node] 本节点成为执行者，轮次 150（任期 18）
+[2026-09-24T14:16:49Z INFO  tape_rs::scsi::reservation] /dev/sg9: 预留现状 generation=25 keys=[] holder=None
+[2026-09-24T14:16:49Z INFO  tape_rs::daemon::executor] 执行线程: IBMtaper2287_LL3 (/dev/sg9) 已隔离（原持有者 None）
+[2026-09-24T14:16:49Z INFO  tape_rs::scsi::reservation] /dev/sg10: 预留现状 generation=27 keys=[] holder=None
+[2026-09-24T14:16:49Z INFO  tape_rs::daemon::executor] 执行线程: IBMtaper2287 (/dev/sg10) 已隔离（原持有者 None）
+[2026-09-24T14:16:49Z INFO  tape_rs::scsi::reservation] /dev/sg11: 预留现状 generation=25 keys=[] holder=None
+[2026-09-24T14:16:49Z INFO  tape_rs::daemon::executor] 执行线程: IBMtaper3D5E (/dev/sg11) 已隔离（原持有者 None）
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=0
+[2026-09-24T14:16:49Z WARN  tape_rs::scsi::transport] LOCATE: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 1 次）
+[2026-09-24T14:16:49Z WARN  tape_rs::scsi::transport] LOCATE: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 2 次）
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=2
+[2026-09-24T14:16:49Z INFO  tape_rs::ltfs::volume] LTFS label: version=2.4.0 uuid=295fe36b-1154-437c-a1e9-a3205030fb75 blocksize=524288 compression=false
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=0
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=258
+[2026-09-24T14:16:49Z INFO  tape_rs::ltfs::recovery] 分区 1 VCI 快速路径命中 gen=45 @ 258..259
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=0
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=5
+[2026-09-24T14:16:49Z INFO  tape_rs::ltfs::recovery] 分区 0 VCI 快速路径命中 gen=45 @ 5..6
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=249
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=240
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=234
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=219
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=213
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=206
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=200
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=176
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=173
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=169
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=166
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=162
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=158
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=155
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=151
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=147
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=144
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=140
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=137
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=133
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=129
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=125
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=121
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=118
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=114
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=110
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=8
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=5
+[2026-09-24T14:16:49Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=260
+[2026-09-24T14:16:49Z INFO  tape_rs::ltfs::volume] index gen=45 highest_uid=53 (dp_tail=Complete, ip_tail=Complete, writable=true)
+[2026-09-24T14:16:49Z INFO  tape_rs::daemon::node] TS1001L08 目录停在第 44 代，磁带是第 45 代：以磁带为准重写该带的目录
+[2026-09-24T14:16:49Z INFO  tape_rs::daemon::node] 轮次 150 开始服务：IBMtaper2287 (/dev/sg10) [TS1001L08]: gen=45 文件 17 个 尾部 Complete；可用 45 MiB
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=2
+[2026-09-24T14:17:23Z INFO  tape_rs::ltfs::volume] LTFS label: version=2.4.0 uuid=295fe36b-1154-437c-a1e9-a3205030fb75 blocksize=524288 compression=false
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=0
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=258
+[2026-09-24T14:17:23Z INFO  tape_rs::ltfs::recovery] 分区 1 VCI 快速路径命中 gen=45 @ 258..259
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=0
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=0, block=5
+[2026-09-24T14:17:23Z INFO  tape_rs::ltfs::recovery] 分区 0 VCI 快速路径命中 gen=45 @ 5..6
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=249
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=240
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=234
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=219
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=213
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=206
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=200
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=176
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=173
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=169
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=166
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=162
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=158
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=155
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=151
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=147
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=144
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=140
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=137
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=133
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=129
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=125
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=121
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=118
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=114
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=110
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=8
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=5
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=260
+[2026-09-24T14:17:23Z INFO  tape_rs::ltfs::volume] index gen=45 highest_uid=53 (dp_tail=Complete, ip_tail=Complete, writable=true)
+[2026-09-24T14:17:23Z INFO  tape_rs::tape::commands] 定位到 partition=1, block=10
+[2026-09-24T14:17:23Z INFO  tape_rs::ltfs::volume] 读取 rc/_probe.bin: 1024 字节

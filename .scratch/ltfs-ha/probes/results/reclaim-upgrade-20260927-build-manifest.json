@@ -1,0 +1,9 @@
+{
+  "commit": "cda359d2baffa8585e221cb997abbdc57ea802b1",
+  "target": "x86_64-unknown-linux-gnu.2.34",
+  "sha256": {
+    "ltfsd": "32bd5541c0123559b590e9dd94c935753a30dacdb660a3e8efcc2ee3e89f8092",
+    "tape-fuse": "ef237d2ea43bfaf182f24d34a3d4a2a3bf9e509e8ba21ead321112e7c87c85d9",
+    "ltfsctl": "90f7d3caee4c16261779b5f5d3608e927dd899657144e3d1c02d4db4ab5ce933"
+  }
+}

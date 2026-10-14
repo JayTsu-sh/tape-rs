@@ -1,0 +1,2 @@
+{"name": "concurrent_append", "status": "PASS", "detail": "two concurrent processes; all 128 append records intact and unique", "seconds": 0.0664}
+{"name": "umount_umount2_private_namespace", "status": "PASS", "detail": "umount and umount2 succeed in isolated private namespaces; host /ltfs unchanged", "seconds": 0.0075}

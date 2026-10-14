@@ -5,8 +5,10 @@ use std::io::{BufReader, BufWriter};
 
 use tape_rs::error::{Result, TapeError};
 use tape_rs::ltfs::mkltfs::{self, MkltfsOptions};
-use tape_rs::ltfs::volume::LtfsVolume;
+use tape_rs::ltfs::recovery::TailKind;
+use tape_rs::ltfs::volume::{HashPolicy, HashVerdict, LtfsVolume, TailPolicy};
 use tape_rs::scsi::device::ScsiDevice;
+use tape_rs::scsi::reservation::{self, FenceOutcome, PrStatus, ReservationKey};
 
 pub fn cmd_mkltfs(
     path: &str,
@@ -58,8 +60,57 @@ pub fn cmd_ltfs_list(path: &str) -> Result<()> {
         println!("  (empty)");
     } else {
         for (p, sz) in &files {
-            println!("  {:>12}  {}", sz, p);
+            match vol.index().find_file(p).and_then(|f| f.symlink.as_deref()) {
+                Some(target) => println!("  {:>12}  {} -> {}", "symlink", p, target),
+                None => println!("  {:>12}  {}", sz, p),
+            }
         }
+    }
+    if let Some(reason) = vol.restricted_reason() {
+        println!();
+        println!("只读: {}", reason);
+    }
+    Ok(())
+}
+
+/// 读出文件并与索引里的 ltfs.hash.* 比对。name 为空时校验全部文件。
+pub fn cmd_ltfs_verify(path: &str, name: Option<&str>, show_xattrs: bool) -> Result<()> {
+    let dev = ScsiDevice::open(path)?;
+    let vol = LtfsVolume::mount(&dev)?;
+    let targets: Vec<String> = match name {
+        Some(n) => vec![n.to_string()],
+        None => vol.list().into_iter().map(|(p, _)| p).collect(),
+    };
+    let mut bad = 0usize;
+    for p in &targets {
+        let verdict = vol.verify_file(p)?;
+        match &verdict {
+            HashVerdict::Match { algo } => println!("  一致   {:<10} {}", algo, p),
+            HashVerdict::NoHash => println!("  无哈希 {:<10} {}", "-", p),
+            HashVerdict::Mismatch {
+                algo,
+                expected,
+                actual,
+            } => {
+                bad += 1;
+                println!("  不一致 {:<10} {}", algo, p);
+                println!("         索引: {}", expected);
+                println!("         实际: {}", actual);
+            }
+        }
+        if show_xattrs && let Some(f) = vol.index().find_file(p) {
+            for x in &f.xattrs {
+                println!(
+                    "         {} = {}{}",
+                    x.key,
+                    x.value,
+                    if x.base64 { " (base64)" } else { "" }
+                );
+            }
+        }
+    }
+    if bad > 0 {
+        return Err(TapeError::Ltfs(format!("{} 个文件哈希不一致", bad)));
     }
     Ok(())
 }
@@ -76,7 +127,22 @@ pub fn cmd_ltfs_read(path: &str, name: &str, output: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_ltfs_write(path: &str, file_path: &str, name: &str) -> Result<()> {
+pub fn cmd_ltfs_write(
+    path: &str,
+    file_path: &str,
+    name: &str,
+    xattrs: &[String],
+    md5: bool,
+    guard: Option<&str>,
+) -> Result<()> {
+    let pairs: Vec<(&str, &str)> = xattrs
+        .iter()
+        .map(|kv| {
+            kv.split_once('=')
+                .filter(|(k, _)| !k.is_empty())
+                .ok_or_else(|| TapeError::Ltfs(format!("--xattr 需要 KEY=VALUE 形式: {}", kv)))
+        })
+        .collect::<Result<_>>()?;
     let dev = ScsiDevice::open(path)?;
     let mut vol = LtfsVolume::mount(&dev)?;
     let f = File::open(file_path)?;
@@ -84,9 +150,175 @@ pub fn cmd_ltfs_write(path: &str, file_path: &str, name: &str) -> Result<()> {
     let bs = vol.block_size() as usize;
     let mut r = BufReader::with_capacity(bs.max(64 * 1024), f);
     println!("写入 {} ({} 字节) → tape:{}", file_path, size, name);
-    let n = vol.append_file(name, &mut r)?;
+    vol.set_hash_policy(HashPolicy { md5, sha256: true });
+    if let Some(g) = guard {
+        let key = g
+            .split_once(':')
+            .and_then(|(n, r)| Some(ReservationKey::new(n.parse().ok()?, r.parse().ok()?)))
+            .ok_or_else(|| TapeError::Ltfs(format!("--guard 需要 NODE:ROUND 形式: {}", g)))?;
+        vol.set_reservation_guard(Some(key));
+    }
+    let n = vol.append_file_with_xattrs(name, &mut r, &pairs)?;
     println!("已追加 {} 字节，执行 commit 写回 index...", n);
     vol.unmount()?;
     println!("完成");
+    Ok(())
+}
+
+fn print_pr_status(st: &PrStatus) {
+    println!("  generation: {}", st.generation);
+    if st.keys.is_empty() {
+        println!("  注册表:     (空)");
+    }
+    for k in &st.keys {
+        let key = ReservationKey(*k);
+        if key.is_ours() {
+            println!(
+                "  注册键:     {:#018x}  (本系统: 节点 {} 轮次 {})",
+                k,
+                key.node(),
+                key.round()
+            );
+        } else {
+            println!("  注册键:     {:#018x}  (非本系统)", k);
+        }
+    }
+    match st.holder {
+        Some((k, t)) => println!("  持有者:     {:#018x}  类型 {:#x}", k, t),
+        None => println!("  持有者:     (无)"),
+    }
+}
+
+pub fn cmd_pr_status(path: &str) -> Result<()> {
+    let dev = ScsiDevice::open(path)?;
+    print_pr_status(&reservation::read_status(&dev)?);
+    Ok(())
+}
+
+pub fn cmd_pr_fence(path: &str, node: u8, round: u64) -> Result<()> {
+    let dev = ScsiDevice::open(path)?;
+    let key = ReservationKey::new(node, round);
+    match reservation::fence(&dev, key)? {
+        FenceOutcome::Fenced { before, after } => {
+            println!("隔离前:");
+            print_pr_status(&before);
+            println!("隔离后（已回读确认）:");
+            print_pr_status(&after);
+            Ok(())
+        }
+        FenceOutcome::Unsupported => {
+            println!("设备不支持持久预留");
+            Ok(())
+        }
+        FenceOutcome::Superseded { holder } => Err(TapeError::Ltfs(format!(
+            "本轮已被取代：持有者是节点 {} 轮次 {}，未做任何改动",
+            holder.node(),
+            holder.round()
+        ))),
+        FenceOutcome::Unconfirmed { reason, status } => {
+            if let Some(st) = status {
+                print_pr_status(&st);
+            }
+            Err(TapeError::Ltfs(format!(
+                "隔离未能确认，不得接管: {}",
+                reason
+            )))
+        }
+    }
+}
+
+pub fn cmd_pr_release(path: &str, node: u8, round: u64) -> Result<()> {
+    let dev = ScsiDevice::open(path)?;
+    reservation::release_and_unregister(&dev, ReservationKey::new(node, round))?;
+    print_pr_status(&reservation::read_status(&dev)?);
+    Ok(())
+}
+
+pub fn cmd_ltfs_takeover(
+    path: &str,
+    node: u8,
+    round: u64,
+    salvage: bool,
+    report_only: bool,
+) -> Result<()> {
+    let dev = ScsiDevice::open(path)?;
+    let key = ReservationKey::new(node, round);
+    println!("[1/3] 设备层隔离 (节点 {} 轮次 {})", node, round);
+    match reservation::fence(&dev, key)? {
+        FenceOutcome::Fenced { before, .. } => match before.holder {
+            Some((k, _)) if k != key.0 => println!("      已抢占原持有者 {:#018x}，回读确认", k),
+            _ => println!("      设备原先无人持有，已取得预留，回读确认"),
+        },
+        FenceOutcome::Unsupported => {
+            return Err(TapeError::Ltfs("设备不支持持久预留，不能自动接管".into()));
+        }
+        FenceOutcome::Superseded { holder } => {
+            return Err(TapeError::Ltfs(format!(
+                "本轮已被取代：持有者是节点 {} 轮次 {}，不得接管",
+                holder.node(),
+                holder.round()
+            )));
+        }
+        FenceOutcome::Unconfirmed { reason, .. } => {
+            return Err(TapeError::Ltfs(format!(
+                "隔离未能确认，不得接管: {}",
+                reason
+            )));
+        }
+    }
+
+    println!("[2/3] 挂载并执行恢复协议");
+    let mut vol = LtfsVolume::mount(&dev)?;
+    vol.set_reservation_guard(Some(key));
+    let (tail, eod, last_end) = {
+        let r = vol.recovery();
+        (
+            r.dp.tail,
+            r.dp.eod,
+            r.dp.last_index.as_ref().map(|c| c.end_block),
+        )
+    };
+    println!(
+        "      视图 gen={}  文件 {} 个  DP 尾部 {:?}  末索引结束于块 {:?}  EOD {}",
+        vol.index().generation,
+        vol.list().len(),
+        tail,
+        last_end,
+        eod
+    );
+    if vol.writable() {
+        println!("[3/3] 尾部完整，无需收尾。卷可写");
+        return Ok(());
+    }
+    println!("      只读原因: {}", vol.restricted_reason().unwrap_or("-"));
+    if !matches!(tail, TailKind::UnindexedData | TailKind::TruncatedIndex) || report_only {
+        println!("[3/3] 不自动收尾，卷保持只读");
+        return Ok(());
+    }
+
+    println!(
+        "[3/3] 收尾：在 EOD 追加索引（{}）",
+        if salvage {
+            "打捞未索引数据"
+        } else {
+            "放弃未索引数据"
+        }
+    );
+    let policy = if salvage {
+        TailPolicy::Salvage
+    } else {
+        TailPolicy::Discard
+    };
+    let rep = vol.close_tail(policy)?;
+    println!(
+        "      放弃块 {}..{}  新索引 gen={}  卷可写={}",
+        rep.abandoned_first_block,
+        rep.abandoned_end_block - 1,
+        rep.generation,
+        vol.writable()
+    );
+    if let Some((p, n)) = rep.salvaged {
+        println!("      打捞: {} ({} 字节)", p, n);
+    }
     Ok(())
 }

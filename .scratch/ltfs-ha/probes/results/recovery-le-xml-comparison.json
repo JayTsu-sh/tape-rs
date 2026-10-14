@@ -1,0 +1,13 @@
+{
+  "baseline_files": 26,
+  "new_files": [
+    "/rc/post-recovery-le-20260925.bin"
+  ],
+  "unchanged_fields": [
+    "fileuid",
+    "length",
+    "modifytime",
+    "symlink",
+    "extents"
+  ]
+}

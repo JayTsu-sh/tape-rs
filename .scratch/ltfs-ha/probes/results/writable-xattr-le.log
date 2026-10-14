@@ -1,0 +1,8 @@
+Mount Cartridge: 14fd7f LTFSI5030E Unexpected xattr size.
+Error mounting tape TS1000L8
+Traceback (most recent call last):
+  File "/home/rocky/tape-rs-xattr-20260924/writable-xattr.py", line 44, in <module>
+    check()
+  File "/home/rocky/tape-rs-xattr-20260924/writable-xattr.py", line 24, in check
+    assert hashlib.sha256(open(f, 'rb').read()).hexdigest() == e['sha256']
+OSError: [Errno 16] Device or resource busy: '/ltfs/TS1000L8/rc/xattr-interop-20260924/file'

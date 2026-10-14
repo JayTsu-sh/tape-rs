@@ -1,0 +1,39 @@
+{
+  "answered_by": 2,
+  "applied_index": 158,
+  "pools": [
+    {
+      "file_limit": 50,
+      "name": "rc",
+      "tape_details": [
+        {
+          "barcode": "TS1000L08",
+          "bytes_used": 0,
+          "bytes_written": 2097152,
+          "files": 0,
+          "generation": 2,
+          "live_bytes": 0,
+          "live_files": 0,
+          "reclaimable_bytes": 2097152,
+          "state": "appendable"
+        },
+        {
+          "barcode": "TS1001L08",
+          "bytes_used": 51450880,
+          "bytes_written": 77594624,
+          "files": 15,
+          "generation": 45,
+          "live_bytes": 51450880,
+          "live_files": 21,
+          "reclaimable_bytes": 26143744,
+          "state": "appendable"
+        }
+      ],
+      "tapes": [
+        "TS1000L08",
+        "TS1001L08"
+      ],
+      "uuid": "0ba1b026-9595-4b86-9056-c54c7858e744"
+    }
+  ]
+}

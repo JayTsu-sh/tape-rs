@@ -1,0 +1,9 @@
+  generation: 169
+  注册表:     (空)
+  持有者:     (无)
+[2026-09-24T12:07:59Z INFO  tape_rs::tape::commands] 装载磁带...
+[2026-09-24T12:07:59Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 1 次）
+[2026-09-24T12:07:59Z WARN  tape_rs::scsi::transport] LOAD: UNIT ATTENTION asc=0x28 ascq=0x00，重发（第 2 次）
+装载完成
+[2026-09-24T12:07:59Z INFO  tape_rs::tape::commands] 装载完成
+CHECK clean_gen=31 dp_block=213 ip_block=5 files=15
