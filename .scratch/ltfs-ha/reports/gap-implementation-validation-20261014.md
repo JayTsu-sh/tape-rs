@@ -6,6 +6,21 @@
 
 目标：补全 `rea-le-tape-rs-integrated-20261014.html` 识别的 P0/P1 gap，并同时提供直接 Rust library 与 FUSE 入口。
 
+## Summary：IBM LE 功能覆盖率
+
+按综合报告枚举的 26 个可独立验收能力组计算，当前版本覆盖 IBM LE 功能约 **79%（20.5 / 26）**：18 项完整覆盖、5 项部分覆盖、3 项缺失或未验证。完整覆盖计 1 分，部分覆盖计 0.5 分，缺失或未验证计 0 分。若只统计 assignment、挂载、自动换带、读写、目录与元数据、索引、sync、PR 和 HA 等日常归档核心链路，则覆盖约 **95%（19 / 20）**。
+
+| 能力域 | 能力组 | 得分 | 覆盖率 |
+|---|---:|---:|---:|
+| 管理与控制面 | 7 | 5.0 | 71% |
+| 多卷 namespace 与数据面 | 6 | 5.5 | 92% |
+| changer 与机械调度 | 4 | 4.0 | 100% |
+| tape / SCSI 数据通路 | 5 | 4.5 | 90% |
+| LTFS 维护与介质安全特性 | 4 | 1.5 | 38% |
+| **合计** | **26** | **20.5** | **79%** |
+
+未完全覆盖项为：IBM `leadm` 线协议及完整 node/library task 编排、持久 cache 策略、recover/rollback/list-points 管理体验、RAO、完整 unformat/维护流程、WORM、硬件加密和特殊诊断结果页。该百分比是当前功能清单的工程覆盖率，不代表 IBM 认证、命令行兼容率或所有硬件/固件组合的兼容率。
+
 ## 结论
 
 生产实现、模拟测试、真实 FUSE、真实直接 Rust library、大于 64 MiB 索引，以及 IBM Spectrum Archive Library Edition（LE）只读互操作均已通过。没有执行 FORMAT 或 ERASE。AA0013L8 保留本轮 65 MiB+ xattr 大索引夹具，AA0000L8 保留独立内容文件。
