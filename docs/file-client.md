@@ -4,6 +4,8 @@
 
 `ltfsctl` 与 `tape-fuse` 都通过 ltfsd 客户端接口寻找 Leader；节点地址可以重复指定。它们不直接打开磁带设备。
 
+希望客户端固定访问一个地址时，可启用 [ltfsd 内置 HTTP VIP](http-vip.md)：首版支持同子网 IPv4，由有效设备 owner 持有，无需 Keepalived。
+
 ```bash
 cargo build --bin ltfsctl --bin tape-fuse --features fuse
 ltfsctl -e 127.0.0.1:7401 put ./archive.bin /archive.bin

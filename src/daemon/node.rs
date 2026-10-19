@@ -54,7 +54,10 @@ pub struct CoordinationConfig {
 /// 对外可见的节点状态快照。
 #[derive(Debug, Clone, Default)]
 pub struct NodeStatus {
+    pub vips: std::collections::BTreeMap<std::net::Ipv4Addr, super::state::VipRecord>,
     pub id: u64,
+    /// 已开始计划停机；HTTP VIP 应先撤下，设备许可仍可续持到安全收尾。
+    pub shutting_down: bool,
     pub role: String,
     pub term: u64,
     pub leader: u64,
@@ -187,19 +190,21 @@ pub fn run_with(
 
     loop {
         if let Some((deadline, done)) = &shutdown {
-            match done.try_recv() {
-                Ok(()) | Err(TryRecvError::Disconnected) => {
-                    info!("节点 {} 停机", cfg.id);
-                    return Ok(());
-                }
-                Err(TryRecvError::Empty) if Instant::now() >= *deadline => {
-                    warn!(
-                        "等执行线程停机超过 {:?}，直接退出；设备上的预留留给下一个执行者抢占",
-                        cfg.shutdown_grace
-                    );
-                    return Ok(());
-                }
-                Err(TryRecvError::Empty) => {}
+            let finished = matches!(done.try_recv(), Ok(()) | Err(TryRecvError::Disconnected));
+            let vip_held = ctl
+                .vips
+                .values()
+                .any(|r| r.holder.as_ref().is_some_and(|h| h.node == cfg.id));
+            if finished && !vip_held {
+                info!("节点 {} 停机", cfg.id);
+                return Ok(());
+            }
+            if Instant::now() >= *deadline {
+                warn!(
+                    "等待执行线程停机或 VIP 撤址确认超过 {:?}，直接退出；保留未确认的 VIP 占用记录和设备预留",
+                    cfg.shutdown_grace
+                );
+                return Ok(());
             }
         }
         let wait = next_tick.saturating_duration_since(Instant::now());
@@ -208,6 +213,10 @@ pub fn run_with(
                 if shutdown.is_some() {
                     continue;
                 }
+                status
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .shutting_down = true;
                 // 等待期间仍驱动 Raft/ReadIndex，长机械操作不能阻塞多数派许可续期。
                 // 宽限耗尽时退出且保留预留，下一任仍须按正常协议隔离。
                 let (done, wait_done) = std::sync::mpsc::channel();
@@ -228,8 +237,22 @@ pub fn run_with(
                     warn!("raft step: {}", e);
                 }
             }
+            Ok(NodeInput::Vip(cmd)) => {
+                let valid = match &cmd {
+                    Command::VipAcquire { node, .. } => *node == cfg.id && shutdown.is_none(),
+                    Command::VipRelease { node, .. } => *node == cfg.id,
+                    _ => false,
+                };
+                if valid && coordinator.is_some() {
+                    propose(&mut node, &cmd);
+                }
+            }
             Ok(NodeInput::Admin { cmd, reply }) => {
-                if shutdown.is_some() {
+                if matches!(cmd, Command::VipAcquire { .. } | Command::VipRelease { .. }) {
+                    let _ = reply.send(AdminReply::Rejected(
+                        "VIP 控制命令仅接受本机网络线程".into(),
+                    ));
+                } else if shutdown.is_some() {
                     let _ = reply.send(AdminReply::Rejected(
                         "节点正在停机，不接受新的管理操作".into(),
                     ));
@@ -832,7 +855,12 @@ fn publish_status(
     last: &mut String,
 ) {
     let st = NodeStatus {
+        vips: ctl.vips.clone(),
         id: cfg.id,
+        shutting_down: shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .shutting_down,
         drives: cfg.drives,
         last_reclaim: last_reclaim.clone(),
         role: format!("{:?}", node.raft.state),
@@ -883,6 +911,8 @@ fn publish_status(
     };
     let text = json!({
         "id": st.id, "role": st.role, "term": st.term, "leader": st.leader,
+        "shutting_down": st.shutting_down,
+        "vips": st.vips.iter().map(|(a,r)| json!({"address":a.to_string(),"token":r.token,"holder":r.holder.as_ref().map(|h|json!({"node":h.node,"round":h.round}))})).collect::<Vec<_>>(),
         "executor": st.executor.as_ref().map(|e| json!({"node": e.node, "round": e.round, "term": e.term, "fenced": e.fenced})),
         "executor_ready": st.executor_ready,
         "candidates": st.candidates.iter().map(|(id,c)| json!({"node": id,"instance":c.instance,"sequence":c.sequence,"group":c.group,"drives":c.drives,"eligible":c.eligible})).collect::<Vec<_>>(),

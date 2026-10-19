@@ -4,9 +4,9 @@
 
 ## 接续入口：先确认工作树
 
-当前开发接续分支为 `ltfs-recovery-ibm-interop`，本机工作树为 `/work/jay/tape-rs-ltfs-recovery-ibm-interop`；`/work/jay/tape-rs` 的 `feature/docs` 保存早期设计。用户明确指定其他分支时，以用户指定为准。
+日常开发直接使用 `main`，本机目录为 `/work/jay/tape-rs`。原 `ltfs-recovery-ibm-interop` worktree 已迁移；用户明确指定其他分支时，以用户指定为准。
 
-每次新会话，以及回答“当前进展”或接到“继续”时，先执行 `git worktree list --porcelain`，再在目标工作树执行 `git status --short`、`git branch --show-current` 和 `git log -1 --oneline`。读取目标工作树的 `AGENTS.md` 和 `.scratch/ltfs-ha/handoff-to-codex.md`，按交接记录的最新条目核对实现、测试及部署状态；确认目录、分支、提交与记录一致后再继续。
+每次新会话，以及回答“当前进展”或接到“继续”时，先执行 `git worktree list --porcelain`，再在目标目录执行 `git status --short`、`git branch --show-current` 和 `git log -1 --oneline`。读取目标目录的 `AGENTS.md` 和 `.scratch/ltfs-ha/handoff-to-codex.md`，按最新交接记录核对实现、测试及部署状态。现场操作或查证历史证据时，另读本地 `.scratch/ltfs-ha/local/handoff-history.md`（若存在）。确认目录、分支、提交与记录一致后再继续。
 
 路径变化时按分支在工作树清单中定位；分支和记录冲突或目标缺失时先查各分支提交及交接文件，仍无法确定再澄清。最新时间戳或当前 cwd 单独都不足以决定接续分支。
 

@@ -1,3 +1,9 @@
+## 2026-10-19 — HTTP VIP 交付与主分支接续
+
+当前直接使用 `/work/jay/tape-rs` 的 `main`；原开发 worktree 已迁移。接续以 `AGENTS.md` 和 `.scratch/ltfs-ha/handoff-to-codex.md` 最新条目为准；下方旧日期的待办、运行进程和硬件状态只作为历史记录，不自动触发重跑。
+
+原生同子网 IPv4 HTTP VIP 已按严格撤址确认策略完成：旧地址删除、内核确认和回读为空后，释放经 Raft 提交，新 owner 才能预约；无法确认时持续暂停。配置、整组升级及故障边界见 [http-vip.md](http-vip.md)。三台物理主机验证了正常停机、暂停/恢复、强杀/重启；本轮无磁带分配或写入，结束后测试服务停止、VIP 和占用记录释放、EE 双设备预留恢复。它不代替写入中恢复、掉电或内核冻结验收。
+
 ## 2026-09-30 — P1 性能优化实机验收完成（session2），候选待正式发布
 
 P1 常驻卷会话优化（含挂载顺序、增量差分、周期DP Full）的实机最终候选 a6a17e27（ltfsd-perf-final）在 .143 全部通过，2026-09-27 22:07。session2：8次4KiB提交合计141.079s（第一候选248.425s）、中途读校验、三节点并发正常停机、Rust冷读3171文件双SHA、归槽、LE互读3171文件SHA全通过；`session2-native.complete`/`session2-interop.complete`。收尾核对：RC18槽7、RC17槽8未动、drive空、allow_dio=0、PR注册表空。周期DP Full 掉电窗口仅模拟器覆盖（先红后绿），物理掉电未独立实测。证据 `probes/results/physical-session-20260927/session2-*`，报告 `performance-implementation-20260927.md` 已补最终结果。

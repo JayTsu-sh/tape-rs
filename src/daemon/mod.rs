@@ -22,3 +22,4 @@ pub mod node;
 pub mod permission;
 pub mod state;
 pub mod store;
+pub mod vip;

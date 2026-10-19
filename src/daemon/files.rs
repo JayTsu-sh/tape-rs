@@ -577,6 +577,15 @@ impl FileService {
         *self.permission.lock().unwrap_or_else(|e| e.into_inner()) = Some(permission);
     }
 
+    /// HTTP VIP 只跟随新 HA 协议的有效 owner；不要求池里已有可写磁带。
+    pub(super) fn serving_deadline(&self, round: u64) -> Option<Instant> {
+        self.permission
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|p| p.deadline(round, super::permission::Phase::Serving))
+    }
+
     fn check_permission(&self) -> Result<(), ServiceError> {
         let permission = self.permission.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = permission.as_ref() {

@@ -2,10 +2,25 @@
 //! 所有节点按相同顺序应用相同条目，得到相同结论；应用过程不做任何设备 I/O。
 
 use serde_json::{Value, json};
+use std::net::Ipv4Addr;
 
 /// 写入 Raft 日志的命令。用 JSON 编码，便于排查和以后扩展。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    /// 仅预约 VIP；只有当前设备 owner 可申请，地址发布还须本地服务许可。
+    VipAcquire {
+        address: Ipv4Addr,
+        node: u64,
+        round: u64,
+        expected_token: u64,
+    },
+    /// 本机网络线程已删除地址并回读为空；不能由超时或 owner 变更代替。
+    VipRelease {
+        address: Ipv4Addr,
+        node: u64,
+        round: u64,
+        token: u64,
+    },
     /// 执行报告也经过共识，且仅能改变同一实例的当前轮次。
     ExecutorReport {
         node: u64,
@@ -142,6 +157,22 @@ pub fn split_catalog(files: &[FileRec]) -> Vec<Vec<FileRec>> {
 impl Command {
     pub fn encode(&self) -> Vec<u8> {
         let v = match self {
+            Command::VipAcquire {
+                address,
+                node,
+                round,
+                expected_token,
+            } => {
+                json!({"op":"vip_acquire","address":address.to_string(),"node":node,"round":round,"expected_token":expected_token})
+            }
+            Command::VipRelease {
+                address,
+                node,
+                round,
+                token,
+            } => {
+                json!({"op":"vip_release","address":address.to_string(),"node":node,"round":round,"token":token})
+            }
             Command::ExecutorReport {
                 node,
                 instance,
@@ -237,6 +268,22 @@ impl Command {
         let v: Value = serde_json::from_slice(data).ok()?;
         let text = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
         match v.get("op")?.as_str()? {
+            "vip_acquire" => {
+                return Some(Command::VipAcquire {
+                    address: text("address")?.parse().ok()?,
+                    node: v.get("node")?.as_u64()?,
+                    round: v.get("round")?.as_u64()?,
+                    expected_token: v.get("expected_token")?.as_u64()?,
+                });
+            }
+            "vip_release" => {
+                return Some(Command::VipRelease {
+                    address: text("address")?.parse().ok()?,
+                    node: v.get("node")?.as_u64()?,
+                    round: v.get("round")?.as_u64()?,
+                    token: v.get("token")?.as_u64()?,
+                });
+            }
             "executor_report" => {
                 let inner = v.get("command")?;
                 // 不递归接收任意嵌套，避免网络输入耗尽栈；报告不能伪装成管理命令。
@@ -409,6 +456,7 @@ impl ControlSnapshot {
             "executor_instance": c.executor_instance,
             "executor_report_sequence": c.executor_report_sequence,
             "executor_ready": c.executor_ready,
+            "vips": c.vips.iter().map(|(a,r)| json!([a.to_string(),r.token,r.holder.as_ref().map(|h|json!([h.node,h.round]))])).collect::<Vec<_>>(),
             "candidates": c.candidates.iter().map(|(n,c)| json!([n,c.instance,c.sequence,c.group,c.drives,c.eligible])).collect::<Vec<_>>(),
             "history": c.history.iter().map(|(r, n)| json!([r, n])).collect::<Vec<_>>(),
             "pools": c.pools.iter().map(|(u, p)| json!([u, p.name, p.file_limit])).collect::<Vec<_>>(),
@@ -445,6 +493,32 @@ impl ControlSnapshot {
                 .unwrap_or(false),
             ..Default::default()
         };
+        if let Some(rows) = v.get("vips") {
+            for r in rows.as_array()? {
+                let address = s(r.get(0))?.parse().ok()?;
+                let token = n(r.get(1))?;
+                if token == 0 || token > c.applied_index {
+                    return None;
+                }
+                let holder = match r.get(2)? {
+                    Value::Null => None,
+                    h => {
+                        let node = n(h.get(0))?;
+                        let round = n(h.get(1))?;
+                        if node == 0 || round == 0 || round > token {
+                            return None;
+                        }
+                        Some(VipOwner { node, round })
+                    }
+                };
+                if c.vips
+                    .insert(address, VipRecord { token, holder })
+                    .is_some()
+                {
+                    return None;
+                }
+            }
+        }
         if let Some(rows) = v.get("candidates") {
             for r in rows.as_array()? {
                 c.candidates.insert(
@@ -516,6 +590,19 @@ pub struct Executor {
     pub fenced: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VipOwner {
+    pub node: u64,
+    pub round: u64,
+}
+
+/// 释放后也保留最后的 token，阻止释放前的迟到申请重新取得地址。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VipRecord {
+    pub token: u64,
+    pub holder: Option<VipOwner>,
+}
+
 /// 应用一条命令后，本地需要知道的结论。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Applied {
@@ -585,6 +672,8 @@ pub const HISTORY_KEPT: usize = 64;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ControlState {
+    /// 地址占用记录不随 owner 变更、超时或失联清除。
+    pub vips: std::collections::BTreeMap<Ipv4Addr, VipRecord>,
     pub executor: Option<Executor>,
     pub executor_instance: u64,
     pub executor_report_sequence: u64,
@@ -627,6 +716,52 @@ impl ControlState {
     pub fn apply(&mut self, index: u64, cmd: &Command) -> Applied {
         self.applied_index = index;
         match cmd {
+            Command::VipAcquire {
+                address,
+                node,
+                round,
+                expected_token,
+            } => {
+                let record = self.vips.get(address).cloned().unwrap_or_default();
+                if index > record.token
+                    && record.token == *expected_token
+                    && record.holder.is_none()
+                    && *node != 0
+                    && self
+                        .executor
+                        .as_ref()
+                        .is_some_and(|e| e.node == *node && e.round == *round)
+                {
+                    self.vips.insert(
+                        *address,
+                        VipRecord {
+                            token: index,
+                            holder: Some(VipOwner {
+                                node: *node,
+                                round: *round,
+                            }),
+                        },
+                    );
+                }
+                Applied::Nothing
+            }
+            Command::VipRelease {
+                address,
+                node,
+                round,
+                token,
+            } => {
+                if let Some(record) = self.vips.get_mut(address)
+                    && record.token == *token
+                    && record
+                        .holder
+                        .as_ref()
+                        .is_some_and(|h| h.node == *node && h.round == *round)
+                {
+                    record.holder = None;
+                }
+                Applied::Nothing
+            }
             Command::ExecutorReport {
                 node,
                 instance,

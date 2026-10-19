@@ -570,3 +570,14 @@ v2兼容构建进行中（exec85753）；下一步部署到独立bin-v2，不覆
 隔离实机验证了自适应Full和增量两条库路径，64个文件经存储哈希或外部SHA-256实读核验，介质已归槽并恢复EE实际双PR。新ltfsd构建未替换正式服务；此前完整HA故障矩阵对应原e9fd构建，不能当作本次新构建的完整HA复验。测试日志、临时脚本和原始现场产物保留在本地验证工作树，不作为源码编译依赖。
 
 本机接续仍使用 /work/jay/tape-rs-ltfs-recovery-ibm-interop 的 ltfs-recovery-ibm-interop 分支，提交以 git log -1 为准；GitHub交付目标为main，未改动另一个feature/docs工作树。现场无在途任务或新增临时SSH密钥。后续按新任务推进，不重跑已消费的现场one-shot标记。
+
+
+## 2026-10-19 — 严格 HTTP VIP 通过 review，接续迁移到 main
+
+用户要求 review 通过后合入 GitHub main，并删除开发 worktree。日常入口改为 /work/jay/tape-rs 的 main；旧 feature/docs 内容、未提交入口修改和开发目录全部内容备份到 /work/jay/tape-rs-local-archive-20261019，详细本地交接保留在 .scratch/ltfs-ha/local/handoff-history.md。主分支代码之外的现场原始证据保留本地，不作为源码依赖。
+
+本次 VIP 不依赖 Keepalived，只支持同子网 IPv4。已提交预约与本地 Serving 许可共同控制挂址；旧节点删除 ACK、回读为空及精确 token 释放提交之前，不允许新 owner 挂址。失联或无多数派时宁可暂停，不能通过等待、清理共识数据或强制释放跳过。升级须整组统一版本，详见 docs/http-vip.md。
+
+Standards / Spec 两轴 review 均无可操作发现；完整软件检查和发布 SHA 以本地 probes/results/http-vip-review-20261019 的最终记录为准。此前候选真实三节点测试观察到正常停机约15.16秒恢复VIP，暂停/强杀后旧地址约1.82/1.99秒消失，旧节点恢复/重启后约.49/.55秒恢复入口；新owner正常ready后约.13秒挂址。无双VIP或持续地址残留；暂停恢复曾观察到短暂旧地址重挂后立即删除，严格确认仍在新地址发布前完成。无磁带分配、装带或数据写入，未覆盖写入中恢复或掉电/内核冻结。
+
+现场已收尾：三台测试服务和观察器停止，物理VIP及Raft holder均释放，token墓碑和共识目录保留；EE恢复可用、无活动任务并回读原双设备唯一Exclusive Access预留。不要重跑已消费的现场one-shot标记。详细测量与证据见本地reports/http-vip-physical-20261019.html及probes/results/http-vip-physical-r2-20261019。

@@ -11,6 +11,7 @@
 //!
 //! 语义见研究笔记 file-contract.md。
 //! GET  /cluster                 本节点对集群的自述
+//! GET  /readyz                  HTTP VIP 就绪：本机是已恢复且许可有效的 owner 时 200，否则 503
 //! GET  /admin/pools             池与磁带归属（任何节点可答，来自已应用的日志）
 //! POST /admin/pools/<name>[?file_limit=N]      新建池（只有 Raft Leader 受理）
 //! POST /admin/tapes/<barcode>?pool=<名称或UUID>  磁带归入池
@@ -33,7 +34,7 @@ use serde_json::{Value, json};
 use super::executor::ExecRequest;
 use super::files::{DirEntry, FileService, PathState, ServiceError, TaskStatus};
 use super::net::{AdminReply, NodeInput};
-use super::node::SharedStatus;
+use super::node::{NodeStatus, SharedStatus};
 use super::state::{Command, DEFAULT_FILE_LIMIT};
 
 pub struct HttpContext {
@@ -45,6 +46,20 @@ pub struct HttpContext {
     /// 节点编号 → 客户端接口地址，用来给出控制 Leader / 数据 owner 提示
     pub client_addrs: HashMap<u64, String>,
     pub wait_timeout: Duration,
+}
+
+/// VIP 与 HTTP 就绪检查共用资格判定，不以控制 Leader 或可写磁带作为条件。
+pub(super) fn ready_owner(
+    s: &NodeStatus,
+    files: &FileService,
+) -> Option<(u64, std::time::Instant)> {
+    let owner = s.executor.as_ref()?;
+    if s.shutting_down || !s.executor_ready || owner.node != s.id || !owner.fenced {
+        return None;
+    }
+    files
+        .serving_deadline(owner.round)
+        .map(|deadline| (owner.round, deadline))
 }
 
 pub fn serve(listen: &str, ctx: Arc<HttpContext>) -> std::io::Result<()> {
@@ -442,6 +457,22 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
     }
 
     match (method.as_str(), path.as_str()) {
+        ("GET", "/readyz") => {
+            let s = ctx.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let owner = s.executor.as_ref();
+            let ready = ready_owner(&s, &ctx.files).is_some();
+            respond_json(
+                &mut conn,
+                if ready { 200 } else { 503 },
+                if ready { "OK" } else { "Service Unavailable" },
+                json!({
+                    "ready": ready, "id": s.id,
+                    "owner": owner.map(|e| e.node), "round": owner.map(|e| e.round),
+                    "shutting_down": s.shutting_down,
+                    "vips": s.vips.iter().map(|(a,r)| json!({"address":a.to_string(),"token":r.token,"holder":r.holder.as_ref().map(|h|json!({"node":h.node,"round":h.round}))})).collect::<Vec<_>>(),
+                }),
+            )
+        }
         ("POST", "/sync") => {
             let Some(round) = ctx.files.serving_round() else {
                 return service_error(
@@ -494,6 +525,7 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                 "OK",
                 json!({
                     "id": s.id, "role": s.role, "term": s.term, "leader": s.leader, "local": s.local,
+                    "shutting_down": s.shutting_down,
                     "executor": s.executor.map(|e| json!({"node": e.node, "round": e.round, "fenced": e.fenced})),
                     "executor_ready":s.executor_ready,
                     "candidates":s.candidates.iter().map(|(id,c)|json!({"node":id,"instance":c.instance,"group":c.group,"drives":c.drives,"eligible":c.eligible})).collect::<Vec<_>>(),
@@ -1045,7 +1077,107 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_range;
+    use super::super::node::NodeStatus;
+    use super::super::permission::{Permission, Phase};
+    use super::super::state::Executor;
+    use super::*;
+    use std::time::Instant;
+
+    fn readiness(ctx: &HttpContext) -> (u16, Value) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let (conn, _) = listener.accept().unwrap();
+                handle(conn, ctx).unwrap();
+            });
+            let mut conn = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            conn.write_all(b"GET /readyz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+            let mut response = String::new();
+            conn.read_to_string(&mut response).unwrap();
+            let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+            (
+                headers.split_whitespace().nth(1).unwrap().parse().unwrap(),
+                serde_json::from_str(body).unwrap(),
+            )
+        })
+    }
+
+    #[test]
+    fn readiness_requires_a_recovered_local_owner_and_live_serving_permission() {
+        let dir = std::env::temp_dir().join(format!("http-ready-{}", uuid::Uuid::new_v4()));
+        let files = FileService::new(dir.clone()).unwrap();
+        let (exec, _exec_rx) = channel();
+        let (node, _node_rx) = channel();
+        let ctx = HttpContext {
+            files: files.clone(),
+            status: Arc::new(Mutex::new(NodeStatus::default())),
+            exec: Mutex::new(exec),
+            node: Mutex::new(node),
+            client_addrs: HashMap::new(),
+            wait_timeout: Duration::from_secs(1),
+        };
+        assert_eq!(readiness(&ctx).0, 503, "启动阶段不可就绪");
+        {
+            let mut s = ctx.status.lock().unwrap();
+            s.id = 1;
+            s.leader = 3;
+            s.role = "Follower".into();
+            s.executor = Some(Executor {
+                node: 1,
+                term: 1,
+                round: 4,
+                fenced: true,
+            });
+            s.executor_ready = true;
+        }
+        assert_eq!(readiness(&ctx).0, 503, "未绑定许可的旧协议不可持有 VIP");
+        let permission = Arc::new(Permission::default());
+        files.set_permission(permission.clone());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for phase in [Phase::Fencing, Phase::Execution] {
+            assert!(permission.renew(4, phase, deadline));
+            assert_eq!(readiness(&ctx).0, 503, "隔离/恢复阶段不可就绪");
+        }
+        assert!(permission.renew(4, Phase::Serving, deadline));
+        assert!(files.serving_round().is_none(), "没有可写磁带的初始库");
+        let (code, body) = readiness(&ctx);
+        assert_eq!(code, 200, "follower owner 即使没有可写磁带也应就绪");
+        assert_eq!(body["ready"], true);
+        assert_eq!(body["owner"], 1);
+        assert_eq!(body["round"], 4);
+        {
+            ctx.status.lock().unwrap().executor_ready = false;
+        }
+        assert_eq!(readiness(&ctx).0, 503);
+        ctx.status.lock().unwrap().executor_ready = true;
+        ctx.status.lock().unwrap().executor.as_mut().unwrap().fenced = false;
+        assert_eq!(readiness(&ctx).0, 503);
+        ctx.status.lock().unwrap().executor.as_mut().unwrap().fenced = true;
+        ctx.status.lock().unwrap().shutting_down = true;
+        assert_eq!(readiness(&ctx).0, 503, "停机收尾仍有许可，但不应持有 VIP");
+        ctx.status.lock().unwrap().shutting_down = false;
+        ctx.status.lock().unwrap().id = 3;
+        ctx.status.lock().unwrap().role = "Leader".into();
+        assert_eq!(readiness(&ctx).0, 503, "控制 Leader 不等于设备 owner");
+        ctx.status.lock().unwrap().id = 1;
+        ctx.status.lock().unwrap().executor.as_mut().unwrap().round = 5;
+        assert_eq!(readiness(&ctx).0, 503, "旧轮次许可不能授权新 owner");
+        ctx.status.lock().unwrap().executor.as_mut().unwrap().round = 4;
+        permission.close(4);
+        assert_eq!(readiness(&ctx).0, 503, "关闭许可立即反映到 HTTP");
+        assert!(permission.renew(
+            5,
+            Phase::Serving,
+            Instant::now() + Duration::from_millis(30)
+        ));
+        ctx.status.lock().unwrap().executor.as_mut().unwrap().round = 5;
+        assert_eq!(readiness(&ctx).0, 200);
+        thread::sleep(Duration::from_millis(40));
+        assert_eq!(readiness(&ctx).0, 503, "状态快照未刷新也不能延长许可");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn range_forms() {

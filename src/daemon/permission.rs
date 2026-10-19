@@ -56,13 +56,19 @@ impl Permission {
     }
 
     pub fn allows(&self, round: u64, phase: Phase) -> bool {
+        self.deadline(round, phase).is_some()
+    }
+
+    /// 返回仍有效的截止时间，供内核 VIP 地址寿命使用；不得据此延长许可。
+    pub fn deadline(&self, round: u64, phase: Phase) -> Option<Instant> {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .is_some_and(|g| {
+            .filter(|g| {
                 g.round == round && !g.closed && g.phase == phase && g.deadline > Instant::now()
             })
+            .map(|g| g.deadline)
     }
 
     pub fn close(&self, round: u64) {

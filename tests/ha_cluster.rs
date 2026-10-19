@@ -161,6 +161,11 @@ fn an_unusable_active_path_yields_even_when_a_fresh_probe_finds_an_alternate_pat
     scenario(9);
 }
 
+#[test]
+fn strict_vip_waits_for_old_follower_owner_withdrawal_across_a_raft_partition() {
+    scenario(10);
+}
+
 fn scenario(case: u8) {
     let dir = std::env::temp_dir().join(format!("ha-coordinator-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&dir).unwrap();
@@ -333,7 +338,7 @@ fn scenario(case: u8) {
             wait_timeout: Duration::from_secs(2),
         });
         tape_rs::daemon::http::serve(&addr, ctx).unwrap();
-        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        let mut stream = std::net::TcpStream::connect(&addr).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
@@ -348,8 +353,191 @@ fn scenario(case: u8) {
         assert_eq!(body["leader"], 3);
         assert_eq!(body["owner"], owner);
         assert_eq!(body["leader_url"], "http://127.0.0.1:18002");
+        fn ready(addr: &str) -> bool {
+            let mut stream = std::net::TcpStream::connect(addr).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .write_all(b"GET /readyz HTTP/1.1\r\nHost: test\r\n\r\n")
+                .unwrap();
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).unwrap();
+            reply.starts_with("HTTP/1.1 200")
+        }
+        assert!(!ready(&addr), "无设备的控制 Leader 不具备 VIP 资格");
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let owner_addr = socket.local_addr().unwrap().to_string();
+        drop(socket);
+        tape_rs::daemon::http::serve(
+            &owner_addr,
+            Arc::new(tape_rs::daemon::http::HttpContext {
+                files: services[&owner].clone(),
+                status: statuses[&owner].clone(),
+                exec: Mutex::new(execs[&owner].clone()),
+                node: Mutex::new(peers[&owner].clone()),
+                client_addrs: HashMap::new(),
+                wait_timeout: Duration::from_secs(2),
+            }),
+        )
+        .unwrap();
+        let until = Instant::now() + Duration::from_secs(3);
+        while !ready(&owner_addr) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            ready(&owner_addr),
+            "真实 Raft 许可发布后 follower owner 应具备 VIP 资格"
+        );
+        assert!(
+            services[&owner].serving_round().is_none(),
+            "尚未分配磁带也必须保留 HTTP 入口"
+        );
     }
-    if success && ((1..=4).contains(&case) || case >= 6) {
+    if success && case == 10 {
+        use tape_rs::daemon::state::Command;
+        let old = first.as_ref().unwrap();
+        let address = "192.0.2.100".parse().unwrap();
+        let wait_vip = |node: u64, round: u64| {
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                let record = statuses[&3].lock().unwrap().vips.get(&address).cloned();
+                if let Some(record) = record
+                    && record
+                        .holder
+                        .as_ref()
+                        .is_some_and(|h| h.node == node && h.round == round)
+                {
+                    return record.token;
+                }
+                assert!(Instant::now() < until, "VIP 预约必须经过真实 Raft 提交");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        peers[&old.node]
+            .send(NodeInput::Vip(Command::VipAcquire {
+                address,
+                node: old.node,
+                round: old.round,
+                expected_token: 0,
+            }))
+            .unwrap();
+        let token = wait_vip(old.node, old.round);
+        let other = if old.node == 1 { 2 } else { 1 };
+        fc[&other].store(true, Ordering::SeqCst);
+        isolated.lock().unwrap().insert(old.node);
+        let until = Instant::now() + Duration::from_secs(8);
+        let new = loop {
+            let state = statuses[&3].lock().unwrap().clone();
+            if state.executor_ready
+                && let Some(new) = state
+                    .executor
+                    .filter(|e| e.node == other && e.round > old.round)
+            {
+                break new;
+            }
+            assert!(Instant::now() < until, "其他候选应完成设备接管");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        peers[&new.node]
+            .send(NodeInput::Vip(Command::VipAcquire {
+                address,
+                node: new.node,
+                round: new.round,
+                expected_token: token,
+            }))
+            .unwrap();
+        // 新节点不允许替旧节点伪造撤址确认，即使两者已知同一 token。
+        peers[&new.node]
+            .send(NodeInput::Vip(Command::VipRelease {
+                address,
+                node: old.node,
+                round: old.round,
+                token,
+            }))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            wait_vip(old.node, old.round),
+            token,
+            "失联/时间/新 owner ready 都不能清除旧占用"
+        );
+        isolated.lock().unwrap().remove(&old.node);
+        peers[&old.node]
+            .send(NodeInput::Vip(Command::VipRelease {
+                address,
+                node: old.node,
+                round: old.round,
+                token,
+            }))
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut next_retry = Instant::now();
+        while statuses[&3].lock().unwrap().vips[&address].holder.is_some() {
+            assert!(Instant::now() < until);
+            if Instant::now() >= next_retry {
+                peers[&old.node]
+                    .send(NodeInput::Vip(Command::VipRelease {
+                        address,
+                        node: old.node,
+                        round: old.round,
+                        token,
+                    }))
+                    .unwrap();
+                next_retry = Instant::now() + Duration::from_millis(200);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        peers[&new.node]
+            .send(NodeInput::Vip(Command::VipAcquire {
+                address,
+                node: new.node,
+                round: new.round,
+                expected_token: token,
+            }))
+            .unwrap();
+        let new_token = wait_vip(new.node, new.round);
+        peers[&old.node]
+            .send(NodeInput::Vip(Command::VipRelease {
+                address,
+                node: old.node,
+                round: old.round,
+                token,
+            }))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            wait_vip(new.node, new.round),
+            new_token,
+            "迟到释放不能撤销新授权"
+        );
+        peers[&new.node].send(NodeInput::Shutdown).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !joins[new.node as usize - 1].0.is_finished(),
+            "计划停机须继续驱动 Raft，等 VIP 撤址确认提交再退出"
+        );
+        peers[&new.node]
+            .send(NodeInput::Vip(Command::VipRelease {
+                address,
+                node: new.node,
+                round: new.round,
+                token: new_token,
+            }))
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while statuses[&new.node]
+            .lock()
+            .unwrap()
+            .vips
+            .get(&address)
+            .is_none_or(|r| r.holder.is_some())
+        {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    if success && ((1..=4).contains(&case) || case >= 6) && case != 10 {
         let old = first.as_ref().unwrap();
         if case == 4 || case >= 6 {
             use tape_rs::daemon::state::Command;

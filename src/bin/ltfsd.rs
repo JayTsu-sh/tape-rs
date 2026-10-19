@@ -7,6 +7,7 @@
 //!         --drive-serial IBMtaper2287 --drive-serial IBMtaper3D5E --demo-write
 
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
@@ -21,6 +22,7 @@ use tape_rs::daemon::http::{self, HttpContext};
 use tape_rs::daemon::net::{NodeInput, TcpNet};
 use tape_rs::daemon::node::{self, CoordinationConfig, NodeConfig, NodeStatus};
 use tape_rs::daemon::store::RaftStore;
+use tape_rs::daemon::vip::{HttpVip, VipConfig};
 
 #[derive(Parser)]
 #[command(
@@ -76,6 +78,12 @@ struct Args {
     /// 客户端接口（HTTP）的监听地址。不给则不开
     #[arg(long)]
     client_listen: Option<String>,
+    /// 同子网 HTTP IPv4 VIP，由有效设备 owner 持有；不给则不管理地址
+    #[arg(long, requires_all = ["http_vip_interface", "client_listen"])]
+    http_vip: Option<Ipv4Addr>,
+    /// HTTP VIP 所在以太网接口，各节点可不同（最多 13 字节）
+    #[arg(long, requires = "http_vip")]
+    http_vip_interface: Option<String>,
     /// 各节点客户端接口的端口，用来在 503 里给出 Leader 地址（主机取自 --peer）
     #[arg(long, default_value_t = 7401)]
     client_port: u16,
@@ -149,6 +157,24 @@ fn main() {
         eprintln!("--peer 必须列出包含本节点在内的至少三个成员");
         std::process::exit(2);
     }
+    let mut http_vip = args.http_vip.map(|address| {
+        let config = VipConfig {
+            address,
+            interface: args.http_vip_interface.clone().expect("VIP 接口"),
+        };
+        config
+            .validate(
+                args.client_listen.as_deref().expect("HTTP 监听地址"),
+                Duration::from_millis(args.execution_permit_ms),
+            )
+            .and_then(|()| {
+                HttpVip::prepare(config, Duration::from_millis(args.execution_permit_ms))
+            })
+            .unwrap_or_else(|e| {
+                eprintln!("HTTP VIP 配置失败：{e}");
+                std::process::exit(2);
+            })
+    });
     let mut ids: Vec<u64> = peers.keys().copied().collect();
     ids.sort();
     std::fs::create_dir_all(&args.data_dir).expect("创建数据目录");
@@ -229,6 +255,10 @@ fn main() {
         changer_serial: args.changer_serial.clone(),
         drive_serials: args.drive_serials.clone(),
     });
+    let provider = match http_vip.as_ref() {
+        Some(vip) => vip.guard_provider(provider),
+        None => provider,
+    };
     let eopts = ExecOptions {
         node_id: args.id,
         interval: Duration::from_millis(args.interval_ms),
@@ -322,6 +352,10 @@ fn main() {
             wait_timeout: Duration::from_secs(600),
         });
         http::serve(listen, ctx).expect("启动客户端接口");
+        if let Some(vip) = http_vip.as_mut() {
+            vip.start(status.clone(), files.clone(), inbox_tx.clone())
+                .expect("启动 HTTP VIP");
+        }
     }
     install_signal_handler(inbox_tx.clone());
     if let Err(e) = node::run_with(
@@ -335,6 +369,7 @@ fn main() {
         status,
     ) {
         eprintln!("ltfsd 退出: {}", e);
+        drop(http_vip);
         std::process::exit(1);
     }
 }

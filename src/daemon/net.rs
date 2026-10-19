@@ -28,6 +28,8 @@ use crate::error::{Result, TapeError};
 pub enum NodeInput {
     Raft(Box<Message>),
     Exec(ExecEvent),
+    /// 本机 VIP 网络线程的幂等预约/撤址确认；经 Raft 转交 Leader，不走 HTTP 管理入口。
+    Vip(super::state::Command),
     /// 管理命令：由 Leader 提交到日志，应用后经 `reply` 回结论。
     Admin {
         cmd: super::state::Command,

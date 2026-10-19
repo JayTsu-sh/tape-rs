@@ -2,7 +2,9 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Current handoff (2026-09-25)
+## Current handoff (2026-10-19)
+
+Active development uses `main` in `/work/jay/tape-rs`; the former `ltfs-recovery-ibm-interop` worktree has been migrated. Start with `AGENTS.md` and the latest entry in `.scratch/ltfs-ha/handoff-to-codex.md`. Older dated notes below describe historical environments, not the current deployment.
 
 Before continuing LTFS interoperability, FUSE, reclaim, or Holo/LE work, read [`docs/CLAUDE-HANDOFF.md`](docs/CLAUDE-HANDOFF.md) for the current branch, deployed versions, isolated media state, latest verification, unresolved findings, and next safe step. Detailed evidence is indexed in `.scratch/ltfs-ha/handoff-to-codex.md` and its linked reports.
 
@@ -16,7 +18,7 @@ CLI tool that controls an IBM TS4300 (labelled `IBM 3573-TL`) tape library by se
 
 ## Remote dev workflow
 
-The active development branch is `ltfs-recovery-ibm-interop`, with GitHub remote `origin` configured. Commit related source, tests, and handoff docs on this branch and push it when requested. Holo/LE test deployment is separate from GitHub: first read the current handoff and the hardware safety rules below, build for the lab hosts, and deploy only to the isolated test cluster unless the task explicitly asks to change the formal cluster. The physical TS4300 is unavailable; lab hardware validation uses Holo VTL.
+The active development branch is `main` in `/work/jay/tape-rs`, with GitHub remote `origin` configured. Commit related source, tests, and handoff docs on this branch and push it when requested. Lab deployment is separate from GitHub: first read the latest handoff and the hardware safety rules below, build for the lab hosts, and deploy only to the isolated test cluster unless the task explicitly asks to change the formal cluster. Hardware availability and device identities come from the latest handoff and live preflight, not the historical inventory below.
 
 The `10.128.54.118` SCP setup is historical, not the active Holo workflow. Use the current handoff for lab host paths and isolated-cluster procedures.
 
