@@ -17,7 +17,7 @@
 //! DELETE /admin/tapes/<barcode>                 解除归属
 //! POST /admin/tapes/<barcode>/reclaim           回收：把带上还活着的文件搬到同池其他带，再重新格式化它
 //!
-//! 不在服务的节点一律返回 503，并在 JSON 里给出它所知的 Leader 地址。
+//! 数据请求不在服务时返回 503，提示设备 owner 地址；管理请求仍提示控制 Leader。
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -42,7 +42,7 @@ pub struct HttpContext {
     pub exec: Mutex<Sender<ExecRequest>>,
     /// 通往 Raft 循环，用来提交管理命令
     pub node: Mutex<Sender<NodeInput>>,
-    /// 节点编号 → 客户端接口地址，用来给出 Leader 提示
+    /// 节点编号 → 客户端接口地址，用来给出控制 Leader / 数据 owner 提示
     pub client_addrs: HashMap<u64, String>,
     pub wait_timeout: Duration,
 }
@@ -191,16 +191,19 @@ fn percent_decode(s: &str) -> String {
 fn service_error(conn: &mut TcpStream, ctx: &HttpContext, e: ServiceError) -> std::io::Result<()> {
     match e {
         ServiceError::NotServing(why) => {
-            let leader = ctx.status.lock().unwrap_or_else(|e| e.into_inner()).leader;
+            let status = ctx.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let leader = status.leader;
+            let owner = status.executor.as_ref().map(|e| e.node);
             let url = ctx
                 .client_addrs
-                .get(&leader)
+                .get(&owner.unwrap_or(0))
                 .map(|a| format!("http://{}", a));
             respond_json(
                 conn,
                 503,
                 "Service Unavailable",
-                json!({"error": "not_serving", "detail": why, "leader": leader, "leader_url": url}),
+                // leader_url 保持旧客户端的重定向字段；数据请求指向 owner，不是控制 Leader。
+                json!({"error": "not_serving", "detail": why, "leader": leader, "owner": owner, "owner_url":url, "leader_url": url}),
             )
         }
         ServiceError::SwitchingTape(why) => {
@@ -492,6 +495,8 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                 json!({
                     "id": s.id, "role": s.role, "term": s.term, "leader": s.leader, "local": s.local,
                     "executor": s.executor.map(|e| json!({"node": e.node, "round": e.round, "fenced": e.fenced})),
+                    "executor_ready":s.executor_ready,
+                    "candidates":s.candidates.iter().map(|(id,c)|json!({"node":id,"instance":c.instance,"group":c.group,"drives":c.drives,"eligible":c.eligible})).collect::<Vec<_>>(),
                     "serving_round": ctx.files.serving_round(),
                     "drives": s.drives,
                     "last_reclaim": s.last_reclaim.map(|r| json!({"round": r.round, "barcode": r.barcode, "outcome": r.outcome, "detail": r.detail})),

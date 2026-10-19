@@ -304,7 +304,7 @@ fn append_records_md5_and_sha256_and_verify_detects_corruption() {
 fn symlink_is_followed_on_read_like_ee_layout() {
     use tape_rs::ltfs::volume::HashVerdict;
 
-    let (_lib, dev) = formatted_drive();
+    let (lib, dev) = formatted_drive();
     let data = payload(100_000, 3);
     {
         let mut vol = LtfsVolume::mount(&dev).unwrap();
@@ -323,8 +323,25 @@ fn symlink_is_followed_on_read_like_ee_layout() {
     assert_eq!(out, data);
     assert_eq!(
         vol.verify_file("gpfs/fs1/a.bin").unwrap(),
-        HashVerdict::NoHash
+        HashVerdict::Match { algo: "sha256sum" }
     );
+    let block = vol.index().find_file(".LTFSEE_DATA/obj-1").unwrap().extents[0].start_block;
+    lib.with_cartridge_mut(BARCODE, |cart| {
+        if let tape_rs::scsi::sim::LogicalObject::Record(bytes) =
+            &mut cart.partitions[1].objects[block as usize]
+        {
+            bytes[0] ^= 1;
+        } else {
+            panic!("expected data record");
+        }
+    });
+    assert!(matches!(
+        vol.verify_file("gpfs/fs1/a.bin").unwrap(),
+        HashVerdict::Mismatch {
+            algo: "sha256sum",
+            ..
+        }
+    ));
     let err = vol
         .read_file_to_writer("gpfs/escape", &mut Vec::new())
         .unwrap_err();
@@ -552,6 +569,230 @@ fn read_rejects_a_premature_filemark() {
         .read_file_to_writer("truncated", &mut std::io::sink())
         .unwrap_err();
     assert!(err.to_string().contains("提前结束"), "{err}");
+}
+
+// 每个 extent 都引用同一个短记录的不同片段，布局来自模拟介质上的 Full 索引。
+fn drive_with_extent_layout(
+    length: u64,
+    layout: &[(u64, u64, u64)],
+) -> (SimLibrary, tape_rs::scsi::sim::SimTransport) {
+    use tape_rs::ltfs::index::{Extent, LtfsIndex};
+    use tape_rs::scsi::sim::LogicalObject;
+
+    let (lib, dev) = formatted_drive();
+    let mut vol = LtfsVolume::mount(&dev).unwrap();
+    vol.append_file("layout", &mut Cursor::new(b"xxABCyyDEFzz"))
+        .unwrap();
+    vol.commit().unwrap();
+    let start_block = vol.index().find_file("layout").unwrap().extents[0].start_block;
+    drop(vol);
+    lib.with_cartridge_mut(BARCODE, |cart| {
+        for partition in &mut cart.partitions {
+            for object in &mut partition.objects {
+                if let LogicalObject::Record(record) = object
+                    && let Ok(mut index) = LtfsIndex::parse(record)
+                    && let Some(file) = index.root.files.iter_mut().find(|f| f.name == "layout")
+                {
+                    file.length = length;
+                    file.extents = layout
+                        .iter()
+                        .map(|&(file_offset, byte_offset, byte_count)| Extent {
+                            partition: 'b',
+                            start_block,
+                            byte_offset,
+                            byte_count,
+                            file_offset,
+                        })
+                        .collect();
+                    *record = index.to_xml().unwrap().to_vec();
+                }
+            }
+        }
+    });
+    (lib, dev)
+}
+
+#[test]
+fn read_extent_layout_rejects_gaps_overlap_and_wrong_order_before_output() {
+    for (case, layout) in [
+        ("leading gap", [(1, 2, 3), (4, 7, 3)]),
+        ("gap after prefix", [(0, 2, 3), (4, 7, 3)]),
+        ("overlap after prefix", [(0, 2, 3), (2, 7, 3)]),
+        ("wrong order", [(3, 7, 3), (0, 2, 3)]),
+    ] {
+        let (_lib, dev) = drive_with_extent_layout(6, &layout);
+        let vol = LtfsVolume::mount(&dev).unwrap();
+        let mut out = Vec::new();
+        let result = vol.read_file_to_writer("layout", &mut out);
+        assert!(out.is_empty(), "{case}: 已输出 {out:?}, {result:?}");
+        assert!(
+            matches!(result, Err(TapeError::Ltfs(_))),
+            "{case}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn read_extent_layout_rejects_overflow_before_output() {
+    for (case, layout) in [
+        ("file offset overflow", [(0, 2, 3), (3, 7, u64::MAX)]),
+        ("byte offset overflow", [(0, 2, 3), (3, u64::MAX, 3)]),
+    ] {
+        let (_lib, dev) = drive_with_extent_layout(6, &layout);
+        let vol = LtfsVolume::mount(&dev).unwrap();
+        let mut out = Vec::new();
+        let result = vol.read_file_to_writer("layout", &mut out);
+        assert!(out.is_empty(), "{case}: 已输出 {out:?}, {result:?}");
+        assert!(
+            matches!(result, Err(TapeError::Ltfs(_))),
+            "{case}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn read_extent_layout_rejects_length_mismatch_before_output() {
+    for length in [5, 7] {
+        let (_lib, dev) = drive_with_extent_layout(length, &[(0, 2, 3), (3, 7, 3)]);
+        let vol = LtfsVolume::mount(&dev).unwrap();
+        let mut out = Vec::new();
+        let result = vol.read_file_to_writer("layout", &mut out);
+        assert!(
+            out.is_empty(),
+            "length={length}: 已输出 {out:?}, {result:?}"
+        );
+        assert!(matches!(result, Err(TapeError::Ltfs(_))), "{result:?}");
+    }
+}
+
+#[test]
+fn read_extent_layout_accepts_contiguous_extents_with_nonzero_byte_offsets() {
+    let (_lib, dev) = drive_with_extent_layout(6, &[(0, 2, 3), (3, 7, 3)]);
+    let vol = LtfsVolume::mount(&dev).unwrap();
+    let mut out = Vec::new();
+    assert_eq!(vol.read_file_to_writer("layout", &mut out).unwrap(), 6);
+    assert_eq!(out, b"ABCDEF");
+}
+
+#[test]
+fn read_rejects_unknown_partition_before_output_or_device_position_change() {
+    use tape_rs::ltfs::index::LtfsIndex;
+    use tape_rs::scsi::sim::LogicalObject;
+    use tape_rs::tape::commands::TapeDrive;
+
+    for bad_extent in [0, 1] {
+        let (lib, dev) = drive_with_extent_layout(6, &[(0, 2, 3), (3, 7, 3)]);
+        lib.with_cartridge_mut(BARCODE, |cart| {
+            for partition in &mut cart.partitions {
+                for object in &mut partition.objects {
+                    if let LogicalObject::Record(record) = object
+                        && let Ok(mut index) = LtfsIndex::parse(record)
+                        && let Some(file) = index.root.files.iter_mut().find(|f| f.name == "layout")
+                    {
+                        file.extents[bad_extent].partition = 'z';
+                        *record = index.to_xml().unwrap().to_vec();
+                    }
+                }
+            }
+        });
+        let vol = LtfsVolume::mount(&dev).unwrap();
+        let drive = TapeDrive::new(&dev);
+        let before = drive.read_position().unwrap();
+        let mut out = Vec::new();
+        let result = vol.read_file_to_writer("layout", &mut out);
+        assert!(
+            matches!(&result, Err(TapeError::Ltfs(message)) if message.contains("partition") && message.contains('z')),
+            "extent {bad_extent}: {result:?}, output {out:?}"
+        );
+        assert!(out.is_empty(), "extent {bad_extent}: {out:?}");
+        let after = drive.read_position().unwrap();
+        assert_eq!(
+            (after.partition, after.block_number),
+            (before.partition, before.block_number)
+        );
+    }
+}
+
+#[test]
+fn read_uses_label_partition_names_for_both_physical_partitions() {
+    use tape_rs::ltfs::index::LtfsIndex;
+    use tape_rs::ltfs::label::LtfsLabel;
+    use tape_rs::scsi::sim::LogicalObject;
+
+    let (lib, dev) = drive_with_extent_layout(6, &[(0, 2, 3), (3, 7, 3)]);
+    lib.with_cartridge_mut(BARCODE, |cart| {
+        for partition in &mut cart.partitions {
+            for object in &mut partition.objects {
+                if let LogicalObject::Record(record) = object {
+                    if let Ok(mut label) = LtfsLabel::parse(record) {
+                        label.index_partition = 'x';
+                        label.data_partition = 'z';
+                        label.location = if label.location == 'a' { 'x' } else { 'z' };
+                        *record = label.to_xml().unwrap().to_vec();
+                    } else if let Ok(mut index) = LtfsIndex::parse(record) {
+                        index.self_location.partition = if index.self_location.partition == 'a' {
+                            'x'
+                        } else {
+                            'z'
+                        };
+                        if let Some(previous) = &mut index.previous_location {
+                            previous.partition = 'z';
+                        }
+                        if let Some(file) = index.root.files.iter_mut().find(|f| f.name == "layout")
+                        {
+                            file.extents[0].partition = 'x';
+                            file.extents[1].partition = 'z';
+                        }
+                        *record = index.to_xml().unwrap().to_vec();
+                    }
+                }
+            }
+        }
+    });
+    let vol = LtfsVolume::mount(&dev).unwrap();
+    assert_eq!(
+        (vol.label().index_partition, vol.label().data_partition),
+        ('x', 'z')
+    );
+    assert!(
+        !vol.writable(),
+        "index partition data must remain read-only"
+    );
+    let block = vol.index().find_file("layout").unwrap().extents[0].start_block as usize;
+    // Deliberately different bytes in physical partition 0 expose misrouting
+    // to partition 1 even when both partitions contain readable records.
+    lib.with_cartridge_mut(BARCODE, |cart| {
+        cart.partitions[0]
+            .objects
+            .resize(block + 1, LogicalObject::Filemark);
+        cart.partitions[0].objects[block] = LogicalObject::Record(b"xxIP!yyDEFzz".to_vec());
+    });
+    let mut out = Vec::new();
+    assert_eq!(vol.read_file_to_writer("layout", &mut out).unwrap(), 6);
+    assert_eq!(out, b"IP!DEF");
+}
+
+#[test]
+fn read_rejects_byte_offset_outside_actual_first_record_without_skipping_it() {
+    use tape_rs::scsi::sim::LogicalObject;
+
+    // The first record is 12 bytes; block_size is 64 KiB. A following record
+    // must never supply data for an offset outside that first record.
+    for offset in [12, 13, 65_535] {
+        let (lib, dev) = drive_with_extent_layout(3, &[(0, offset, 3)]);
+        let vol = LtfsVolume::mount(&dev).unwrap();
+        let block = vol.index().find_file("layout").unwrap().extents[0].start_block;
+        lib.with_cartridge_mut(BARCODE, |cart| {
+            cart.partitions[1].objects[block as usize + 1] = LogicalObject::Record(b"BAD".to_vec());
+        });
+        let mut out = Vec::new();
+        let result = vol.read_file_to_writer("layout", &mut out);
+        assert!(
+            result.is_err(),
+            "offset {offset}: {result:?}, bytes {out:?}"
+        );
+        assert!(out.is_empty(), "offset {offset}: {out:?}");
+    }
 }
 
 #[test]

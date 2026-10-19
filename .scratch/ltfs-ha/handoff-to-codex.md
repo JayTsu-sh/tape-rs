@@ -559,3 +559,14 @@ v2兼容构建进行中（exec85753）；下一步部署到独立bin-v2，不覆
 硬件事件1：大索引DP commit后sg5路径lpfc devloss；用同一TS4300备用sg3、原round/key完成两轮读、checkpoint、归槽和PR释放，未重放65MiB append。硬件事件2：LE成功后post-LE Rust冷读在LOAD上收到host status0x000d，随后HH8/changer ENXIO并从lsscsi消失；WWPN50:00:e1:11:70:18:60:70 devloss。当前host15/host16均Linkdown，无设备/FUSE/LE进程。AA0013物理位置和PR须等链路恢复后核实，不能猜测或盲重试。
 
 链路恢复后：按VPD重新解析sg节点；先库存/PR核查，用失败round202610140130接续清场或确认无旧key后新round；再跑post-LE两轮四文件SHA；最后确认drive空、AA13/AA00槽1/2、两设备无PR、mode状态。远端失败证据 `post-le-native.stderr` 与kernel journal必须保留。
+
+
+## 2026-10-19 — 主分支交付：HA、LE互通与自适应合批索引
+
+本次发布从 GitHub origin/main 的 0cc1042 合并历史接续，整合当前已验证的源码、回归测试与正式文档。实现包括库管理及任务调度、控制/设备所有者协调与执行许可、EE同代恢复索引互通、挂载会话复用，以及根据实际索引块数选择 Full/增量的 sync_batch。保持现有持久化屏障、VCI 与设备预留保护；显式增量接口保留，链上限不放宽。
+
+发布前在仅含已提交文件的干净工作树复核：cargo fmt、cargo test（390通过、2忽略）、example探针测试（3通过）、cargo check --all-targets、cargo clippy --all-targets --all-features。原始EE XML夹具按采集字节保留，其中DP57末尾空行未作格式归一化。正式行为及测量边界见 docs/library.md 与 docs/research/raft-ha-evidence.md。
+
+隔离实机验证了自适应Full和增量两条库路径，64个文件经存储哈希或外部SHA-256实读核验，介质已归槽并恢复EE实际双PR。新ltfsd构建未替换正式服务；此前完整HA故障矩阵对应原e9fd构建，不能当作本次新构建的完整HA复验。测试日志、临时脚本和原始现场产物保留在本地验证工作树，不作为源码编译依赖。
+
+本机接续仍使用 /work/jay/tape-rs-ltfs-recovery-ibm-interop 的 ltfs-recovery-ibm-interop 分支，提交以 git log -1 为准；GitHub交付目标为main，未改动另一个feature/docs工作树。现场无在途任务或新增临时SSH密钥。后续按新任务推进，不重跑已消费的现场one-shot标记。

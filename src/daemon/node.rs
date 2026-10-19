@@ -1,7 +1,7 @@
 //! Raft 循环：驱动 raft-rs，应用已提交的控制命令，并据此指挥设备执行线程。
 
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -11,6 +11,7 @@ use raft::{Config, RawNode, StateRole, Storage as _};
 use serde_json::json;
 use slog::Drain;
 
+use super::coordinator::Coordinator;
 use super::directory::{Directory, PoolRow};
 use super::executor::{ExecEvent, ExecRequest};
 use super::net::{AdminReply, DirectoryFetch, Network, NodeInput};
@@ -38,6 +39,16 @@ pub struct NodeConfig {
     /// 本节点配置的驱动器数。回收需要两台（一台放写入带、一台放源带），
     /// 不够时 Leader 在受理阶段就同步拒绝，不进日志。
     pub drives: usize,
+    /// 新的控制/执行分离协议。None 仅保留原公开调用者的旧协议行为。
+    pub coordination: Option<CoordinationConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoordinationConfig {
+    /// 同一受管逻辑库的精确设备集合标识，各节点必须一致。
+    pub group: String,
+    /// 从 ReadIndex 请求发起到许可失效的最大时长，不改变任何设备超时。
+    pub validity: Duration,
 }
 
 /// 对外可见的节点状态快照。
@@ -48,6 +59,8 @@ pub struct NodeStatus {
     pub term: u64,
     pub leader: u64,
     pub executor: Option<Executor>,
+    pub executor_ready: bool,
+    pub candidates: std::collections::BTreeMap<u64, super::state::Candidate>,
     /// 本节点执行线程的最新状态
     pub local: String,
     pub applied_index: u64,
@@ -165,26 +178,46 @@ pub fn run_with(
     let mut last_reclaim: Option<ReclaimRecord> = None;
     let mut next_tick = Instant::now() + cfg.tick;
     let mut last_status = String::new();
+    let mut shutdown: Option<(Instant, Receiver<()>)> = None;
+    let mut coordinator = cfg
+        .coordination
+        .clone()
+        .map(|c| Coordinator::new(cfg.id, store.next_instance()?, c, cfg.cooldown, &exec))
+        .transpose()?;
 
     loop {
-        let wait = next_tick.saturating_duration_since(Instant::now());
-        match inbox.recv_timeout(wait) {
-            Ok(NodeInput::Shutdown) => {
-                // 等执行线程把队列落带、退带、放掉预留，再让进程退出。等不到就照常退：
-                // 不释放预留是安全的，下一个执行者会抢占。
-                let (done, wait_done) = std::sync::mpsc::channel();
-                if exec
-                    .send(ExecRequest::Shutdown { done: Some(done) })
-                    .is_ok()
-                    && wait_done.recv_timeout(cfg.shutdown_grace).is_err()
-                {
+        if let Some((deadline, done)) = &shutdown {
+            match done.try_recv() {
+                Ok(()) | Err(TryRecvError::Disconnected) => {
+                    info!("节点 {} 停机", cfg.id);
+                    return Ok(());
+                }
+                Err(TryRecvError::Empty) if Instant::now() >= *deadline => {
                     warn!(
                         "等执行线程停机超过 {:?}，直接退出；设备上的预留留给下一个执行者抢占",
                         cfg.shutdown_grace
                     );
+                    return Ok(());
                 }
-                info!("节点 {} 停机", cfg.id);
-                return Ok(());
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        let wait = next_tick.saturating_duration_since(Instant::now());
+        match inbox.recv_timeout(wait) {
+            Ok(NodeInput::Shutdown) => {
+                if shutdown.is_some() {
+                    continue;
+                }
+                // 等待期间仍驱动 Raft/ReadIndex，长机械操作不能阻塞多数派许可续期。
+                // 宽限耗尽时退出且保留预留，下一任仍须按正常协议隔离。
+                let (done, wait_done) = std::sync::mpsc::channel();
+                if exec
+                    .send(ExecRequest::Shutdown { done: Some(done) })
+                    .is_err()
+                {
+                    return Ok(());
+                }
+                shutdown = Some((Instant::now() + cfg.shutdown_grace, wait_done));
             }
             Err(RecvTimeoutError::Disconnected) => {
                 let _ = exec.send(ExecRequest::Shutdown { done: None });
@@ -196,16 +229,27 @@ pub fn run_with(
                 }
             }
             Ok(NodeInput::Admin { cmd, reply }) => {
-                if node.raft.state != StateRole::Leader {
+                if shutdown.is_some() {
+                    let _ = reply.send(AdminReply::Rejected(
+                        "节点正在停机，不接受新的管理操作".into(),
+                    ));
+                } else if node.raft.state != StateRole::Leader {
                     let _ = reply.send(AdminReply::NotLeader(node.raft.leader_id));
                 } else if let Command::TapeReclaim { barcode } = &cmd
-                    && cfg.drives < 2
+                    && (if coordinator.is_some() {
+                        ctl.executor
+                            .as_ref()
+                            .and_then(|e| ctl.candidates.get(&e.node))
+                            .map_or(0, |c| c.drives)
+                    } else {
+                        cfg.drives
+                    }) < 2
                 {
                     // 与 EE 一致（GLESL154E）：资源不够是命令期失败，磁带状态不动。
                     // 驱动器数是本节点的事实，进不了状态机，所以在提案之前拦下
                     let _ = reply.send(AdminReply::Rejected(format!(
-                        "回收 {} 需要两台驱动器（一台放写入带，一台放源带），本节点只配置了 {} 台",
-                        barcode, cfg.drives
+                        "回收 {} 需要两台驱动器（一台放写入带，一台放源带），当前设备 owner 资源不足",
+                        barcode
                     )));
                 } else {
                     let id = next_admin;
@@ -260,190 +304,195 @@ pub fn run_with(
                 }
             }
             Ok(NodeInput::Exec(ev)) => {
-                let is_leader = node.raft.state == StateRole::Leader;
-                match ev {
-                    ExecEvent::Fenced { round } if my_round == Some(round) && is_leader => {
-                        local = format!("轮次 {}：全部设备已隔离，等待多数派确认", round);
-                        propose(
-                            &mut node,
-                            &Command::Fenced {
-                                node: cfg.id,
-                                round,
-                            },
-                        );
-                    }
-                    ExecEvent::Fenced { round } => {
-                        info!("轮次 {} 的隔离结果已过时，忽略", round);
-                        let _ = exec.send(ExecRequest::Stop {
-                            round: Some(round),
-                            reason: "隔离完成时已不是该轮的执行者".into(),
-                        });
-                    }
-                    ExecEvent::Committed {
-                        round,
-                        barcode,
-                        volume_uuid,
-                        generation,
-                        files_total,
-                        bytes_used,
-                        bytes_written,
-                        files,
-                        full,
-                    } => {
-                        // 目录记录在卷提交成功之后才进日志。这里失败（不再是 Leader 等）没关系：
-                        // 目录会落后于磁带，下次装载该带时按磁带对账补齐。
-                        let known = ctl
-                            .tape_summary
-                            .get(&barcode)
-                            .map(|t| t.generation)
-                            .unwrap_or(0);
-                        if my_round != Some(round) || !is_leader {
-                            info!(
-                                "{} 第 {} 代的目录记录未写入日志：已不是执行者",
-                                barcode, generation
-                            );
-                        } else if full && known > generation {
-                            // 目录比磁带还新：不应出现（磁带被回退或换了盘）。不改目录，标记该带待核验并告警
-                            warn!(
-                                "{} 目录是第 {} 代，磁带只有第 {} 代：标记待核验，不自动修改",
-                                barcode, known, generation
-                            );
+                if let Some(c) = coordinator.as_mut() {
+                    c.event(ev, &mut node, &ctl, &mut local);
+                } else {
+                    let is_leader = node.raft.state == StateRole::Leader;
+                    match ev {
+                        ExecEvent::Fenced { round } if my_round == Some(round) && is_leader => {
+                            local = format!("轮次 {}：全部设备已隔离，等待多数派确认", round);
                             propose(
                                 &mut node,
-                                &Command::TapeState {
-                                    barcode,
-                                    state: super::state::tape_state::CHECK.to_string(),
+                                &Command::Fenced {
+                                    node: cfg.id,
+                                    round,
                                 },
                             );
-                        } else {
-                            if full {
-                                // 同代也刷新：旧版 catalog 可能缺少原生空目录记录。
+                        }
+                        ExecEvent::Fenced { round } => {
+                            info!("轮次 {} 的隔离结果已过时，忽略", round);
+                            let _ = exec.send(ExecRequest::Stop {
+                                round: Some(round),
+                                reason: "隔离完成时已不是该轮的执行者".into(),
+                            });
+                        }
+                        ExecEvent::Committed {
+                            round,
+                            barcode,
+                            volume_uuid,
+                            generation,
+                            files_total,
+                            bytes_used,
+                            bytes_written,
+                            files,
+                            full,
+                        } => {
+                            // 目录记录在卷提交成功之后才进日志。这里失败（不再是 Leader 等）没关系：
+                            // 目录会落后于磁带，下次装载该带时按磁带对账补齐。
+                            let known = ctl
+                                .tape_summary
+                                .get(&barcode)
+                                .map(|t| t.generation)
+                                .unwrap_or(0);
+                            if my_round != Some(round) || !is_leader {
                                 info!(
-                                    "{} 目录停在第 {} 代，磁带是第 {} 代：以磁带为准重写该带的目录",
+                                    "{} 第 {} 代的目录记录未写入日志：已不是执行者",
+                                    barcode, generation
+                                );
+                            } else if full && known > generation {
+                                // 目录比磁带还新：不应出现（磁带被回退或换了盘）。不改目录，标记该带待核验并告警
+                                warn!(
+                                    "{} 目录是第 {} 代，磁带只有第 {} 代：标记待核验，不自动修改",
                                     barcode, known, generation
                                 );
-                            }
-                            let parts = split_catalog(&files);
-                            for (i, part) in parts.iter().enumerate() {
                                 propose(
                                     &mut node,
-                                    &Command::CatalogPart {
-                                        barcode: barcode.clone(),
+                                    &Command::TapeState {
+                                        barcode,
+                                        state: super::state::tape_state::CHECK.to_string(),
+                                    },
+                                );
+                            } else {
+                                if full {
+                                    // 同代也刷新：旧版 catalog 可能缺少原生空目录记录。
+                                    info!(
+                                        "{} 目录停在第 {} 代，磁带是第 {} 代：以磁带为准重写该带的目录",
+                                        barcode, known, generation
+                                    );
+                                }
+                                let parts = split_catalog(&files);
+                                for (i, part) in parts.iter().enumerate() {
+                                    propose(
+                                        &mut node,
+                                        &Command::CatalogPart {
+                                            barcode: barcode.clone(),
+                                            generation,
+                                            part: i as u32,
+                                            files: part.clone(),
+                                        },
+                                    );
+                                }
+                                propose(
+                                    &mut node,
+                                    &Command::TapeCommitted {
+                                        barcode,
+                                        volume_uuid,
                                         generation,
-                                        part: i as u32,
-                                        files: part.clone(),
+                                        files: files_total,
+                                        bytes_used,
+                                        bytes_written,
+                                        parts: parts.len() as u32,
+                                        full,
                                     },
                                 );
                             }
-                            propose(
-                                &mut node,
-                                &Command::TapeCommitted {
-                                    barcode,
-                                    volume_uuid,
-                                    generation,
-                                    files: files_total,
-                                    bytes_used,
-                                    bytes_written,
-                                    parts: parts.len() as u32,
-                                    full,
-                                },
-                            );
                         }
-                    }
-                    ExecEvent::Reclaimed {
-                        round,
-                        barcode,
-                        volume_uuid,
-                        files,
-                        bytes,
-                    } => {
-                        last_reclaim = Some(ReclaimRecord {
+                        ExecEvent::Reclaimed {
                             round,
-                            barcode: barcode.clone(),
-                            outcome: "done".into(),
-                            detail: format!(
-                                "搬走 {} 个文件 / {} MiB，已重新格式化",
-                                files,
-                                bytes >> 20
-                            ),
-                        });
-                        if my_round == Some(round) && is_leader {
-                            info!(
-                                "磁带 {} 回收完毕：搬走 {} 个文件 / {} MiB，已重新格式化",
-                                barcode,
-                                files,
-                                bytes >> 20
-                            );
-                            propose(
-                                &mut node,
-                                &Command::TapeReclaimed {
+                            barcode,
+                            volume_uuid,
+                            files,
+                            bytes,
+                        } => {
+                            last_reclaim = Some(ReclaimRecord {
+                                round,
+                                barcode: barcode.clone(),
+                                outcome: "done".into(),
+                                detail: format!(
+                                    "搬走 {} 个文件 / {} MiB，已重新格式化",
+                                    files,
+                                    bytes >> 20
+                                ),
+                            });
+                            if my_round == Some(round) && is_leader {
+                                info!(
+                                    "磁带 {} 回收完毕：搬走 {} 个文件 / {} MiB，已重新格式化",
                                     barcode,
-                                    volume_uuid,
-                                },
-                            );
-                        } else {
-                            // 状态仍为 reformatting，新执行者依据持久化的迁出核验，
-                            // 再完成初始化并上报；标签尚未形成也可接续。
-                            warn!(
-                                "{} 的回收结果未写入日志：已不是执行者，由下一任重做收尾",
-                                barcode
-                            );
+                                    files,
+                                    bytes >> 20
+                                );
+                                propose(
+                                    &mut node,
+                                    &Command::TapeReclaimed {
+                                        barcode,
+                                        volume_uuid,
+                                    },
+                                );
+                            } else {
+                                // 状态仍为 reformatting，新执行者依据持久化的迁出核验，
+                                // 再完成初始化并上报；标签尚未形成也可接续。
+                                warn!(
+                                    "{} 的回收结果未写入日志：已不是执行者，由下一任重做收尾",
+                                    barcode
+                                );
+                            }
                         }
-                    }
-                    ExecEvent::TapeState {
-                        round,
-                        barcode,
-                        state,
-                    } => {
-                        if my_round == Some(round) && is_leader {
-                            info!("磁带 {} 状态变为 {}", barcode, state);
-                            propose(&mut node, &Command::TapeState { barcode, state });
-                        }
-                    }
-                    ExecEvent::ReclaimAbandoned {
-                        round,
-                        barcode,
-                        reason,
-                        state,
-                    } => {
-                        last_reclaim = Some(ReclaimRecord {
+                        ExecEvent::TapeState {
                             round,
-                            barcode: barcode.clone(),
-                            outcome: "abandoned".into(),
-                            detail: reason.clone(),
-                        });
-                        if my_round == Some(round) && is_leader {
-                            warn!(
-                                "磁带 {} 的回收已放弃（{}），状态改为 {}",
-                                barcode, reason, state
-                            );
-                            propose(&mut node, &Command::TapeState { barcode, state });
+                            barcode,
+                            state,
+                        } => {
+                            if my_round == Some(round) && is_leader {
+                                info!("磁带 {} 状态变为 {}", barcode, state);
+                                propose(&mut node, &Command::TapeState { barcode, state });
+                            }
                         }
-                    }
-                    ExecEvent::Serving { round, summary } => {
-                        info!("轮次 {} 开始服务：{}", round, summary);
-                        local = format!("轮次 {}：服务中。{}", round, summary);
-                    }
-                    ExecEvent::FenceFailed { round, reason }
-                    | ExecEvent::Lost { round, reason } => {
-                        error!("轮次 {} 放弃：{}", round, reason);
-                        local = format!("轮次 {} 已放弃：{}", round, reason);
-                        last_reclaim = None;
-                        if my_round == Some(round) {
-                            my_round = None;
+                        ExecEvent::ReclaimAbandoned {
+                            round,
+                            barcode,
+                            reason,
+                            state,
+                        } => {
+                            last_reclaim = Some(ReclaimRecord {
+                                round,
+                                barcode: barcode.clone(),
+                                outcome: "abandoned".into(),
+                                detail: reason.clone(),
+                            });
+                            if my_round == Some(round) && is_leader {
+                                warn!(
+                                    "磁带 {} 的回收已放弃（{}），状态改为 {}",
+                                    barcode, reason, state
+                                );
+                                propose(&mut node, &Command::TapeState { barcode, state });
+                            }
                         }
-                        cooldown_until = Instant::now() + cfg.cooldown;
-                        if is_leader {
-                            propose(
-                                &mut node,
-                                &Command::Abandoned {
-                                    node: cfg.id,
-                                    round,
-                                    reason,
-                                },
-                            );
-                            yield_leadership(&mut node, &cfg);
+                        ExecEvent::Serving { round, summary } => {
+                            info!("轮次 {} 开始服务：{}", round, summary);
+                            local = format!("轮次 {}：服务中。{}", round, summary);
                         }
+                        ExecEvent::FenceFailed { round, reason }
+                        | ExecEvent::Lost { round, reason } => {
+                            error!("轮次 {} 放弃：{}", round, reason);
+                            local = format!("轮次 {} 已放弃：{}", round, reason);
+                            last_reclaim = None;
+                            if my_round == Some(round) {
+                                my_round = None;
+                            }
+                            cooldown_until = Instant::now() + cfg.cooldown;
+                            if is_leader {
+                                propose(
+                                    &mut node,
+                                    &Command::Abandoned {
+                                        node: cfg.id,
+                                        round,
+                                        reason,
+                                    },
+                                );
+                                yield_leadership(&mut node, &cfg);
+                            }
+                        }
+                        ExecEvent::Capability { .. } => {}
                     }
                 }
             }
@@ -461,7 +510,9 @@ pub fn run_with(
             // 不再是 Leader：这些命令也许会被新 Leader 提交，也许不会。让请求方自己查询后决定。
             pending_admin.clear();
         }
-        if let Some(r) = my_round.take_if(|_| !is_leader) {
+        if coordinator.is_none()
+            && let Some(r) = my_round.take_if(|_| !is_leader)
+        {
             // 尽早停手。安全性不靠这一步：设备会拒绝陈旧的执行者。
             let _ = exec.send(ExecRequest::Stop {
                 round: Some(r),
@@ -471,7 +522,7 @@ pub fn run_with(
         }
         // 每个任期只提交一次 Takeover。Leader 身份不变时已追加的条目终会提交，重复提交只会
         // 制造多余的轮次；proposed_term 在失去 Leader 身份时清零。
-        if is_leader && claimed_term != Some(term) {
+        if coordinator.is_none() && is_leader && claimed_term != Some(term) {
             // 目录库还没同步回来就接管，stat/list 会漏报快照点之前提交的文件。让别人来。
             if Instant::now() < cooldown_until || directory_pending.is_some() {
                 if last_propose.is_none_or(|t| t.elapsed() > cfg.tick * 5) {
@@ -485,7 +536,16 @@ pub fn run_with(
             }
         }
 
-        let (installed, committed) = on_ready(&mut node, &mut store, net.as_ref())?;
+        if let Some(c) = coordinator.as_mut() {
+            c.tick(
+                &mut node,
+                &ctl,
+                directory_pending.is_none(),
+                &exec,
+                &mut local,
+            );
+        }
+        let (installed, committed, reads) = on_ready(&mut node, &mut store, net.as_ref())?;
         if let Some(snap) = installed {
             // 收到快照：本地日志整段作废，控制状态整体替换。目录库另行拉取。
             let index = snap.get_metadata().index;
@@ -536,6 +596,10 @@ pub fn run_with(
                     _ => AdminReply::Ok("已应用".to_string()),
                 });
             }
+            if let Some(c) = coordinator.as_mut() {
+                c.observe(&ctl);
+                continue;
+            }
             match applied {
                 Applied::NewExecutor(e) if e.node == cfg.id && is_leader && e.term == term => {
                     info!("本节点成为执行者，轮次 {}（任期 {}）", e.round, e.term);
@@ -574,6 +638,9 @@ pub fn run_with(
                 }
                 _ => {}
             }
+        }
+        if let Some(c) = coordinator.as_mut() {
+            c.confirm(reads, &node, &ctl, applied, directory_pending.is_none());
         }
 
         // 日志压缩：攒够了、或者有落后的节点在等快照，就现做一份。
@@ -693,7 +760,7 @@ fn replay_into(
     Ok(())
 }
 
-fn propose(node: &mut RawNode<ControlStorage>, cmd: &Command) -> bool {
+pub(super) fn propose(node: &mut RawNode<ControlStorage>, cmd: &Command) -> bool {
     match node.propose(vec![], cmd.encode()) {
         Ok(()) => true,
         Err(e) => {
@@ -719,10 +786,10 @@ fn on_ready(
     node: &mut RawNode<ControlStorage>,
     store: &mut RaftStore,
     net: &dyn Network,
-) -> Result<(Option<Snapshot>, Vec<Entry>)> {
+) -> Result<(Option<Snapshot>, Vec<Entry>, Vec<raft::ReadState>)> {
     let mut committed = Vec::new();
     if !node.has_ready() {
-        return Ok((None, committed));
+        return Ok((None, committed, Vec::new()));
     }
     let send = |msgs: Vec<Message>| {
         for m in msgs {
@@ -730,6 +797,7 @@ fn on_ready(
         }
     };
     let mut ready = node.ready();
+    let reads = ready.take_read_states();
     send(ready.take_messages());
     // 快照要在日志之前落盘：它会让本地整段日志作废，之后的条目才接得上
     let mut installed = None;
@@ -751,7 +819,7 @@ fn on_ready(
     send(light.take_messages());
     committed.extend(light.take_committed_entries());
     node.advance_apply();
-    Ok((installed, committed))
+    Ok((installed, committed, reads))
 }
 
 fn publish_status(
@@ -771,6 +839,8 @@ fn publish_status(
         term: node.raft.term,
         leader: node.raft.leader_id,
         executor: ctl.executor.clone(),
+        executor_ready: ctl.executor_ready,
+        candidates: ctl.candidates.clone(),
         local: local.to_string(),
         applied_index: ctl.applied_index,
         pools: ctl
@@ -814,6 +884,8 @@ fn publish_status(
     let text = json!({
         "id": st.id, "role": st.role, "term": st.term, "leader": st.leader,
         "executor": st.executor.as_ref().map(|e| json!({"node": e.node, "round": e.round, "term": e.term, "fenced": e.fenced})),
+        "executor_ready": st.executor_ready,
+        "candidates": st.candidates.iter().map(|(id,c)| json!({"node": id,"instance":c.instance,"sequence":c.sequence,"group":c.group,"drives":c.drives,"eligible":c.eligible})).collect::<Vec<_>>(),
         "local": st.local, "applied_index": st.applied_index, "drives": st.drives,
         "last_reclaim": st.last_reclaim.as_ref().map(|r| json!({"round": r.round, "barcode": r.barcode, "outcome": r.outcome, "detail": r.detail})),
         "tapes": st.tapes.iter().map(|(b, t)| json!({"barcode": b, "state": t.state, "generation": t.generation, "files": t.files, "bytes_used": t.bytes_used, "bytes_written": t.bytes_written})).collect::<Vec<_>>(),

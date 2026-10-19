@@ -6,10 +6,45 @@ use serde_json::{Value, json};
 /// 写入 Raft 日志的命令。用 JSON 编码，便于排查和以后扩展。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    /// 执行报告也经过共识，且仅能改变同一实例的当前轮次。
+    ExecutorReport {
+        node: u64,
+        instance: u64,
+        round: u64,
+        sequence: u64,
+        command: Box<Command>,
+    },
+    ExecutorReady {
+        node: u64,
+        round: u64,
+    },
+    /// 节点实例的能力观测；不改变 Raft 成员，也不授予设备访问权。
+    Candidate {
+        node: u64,
+        instance: u64,
+        sequence: u64,
+        group: String,
+        drives: usize,
+        eligible: bool,
+    },
+    /// 控制 Leader 为指定实例申请接管；前态不匹配的迟到请求不生效。
+    AssignExecutor {
+        node: u64,
+        instance: u64,
+        term: u64,
+        expected_round: Option<u64>,
+        group: String,
+    },
     /// 新 Leader 声明接管。它被提交时的日志索引就是该执行者的轮次。
-    Takeover { node: u64, term: u64 },
+    Takeover {
+        node: u64,
+        term: u64,
+    },
     /// 执行者报告：本轮已对全部设备完成隔离并回读确认。
-    Fenced { node: u64, round: u64 },
+    Fenced {
+        node: u64,
+        round: u64,
+    },
     /// 执行者放弃本轮（隔离失败、失去预留、计划移交）。
     Abandoned {
         node: u64,
@@ -23,14 +58,24 @@ pub enum Command {
         file_limit: u64,
     },
     /// 把一盘带（按条码）归入某个池。
-    TapeAssign { barcode: String, pool: String },
+    TapeAssign {
+        barcode: String,
+        pool: String,
+    },
     /// 解除归属。
-    TapeUnassign { barcode: String },
+    TapeUnassign {
+        barcode: String,
+    },
     /// 磁带的追加资格或健康发生变化（执行者在写满、到文件数上限、池标记不符等时上报）。
-    TapeState { barcode: String, state: String },
+    TapeState {
+        barcode: String,
+        state: String,
+    },
     /// 开始回收一盘带：把它上面还活着的文件搬到同池的其他带上，然后重新格式化它。
     /// 只改状态；真正的搬迁由执行者做，中途换届也能从状态里接着干。
-    TapeReclaim { barcode: String },
+    TapeReclaim {
+        barcode: String,
+    },
     /// 回收完成：源带已重新格式化。这是唯一允许摘要代数回退的地方（带真的被重写了）。
     TapeReclaimed {
         barcode: String,
@@ -97,6 +142,37 @@ pub fn split_catalog(files: &[FileRec]) -> Vec<Vec<FileRec>> {
 impl Command {
     pub fn encode(&self) -> Vec<u8> {
         let v = match self {
+            Command::ExecutorReport {
+                node,
+                instance,
+                round,
+                sequence,
+                command,
+            } => {
+                json!({"op":"executor_report","node":node,"instance":instance,"round":round,"sequence":sequence,"command":serde_json::from_slice::<Value>(&command.encode()).expect("控制命令 JSON")})
+            }
+            Command::ExecutorReady { node, round } => {
+                json!({"op":"executor_ready","node":node,"round":round})
+            }
+            Command::Candidate {
+                node,
+                instance,
+                sequence,
+                group,
+                drives,
+                eligible,
+            } => {
+                json!({"op":"candidate", "node":node, "instance":instance, "sequence":sequence, "group":group, "drives":drives, "eligible":eligible})
+            }
+            Command::AssignExecutor {
+                node,
+                instance,
+                term,
+                expected_round,
+                group,
+            } => {
+                json!({"op":"assign_executor", "node":node, "instance":instance, "term":term, "expected_round":expected_round, "group":group})
+            }
             Command::Takeover { node, term } => {
                 json!({"op": "takeover", "node": node, "term": term})
             }
@@ -161,6 +237,57 @@ impl Command {
         let v: Value = serde_json::from_slice(data).ok()?;
         let text = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
         match v.get("op")?.as_str()? {
+            "executor_report" => {
+                let inner = v.get("command")?;
+                // 不递归接收任意嵌套，避免网络输入耗尽栈；报告不能伪装成管理命令。
+                if !matches!(
+                    inner.get("op")?.as_str()?,
+                    "fenced"
+                        | "abandoned"
+                        | "executor_ready"
+                        | "tape_state"
+                        | "catalog_part"
+                        | "tape_committed"
+                        | "tape_reclaimed"
+                ) {
+                    return None;
+                }
+                return Some(Command::ExecutorReport {
+                    node: v.get("node")?.as_u64()?,
+                    instance: v.get("instance")?.as_u64()?,
+                    round: v.get("round")?.as_u64()?,
+                    sequence: v.get("sequence")?.as_u64()?,
+                    command: Box::new(Self::decode(inner.to_string().as_bytes())?),
+                });
+            }
+            "executor_ready" => {
+                return Some(Command::ExecutorReady {
+                    node: v.get("node")?.as_u64()?,
+                    round: v.get("round")?.as_u64()?,
+                });
+            }
+            "candidate" => {
+                return Some(Command::Candidate {
+                    node: v.get("node")?.as_u64()?,
+                    instance: v.get("instance")?.as_u64()?,
+                    sequence: v.get("sequence")?.as_u64()?,
+                    group: text("group")?,
+                    drives: usize::try_from(v.get("drives")?.as_u64()?).ok()?,
+                    eligible: v.get("eligible")?.as_bool()?,
+                });
+            }
+            "assign_executor" => {
+                return Some(Command::AssignExecutor {
+                    node: v.get("node")?.as_u64()?,
+                    instance: v.get("instance")?.as_u64()?,
+                    term: v.get("term")?.as_u64()?,
+                    expected_round: match v.get("expected_round")? {
+                        Value::Null => None,
+                        n => Some(n.as_u64()?),
+                    },
+                    group: text("group")?,
+                });
+            }
             "pool_create" => {
                 return Some(Command::PoolCreate {
                     uuid: text("uuid")?,
@@ -279,6 +406,10 @@ impl ControlSnapshot {
             "directory_index": self.directory_index,
             "applied_index": c.applied_index,
             "executor": c.executor.as_ref().map(|e| json!([e.node, e.term, e.round, e.fenced])),
+            "executor_instance": c.executor_instance,
+            "executor_report_sequence": c.executor_report_sequence,
+            "executor_ready": c.executor_ready,
+            "candidates": c.candidates.iter().map(|(n,c)| json!([n,c.instance,c.sequence,c.group,c.drives,c.eligible])).collect::<Vec<_>>(),
             "history": c.history.iter().map(|(r, n)| json!([r, n])).collect::<Vec<_>>(),
             "pools": c.pools.iter().map(|(u, p)| json!([u, p.name, p.file_limit])).collect::<Vec<_>>(),
             "tapes": c.tapes.iter().map(|(b, u)| json!([b, u])).collect::<Vec<_>>(),
@@ -300,8 +431,34 @@ impl ControlSnapshot {
         let n = |x: Option<&Value>| -> Option<u64> { x?.as_u64() };
         let mut c = ControlState {
             applied_index: n(v.get("applied_index"))?,
+            executor_instance: v
+                .get("executor_instance")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            executor_report_sequence: v
+                .get("executor_report_sequence")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            executor_ready: v
+                .get("executor_ready")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             ..Default::default()
         };
+        if let Some(rows) = v.get("candidates") {
+            for r in rows.as_array()? {
+                c.candidates.insert(
+                    n(r.get(0))?,
+                    Candidate {
+                        instance: n(r.get(1))?,
+                        sequence: n(r.get(2))?,
+                        group: s(r.get(3))?,
+                        drives: usize::try_from(n(r.get(4))?).ok()?,
+                        eligible: r.get(5)?.as_bool()?,
+                    },
+                );
+            }
+        }
         if let Some(e) = v.get("executor").filter(|e| !e.is_null()) {
             c.executor = Some(Executor {
                 node: n(e.get(0))?,
@@ -362,6 +519,7 @@ pub struct Executor {
 /// 应用一条命令后，本地需要知道的结论。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Applied {
+    Reported(Box<Applied>),
     /// 出现了新的执行者（可能是自己，也可能是别人）。
     NewExecutor(Executor),
     /// 某一轮的隔离得到确认，可以进入恢复。
@@ -428,6 +586,10 @@ pub const HISTORY_KEPT: usize = 64;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ControlState {
     pub executor: Option<Executor>,
+    pub executor_instance: u64,
+    pub executor_report_sequence: u64,
+    pub executor_ready: bool,
+    pub candidates: std::collections::BTreeMap<u64, Candidate>,
     pub applied_index: u64,
     /// 历次接管的简要记录：(轮次, 节点)，只留最近 `HISTORY_KEPT` 条
     pub history: Vec<(u64, u64)>,
@@ -439,6 +601,15 @@ pub struct ControlState {
     pub tape_state: std::collections::BTreeMap<String, String>,
     /// 条码 → 最近一次卷提交的摘要。文件记录本身只在目录库里，不放内存。
     pub tape_summary: std::collections::BTreeMap<String, TapeSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    pub instance: u64,
+    pub sequence: u64,
+    pub group: String,
+    pub drives: usize,
+    pub eligible: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -456,7 +627,119 @@ impl ControlState {
     pub fn apply(&mut self, index: u64, cmd: &Command) -> Applied {
         self.applied_index = index;
         match cmd {
+            Command::ExecutorReport {
+                node,
+                instance,
+                round,
+                sequence,
+                command,
+            } => {
+                let Some(e) = self
+                    .executor
+                    .as_ref()
+                    .filter(|e| e.node == *node && e.round == *round)
+                else {
+                    return Applied::Nothing;
+                };
+                if self.executor_instance != *instance
+                    || self.executor_report_sequence.checked_add(1) != Some(*sequence)
+                    || !self
+                        .candidates
+                        .get(node)
+                        .is_some_and(|c| c.instance == *instance)
+                {
+                    return Applied::Nothing;
+                }
+                let valid = match command.as_ref() {
+                    Command::Fenced { node: n, round: r }
+                    | Command::Abandoned {
+                        node: n, round: r, ..
+                    } => n == node && r == round,
+                    Command::ExecutorReady { node: n, round: r } => {
+                        e.fenced && n == node && r == round
+                    }
+                    Command::TapeState { .. }
+                    | Command::CatalogPart { .. }
+                    | Command::TapeCommitted { .. }
+                    | Command::TapeReclaimed { .. } => e.fenced,
+                    _ => false,
+                };
+                if !valid {
+                    return Applied::Nothing;
+                }
+                self.executor_report_sequence = *sequence;
+                Applied::Reported(Box::new(self.apply(index, command)))
+            }
+            Command::ExecutorReady { node, round } => {
+                if self
+                    .executor
+                    .as_ref()
+                    .is_some_and(|e| e.node == *node && e.round == *round && e.fenced)
+                {
+                    self.executor_ready = true;
+                }
+                Applied::Nothing
+            }
+            Command::Candidate {
+                node,
+                instance,
+                sequence,
+                group,
+                drives,
+                eligible,
+            } => {
+                if *node == 0
+                    || *instance == 0
+                    || *sequence == 0
+                    || group.is_empty()
+                    || self.candidates.get(node).is_some_and(|old| {
+                        *instance < old.instance
+                            || (*instance == old.instance && *sequence <= old.sequence)
+                    })
+                {
+                    return Applied::Nothing;
+                }
+                self.candidates.insert(
+                    *node,
+                    Candidate {
+                        instance: *instance,
+                        sequence: *sequence,
+                        group: group.clone(),
+                        drives: *drives,
+                        eligible: *eligible && *drives > 0,
+                    },
+                );
+                Applied::Nothing
+            }
+            Command::AssignExecutor {
+                node,
+                instance,
+                term,
+                expected_round,
+                group,
+            } => {
+                if self.executor.as_ref().map(|e| e.round) != *expected_round
+                    || !self
+                        .candidates
+                        .get(node)
+                        .is_some_and(|c| c.instance == *instance && c.eligible && c.group == *group)
+                {
+                    return Applied::Nothing;
+                }
+                let outcome = self.apply(
+                    index,
+                    &Command::Takeover {
+                        node: *node,
+                        term: *term,
+                    },
+                );
+                self.executor_instance = *instance;
+                outcome
+            }
             Command::Takeover { node, term } => {
+                self.executor_instance = 0;
+                self.executor_report_sequence = 0;
+                self.executor_ready = false;
                 let e = Executor {
                     node: *node,
                     term: *term,
@@ -484,6 +767,7 @@ impl ControlState {
             Command::Abandoned { node, round, .. } => match &self.executor {
                 Some(e) if e.round == *round && e.node == *node => {
                     self.executor = None;
+                    self.executor_ready = false;
                     Applied::ExecutorGone {
                         node: *node,
                         round: *round,

@@ -136,6 +136,32 @@ fn pb_err(e: protobuf::ProtobufError) -> TapeError {
 }
 
 impl RaftStore {
+    /// 本机进程代数，不属于 Raft 日志；安装快照、日志回滚不能把它退回旧值。
+    /// 复制/回滚整个 data-dir 不受此计数保护，部署必须保留独占目录和节点身份。
+    pub fn next_instance(&mut self) -> Result<u64> {
+        self.db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS local_instance (id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL);"
+        ).map_err(db_err)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(db_err)?;
+        let old: i64 = tx
+            .query_row("SELECT value FROM local_instance WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(db_err)?
+            .unwrap_or(0);
+        let next = old
+            .checked_add(1)
+            .filter(|v| *v > 0)
+            .ok_or_else(|| TapeError::Ltfs("本机执行实例计数溢出".into()))?;
+        tx.execute("INSERT INTO local_instance(id,value) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET value=excluded.value", [next]).map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
+        Ok(next as u64)
+    }
+
     /// 打开（或创建）控制存储，并把已有状态装入内存。`voters` 是固定的三节点成员。
     pub fn open(path: &Path, voters: &[u64]) -> Result<Self> {
         let db = Connection::open(path).map_err(db_err)?;

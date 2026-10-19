@@ -86,10 +86,14 @@ pub struct Fixture {
     pub drive: std::sync::Arc<SimTransport>,
     pub changer: std::sync::Arc<SimTransport>,
     pub path: PathBuf,
+    drive_count: usize,
 }
 impl Fixture {
     pub fn new() -> Self {
-        let sim = SimLibrary::new(1, 3, 1);
+        Self::with_drive_count(1)
+    }
+    pub fn with_drive_count(drive_count: usize) -> Self {
+        let sim = SimLibrary::new(drive_count, 3, 1);
         for (i, b) in ["LIB001L8", "LIB002L8"].iter().enumerate() {
             sim.insert_cartridge(SimCartridge::blank(b, 256 << 20), i)
                 .unwrap();
@@ -101,6 +105,7 @@ impl Fixture {
             sim,
             changer_pr: SharedTransport(std::sync::Arc::new(SimLibrary::new(1, 1, 0).drive(0))),
             path,
+            drive_count,
         }
     }
     pub fn open(&self) -> Library<ReservedChanger, SharedTransport> {
@@ -109,10 +114,16 @@ impl Fixture {
                 changer: SharedTransport(self.changer.clone()),
                 pr: self.changer_pr.clone(),
             },
-            vec![LibraryDrive {
-                offset: 0,
-                device: SharedTransport(self.drive.clone()),
-            }],
+            (0..self.drive_count)
+                .map(|i| LibraryDrive {
+                    offset: i as u16,
+                    device: if i == 0 {
+                        SharedTransport(self.drive.clone())
+                    } else {
+                        SharedTransport(std::sync::Arc::new(self.sim.drive(i)))
+                    },
+                })
+                .collect(),
             &self.path,
             ReservationKey::new(1, 100),
         )

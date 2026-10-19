@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 
 use super::files::{FileService, TapeIdent, TapeLimits, catalog_of, is_directory};
 use super::node::SharedStatus;
+use super::permission::{GuardedTransport, Permission};
 use super::state::FileRec;
 use super::state::tape_state;
 use crate::changer::commands::MediumChanger;
@@ -46,8 +47,23 @@ pub struct ManagedDevice {
 }
 
 /// 打开受管逻辑库的全部设备。每次接管重新打开一遍。
-pub trait DeviceProvider: Send {
+pub trait DeviceProvider: Send + Sync {
     fn open_all(&self) -> Result<Vec<ManagedDevice>>;
+
+    /// 只发现配置的完整设备组，不注册 PR、不移动介质。不满足完整组时立即撤销准入。
+    fn probe(&self) -> Result<usize> {
+        let devices = self.open_all()?;
+        let drives = devices
+            .iter()
+            .filter(|d| d.kind == DeviceKind::Drive)
+            .count();
+        if drives == 0 || !devices.iter().any(|d| d.kind == DeviceKind::Changer) {
+            return Err(TapeError::NotReady(
+                "执行候选需要完整的换带器和驱动器设备组".into(),
+            ));
+        }
+        Ok(drives)
+    }
 }
 
 /// 真实设备：按 VPD 0x80 序列号在 `/dev/sg*` 里定位，不依赖会变化的设备名。
@@ -65,6 +81,9 @@ impl DeviceProvider for SgProvider {
             .collect();
         if let Some(c) = &self.changer_serial {
             wanted.push((c.clone(), DeviceKind::Changer));
+        }
+        if wanted.is_empty() {
+            return Ok(Vec::new());
         }
         let mut found = Vec::new();
         for path in enumerate_sg_nodes()? {
@@ -95,6 +114,8 @@ impl DeviceProvider for SgProvider {
 
 #[derive(Debug)]
 pub enum ExecRequest {
+    /// 由 Raft 循环安装本进程许可；必须在任何接管之前发送。
+    AttachPermission { permission: Arc<Permission> },
     /// 本节点成为第 `round` 轮的执行者：隔离全部设备并回读确认。
     Takeover { round: u64 },
     /// `Fenced` 已被多数派确认：恢复卷、需要时收尾，然后开始服务。
@@ -155,6 +176,10 @@ impl std::fmt::Display for ReadError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecEvent {
+    Capability {
+        drives: usize,
+        eligible: bool,
+    },
     Fenced {
         round: u64,
     },
@@ -281,6 +306,15 @@ pub fn run(
     files: Arc<FileService>,
     status: SharedStatus,
 ) {
+    let provider: Arc<dyn DeviceProvider> = Arc::from(provider);
+    let mut permission: Option<Arc<Permission>> = None;
+    struct ProbeStop(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for ProbeStop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let probe_stop = ProbeStop(Arc::new(std::sync::atomic::AtomicBool::new(false)));
     let mut active: Option<Active> = None;
     let mut next_work = Instant::now() + opts.interval;
     loop {
@@ -294,6 +328,35 @@ pub fn run(
             wait = wait.min(due);
         }
         match rx.recv_timeout(wait) {
+            Ok(ExecRequest::AttachPermission {
+                permission: attached,
+            }) => {
+                if permission.is_some() || active.is_some() {
+                    continue;
+                }
+                files.set_permission(attached.clone());
+                permission = Some(attached);
+                let (provider, tx, stop) = (provider.clone(), tx.clone(), probe_stop.0.clone());
+                let interval = opts.interval.min(Duration::from_secs(1));
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        let event = match provider.probe() {
+                            Ok(drives) => ExecEvent::Capability {
+                                drives,
+                                eligible: true,
+                            },
+                            Err(_) => ExecEvent::Capability {
+                                drives: 0,
+                                eligible: false,
+                            },
+                        };
+                        if tx.send(event).is_err() {
+                            break;
+                        }
+                        std::thread::sleep(interval);
+                    }
+                });
+            }
             Ok(ExecRequest::Shutdown { done }) => {
                 if let Some(a) = active.take() {
                     shut_down(a, &files, &tx);
@@ -318,7 +381,7 @@ pub fn run(
             Ok(ExecRequest::Takeover { round }) => {
                 files.close("正在接管");
                 active = None;
-                match takeover(provider.as_ref(), &opts, round) {
+                match takeover(provider.as_ref(), &opts, round, permission.as_ref()) {
                     Ok(a) => {
                         active = Some(a);
                         let _ = tx.send(ExecEvent::Fenced { round });
@@ -469,7 +532,7 @@ pub fn run(
                     }
                     // 重新选带失败说明已经不能再服务了，这时不该再去做周期自检把结论盖掉
                     if worked.is_ok() {
-                        worked = periodic(a, &opts);
+                        worked = periodic(a, &opts, permission.is_some());
                     }
                 }
                 // 回收：一次搬一个批次就回到这里，读请求和客户端上传不会被长时间的回收饿死
@@ -544,9 +607,20 @@ fn shut_down(mut a: Active, files: &FileService, tx: &Sender<ExecEvent>) {
     }
 }
 
-fn takeover(provider: &dyn DeviceProvider, opts: &ExecOptions, round: u64) -> Result<Active> {
+fn takeover(
+    provider: &dyn DeviceProvider,
+    opts: &ExecOptions,
+    round: u64,
+    permission: Option<&Arc<Permission>>,
+) -> Result<Active> {
     let key = ReservationKey::new(opts.node_id, round);
-    let devices = provider.open_all()?;
+    let mut devices = provider.open_all()?;
+    if let Some(permission) = permission {
+        for d in &mut devices {
+            let inner = std::mem::replace(&mut d.dev, Box::new(ClosedTransport));
+            d.dev = Box::new(GuardedTransport::new(inner, permission.clone(), round));
+        }
+    }
     for d in &devices {
         match reservation::fence(d.dev.as_ref(), key)? {
             FenceOutcome::Fenced { before, .. } => {
@@ -556,7 +630,7 @@ fn takeover(provider: &dyn DeviceProvider, opts: &ExecOptions, round: u64) -> Re
                     before.holder.map(|h| h.0)
                 );
             }
-            FenceOutcome::Unsupported if d.kind == DeviceKind::Changer => {
+            FenceOutcome::Unsupported if d.kind == DeviceKind::Changer && permission.is_none() => {
                 warn!("执行线程: 换带器 {} 不支持持久预留，降级为库存核对", d.name);
             }
             FenceOutcome::Unsupported => {
@@ -594,6 +668,28 @@ fn takeover(provider: &dyn DeviceProvider, opts: &ExecOptions, round: u64) -> Re
         reclaim_failures: 0,
         reclaim_given_up: None,
     })
+}
+
+// 仅用于转移 Box 所有权，不会执行设备命令。
+struct ClosedTransport;
+impl TapeTransport for ClosedTransport {
+    fn identity(&self) -> &str {
+        "已关闭"
+    }
+    fn execute_no_data(&self, _: &[u8], _: u32) -> Result<crate::scsi::device::ScsiResult> {
+        Err(TapeError::NotReady("设备句柄已关闭".into()))
+    }
+    fn execute_read(
+        &self,
+        _: &[u8],
+        _: &mut [u8],
+        _: u32,
+    ) -> Result<crate::scsi::device::ScsiResult> {
+        self.execute_no_data(&[], 0)
+    }
+    fn execute_write(&self, _: &[u8], _: &[u8], _: u32) -> Result<crate::scsi::device::ScsiResult> {
+        self.execute_no_data(&[], 0)
+    }
 }
 
 /// 带上实际写掉的字节：数据分区的最大容量减去剩余容量。读不到就返回 0。
@@ -1329,7 +1425,7 @@ fn process_uploads_limited(
                     }
                 }
             }
-            vol.commit_incremental()?;
+            vol.sync_batch()?;
             let (all, bytes_used) = catalog_of(vol.index());
             let written: Vec<FileRec> = all
                 .iter()
@@ -2306,7 +2402,11 @@ fn unload_idle_read_tape(a: &mut Active, opts: &ExecOptions) {
 }
 
 /// 服务期间的周期工作。返回 `Err(原因)` 表示已失去执行资格。
-fn periodic(a: &mut Active, opts: &ExecOptions) -> std::result::Result<(), String> {
+fn periodic(
+    a: &mut Active,
+    opts: &ExecOptions,
+    strict_fencing: bool,
+) -> std::result::Result<(), String> {
     unload_idle_read_tape(a, opts);
     if let (true, Some(i)) = (opts.demo_write, a.drive) {
         a.write_session = None;
@@ -2334,10 +2434,14 @@ fn periodic(a: &mut Active, opts: &ExecOptions) -> std::result::Result<(), Strin
     for d in &a.devices {
         match reservation::verify_holder(d.dev.as_ref(), a.key) {
             Ok(()) => {}
+            // 新协议要求持续确认整组设备。旧句柄失效时，即使发现线程能从
+            // 另一条路径打开同一设备，也不能继续发布这轮失效的卷会话。
+            Err(e) if strict_fencing || ownership_lost(&e) => {
+                return Err(format!("{} 持有者自检无法确认: {}", d.name, e));
+            }
             Err(TapeError::ScsiCommand {
                 sense_key: 0x05, ..
             }) if d.kind == DeviceKind::Changer => {}
-            Err(e) if ownership_lost(&e) => return Err(format!("{}: {}", d.name, e)),
             Err(e) => warn!("执行线程: {} 持有者自检出错: {}", d.name, e),
         }
     }

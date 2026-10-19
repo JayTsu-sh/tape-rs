@@ -412,6 +412,7 @@ struct Inner {
 type DirectoryReader = (Directory, Option<(u64, u64)>);
 
 pub struct FileService {
+    permission: Mutex<Option<Arc<super::permission::Permission>>>,
     inner: Mutex<Inner>,
     changed: Condvar,
     spool_dir: PathBuf,
@@ -550,6 +551,7 @@ impl FileService {
         let _ = std::fs::remove_dir_all(&spool_dir);
         std::fs::create_dir_all(&spool_dir)?;
         Ok(Arc::new(Self {
+            permission: Mutex::new(None),
             inner: Mutex::new(Inner {
                 serving: None,
                 why_not: "尚未接管".into(),
@@ -569,6 +571,28 @@ impl FileService {
 
     pub fn set_executor(&self, tx: Sender<ExecRequest>) {
         *self.exec.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    }
+
+    pub fn set_permission(&self, permission: Arc<super::permission::Permission>) {
+        *self.permission.lock().unwrap_or_else(|e| e.into_inner()) = Some(permission);
+    }
+
+    fn check_permission(&self) -> Result<(), ServiceError> {
+        let permission = self.permission.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(p) = permission.as_ref() {
+            let g = self.lock();
+            let round = g
+                .serving
+                .as_ref()
+                .map(|s| s.round)
+                .or_else(|| g.read_only.as_ref().map(|(r, _)| *r));
+            if !round.is_some_and(|r| p.allows(r, super::permission::Phase::Serving)) {
+                return Err(ServiceError::NotServing(
+                    "本轮尚未发布或多数派执行许可已失效".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -756,6 +780,7 @@ impl FileService {
     }
 
     pub fn serving_round(&self) -> Option<u64> {
+        self.check_permission().ok()?;
         self.lock().serving.as_ref().map(|s| s.round)
     }
 
@@ -907,6 +932,7 @@ impl FileService {
         &self,
         path: &str,
     ) -> Result<(Arc<VolumeState>, BTreeMap<String, bool>), ServiceError> {
+        self.check_permission()?;
         let (state, pool) = {
             let g = self.lock();
             let s = g.serving.as_ref().ok_or_else(|| {
@@ -964,6 +990,7 @@ impl FileService {
         len: u64,
         create_only: bool,
     ) -> Result<UploadHandle, ServiceError> {
+        self.check_permission()?;
         let path = norm(path)?;
         let (state, live) = self.namespace_snapshot(&path)?;
         let mut g = self.lock();
@@ -1041,6 +1068,7 @@ impl FileService {
     }
 
     pub fn ingest(&self, h: &UploadHandle, bytes: u64) -> Result<(), ServiceError> {
+        self.check_permission()?;
         let g = self.lock();
         let s = g
             .serving
@@ -1094,6 +1122,10 @@ impl FileService {
         len: u64,
         metadata: Option<crate::ltfs::volume::FileMetadata>,
     ) -> Result<u64, ServiceError> {
+        if let Err(e) = self.check_permission() {
+            self.abort(h);
+            return Err(e);
+        }
         {
             let mut g = self.lock();
             let why = g.why_not.clone();
@@ -1184,6 +1216,7 @@ impl FileService {
 
     /// 已提交的文件。先看本轮刚落带的，再看目录库（池内全部磁带、之前各轮提交的）。
     pub fn stat(&self, path: &str) -> Result<Option<Stat>, ServiceError> {
+        self.check_permission()?;
         let path = norm(path)?;
         let (round, pool) = {
             let g = self.lock();
@@ -1825,6 +1858,7 @@ impl FileService {
         &self,
         dir: Option<&str>,
     ) -> Result<BTreeMap<String, NodeSummary>, ServiceError> {
+        self.check_permission()?;
         let prefix = dir.map(|d| format!("{d}/"));
         let in_scope =
             |p: &str| dir.is_none_or(|d| p == d || p.starts_with(prefix.as_deref().unwrap()));

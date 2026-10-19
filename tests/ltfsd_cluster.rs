@@ -392,6 +392,7 @@ impl Cluster {
                 }
             });
             let cfg = NodeConfig {
+                coordination: None,
                 id,
                 peers: ids.to_vec(),
                 tick: Duration::from_millis(15),
@@ -2475,7 +2476,40 @@ fn a_lagging_node_catches_up_from_a_snapshot_and_pulls_the_directory() {
 /// 但设备上会留着一个已经不存在的持有者。
 #[test]
 fn a_planned_shutdown_commits_the_queue_and_releases_every_reservation() {
-    let c = Cluster::start_with("graceful", false);
+    // 大索引上的少量变化应继续采用增量；停机仍必须收束为双分区Full。
+    let lib = SimLibrary::new(1, 4, 1);
+    lib.insert_cartridge(SimCartridge::blank(BARCODE, 256 << 20), 0)
+        .unwrap();
+    lib.load_into_drive(BARCODE, 0).unwrap();
+    let drive = lib.drive_as(0, 50);
+    mkltfs(
+        &drive,
+        &MkltfsOptions {
+            volume_id: "LTFSD1".into(),
+            block_size: 64 * 1024,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut baseline = tape_rs::ltfs::volume::LtfsVolume::mount(&drive).unwrap();
+    baseline
+        .append_file("/baseline", &mut std::io::Cursor::new(b"kept"))
+        .unwrap();
+    baseline
+        .set_node_xattr(
+            "/baseline",
+            tape_rs::ltfs::index::Xattr {
+                key: "padding".into(),
+                value: "p".repeat(128 * 1024),
+                base64: false,
+            },
+            true,
+            false,
+        )
+        .unwrap();
+    baseline.commit().unwrap();
+    drop(baseline);
+    let c = Cluster::start_lib("graceful", false, lib, 200_000, &[BARCODE]);
     let (leader, round) = c.wait_serving(None, 0);
     let svc = c.services[&leader].clone();
     c.wait("文件服务开放", || svc.serving_round() == Some(round));
@@ -3797,7 +3831,7 @@ fn explicit_sync_commits_staged_files_without_forcing_ip_checkpoint() {
     copy.load_into_drive(BARCODE, 0).unwrap();
     let drive = copy.drive(0);
     let vol = LtfsVolume::mount(&drive).unwrap();
-    assert!(vol.index().incremental);
+    assert!(!vol.index().incremental, "单块索引应直接写DP Full");
     assert!(vol.needs_checkpoint());
     assert!(vol.writable());
     for (path, expected) in [

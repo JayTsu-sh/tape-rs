@@ -29,7 +29,7 @@ use super::index::{
     DirectoryNode, Extent, FileNode, IndexLocation, LtfsIndex, NodeMeta, XATTR_MD5, XATTR_SHA256,
     Xattr,
 };
-use super::label::{LtfsLabel, PART_INDEX};
+use super::label::LtfsLabel;
 use super::mam::{Mam, VolumeCoherencyInfo};
 use super::recovery::{self, RecoveryBudget, RecoveryReport};
 
@@ -160,6 +160,7 @@ pub(crate) struct VolumeSession {
 pub(crate) struct ReadView {
     index: LtfsIndex,
     block_size: u32,
+    partitions: [char; 2],
     read_buffer: std::cell::RefCell<Option<crate::scsi::buffer::TransferBuffer>>,
 }
 
@@ -222,6 +223,7 @@ impl ReadView {
             device,
             &self.index,
             self.block_size,
+            self.partitions,
             path,
             w,
             &self.read_buffer,
@@ -233,6 +235,7 @@ fn read_index_file<W: Write>(
     device: &dyn crate::scsi::transport::TapeTransport,
     index: &LtfsIndex,
     block_size: u32,
+    partitions: [char; 2],
     path: &str,
     w: &mut W,
     read_buffer: &std::cell::RefCell<Option<crate::scsi::buffer::TransferBuffer>>,
@@ -247,9 +250,15 @@ fn read_index_file<W: Write>(
             .ok_or_else(|| TapeError::Ltfs(format!("符号链接越出卷根: {} -> {}", path, target)))?;
         let hit = index.find_file(&resolved);
         return match hit {
-            Some(f) if f.symlink.is_none() => {
-                read_index_file(device, index, block_size, &resolved, w, read_buffer)
-            }
+            Some(f) if f.symlink.is_none() => read_index_file(
+                device,
+                index,
+                block_size,
+                partitions,
+                &resolved,
+                w,
+                read_buffer,
+            ),
             _ => Err(TapeError::Ltfs(format!(
                 "符号链接目标不可读: {} -> {}",
                 path, target
@@ -263,6 +272,36 @@ fn read_index_file<W: Write>(
         return Ok(0);
     }
 
+    // 只支持从 0 开始、按索引顺序连续的布局；先核验全部 extent，避免输出错误前缀。
+    let mut expected_offset = 0u64;
+    for ext in &file.extents {
+        partition_char_to_num(ext.partition, partitions)?;
+        if ext.file_offset != expected_offset {
+            return Err(TapeError::Ltfs(format!(
+                "文件 {} 的 extent 不连续或错序: fileoffset {}，预期 {}",
+                path, ext.file_offset, expected_offset
+            )));
+        }
+        expected_offset = expected_offset
+            .checked_add(ext.byte_count)
+            .ok_or_else(|| TapeError::Ltfs(format!("文件 {} 的 extent 文件范围溢出", path)))?;
+        ext.byte_offset
+            .checked_add(ext.byte_count)
+            .ok_or_else(|| TapeError::Ltfs(format!("文件 {} 的 extent 字节范围溢出", path)))?;
+        if ext.byte_count > 0 && ext.byte_offset >= u64::from(block_size) {
+            return Err(TapeError::Ltfs(format!(
+                "文件 {} 的 extent byteoffset {} 超出块大小 {}",
+                path, ext.byte_offset, block_size
+            )));
+        }
+    }
+    if expected_offset != file.length {
+        return Err(TapeError::Ltfs(format!(
+            "文件 {} 的 extent 长度不符: 索引 {}，extent {}",
+            path, file.length, expected_offset
+        )));
+    }
+
     let mut total: u64 = 0;
     let mut buffer = read_buffer
         .try_borrow_mut()
@@ -272,7 +311,7 @@ fn read_index_file<W: Write>(
         .as_mut_slice();
 
     for ext in &file.extents {
-        let partition = partition_char_to_num(ext.partition);
+        let partition = partition_char_to_num(ext.partition, partitions)?;
         drive.locate_if_needed(partition, ext.start_block)?;
 
         // 从 extent 起始块读起，按 byte_offset / byte_count 精确裁剪。
@@ -291,8 +330,14 @@ fn read_index_file<W: Write>(
             } else {
                 0
             };
-            let available = n.saturating_sub(slice_start);
-            let take = (remaining as usize).min(available);
+            if slice_start >= n {
+                return Err(TapeError::Ltfs(format!(
+                    "文件 {} 的 extent byteoffset {} 超出首记录长度 {}",
+                    path, ext.byte_offset, n
+                )));
+            }
+            let available = n - slice_start;
+            let take = remaining.min(available as u64) as usize;
             if take > 0 {
                 w.write_all(&buf[slice_start..slice_start + take])?;
                 total += take as u64;
@@ -584,6 +629,7 @@ impl<'a> LtfsVolume<'a> {
         ReadView {
             index: self.index.clone(),
             block_size: self.block_size,
+            partitions: [self.label.index_partition, self.label.data_partition],
             read_buffer: std::cell::RefCell::new(None),
         }
     }
@@ -594,6 +640,7 @@ impl<'a> LtfsVolume<'a> {
             self.device,
             &self.index,
             self.block_size,
+            [self.label.index_partition, self.label.data_partition],
             path,
             w,
             &self.read_buffer,
@@ -1036,11 +1083,27 @@ impl<'a> LtfsVolume<'a> {
     }
 
     /// 读出文件并与索引里的哈希比对。优先 sha256sum，其次 md5sum。
+    /// 别名自身无哈希时，使用卷内单层符号链接目标的哈希。
     pub fn verify_file(&self, path: &str) -> Result<HashVerdict> {
         let file = self
             .index
             .find_file(path)
             .ok_or_else(|| TapeError::Ltfs(format!("文件不存在: {}", path)))?;
+        if file.xattr(XATTR_SHA256).is_none()
+            && file.xattr(XATTR_MD5).is_none()
+            && let Some(target) = &file.symlink
+        {
+            let resolved = resolve_symlink(path, target).ok_or_else(|| {
+                TapeError::Ltfs(format!("符号链接越出卷根: {} -> {}", path, target))
+            })?;
+            return match self.index.find_file(&resolved) {
+                Some(target) if target.symlink.is_none() => self.verify_file(&resolved),
+                _ => Err(TapeError::Ltfs(format!(
+                    "符号链接目标不可读: {} -> {}",
+                    path, target
+                ))),
+            };
+        }
         let (algo, expected) = match (file.xattr(XATTR_SHA256), file.xattr(XATTR_MD5)) {
             (Some(v), _) => ("sha256sum", v.to_ascii_lowercase()),
             (None, Some(v)) => ("md5sum", v.to_ascii_lowercase()),
@@ -1296,13 +1359,27 @@ impl<'a> LtfsVolume<'a> {
         self.commit_mode(true, false)
     }
 
+    /// 同卷批次同步：增量至少节省一个索引块时使用增量，否则直接追加 DP Full。
+    /// 保留增量链预算、持久化屏障及 VCI；普通批次不切换到 IP。
+    pub fn sync_batch(&mut self) -> Result<()> {
+        if !self.dirty
+            || self.index.self_location.partition != self.label.data_partition
+            || self.incremental_depth >= self.incremental_limit
+        {
+            return self.commit_incremental();
+        }
+        self.ensure_writable()?;
+        let result = self.commit_inner(true, false, true);
+        self.finish_commit(result)
+    }
+
     fn commit_mode(&mut self, incremental: bool, checkpoint: bool) -> Result<()> {
         if !self.dirty {
             debug!("commit: nothing to do");
             return Ok(());
         }
         self.ensure_writable()?;
-        let result = self.commit_inner(incremental, checkpoint);
+        let result = self.commit_inner(incremental, checkpoint, false);
         self.finish_commit(result)
     }
 
@@ -1328,8 +1405,9 @@ impl<'a> LtfsVolume<'a> {
     /// `index_partition` / `barrier` / `vci`（DP 索引可能已完整，结果未定）。
     fn commit_inner(
         &mut self,
-        incremental: bool,
+        mut incremental: bool,
         checkpoint: bool,
+        adaptive: bool,
     ) -> std::result::Result<(), (&'static str, TapeError)> {
         // 回指指向 DP 上的前一份 Full（LTFS 2.5.1 §5.4.3）；旧版本曾误指向 IP。
         // 动带之前先自检；失败时介质未被触碰，但为了语义统一仍按提交失败冻结。
@@ -1360,14 +1438,32 @@ impl<'a> LtfsVolume<'a> {
             start_block: p1_index_block,
         };
         let xml = if incremental {
-            self.working
+            let delta = self
+                .working
                 .incremental_since(&self.index)
-                .map_err(|e| ("encode", e))?
-                .to_xml()
+                .and_then(|index| index.to_xml())
+                .map_err(|e| ("encode", e))?;
+            if adaptive {
+                let block_size = self.block_size as usize;
+                let budget = delta.len().div_ceil(block_size).saturating_mul(block_size);
+                self.working.incremental = false;
+                if self
+                    .working
+                    .xml_fits_within(budget)
+                    .map_err(|e| ("encode", e))?
+                {
+                    incremental = false;
+                    self.working.to_xml().map_err(|e| ("encode", e))?
+                } else {
+                    self.working.incremental = true;
+                    delta
+                }
+            } else {
+                delta
+            }
         } else {
-            self.working.to_xml()
-        }
-        .map_err(|e| ("encode", e))?;
+            self.working.to_xml().map_err(|e| ("encode", e))?
+        };
         let blocks_written = write_bytes_in_blocks(&self.drive, &xml, self.block_size as usize)
             .map_err(|e| ("index_records", e))?;
         self.drive
@@ -1406,8 +1502,12 @@ impl<'a> LtfsVolume<'a> {
         self.working.materialized = incremental;
         self.index = self.working.clone();
         info!(
-            "commit: gen {} @ DP {}, IP checkpoint={}",
-            self.working.generation, p1_index_block, checkpoint
+            "commit: gen {} @ DP {}, incremental={}, index_bytes={}, IP checkpoint={}",
+            self.working.generation,
+            p1_index_block,
+            incremental,
+            xml.len(),
+            checkpoint
         );
         Ok(())
     }
@@ -1524,8 +1624,19 @@ impl<R: Read> BlockSource for StreamBlocks<'_, R> {
 
 // ---------- 辅助函数 ----------
 
-fn partition_char_to_num(c: char) -> u8 {
-    if c == PART_INDEX { 0 } else { 1 }
+fn partition_char_to_num(c: char, partitions: [char; 2]) -> Result<u8> {
+    if partitions[0] == partitions[1] {
+        return Err(TapeError::Ltfs("卷标 partition 映射重复".into()));
+    }
+    partitions
+        .iter()
+        .position(|&partition| partition == c)
+        .map(|position| position as u8)
+        .ok_or_else(|| {
+            TapeError::Ltfs(format!(
+                "extent partition {c:?} 不在卷标映射 {partitions:?} 中"
+            ))
+        })
 }
 
 fn split_path(path: &str) -> Result<(Vec<&str>, &str)> {

@@ -90,6 +90,12 @@ impl LtfsIndex {
         let mut out = delta.clone_with_root(root);
         out.materialized = true;
         out.allow_policy_update = self.allow_policy_update;
+        // 重放不能让后续合法增量清除 Full 基线的未知元素只读限制。
+        for name in &self.unknown_elements {
+            if !out.unknown_elements.contains(name) {
+                out.unknown_elements.push(name.clone());
+            }
+        }
         Ok(out)
     }
 }

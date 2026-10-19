@@ -1,5 +1,9 @@
 //! 专用介质上的直接库基线。显式门控、驱动序列号和清单 UUID 校验；不格式化、不换带。
 //! 装卸带由外部探针核对 inventory 后执行，计时单独保存。不要对业务介质运行。
+#[path = "support/perf_transport.rs"]
+mod perf_transport;
+
+use perf_transport::MeasuredTransport;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -15,6 +19,23 @@ use tape_rs::scsi::inquiry::read_unit_serial;
 struct Args {
     #[arg(long)]
     device: String,
+    /// 输出按阶段聚合的命令耗时；实机须提供已有预留的 guard，不自动抢占。
+    #[arg(long)]
+    profile: bool,
+    #[arg(long)]
+    guard: Option<String>,
+    /// 写入后完成 IP 检查点，单列耗时；不改变普通 sync 的含义。
+    #[arg(long)]
+    finish_checkpoint: bool,
+    /// 所有测量完成后显式倒带，单列耗时。
+    #[arg(long)]
+    rewind: bool,
+    /// 显式测量增量提交路径；默认仍为 DP Full sync。
+    #[arg(long)]
+    incremental: bool,
+    /// 按索引块数选择 DP Full 或增量，与守护进程批次同步相同。
+    #[arg(long, conflicts_with = "incremental")]
+    adaptive: bool,
     /// 使用已授权的实机 RC0018L9/RC0017L9，仍核验清单 UUID。
     #[arg(long)]
     physical: bool,
@@ -83,6 +104,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ) {
         return Err("mode 必须为 write/write-groups/read/list/checkpoint".into());
     }
+    if (args.finish_checkpoint || args.incremental || args.adaptive)
+        && !matches!(args.mode.as_str(), "write" | "write-groups")
+    {
+        return Err("--finish-checkpoint/--incremental/--adaptive 仅适用于写入测量".into());
+    }
+    let guard =
+        args.guard
+            .as_deref()
+            .map(|value| {
+                let (node, round) = value.split_once(':').ok_or("--guard 需要 NODE:ROUND")?;
+                Ok::<_, Box<dyn std::error::Error>>(
+                    tape_rs::scsi::reservation::ReservationKey::new(node.parse()?, round.parse()?),
+                )
+            })
+            .transpose()?;
+    if args.physical && args.profile && guard.is_none() {
+        return Err("实机分阶段探针需要已取得设备预留的 --guard NODE:ROUND".into());
+    }
     let value: serde_json::Value = serde_json::from_reader(std::fs::File::open(&args.manifest)?)?;
     let manifest = Manifest {
         barcode: value["barcode"]
@@ -132,8 +171,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if read_unit_serial(&dev).as_deref() != Some(serial) {
         return Err("驱动器序列号不匹配，拒绝访问介质".into());
     }
+    if let Some(key) = guard {
+        tape_rs::scsi::reservation::verify_holder(&dev, key)?;
+    }
+    let measured = MeasuredTransport::new(&dev, args.profile);
+    if args.profile {
+        println!(
+            "{}",
+            json!({"kind":"measurement_config","schema":1,"diagnostic":true,
+                "barcode":manifest.barcode,"volume_uuid":manifest.volume_uuid.to_string(),
+                "mode":args.mode,"group":args.group,"store_sha256":args.store_sha256,
+                "incremental":args.incremental,"adaptive":args.adaptive,"finish_checkpoint":args.finish_checkpoint,
+                "rewind":args.rewind})
+        );
+    }
     let start = Instant::now();
-    let mut vol = LtfsVolume::mount(&dev)?;
+    let mut vol = measured.phase("mount", || LtfsVolume::mount(&measured))?;
+    vol.set_reservation_guard(guard);
     if vol.label().volume_uuid != manifest.volume_uuid {
         return Err("介质 UUID 不匹配，拒绝继续".into());
     }
@@ -181,65 +235,83 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Err("卷不可写".into());
                 }
                 // 先验证全部源文件；校验时间不计入设备写入阶段。
-                for row in &rows {
-                    if vol.index().find_file(&row.path).is_some() {
-                        return Err("路径已存在，拒绝覆盖".into());
-                    }
-                    let mut source = std::fs::File::open(args.source.join(&row.path))?;
-                    let mut hash = Sha256::new();
-                    let mut buffer = [0u8; 64 * 1024];
-                    let mut count = 0;
-                    loop {
-                        let n = source.read(&mut buffer)?;
-                        if n == 0 {
-                            break;
+                measured.phase(
+                    "source_verify",
+                    || -> Result<(), Box<dyn std::error::Error>> {
+                        for row in &rows {
+                            if vol.index().find_file(&row.path).is_some() {
+                                return Err("路径已存在，拒绝覆盖".into());
+                            }
+                            let mut source = std::fs::File::open(args.source.join(&row.path))?;
+                            let mut hash = Sha256::new();
+                            let mut buffer = [0u8; 64 * 1024];
+                            let mut count = 0;
+                            loop {
+                                let n = source.read(&mut buffer)?;
+                                if n == 0 {
+                                    break;
+                                }
+                                count += n as u64;
+                                hash.update(&buffer[..n]);
+                            }
+                            if count != row.size || format!("{:x}", hash.finalize()) != row.sha256 {
+                                return Err("源文件摘要不匹配".into());
+                            }
                         }
-                        count += n as u64;
-                        hash.update(&buffer[..n]);
-                    }
-                    if count != row.size || format!("{:x}", hash.finalize()) != row.sha256 {
-                        return Err("源文件摘要不匹配".into());
-                    }
-                }
+                        Ok(())
+                    },
+                )?;
                 let start = Instant::now();
                 let mut mixed_reads = 0;
-                for (i, row) in rows.iter().enumerate() {
-                    if args.borrowed {
-                        let source = std::fs::read(args.source.join(&row.path))?;
-                        vol.append_bytes(&row.path, &source)?;
-                    } else {
-                        let mut source = std::fs::File::open(args.source.join(&row.path))?;
-                        vol.append_file(&row.path, &mut source)?;
-                    }
-                    if group == "mixed" && (i + 1) % 16 == 0 {
-                        let large: Vec<_> = manifest
-                            .files
-                            .iter()
-                            .filter(|f| f.group == "large")
-                            .collect();
-                        if large.len() != 4 {
-                            return Err("混合负载缺少4个大文件".into());
-                        }
-                        for _ in 0..3 {
-                            let input = large[mixed_reads % 4];
-                            let mut out = CheckedBytes::default();
-                            vol.read_file_to_writer(&input.path, &mut out)?;
-                            if out.count != input.size
-                                || format!("{:x}", out.hash.finalize()) != input.sha256
-                            {
-                                return Err("混合读摘要不匹配".into());
+                measured.phase(
+                    "data_write",
+                    || -> Result<(), Box<dyn std::error::Error>> {
+                        for (i, row) in rows.iter().enumerate() {
+                            if args.borrowed {
+                                let source = std::fs::read(args.source.join(&row.path))?;
+                                vol.append_bytes(&row.path, &source)?;
+                            } else {
+                                let mut source = std::fs::File::open(args.source.join(&row.path))?;
+                                vol.append_file(&row.path, &mut source)?;
                             }
-                            mixed_reads += 1;
+                            if group == "mixed" && (i + 1) % 16 == 0 {
+                                let large: Vec<_> = manifest
+                                    .files
+                                    .iter()
+                                    .filter(|f| f.group == "large")
+                                    .collect();
+                                if large.len() != 4 {
+                                    return Err("混合负载缺少4个大文件".into());
+                                }
+                                for _ in 0..3 {
+                                    let input = large[mixed_reads % 4];
+                                    let mut out = CheckedBytes::default();
+                                    vol.read_file_to_writer(&input.path, &mut out)?;
+                                    if out.count != input.size
+                                        || format!("{:x}", out.hash.finalize()) != input.sha256
+                                    {
+                                        return Err("混合读摘要不匹配".into());
+                                    }
+                                    mixed_reads += 1;
+                                }
+                            }
                         }
-                    }
-                }
+                        Ok(())
+                    },
+                )?;
                 let data_seconds = start.elapsed().as_secs_f64();
                 let commit = Instant::now();
-                vol.sync()?;
+                if args.adaptive {
+                    measured.phase("dp_adaptive", || vol.sync_batch())?;
+                } else if args.incremental {
+                    measured.phase("dp_incremental", || vol.commit_incremental())?;
+                } else {
+                    measured.phase("dp_sync", || vol.sync())?;
+                }
                 let commit_seconds = commit.elapsed().as_secs_f64();
                 println!(
                     "{}",
-                    json!({"interface":"rust-library","kind":"write","group":group,"count":rows.len(),"bytes":rows.iter().map(|f|f.size).sum::<u64>(),"mount_seconds":mount_seconds,"mixed_reads":mixed_reads,"data_seconds":data_seconds,"commit_seconds":commit_seconds,"total_seconds":start.elapsed().as_secs_f64(),"generation":vol.index().generation})
+                    json!({"interface":"rust-library","kind":"write","group":group,"count":rows.len(),"bytes":rows.iter().map(|f|f.size).sum::<u64>(),"mount_seconds":mount_seconds,"mixed_reads":mixed_reads,"data_seconds":data_seconds,"commit_seconds":commit_seconds,"total_seconds":start.elapsed().as_secs_f64(),"generation":vol.index().generation,"index_incremental":vol.index().incremental})
                 );
             }
             "read" => {
@@ -249,15 +321,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &["first", "repeat"][..]
                 } {
                     let start = Instant::now();
-                    for row in &rows {
-                        let mut out = CheckedBytes::default();
-                        vol.read_file_to_writer(&row.path, &mut out)?;
-                        if out.count != row.size
-                            || format!("{:x}", out.hash.finalize()) != row.sha256
-                        {
-                            return Err("磁带内容摘要不匹配".into());
+                    measured.phase(label, || -> Result<(), Box<dyn std::error::Error>> {
+                        for row in &rows {
+                            let mut out = CheckedBytes::default();
+                            vol.read_file_to_writer(&row.path, &mut out)?;
+                            if out.count != row.size
+                                || format!("{:x}", out.hash.finalize()) != row.sha256
+                            {
+                                return Err("磁带内容摘要不匹配".into());
+                            }
                         }
-                    }
+                        Ok(())
+                    })?;
                     println!(
                         "{}",
                         json!({"interface":"rust-library","kind":"read","group":group,"label":label,"count":rows.len(),"bytes":rows.iter().map(|f|f.size).sum::<u64>(),"mount_seconds":mount_seconds,"seconds":start.elapsed().as_secs_f64(),"verified":true})
@@ -267,7 +342,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "list" => measure_listing(&vol, group, mount_seconds)?,
             "checkpoint" => {
                 let start = Instant::now();
-                vol.commit()?;
+                measured.phase("checkpoint", || vol.commit())?;
                 println!(
                     "{}",
                     json!({"interface":"rust-library","kind":"checkpoint","mount_seconds":mount_seconds,"seconds":start.elapsed().as_secs_f64(),"generation":vol.index().generation})
@@ -275,21 +350,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ => unreachable!(),
         }
+        measured.emit();
         if args.mode == "write-groups" && matches!(group, "small" | "growth") {
             for directory in ["large", "small"] {
                 measure_listing(&vol, directory, mount_seconds)?;
             }
         }
     }
-    if args.mode == "write-groups" {
+    if args.mode == "write-groups" || args.finish_checkpoint {
         // 会话结束前补齐 IP；与普通 sync 分开计时，供装卸带流程合计。
         let start = Instant::now();
-        vol.commit()?;
+        measured.phase("checkpoint", || vol.commit())?;
         println!(
             "{}",
             json!({"interface":"rust-library","kind":"checkpoint","seconds":start.elapsed().as_secs_f64(),"generation":vol.index().generation})
         );
     }
+    if args.rewind {
+        measured.phase("rewind", || {
+            tape_rs::tape::commands::TapeDrive::new(&measured).rewind()
+        })?;
+    }
+    measured.emit();
     let stats = dev.direct_io_stats();
     println!(
         "{}",

@@ -14,11 +14,12 @@ use std::thread;
 use std::time::Duration;
 
 use clap::Parser;
+use sha2::{Digest, Sha256};
 use tape_rs::daemon::executor::{self, ExecOptions, SgProvider};
 use tape_rs::daemon::files::{BatchPolicy, FileService};
 use tape_rs::daemon::http::{self, HttpContext};
 use tape_rs::daemon::net::{NodeInput, TcpNet};
-use tape_rs::daemon::node::{self, NodeConfig, NodeStatus};
+use tape_rs::daemon::node::{self, CoordinationConfig, NodeConfig, NodeStatus};
 use tape_rs::daemon::store::RaftStore;
 
 #[derive(Parser)]
@@ -81,6 +82,9 @@ struct Args {
     /// Raft 逻辑时钟周期（毫秒）
     #[arg(long, default_value_t = 100)]
     tick_ms: u64,
+    /// 多数派执行许可时限（毫秒），不改变磁带命令超时
+    #[arg(long, default_value_t = 6000, value_parser = clap::value_parser!(u64).range(1000..))]
+    execution_permit_ms: u64,
     /// 日志压缩：距上次快照累积这么多条目即做一次快照
     #[arg(long, default_value_t = 2000)]
     snapshot_entries: u64,
@@ -148,6 +152,58 @@ fn main() {
     let mut ids: Vec<u64> = peers.keys().copied().collect();
     ids.sort();
     std::fs::create_dir_all(&args.data_dir).expect("创建数据目录");
+    // 必须在打开 SQLite、清理 spool、启动网络和设备线程之前取得锁。
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(args.data_dir.join("ltfsd.lock"))
+        .expect("打开进程锁");
+    let _instance_lock =
+        nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+            .unwrap_or_else(|(_, e)| {
+                eprintln!("该数据目录已有 ltfsd 实例：{e}");
+                std::process::exit(2)
+            });
+    let mut devices = args.drive_serials.clone();
+    devices.sort();
+    if devices.windows(2).any(|w| w[0] == w[1]) || devices.iter().any(String::is_empty) {
+        eprintln!("驱动器序列号不得重复或为空");
+        std::process::exit(2);
+    }
+    let group = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&(args.changer_serial.as_ref(), &devices)).expect("设备组编码")
+        )
+    );
+    // 同一主机不同 data-dir 也不能同时操作同一设备组（同 I_T nexus 的 PR 不能区分进程）。
+    let lock_dir = std::path::Path::new("/run/lock/tape-rs");
+    std::fs::create_dir_all(lock_dir).expect("创建设备组锁目录");
+    if let Some(changer) = &args.changer_serial {
+        devices.push(changer.clone());
+    }
+    devices.sort();
+    devices.dedup();
+    let mut _device_locks = Vec::new();
+    for serial in devices {
+        let name = format!("ltfsd-{:x}.lock", Sha256::digest(serial.as_bytes()));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_dir.join(name))
+            .expect("打开设备锁");
+        _device_locks.push(
+            nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+                .unwrap_or_else(|(_, e)| {
+                    eprintln!("本机已有实例管理设备 {serial}：{e}");
+                    std::process::exit(2)
+                }),
+        );
+    }
 
     let (inbox_tx, inbox_rx) = channel::<NodeInput>();
     let others: HashMap<u64, String> = peers
@@ -224,6 +280,10 @@ fn main() {
 
     let store = RaftStore::open(&args.data_dir.join("raft.db"), &ids).expect("打开控制存储");
     let cfg = NodeConfig {
+        coordination: Some(CoordinationConfig {
+            group,
+            validity: Duration::from_millis(args.execution_permit_ms),
+        }),
         id: me,
         peers: ids,
         tick: Duration::from_millis(args.tick_ms),

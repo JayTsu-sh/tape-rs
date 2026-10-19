@@ -89,6 +89,77 @@ fn clean_full_after_incrementals_mounts_without_historical_scan() {
 }
 
 #[test]
+fn incremental_replay_keeps_unknown_full_elements_read_only() {
+    use tape_rs::error::TapeError;
+    use tape_rs::scsi::sim::LogicalObject;
+
+    let (lib, dev) = formatted();
+    let mut vol = LtfsVolume::mount(&dev).unwrap();
+    vol.append_file("/baseline", &mut Cursor::new(b"base"))
+        .unwrap();
+    vol.commit().unwrap();
+    for path in ["/first", "/second"] {
+        vol.append_file(path, &mut Cursor::new(b"delta")).unwrap();
+        vol.commit_incremental().unwrap();
+    }
+    drop(vol);
+    lib.with_cartridge_mut("DEL001L8", |cart| {
+        for partition in &mut cart.partitions {
+            for object in &mut partition.objects {
+                if let LogicalObject::Record(record) = object {
+                    let xml = String::from_utf8_lossy(record);
+                    if xml.contains("<ltfsindex") {
+                        *record = xml
+                            .replace(
+                                "</ltfsindex>",
+                                "<futurefeature/><anotherfeature/><futurefeature/></ltfsindex>",
+                            )
+                            .into_bytes();
+                    }
+                }
+            }
+        }
+    });
+
+    let mut vol = LtfsVolume::mount(&dev).unwrap();
+    assert!(!vol.writable(), "合法增量不能清除 Full 基线的只读限制");
+    assert_eq!(
+        vol.index().unknown_elements,
+        ["futurefeature", "anotherfeature"]
+    );
+    let mut out = Vec::new();
+    vol.read_file_to_writer("/second", &mut out).unwrap();
+    assert_eq!(out, b"delta");
+    assert!(matches!(
+        vol.append_file("/refused", &mut Cursor::new(b"no")),
+        Err(TapeError::RecoveryRestricted { .. })
+    ));
+}
+
+#[test]
+fn apply_incremental_keeps_unknown_elements_union_across_replays() {
+    let mut base = LtfsIndex::empty(uuid::Uuid::new_v4(), "test".into(), 'b');
+    let mut next = base.clone();
+    next.generation = 2;
+    next.self_location.start_block = 10;
+    let first = next.incremental_since(&base).unwrap();
+    let applied = base.apply_incremental(&first).unwrap();
+    let mut next = applied.clone();
+    next.generation = 3;
+    next.self_location.start_block = 20;
+    let second = next.incremental_since(&applied).unwrap();
+
+    base.unknown_elements = vec!["futurefeature".into(), "anotherfeature".into()];
+    let applied = base.apply_incremental(&first).unwrap();
+    let applied = applied.apply_incremental(&second).unwrap();
+    assert_eq!(
+        applied.unknown_elements,
+        ["futurefeature", "anotherfeature"]
+    );
+    assert_eq!(base.unknown_elements, ["futurefeature", "anotherfeature"]);
+}
+
+#[test]
 fn delta_is_not_a_full_snapshot_and_partial_chain_is_not_accepted() {
     let (_lib, dev) = formatted();
     let mut vol = LtfsVolume::mount(&dev).unwrap();
@@ -507,5 +578,120 @@ fn incremental_barrier_and_partial_vci_failures_recover_metadata_and_allow_next_
                 );
             }
         }
+    }
+}
+
+#[test]
+fn adaptive_batch_uses_full_when_delta_saves_no_index_blocks() {
+    let (lib, dev) = formatted();
+    let mut vol = LtfsVolume::mount(&dev).unwrap();
+    for n in 0..3 {
+        vol.append_file(&format!("/batch/{n}"), &mut Cursor::new(b"payload"))
+            .unwrap();
+    }
+    vol.sync_batch().unwrap();
+    assert!(
+        !vol.index().incremental,
+        "同为一个索引块时应直接提交DP Full"
+    );
+    assert!(vol.needs_checkpoint(), "普通批次不切换IP");
+    let generation = vol.index().generation;
+    vol.sync_batch().unwrap();
+    assert_eq!(vol.index().generation, generation, "干净同步不制造新索引");
+    drop(vol);
+    lib.power_cut();
+    let vol = LtfsVolume::mount(&dev).unwrap();
+    assert!(!vol.index().incremental);
+    for n in 0..3 {
+        let mut out = Vec::new();
+        vol.read_file_to_writer(&format!("/batch/{n}"), &mut out)
+            .unwrap();
+        assert_eq!(out, b"payload");
+    }
+    vol.unmount().unwrap();
+    let clean = LtfsVolume::mount(&dev).unwrap();
+    assert_eq!(
+        clean.index().generation,
+        generation,
+        "已有DP Full只需补同代IP"
+    );
+    assert!(!clean.needs_checkpoint());
+}
+
+fn large_baseline(vol: &mut LtfsVolume<'_>) {
+    for n in 0..160 {
+        vol.append_file(&format!("/baseline/{n}"), &mut Cursor::new(b"kept"))
+            .unwrap();
+    }
+    vol.commit().unwrap();
+    assert!(vol.index().to_xml().unwrap().len() > 2 * 65536);
+}
+
+#[test]
+fn adaptive_batch_preserves_smaller_deltas_and_bounds_chain_across_remounts() {
+    let (lib, dev) = formatted();
+    let mut vol = LtfsVolume::mount(&dev).unwrap();
+    large_baseline(&mut vol);
+    drop(vol);
+    let budget = RecoveryBudget {
+        max_chain_len: 2,
+        ..Default::default()
+    };
+    for n in 1..=4 {
+        let mut vol = LtfsVolume::mount_with_budget(&dev, &budget).unwrap();
+        vol.append_file(&format!("/batch/{n}"), &mut Cursor::new([n as u8]))
+            .unwrap();
+        vol.sync_batch().unwrap();
+        assert_eq!(vol.index().incremental, n % 3 != 0);
+        assert!(vol.needs_checkpoint());
+        drop(vol);
+        lib.power_cut();
+        let vol = LtfsVolume::mount_with_budget(&dev, &budget).unwrap();
+        assert_eq!(vol.recovery().incremental_depth, n % 3);
+        let mut out = Vec::new();
+        vol.read_file_to_writer(&format!("/batch/{n}"), &mut out)
+            .unwrap();
+        assert_eq!(out, [n as u8]);
+    }
+    LtfsVolume::mount(&dev).unwrap().unmount().unwrap();
+    let vol = LtfsVolume::mount(&dev).unwrap();
+    assert!(!vol.index().incremental && !vol.needs_checkpoint());
+    let mut out = Vec::new();
+    vol.read_file_to_writer("/baseline/0", &mut out).unwrap();
+    assert_eq!(out, b"kept");
+}
+
+#[test]
+fn adaptive_batch_barrier_failure_never_acknowledges_full_or_delta() {
+    for large in [false, true] {
+        let (lib, dev) = formatted();
+        let mut vol = LtfsVolume::mount(&dev).unwrap();
+        if large {
+            large_baseline(&mut vol);
+        }
+        let generation = vol.index().generation;
+        vol.append_file("/pending", &mut Cursor::new(b"pending"))
+            .unwrap();
+        dev.inject(Fault {
+            opcode: opcode::WRITE_FILEMARKS_6,
+            action: FaultAction::CheckCondition {
+                sense_key: 3,
+                asc: 0x0c,
+                ascq: 0,
+            },
+            after: 2,
+            remaining: 1,
+        });
+        assert!(vol.sync_batch().is_err());
+        assert_eq!(vol.index().generation, generation);
+        assert!(vol.index().find_file("/pending").is_none());
+        assert!(!vol.writable());
+        drop(vol);
+        lib.power_cut();
+        let recovered = LtfsVolume::mount(&dev).unwrap();
+        assert_eq!(recovered.index().incremental, large);
+        let mut out = Vec::new();
+        recovered.read_file_to_writer("/pending", &mut out).unwrap();
+        assert_eq!(out, b"pending");
     }
 }

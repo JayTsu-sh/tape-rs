@@ -165,6 +165,7 @@ impl SimQuirks {
 
 #[derive(Debug)]
 struct LibState {
+    changer_pr: Option<PrState>,
     quirks: SimQuirks,
     serial: String,
     cartridges: BTreeMap<String, SimCartridge>,
@@ -265,6 +266,7 @@ impl SimLibrary {
             .collect();
         Self {
             state: Arc::new(Mutex::new(LibState {
+                changer_pr: None,
                 quirks: SimQuirks::default(),
                 serial: "SIMLIB0000000001".to_string(),
                 cartridges: BTreeMap::new(),
@@ -348,10 +350,21 @@ impl SimLibrary {
     }
 
     pub fn changer(&self) -> SimTransport {
+        self.changer_as(0)
+    }
+
+    /// 显式启用换带器 PR 模型；默认仍模拟不支持 PR 的旧设备。
+    pub fn enable_changer_pr(&self) {
+        lock(&self.state)
+            .changer_pr
+            .get_or_insert_with(PrState::default);
+    }
+
+    pub fn changer_as(&self, initiator: u32) -> SimTransport {
         SimTransport {
             lib: Arc::clone(&self.state),
             target: Target::Changer,
-            initiator: 0,
+            initiator,
             faults: Mutex::new(Vec::new()),
             log: Mutex::new(Vec::new()),
             session_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -532,7 +545,7 @@ impl SimTransport {
         }
         let mut st = lock(&self.lib);
         let outcome = match self.target {
-            Target::Changer => changer_command(&mut st, cdb, data_out),
+            Target::Changer => changer_with_pr(&mut st, self.initiator, cdb, data_in, data_out),
             Target::Drive(i) => drive_command(&mut st, i, self.initiator, cdb, data_in, data_out),
         };
         match outcome {
@@ -701,6 +714,41 @@ fn inquiry_response(
 
 /// (地址, 条码, 驱动器序列号)
 type ElemEntry = (u16, Option<String>, Option<String>);
+
+fn changer_with_pr(
+    st: &mut LibState,
+    initiator: u32,
+    cdb: &[u8],
+    data: Option<&[u8]>,
+    out: Option<&mut [u8]>,
+) -> Result<Completion> {
+    if let Some(pr) = st.changer_pr.as_mut() {
+        let op = cdb[0];
+        if op != opcode::INQUIRY
+            && op != opcode::REQUEST_SENSE
+            && let Some(q) = pr.ua.get_mut(&initiator)
+            && !q.is_empty()
+        {
+            let (asc, ascq) = q.remove(0);
+            return check(0x06, asc, ascq);
+        }
+        match op {
+            opcode::PERSISTENT_RESERVE_IN => return pr_in(pr, cdb, out),
+            opcode::PERSISTENT_RESERVE_OUT => return pr_out(pr, initiator, cdb, data),
+            _ => {}
+        }
+        if pr.holder.is_some_and(|(h, _)| h != initiator)
+            && !matches!(op, opcode::INQUIRY | opcode::REQUEST_SENSE)
+        {
+            return Ok(Completion {
+                status: 0x18,
+                sense: SenseInfo::from_bytes(&[]),
+                transferred: 0,
+            });
+        }
+    }
+    changer_command(st, cdb, out)
+}
 
 fn changer_command(st: &mut LibState, cdb: &[u8], out: Option<&mut [u8]>) -> Result<Completion> {
     match cdb[0] {

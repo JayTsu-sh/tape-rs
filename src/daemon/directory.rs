@@ -196,6 +196,10 @@ impl Directory {
     /// 把一条已应用的命令落库。`outcome` 是状态机给出的结论：被拒绝的命令不改变任何东西。
     /// 索引不大于 `applied_index` 的条目（重放）直接跳过。
     pub fn apply(&mut self, index: u64, cmd: &Command, outcome: &Applied) -> Result<()> {
+        if let (Command::ExecutorReport { command, .. }, Applied::Reported(inner)) = (cmd, outcome)
+        {
+            return self.apply(index, command, inner);
+        }
         if index <= self.applied {
             return Ok(());
         }

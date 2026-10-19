@@ -287,13 +287,48 @@ impl LtfsIndex {
     /// 序列化为 XML。self_location / previous_location / generation 由调用方
     /// 在 commit 前设好。
     pub fn to_xml(&self) -> Result<Bytes> {
+        let mut out = Vec::with_capacity(4096);
+        self.write_xml(&mut out)?;
+        Ok(Bytes::from(out))
+    }
+
+    /// 只编码到给定字节预算，不分配完整 XML；用于比较 Full 与增量的磁带块数。
+    pub(crate) fn xml_fits_within(&self, limit: usize) -> Result<bool> {
+        struct Budget {
+            remaining: usize,
+            exceeded: bool,
+        }
+        impl std::io::Write for Budget {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.len() > self.remaining {
+                    self.exceeded = true;
+                    return Err(std::io::Error::other("索引编码超过比较预算"));
+                }
+                self.remaining -= bytes.len();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut out = Budget {
+            remaining: limit,
+            exceeded: false,
+        };
+        match self.write_xml(&mut out) {
+            Ok(()) => Ok(true),
+            Err(_) if out.exceeded => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn write_xml<W: std::io::Write>(&self, out: W) -> Result<()> {
         if self.incremental && self.materialized {
             return Err(TapeError::Ltfs(
                 "已重放视图不能作为原始增量序列化，请生成差分或完整检查点".into(),
             ));
         }
-        let mut out = Vec::with_capacity(4096);
-        let mut w = Writer::new_with_indent(&mut out, b' ', 2);
+        let mut w = Writer::new_with_indent(out, b' ', 2);
         w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
 
         let root_name = if self.incremental {
@@ -338,7 +373,7 @@ impl LtfsIndex {
         write_directory(&mut w, &self.root, /*is_root=*/ true)?;
 
         w.write_event(Event::End(BytesEnd::new(root_name)))?;
-        Ok(Bytes::from(out))
+        Ok(())
     }
 }
 
@@ -833,8 +868,8 @@ impl IndexParser {
             && let Some(loc) = self.cur_location.as_mut()
         {
             match name.as_str() {
-                "partition" => loc.partition = trimmed.chars().next().unwrap_or('b'),
-                "startblock" => loc.start_block = trimmed.parse().unwrap_or(0),
+                "partition" => loc.partition = parse_index_partition(trimmed)?,
+                "startblock" => loc.start_block = parse_index_u64(&name, trimmed)?,
                 _ => {}
             }
         }
@@ -860,11 +895,11 @@ impl IndexParser {
             && parent == "extent"
         {
             match name.as_str() {
-                "partition" => ext.partition = trimmed.chars().next().unwrap_or('b'),
-                "startblock" => ext.start_block = trimmed.parse().unwrap_or(0),
-                "byteoffset" => ext.byte_offset = trimmed.parse().unwrap_or(0),
-                "bytecount" => ext.byte_count = trimmed.parse().unwrap_or(0),
-                "fileoffset" => ext.file_offset = trimmed.parse().unwrap_or(0),
+                "partition" => ext.partition = parse_index_partition(trimmed)?,
+                "startblock" => ext.start_block = parse_index_u64(&name, trimmed)?,
+                "byteoffset" => ext.byte_offset = parse_index_u64(&name, trimmed)?,
+                "bytecount" => ext.byte_count = parse_index_u64(&name, trimmed)?,
+                "fileoffset" => ext.file_offset = parse_index_u64(&name, trimmed)?,
                 _ => {}
             }
         }
@@ -903,10 +938,10 @@ impl IndexParser {
         {
             match name.as_str() {
                 "name" => file.name = text.clone(),
-                "length" => file.length = trimmed.parse().unwrap_or(0),
+                "length" => file.length = parse_index_u64(&name, trimmed)?,
                 "symlink" => file.symlink = Some(text.clone()),
                 "openforwrite" => file.open_for_write = Some(matches!(trimmed, "true" | "1")),
-                _ => apply_meta(&mut file.meta, &name, trimmed),
+                _ => apply_meta(&mut file.meta, &name, trimmed)?,
             }
         }
 
@@ -916,7 +951,7 @@ impl IndexParser {
         {
             match name.as_str() {
                 "name" => dir.name = text.clone(),
-                _ => apply_meta(&mut dir.meta, &name, trimmed),
+                _ => apply_meta(&mut dir.meta, &name, trimmed)?,
             }
         }
 
@@ -926,12 +961,12 @@ impl IndexParser {
                 "creator" => self.creator = trimmed.to_string(),
                 "comment" => self.comment = Some(text.clone()),
                 "volumeuuid" => self.volume_uuid = Uuid::parse_str(trimmed).ok(),
-                "generationnumber" => self.generation = trimmed.parse().unwrap_or(0),
+                "generationnumber" => self.generation = parse_index_u64(&name, trimmed)?,
                 "updatetime" => self.update_time = trimmed.to_string(),
                 "allowpolicyupdate" => {
                     self.allow_policy_update = matches!(trimmed, "true" | "1" | "yes")
                 }
-                "highestfileuid" => self.highest_file_uid = trimmed.parse().unwrap_or(0),
+                "highestfileuid" => self.highest_file_uid = parse_index_u64(&name, trimmed)?,
                 "volumelockstate" => self.volume_lock_state = Some(trimmed.to_string()),
                 _ => {}
             }
@@ -1017,7 +1052,19 @@ impl IndexParser {
     }
 }
 
-fn apply_meta(m: &mut NodeMeta, tag: &str, text: &str) {
+fn parse_index_u64(tag: &str, text: &str) -> Result<u64> {
+    text.parse()
+        .map_err(|_| TapeError::Ltfs(format!("索引数值非法: {tag}={text:?}")))
+}
+
+fn parse_index_partition(text: &str) -> Result<char> {
+    if text.len() != 1 || !text.as_bytes()[0].is_ascii_alphabetic() {
+        return Err(TapeError::Ltfs(format!("索引 partition 非法: {text:?}")));
+    }
+    Ok(text.as_bytes()[0] as char)
+}
+
+fn apply_meta(m: &mut NodeMeta, tag: &str, text: &str) -> Result<()> {
     match tag {
         "readonly" => m.readonly = matches!(text, "true" | "1" | "yes"),
         "creationtime" => m.creation_time = text.to_string(),
@@ -1025,9 +1072,10 @@ fn apply_meta(m: &mut NodeMeta, tag: &str, text: &str) {
         "modifytime" => m.modify_time = text.to_string(),
         "accesstime" => m.access_time = text.to_string(),
         "backuptime" => m.backup_time = text.to_string(),
-        "fileuid" => m.file_uid = text.parse().unwrap_or(0),
+        "fileuid" => m.file_uid = parse_index_u64(tag, text)?,
         _ => {}
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1043,6 +1091,29 @@ mod tests {
         assert_eq!(back.generation, 1);
         assert!(back.root.files.is_empty());
         assert!(back.root.subdirs.is_empty());
+    }
+
+    #[test]
+    fn bounded_xml_size_matches_escaped_utf8_and_preserves_errors() {
+        let mut index = LtfsIndex::empty(Uuid::nil(), "边界<&>".into(), 'b');
+        index.root.xattrs.push(Xattr {
+            key: "注释<&>".into(),
+            value: "长属性<&>".repeat(4096),
+            base64: false,
+        });
+        let size = index.to_xml().unwrap().len();
+        for limit in [0, 1, size - 1] {
+            assert!(!index.xml_fits_within(limit).unwrap());
+        }
+        for limit in [size, size + 1, usize::MAX] {
+            assert!(index.xml_fits_within(limit).unwrap());
+        }
+        index.incremental = true;
+        index.materialized = true;
+        assert!(
+            index.xml_fits_within(0).is_err(),
+            "序列化错误不能当成超过预算"
+        );
     }
 
     #[test]
@@ -1134,6 +1205,63 @@ mod tests {
 </contents></directory>
 </contents></directory>
 </ltfsindex>"#;
+
+    #[test]
+    fn full_index_rejects_malformed_numeric_fields_in_ibm_xml() {
+        for tag in [
+            "generationnumber",
+            "highestfileuid",
+            "startblock",
+            "length",
+            "fileuid",
+            "byteoffset",
+            "bytecount",
+            "fileoffset",
+        ] {
+            for value in ["", "bad", "-1", "1.0", "1x", "18446744073709551616"] {
+                let start = IBM_STYLE.find(&format!("<{tag}>")).unwrap() + tag.len() + 2;
+                let end = start + IBM_STYLE[start..].find(&format!("</{tag}>")).unwrap();
+                let mut xml = IBM_STYLE.to_string();
+                xml.replace_range(start..end, value);
+                assert!(
+                    LtfsIndex::parse(xml.as_bytes()).is_err(),
+                    "accepted malformed {tag}={value:?}"
+                );
+            }
+        }
+        // fileuid is also parsed on files, not just the root directory.
+        let xml = IBM_STYLE.replace("<fileuid>3</fileuid>", "<fileuid>bad</fileuid>");
+        assert!(LtfsIndex::parse(xml.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn full_index_rejects_malformed_partitions_in_ibm_xml() {
+        for occurrence in 0..3 {
+            let start = IBM_STYLE
+                .match_indices("<partition>")
+                .nth(occurrence)
+                .unwrap()
+                .0
+                + "<partition>".len();
+            let end = start + IBM_STYLE[start..].find("</partition>").unwrap();
+            for value in ["", "ab", "bgarbage", "1", "磁", "b b"] {
+                let mut xml = IBM_STYLE.to_string();
+                xml.replace_range(start..end, value);
+                assert!(
+                    LtfsIndex::parse(xml.as_bytes()).is_err(),
+                    "accepted partition occurrence {occurrence}={value:?}"
+                );
+            }
+        }
+        // XML whitespace is allowed around otherwise valid scalar values.
+        let xml = IBM_STYLE.replace("<partition>b</partition>", "<partition> b </partition>");
+        let parsed = LtfsIndex::parse(xml.as_bytes()).unwrap();
+        assert_eq!(parsed.self_location.partition, 'b');
+        assert_eq!(
+            parsed.find_file(".LTFSEE_DATA/obj-1").unwrap().extents[0].partition,
+            'b'
+        );
+    }
 
     #[test]
     fn empty_base64_xattr_uses_ibm_compatible_empty_element() {

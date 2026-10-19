@@ -19,7 +19,7 @@ pub struct LibraryArgs {
     #[arg(long, requires = "library_changer")]
     pub library_drive: Vec<String>,
     /// 资源状态 SQLite 路径；禁止复用 ltfsd catalog
-    #[arg(long, requires = "library_changer")]
+    #[arg(long)]
     pub library_state: Option<PathBuf>,
     /// 独占执行节点号
     #[arg(long, default_value_t = 1)]

@@ -644,6 +644,25 @@ fn classify_tail(
 
 // ---------- 回指链 ----------
 
+// EE/LE Recovery 会把同一代 Full 追加为新构造，creator/物理位置和回指改变，
+// 逻辑视图不变。只接受完整可解释、所有节点字段完全相同的 Full 副本。
+fn same_full_view(a: &LtfsIndex, b: &LtfsIndex) -> bool {
+    !a.incremental
+        && !b.incremental
+        && a.unknown_elements.is_empty()
+        && b.unknown_elements.is_empty()
+        && a.volume_uuid == b.volume_uuid
+        && a.generation == b.generation
+        && a.version == b.version
+        && a.update_time == b.update_time
+        && a.allow_policy_update == b.allow_policy_update
+        && a.highest_file_uid == b.highest_file_uid
+        && a.volume_lock_state == b.volume_lock_state
+        && a.previous_incremental_location == b.previous_incremental_location
+        && a.comment == b.comment
+        && a.root == b.root
+}
+
 /// 沿 `previousgenerationlocation` 核验 DP 链。返回 (是否通过, 深度, 是否因预算截断)。
 pub fn verify_chain(
     drive: &TapeDrive<'_>,
@@ -655,7 +674,7 @@ pub fn verify_chain(
     let block_size = label.blocksize as usize;
     let dp_char = label.data_partition;
     let mut prev = cand.index.previous_location;
-    let mut cur_gen = cand.index.generation;
+    let mut current = std::borrow::Cow::Borrowed(&cand.index);
     let mut depth = 0u32;
     while let Some(loc) = prev {
         if loc.partition != dp_char {
@@ -669,6 +688,10 @@ pub fn verify_chain(
         if depth >= budget.max_chain_len {
             notes.push(format!("链核验深度达到预算 {}", budget.max_chain_len));
             return Ok((true, depth, true));
+        }
+        if loc.start_block >= current.self_location.start_block {
+            notes.push(format!("链 @{} 未指向更早的物理构造", loc.start_block));
+            return Ok((false, depth, false));
         }
         let (bytes, ended_by_fm, _) = match read_until_fm(
             drive,
@@ -698,16 +721,18 @@ pub fn verify_chain(
             notes.push(format!("链 @{} 无效: {}", loc.start_block, why));
             return Ok((false, depth, false));
         }
-        if idx.generation >= cur_gen {
+        if idx.generation > current.generation
+            || (idx.generation == current.generation && !same_full_view(&current, &idx))
+        {
             notes.push(format!(
                 "链 @{} 代数 {} 不低于后继 {}",
-                loc.start_block, idx.generation, cur_gen
+                loc.start_block, idx.generation, current.generation
             ));
             return Ok((false, depth, false));
         }
         depth += 1;
-        cur_gen = idx.generation;
         prev = idx.previous_location;
+        current = std::borrow::Cow::Owned(idx);
     }
     Ok((true, depth, false))
 }

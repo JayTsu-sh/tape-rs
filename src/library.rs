@@ -18,6 +18,11 @@ use crate::scsi::reservation::{self, FenceOutcome, ReservationKey};
 use crate::scsi::transport::TapeTransport;
 use crate::tape::commands::TapeDrive;
 
+mod admin;
+mod maintenance;
+mod pools;
+pub mod tasks;
+
 /// IBM DVCID 可能含 vendor/product；只匹配完整 ASCII 分量，不用任意子串。
 pub(crate) fn drive_id_matches(id: &str, serial: &str) -> bool {
     !serial.is_empty() && (id == serial || id.split_ascii_whitespace().any(|part| part == serial))
@@ -44,6 +49,40 @@ fn component(s: &str) -> Result<()> {
     Ok(())
 }
 
+/// 普通命名空间操作不得拆散 EE 对象、别名及其父目录。
+fn ordinary_path(index: &LtfsIndex, path: &str) -> Result<()> {
+    let path = path.trim_matches('/');
+    let related = |other: &str| {
+        path.is_empty()
+            || other == path
+            || other.strip_prefix(path).is_some_and(|s| s.starts_with('/'))
+            || path.strip_prefix(other).is_some_and(|s| s.starts_with('/'))
+    };
+    let mut protected = path.split('/').next() == Some(".LTFSEE_DATA");
+    index.walk_files(|name, file| {
+        if related(name)
+            && (name.split('/').next() == Some(".LTFSEE_DATA")
+                || file.xattrs.iter().any(|x| x.key.starts_with("ibm.ltfsee."))
+                || file
+                    .symlink
+                    .as_deref()
+                    .is_some_and(|target| target.split('/').any(|part| part == ".LTFSEE_DATA")))
+        {
+            protected = true;
+        }
+    });
+    index.walk_directories(|name, dir| {
+        if related(name) && dir.xattrs.iter().any(|x| x.key.starts_with("ibm.ltfsee.")) {
+            protected = true;
+        }
+    });
+    if protected {
+        Err(refuse("不能用普通操作改动 EE 管理对象、别名或其父目录"))
+    } else {
+        Ok(())
+    }
+}
+
 /// 确切的 DTE 偏移与 transport；创建时以库存 DVCID/VPD 核对。
 pub struct LibraryDrive<D> {
     pub offset: u16,
@@ -62,6 +101,9 @@ pub struct Library<C, D> {
     stopped: bool,
     validated: bool,
     serial: String,
+    online_candidate: Option<String>,
+    task: Option<(tasks::TaskStore, i64)>,
+    task_cancelled: std::cell::Cell<bool>,
     _lock: nix::fcntl::Flock<std::fs::File>,
 }
 
@@ -82,11 +124,15 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
         let lock = nix::fcntl::Flock::lock(lock, nix::fcntl::FlockArg::LockExclusiveNonblock)
             .map_err(|(_, e)| TapeError::Nix(e))?;
         let db = Connection::open(state)?;
+        db.busy_timeout(Duration::from_secs(5))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
           CREATE TABLE IF NOT EXISTS library_identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1), serial TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS library_observations (singleton INTEGER PRIMARY KEY CHECK(singleton=1), data TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS library_volumes (barcode TEXT PRIMARY KEY, pool TEXT NOT NULL,
             home INTEGER NOT NULL, blacklist TEXT, phase TEXT NOT NULL DEFAULT 'Assigned', failure TEXT, last_failure TEXT);")?;
+        pools::initialize(&db)?;
+        admin::initialize(&db)?;
+        maintenance::initialize(&db)?;
         let columns: Vec<String> = db
             .prepare("PRAGMA table_info(library_volumes)")?
             .query_map([], |r| r.get(1))?
@@ -109,6 +155,9 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
             stopped: false,
             validated: false,
             serial: String::new(),
+            online_candidate: None,
+            task: None,
+            task_cancelled: std::cell::Cell::new(false),
             _lock: lock,
         };
         let serial =
@@ -156,6 +205,7 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
         this.serial = serial;
         this.validated = true;
         this.remember_inventory(&map, &inventory)?;
+        tasks::TaskStore::open(state)?.interrupt_running()?;
         Ok(this)
     }
 
@@ -196,6 +246,7 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
             e.source_address
                 .ok_or_else(|| refuse("无法确认介质 home slot"))?
         };
+        self.check_pool_media(pool, barcode)?;
         if home < map.storage_start
             || u32::from(home) >= u32::from(map.storage_start) + u32::from(map.storage_count)
         {
@@ -217,8 +268,15 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
         }) {
             return Err(refuse("先显式归槽再取消 assignment"));
         }
-        self.db
-            .execute("DELETE FROM library_volumes WHERE barcode=?1", [barcode])?;
+        let transaction = self.db.transaction()?;
+        if transaction.execute("DELETE FROM library_volumes WHERE barcode=?1", [barcode])? == 0 {
+            return Err(refuse("NEED_ASSIGN"));
+        }
+        transaction.execute(
+            "DELETE FROM library_tape_options WHERE barcode=?1",
+            [barcode],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -241,6 +299,7 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
         let (map, inv) = self.inventory()?;
         let mut status = self.status_from(map, inv)?;
         status["source"] = json!("device_query");
+        status["observed_at"] = json!(crate::ltfs::label::ltfs_time_now());
         Ok(status)
     }
     fn remember_inventory(&self, map: &ElementAddressMap, inv: &[ElementStatus]) -> Result<()> {
@@ -269,17 +328,13 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
         let drives: Vec<Value> = inv.iter().filter(|e| e.element_type == ElementType::DataTransfer).map(|e| json!({
             "offset":e.address-map.dt_start,"serial":e.drive_id,"barcode":e.volume_tag,"occupied":e.full,
             "configured":self.drives.iter().any(|d| map.dt_start+d.offset==e.address)})).collect();
-        Ok(
-            json!({"node":if self.stopped {"OwnershipLost"} else {"Available"},"library_serial":self.serial,"volumes":volumes,"drives":drives}),
-        )
+        let mut status = json!({"node":if self.stopped {"OwnershipLost"} else {"Available"},"library_serial":self.serial,"volumes":volumes,"drives":drives,"pools":self.pool_list()?});
+        admin::decorate_status(&self.db, &mut status)?;
+        Ok(status)
     }
 
     pub fn pools(&self) -> Result<Vec<String>> {
-        let mut s = self
-            .db
-            .prepare("SELECT DISTINCT pool FROM library_volumes ORDER BY pool")?;
-        Ok(s.query_map([], |r| r.get(0))?
-            .collect::<std::result::Result<_, _>>()?)
+        self.pool_names()
     }
     pub fn volumes(&self, pool: &str) -> Result<Vec<String>> {
         let mut s = self
@@ -323,6 +378,77 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
         log::info!("卷 {} 调度阶段 {}{}", barcode, phase, failure.unwrap_or(""));
         Ok(())
     }
+
+    /// 开始前台持久任务；调用方必须在 close 后记录终态。
+    pub fn begin_task(&mut self, operation: &str, target: &str) -> Result<i64> {
+        if self.task.is_some() {
+            return Err(refuse("本实例已有活动任务"));
+        }
+        let path = self.db.path().ok_or_else(|| refuse("任务需要文件资源库"))?;
+        let store = tasks::TaskStore::open(Path::new(path))?;
+        let task = store.start(operation, target)?;
+        self.task_cancelled.set(false);
+        self.task = Some((store, task.id));
+        Ok(task.id)
+    }
+
+    /// 只在安全边界响应取消；不在文件追加与提交之间调用。
+    pub fn check_task(&self, progress: u8, message: &str) -> Result<()> {
+        if let Some((store, id)) = &self.task
+            && !store.checkpoint(*id, progress, message, None)?
+        {
+            self.task_cancelled.set(true);
+            return Err(refuse("任务已在安全检查点取消；已发生的副作用未回滚"));
+        }
+        Ok(())
+    }
+
+    fn task_outcome(&self, progress: u8, message: &str, outcome: Value) -> Result<()> {
+        if let Some((store, id)) = &self.task {
+            // 此处只记事实，忽略返回的取消请求；不能把已完成 commit 抹掉。
+            store.checkpoint(*id, progress, message, Some(&outcome))?;
+        }
+        Ok(())
+    }
+
+    fn observe_capacity(&self, idx: usize, barcode: &str) -> Result<()> {
+        use crate::ltfs::mam::{ATTR_MAXIMUM_CAPACITY, ATTR_REMAINING_CAPACITY, Mam};
+        let mam = Mam::with_partition(&self.drives[idx].device, 1);
+        let measured = (|| -> Result<Option<(u64, u64)>> {
+            // 两个属性必须都存在；不能使用缺一个就默认零的旧聚合接口。
+            let remaining = mam.read_u64(ATTR_REMAINING_CAPACITY)?;
+            let maximum = mam.read_u64(ATTR_MAXIMUM_CAPACITY)?;
+            Ok(match (maximum, remaining) {
+                (Some(maximum), Some(remaining)) => maximum
+                    .checked_mul(1 << 20)
+                    .zip(remaining.checked_mul(1 << 20))
+                    .filter(|(m, r)| *m > 0 && r <= m && *m <= i64::MAX as u64),
+                _ => None,
+            })
+        })();
+        match measured {
+            Ok(capacity) => self.record_tape_capacity(barcode, capacity),
+            Err(error) if reservation::ownership_lost(&error) => Err(error),
+            Err(error) => {
+                log::debug!("卷 {barcode} DP 容量未知，保留原始错误: {error}");
+                self.record_tape_capacity(barcode, None)
+            }
+        }
+    }
+
+    pub fn finish_task(&mut self, success: bool, message: &str) -> Result<Option<Value>> {
+        let Some((store, id)) = self.task.take() else {
+            return Ok(None);
+        };
+        let state = if success {
+            tasks::TaskState::Success
+        } else if self.task_cancelled.get() {
+            tasks::TaskState::Cancelled
+        } else {
+            tasks::TaskState::Failed
+        };
+        Ok(Some(store.finish(id, state, message, None)?.to_json()))
+    }
     fn fence(&self, dev: &dyn TapeTransport) -> Result<()> {
         match reservation::fence(dev, self.key)? {
             FenceOutcome::Fenced { .. } => Ok(()),
@@ -330,6 +456,7 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
         }
     }
     fn allowed(&self, barcode: &str) -> Result<u16> {
+        self.check_online(barcode)?;
         let row: Option<(u16, Option<String>)> = self
             .db
             .query_row(
@@ -346,11 +473,31 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
     }
 
     /// reservation → MOVE → LOAD → ready；只驱逐本资源库已分配且未 blacklist 的卷。
-    fn select(&mut self, barcode: &str) -> Result<usize> {
+    fn select(&mut self, barcode: &str, role: char) -> Result<usize> {
+        self.check_task(5, "调度前检查")?;
         if self.stopped {
             return Err(refuse("设备资格已失去，请关闭并重新核验现场"));
         }
         let home = self.allowed(barcode)?;
+        let pool: String = self.db.query_row(
+            "SELECT pool FROM library_volumes WHERE barcode=?1",
+            [barcode],
+            |r| r.get(0),
+        )?;
+        let (map, inv) = self.inventory()?;
+        let enabled = (0..self.drives.len())
+            .map(|i| self.drive_eligible_in(i, &pool, role, &map, &inv))
+            .collect::<Result<Vec<_>>>()?;
+        if !enabled.iter().any(|enabled| *enabled) {
+            return Err(refuse(format!("没有符合角色 {role} 和节点组约束的驱动器")));
+        }
+        self.check_task(8, "挂载限额调整前检查")?;
+        self.task_outcome(
+            8,
+            "准备调整挂载限额",
+            json!({"effects":"may_have_started","commit":"not_started"}),
+        )?;
+        self.enforce_mount_limit(barcode)?;
         let (map, inv) = self.inventory()?;
         if home < map.storage_start
             || u32::from(home) >= u32::from(map.storage_start) + u32::from(map.storage_count)
@@ -367,14 +514,23 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
                     && e.address == map.dt_start + self.drives[i].offset
             })
         };
+        let enabled = (0..self.drives.len())
+            .map(|i| self.drive_eligible_in(i, &pool, role, &map, &inv))
+            .collect::<Result<Vec<_>>>()?;
         let chosen = (0..self.drives.len())
+            .filter(|&i| enabled[i])
             .find(|&i| configured(i).is_some_and(|e| e.volume_tag.as_deref() == Some(barcode)))
-            .or_else(|| (0..self.drives.len()).find(|&i| configured(i).is_some_and(|e| !e.full)))
+            .or_else(|| {
+                (0..self.drives.len())
+                    .filter(|&i| enabled[i])
+                    .find(|&i| configured(i).is_some_and(|e| !e.full))
+            })
             .or_else(|| {
                 (0..self.drives.len()).find(|&i| {
-                    configured(i)
-                        .and_then(|e| e.volume_tag.as_deref())
-                        .is_some_and(|b| self.allowed(b).is_ok())
+                    enabled[i]
+                        && configured(i)
+                            .and_then(|e| e.volume_tag.as_deref())
+                            .is_some_and(|b| self.allowed(b).is_ok())
                 })
             })
             .ok_or_else(|| refuse("没有可调度驱动器（不会驱逐未分配介质）"))?;
@@ -387,6 +543,12 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
             return Err(refuse("目标介质不在已确认 home slot"));
         }
         self.phase(barcode, "Reserving", None)?;
+        self.check_task(10, "取得设备资格前检查")?;
+        self.task_outcome(
+            10,
+            "准备取得资格",
+            json!({"effects":"may_have_started","commit":"not_started"}),
+        )?;
         if self.claimed_changer {
             reservation::verify_holder(&self.changer, self.key)?;
         } else {
@@ -405,6 +567,7 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
             self.return_drive(chosen)?;
         }
         // 重新确认库存：禁止根据旧位置盲目 MOVE。
+        self.check_task(20, "搬带前检查")?;
         let (_, now) = self.inventory()?;
         let dest = map.dt_start + self.drives[chosen].offset;
         let mut moved = false;
@@ -435,6 +598,7 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
             }
         }
         self.phase(barcode, "Loading", None)?;
+        self.check_task(30, "装带前检查")?;
         let drive = TapeDrive::new(&self.drives[chosen].device);
         reservation::verify_holder(&self.drives[chosen].device, self.key)?;
         if moved || !drive.test_unit_ready()? {
@@ -502,7 +666,7 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
         path: &str,
         f: impl FnOnce(&LtfsVolume<'_>, &str) -> Result<T>,
     ) -> Result<T> {
-        self.volume_operation(path, false, |v, p| f(v, p))
+        self.volume_operation(path, false, 'r', |v, p| f(v, p))
     }
     /// 显式卷更新；完整 commit/checkpoint 后才报告成功。
     pub fn with_volume<T>(
@@ -510,18 +674,27 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
         path: &str,
         f: impl FnOnce(&mut LtfsVolume<'_>, &str) -> Result<T>,
     ) -> Result<T> {
-        self.volume_operation(path, true, f)
+        self.volume_operation(path, true, 'm', f)
+    }
+    /// 显式维护检查使用 g 角色，仍只向回调提供不可变卷。
+    pub fn inspect_maintenance_volume<T>(
+        &mut self,
+        path: &str,
+        f: impl FnOnce(&LtfsVolume<'_>, &str) -> Result<T>,
+    ) -> Result<T> {
+        self.volume_operation(path, false, 'g', |v, p| f(v, p))
     }
     fn volume_operation<T>(
         &mut self,
         path: &str,
         write: bool,
+        role: char,
         f: impl FnOnce(&mut LtfsVolume<'_>, &str) -> Result<T>,
     ) -> Result<T> {
         let (barcode, relative) = self.resolve(path)?;
         let mut recovering = false;
         let result: Result<T> = (|| {
-            let idx = self.select(barcode)?;
+            let idx = self.select(barcode, role)?;
             self.phase(barcode, "Recovering", None)?;
             recovering = true;
             reservation::verify_holder(&self.drives[idx].device, self.key)?;
@@ -544,9 +717,20 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
                 vol.restricted_reason(),
             )?;
             recovering = false;
+            self.check_task(50, "文件操作前安全检查")?;
+            self.observe_capacity(idx, barcode)?;
+            if write {
+                self.task_outcome(
+                    50,
+                    "开始卷更新",
+                    json!({"effects":"may_have_started","commit":"indeterminate_until_remount"}),
+                )?;
+            }
             let value = f(&mut vol, relative)?;
             if write {
                 vol.commit()?;
+                self.task_outcome(90, "完整提交已完成", json!({"effects":"completed","commit":"full_checkpoint","generation":vol.index().generation,"uuid":vol.index().volume_uuid.to_string()}))?;
+                self.observe_capacity(idx, barcode)?;
             }
             self.sessions[idx] = vol
                 .into_session()
@@ -592,6 +776,7 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
         create_only: bool,
     ) -> Result<u64> {
         self.with_volume(path, |v, p| {
+            ordinary_path(v.index(), p)?;
             if create_only && v.index().find_file(p).is_some() {
                 return Err(refuse("目标文件已存在"));
             }
@@ -778,6 +963,7 @@ impl<C: TapeTransport + Send, D: TapeTransport + Send> crate::tapefs::Backend
             .lock()
             .map_err(|_| nix::libc::EIO)?
             .with_volume(path, |v, p| {
+                ordinary_path(v.index(), p)?;
                 if v.remove_file(p)? {
                     Ok(())
                 } else {
@@ -790,21 +976,33 @@ impl<C: TapeTransport + Send, D: TapeTransport + Send> crate::tapefs::Backend
         self.0
             .lock()
             .map_err(|_| nix::libc::EIO)?
-            .with_volume(path, |v, p| v.create_directory(p))
+            .with_volume(path, |v, p| {
+                ordinary_path(v.index(), p)?;
+                v.create_directory(p)
+            })
             .map_err(errno)
     }
     fn rmdir(&self, path: &str) -> crate::tapefs::Res<()> {
         self.0
             .lock()
             .map_err(|_| nix::libc::EIO)?
-            .with_volume(path, |v, p| v.remove_directory(p))
+            .with_volume(path, |v, p| {
+                ordinary_path(v.index(), p)?;
+                v.remove_directory(p)
+            })
             .map_err(errno)
     }
     fn symlink(&self, target: &str, path: &str) -> crate::tapefs::Res<()> {
         self.0
             .lock()
             .map_err(|_| nix::libc::EIO)?
-            .with_volume(path, |v, p| v.add_symlink(p, target))
+            .with_volume(path, |v, p| {
+                ordinary_path(v.index(), p)?;
+                if target.split('/').any(|part| part == ".LTFSEE_DATA") {
+                    return Err(refuse("普通链接不能引用 EE 管理对象"));
+                }
+                v.add_symlink(p, target)
+            })
             .map_err(errno)
     }
     fn rename(&self, from: &str, to: &str, no_replace: bool) -> crate::tapefs::Res<()> {
@@ -816,6 +1014,8 @@ impl<C: TapeTransport + Send, D: TapeTransport + Send> crate::tapefs::Backend
         }
         let p2 = p2.to_owned();
         lib.with_volume(from, |v, p| {
+            ordinary_path(v.index(), p)?;
+            ordinary_path(v.index(), &p2)?;
             if no_replace
                 && (v.index().find_file(&p2).is_some() || v.index().find_directory(&p2).is_some())
             {
@@ -829,7 +1029,10 @@ impl<C: TapeTransport + Send, D: TapeTransport + Send> crate::tapefs::Backend
         self.0
             .lock()
             .map_err(|_| nix::libc::EIO)?
-            .with_volume(path, |v, p| v.change_node_metadata(p, change))
+            .with_volume(path, |v, p| {
+                ordinary_path(v.index(), p)?;
+                v.change_node_metadata(p, change)
+            })
             .map_err(errno)
     }
     fn change_xattr(
@@ -846,8 +1049,12 @@ impl<C: TapeTransport + Send, D: TapeTransport + Send> crate::tapefs::Backend
             return Err(nix::libc::EINVAL);
         }
         let key = name.strip_prefix("user.").ok_or(nix::libc::EOPNOTSUPP)?;
+        if key.starts_with("ibm.ltfsee.") {
+            return Err(nix::libc::EPERM);
+        }
         let mut lib = self.0.lock().map_err(|_| nix::libc::EIO)?;
         lib.with_volume(path, |v, p| {
+            ordinary_path(v.index(), p)?;
             let xs = if let Some(f) = v.index().find_file(p) {
                 &f.xattrs
             } else {
@@ -946,6 +1153,8 @@ pub fn cached_status_if_active(state: &Path) -> Result<Option<Value>> {
         }
     }
     status["source"] = json!("cached_inventory");
+    status["pools"] = pools::list_from_db(&db)?;
+    admin::decorate_status(&db, &mut status)?;
     db.execute_batch("COMMIT")?;
     Ok(Some(status))
 }

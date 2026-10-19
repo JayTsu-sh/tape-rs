@@ -1,18 +1,24 @@
-//! ltfsd 最小骨架：三节点 Raft 选出 Leader，Leader 取得执行轮次、隔离逻辑库的全部设备、
-//! 经多数派确认后恢复卷并开始服务；失去资格则冻结并让出领导权。
+//! ltfsd：三个持久 Raft 投票副本，控制 Leader 与设备 owner 分离。
+//! 无 FC 的节点也可担任控制 Leader；完整设备组通过发现后才成为执行候选。
 //!
 //! 线程划分：一个 Raft 循环线程（`node`），一个设备执行线程（`executor`），网络收发线程（`net`）。
 //! 设备操作可能耗时数分钟，绝不在 Raft 循环里做。
 //!
-//! 接管序列（研究笔记 authority-after-device-fencing.md）：
-//! 当选 → 提交 `Takeover`，它的日志索引就是执行轮次 → 隔离全部设备并回读 →
-//! 提交 `Fenced`（应用时若已有更新的 `Takeover` 则本轮作废）→ 恢复、收尾 → 服务。
+//! 新协议：提交 `AssignExecutor`（日志索引为轮次）→ ReadIndex 核验隔离许可 →
+//! 隔离全部设备并回读 → 提交实例/轮次/序号绑定的 `Fenced` → ReadIndex 执行许可 →
+//! 恢复卷 → 提交 `ExecutorReady` → ReadIndex 服务许可。每条 CDB 均有本地时效门控。
+//! 许可超时不能代替设备隔离，不会取消已经进入内核的命令，也不授权重放硬件操作。
+//!
+//! `ltfsd` 默认使用新协议；`NodeConfig::coordination=None` 仅保留旧公开调用者的兼容行为。
+//! 不支持旧协议节点与新协议节点混合运行。
 
+mod coordinator;
 pub mod directory;
 pub mod executor;
 pub mod files;
 pub mod http;
 pub mod net;
 pub mod node;
+pub mod permission;
 pub mod state;
 pub mod store;
