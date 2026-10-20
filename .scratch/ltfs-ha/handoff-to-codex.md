@@ -672,3 +672,20 @@ R2三份4KiB新路径comparison/recovery-bounded-20261020/{control-only-leader,l
 最终代码完整 cargo test 422 通过 / 4 忽略；cargo fmt --all -- --check、cargo check --all-targets、cargo clippy --all-targets --all-features、git diff --check 均通过，check/clippy 无告警。review 修复前的首轮完整检查也通过。日志 /tmp/tape-review-20261020，最终轮 final/verification.json 和各检查日志。CodeGraph sync、affected 和相关调用路径检查完成；affected 未推导出测试，不替代实际全量测试。
 
 已逐文件比较当前生产源码与 R2 实机 source.patch：Cargo.toml/Cargo.lock 及 http/coordinator/executor/recovery 均完全一致，故前述 R2 物理验收适用于本次生产实现。review 后只修正测试，本轮未访问设备、未重新部署或执行硬件动作；实机掉电、写入中故障、内核冻结仍未验证。正式服务保持原部署。本次提交限于已跟踪源码、测试、依赖及文档；CodeGraph、本地历史、探针原始日志、认证材料与其他未跟踪文件不纳入。交接记录随代码提交，远端推送结果以 main/origin/main 核对为准。
+
+
+### 2026-10-20 — 四项默认忽略用例物理主机显式验收通过
+
+用户要求在真实环境完成四项忽略用例。源码为已推送 GitHub main 的 32479460daf272303c859a54e50044f3a941bcb1，生产代码未修改。使用 cargo zigbuild --release --locked --target x86_64-unknown-linux-musl --tests -j6 构建静态原始测试 harness（避免物理节点 glibc2.34 与 libtest 的版本冲突），在物理 lisa-1 / 10.131.7.207、Linux5.14.0-687.56.1.el9_8 显式逐项执行 --ignored --exact。四项均实际执行并显示1 passed/0 failed/0 ignored；不是以默认忽略视为通过。
+
+kernel_address_lifecycle通过真实地址增删、内核寿命、ARP、外部地址保护及链路故障检查；kernel_process_expiry通过真实HTTP/ARP和SIGSTOP/SIGCONT/计划退出/SIGKILL，pause/kill触发后VIP分别2000/2201ms消失，计划退出200ms。两个用例分别置于与宿主不同inode的匿名网络命名空间，veth仅连接命名空间内部，192.0.2.100未配置到宿主。控制日志提交按原用例模拟，不能描述为三节点Raft或真实掉电/写带故障。
+
+export_xml_for_schema_validation除导出用例通过，还用现场xmllint/libxml2 2.9.13按SNIA官方LTFS2.5.1 Annex B.2实际XSD校验成功；非法generationnumber对照以预期退出码3拒绝。首次PDF直连403，schema由web PDF文本提取；随后带User-Agent下载成功，已将本地PDF附录与所用schema按XML节点和属性复核一致，仅移除页眉页脚、缩进并连接UUID折行，约束未改。官方PDF SHA256 25744563f0bc1d72af89eba6abac2a3378feeb2ddb9c0a6ccf6d037b01bb4293；来源与schema哈希留证。XSD只覆盖其可表达的基本结构约束。stream_parser_materializes_one_million_files通过百万数量、末文件名/UID、时间字段断言，流式解析2.333923552s，/usr/bin/time峰值RSS387252KiB（378.18MiB），无swap；这是合成输入解析性能，不是磁带读速。
+
+脚本probes/run-ignored-four-20261020.py；唯一远端目录/root/tape-ignored-four-20261020，systemd unit tape-ignored-four-20261020.service，DevicePolicy=closed、MemoryMax8GiB、CPUQuota200%、RuntimeMax15min。requested/complete已消费，禁止重跑同一one-shot。结果probes/results/ignored-four-physical-20261020，含构建日志、二进制哈希、原始四用例日志、XSD正反校验、峰值RSS、宿主前后状态、summary.json及cleanup-proof.json。报告reports/ignored-four-physical-20261020.html全部本地链接已核对。
+
+独立清理核验通过：unit inactive/MainPID0且已collect，无测试进程、测试网络命名空间或宿主测试网卡/VIP；宿主所有IP和原有命名空间列表一致。临时schema中转文件已删，临时SSH及socket已关闭。全程未访问/dev/sg*、未操作磁带/机械手、未替换正式服务。四项保留默认#[ignore]门控；本次现场全部显式通过。
+
+用户随后授权将测试与文档合入GitHub main。本条随测试脚本、所用XSD（probes/fixtures/ltfs-incremental-2.5.1.xsd）、独立验收摘要（reports/ignored-four-physical-20261020-summary.html和同名JSON）、docs/file-client.md入口一并提交。摘要中的相对链接仅引用本次提交或已有已跟踪文件，完整原始报告、日志、二进制、压缩包、PDF和本地历史保留本地。所提交脚本与现场实际执行的run-tests.py逐字节一致，XSD也与实际校验版本一致；本次仅整理测试文档，不重跑已消费one-shot、不访问现场、不修改Rust源码、依赖或默认测试门控。远端main最终推送状态以Git提交核对为准。
+
+本次提交前检查：Python AST语法通过；脚本及XSD与现场版本字节/哈希一致；摘要计数、源码SHA、RSS和XSD正反校验结果核对通过；HTML全部链接目标在提交集合或已有跟踪文件内；凭据模式扫描无匹配；cargo fmt --all -- --check、git diff --check和CodeGraph sync通过。未修改Rust代码，未再跑全量cargo test或现场one-shot；四项物理验收仍以此前原始记录为依据。

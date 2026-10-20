@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>四项忽略测试的物理主机验收摘要 · 2026-10-20</title>
+<style>body{font:16px/1.65 system-ui;max-width:1100px;margin:36px auto;padding:0 20px;color:#18232e}table{border-collapse:collapse;width:100%;margin:20px 0}td,th{border:1px solid #ccd4dc;padding:9px;text-align:left}code{overflow-wrap:anywhere}pre{overflow:auto;background:#f3f5f7;padding:14px}a{color:#126aaf}</style>
+</head>
+<body>
+<h1>四项忽略测试：4项通过，0项失败，0项忽略</h1>
+<p>完成时间：2026-10-20 12:30（Asia/Shanghai）。测试源码：<a href="https://github.com/JayTsu-sh/tape-rs/commit/32479460daf272303c859a54e50044f3a941bcb1"><code>32479460daf272303c859a54e50044f3a941bcb1</code></a>。物理节点 lisa-1 / 10.131.7.207，内核 <code>5.14.0-687.56.1.el9_8.x86_64</code>，宿主 glibc 2.34。测试以 release / x86_64-unknown-linux-musl 静态二进制运行，锁定 Cargo.lock，不修改生产代码、依赖或正式部署。</p>
+<table><thead><tr><th>显式执行的用例</th><th>结论</th><th>运行耗时/秒</th></tr></thead><tbody>
+<tr><td><code>daemon::vip::tests::kernel_address_lifecycle</code></td><td>通过</td><td>1.315</td></tr>
+<tr><td><code>daemon::vip::tests::kernel_process_expiry</code></td><td>通过</td><td>27.196</td></tr>
+<tr><td><code>ltfs::incremental::tests::export_xml_for_schema_validation</code></td><td>通过</td><td>0.001</td></tr>
+<tr><td><code>stream_parser_materializes_one_million_files</code></td><td>通过</td><td>2.417</td></tr>
+</tbody></table>
+<p>每项以 <code>--ignored --exact &lt;name&gt; --nocapture --test-threads=1</code> 单独执行，原始日志均显示 <code>1 passed; 0 failed; 0 ignored</code>。默认 <code>#[ignore]</code> 环境门控保留。</p>
+<h2>核验内容和实测值</h2>
+<p>VIP 地址生命周期覆盖真实内核地址增删、内核到期回收、ARP公告、外部地址保护和链路故障撤销准入。进程用例实际通过 VIP 请求 HTTP /readyz 并要求200，从 veth 对端接收 ARP，并检查 SIGSTOP/SIGCONT、计划退出和 SIGKILL。</p>
+<table><thead><tr><th>场景</th><th>owner就绪/ms</th><th>VIP发布/ms</th><th>触发后VIP消失/ms</th></tr></thead><tbody>
+<tr><td>pause</td><td>9004</td><td>9204</td><td>2000</td></tr>
+<tr><td>shutdown</td><td>1000</td><td>1200</td><td>200</td></tr>
+<tr><td>kill</td><td>1000</td><td>1200</td><td>2201</td></tr>
+</tbody></table>
+<p>XML 导出后，由现场 <code>xmllint / libxml2 2.9.13</code> 按 <a href="https://www.snia.org/sites/default/files/technical-work/ltfs/release/SNIA-LTFS-Format-2-5-1-Standard.pdf">SNIA LTFS 2.5.1</a> Annex B.2 进行 XSD 校验，退出码0；非法 generationnumber 对照样本被拒绝，退出码3符合预期。测试所用 <a href="../probes/fixtures/ltfs-incremental-2.5.1.xsd">XSD</a> 已与下载PDF对应附录逐节点、属性复核一致，仅移除页眉页脚、空白缩进并连接UUID折行。</p>
+<p>百万文件用例核对数量、末文件名、UID及时间字段，解析耗时 <strong>2.334秒</strong>，<code>/usr/bin/time -v</code> 测得进程峰值 RSS <strong>387252 KiB / 378.18 MiB</strong>，无swap。</p>
+<h2>范围与清理</h2>
+<p>两个VIP用例分别在与宿主不同inode的匿名网络命名空间运行，测试veth不连接物理网卡，192.0.2.100仅在隔离网络内出现。systemd限制 DevicePolicy=closed、MemoryMax=8GiB、CPUQuota=200%、TasksMax=128、RuntimeMax=15分钟，KillMode=control-group。</p>
+<p>独立收尾核验：服务inactive / MainPID=0，无测试进程、测试命名空间、宿主测试网卡或VIP残留；宿主全部IP和原有命名空间列表一致，SSH及socket已关闭。未访问/dev/sg*，未操作磁带或机械手。</p>
+<p>控制日志提交沿用原用例内模拟，不代表三节点Raft、物理掉电或写带故障验证。百万文件输入是流式合成XML，不代表磁带读取速度。XSD验证其可表达的基本结构约束，不能替代全部增量语义检查。</p>
+<h2>复用脚本</h2>
+<p>运行脚本：<a href="../probes/run-ignored-four-20261020.py">run-ignored-four-20261020.py</a>。仅在用户授权的实验室主机运行，不直接在仓库目录执行，不复用本次已消费的目录或unit名称。</p>
+<ol>
+<li>在构建主机安装Rust musl target、cargo-zigbuild及兼容Zig；从目标源码提交构建测试二进制，保留构建JSON以识别目标产物：<pre>CARGO_ZIGBUILD_ZIG_PATH=&quot;$PWD/.scratch/ltfs-ha/probes/zig-linker-compat.py&quot; \
+CARGO_TARGET_DIR=/tmp/tape-ignored-validation \
+cargo zigbuild --release --locked --target x86_64-unknown-linux-musl \
+  --tests -j 6 --message-format=json</pre></li>
+<li>新建独立运行目录，将脚本复制为 <code>run-tests.py</code>，将lib单元测试harness和sim_large_index测试harness分别复制为 <code>unit-tests</code>、<code>large-index-tests</code>；以源码提交SHA填入 <code>source-commit</code>，复制上述XSD为 <code>ltfs-incremental-2.5.1.xsd</code>。核对文件哈希和权限。</li>
+<li>目标主机需要普通Python3（保留断言）、root及网络命名空间/NET_ADMIN/NET_RAW权限、ip、unshare、xmllint和/usr/bin/time。使用新unit名和新目录，在禁止设备访问的cgroup内运行：<pre>systemd-run --wait --pipe --collect --unit=&lt;new-unit-name&gt; \
+  --property=Type=exec --property=DevicePolicy=closed \
+  --property=MemoryMax=8G --property=CPUQuota=200% \
+  --property=TasksMax=128 --property=RuntimeMaxSec=900 \
+  --property=KillMode=control-group \
+  /usr/bin/python3 &lt;new-run-directory&gt;/run-tests.py</pre></li>
+<li>要求四用例均实际运行、XSD正反校验符合预期，检查 <code>summary.json</code> 及 <code>complete</code>，并独立确认无进程、命名空间及VIP残留、宿主地址一致。脚本用 <code>requested</code> 排他标记防止原地重跑；完整原始记录留在运行目录。</li>
+</ol>
+<h2>可核对摘要</h2>
+<p><a href="ignored-four-physical-20261020-summary.json">JSON摘要</a> 包含精确时延、资源数值、源码SHA、二进制及脚本SHA256、官方PDF和XSD哈希、清理结论。原始日志、构建产物、宿主库存、压缩包和PDF保留在本地 <code>.scratch/ltfs-ha/probes/results/ignored-four-physical-20261020</code>，不随此提交上传；本页不依赖这些文件的链接。</p>
+</body>
+</html>

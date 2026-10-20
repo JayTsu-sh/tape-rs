@@ -1,0 +1,93 @@
+{
+  "source_commit": "32479460daf272303c859a54e50044f3a941bcb1",
+  "completed_utc": "2026-10-20T04:30:07.799339+00:00",
+  "host": "lisa-1",
+  "host_ip": "10.131.7.207",
+  "kernel": "5.14.0-687.56.1.el9_8.x86_64",
+  "test_target": "x86_64-unknown-linux-musl",
+  "profile": "release",
+  "host_glibc": "2.34",
+  "counts": {
+    "passed": 4,
+    "failed": 0,
+    "ignored": 0
+  },
+  "tests": [
+    {
+      "name": "daemon::vip::tests::kernel_address_lifecycle",
+      "exit_code": 0,
+      "seconds": 1.315364
+    },
+    {
+      "name": "daemon::vip::tests::kernel_process_expiry",
+      "exit_code": 0,
+      "seconds": 27.19621
+    },
+    {
+      "name": "ltfs::incremental::tests::export_xml_for_schema_validation",
+      "exit_code": 0,
+      "seconds": 0.001386
+    },
+    {
+      "name": "stream_parser_materializes_one_million_files",
+      "exit_code": 0,
+      "seconds": 2.416801
+    }
+  ],
+  "xml_validation": {
+    "validator": "xmllint / libxml2 2.9.13",
+    "valid_sample_exit_code": 0,
+    "invalid_generation_sample_exit_code": 3,
+    "invalid_generation_expected_exit_code": 3,
+    "schema_source": "https://www.snia.org/sites/default/files/technical-work/ltfs/release/SNIA-LTFS-Format-2-5-1-Standard.pdf",
+    "annex": "B.2",
+    "pdf_sha256": "25744563f0bc1d72af89eba6abac2a3378feeb2ddb9c0a6ccf6d037b01bb4293",
+    "xsd_sha256": "b3bf368ae08f502864218bfe10f6cc1c42f3da0aafefc0831449ae77fac78886",
+    "official_pdf_annex_b2_matches_used_schema": true,
+    "normalization": "remove page headers/footers and indentation, join wrapped UUID pattern; compare parsed XML elements and attributes"
+  },
+  "million_file_parse_seconds": 2.333923552,
+  "million_file_peak_rss_kib": 387252,
+  "vip_process_timings": {
+    "pause": {
+      "ready_ms": 9004,
+      "published_ms": 9204,
+      "withdrawal_ms": 2000
+    },
+    "shutdown": {
+      "ready_ms": 1000,
+      "published_ms": 1200,
+      "withdrawal_ms": 200
+    },
+    "kill": {
+      "ready_ms": 1000,
+      "published_ms": 1200,
+      "withdrawal_ms": 2201
+    }
+  },
+  "binaries_sha256": {
+    "unit-tests": "9593fc9797eceabe384e558f0b1dd6adc1b9e5e0dfb7f8ce7cc059bd1441de86",
+    "large-index-tests": "94f93c69911cbdb2fd4d08dad61075b93e3176a639ec8d5fc0e091120f2df3f2"
+  },
+  "runner_sha256": "caeee59e4f293dc4baa02b8b807befb825ac5471ccc53aca8e2934e544230389",
+  "isolation": {
+    "network": "separate anonymous network namespace per VIP test",
+    "device_policy": "closed",
+    "memory_max_gib": 8,
+    "cpu_quota_percent": 200,
+    "runtime_max_seconds": 900
+  },
+  "cleanup": {
+    "unit_inactive": true,
+    "main_pid": 0,
+    "no_test_processes": true,
+    "no_test_namespaces": true,
+    "host_addresses_unchanged": true,
+    "named_netns_unchanged": true,
+    "no_host_test_interfaces_or_vip": true,
+    "ssh_closed": true
+  },
+  "scope": "Actual physical-host Linux networking/HTTP/ARP; test simulates control commit; no three-node Raft or SCSI/media I/O. Million-file XML input is synthetic. XSD validates basic structure, not every incremental semantic constraint.",
+  "local_evidence_directory": ".scratch/ltfs-ha/probes/results/ignored-four-physical-20261020",
+  "local_evidence_note": "Raw logs, host inventory, build binaries, archives and PDF stay local; this committed summary contains the measured results and provenance."
+}

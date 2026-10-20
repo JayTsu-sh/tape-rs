@@ -49,6 +49,8 @@ tape-fuse -e 127.0.0.1:7401 --cache-dir /tmp/tape-cache /tmp/tape-mount
 cargo test --features fuse --bin tape-fuse -- --ignored
 ```
 
+2026-10-20 已在物理节点显式运行四项默认忽略用例：内核 VIP 地址生命周期、VIP 进程暂停/恢复/退出/强杀、增量 XML 导出及官方 XSD 校验、百万文件索引解析，均通过。VIP 使用隔离网络中的真实内核、HTTP 和 ARP，控制日志提交按用例模拟；本轮不访问磁带。结果、资源测量、清理核验及复用步骤见[验收摘要](../.scratch/ltfs-ha/reports/ignored-four-physical-20261020-summary.html)。默认测试的环境门控保持不变。
+
 Holo 端到端实测已覆盖 fsync、覆盖、删除、旧句柄读取、mv、Range 和计划接管；EE 删除/覆盖现场对照与物理带库验证仍未完成。详见[现场记录](../.scratch/ltfs-ha/holo-file-client-20260924.md)。
 
 
