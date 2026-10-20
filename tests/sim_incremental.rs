@@ -51,7 +51,8 @@ fn increments_recover_and_clean_unmount_writes_full_on_both_partitions() {
     vol.read_file_to_writer("/dir/b", &mut bytes).unwrap();
     assert_eq!(bytes, b"new");
     assert!(vol.recovery().ip_debt);
-    assert!(vol.recovery().history_checked);
+    assert!(!vol.recovery().history_checked);
+    assert_eq!(vol.recovery().incremental_depth, 2);
     vol.unmount().unwrap();
     let vol = LtfsVolume::mount(&dev).unwrap();
     assert!(!vol.index().incremental);
@@ -693,5 +694,139 @@ fn adaptive_batch_barrier_failure_never_acknowledges_full_or_delta() {
         let mut out = Vec::new();
         recovered.read_file_to_writer("/pending", &mut out).unwrap();
         assert_eq!(out, b"pending");
+    }
+}
+
+/// Full 已跨两个块时，真实 sync_batch 会选择增量；接管只依赖最近 Full 和其后增量。
+#[test]
+fn batch_incremental_takeover_stops_at_its_full_baseline() {
+    let (lib, dev) = formatted();
+    let mut vol = LtfsVolume::mount(&dev).unwrap();
+    vol.set_root_xattr("fixture.padding", &"x".repeat(65536))
+        .unwrap();
+    for i in 0..40 {
+        vol.append_file(&format!("/base-{i}"), &mut Cursor::new(b"base"))
+            .unwrap();
+        vol.sync().unwrap();
+    }
+    for i in 0..3 {
+        vol.append_file(&format!("/delta-{i}"), &mut Cursor::new(b"delta"))
+            .unwrap();
+        vol.sync_batch().unwrap();
+        assert!(vol.index().incremental, "必须覆盖真实批次增量提交路径");
+    }
+    let generation = vol.index().generation;
+    drop(vol);
+    lib.power_cut();
+    let before = dev.command_log().len();
+    let vol = LtfsVolume::mount(&dev).unwrap();
+    let locates = dev.command_log()[before..]
+        .iter()
+        .filter(|&&op| op == opcode::LOCATE_16)
+        .count();
+    eprintln!(
+        "locates={locates}, history={}, chain_depth={}, replay={}",
+        vol.recovery().history_checked,
+        vol.recovery().chain_depth,
+        vol.recovery().incremental_depth
+    );
+    assert_eq!(vol.index().generation, generation);
+    assert_eq!(vol.recovery().incremental_depth, 3);
+    assert!(vol.writable() && vol.recovery().ip_debt);
+    assert!(
+        locates <= 12,
+        "不能在完整重放所需增量后又逐代核验旧 Full：{locates}"
+    );
+    assert_eq!(
+        vol.index()
+            .root
+            .xattrs
+            .iter()
+            .find(|x| x.key == "fixture.padding")
+            .unwrap()
+            .value
+            .len(),
+        65536
+    );
+    for (prefix, count, expected) in [
+        ("base", 40, b"base".as_slice()),
+        ("delta", 3, b"delta".as_slice()),
+    ] {
+        for i in 0..count {
+            let mut bytes = Vec::new();
+            vol.read_file_to_writer(&format!("/{prefix}-{i}"), &mut bytes)
+                .unwrap();
+            assert_eq!(bytes, expected);
+        }
+    }
+}
+
+#[test]
+fn incremental_takeover_requires_its_full_baseline_but_not_older_history() {
+    for corrupt_baseline in [false, true] {
+        let (lib, dev) = formatted();
+        let mut vol = LtfsVolume::mount(&dev).unwrap();
+        vol.append_file("/old", &mut Cursor::new(b"old")).unwrap();
+        vol.sync().unwrap();
+        let old = vol.index().self_location.start_block;
+        vol.append_file("/base", &mut Cursor::new(b"base")).unwrap();
+        vol.sync().unwrap();
+        let baseline = vol.index().self_location.start_block;
+        vol.append_file("/delta", &mut Cursor::new(b"delta"))
+            .unwrap();
+        vol.commit_incremental().unwrap();
+        drop(vol);
+        lib.with_cartridge_mut("DEL001L8", |c| {
+            let block = if corrupt_baseline { baseline } else { old };
+            c.partitions[1].objects[block as usize] =
+                tape_rs::scsi::sim::LogicalObject::Record(b"corrupt Full".to_vec());
+        });
+        if corrupt_baseline {
+            assert!(
+                LtfsVolume::mount(&dev).is_err(),
+                "当前视图所需 Full 损坏不能开放"
+            );
+        } else {
+            let vol = LtfsVolume::mount(&dev).unwrap();
+            assert!(vol.writable() && !vol.recovery().history_checked);
+            assert_eq!(vol.recovery().incremental_depth, 1);
+            for (path, expected) in [
+                ("/old", b"old".as_slice()),
+                ("/base", b"base"),
+                ("/delta", b"delta"),
+            ] {
+                let mut bytes = Vec::new();
+                vol.read_file_to_writer(path, &mut bytes).unwrap();
+                assert_eq!(bytes, expected);
+            }
+            drop(vol);
+            assert!(
+                LtfsVolume::mount_with_budget(&dev, &RecoveryBudget::default()).is_err(),
+                "显式审计仍须发现旧 Full 损坏"
+            );
+        }
+    }
+}
+
+#[test]
+fn incremental_takeover_with_mismatched_vci_keeps_history_audit() {
+    for partition in [0, 1] {
+        let (_lib, dev) = formatted();
+        let mut vol = LtfsVolume::mount(&dev).unwrap();
+        vol.append_file("/first", &mut Cursor::new(b"first"))
+            .unwrap();
+        vol.sync().unwrap();
+        vol.append_file("/delta", &mut Cursor::new(b"delta"))
+            .unwrap();
+        vol.commit_incremental().unwrap();
+        drop(vol);
+        let mam = tape_rs::ltfs::mam::Mam::with_partition(&dev, partition);
+        let mut vci = mam.read_vci().unwrap().unwrap();
+        vci.generation += 1;
+        mam.write_vci(&vci).unwrap();
+        let vol = LtfsVolume::mount(&dev).unwrap();
+        assert!(vol.recovery().history_checked);
+        assert_eq!(vol.recovery().incremental_depth, 1);
+        assert!(vol.writable());
     }
 }

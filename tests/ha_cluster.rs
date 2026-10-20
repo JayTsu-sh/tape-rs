@@ -117,7 +117,7 @@ fn control_only_c_leads_while_a_or_b_owns_devices() {
 }
 
 #[test]
-fn c_is_automatically_admitted_after_fc_appears_without_preempting_a_healthy_owner() {
+fn a_control_leader_with_new_fc_access_takes_over_from_a_healthy_owner() {
     scenario(1);
 }
 
@@ -127,7 +127,7 @@ fn partitioned_owner_loses_permission_and_the_other_fc_node_takes_over() {
 }
 
 #[test]
-fn losing_the_control_leader_does_not_replace_a_healthy_device_owner() {
+fn losing_the_control_leader_aligns_the_owner_with_the_new_fc_leader() {
     scenario(3);
 }
 
@@ -166,6 +166,11 @@ fn strict_vip_waits_for_old_follower_owner_withdrawal_across_a_raft_partition() 
     scenario(10);
 }
 
+#[test]
+fn transferring_control_to_an_fc_follower_moves_ownership_and_preserves_committed_data() {
+    scenario(11);
+}
+
 fn scenario(case: u8) {
     let dir = std::env::temp_dir().join(format!("ha-coordinator-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&dir).unwrap();
@@ -182,7 +187,7 @@ fn scenario(case: u8) {
     if case != 5 {
         lib.enable_changer_pr();
     }
-    if case == 4 || case >= 6 {
+    if case == 1 || case == 4 || case >= 6 {
         lib.insert_cartridge(
             tape_rs::scsi::sim::SimCartridge::blank("HATESTL8", 256 << 20),
             0,
@@ -539,7 +544,7 @@ fn scenario(case: u8) {
     }
     if success && ((1..=4).contains(&case) || case >= 6) && case != 10 {
         let old = first.as_ref().unwrap();
-        if case == 4 || case >= 6 {
+        if case == 1 || case == 4 || case >= 6 {
             use tape_rs::daemon::state::Command;
             let pool = "00000000-0000-4000-8000-000000000001".to_string();
             for cmd in [
@@ -617,6 +622,88 @@ fn scenario(case: u8) {
                 success &= rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap()
                     == vec![0x5a; 700_000];
             }
+        } else if case == 11 {
+            // 建池和提交可能跨过一次正常重接管，抢占观察必须使用准备完成后的轮次。
+            let until = Instant::now() + Duration::from_secs(4);
+            let before = loop {
+                let s = statuses[&3].lock().unwrap().clone();
+                if s.leader == 3
+                    && s.executor_ready
+                    && s.executor.as_ref().is_some_and(|e| {
+                        e.node == old.node
+                            && e.fenced
+                            && services[&e.node].serving_round() == Some(e.round)
+                    })
+                {
+                    break s;
+                }
+                assert!(Instant::now() < until, "准备后 owner 未恢复就绪: {s:?}");
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            let old = before.executor.unwrap();
+            let instance = before.candidates[&old.node].instance;
+            let other = if old.node == 1 { 2 } else { 1 };
+            fc[&other].store(true, Ordering::SeqCst);
+            let until = Instant::now() + Duration::from_secs(4);
+            let mut eligible_since = None;
+            loop {
+                let s = statuses[&3].lock().unwrap().clone();
+                // 连续观察若干分配周期：资格恢复须成功，且 follower 不能抢占。
+                assert_eq!(s.leader, 3);
+                assert_eq!(
+                    s.executor.as_ref().map(|e| (e.node, e.round)),
+                    Some((old.node, old.round))
+                );
+                assert_eq!(s.candidates[&old.node].instance, instance);
+                if s.candidates.get(&other).is_some_and(|c| c.eligible) {
+                    if eligible_since.get_or_insert_with(Instant::now).elapsed()
+                        >= Duration::from_millis(500)
+                    {
+                        break;
+                    }
+                } else {
+                    eligible_since = None;
+                }
+                assert!(Instant::now() < until, "FC follower 未稳定取得资格: {s:?}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // 控制权转给已合格 follower 后，才应迁移 owner。
+            peers[&3]
+                .send(NodeInput::Raft(Box::new(Message {
+                    msg_type: raft::eraftpb::MessageType::MsgTransferLeader,
+                    from: other,
+                    to: 3,
+                    ..Default::default()
+                })))
+                .unwrap();
+            let until = Instant::now() + Duration::from_secs(6);
+            let mut moved = false;
+            while Instant::now() < until {
+                let s = statuses[&other].lock().unwrap().clone();
+                if s.leader == other
+                    && s.executor_ready
+                    && s.executor
+                        .as_ref()
+                        .is_some_and(|e| e.node == other && e.round > old.round && e.fenced)
+                    && services[&other].serving_round().is_some()
+                {
+                    moved = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            success &= moved && services[&old.node].serving_round().is_none();
+            if moved {
+                let (reply, rx) = mpsc::channel();
+                execs[&other]
+                    .send(executor::ExecRequest::Read {
+                        path: "/ha.bin".into(),
+                        reply,
+                    })
+                    .unwrap();
+                success &= rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap()
+                    == vec![0x5a; 700_000];
+            }
         } else if case >= 6 {
             slow_checkpoint.store(true, Ordering::SeqCst);
             peers[&old.node].send(NodeInput::Shutdown).unwrap();
@@ -649,13 +736,6 @@ fn scenario(case: u8) {
         } else {
             if case == 1 {
                 fc[&3].store(true, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(250));
-                let c = statuses[&3].lock().unwrap().clone();
-                success = c.candidates.get(&3).is_some_and(|c| c.eligible)
-                    && c.executor
-                        .as_ref()
-                        .is_some_and(|e| e.node == old.node && e.round == old.round);
-                fc[&old.node].store(false, Ordering::SeqCst);
             } else if case == 2 || case == 4 {
                 isolated.lock().unwrap().insert(old.node);
             } else {
@@ -670,10 +750,14 @@ fn scenario(case: u8) {
                     e.fenced
                         && s.executor_ready
                         && if case == 3 {
-                            e.node == old.node
-                                && e.round == old.round
+                            e.node == s.leader
                                 && s.leader != 3
                                 && s.leader != 0
+                                && if e.node == old.node {
+                                    e.round == old.round
+                                } else {
+                                    e.round > old.round
+                                }
                         } else {
                             e.node != old.node && (case != 1 || e.node == 3)
                         }
@@ -685,10 +769,10 @@ fn scenario(case: u8) {
                 std::thread::sleep(Duration::from_millis(20));
             }
             success &= transitioned;
-            if case == 2 || case == 4 {
+            if case == 1 || case == 2 || case == 4 {
                 success &= services[&old.node].serving_round().is_none();
             }
-            if success && case == 4 {
+            if success && (case == 1 || case == 4) {
                 let owner = statuses[&3].lock().unwrap().executor.as_ref().unwrap().node;
                 let until = Instant::now() + Duration::from_secs(3);
                 while services[&owner].serving_round().is_none() && Instant::now() < until {
@@ -707,6 +791,21 @@ fn scenario(case: u8) {
                 );
             }
         }
+    }
+    if success && case == 1 {
+        let round = statuses[&3]
+            .lock()
+            .unwrap()
+            .executor
+            .as_ref()
+            .unwrap()
+            .round;
+        std::thread::sleep(Duration::from_millis(500));
+        let s = statuses[&3].lock().unwrap();
+        success &= s.leader == 3
+            && s.executor
+                .as_ref()
+                .is_some_and(|e| e.node == 3 && e.round == round);
     }
     let observed: Vec<_> = statuses
         .values()

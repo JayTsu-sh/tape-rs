@@ -6,6 +6,14 @@
 
 希望客户端固定访问一个地址时，可启用 [ltfsd 内置 HTTP VIP](http-vip.md)：首版支持同子网 IPv4，由有效设备 owner 持有，无需 Keepalived。
 
+HTTP 接入使用 axum / Hyper，保持现有端点、状态码、JSON 字段和每次请求后关闭连接的行为；客户端无需升级。同步文件服务和设备任务等待在有界阻塞任务中执行，上传和下载逐块传输，不把整个文件装入内存，也不套用缓冲型提取器的默认 2 MiB 限制。
+
+每节点最多同时接入 256 条连接、处理 32 个业务请求；下载发送期间仍占业务额度。业务额度用尽时返回 `503 http_busy`，连接额度用尽时关闭新连接；`/readyz` 不占业务额度，但仍受连接总量限制。请求头总量最多 32 KiB，须在 30 秒内接收完整；请求体连续 60 秒未收到下一帧时中止接收。文件上传仍要求 `Content-Length`，不支持 chunked 上传；`Expect: 100-continue` 在准入成功、开始读取内容时才发送。HTTP 断开或等待超时不代表已经提交的设备任务被取消，结果未定时仍须查询，不能自动重放有副作用的操作。
+
+设备接管时，驱动器内仍有盒带不代表介质已经上带。新 owner 在设备隔离完成后显式执行 LOAD 并等待就绪，再识别和恢复卷；这覆盖计划停机已执行 UNLOAD、但没有把盒带移回槽位的情况。磁带恢复时间还包含机械定位和索引链检查，HTTP 就绪不等于池里已有可写磁带。
+
+普通接管时，两分区的新鲜 VCI 与实际完整末索引一致、DP 为最新视图时，允许 IP 仍为旧检查点。Full 自包含；增量必须完整读取、核验并重放到其 Full 基线，才能省去基线之前的历史 Full 链审计，IP 维护债务保留。仍读取并核验两分区索引、卷身份、EOD、尾部和追加位置；增量链不完整会拒绝开放，过期或不符的 VCI、异常尾部及显式历史审计沿用原路径。依据为 [LTFS 2.5.1 §9.2、§10.3](https://www.snia.org/sites/default/files/technical-work/ltfs/release/SNIA-LTFS-Format-2-5-1-Standard.pdf)，不改变卷提交屏障或设备隔离。
+
 ```bash
 cargo build --bin ltfsctl --bin tape-fuse --features fuse
 ltfsctl -e 127.0.0.1:7401 put ./archive.bin /archive.bin
@@ -33,7 +41,7 @@ tape-fuse -e 127.0.0.1:7401 --cache-dir /tmp/tape-cache /tmp/tape-mount
 
 ## 当前限制与验证范围
 
-当前提供 `user.tape.state`、`user.tape.generation`、`user.tape.version`（轮次.序号）、`user.tape.barcode`、`user.tape.sha256`，并透传已提交文件的索引修改时间与文件 xattr。索引 xattr 名称放在 `user.` 命名空间，已有该前缀则不重复添加；内置 `user.tape.*` 属性优先。文本按 UTF-8 返回，Base64 值解码为字节，损坏编码返回 EIO。原生目录的修改时间已透传；合成根目录、旧缓存推导的目录及缺失或非法时间回退为 Unix epoch。HTTP 下载已去掉 256 MiB 上限：设备线程分块写入服务端暂存目录下的匿名临时文件，完成后由 HTTP 线程流式发送。临时文件在最后一个句柄关闭时自动回收；服务端需要容纳并发下载的临时磁盘空间。Range 仍先读完整文件到临时磁盘再切片，尚未优化成只读所需磁带块。采用内核页缓存和默认 write-through，不启用异步 writeback-cache，也不再依赖 `FUSE_DIRECT_IO_ALLOW_MMAP`。每次 open 不设置 KEEP_CACHE，避免无条件复用旧页；支持读写混合打开；共享可写映射不属于当前承诺或 LE 官方只读 mmap 支持范围。
+当前提供 `user.tape.state`、`user.tape.generation`、`user.tape.version`（轮次.序号）、`user.tape.barcode`、`user.tape.sha256`，并透传已提交文件的索引修改时间与文件 xattr。索引 xattr 名称放在 `user.` 命名空间，已有该前缀则不重复添加；内置 `user.tape.*` 属性优先。文本按 UTF-8 返回，Base64 值解码为字节，损坏编码返回 EIO。原生目录的修改时间已透传；合成根目录、旧缓存推导的目录及缺失或非法时间回退为 Unix epoch。HTTP 下载已去掉 256 MiB 上限：设备线程分块写入服务端暂存目录下的匿名临时文件，完成后由 HTTP 异步任务流式发送。临时文件在最后一个句柄关闭时自动回收；服务端需要容纳并发下载的临时磁盘空间。Range 仍先读完整文件到临时磁盘再切片，尚未优化成只读所需磁带块。采用内核页缓存和默认 write-through，不启用异步 writeback-cache，也不再依赖 `FUSE_DIRECT_IO_ALLOW_MMAP`。每次 open 不设置 KEEP_CACHE，避免无条件复用旧页；支持读写混合打开；共享可写映射不属于当前承诺或 LE 官方只读 mmap 支持范围。
 
 纯软件测试覆盖删除提交、接管、墓碑回收、删除响应丢失不重放，257 MiB 文件上传/下载逐字节校验、提交等待超时后的查询、提前文件标记拒绝短读，以及适配器的关闭/同步、随机写、多写句柄、追加、截断、目录和错误映射。可显式运行使用内存后端的内核挂载测试，不接触磁带：
 

@@ -393,7 +393,10 @@ impl Coordinator {
                         .get(&e.node)
                         .is_some_and(|c| c.instance == ctl.executor_instance)
             });
-            if !healthy_owner {
+            // Leader 具备本设备组的有效资格时兼任 owner；无资格时保留健康 owner。
+            let leader_should_own = self.fresh(ctl, self.id, now)
+                && ctl.executor.as_ref().is_none_or(|e| e.node != self.id);
+            if leader_should_own || !healthy_owner {
                 let chosen = std::iter::once(self.id)
                     .chain(ctl.candidates.keys().copied().filter(|id| *id != self.id))
                     .find(|id| self.fresh(ctl, *id, now));

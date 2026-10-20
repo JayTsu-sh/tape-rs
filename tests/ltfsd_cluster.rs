@@ -1683,6 +1683,49 @@ fn rejected_large_uploads_get_a_clean_answer_over_http() {
     c.shutdown();
 }
 
+/// 客户端在 100 Continue 后断流，已准入路径和容量必须释放，不能留下半文件。
+#[test]
+fn interrupted_http_upload_releases_admission() {
+    use std::io::{BufRead, BufReader, Write};
+    let c = Cluster::start_with("http-interrupted", false);
+    let (owner, round) = c.wait_serving(None, 0);
+    c.wait("文件服务开放", || {
+        c.services[&owner].serving_round() == Some(round)
+    });
+    let endpoints = c.start_http();
+    let mut conn = std::net::TcpStream::connect(&endpoints[owner as usize - 1]).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    conn.write_all(b"PUT /files/interrupted.bin HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\nExpect: 100-continue\r\n\r\n").unwrap();
+    let mut reader = BufReader::new(conn.try_clone().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.starts_with("HTTP/1.1 100"), "{line}");
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    assert_eq!(line, "\r\n");
+    conn.write_all(b"incomplete").unwrap();
+    drop(reader);
+    drop(conn);
+    c.wait("断流上传释放路径与容量", || {
+        match c.services[&owner].begin("/interrupted.bin", 1000) {
+            Ok(handle) => {
+                c.services[&owner].abort(handle);
+                true
+            }
+            Err(_) => false,
+        }
+    });
+    let mut client = Client::new(endpoints);
+    assert!(
+        client
+            .put("/interrupted.bin", b"complete")
+            .unwrap()
+            .committed
+    );
+    assert_eq!(client.get("/interrupted.bin").unwrap(), b"complete");
+    c.shutdown();
+}
+
 // ---------- 文件契约 F1（file-contract.md）----------
 
 /// 发一个不带内容的请求，返回整个响应文本。
@@ -2468,6 +2511,61 @@ fn a_lagging_node_catches_up_from_a_snapshot_and_pulls_the_directory() {
     assert!(
         log_range(&c.dir, lagging).1 > 1,
         "落后节点的日志也从快照点开始"
+    );
+    c.shutdown();
+}
+
+/// UNLOAD 只退带、不把盒带移出驱动器；下一 owner 必须先 LOAD 再识别索引。
+#[test]
+fn takeover_reloads_a_cartridge_left_unthreaded_in_the_drive() {
+    let lib = SimLibrary::new(1, 4, 1);
+    lib.insert_cartridge(SimCartridge::blank(BARCODE, 256 << 20), 0)
+        .unwrap();
+    lib.load_into_drive(BARCODE, 0).unwrap();
+    let initial = lib.drive_as(0, 50);
+    mkltfs(
+        &initial,
+        &MkltfsOptions {
+            volume_id: "LTFSD1".into(),
+            block_size: 64 * 1024,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    tape_rs::tape::commands::TapeDrive::new(&initial)
+        .unload()
+        .unwrap();
+    assert_eq!(
+        lib.loaded_barcode(0).as_deref(),
+        Some(BARCODE),
+        "盒带仍在驱动器中"
+    );
+    let c = Cluster::start_lib("unthreaded-takeover", false, lib, 200_000, &[BARCODE]);
+    let (owner, round) = c.wait_serving(None, 0);
+    c.wait("完成已归属磁带的装载尝试", || {
+        c.services[&owner].serving_round() == Some(round)
+            || c.st(owner)
+                .tapes
+                .get(BARCODE)
+                .is_some_and(|t| t.state == "check")
+    });
+    let handle = c.services[&owner].begin("/after-unthreaded-takeover.bin", 4);
+    assert!(
+        handle.is_ok(),
+        "接管后必须恢复写入准入，不能把未上带误标为 check: {:?}",
+        handle.as_ref().err()
+    );
+    c.services[&owner].abort(handle.unwrap());
+    let mut client = Client::new(c.start_http());
+    assert!(
+        client
+            .put("/after-unthreaded-takeover.bin", b"kept")
+            .unwrap()
+            .committed
+    );
+    assert_eq!(
+        client.get("/after-unthreaded-takeover.bin").unwrap(),
+        b"kept"
     );
     c.shutdown();
 }

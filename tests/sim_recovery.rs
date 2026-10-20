@@ -575,3 +575,133 @@ fn normal_mount_audits_history_when_vci_generation_disagrees() {
     assert_eq!(vol.recovery().chain_depth, 1);
     assert_eq!(vol.index().generation, 2);
 }
+
+/// 小批次追加 DP Full、IP 留待检查点更新，与守护进程实际 sync_batch 路径一致。
+#[test]
+fn committed_dp_full_with_older_ip_has_bounded_mount_locates() {
+    let (lib, dev) = setup();
+    let mut vol = LtfsVolume::mount(&dev).unwrap();
+    for i in 0..40 {
+        vol.append_file(&format!("/file-{i}"), &mut Cursor::new(payload(32, i)))
+            .unwrap();
+        vol.sync_batch().unwrap();
+        assert!(!vol.index().incremental, "此夹具必须生成自包含 Full");
+    }
+    let generation = vol.index().generation;
+    drop(vol); // 已提交，但没有计划卸载检查点。
+    lib.power_cut();
+    let before = dev.command_log().len();
+    let vol = LtfsVolume::mount(&dev).unwrap();
+    let locates = dev.command_log()[before..]
+        .iter()
+        .filter(|&&op| op == opcode::LOCATE_16)
+        .count();
+    let r = vol.recovery();
+    eprintln!(
+        "locates={locates}, history_checked={}, depth={}, hints={}/{}, ip_debt={}",
+        r.history_checked, r.chain_depth, r.dp.hint_used, r.ip.hint_used, r.ip_debt
+    );
+    assert!(vol.writable());
+    assert_eq!(vol.index().generation, generation);
+    assert!(r.ip_debt && r.dp.hint_used && r.ip.hint_used);
+    assert!(
+        locates <= 12,
+        "正常 Full 接管不应逐代随机定位：实际 {locates}"
+    );
+    for i in 0..40 {
+        let mut bytes = Vec::new();
+        vol.read_file_to_writer(&format!("/file-{i}"), &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, payload(32, i));
+    }
+}
+
+#[test]
+fn dp_full_with_older_ip_still_audits_if_either_vci_is_stale_or_mismatched() {
+    for partition in [0, 1] {
+        for stale in [false, true] {
+            let (_lib, dev) = setup();
+            let mut vol = LtfsVolume::mount(&dev).unwrap();
+            for i in 0..3 {
+                vol.append_file(&format!("/file-{i}"), &mut Cursor::new(b"data"))
+                    .unwrap();
+                vol.sync_batch().unwrap();
+            }
+            drop(vol);
+            let mam = tape_rs::ltfs::mam::Mam::with_partition(&dev, partition);
+            let mut vci = mam.read_vci().unwrap().unwrap();
+            if stale {
+                vci.vcr[0] ^= 0x80;
+            } else {
+                vci.generation += 1;
+            }
+            mam.write_vci(&vci).unwrap();
+            let vol = LtfsVolume::mount(&dev).unwrap();
+            assert!(
+                vol.recovery().history_checked,
+                "partition={partition}, stale={stale}"
+            );
+            assert_eq!(vol.recovery().chain_depth, 3);
+            assert_eq!(vol.index().generation, 4);
+            assert!(vol.writable());
+        }
+    }
+}
+
+#[test]
+fn dp_full_with_older_ip_keeps_explicit_history_audit() {
+    let (lib, dev) = setup();
+    let mut vol = LtfsVolume::mount(&dev).unwrap();
+    for path in ["/first", "/second"] {
+        vol.append_file(path, &mut Cursor::new(b"data")).unwrap();
+        vol.sync_batch().unwrap();
+    }
+    drop(vol);
+    lib.with_cartridge_mut(BARCODE, |c| {
+        for object in &mut c.partitions[1].objects {
+            if let LogicalObject::Record(bytes) = object
+                && String::from_utf8_lossy(bytes).contains("<generationnumber>2<")
+            {
+                *bytes = b"broken historical Full".to_vec();
+            }
+        }
+    });
+    let vol = LtfsVolume::mount(&dev).unwrap();
+    assert!(vol.writable() && vol.recovery().ip_debt);
+    assert!(!vol.recovery().history_checked);
+    for path in ["/first", "/second"] {
+        let mut bytes = Vec::new();
+        vol.read_file_to_writer(path, &mut bytes).unwrap();
+        assert_eq!(bytes, b"data");
+    }
+    drop(vol);
+    assert!(matches!(
+        mount_err(&dev, &RecoveryBudget::default()),
+        TapeError::RecoveryRestricted { .. }
+    ));
+}
+
+#[test]
+fn dp_full_does_not_skip_history_if_older_ip_points_beyond_it() {
+    let (lib, dev) = setup();
+    let mut vol = LtfsVolume::mount(&dev).unwrap();
+    vol.append_file("/file", &mut Cursor::new(b"data")).unwrap();
+    vol.sync_batch().unwrap();
+    let end = vol.index().self_location.start_block + 100;
+    drop(vol);
+    lib.with_cartridge_mut(BARCODE, |c| {
+        for object in &mut c.partitions[0].objects {
+            if let LogicalObject::Record(bytes) = object {
+                let xml = String::from_utf8_lossy(bytes);
+                if xml.contains("<ltfsindex") {
+                    let mut index = tape_rs::ltfs::index::LtfsIndex::parse(bytes).unwrap();
+                    index.previous_location.as_mut().unwrap().start_block = end;
+                    *bytes = index.to_xml().unwrap().to_vec();
+                }
+            }
+        }
+    });
+    let vol = LtfsVolume::mount(&dev).unwrap();
+    assert!(vol.recovery().history_checked);
+    assert_eq!(vol.index().generation, 2);
+}

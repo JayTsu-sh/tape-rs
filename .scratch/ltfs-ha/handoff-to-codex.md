@@ -581,3 +581,94 @@ v2兼容构建进行中（exec85753）；下一步部署到独立bin-v2，不覆
 Standards / Spec 两轴 review 均无可操作发现；完整软件检查和发布 SHA 以本地 probes/results/http-vip-review-20261019 的最终记录为准。此前候选真实三节点测试观察到正常停机约15.16秒恢复VIP，暂停/强杀后旧地址约1.82/1.99秒消失，旧节点恢复/重启后约.49/.55秒恢复入口；新owner正常ready后约.13秒挂址。无双VIP或持续地址残留；暂停恢复曾观察到短暂旧地址重挂后立即删除，严格确认仍在新地址发布前完成。无磁带分配、装带或数据写入，未覆盖写入中恢复或掉电/内核冻结。
 
 现场已收尾：三台测试服务和观察器停止，物理VIP及Raft holder均释放，token墓碑和共识目录保留；EE恢复可用、无活动任务并回读原双设备唯一Exclusive Access预留。不要重跑已消费的现场one-shot标记。详细测量与证据见本地reports/http-vip-physical-20261019.html及probes/results/http-vip-physical-r2-20261019。
+
+
+## 2026-10-20 — HTTP 接入迁移至 axum（本地软件验证完成，未部署）
+
+在 /work/jay/tape-rs 的 main（基于 1c2ed45）完成迁移，改动尚未提交。删除手写请求行/请求头解析和每连接创建线程的处理方式；axum Router 承接 HTTP 请求，Hyper HTTP/1 连接显式设置请求头总量 32 KiB、头部接收期限 30 秒，并保留每请求后关闭连接及原有响应头大小写形式。新增 axum / Tokio / Hyper 及必要流式适配依赖，未改动 SCSI、设备执行器、Raft、持久化格式或客户端协议字段。
+
+固定内部上限为每节点 256 条连接、32 个业务请求；业务额度用尽返回 503 http_busy，连接额度用尽关闭新连接。阻塞任务和下载响应体持有业务额度直到完成/释放；/readyz 独立于业务额度，继续共用 ready_owner 和实时 Serving 许可判断。同步业务在 spawn_blocking 中运行，不对已受理设备操作增加整体 HTTP 取消期限。上传逐帧读取并沿用 60 秒无下一帧期限、准入后 100 Continue、abort/finish；下载从匿名暂存文件异步流式发送，保留 Range，并明确报告暂存内容截断。接口及限制见 docs/file-client.md，线程示意同步更新 docs/architecture.html。
+
+验证：cargo fmt --all -- --check、cargo test（413 通过、4 忽略）、cargo check --all-targets、cargo clippy --all-targets --all-features、git diff --check 均通过，Clippy 无告警。最后移除 JSON 响应额外复制后重新运行 HTTP 七项测试、check、Clippy 和 fmt，均通过。覆盖冲突 Content-Length、超大请求头、准入拒绝时不发送 100、业务满载时 readiness 可用、响应体存活期间保留额度、取消 HTTP 等待后已受理命令仍能接收结果、下载暂存截断报错；新增模拟集群实 HTTP 上传断流后重新上传/实读通过。现有大文件、Range、客户端和 HA 集群回归通过。构建使用 /tmp/tape-rs-axum-target 和 /tmp/tape-rs-axum-check-target，避免竞争全局共享构建目录；日志 /tmp/tape-axum-{tests-final,http-final,check-final,clippy-final,fmt}.log。
+
+CodeGraph 已 sync，并通过 affected 与 explore 检查 HTTP 相关路径；affected 本轮未列出测试文件，实际测试覆盖以上述执行结果为准。未连接远端、未部署、未访问真实设备，Holo/物理带库与现场 VIP 回归均未执行，仍待现场验证；未做性能对照测量，不承诺吞吐提升。现有现场状态沿用上一条记录，本轮未重新核查。
+
+
+## 2026-10-20 — axum 实机验收完成；修复接管时未重新 LOAD 的旧缺陷
+
+用户明确要求真实环境验证，并提供临时 SSH 认证。工作树仍 /work/jay/tape-rs / main，基于 1c2ed45，源码、测试和本交接改动未提交。三台实际物理节点 lisa-1/2/3（10.131.7.207/208/209），目标 changer 55L3A7802K19LL01 / sg3、TD9 11EB4A80F1 / sg2，逐机 VPD 核对。真实测试带仅 RC0018L9（槽7），RC0017L9（槽8/EE REA_P0）未读写或移动。测试使用原隔离 /root/tape-ha-hw-20261016/state、节点71/72/73和17820/17821，保留 Raft/目录状态并事先离线备份；候选在独立 /root/tape-axum-20261020 和 /root/tape-axum-r2-20261020。正式 Rust 构建未替换。
+
+R1：新 HTTP 协议、32业务额度、64MiB上传/下载SHA、Range、只创建、断流释放、删除以及三种故障后的读取通过，但计划停机后 RC18 被标记 check，新写准入507。真实轨迹表明旧 owner UNLOAD 后盒带仍留驱动器，新 owner 首条 LOCATE(16) 返回02/04/02（需初始化），原 open_candidate 未先 LOAD。此路径在HTTP迁移前即存在。新增模拟回归稳定先红（NoTape/CHECK）、修复后绿；仅在已隔离后的 open_candidate 增加显式 LOAD 和等待就绪，保持原SCSI超时/编码/预留/持久化屏障。没有改控制 Leader/设备 owner 的选择策略：分配时优先合格 Leader，健康 owner 保持，不随控制选举主动迁移。
+
+R2 gnu.2.34 release ltfsd SHA256 ac16bec88787f4bbd061ac197b97239fafe7bcecc2103ebdf9d48f0280fc4d86，三机部署逐一核对。先独立隔离/装带、确认原卷UUID4d78dbe5-5d35-4bb1-a0f3-ca2621702349且无只读限制，ltfs-verify实读56个已有存储哈希全部Match，另10条NoHash未计作通过。再UNLOAD但保留盒带于驱动器，以复现R1起点；设备访问全部被cgroup禁止时，通过现有可信Raft提案帧提交唯一TapeState(RC18,appendable)，三机回读提交后才恢复SG访问。此操作有物理校验证据，不清库/回滚数据库，不改投票、成员或VIP授权与ACK。
+
+R2：32业务请求占满时503 http_busy，/readyz仍200；冲突Content-Length400、超大头431、chunked上传411。64MiB文件实际写入/读回SHA一致，Range206、只创建412且不要求正文、断流路径与容量释放后可重新上传、DELETE提交200均通过。计划停机、SIGSTOP/CONT、SIGKILL/重启各自之后均读回64MiB、再新写入及读回4KiB；最后独立再次读回全部三个已确认的小文件，哈希均一致；原64MiB文件故障前后SHA一致，R2起点已有65个活路径长度保留。新增测试路径 comparison/http-axum-20261020 与 comparison/http-axum-r2-20261020 留在带上，含两轮64MiB文件、第二轮三份4KiB标记及删除墓碑；不回收/格式化。
+
+测量：正常207→208旧IP0.231s消失，新owner112.011s ready、112.193s VIP HTTP，113.421s完成64MiB读回、129.914s完成新写读回。暂停208→207旧IP1.867s消失，新owner340.500s ready、355.540s VIP HTTP、380.490s完成新写读回；强杀207→208旧IP1.845s消失、新owner340.115s ready、355.206s VIP HTTP、380.198s完成新写读回。两异常场景人为旧节点未确认观察门槛至少5秒，含不可达HTTP请求等待的实际观察约14.2秒；恢复旧节点后约0.770/0.821秒新IP发布。705条独立Netlink地址事件无重叠、无观察器错误，本轮没有旧节点瞬时重挂事件。跨主机地址时间保守40ms误差，HTTP100ms采样；控制机与现场约33秒偏差已单独校准。约340秒恢复就绪主要耗在实际索引历史回溯，不把它解释为HTTP框架开销或承诺固定RTO。
+
+额外HTTP-only进程位于同一物理208、17920/17921，SG访问完全禁止、独立状态目录：256条连接占满时第257条关闭，头部30.001s超时、正文59.999s超时，之后正常停止。第一次探针漏配CLI要求的至少三个成员，启动参数校验拒绝、未触及设备，原失败日志保留，修正探针后通过。R2进程每5秒资源采样峰值RSS约27.4/32.4/21.7MiB，线程峰值46/18/15；没有旧HTTP同口径A/B，不能声称已测吞吐提升。守护进程SG_IO仅sg2/sg3，1128次READ、146次WRITE、4次LOAD、2次UNLOAD；无FORMAT/ERASE。维护CLI另有记录，不能把守护进程计数当成全部现场命令计数。
+
+软件：最终cargo test 414通过/4忽略，fmt、check all-targets、clippy all-targets/all-features无告警、diff-check通过；新回归含真实调用序列的模拟卸带后接管和实HTTP读写。CodeGraph sync并explore open_candidate路径完成。源码额外改动为executor四行和回归，HTTP迁移其余不变。
+
+现场已安全收尾并独立复核：R1/R2所有测试及观察进程MainPID0，无VIP，三机Raft holder=null、token26239墓碑保留，原ens9f0地址集合保留。控制面磁带摘要为gen98、files=71（含内部墓碑）、appendable；不将缓存代数当成另行冷挂验证的物理末代。驱动器空，RC18槽7、RC17槽8；EE208available/enabled、207disabled、无活动任务，恢复drive0x400000000a8307d0/changer0x500000000a8307d0的各唯一登记及Exclusive Access(type3)。无BMC、FC断链、掉电、内核冻结或写入中的故障注入；这不是完整HA故障矩阵，也未做Holo回归。
+
+报告 reports/http-axum-physical-20261020.html；R1与R2证据分别在probes/results/http-axum-physical[-r2]-20261020，R1失败和CHECK证据保留。R2 summary.json、committed-markers-final.json、post-close-proof.json、scsi-opcodes.json、validated-*、clock-calibration.json、各node tar和软件/构建日志均已保留本地。one-shot requested/files.requested已消费，不得重跑。后续如继续部署，使用上述已验收候选并先重新核对现场；不要恢复pretest-state.tgz覆盖已推进的状态。
+
+本轮临时SSH ControlMaster已全部关闭，无新增认证key或凭据文件；现场读写与清场脚本最终exit0。
+
+### 2026-10-20 — Leader/owner 对齐策略（已验收）
+
+用户明确调整策略：控制 Leader 具备目标设备组有效访问资格时兼任 owner；只有不具备资格时才使用其他节点。coordinator 在健康 owner 为 follower 时也会向合格 Leader 提议 AssignExecutor，继续使用 expected_round、实例号、ReadIndex 许可、PR 隔离/卷恢复与严格 VIP 撤址确认。资格沿用连续探测、设备组匹配、新鲜度与冷却，非仅看有无 FC 卡。恢复的普通 follower 不抢占；控制权迁移带来设备接管和服务中断，收敛期间允许临时不同。
+
+新增控制权转移后迁移并保留已提交数据的模拟用例；原“Leader 恢复 FC 不抢健康 owner”用例改为不撤销旧 owner 资格也须接管并读回数据；原控制换届用例改为与新合格 Leader 对齐。12 项 HA 测试通过。完整软件并行首跑在原 500ms 许可场景6/9失败（Leader3无设备、新分支未触发），独立重跑12项通过；保留 /tmp/leader-owner-{tests,ha-repeat}.log，完整串行回归已415通过/4忽略，fmt、check、clippy均通过。并行首跑失败原因尚未定论，不以重跑通过掩盖，未修改短时限；最后默认并行完整回归也已415通过/4忽略。
+
+实机探针 probes/leader-owner-physical-20261020.py，唯一结果目录 probes/results/leader-owner-physical-20261020；requested 已消费，禁止重跑。三机候选 /root/tape-owner-20261020、unit tape-owner-20261020.service、observer tape-owner-observe-20261020.service。复用既有 /root/tape-ha-hw-20261016/state，未清除/回退状态，均离线备份。设备序列及 sg2/sg3 同前，RC18原槽7、RC17槽8，EE无任务后已正常暂停。所有SG先禁止；208控制Leader，逐步仅207允许设备访问，后恢复209和208，再转移控制权至209；新增文件仅 comparison/leader-owner-20261020 的三份4KiB标记。自动 finally 沿用已验证的归槽/释放/恢复EE/确认VIP空流程。现场已全部通过并收尾，详细结果如下。
+
+
+Leader/owner 实机结果：gnu.2.34 候选 ltfsd SHA256 cbaef10a82e93529d8aba21713d93bdbdc9a3253f0d1e10126973001173cd6ba；三机分别核对。208 禁止 SG 访问时保持控制 Leader，207 成为 owner；恢复普通 follower209 的设备访问不抢占；恢复 Leader208 的访问后自动从健康207接管；正常 Raft MsgTransferLeader 转给209后，owner从健康208迁到209。每个稳定状态观察12秒，两次主动接管从触发至VIP可用330.591/330.286秒。cgroup仅模拟无有效设备通路，未物理拔卡/断链，未进行写入中故障/断电/内核冻结。
+
+三阶段各新写/读回4KiB标记，最后在209重新读回全部三份并核对SHA c8f5d0341d54d951a71b136e6e2afcb14d11ed8489a7ae126a8fee0df6ecf193；此前R2 64MiB也实读SHA281e519df3077b557c6b03f5da83c4e8d397219259615dd7c3308f89cae8f2a6一致。新增路径仅comparison/leader-owner-20261020/{control-only-leader,leader-regains-devices,control-transfer}.bin，保留于RC18，无格式化/擦除。572条独立Netlink地址事件未观察到重叠或观察器错误。正式Rust服务未替换。
+
+用户追问330秒拆分，已按每条SG_IO wall_us统计：208/209分别LOCATE(16)54/55次，307.804/309.168秒（总时长93.1%/93.6%）；LOAD8.592/9.044秒；READ(6)107/109次共8.951/8.960秒；剩余资格/控制/其他IO/循环等待和发布合计5.245/3.114秒。设备双PR隔离约12.3/24.7毫秒；最后恢复设备IO至VIP发布1.724/1.397秒。计时为kernel/HBA/device wall wait，非CPU；VPD探测并发，不叠加为串行耗时。日志逐次回溯至早期DP索引块；代码不满足clean_full_pair时执行verify_chain沿previousgenerationlocation核验历史，不应把全部回溯称为增量重放。现场未记录快路径每一条件，哪项未满足尚不能单凭日志断言。优化重点应为安全减少历史随机定位，不改超时或削弱隔离校验；本轮未修改恢复策略。
+
+软件最终完整串行和默认并行均415通过/4忽略，fmt/check all-targets/clippy all-targets all-features/diff-check通过，CodeGraph sync及affected/explore完成。首轮并行两项短许可HA失败已保留，后独立HA和完整复核通过；首次失败原因未定，没有修改测试超时。证据probes/results/leader-owner-physical-20261020，summary.json、timing-breakdown.json、software-verification.json及software-*.log，报告reports/leader-owner-physical-20261020.html。requested/measurements.complete/cleanup.complete已消费，禁止重跑原one-shot。
+
+独立收尾复核通过：三机测试/观察进程MainPID0，无VIP，holder=null、token27964墓碑保留。控制缓存RC18 gen102/files74/appendable（未额外冷挂宣称物理末代）。驱动器空，RC18槽7/RC17槽8，EE208available/enabled、207disabled、无任务，drive0x400000000a8307d0/changer0x500000000a8307d0各唯一注册+Exclusive Access(type3)。无清库/回滚/强制VIP释放。临时SSH已关闭，无新增凭据文件，现场脚本exit0。
+
+### 2026-10-20 — 减少接管历史随机定位（已验收）
+
+用户要求研究安全减少历史索引定位。已使用 diagnosing-bugs 快速回归复现：tests/sim_recovery.rs::committed_dp_full_with_older_ip_has_bounded_mount_locates，经守护进程同款 sync_batch 连续40次小文件提交，均为DP Full，IP滞后、VCI双新鲜；旧代码挂载46次LOCATE/历史深度40，先红。保守扩展clean_full_view：实际两分区末构造完整、VCI均新鲜且代数匹配、DP为非materialized的最新Full，IP同代回指须精确匹配DP或旧代回指须指向DP更早物理位置时，普通挂载跳过历史Full核验，保留IP债务。所有EOD/UUID/自指针/尾部/追加位置、PR和屏障保留，显式recover/mount_with_budget继续历史审计，增量/异常/失效提示仍原路径。未改CDB/超时/格式/配置或依赖。依据SNIA LTFS2.5.1 §9.2 Full自包含与§10.3 VCI，已核对官方PDF。
+
+现快回归6次LOCATE/history_checked=false/depth0，模拟掉电后40文件均完整实读；新增失效/代数不符VCI双分区矩阵、旧历史损坏仍由显式审计拒绝、IP异常前向回指保留历史核验。针对恢复/增量/提交故障及全量419通过/4忽略，fmt/check/clippy/diff-check通过。源码src/ltfs/recovery.rs另加一次恢复INFO日志以记录IP/DP代数、增量、VCI命中、历史深度、IP债务和可追加结论，现场开启该命名空间。
+
+实机新one-shot probes/recovery-fast-full-physical-20261020.py 已启动，原历史one-shot不重跑。结果probes/results/recovery-fast-full-physical-20261020；候选/root/tape-recovery-fast-20261020，unit tape-recovery-fast-20261020.service、observer tape-recovery-fast-observe-20261020.service，仍用原/root/tape-ha-hw-20261016/state节点71/72/73。仅RC18追加comparison/recovery-fast-full-20261020三份4KiB，复现“208无设备owner207→208恢复访问主动接管→转控制权至209并接管”。原64MiB和本轮三文件最终实读SHA，独立Netlink检查。相同已验收preflight/finally归槽释放恢复EE流程；当前尚在运行，不能宣称实机性能通过。
+
+
+恢复优化第二阶段：R1仅放宽Full条件，实机当前Full已跨多个块、sync_batch实际写入增量，未覆盖本轮330秒瓶颈；控制器SIGINT后finally正常清场（exit130），结果标记incomplete.json，不能计性能通过。收尾时未就绪owner已持VIP预约，先停其他节点后欠多数派ACK；临时207控制节点明确禁止SG访问恢复多数派，随后以常规控制集群完成精确释放，保留墓碑。自动fallback曾与临时控制节点同机启动，受到本机VIP实例锁EAGAIN拒绝，未进入设备操作；停止临时holder并恢复标准peer后释放成功。未force release、清库或回滚。R1独立库存/EE/PR/MainPID/VIP复核已通过，临时SSH为下一轮继续使用。R1只新增control-only-leader.bin一个4KiB标记。
+
+R2 fresh_current_index在增量重放前保存新鲜当前头条件；只有完整重放到Full成功后，普通挂载才跳过该基线以前Full审计。重放失败仍原受限路径，显式recover/mount_with_budget仍全历史，IP债务不清除。新增实际sync_batch增量回归40份Full+3份增量：50定位先红→9定位、3份全重放后绿（含模拟掉电全文件实读）；必要Full损坏拒绝、非依赖旧Full损坏普通视图可用但显式审计失败、错代VCI仍审计通过。更新原增量测试以断言必要增量重放2份而非强制历史审计。全量串行及最后默认并行422通过/4忽略；fmt/check/clippy均通过。并行首次HA转移用例因建池/写入后round176与初始round9对比失败，未改时限或断言，原日志保留。
+
+R2实机probes/recovery-bounded-physical-20261020.py进行中；候选/root/tape-recovery-bounded-20261020，ltfsd SHA bd015e0f29ee7ab1889596e3a1b9dc074f9aa35b6e4c27391f9e8e9c08c5e04d；unit tape-recovery-bounded-20261020.service，observer tape-recovery-bounded-observe-20261020.service。已消费requested，禁止重跑。复用相同原状态、节点、17820/17821和RC18，源码/测试完整检查后部署。初始实机冷挂确认IP102/DP103增量，VCI命中true/true、重放1份、history_checked=false/depth1、IP债务true且可追加。即将测208接回、209控制转移；只追加comparison/recovery-bounded-20261020三份4KiB，末尾还复核R1确认标记及原64MiB。报告/结果仍待本轮现场完成。
+
+
+### 2026-10-20 — 有界恢复最终实机验收通过
+
+最终实现fresh_current_index与必要增量重放成功共同决定是否跳过更早Full审计：Full直接取当前快照，增量全部验证/重放到最近Full后停止。IP允许旧检查点但保留债务；双VCI新鲜、实际代数匹配、两分区末构造完整、自指针/UUID/回指方向/EOD/追加位置及原PR/执行许可均保留。错/旧提示、异常尾部、必要基线损坏或增量不完整不走省审计路径；显式recover/mount_with_budget按原预算审计历史。无新格式、依赖、CLI或配置，SCSI编码/超时及写入屏障不变。新增恢复INFO日志便于核对实际分支。
+
+R2相同三物理节点、原RC18和原隔离Raft状态：208恢复FC资格接回，触发至VIP从330.591s降至30.535s（-90.76%），LOCATE54→9；转控制权到209后接管从330.286s降至28.883s（-91.26%），LOCATE55→10。日志分别确认IP102/DP104增量、重放2份、历史核验false/depth2，以及IP102/DP105增量、重放3份、历史核验false/depth3，均VCI命中true/true、IP债务true、可追加true。必要增量没有省略。对比为同设备/带/场景，但介质按追加写推进，不是假装同一份字节镜像；不承诺所有磁带固定30秒。
+
+R2三份4KiB新路径comparison/recovery-bounded-20261020/{control-only-leader,leader-regains-devices,control-transfer}.bin分别写/读后，最终209再逐份实读SHA c8f5d0341d54d951a71b136e6e2afcb14d11ed8489a7ae126a8fee0df6ecf193一致；原64MiB SHA281e519df3077b557c6b03f5da83c4e8d397219259615dd7c3308f89cae8f2a6及R1确认标记也实读一致。578条独立Netlink事件未观察到重叠/观察器错误；无FORMAT/ERASE，仅sg2/sg3。R1不完整状态和控制面清场记录保留，不能计作性能通过；R2 measurements.complete/extra-validation.complete/cleanup.complete均已生成、现场exit0，禁止重跑one-shot。
+
+最终完整串行及默认并行cargo test均422通过/4忽略；fmt、check all-targets、clippy all-targets/all-features、diff-check和CodeGraph sync/affected/explore完成。新增回归覆盖Full历史40份46→6定位、40Full+3必要增量50→9定位（均模拟掉电后全文件实读），失效/错代VCI、旧IP异常回指、基线损坏拒绝、非依赖旧Full损坏只在显式审计失败。首轮并行旧HA测试round176与setup前round9断言失败保留，最终复核通过，未放宽断言/时限。报告reports/recovery-bounded-physical-20261020.html，结果probes/results/recovery-bounded-physical-20261020含summary、逐CDB、recovery日志、controller、原始node归档、software-verification、源码diff和clock-calibration；所有报告本地链接已核验。
+
+独立最终核验：R1/R2/临时control-cleanup所有测试和观察unit MainPID0，三机无VIP且holder=null/token30564墓碑保留；RC18槽7、RC17槽8、驱动空；EE208available/enabled、207disabled、无任务，双设备各原唯一注册+holder(type3)，drive0x400000000a8307d0/changer0x500000000a8307d0。控制缓存gen107/files78/appendable（含内部墓碑，未另行冷挂宣称物理末代）。R2候选/root/tape-recovery-bounded-20261020/ltfsd SHA bd015e0f29ee7ab1889596e3a1b9dc074f9aa35b6e4c27391f9e8e9c08c5e04d，正式服务未替换。未进行本轮写入中故障、实机掉电或内核冻结；默认测试不接触真实设备。全部临时SSH会话及socket已关闭，无新增认证key/凭据文件。源码和文档尚未提交。
+
+### 2026-10-20 — GitHub main 提交前 review 与最终复核
+
+用户要求 review 后提交 GitHub main。本次以 1c2ed455103a2b7ba29e7fd0bee89c599e7d7241 为固定基线，审查全部已跟踪 WIP：axum HTTP、显式 LOAD、合格控制 Leader 兼任 owner、有界恢复、对应测试和文档。按 code-review 技能并行执行 Standards / Spec 两轴审查；Standards 无明确问题，Spec 发现一项 P2 测试问题，修复后复核无剩余问题。未发现生产实现阻断项。
+
+修复 tests/ha_cluster.rs case11：原测试在建池和提交文件后仍比较准备前的 first.round，会将准备期间正常许可失效/重接管误判为 follower 抢占。现在准备完成后重新取得 fenced/ready 且 serving_round 精确匹配的 owner，启用 follower 后连续 500ms 核对已取得资格且控制 Leader、owner 节点/轮次/实例不变；保留原 4s 等待上限、控制权转移后的迁移及已提交数据实读。此前 round9→176 失败记录仍保留，不以重跑抹去。
+
+最终代码完整 cargo test 422 通过 / 4 忽略；cargo fmt --all -- --check、cargo check --all-targets、cargo clippy --all-targets --all-features、git diff --check 均通过，check/clippy 无告警。review 修复前的首轮完整检查也通过。日志 /tmp/tape-review-20261020，最终轮 final/verification.json 和各检查日志。CodeGraph sync、affected 和相关调用路径检查完成；affected 未推导出测试，不替代实际全量测试。
+
+已逐文件比较当前生产源码与 R2 实机 source.patch：Cargo.toml/Cargo.lock 及 http/coordinator/executor/recovery 均完全一致，故前述 R2 物理验收适用于本次生产实现。review 后只修正测试，本轮未访问设备、未重新部署或执行硬件动作；实机掉电、写入中故障、内核冻结仍未验证。正式服务保持原部署。本次提交限于已跟踪源码、测试、依赖及文档；CodeGraph、本地历史、探针原始日志、认证材料与其他未跟踪文件不纳入。交接记录随代码提交，远端推送结果以 main/origin/main 核对为准。

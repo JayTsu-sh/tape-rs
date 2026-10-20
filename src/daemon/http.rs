@@ -1,4 +1,4 @@
-//! 最小 HTTP/1.1 客户端接口（骨架用，不引入新依赖）。每个连接一个线程，一次请求后关闭。
+//! axum HTTP/1.1 接口。协议解析异步执行，同步业务由有界阻塞任务处理；一次请求后关闭。
 //!
 //! PUT  /files/<path>[?wait=1]   上传（默认替换）。202 = 已暂存；带 wait 时等到落带，201 = 已提交。
 //!                               `If-None-Match: *` 为只创建，路径已有已提交版本时 412
@@ -21,15 +21,28 @@
 //! 数据请求不在服务时返回 503，提示设备 owner 地址；管理请求仍提示控制 Leader。
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::net::TcpListener;
+use std::pin::Pin;
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::thread;
 use std::time::Duration;
 
+use axum::Router;
+use axum::body::{Body, Bytes};
+use axum::extract::{Request, State};
+use axum::http::{StatusCode, header, request::Parts};
+use axum::response::Response;
+use http_body_util::BodyExt;
+use hyper::body::{Body as HttpBody, Frame, SizeHint};
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::service::TowerToHyperService;
 use log::{info, warn};
 use serde_json::{Value, json};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::io::ReaderStream;
 
 use super::executor::ExecRequest;
 use super::files::{DirEntry, FileService, PathState, ServiceError, TaskStatus};
@@ -62,89 +75,285 @@ pub(super) fn ready_owner(
         .map(|deadline| (owner.round, deadline))
 }
 
+// 固定内部资源上限，不把 HTTP 并发映射为设备并发。
+const MAX_CONNECTIONS: usize = 256;
+const MAX_REQUESTS: usize = 32;
+const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Clone)]
+struct HttpState {
+    ctx: Arc<HttpContext>,
+    requests: Arc<Semaphore>,
+}
+
+fn router(ctx: Arc<HttpContext>) -> Router {
+    Router::new().fallback(dispatch).with_state(HttpState {
+        ctx,
+        requests: Arc::new(Semaphore::new(MAX_REQUESTS)),
+    })
+}
+
 pub fn serve(listen: &str, ctx: Arc<HttpContext>) -> std::io::Result<()> {
+    // 绑定与运行时创建在调用线程完成，启动失败仍同步返回给调用方。
     let listener = TcpListener::bind(listen)?;
+    listener.set_nonblocking(true)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(MAX_REQUESTS + 8)
+        .enable_all()
+        .build()?;
     info!("客户端接口监听 {}", listen);
     thread::Builder::new()
         .name("ltfsd-http".into())
         .spawn(move || {
-            for conn in listener.incoming().flatten() {
-                let ctx = ctx.clone();
-                let _ = thread::Builder::new()
-                    .name("ltfsd-http-conn".into())
-                    .spawn(move || {
-                        if let Err(e) = handle(conn, &ctx) {
-                            warn!("HTTP 连接出错: {}", e);
+            runtime.block_on(async move {
+                let listener = match tokio::net::TcpListener::from_std(listener) {
+                    Ok(listener) => listener,
+                    Err(e) => {
+                        warn!("HTTP 监听器启动失败: {}", e);
+                        return;
+                    }
+                };
+                let app = router(ctx);
+                let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+                loop {
+                    let (conn, _) = match listener.accept().await {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            warn!("HTTP 接受连接失败: {}", e);
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
                         }
+                    };
+                    let Ok(permit) = connections.clone().try_acquire_owned() else {
+                        // 不为超限连接创建等待任务。
+                        drop(conn);
+                        continue;
+                    };
+                    let app = app.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        serve_connection(conn, app).await;
                     });
-            }
+                }
+            });
         })?;
     Ok(())
 }
 
+async fn serve_connection(conn: tokio::net::TcpStream, app: Router) {
+    let mut http = hyper::server::conn::http1::Builder::new();
+    http.keep_alive(false)
+        .title_case_headers(true)
+        .max_buf_size(32 * 1024)
+        .max_header_size(32 * 1024)
+        .timer(TokioTimer::new())
+        .header_read_timeout(Duration::from_secs(30));
+    if let Err(e) = http
+        .serve_connection(TokioIo::new(conn), TowerToHyperService::new(app))
+        .await
+    {
+        warn!("HTTP 连接出错: {}", e);
+    }
+}
+
+/// 许可随响应体一起存活，慢下载也计入并发上限。
+struct LimitedBody {
+    body: Body,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl HttpBody for LimitedBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        Pin::new(&mut self.body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
+}
+
+async fn dispatch(State(state): State<HttpState>, req: Request) -> Response {
+    // 健康检查不排在上传/设备等待之后，资格判定与 VIP 完全共用。
+    if req.method() == "GET" && req.uri().path() == "/readyz" {
+        return ready_response(&state.ctx);
+    }
+    let Ok(permit) = state.requests.try_acquire_owned() else {
+        return json_response(
+            503,
+            json!({"error":"http_busy", "detail":"HTTP 并发请求已达上限"}),
+        );
+    };
+    let (parts, body) = req.into_parts();
+    // 不对在途写操作套整体超时：连接消失不意味着设备操作已取消。
+    match tokio::task::spawn_blocking(move || {
+        let mut response = Response::new(Body::empty());
+        let mut reader = BodyReader {
+            body,
+            pending: Bytes::new(),
+        };
+        if let Err(e) = handle(parts, &mut reader, &mut response, &state.ctx) {
+            warn!("HTTP 请求出错: {}", e);
+            response = json_response(400, json!({"error":"bad_request", "detail":e.to_string()}));
+        }
+        let (parts, body) = response.into_parts();
+        Response::from_parts(
+            parts,
+            Body::new(LimitedBody {
+                body,
+                _permit: permit,
+            }),
+        )
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            warn!("HTTP 请求任务失败: {}", e);
+            json_response(
+                500,
+                json!({"error":"indeterminate", "status":"indeterminate", "detail":"HTTP 请求任务异常，操作结果未定"}),
+            )
+        }
+    }
+}
+
+/// 只在 spawn_blocking 内跨接异步请求体；逐帧读取，避免整文件缓冲。
+struct BodyReader {
+    body: Body,
+    pending: Bytes,
+}
+
+impl Read for BodyReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        while self.pending.is_empty() {
+            let frame = tokio::runtime::Handle::current()
+                .block_on(async {
+                    tokio::time::timeout(BODY_IDLE_TIMEOUT, self.body.frame()).await
+                })
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "HTTP 内容接收超时")
+                })?;
+            match frame {
+                None => return Ok(0),
+                Some(Err(e)) => return Err(std::io::Error::other(e)),
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        self.pending = data;
+                    }
+                }
+            }
+        }
+        let n = out.len().min(self.pending.len());
+        out[..n].copy_from_slice(&self.pending.split_to(n));
+        Ok(n)
+    }
+}
+
+fn json_response(code: u16, v: Value) -> Response {
+    let mut response = Response::new(Body::empty());
+    respond_json(&mut response, code, "", v).expect("固定 HTTP 响应头合法");
+    response
+}
+
 fn respond(
-    conn: &mut TcpStream,
+    conn: &mut Response,
     code: u16,
-    reason: &str,
+    _reason: &str,
     ctype: &str,
-    body: &[u8],
+    body: Vec<u8>,
 ) -> std::io::Result<()> {
-    write!(
-        conn,
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        code,
-        reason,
-        ctype,
-        body.len()
-    )?;
-    conn.write_all(body)
+    *conn = Response::builder()
+        .status(code)
+        .header(header::CONTENT_TYPE, ctype)
+        .header(header::CONTENT_LENGTH, body.len())
+        .header(header::CONNECTION, "close")
+        .body(Body::from(body))
+        .map_err(std::io::Error::other)?;
+    Ok(())
+}
+
+/// 暂存文件若在发送中意外截断，必须报告错误，不能把短内容当作成功结束。
+struct DownloadFile(tokio::io::Take<tokio::fs::File>);
+
+impl tokio::io::AsyncRead for DownloadFile {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let has_room = buf.remaining() > 0;
+        match Pin::new(&mut self.0).poll_read(cx, buf) {
+            Poll::Ready(Ok(()))
+                if has_room && buf.filled().len() == before && self.0.limit() != 0 =>
+            {
+                Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "下载暂存内容不完整",
+                )))
+            }
+            result => result,
+        }
+    }
 }
 
 /// 磁带读完后再发送；Range 从磁盘切片，内存不随文件大小增长。
 fn respond_file(
-    conn: &mut TcpStream,
+    conn: &mut Response,
     mut file: std::fs::File,
     range: Option<&str>,
 ) -> std::io::Result<()> {
     let total = file.metadata()?.len();
-    let (start, end) = match range.and_then(|r| parse_range(r, total)) {
+    let (start, end, partial) = match range.and_then(|r| parse_range(r, total)) {
         Some(Err(())) => {
             return respond_json(
                 conn,
                 416,
                 "Range Not Satisfiable",
-                json!({"error": "bad_range", "length": total}),
+                json!({"error":"bad_range", "length":total}),
             );
         }
-        Some(Ok((start, end))) => {
-            write!(
-                conn,
-                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\n",
-                start,
-                end - 1,
-                total
-            )?;
-            (start, end)
-        }
-        None => {
-            write!(conn, "HTTP/1.1 200 OK\r\n")?;
-            (0, total)
-        }
+        Some(Ok((start, end))) => (start, end, true),
+        None => (0, total, false),
     };
-    write!(
-        conn,
-        "Content-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        end - start
-    )?;
     file.seek(SeekFrom::Start(start))?;
-    let copied = std::io::copy(&mut file.take(end - start), conn)?;
-    if copied != end - start {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "下载暂存内容不完整",
-        ));
+    let file = tokio::fs::File::from_std(file);
+    let stream = ReaderStream::with_capacity(
+        DownloadFile(tokio::io::AsyncReadExt::take(file, end - start)),
+        256 * 1024,
+    );
+    let mut response = Response::builder()
+        .status(if partial {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        })
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, end - start)
+        .header(header::CONNECTION, "close");
+    if partial {
+        response = response.header(
+            header::CONTENT_RANGE,
+            format!("bytes {}-{}/{}", start, end - 1, total),
+        );
     }
-    conn.flush()
+    *conn = response
+        .body(Body::from_stream(stream))
+        .map_err(std::io::Error::other)?;
+    Ok(())
 }
 
 /// 单段 `Range: bytes=a-b` / `bytes=a-` / `bytes=-n`，按全长 `total` 解析成 `[start, end)`。
@@ -176,10 +385,10 @@ pub fn parse_range(v: &str, total: u64) -> Option<Result<(u64, u64), ()>> {
     Some(Ok((start, end)))
 }
 
-fn respond_json(conn: &mut TcpStream, code: u16, reason: &str, v: Value) -> std::io::Result<()> {
+fn respond_json(conn: &mut Response, code: u16, reason: &str, v: Value) -> std::io::Result<()> {
     let mut body = v.to_string().into_bytes();
     body.push(b'\n');
-    respond(conn, code, reason, "application/json", &body)
+    respond(conn, code, reason, "application/json", body)
 }
 
 fn percent_decode(s: &str) -> String {
@@ -203,7 +412,7 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn service_error(conn: &mut TcpStream, ctx: &HttpContext, e: ServiceError) -> std::io::Result<()> {
+fn service_error(conn: &mut Response, ctx: &HttpContext, e: ServiceError) -> std::io::Result<()> {
     match e {
         ServiceError::NotServing(why) => {
             let status = ctx.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -344,7 +553,7 @@ fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
 }
 
 /// 把管理命令交给 Raft 循环并等结论。只有 Raft Leader 受理；不是 Leader 时答 503 并指出 Leader。
-fn admin(conn: &mut TcpStream, ctx: &HttpContext, cmd: Command) -> std::io::Result<()> {
+fn admin(conn: &mut Response, ctx: &HttpContext, cmd: Command) -> std::io::Result<()> {
     let (tx, rx) = channel();
     if ctx
         .node
@@ -411,72 +620,59 @@ fn task_json(id: u64, st: &TaskStatus) -> (u16, &'static str, Value) {
     }
 }
 
-fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
-    conn.set_read_timeout(Some(Duration::from_secs(60)))?;
-    let mut reader = BufReader::new(conn.try_clone()?);
-    let mut conn = conn;
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    let mut parts = line.split_whitespace();
-    let (Some(method), Some(target)) = (parts.next(), parts.next()) else {
-        return respond_json(
-            &mut conn,
-            400,
-            "Bad Request",
-            json!({"error": "bad_request"}),
-        );
-    };
-    let method = method.to_string();
-    let (raw_path, query) = target.split_once('?').unwrap_or((target, ""));
+fn ready_response(ctx: &HttpContext) -> Response {
+    let s = ctx.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let owner = s.executor.as_ref();
+    let ready = ready_owner(&s, &ctx.files).is_some();
+    json_response(
+        if ready { 200 } else { 503 },
+        json!({
+            "ready": ready, "id": s.id,
+            "owner": owner.map(|e| e.node), "round": owner.map(|e| e.round),
+            "shutting_down": s.shutting_down,
+            "vips": s.vips.iter().map(|(a,r)| json!({"address":a.to_string(),"token":r.token,"holder":r.holder.as_ref().map(|h|json!({"node":h.node,"round":h.round}))})).collect::<Vec<_>>(),
+        }),
+    )
+}
+
+fn handle(
+    parts: Parts,
+    reader: &mut dyn Read,
+    conn: &mut Response,
+    ctx: &HttpContext,
+) -> std::io::Result<()> {
+    let method = parts.method.to_string();
+    let raw_path = parts.uri.path();
+    let query = parts.uri.query().unwrap_or("");
     let wait = query.split('&').any(|kv| kv == "wait=1");
     let path = percent_decode(raw_path);
-    let mut content_length: Option<u64> = None;
-    let mut expects_continue = false;
-    let mut create_only = false;
-    let mut range: Option<String> = None;
-    loop {
-        let mut h = String::new();
-        if reader.read_line(&mut h)? == 0 || h == "\r\n" || h == "\n" {
-            break;
-        }
-        if let Some((k, v)) = h.split_once(':') {
-            if k.eq_ignore_ascii_case("content-length") {
-                content_length = v.trim().parse().ok();
-            }
-            if k.eq_ignore_ascii_case("expect") && v.trim().eq_ignore_ascii_case("100-continue") {
-                // 先不回：等准入成功再让客户端发内容；被拒绝就直接回最终结论
-                expects_continue = true;
-            }
-            if k.eq_ignore_ascii_case("if-none-match") && v.trim() == "*" {
-                create_only = true;
-            }
-            if k.eq_ignore_ascii_case("range") {
-                range = Some(v.trim().to_string());
-            }
-        }
-    }
+    let content_length = parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let expects_continue = parts
+        .headers
+        .get(header::EXPECT)
+        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"100-continue"));
+    let create_only = parts
+        .headers
+        .get(header::IF_NONE_MATCH)
+        .is_some_and(|v| v == "*");
+    let range = parts
+        .headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok());
 
     match (method.as_str(), path.as_str()) {
         ("GET", "/readyz") => {
-            let s = ctx.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            let owner = s.executor.as_ref();
-            let ready = ready_owner(&s, &ctx.files).is_some();
-            respond_json(
-                &mut conn,
-                if ready { 200 } else { 503 },
-                if ready { "OK" } else { "Service Unavailable" },
-                json!({
-                    "ready": ready, "id": s.id,
-                    "owner": owner.map(|e| e.node), "round": owner.map(|e| e.round),
-                    "shutting_down": s.shutting_down,
-                    "vips": s.vips.iter().map(|(a,r)| json!({"address":a.to_string(),"token":r.token,"holder":r.holder.as_ref().map(|h|json!({"node":h.node,"round":h.round}))})).collect::<Vec<_>>(),
-                }),
-            )
+            *conn = ready_response(ctx);
+            Ok(())
         }
         ("POST", "/sync") => {
             let Some(round) = ctx.files.serving_round() else {
                 return service_error(
-                    &mut conn,
+                    conn,
                     ctx,
                     ServiceError::NotServing("同步目标尚未接管".into()),
                 );
@@ -490,27 +686,24 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                 .is_err()
             {
                 return respond_json(
-                    &mut conn,
+                    conn,
                     503,
                     "Service Unavailable",
                     json!({"error":"executor_gone"}),
                 );
             }
             match rx.recv_timeout(ctx.wait_timeout) {
-                Ok(Ok(())) => respond_json(
-                    &mut conn,
-                    200,
-                    "OK",
-                    json!({"status":"synced","round":round}),
-                ),
+                Ok(Ok(())) => {
+                    respond_json(conn, 200, "OK", json!({"status":"synced","round":round}))
+                }
                 Ok(Err(reason)) => respond_json(
-                    &mut conn,
+                    conn,
                     500,
                     "Internal Server Error",
                     json!({"error":"indeterminate","detail":reason}),
                 ),
                 Err(_) => respond_json(
-                    &mut conn,
+                    conn,
                     504,
                     "Gateway Timeout",
                     json!({"error":"indeterminate","detail":"同步结果未定"}),
@@ -520,7 +713,7 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
         ("GET", "/cluster") => {
             let s = ctx.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
             respond_json(
-                &mut conn,
+                conn,
                 200,
                 "OK",
                 json!({
@@ -566,7 +759,7 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                 })
                 .collect();
             respond_json(
-                &mut conn,
+                conn,
                 200,
                 "OK",
                 json!({"pools": pools, "applied_index": s.applied_index, "answered_by": s.id}),
@@ -581,30 +774,25 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                 name: p[13..].to_string(),
                 file_limit,
             };
-            admin(&mut conn, ctx, cmd)
+            admin(conn, ctx, cmd)
         }
         ("POST", p) if p.starts_with("/admin/tapes/") && p.ends_with("/reclaim") => {
             let barcode = p[13..p.len() - "/reclaim".len()].to_string();
-            admin(&mut conn, ctx, Command::TapeReclaim { barcode })
+            admin(conn, ctx, Command::TapeReclaim { barcode })
         }
         ("POST", p) if p.starts_with("/admin/tapes/") => match query_param(query, "pool") {
             Some(pool) => admin(
-                &mut conn,
+                conn,
                 ctx,
                 Command::TapeAssign {
                     barcode: p[13..].to_string(),
                     pool: percent_decode(pool),
                 },
             ),
-            None => respond_json(
-                &mut conn,
-                400,
-                "Bad Request",
-                json!({"error": "pool_required"}),
-            ),
+            None => respond_json(conn, 400, "Bad Request", json!({"error": "pool_required"})),
         },
         ("DELETE", p) if p.starts_with("/admin/tapes/") => admin(
-            &mut conn,
+            conn,
             ctx,
             Command::TapeUnassign {
                 barcode: p[13..].to_string(),
@@ -632,20 +820,20 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                                 }
                             })
                             .collect();
-                        respond_json(&mut conn, 200, "OK", json!({"dir": dir, "entries": v}))
+                        respond_json(conn, 200, "OK", json!({"dir": dir, "entries": v}))
                     }
                     Ok(None) => respond_json(
-                        &mut conn,
+                        conn,
                         404,
                         "Not Found",
                         json!({"error": "not_found", "dir": dir}),
                     ),
-                    Err(e) => service_error(&mut conn, ctx, e),
+                    Err(e) => service_error(conn, ctx, e),
                 }
             }
             None => match ctx.files.list() {
-                Ok(m) => respond_json(&mut conn, 200, "OK", json!({"files": m})),
-                Err(e) => service_error(&mut conn, ctx, e),
+                Ok(m) => respond_json(conn, 200, "OK", json!({"files": m})),
+                Err(e) => service_error(conn, ctx, e),
             },
         },
         ("GET", p) if p.starts_with("/stat/") => match ctx.files.stat_full(&p[5..]) {
@@ -658,7 +846,7 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                 });
                 match (in_flight, committed_json) {
                     (None, None) => respond_json(
-                        &mut conn,
+                        conn,
                         404,
                         "Not Found",
                         json!({"path": &p[5..], "committed": false}),
@@ -668,7 +856,7 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                         j["path"] = json!(&p[5..]);
                         j["state"] = json!("committed");
                         j["committed"] = json!(true);
-                        respond_json(&mut conn, 200, "OK", j)
+                        respond_json(conn, 200, "OK", j)
                     }
                     // 新版本在途：顶层是在途的状态与已接收长度，已提交的当前版本（如有）放在 current
                     (Some((st, len)), cur) => {
@@ -676,20 +864,15 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                         if let Some(c) = cur {
                             j["current"] = c;
                         }
-                        respond_json(&mut conn, 200, "OK", j)
+                        respond_json(conn, 200, "OK", j)
                     }
                 }
             }
-            Err(e) => service_error(&mut conn, ctx, e),
+            Err(e) => service_error(conn, ctx, e),
         },
         ("GET", p) if p.starts_with("/tasks/") => {
             let Ok(id) = p[7..].parse::<u64>() else {
-                return respond_json(
-                    &mut conn,
-                    400,
-                    "Bad Request",
-                    json!({"error": "bad_task_id"}),
-                );
+                return respond_json(conn, 400, "Bad Request", json!({"error": "bad_task_id"}));
             };
             let st = if wait {
                 ctx.files.wait_task(id, ctx.wait_timeout)
@@ -698,9 +881,9 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
             };
             match st {
                 // 查询本身成功；任务的结论在 JSON 里
-                Some(st) => respond_json(&mut conn, 200, "OK", task_json(id, &st).2),
+                Some(st) => respond_json(conn, 200, "OK", task_json(id, &st).2),
                 None => respond_json(
-                    &mut conn,
+                    conn,
                     404,
                     "Not Found",
                     json!({"error": "unknown_task", "detail": "任务记录不跨节点、不跨进程保留"}),
@@ -709,13 +892,13 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
         }
         ("GET", p) if p.starts_with("/files/") => {
             match ctx.files.stat_full(&p[6..]) {
-                Err(e) => return service_error(&mut conn, ctx, e),
+                Err(e) => return service_error(conn, ctx, e),
                 Ok(PathState {
                     committed: None,
                     in_flight: Some((st, _)),
                 }) => {
                     return respond_json(
-                        &mut conn,
+                        conn,
                         409,
                         "Conflict",
                         json!({"error": "not_committed", "path": &p[6..], "state": st.as_str()}),
@@ -726,7 +909,7 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                     in_flight: None,
                 }) => {
                     return respond_json(
-                        &mut conn,
+                        conn,
                         404,
                         "Not Found",
                         json!({"error": "not_found", "path": &p[6..]}),
@@ -736,7 +919,7 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                     committed: Some(st),
                     ..
                 }) if super::files::is_directory(&st.metadata) => {
-                    return service_error(&mut conn, ctx, ServiceError::IsDirectory(p[6..].into()));
+                    return service_error(conn, ctx, ServiceError::IsDirectory(p[6..].into()));
                 }
                 Ok(_) => {}
             }
@@ -745,7 +928,7 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                 Ok(file) => file,
                 Err(e) => {
                     return respond_json(
-                        &mut conn,
+                        conn,
                         500,
                         "Internal Server Error",
                         json!({"error": "spool_io", "detail": e.to_string()}),
@@ -763,28 +946,28 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                     });
             if sent.is_err() {
                 return respond_json(
-                    &mut conn,
+                    conn,
                     503,
                     "Service Unavailable",
                     json!({"error": "executor_gone"}),
                 );
             }
             match rx.recv_timeout(ctx.wait_timeout) {
-                Ok(Ok(file)) => respond_file(&mut conn, file, range.as_deref()),
+                Ok(Ok(file)) => respond_file(conn, file, range),
                 Ok(Err(tape_rs_read_busy @ super::executor::ReadError::Busy(_))) => respond_json(
-                    &mut conn,
+                    conn,
                     503,
                     "Service Unavailable",
                     json!({"error": "drive_busy", "detail": tape_rs_read_busy.to_string()}),
                 ),
                 Ok(Err(e)) => respond_json(
-                    &mut conn,
+                    conn,
                     500,
                     "Internal Server Error",
                     json!({"error": "read_failed", "detail": e.to_string()}),
                 ),
                 Err(_) => respond_json(
-                    &mut conn,
+                    conn,
                     504,
                     "Gateway Timeout",
                     json!({"error": "read_timeout"}),
@@ -793,16 +976,11 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
         }
         (method @ ("POST" | "DELETE"), "/xattrs") => {
             let Some(path) = query_param(query, "path") else {
-                return respond_json(
-                    &mut conn,
-                    400,
-                    "Bad Request",
-                    json!({"error":"missing_path"}),
-                );
+                return respond_json(conn, 400, "Bad Request", json!({"error":"missing_path"}));
             };
             let Some(name) = query_param(query, "name") else {
                 return respond_json(
-                    &mut conn,
+                    conn,
                     400,
                     "Bad Request",
                     json!({"error":"missing_attribute_name"}),
@@ -812,7 +990,7 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                 Ok(v) => v,
                 Err(_) => {
                     return respond_json(
-                        &mut conn,
+                        conn,
                         400,
                         "Bad Request",
                         json!({"error":"invalid_flags"}),
@@ -822,17 +1000,14 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
             let value = if method == "POST" {
                 let Some(len) = content_length else {
                     return respond_json(
-                        &mut conn,
+                        conn,
                         411,
                         "Length Required",
                         json!({"error":"length_required"}),
                     );
                 };
                 if len > 65536 {
-                    return service_error(&mut conn, ctx, ServiceError::AttributeTooLarge);
-                }
-                if expects_continue {
-                    conn.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+                    return service_error(conn, ctx, ServiceError::AttributeTooLarge);
                 }
                 let mut value = vec![0; len as usize];
                 reader.read_exact(&mut value)?;
@@ -847,29 +1022,22 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                 flags,
             ) {
                 Ok(t) => t,
-                Err(e) => return service_error(&mut conn, ctx, e),
+                Err(e) => return service_error(conn, ctx, e),
             };
             let st = ctx
                 .files
                 .wait_task(task, ctx.wait_timeout)
                 .unwrap_or(TaskStatus::Staged);
             let (code, reason, body) = task_json(task, &st);
-            respond_json(&mut conn, code, reason, body)
+            respond_json(conn, code, reason, body)
         }
         ("POST", "/metadata") => {
             let Some(path) = query_param(query, "path") else {
-                return service_error(&mut conn, ctx, ServiceError::BadPath("缺少路径".into()));
+                return service_error(conn, ctx, ServiceError::BadPath("缺少路径".into()));
             };
             let Some(len) = content_length.filter(|n| *n <= 1024) else {
-                return service_error(
-                    &mut conn,
-                    ctx,
-                    ServiceError::BadPath("属性请求长度非法".into()),
-                );
+                return service_error(conn, ctx, ServiceError::BadPath("属性请求长度非法".into()));
             };
-            if expects_continue {
-                conn.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
-            }
             let mut body = vec![0; len as usize];
             reader.read_exact(&mut body)?;
             let parsed = (|| -> Option<crate::ltfs::index::MetadataChange> {
@@ -898,29 +1066,25 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                 })
             })();
             let Some(change) = parsed else {
-                return service_error(
-                    &mut conn,
-                    ctx,
-                    ServiceError::BadPath("属性请求字段非法".into()),
-                );
+                return service_error(conn, ctx, ServiceError::BadPath("属性请求字段非法".into()));
             };
             let task = match ctx.files.change_metadata(&percent_decode(path), &change) {
                 Ok(t) => t,
-                Err(e) => return service_error(&mut conn, ctx, e),
+                Err(e) => return service_error(conn, ctx, e),
             };
             let st = ctx
                 .files
                 .wait_task(task, ctx.wait_timeout)
                 .unwrap_or(TaskStatus::Staged);
             let (code, reason, body) = task_json(task, &st);
-            respond_json(&mut conn, code, reason, body)
+            respond_json(conn, code, reason, body)
         }
         ("POST", "/symlinks") => {
             let (Some(path), Some(target)) =
                 (query_param(query, "path"), query_param(query, "target"))
             else {
                 return respond_json(
-                    &mut conn,
+                    conn,
                     400,
                     "Bad Request",
                     json!({"error":"missing_path_or_target"}),
@@ -931,31 +1095,21 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                 .symlink(&percent_decode(target), &percent_decode(path))
             {
                 Ok(task) => task,
-                Err(e) => return service_error(&mut conn, ctx, e),
+                Err(e) => return service_error(conn, ctx, e),
             };
             let st = ctx
                 .files
                 .wait_task(task, ctx.wait_timeout)
                 .unwrap_or(TaskStatus::Staged);
             let (code, reason, body) = task_json(task, &st);
-            respond_json(&mut conn, code, reason, body)
+            respond_json(conn, code, reason, body)
         }
         ("POST", "/rename") => {
             let Some(from) = query_param(query, "from") else {
-                return respond_json(
-                    &mut conn,
-                    400,
-                    "Bad Request",
-                    json!({"error":"missing_source"}),
-                );
+                return respond_json(conn, 400, "Bad Request", json!({"error":"missing_source"}));
             };
             let Some(to) = query_param(query, "to") else {
-                return respond_json(
-                    &mut conn,
-                    400,
-                    "Bad Request",
-                    json!({"error":"missing_target"}),
-                );
+                return respond_json(conn, 400, "Bad Request", json!({"error":"missing_target"}));
             };
             let task = match ctx.files.rename(
                 &percent_decode(from),
@@ -963,14 +1117,14 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                 query_param(query, "noreplace") == Some("1"),
             ) {
                 Ok(task) => task,
-                Err(e) => return service_error(&mut conn, ctx, e),
+                Err(e) => return service_error(conn, ctx, e),
             };
             let st = ctx
                 .files
                 .wait_task(task, ctx.wait_timeout)
                 .unwrap_or(TaskStatus::Staged);
             let (code, reason, body) = task_json(task, &st);
-            respond_json(&mut conn, code, reason, body)
+            respond_json(conn, code, reason, body)
         }
         (method @ ("POST" | "DELETE"), p) if p.starts_with("/directories/") => {
             let task = match if method == "POST" {
@@ -979,19 +1133,19 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                 ctx.files.rmdir(&p[12..])
             } {
                 Ok(task) => task,
-                Err(e) => return service_error(&mut conn, ctx, e),
+                Err(e) => return service_error(conn, ctx, e),
             };
             let st = ctx
                 .files
                 .wait_task(task, ctx.wait_timeout)
                 .unwrap_or(TaskStatus::Staged);
             let (code, reason, body) = task_json(task, &st);
-            respond_json(&mut conn, code, reason, body)
+            respond_json(conn, code, reason, body)
         }
         ("DELETE", p) if p.starts_with("/files/") => {
             let task = match ctx.files.delete(&p[6..]) {
                 Ok(task) => task,
-                Err(e) => return service_error(&mut conn, ctx, e),
+                Err(e) => return service_error(conn, ctx, e),
             };
             let st = if wait {
                 ctx.files.wait_task(task, ctx.wait_timeout)
@@ -1004,12 +1158,12 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
             } else {
                 (code, reason)
             };
-            respond_json(&mut conn, code, reason, body)
+            respond_json(conn, code, reason, body)
         }
         ("PUT", p) if p.starts_with("/files/") => {
             let Some(len) = content_length else {
                 return respond_json(
-                    &mut conn,
+                    conn,
                     411,
                     "Length Required",
                     json!({"error": "length_required"}),
@@ -1022,14 +1176,11 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                     // 而不是这条错误。
                     // 内容太大就不读了：读完之前对方一直收不到错误，不如让它尽早失败。
                     if !expects_continue && len <= 256 << 20 {
-                        let _ = std::io::copy(&mut (&mut reader).take(len), &mut std::io::sink());
+                        let _ = std::io::copy(&mut reader.take(len), &mut std::io::sink());
                     }
-                    return service_error(&mut conn, ctx, e);
+                    return service_error(conn, ctx, e);
                 }
             };
-            if expects_continue {
-                conn.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
-            }
             let spooled = (|| -> Result<(), ServiceError> {
                 let mut f =
                     std::fs::File::create(&h.spool).map_err(|e| ServiceError::Io(e.to_string()))?;
@@ -1052,11 +1203,11 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
             })();
             if let Err(e) = spooled {
                 ctx.files.abort(h);
-                return service_error(&mut conn, ctx, e);
+                return service_error(conn, ctx, e);
             }
             let task = match ctx.files.finish(h, len) {
                 Ok(t) => t,
-                Err(e) => return service_error(&mut conn, ctx, e),
+                Err(e) => return service_error(conn, ctx, e),
             };
             let st = if wait {
                 ctx.files.wait_task(task, ctx.wait_timeout)
@@ -1064,14 +1215,9 @@ fn handle(conn: TcpStream, ctx: &HttpContext) -> std::io::Result<()> {
                 ctx.files.task(task)
             };
             let (code, reason, body) = task_json(task, &st.unwrap_or(TaskStatus::Staged));
-            respond_json(&mut conn, code, reason, body)
+            respond_json(conn, code, reason, body)
         }
-        _ => respond_json(
-            &mut conn,
-            404,
-            "Not Found",
-            json!({"error": "no_such_route"}),
-        ),
+        _ => respond_json(conn, 404, "Not Found", json!({"error": "no_such_route"})),
     }
 }
 
@@ -1083,24 +1229,199 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
-    fn readiness(ctx: &HttpContext) -> (u16, Value) {
+    fn test_context() -> Arc<HttpContext> {
+        let dir = std::env::temp_dir().join(format!("http-axum-{}", uuid::Uuid::new_v4()));
+        let files = FileService::new(dir).unwrap();
+        let (exec, _) = channel();
+        let (node, _) = channel();
+        Arc::new(HttpContext {
+            files,
+            status: Arc::new(Mutex::new(NodeStatus::default())),
+            exec: Mutex::new(exec),
+            node: Mutex::new(node),
+            client_addrs: HashMap::new(),
+            wait_timeout: Duration::from_secs(1),
+        })
+    }
+
+    // 使用生产连接配置，且每次只接一条连接，测试结束后回收运行时。
+    fn exchange(app: Router, request: &[u8]) -> String {
+        use std::net::TcpStream;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
         thread::scope(|scope| {
-            scope.spawn(|| {
-                let (conn, _) = listener.accept().unwrap();
-                handle(conn, ctx).unwrap();
+            scope.spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                    let (conn, _) = listener.accept().await.unwrap();
+                    tokio::time::timeout(Duration::from_secs(3), serve_connection(conn, app))
+                        .await
+                        .unwrap();
+                });
             });
-            let mut conn = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-            conn.write_all(b"GET /readyz HTTP/1.1\r\nHost: localhost\r\n\r\n")
-                .unwrap();
+            let mut conn = TcpStream::connect(address).unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            conn.write_all(request).unwrap();
             let mut response = String::new();
             conn.read_to_string(&mut response).unwrap();
-            let (headers, body) = response.split_once("\r\n\r\n").unwrap();
-            (
-                headers.split_whitespace().nth(1).unwrap().parse().unwrap(),
-                serde_json::from_str(body).unwrap(),
-            )
+            response
+        })
+    }
+
+    #[test]
+    fn protocol_limits_reject_conflicting_lengths_and_oversized_headers() {
+        let ctx = test_context();
+        let response = exchange(
+            router(ctx.clone()),
+            b"PUT /files/a HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        let request = format!(
+            "GET /cluster HTTP/1.1\r\nHost: x\r\nX-Large: {}\r\n\r\n",
+            "a".repeat(40 * 1024)
+        );
+        let response = exchange(router(ctx), request.as_bytes());
+        assert!(response.starts_with("HTTP/1.1 431"), "{response}");
+    }
+
+    #[test]
+    fn rejected_expect_upload_does_not_request_body() {
+        let response = exchange(router(test_context()), b"PUT /files/a HTTP/1.1\r\nHost: x\r\nContent-Length: 8388608\r\nExpect: 100-continue\r\n\r\n");
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(!response.contains("100 Continue"), "准入之前不得请求内容");
+    }
+
+    #[test]
+    fn request_limit_keeps_readiness_available_and_holds_until_body_dropped() {
+        let requests = Arc::new(Semaphore::new(1));
+        let state = HttpState {
+            ctx: test_context(),
+            requests: requests.clone(),
+        };
+        let app = Router::new().fallback(dispatch).with_state(state.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let held_response = runtime.block_on(dispatch(
+            State(state),
+            Request::builder()
+                .uri("/cluster")
+                .body(Body::empty())
+                .unwrap(),
+        ));
+        assert_eq!(held_response.status(), StatusCode::OK);
+        let response = exchange(app.clone(), b"GET /cluster HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(
+            response.starts_with("HTTP/1.1 503") && response.contains("http_busy"),
+            "{response}"
+        );
+        let response = exchange(app.clone(), b"GET /readyz HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(
+            response.contains("\"ready\":false") && !response.contains("http_busy"),
+            "{response}"
+        );
+        assert_eq!(requests.available_permits(), 0);
+        drop(held_response);
+        assert_eq!(requests.available_permits(), 1);
+        let response = exchange(app, b"GET /cluster HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+
+    #[test]
+    fn cancelled_request_keeps_accepted_command_and_capacity_until_result() {
+        let ctx = test_context();
+        let (node, input) = channel();
+        *ctx.node.lock().unwrap() = node;
+        let requests = Arc::new(Semaphore::new(1));
+        let state = HttpState {
+            ctx,
+            requests: requests.clone(),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/admin/pools/test")
+                .body(Body::empty())
+                .unwrap();
+            let task = tokio::spawn(dispatch(State(state), request));
+            let command = tokio::task::spawn_blocking(move || {
+                input.recv_timeout(Duration::from_secs(2)).unwrap()
+            })
+            .await
+            .unwrap();
+            let NodeInput::Admin { reply, .. } = command else {
+                panic!("应收到管理命令");
+            };
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert_eq!(
+                requests.available_permits(),
+                0,
+                "HTTP 等待取消不能释放在途操作额度"
+            );
+            reply
+                .send(AdminReply::Ok("committed".into()))
+                .expect("已接收的命令仍有接收者");
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while requests.available_permits() == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn truncated_download_is_an_error_instead_of_clean_eof() {
+        let path = std::env::temp_dir().join(format!("http-spool-{}", uuid::Uuid::new_v4()));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
+        file.write_all(b"0123456789").unwrap();
+        let truncator = file.try_clone().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut response = Response::new(Body::empty());
+            respond_file(&mut response, file, None).unwrap();
+            assert_eq!(response.headers()[header::CONTENT_LENGTH], "10");
+            truncator.set_len(5).unwrap();
+            let error = axum::body::to_bytes(response.into_body(), 100)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("下载暂存内容不完整"), "{error}");
+        });
+    }
+
+    fn readiness(ctx: &HttpContext) -> (u16, Value) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let response = ready_response(ctx);
+            let status = response.status().as_u16();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&body).unwrap())
         })
     }
 

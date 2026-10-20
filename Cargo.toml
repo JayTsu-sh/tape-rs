@@ -23,6 +23,14 @@ slog = "2"
 slog-stdlog = "4"
 base64 = "0.22"
 
+# HTTP 接入；只启用 HTTP/1，业务与设备执行仍使用现有同步通道。
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "fs", "io-util", "sync", "time"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+http-body-util = "0.1"
+tokio-util = { version = "0.7", features = ["io"] }
+
 [dev-dependencies]
 # 集成测试直接查控制存储，验证日志确实被压缩过
 rusqlite = { version = "0.31", features = ["bundled"] }

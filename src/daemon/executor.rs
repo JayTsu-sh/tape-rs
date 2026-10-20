@@ -986,6 +986,10 @@ fn open_candidate(
     di: usize,
 ) -> Result<std::result::Result<String, (String, &'static str)>> {
     let dev = a.devices[di].dev.as_ref();
+    // 盒带仍在驱动器里不代表介质已上带：计划停机会 UNLOAD 但不搬回槽位。
+    // 在本轮设备隔离后显式 LOAD，再等待就绪，不能把 02/04/02 误记为坏带。
+    TapeDrive::new(dev).load()?;
+    wait_ready(dev)?;
     // 2. 带上是什么
     match probe_format(dev) {
         Ok(FormatProbe::Ltfs) => {}

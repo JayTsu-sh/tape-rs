@@ -856,10 +856,10 @@ pub(crate) fn recover_for_mount(
     recover_inner(device, label, budget, false)
 }
 
-/// Full 自包含最新视图；只有双分区新鲜提示和实际末构造均一致时才省去历史扫描。
-/// 仍读取两个索引、核验 EOD/自指针/追加位置，增量与异常卷不使用此路径。
-/// DP Full 可带历史增量回指（LTFS 2.5.1 §9.2.4）；Full 自包含，回指不构成重放依赖。
-fn clean_full_pair(
+/// 新鲜 VCI 与实际完整末构造共同证明当前索引的位置（§10.3），允许 IP 滞后。
+/// Full 自包含；增量必须先完整重放到 Full 基线（§9.2、§9.2.13），才能省去更早的历史审计。
+/// 保留两个分区的索引、EOD、自指针与追加位置核验；异常卷不使用此路径。
+fn fresh_current_index(
     dp: &PartitionScan,
     ip: &PartitionScan,
     hints: &[Option<VolumeCoherencyInfo>; 2],
@@ -873,19 +873,25 @@ fn clean_full_pair(
     }
     match (&dp.last_index, &ip.last_index) {
         (Some(d), Some(i)) => {
-            !d.index.incremental
-                && !i.index.incremental
+            !i.index.incremental
                 && !d.index.materialized
                 && !i.index.materialized
                 && i.index.previous_incremental_location.is_none()
-                && d.index.generation == i.index.generation
+                && d.index.generation >= i.index.generation
                 && hints[1]
                     .as_ref()
                     .is_some_and(|h| h.generation == d.index.generation)
                 && hints[0]
                     .as_ref()
                     .is_some_and(|h| h.generation == i.index.generation)
-                && i.index.previous_location == Some(d.index.self_location)
+                && if d.index.generation == i.index.generation {
+                    !d.index.incremental && i.index.previous_location == Some(d.index.self_location)
+                } else {
+                    i.index.previous_location.is_some_and(|p| {
+                        p.partition == d.index.self_location.partition
+                            && p.start_block < d.index.self_location.start_block
+                    })
+                }
         }
         _ => false,
     }
@@ -920,18 +926,21 @@ fn recover_inner(
         hints[1].as_ref().map(|h| h.block),
     )?;
 
-    let history_checked = verify_history || !clean_full_pair(&dp, &ip, &hints);
+    let fresh_current = fresh_current_index(&dp, &ip, &hints);
     let replay = match &mut dp.last_index {
         Some(c) if c.index.incremental => replay_incremental_chain(drive, label, c, budget),
         _ => Ok(0),
     };
+    let history_checked = verify_history || !fresh_current || replay.is_err();
     let (mut chain_ok, mut chain_depth, chain_truncated) = if history_checked {
         match &dp.last_index {
             Some(c) => verify_chain(drive, label, c, budget, &mut notes)?,
             None => (true, 0, false),
         }
     } else {
-        notes.push("双分区最新 Full 构造与新鲜 VCI 一致；未扫描历史 Full 链".into());
+        notes.push(
+            "新鲜 VCI 与两分区末构造一致；当前视图及必要增量已核验，未审计更早 Full 链".into(),
+        );
         (true, 0, false)
     };
 
@@ -1005,6 +1014,24 @@ fn recover_inner(
     if !report.append_ok {
         warn!("卷 {} 恢复为只读: {:?}", label.volume_uuid, report.notes);
     }
+    info!(
+        "卷 {} 恢复：IP gen={:?}，DP gen={:?}，DP增量={}，VCI命中(IP/DP)={}/{}，历史核验={}，历史深度={}，增量重放={}，IP维护债务={}，可追加={}",
+        label.volume_uuid,
+        report.ip.last_index.as_ref().map(|c| c.index.generation),
+        report.dp.last_index.as_ref().map(|c| c.index.generation),
+        report
+            .dp
+            .last_index
+            .as_ref()
+            .is_some_and(|c| c.index.incremental),
+        report.ip.hint_used,
+        report.dp.hint_used,
+        report.history_checked,
+        report.chain_depth,
+        report.incremental_depth,
+        report.ip_debt,
+        report.append_ok,
+    );
     Ok(report)
 }
 
