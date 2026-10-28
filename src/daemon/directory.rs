@@ -49,6 +49,23 @@ pub struct PoolRow {
     pub tapes: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileTaskRow {
+    pub path: String,
+    pub status: String,
+    pub generation: Option<u64>,
+    pub reason: String,
+}
+
+/// 切换前的本节点目录水位与债务，来自同一条 SQLite 查询、同一读快照。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CutoverAudit {
+    pub applied_index: u64,
+    pub frozen_index: Option<u64>,
+    pub has_staging: bool,
+    pub has_unresolved_file_tasks: bool,
+}
+
 impl Directory {
     /// 只读连接，给 HTTP 线程查询用。WAL 模式下读不阻塞 Raft 应用线程的写。
     pub fn open_reader(path: &Path) -> Result<Self> {
@@ -79,7 +96,10 @@ impl Directory {
                  path TEXT NOT NULL, length INTEGER NOT NULL, sha256 TEXT NOT NULL,
                  ver_round INTEGER NOT NULL DEFAULT 0, ver_seq INTEGER NOT NULL DEFAULT 0,
                  deleted INTEGER NOT NULL DEFAULT 0);
-             CREATE INDEX IF NOT EXISTS staging_by_batch ON staging (barcode, generation, part);",
+             CREATE INDEX IF NOT EXISTS staging_by_batch ON staging (barcode, generation, part);
+             CREATE TABLE IF NOT EXISTS file_tasks (pool_uuid TEXT NOT NULL, task INTEGER NOT NULL,
+                 round INTEGER NOT NULL, path TEXT NOT NULL, status TEXT NOT NULL,
+                 generation INTEGER, reason TEXT NOT NULL DEFAULT '', PRIMARY KEY(pool_uuid, task));",
         )
         .map_err(db_err)?;
         // 版本列、墓碑列是后加的。老库里没有时补上，默认 0：没有版本的记录不会抢走任何路径，
@@ -134,6 +154,59 @@ impl Directory {
     /// 已经落库的最后一个日志索引。
     pub fn applied_index(&self) -> u64 {
         self.applied
+    }
+
+    pub fn cutover_audit(&self) -> Result<CutoverAudit> {
+        let (applied, frozen, staging, tasks): (Option<i64>, Option<i64>, i64, i64) = self
+            .db
+            .query_row(
+                "SELECT (SELECT v FROM meta WHERE k='applied_index'),
+                        (SELECT v FROM meta WHERE k='catalog_frozen_index'),
+                        EXISTS(SELECT 1 FROM staging LIMIT 1),
+                        EXISTS(SELECT 1 FROM file_tasks
+                               WHERE status NOT IN ('committed','failed') LIMIT 1)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .map_err(db_err)?;
+        let applied_index = applied
+            .and_then(|index| u64::try_from(index).ok())
+            .ok_or_else(|| TapeError::Ltfs("目录库缺少有效的已应用日志索引".into()))?;
+        let frozen_index = frozen
+            .map(|index| {
+                u64::try_from(index)
+                    .ok()
+                    .filter(|index| *index > 0 && *index <= applied_index)
+                    .ok_or_else(|| TapeError::Ltfs("目录库冻结索引无效".into()))
+            })
+            .transpose()?;
+        Ok(CutoverAudit {
+            applied_index,
+            frozen_index,
+            has_staging: staging != 0,
+            has_unresolved_file_tasks: tasks != 0,
+        })
+    }
+
+    pub fn file_task(&self, pool_uuid: &str, task: u64) -> Result<Option<FileTaskRow>> {
+        if task > i64::MAX as u64 {
+            return Ok(None);
+        }
+        self.db
+            .query_row(
+                "SELECT path,status,generation,reason FROM file_tasks WHERE pool_uuid=?1 AND task=?2",
+                params![pool_uuid, task as i64],
+                |r| {
+                    Ok(FileTaskRow {
+                        path: r.get(0)?,
+                        status: r.get(1)?,
+                        generation: r.get::<_, Option<i64>>(2)?.map(|g| g as u64),
+                        reason: r.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_err)
     }
 
     /// 目录库快照文件放在实况库旁边：`directory.db` → `directory.snap.db`。
@@ -203,7 +276,129 @@ impl Directory {
         if index <= self.applied {
             return Ok(());
         }
-        let tx = self.db.transaction().map_err(db_err)?;
+        // 每次应用都会更新 applied_index，先取得写锁，避免合并先读 staging
+        // 后升级事务时直接 SQLITE_BUSY，绕过连接已有的锁等待。
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(db_err)?;
+        if matches!(outcome, Applied::CatalogRejected) {
+            tx.execute(
+                "INSERT INTO meta (k, v) VALUES ('applied_index', ?1) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                params![index as i64],
+            )
+            .map_err(db_err)?;
+            tx.commit().map_err(db_err)?;
+            self.applied = index;
+            return Ok(());
+        }
+        if let (Command::CatalogFreeze { .. }, Applied::Admin(Ok(reply))) = (cmd, outcome) {
+            let result: serde_json::Value = serde_json::from_str(reply)
+                .map_err(|e| TapeError::Ltfs(format!("目录冻结结论解析失败: {e}")))?;
+            let frozen = result["frozen_index"]
+                .as_u64()
+                .filter(|frozen| *frozen > 0 && *frozen <= index && *frozen <= i64::MAX as u64)
+                .ok_or_else(|| TapeError::Ltfs("目录冻结结论缺少有效索引".into()))?;
+            if frozen == index {
+                tx.execute(
+                    "INSERT OR IGNORE INTO meta(k,v) VALUES('catalog_frozen_index',?1)",
+                    [frozen as i64],
+                )
+                .map_err(db_err)?;
+            }
+            let saved: Option<i64> = tx
+                .query_row(
+                    "SELECT v FROM meta WHERE k='catalog_frozen_index'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(db_err)?;
+            if saved != Some(frozen as i64) {
+                return Err(TapeError::Ltfs("目录冻结投影与控制状态不一致".into()));
+            }
+        }
+        if matches!(outcome, Applied::NewExecutor(_))
+            && matches!(
+                cmd,
+                Command::Takeover { .. } | Command::AssignExecutor { .. }
+            )
+        {
+            tx.execute(
+                "UPDATE file_tasks SET status='indeterminate', reason='设备 owner 已变更；请查询文件路径确认提交结果'
+                 WHERE status='staged' AND round < ?1",
+                [index as i64],
+            )
+            .map_err(db_err)?;
+        }
+        if let Command::FileTask {
+            task,
+            round,
+            pool,
+            path,
+            status,
+            generation,
+            reason,
+        } = cmd
+        {
+            if *task > i64::MAX as u64
+                || *round > i64::MAX as u64
+                || generation.is_some_and(|g| g > i64::MAX as u64)
+            {
+                return Err(TapeError::Ltfs(
+                    "文件任务号、轮次或索引代数超出目录库范围".into(),
+                ));
+            }
+            match status.as_str() {
+                "staged" => {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO file_tasks(pool_uuid,task,round,path,status,generation,reason)
+                         VALUES(?1,?2,?3,?4,'staged',NULL,'')",
+                        params![pool, *task as i64, *round as i64, path],
+                    ).map_err(db_err)?;
+                }
+                "committed" | "failed" | "indeterminate" => {
+                    tx.execute(
+                        "UPDATE file_tasks SET status=?5,generation=?6,reason=?7
+                         WHERE pool_uuid=?1 AND task=?2 AND round=?3 AND path=?4 AND status='staged'",
+                        params![pool, *task as i64, *round as i64, path, status, generation.map(|g| g as i64), reason],
+                    ).map_err(db_err)?;
+                }
+                _ => return Err(TapeError::Ltfs("文件任务状态无效".into())),
+            }
+        }
+        if let Applied::Management(result) = outcome {
+            if let Some(p) = result.get("pool_update") {
+                tx.execute(
+                    "UPDATE pools SET name=?2,file_limit=?3 WHERE uuid=?1",
+                    params![
+                        p["uuid"].as_str(),
+                        p["name"].as_str(),
+                        p["file_limit"].as_u64()
+                    ],
+                )
+                .map_err(db_err)?;
+            }
+            if let Some(a) = result.get("assignment") {
+                tx.execute(
+                    "INSERT INTO tapes(barcode,pool_uuid) VALUES(?1,?2)",
+                    params![a["barcode"].as_str(), a["pool_uuid"].as_str()],
+                )
+                .map_err(db_err)?;
+            }
+            if let Some(b) = result.get("unassigned").and_then(serde_json::Value::as_str) {
+                tx.execute("DELETE FROM tapes WHERE barcode=?1", [b])
+                    .map_err(db_err)?;
+            }
+        }
+        if let (Command::Manage { request }, Applied::Admin(Ok(reply))) = (cmd, outcome) {
+            let result: serde_json::Value = serde_json::from_str(reply)
+                .map_err(|e| TapeError::Ltfs(format!("管理结论解析失败: {e}")))?;
+            if request["resource"] == "pools" && request["action"] == "delete" {
+                tx.execute("DELETE FROM pools WHERE uuid=?1", [result["uuid"].as_str()])
+                    .map_err(db_err)?;
+            }
+        }
         if let Applied::Admin(Ok(_)) = outcome {
             match cmd {
                 Command::PoolCreate {
@@ -615,6 +810,249 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cutover_audit_reads_one_local_snapshot_and_rejects_invalid_index() {
+        let root = std::env::temp_dir().join(format!("cutover-audit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("directory.db");
+        let mut directory = Directory::open(&path).unwrap();
+        directory
+            .apply(7, &Command::CatalogQuiesce, &Applied::Nothing)
+            .unwrap();
+        assert_eq!(
+            Directory::open_reader(&path)
+                .unwrap()
+                .cutover_audit()
+                .unwrap(),
+            CutoverAudit {
+                applied_index: 7,
+                frozen_index: None,
+                has_staging: false,
+                has_unresolved_file_tasks: false,
+            }
+        );
+        directory.db.execute(
+            "INSERT INTO staging(barcode,generation,part,path,length,sha256) VALUES('T1',1,0,'/f',1,'x')",
+            [],
+        ).unwrap();
+        directory.db.execute(
+            "INSERT INTO file_tasks(pool_uuid,task,round,path,status) VALUES('P',1,1,'/f','staged')",
+            [],
+        ).unwrap();
+        let debt = Directory::open_reader(&path)
+            .unwrap()
+            .cutover_audit()
+            .unwrap();
+        assert!(debt.has_staging && debt.has_unresolved_file_tasks);
+        directory.db.execute("DELETE FROM staging", []).unwrap();
+        directory
+            .db
+            .execute("UPDATE file_tasks SET status='indeterminate'", [])
+            .unwrap();
+        let debt = Directory::open_reader(&path)
+            .unwrap()
+            .cutover_audit()
+            .unwrap();
+        assert!(!debt.has_staging && debt.has_unresolved_file_tasks);
+        directory
+            .db
+            .execute("UPDATE file_tasks SET status='committed'", [])
+            .unwrap();
+        assert!(
+            !Directory::open_reader(&path)
+                .unwrap()
+                .cutover_audit()
+                .unwrap()
+                .has_unresolved_file_tasks
+        );
+        directory
+            .db
+            .execute("UPDATE meta SET v=-1 WHERE k='applied_index'", [])
+            .unwrap();
+        assert!(
+            Directory::open_reader(&path)
+                .unwrap()
+                .cutover_audit()
+                .is_err()
+        );
+        drop(directory);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn accepted_freeze_is_projected_with_the_directory_snapshot() {
+        let root =
+            std::env::temp_dir().join(format!("catalog-freeze-proof-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("directory.db");
+        let snapshot = root.join("cutover.db");
+        let mut directory = Directory::open(&path).unwrap();
+        let mut control = ControlState::default();
+        let quiesce = Command::CatalogQuiesce;
+        let outcome = control.apply(1, &quiesce);
+        directory.apply(1, &quiesce, &outcome).unwrap();
+        let rejected = Command::CatalogFreeze { quiesce_index: 99 };
+        let outcome = control.apply(2, &rejected);
+        assert!(matches!(outcome, Applied::Admin(Err(_))));
+        directory.apply(2, &rejected, &outcome).unwrap();
+        assert_eq!(directory.cutover_audit().unwrap().frozen_index, None);
+        let freeze = Command::CatalogFreeze { quiesce_index: 1 };
+        let outcome = control.apply(3, &freeze);
+        assert!(matches!(outcome, Applied::Admin(Ok(_))));
+        directory
+            .db
+            .execute(
+                "INSERT INTO meta(k,v) VALUES('catalog_frozen_index',99)",
+                [],
+            )
+            .unwrap();
+        assert!(directory.apply(3, &freeze, &outcome).is_err());
+        directory
+            .db
+            .execute("DELETE FROM meta WHERE k='catalog_frozen_index'", [])
+            .unwrap();
+        directory.apply(3, &freeze, &outcome).unwrap();
+        let duplicate = control.apply(4, &freeze);
+        directory.apply(4, &freeze, &duplicate).unwrap();
+        assert_eq!(directory.cutover_audit().unwrap().frozen_index, Some(3));
+        directory.write_snapshot(&snapshot).unwrap();
+        let copy = Directory::open_reader(&snapshot)
+            .unwrap()
+            .cutover_audit()
+            .unwrap();
+        assert_eq!(copy.applied_index, 4);
+        assert_eq!(copy.frozen_index, Some(3));
+        drop(directory);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn frozen_catalog_rejects_staging_and_tasks_but_advances_projection_index() {
+        let root = std::env::temp_dir().join(format!("catalog-freeze-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("directory.db");
+        let mut directory = Directory::open(&path).unwrap();
+        directory
+            .apply(
+                1,
+                &Command::CatalogPart {
+                    barcode: "A001L8".into(),
+                    generation: 1,
+                    part: 0,
+                    files: Vec::new(),
+                },
+                &Applied::CatalogRejected,
+            )
+            .unwrap();
+        directory
+            .apply(
+                2,
+                &Command::FileTask {
+                    task: 1,
+                    round: 1,
+                    pool: "P".into(),
+                    path: "/file".into(),
+                    status: "staged".into(),
+                    generation: None,
+                    reason: String::new(),
+                },
+                &Applied::CatalogRejected,
+            )
+            .unwrap();
+        assert_eq!(directory.applied_index(), 2);
+        let rows: i64 = directory
+            .db
+            .query_row("SELECT COUNT(*) FROM staging", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+        assert!(directory.file_task("P", 1).unwrap().is_none());
+        drop(directory);
+        assert_eq!(Directory::open(&path).unwrap().applied_index(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_task_survives_reopen_and_old_owner_staged_result_becomes_indeterminate() {
+        let root = std::env::temp_dir().join(format!("file-task-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("directory.db");
+        let mut directory = Directory::open(&path).unwrap();
+        let staged = |task, round| Command::FileTask {
+            task,
+            round,
+            pool: "P".into(),
+            path: "/file".into(),
+            status: "staged".into(),
+            generation: None,
+            reason: String::new(),
+        };
+        let old = (5u64 << 32) | 1;
+        directory
+            .apply(5, &staged(old, 5), &Applied::Nothing)
+            .unwrap();
+        let takeover = Command::AssignExecutor {
+            node: 2,
+            instance: 1,
+            term: 2,
+            expected_round: Some(5),
+            group: "lab".into(),
+        };
+        directory
+            .apply(
+                6,
+                &takeover,
+                &Applied::NewExecutor(super::super::state::Executor {
+                    node: 2,
+                    term: 2,
+                    round: 6,
+                    fenced: false,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            directory.file_task("P", old).unwrap().unwrap().status,
+            "indeterminate"
+        );
+        let fresh = (6u64 << 32) | 1;
+        directory
+            .apply(7, &staged(fresh, 6), &Applied::Nothing)
+            .unwrap();
+        directory
+            .apply(
+                8,
+                &Command::FileTask {
+                    task: fresh,
+                    round: 6,
+                    pool: "P".into(),
+                    path: "/file".into(),
+                    status: "committed".into(),
+                    generation: Some(42),
+                    reason: String::new(),
+                },
+                &Applied::Nothing,
+            )
+            .unwrap();
+        drop(directory);
+        let reader = Directory::open_reader(&path).unwrap();
+        assert_eq!(
+            reader.file_task("P", old).unwrap().unwrap().status,
+            "indeterminate"
+        );
+        let row = reader.file_task("P", fresh).unwrap().unwrap();
+        assert_eq!(
+            (row.status.as_str(), row.generation),
+            ("committed", Some(42))
+        );
+        assert!(
+            reader
+                .file_task("P", i64::MAX as u64 + 1)
+                .unwrap()
+                .is_none()
+        );
+        drop(reader);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn scoped_nodes_preserve_boundaries_and_skip_unrelated_metadata() {
         let d = Directory::open(Path::new(":memory:")).unwrap();
         for path in [
@@ -731,6 +1169,88 @@ mod tests {
             }]
         );
         let _ = (ctl, std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn catalog_merge_waits_for_writer_before_reading_staging() {
+        use super::super::state::FileRec;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = std::env::temp_dir().join(format!("directory-writer-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("directory.db");
+        let mut directory = Directory::open(&path).unwrap();
+        let mut control = ControlState::default();
+        let commands = [
+            Command::PoolCreate {
+                uuid: "p".into(),
+                name: "pool".into(),
+                file_limit: 100,
+            },
+            Command::TapeAssign {
+                barcode: "T".into(),
+                pool: "p".into(),
+            },
+            Command::CatalogPart {
+                barcode: "T".into(),
+                generation: 1,
+                part: 0,
+                files: vec![FileRec {
+                    path: "/file".into(),
+                    length: 7,
+                    sha256: String::new(),
+                    version: (0, 0),
+                    deleted: false,
+                    metadata: serde_json::Value::Null,
+                }],
+            },
+        ];
+        for (offset, command) in commands.iter().enumerate() {
+            let index = offset as u64 + 1;
+            directory
+                .apply(index, command, &control.apply(index, command))
+                .unwrap();
+        }
+        let commit = Command::TapeCommitted {
+            barcode: "T".into(),
+            volume_uuid: "v".into(),
+            generation: 1,
+            files: 1,
+            bytes_used: 7,
+            bytes_written: 7,
+            parts: 1,
+            full: true,
+        };
+        let outcome = control.apply(4, &commit);
+        assert!(matches!(outcome, Applied::CatalogCommitted));
+        let blocker = Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = directory.apply(4, &commit, &outcome);
+            done_tx.send((result, directory)).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let early = done_rx.recv_timeout(Duration::from_millis(200));
+        let waiting = matches!(early, Err(mpsc::RecvTimeoutError::Timeout));
+        let reader = Directory::open_reader(&path).unwrap();
+        assert!(reader.stat("p", "/file").unwrap().is_none());
+        // Release before asserting, so failure also joins and cleans up the worker.
+        blocker.execute_batch("COMMIT").unwrap();
+        let (result, directory) =
+            early.unwrap_or_else(|_| done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        worker.join().unwrap();
+        let applied = directory.applied_index();
+        let file = directory.stat("p", "/file").unwrap();
+        drop((directory, blocker, reader));
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(waiting, "目录合并应等待写锁，实际提前结束: {result:?}");
+        result.unwrap();
+        assert_eq!(applied, 4);
+        assert_eq!(file.unwrap().length, 7);
     }
 
     #[test]

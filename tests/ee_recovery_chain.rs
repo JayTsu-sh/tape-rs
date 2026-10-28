@@ -56,6 +56,7 @@ fn ee_same_generation_recovery_full_is_not_a_broken_chain() {
     let candidate = IndexCandidate {
         start_block: 57,
         end_block: 58,
+        construct_sha256: [0; 32],
         index,
     };
     let mut notes = Vec::new();
@@ -117,6 +118,7 @@ fn same_generation_does_not_accept_changed_views_unknown_fields_or_deltas() {
             &IndexCandidate {
                 start_block: 57,
                 end_block: 58,
+                construct_sha256: [0; 32],
                 index,
             },
             &RecoveryBudget::default(),
@@ -146,6 +148,7 @@ fn forward_and_self_references_are_rejected_before_reading() {
             &IndexCandidate {
                 start_block: 57,
                 end_block: 58,
+                construct_sha256: [0; 32],
                 index,
             },
             &RecoveryBudget::default(),

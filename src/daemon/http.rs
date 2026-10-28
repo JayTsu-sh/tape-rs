@@ -2,6 +2,7 @@
 //!
 //! PUT  /files/<path>[?wait=1]   上传（默认替换）。202 = 已暂存；带 wait 时等到落带，201 = 已提交。
 //!                               `If-None-Match: *` 为只创建，路径已有已提交版本时 412
+//!                               `X-Tapers-Copy-Metadata` 为跨库复制时的 Base64 JSON 原生属性
 //! GET  /files/<path>            读出已提交的文件内容；支持单段 `Range`（206）；只有在途版本时 409
 //! DELETE /files/<path>[?wait=1] 删除：202 = 墓碑已暂存，200 = 墓碑已落带
 //! POST/DELETE /directories/<path> 创建/删除空目录；201 = 索引已提交，202 = 仍在暂存
@@ -35,6 +36,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
 use axum::http::{StatusCode, header, request::Parts};
 use axum::response::Response;
+use base64::Engine as _;
 use http_body_util::BodyExt;
 use hyper::body::{Body as HttpBody, Frame, SizeHint};
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -45,10 +47,16 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::io::ReaderStream;
 
 use super::executor::ExecRequest;
-use super::files::{DirEntry, FileService, PathState, ServiceError, TaskStatus};
+use super::files::{
+    CatalogExportLease, CatalogSnapshotExport, DirEntry, FileService, PathState, ServiceError,
+    TaskStatus,
+};
 use super::net::{AdminReply, NodeInput};
 use super::node::{NodeStatus, SharedStatus};
 use super::state::{Command, DEFAULT_FILE_LIMIT};
+
+#[path = "http_management.rs"]
+mod management;
 
 pub struct HttpContext {
     pub files: Arc<FileService>,
@@ -67,7 +75,12 @@ pub(super) fn ready_owner(
     files: &FileService,
 ) -> Option<(u64, std::time::Instant)> {
     let owner = s.executor.as_ref()?;
-    if s.shutting_down || !s.executor_ready || owner.node != s.id || !owner.fenced {
+    if s.shutting_down
+        || s.catalog_quiesce_index.is_some()
+        || !s.executor_ready
+        || owner.node != s.id
+        || !owner.fenced
+    {
         return None;
     }
     files
@@ -79,6 +92,8 @@ pub(super) fn ready_owner(
 const MAX_CONNECTIONS: usize = 256;
 const MAX_REQUESTS: usize = 32;
 const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const REJECTED_BODY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const REJECTED_BODY_DRAIN_LIMIT: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 struct HttpState {
@@ -94,6 +109,10 @@ fn router(ctx: Arc<HttpContext>) -> Router {
 }
 
 pub fn serve(listen: &str, ctx: Arc<HttpContext>) -> std::io::Result<()> {
+    serve_router(listen, router(ctx))
+}
+
+pub(crate) fn serve_router(listen: &str, app: Router) -> std::io::Result<()> {
     // 绑定与运行时创建在调用线程完成，启动失败仍同步返回给调用方。
     let listener = TcpListener::bind(listen)?;
     listener.set_nonblocking(true)?;
@@ -114,7 +133,6 @@ pub fn serve(listen: &str, ctx: Arc<HttpContext>) -> std::io::Result<()> {
                         return;
                     }
                 };
-                let app = router(ctx);
                 let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
                 loop {
                     let (conn, _) = match listener.accept().await {
@@ -158,9 +176,9 @@ async fn serve_connection(conn: tokio::net::TcpStream, app: Router) {
 }
 
 /// 许可随响应体一起存活，慢下载也计入并发上限。
-struct LimitedBody {
-    body: Body,
-    _permit: OwnedSemaphorePermit,
+pub(super) struct LimitedBody {
+    pub(super) body: Body,
+    pub(super) _permit: OwnedSemaphorePermit,
 }
 
 impl HttpBody for LimitedBody {
@@ -194,16 +212,38 @@ async fn dispatch(State(state): State<HttpState>, req: Request) -> Response {
         );
     };
     let (parts, body) = req.into_parts();
+    let forwarded = parts.headers.contains_key("x-tapers-forwarded");
+    let content_length = parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
     // 不对在途写操作套整体超时：连接消失不意味着设备操作已取消。
     match tokio::task::spawn_blocking(move || {
         let mut response = Response::new(Body::empty());
         let mut reader = BodyReader {
             body,
             pending: Bytes::new(),
+            consumed: 0,
+            deadline: None,
         };
         if let Err(e) = handle(parts, &mut reader, &mut response, &state.ctx) {
             warn!("HTTP 请求出错: {}", e);
             response = json_response(400, json!({"error":"bad_request", "detail":e.to_string()}));
+        }
+        // VIP 已可能向客户端发出 100 Continue。owner 若提前拒绝，先读完已声明的
+        // 请求体再返回错误，避免入口在客户端写正文时关闭连接。排空必须有总时间
+        // 和字节上限：转发标记来自请求头，不能视为可信身份。
+        if forwarded
+            && response.status().as_u16() >= 400
+            && let Some(remaining) = content_length.map(|len| len.saturating_sub(reader.consumed))
+            && remaining > 0
+        {
+            reader.deadline = Some(std::time::Instant::now() + REJECTED_BODY_DRAIN_TIMEOUT);
+            let _ = std::io::copy(
+                &mut (&mut reader).take(remaining.min(REJECTED_BODY_DRAIN_LIMIT)),
+                &mut std::io::sink(),
+            );
         }
         let (parts, body) = response.into_parts();
         Response::from_parts(
@@ -227,10 +267,21 @@ async fn dispatch(State(state): State<HttpState>, req: Request) -> Response {
     }
 }
 
+/// 多库入口复用同一个有界业务执行入口。
+pub(super) async fn dispatch_context(
+    ctx: Arc<HttpContext>,
+    requests: Arc<Semaphore>,
+    req: Request,
+) -> Response {
+    dispatch(State(HttpState { ctx, requests }), req).await
+}
+
 /// 只在 spawn_blocking 内跨接异步请求体；逐帧读取，避免整文件缓冲。
 struct BodyReader {
     body: Body,
     pending: Bytes,
+    consumed: u64,
+    deadline: Option<std::time::Instant>,
 }
 
 impl Read for BodyReader {
@@ -238,11 +289,22 @@ impl Read for BodyReader {
         if out.is_empty() {
             return Ok(0);
         }
-        while self.pending.is_empty() {
+        loop {
+            let timeout = match self.deadline {
+                Some(deadline) => deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::TimedOut, "HTTP 拒绝正文排空超时")
+                    })?
+                    .min(BODY_IDLE_TIMEOUT),
+                None => BODY_IDLE_TIMEOUT,
+            };
+            if !self.pending.is_empty() {
+                break;
+            }
             let frame = tokio::runtime::Handle::current()
-                .block_on(async {
-                    tokio::time::timeout(BODY_IDLE_TIMEOUT, self.body.frame()).await
-                })
+                .block_on(async { tokio::time::timeout(timeout, self.body.frame()).await })
                 .map_err(|_| {
                     std::io::Error::new(std::io::ErrorKind::TimedOut, "HTTP 内容接收超时")
                 })?;
@@ -258,6 +320,7 @@ impl Read for BodyReader {
         }
         let n = out.len().min(self.pending.len());
         out[..n].copy_from_slice(&self.pending.split_to(n));
+        self.consumed = self.consumed.saturating_add(n as u64);
         Ok(n)
     }
 }
@@ -311,7 +374,7 @@ impl tokio::io::AsyncRead for DownloadFile {
 }
 
 /// 磁带读完后再发送；Range 从磁盘切片，内存不随文件大小增长。
-fn respond_file(
+pub(super) fn respond_file(
     conn: &mut Response,
     mut file: std::fs::File,
     range: Option<&str>,
@@ -319,12 +382,17 @@ fn respond_file(
     let total = file.metadata()?.len();
     let (start, end, partial) = match range.and_then(|r| parse_range(r, total)) {
         Some(Err(())) => {
-            return respond_json(
+            respond_json(
                 conn,
                 416,
                 "Range Not Satisfiable",
                 json!({"error":"bad_range", "length":total}),
+            )?;
+            conn.headers_mut().insert(
+                header::CONTENT_RANGE,
+                format!("bytes */{total}").parse().unwrap(),
             );
+            return Ok(());
         }
         Some(Ok((start, end))) => (start, end, true),
         None => (0, total, false),
@@ -351,6 +419,55 @@ fn respond_file(
         );
     }
     *conn = response
+        .body(Body::from_stream(stream))
+        .map_err(std::io::Error::other)?;
+    Ok(())
+}
+
+/// 导出的 SQLite 文件在 HTTP 正文被读完或连接关闭前始终占用单库导出许可。
+struct CatalogDownload {
+    inner: DownloadFile,
+    _lease: CatalogExportLease,
+}
+
+impl tokio::io::AsyncRead for CatalogDownload {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+fn respond_catalog_snapshot(
+    conn: &mut Response,
+    export: CatalogSnapshotExport,
+    source_node: u64,
+) -> std::io::Result<()> {
+    let total = export.file.metadata()?.len();
+    let sha256 = export
+        .sha256
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let file = tokio::fs::File::from_std(export.file);
+    let stream = ReaderStream::with_capacity(
+        CatalogDownload {
+            inner: DownloadFile(tokio::io::AsyncReadExt::take(file, total)),
+            _lease: export.lease,
+        },
+        256 * 1024,
+    );
+    *conn = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, total)
+        .header(header::CONNECTION, "close")
+        .header("x-tapers-source-node", source_node.to_string())
+        .header("x-tapers-freeze-index", export.frozen_index.to_string())
+        .header("x-tapers-directory-index", export.applied_index.to_string())
+        .header("x-tapers-snapshot-sha256", sha256)
         .body(Body::from_stream(stream))
         .map_err(std::io::Error::other)?;
     Ok(())
@@ -391,7 +508,7 @@ fn respond_json(conn: &mut Response, code: u16, reason: &str, v: Value) -> std::
     respond(conn, code, reason, "application/json", body)
 }
 
-fn percent_decode(s: &str) -> String {
+pub(super) fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -514,6 +631,12 @@ fn service_error(conn: &mut Response, ctx: &HttpContext, e: ServiceError) -> std
             "Not Found",
             json!({"error": "not_found", "path": p}),
         ),
+        ServiceError::VersionMismatch(p) => respond_json(
+            conn,
+            412,
+            "Precondition Failed",
+            json!({"error": "version_changed", "path": p}),
+        ),
         ServiceError::InsufficientCapacity {
             requested,
             available,
@@ -544,6 +667,12 @@ fn service_error(conn: &mut Response, ctx: &HttpContext, e: ServiceError) -> std
     }
 }
 
+fn parse_version_match(value: &str) -> Option<(u64, u64)> {
+    let quoted = value.strip_prefix('"')?.strip_suffix('"')?;
+    let (round, sequence) = quoted.split_once('.')?;
+    Some((round.parse().ok()?, sequence.parse().ok()?))
+}
+
 fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     query.split('&').find_map(|kv| {
         kv.split_once('=')
@@ -554,6 +683,13 @@ fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
 
 /// 把管理命令交给 Raft 循环并等结论。只有 Raft Leader 受理；不是 Leader 时答 503 并指出 Leader。
 fn admin(conn: &mut Response, ctx: &HttpContext, cmd: Command) -> std::io::Result<()> {
+    let management = matches!(
+        cmd,
+        Command::Manage { .. }
+            | Command::CatalogQuiesce
+            | Command::CatalogResume { .. }
+            | Command::CatalogFreeze { .. }
+    );
     let (tx, rx) = channel();
     if ctx
         .node
@@ -570,6 +706,15 @@ fn admin(conn: &mut Response, ctx: &HttpContext, cmd: Command) -> std::io::Resul
         );
     }
     match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(AdminReply::Ok(result)) if management => {
+            let value: Value = serde_json::from_str(&result).map_err(std::io::Error::other)?;
+            let code = if value.get("task").is_some() {
+                202
+            } else {
+                200
+            };
+            respond_json(conn, code, "", value)
+        }
         Ok(AdminReply::Ok(result)) => respond_json(conn, 200, "OK", json!({"result": result})),
         Ok(AdminReply::Rejected(why)) => respond_json(
             conn,
@@ -620,6 +765,17 @@ fn task_json(id: u64, st: &TaskStatus) -> (u16, &'static str, Value) {
     }
 }
 
+fn durable_task_json(ctx: &HttpContext, id: u64, st: &TaskStatus) -> (u16, &'static str, Value) {
+    if !ctx.files.task_recorded(id, st, Duration::from_secs(10)) {
+        return (
+            504,
+            "Gateway Timeout",
+            json!({"task":id,"error":"indeterminate","detail":"任务记录尚未得到多数派确认；请用任务号或文件路径查询，勿盲目重发"}),
+        );
+    }
+    task_json(id, st)
+}
+
 fn ready_response(ctx: &HttpContext) -> Response {
     let s = ctx.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let owner = s.executor.as_ref();
@@ -635,6 +791,17 @@ fn ready_response(ctx: &HttpContext) -> Response {
     )
 }
 
+fn scoped_request(files: &FileService, request: ExecRequest) -> ExecRequest {
+    match files.target_pool() {
+        Some(pool) => ExecRequest::Scoped {
+            pool,
+            lane: files.lane_id(),
+            request: Box::new(request),
+        },
+        None => request,
+    }
+}
+
 fn handle(
     parts: Parts,
     reader: &mut dyn Read,
@@ -645,7 +812,7 @@ fn handle(
     let raw_path = parts.uri.path();
     let query = parts.uri.query().unwrap_or("");
     let wait = query.split('&').any(|kv| kv == "wait=1");
-    let path = percent_decode(raw_path);
+    let mut path = percent_decode(raw_path);
     let content_length = parts
         .headers
         .get(header::CONTENT_LENGTH)
@@ -664,6 +831,101 @@ fn handle(
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok());
 
+    if management::handle(&method, &path, content_length, reader, conn, ctx)? {
+        return Ok(());
+    }
+    if !path.starts_with("/admin/")
+        && path != "/cluster"
+        && path != "/readyz"
+        && ctx
+            .status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .catalog_pending
+    {
+        return respond_json(
+            conn,
+            503,
+            "Service Unavailable",
+            json!({"error":"catalog_pending","detail":"目录正在原子发布，请稍后重试"}),
+        );
+    }
+    let library_files = ctx.files.clone();
+    let scoped;
+    let mut selected_pool = None;
+    let ctx = if !path.starts_with("/admin/") && path != "/cluster" && path != "/readyz" {
+        let selector = if let Some(rest) = path.strip_prefix("/pools/") {
+            let Some((pool, rest)) = rest.split_once('/') else {
+                return respond_json(
+                    conn,
+                    400,
+                    "Bad Request",
+                    json!({"error":"invalid_pool_route"}),
+                );
+            };
+            let pool = pool.to_string();
+            path = format!("/{rest}");
+            Some(pool)
+        } else {
+            None
+        };
+        let pools = ctx
+            .status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pools
+            .clone();
+        let pool = match selector {
+            Some(selector) => match pools
+                .iter()
+                .find(|p| p.uuid == selector || p.name == selector)
+            {
+                Some(pool) => Some(pool.uuid.clone()),
+                None => {
+                    return respond_json(conn, 404, "Not Found", json!({"error":"pool_not_found"}));
+                }
+            },
+            None if pools.len() > 1 => {
+                return respond_json(
+                    conn,
+                    400,
+                    "Bad Request",
+                    json!({"error":"pool_required","detail":"库内有多个池，请指定 /pools/<池名称或UUID>/..."}),
+                );
+            }
+            None => pools.first().map(|p| p.uuid.clone()),
+        };
+        selected_pool = pool.clone();
+        let write = !matches!(method.as_str(), "GET" | "HEAD");
+        let pin = !(method == "PUT" && path.starts_with("/files/"));
+        let file_path = ["/files/", "/stat/", "/metadata/", "/xattrs/", "/rename/"]
+            .iter()
+            .find_map(|prefix| path.strip_prefix(prefix));
+        let files = pool
+            .as_deref()
+            .and_then(|p| ctx.files.select_pool(p, file_path, pin, write))
+            .unwrap_or_else(|| ctx.files.clone());
+        // 未接管时不能把别池请求落到默认写入卷。
+        if pool.as_ref().is_some_and(|p| {
+            files
+                .target_pool()
+                .as_ref()
+                .is_some_and(|target| target != p)
+        }) {
+            return service_error(conn, ctx, ServiceError::NotServing("目标池尚未恢复".into()));
+        }
+        scoped = HttpContext {
+            files,
+            status: ctx.status.clone(),
+            exec: Mutex::new(ctx.exec.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+            node: Mutex::new(ctx.node.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+            client_addrs: ctx.client_addrs.clone(),
+            wait_timeout: ctx.wait_timeout,
+        };
+        &scoped
+    } else {
+        ctx
+    };
     match (method.as_str(), path.as_str()) {
         ("GET", "/readyz") => {
             *conn = ready_response(ctx);
@@ -682,7 +944,10 @@ fn handle(
                 .exec
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .send(ExecRequest::Sync { round, reply: tx })
+                .send(scoped_request(
+                    &ctx.files,
+                    ExecRequest::Sync { round, reply: tx },
+                ))
                 .is_err()
             {
                 return respond_json(
@@ -722,7 +987,7 @@ fn handle(
                     "executor": s.executor.map(|e| json!({"node": e.node, "round": e.round, "fenced": e.fenced})),
                     "executor_ready":s.executor_ready,
                     "candidates":s.candidates.iter().map(|(id,c)|json!({"node":id,"instance":c.instance,"group":c.group,"drives":c.drives,"eligible":c.eligible})).collect::<Vec<_>>(),
-                    "serving_round": ctx.files.serving_round(),
+                    "serving_round": ctx.files.library_serving_round(),
                     "drives": s.drives,
                     "last_reclaim": s.last_reclaim.map(|r| json!({"round": r.round, "barcode": r.barcode, "outcome": r.outcome, "detail": r.detail})),
                 }),
@@ -755,7 +1020,9 @@ fn handle(
                             None => json!({"barcode": b}),
                         })
                         .collect();
-                    json!({"uuid": p.uuid, "name": p.name, "file_limit": p.file_limit, "tapes": p.tapes, "tape_details": tapes})
+                    let mut row = super::management::pool_view(&s,p);
+                    row["tape_details"] = json!(tapes);
+                    row
                 })
                 .collect();
             respond_json(
@@ -874,10 +1141,11 @@ fn handle(
             let Ok(id) = p[7..].parse::<u64>() else {
                 return respond_json(conn, 400, "Bad Request", json!({"error": "bad_task_id"}));
             };
-            let st = if wait {
-                ctx.files.wait_task(id, ctx.wait_timeout)
-            } else {
-                ctx.files.task(id)
+            let st = match (selected_pool.as_deref(), wait) {
+                (Some(pool), true) => ctx.files.wait_task_for_pool(pool, id, ctx.wait_timeout),
+                (Some(pool), false) => ctx.files.task_for_pool(pool, id),
+                (None, true) => ctx.files.wait_task(id, ctx.wait_timeout),
+                (None, false) => ctx.files.task(id),
             };
             match st {
                 // 查询本身成功；任务的结论在 JSON 里
@@ -886,7 +1154,7 @@ fn handle(
                     conn,
                     404,
                     "Not Found",
-                    json!({"error": "unknown_task", "detail": "任务记录不跨节点、不跨进程保留"}),
+                    json!({"error": "unknown_task", "detail": "没有该池的任务记录"}),
                 ),
             }
         }
@@ -935,15 +1203,18 @@ fn handle(
                     );
                 }
             };
-            let sent =
-                ctx.exec
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .send(ExecRequest::ReadTo {
+            let sent = ctx
+                .exec
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .send(scoped_request(
+                    &ctx.files,
+                    ExecRequest::ReadTo {
                         path: p[6..].to_string(),
                         file,
                         reply: tx,
-                    });
+                    },
+                ));
             if sent.is_err() {
                 return respond_json(
                     conn,
@@ -1028,7 +1299,7 @@ fn handle(
                 .files
                 .wait_task(task, ctx.wait_timeout)
                 .unwrap_or(TaskStatus::Staged);
-            let (code, reason, body) = task_json(task, &st);
+            let (code, reason, body) = durable_task_json(ctx, task, &st);
             respond_json(conn, code, reason, body)
         }
         ("POST", "/metadata") => {
@@ -1076,7 +1347,7 @@ fn handle(
                 .files
                 .wait_task(task, ctx.wait_timeout)
                 .unwrap_or(TaskStatus::Staged);
-            let (code, reason, body) = task_json(task, &st);
+            let (code, reason, body) = durable_task_json(ctx, task, &st);
             respond_json(conn, code, reason, body)
         }
         ("POST", "/symlinks") => {
@@ -1101,7 +1372,7 @@ fn handle(
                 .files
                 .wait_task(task, ctx.wait_timeout)
                 .unwrap_or(TaskStatus::Staged);
-            let (code, reason, body) = task_json(task, &st);
+            let (code, reason, body) = durable_task_json(ctx, task, &st);
             respond_json(conn, code, reason, body)
         }
         ("POST", "/rename") => {
@@ -1111,11 +1382,19 @@ fn handle(
             let Some(to) = query_param(query, "to") else {
                 return respond_json(conn, 400, "Bad Request", json!({"error":"missing_target"}));
             };
-            let task = match ctx.files.rename(
-                &percent_decode(from),
-                &percent_decode(to),
-                query_param(query, "noreplace") == Some("1"),
-            ) {
+            let task = match library_files
+                .select_pool(
+                    &ctx.files.target_pool().unwrap_or_default(),
+                    Some(from),
+                    true,
+                    true,
+                )
+                .unwrap_or_else(|| ctx.files.clone())
+                .rename(
+                    &percent_decode(from),
+                    &percent_decode(to),
+                    query_param(query, "noreplace") == Some("1"),
+                ) {
                 Ok(task) => task,
                 Err(e) => return service_error(conn, ctx, e),
             };
@@ -1123,7 +1402,7 @@ fn handle(
                 .files
                 .wait_task(task, ctx.wait_timeout)
                 .unwrap_or(TaskStatus::Staged);
-            let (code, reason, body) = task_json(task, &st);
+            let (code, reason, body) = durable_task_json(ctx, task, &st);
             respond_json(conn, code, reason, body)
         }
         (method @ ("POST" | "DELETE"), p) if p.starts_with("/directories/") => {
@@ -1139,11 +1418,29 @@ fn handle(
                 .files
                 .wait_task(task, ctx.wait_timeout)
                 .unwrap_or(TaskStatus::Staged);
-            let (code, reason, body) = task_json(task, &st);
+            let (code, reason, body) = durable_task_json(ctx, task, &st);
             respond_json(conn, code, reason, body)
         }
         ("DELETE", p) if p.starts_with("/files/") => {
-            let task = match ctx.files.delete(&p[6..]) {
+            let version = match parts.headers.get(header::IF_MATCH) {
+                None => None,
+                Some(value) => match value.to_str().ok().and_then(parse_version_match) {
+                    Some(version) => Some(version),
+                    None => {
+                        return respond_json(
+                            conn,
+                            400,
+                            "Bad Request",
+                            json!({"error":"bad_if_match","detail":"If-Match 应为双引号括起的 round.sequence"}),
+                        );
+                    }
+                },
+            };
+            let result = match version {
+                Some(version) => ctx.files.delete_if_version(&p[6..], version),
+                None => ctx.files.delete(&p[6..]),
+            };
+            let task = match result {
                 Ok(task) => task,
                 Err(e) => return service_error(conn, ctx, e),
             };
@@ -1152,7 +1449,8 @@ fn handle(
             } else {
                 ctx.files.task(task)
             };
-            let (code, reason, body) = task_json(task, &st.unwrap_or(TaskStatus::Staged));
+            let (code, reason, body) =
+                durable_task_json(ctx, task, &st.unwrap_or(TaskStatus::Staged));
             let (code, reason) = if code == 201 {
                 (200, "OK")
             } else {
@@ -1168,6 +1466,46 @@ fn handle(
                     "Length Required",
                     json!({"error": "length_required"}),
                 );
+            };
+            let copied_metadata = if let Some(encoded) = parts.headers.get("x-tapers-copy-metadata")
+            {
+                if !create_only {
+                    if !expects_continue && len <= 256 << 20 {
+                        let _ = std::io::copy(&mut reader.take(len), &mut std::io::sink());
+                    }
+                    return respond_json(
+                        conn,
+                        400,
+                        "Bad Request",
+                        json!({"error":"copy_metadata_requires_create_only"}),
+                    );
+                }
+                let decoded = encoded
+                    .to_str()
+                    .ok()
+                    .filter(|s| s.len() <= 16 * 1024)
+                    .and_then(|s| {
+                        base64::engine::general_purpose::STANDARD_NO_PAD
+                            .decode(s)
+                            .ok()
+                    })
+                    .filter(|bytes| bytes.len() <= 12 * 1024)
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .and_then(|value| super::files::copied_file_metadata(&value).ok());
+                let Some(metadata) = decoded else {
+                    if !expects_continue && len <= 256 << 20 {
+                        let _ = std::io::copy(&mut reader.take(len), &mut std::io::sink());
+                    }
+                    return respond_json(
+                        conn,
+                        400,
+                        "Bad Request",
+                        json!({"error":"bad_copy_metadata","detail":"复制元数据无效或超过 12 KiB"}),
+                    );
+                };
+                Some(metadata)
+            } else {
+                None
             };
             let h = match ctx.files.begin_with(&p[6..], len, create_only) {
                 Ok(h) => h,
@@ -1205,7 +1543,11 @@ fn handle(
                 ctx.files.abort(h);
                 return service_error(conn, ctx, e);
             }
-            let task = match ctx.files.finish(h, len) {
+            let result = match copied_metadata {
+                Some(metadata) => ctx.files.finish_with_metadata(h, len, Some(metadata)),
+                None => ctx.files.finish(h, len),
+            };
+            let task = match result {
                 Ok(t) => t,
                 Err(e) => return service_error(conn, ctx, e),
             };
@@ -1214,7 +1556,8 @@ fn handle(
             } else {
                 ctx.files.task(task)
             };
-            let (code, reason, body) = task_json(task, &st.unwrap_or(TaskStatus::Staged));
+            let (code, reason, body) =
+                durable_task_json(ctx, task, &st.unwrap_or(TaskStatus::Staged));
             respond_json(conn, code, reason, body)
         }
         _ => respond_json(conn, 404, "Not Found", json!({"error": "no_such_route"})),
@@ -1229,6 +1572,14 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
+    #[test]
+    fn if_match_requires_exact_quoted_file_version() {
+        assert_eq!(parse_version_match("\"42.7\""), Some((42, 7)));
+        for value in ["42.7", "*", "\"42\"", "\"42.7.1\"", "W/\"42.7\""] {
+            assert_eq!(parse_version_match(value), None);
+        }
+    }
+
     fn test_context() -> Arc<HttpContext> {
         let dir = std::env::temp_dir().join(format!("http-axum-{}", uuid::Uuid::new_v4()));
         let files = FileService::new(dir).unwrap();
@@ -1242,6 +1593,245 @@ mod tests {
             client_addrs: HashMap::new(),
             wait_timeout: Duration::from_secs(1),
         })
+    }
+
+    #[test]
+    fn catalog_audit_without_local_directory_fails_closed() {
+        let ctx = test_context();
+        let mut response = Response::new(Body::empty());
+        assert!(
+            management::handle(
+                "GET",
+                "/admin/catalog/current/audit",
+                None,
+                &mut std::io::Cursor::new(&[]),
+                &mut response,
+                &ctx,
+            )
+            .unwrap()
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn catalog_export_requires_freeze_and_streams_matching_snapshot() {
+        use super::super::directory::Directory;
+        use super::super::files::BatchPolicy;
+        use super::super::state::{Applied, ControlState};
+        use sha2::{Digest, Sha256};
+
+        let root =
+            std::env::temp_dir().join(format!("http-catalog-export-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("directory.db");
+        let mut directory = Directory::open(&path).unwrap();
+        let files = FileService::with_options(
+            root.join("spool"),
+            BatchPolicy::default(),
+            Some(path.clone()),
+        )
+        .unwrap();
+        let (exec, _) = channel();
+        let (node, _) = channel();
+        let ctx = HttpContext {
+            files,
+            status: Arc::new(Mutex::new(NodeStatus {
+                id: 207,
+                ..NodeStatus::default()
+            })),
+            exec: Mutex::new(exec),
+            node: Mutex::new(node),
+            client_addrs: HashMap::new(),
+            wait_timeout: Duration::from_secs(1),
+        };
+        let call = |ctx: &HttpContext| {
+            let mut response = Response::new(Body::empty());
+            assert!(
+                management::handle(
+                    "POST",
+                    "/admin/catalog/current/export",
+                    Some(0),
+                    &mut std::io::Cursor::new(&[]),
+                    &mut response,
+                    ctx
+                )
+                .unwrap()
+            );
+            response
+        };
+        assert_eq!(call(&ctx).status(), StatusCode::CONFLICT);
+        let mut control = ControlState::default();
+        for (index, command) in [
+            (1, Command::CatalogQuiesce),
+            (2, Command::CatalogFreeze { quiesce_index: 1 }),
+        ] {
+            let outcome = control.apply(index, &command);
+            assert!(matches!(outcome, Applied::Admin(Ok(_))));
+            directory.apply(index, &command, &outcome).unwrap();
+        }
+        {
+            let mut status = ctx.status.lock().unwrap();
+            status.catalog_quiesce_index = Some(1);
+            status.catalog_frozen_index = Some(2);
+            status.applied_index = 2;
+            status.catalog_pending = true;
+        }
+        assert_eq!(call(&ctx).status(), StatusCode::CONFLICT);
+        ctx.status.lock().unwrap().catalog_pending = false;
+        let debt = rusqlite::Connection::open(&path).unwrap();
+        debt.execute("INSERT INTO staging(barcode,generation,part,path,length,sha256) VALUES('T1',1,0,'/f',1,'x')", []).unwrap();
+        assert_eq!(call(&ctx).status(), StatusCode::SERVICE_UNAVAILABLE);
+        debt.execute("DELETE FROM staging", []).unwrap();
+        drop(debt);
+        let response = call(&ctx);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(call(&ctx).status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["x-tapers-source-node"], "207");
+        assert_eq!(response.headers()["x-tapers-freeze-index"], "2");
+        assert_eq!(response.headers()["x-tapers-directory-index"], "2");
+        let expected_hash = response.headers()["x-tapers-snapshot-sha256"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let bytes = runtime
+            .block_on(axum::body::to_bytes(response.into_body(), 1024 * 1024))
+            .unwrap();
+        let repeated = call(&ctx);
+        assert_eq!(repeated.status(), StatusCode::OK);
+        drop(repeated);
+        assert_eq!(format!("{:x}", Sha256::digest(&bytes)), expected_hash);
+        let copy = root.join("download.db");
+        std::fs::write(&copy, &bytes).unwrap();
+        let audit = Directory::open_reader(&copy)
+            .unwrap()
+            .cutover_audit()
+            .unwrap();
+        assert_eq!(audit.frozen_index, Some(2));
+        assert!(!audit.has_staging && !audit.has_unresolved_file_tasks);
+        assert!(
+            !std::fs::read_dir(&root)
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().contains("cutover-"))
+        );
+        drop(directory);
+        drop(ctx);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_quiesce_http_requires_confirmation_and_exact_resume_epoch() {
+        let ctx = test_context();
+        let (node, input) = channel();
+        *ctx.node.lock().unwrap() = node;
+        let mut response = Response::new(Body::empty());
+        let body = br#"{"confirm":false}"#;
+        assert!(
+            management::handle(
+                "POST",
+                "/admin/catalog/current/quiesce",
+                Some(body.len() as u64),
+                &mut std::io::Cursor::new(body),
+                &mut response,
+                &ctx,
+            )
+            .unwrap()
+        );
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let worker = thread::spawn(move || {
+            let NodeInput::Admin { cmd, reply } = input.recv().unwrap() else {
+                panic!("应收到目录暂停命令");
+            };
+            assert_eq!(cmd, Command::CatalogQuiesce);
+            reply
+                .send(AdminReply::Ok(r#"{"quiesce_index":42}"#.into()))
+                .unwrap();
+            let NodeInput::Admin { cmd, reply } = input.recv().unwrap() else {
+                panic!("应收到目录恢复命令");
+            };
+            assert_eq!(cmd, Command::CatalogResume { quiesce_index: 42 });
+            reply
+                .send(AdminReply::Ok(r#"{"resumed":true}"#.into()))
+                .unwrap();
+            let NodeInput::Admin { cmd, reply } = input.recv().unwrap() else {
+                panic!("应收到目录冻结命令");
+            };
+            assert_eq!(cmd, Command::CatalogFreeze { quiesce_index: 42 });
+            reply
+                .send(AdminReply::Ok(r#"{"frozen_index":43}"#.into()))
+                .unwrap();
+        });
+        let body = br#"{"confirm":true}"#;
+        assert!(
+            management::handle(
+                "POST",
+                "/admin/catalog/current/quiesce",
+                Some(body.len() as u64),
+                &mut std::io::Cursor::new(body),
+                &mut response,
+                &ctx,
+            )
+            .unwrap()
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = br#"{"confirm":true,"quiesce_index":0}"#;
+        assert!(
+            management::handle(
+                "POST",
+                "/admin/catalog/current/resume",
+                Some(body.len() as u64),
+                &mut std::io::Cursor::new(body),
+                &mut response,
+                &ctx,
+            )
+            .unwrap()
+        );
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = br#"{"confirm":true,"quiesce_index":42}"#;
+        assert!(
+            management::handle(
+                "POST",
+                "/admin/catalog/current/resume",
+                Some(body.len() as u64),
+                &mut std::io::Cursor::new(body),
+                &mut response,
+                &ctx,
+            )
+            .unwrap()
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        for (body, status) in [
+            (
+                br#"{"confirm":false,"quiesce_index":42}"#.as_slice(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                br#"{"confirm":true,"quiesce_index":0}"#.as_slice(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                br#"{"confirm":true,"quiesce_index":42}"#.as_slice(),
+                StatusCode::OK,
+            ),
+        ] {
+            assert!(
+                management::handle(
+                    "POST",
+                    "/admin/catalog/current/freeze",
+                    Some(body.len() as u64),
+                    &mut std::io::Cursor::new(body),
+                    &mut response,
+                    &ctx,
+                )
+                .unwrap()
+            );
+            assert_eq!(response.status(), status);
+        }
+        worker.join().unwrap();
     }
 
     // 使用生产连接配置，且每次只接一条连接，测试结束后回收运行时。
@@ -1274,6 +1864,297 @@ mod tests {
     }
 
     #[test]
+    fn pending_catalog_refuses_data_without_hiding_control_status() {
+        let ctx = test_context();
+        ctx.status.lock().unwrap().catalog_pending = true;
+        let raw = exchange(
+            router(ctx.clone()),
+            b"GET /stat/file HTTP/1.1\r\nHost: x\r\n\r\n",
+        );
+        assert!(raw.starts_with("HTTP/1.1 503"), "{raw}");
+        assert!(raw.contains("catalog_pending"), "{raw}");
+        let raw = exchange(router(ctx), b"GET /cluster HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
+    }
+
+    #[test]
+    fn library_reports_serving_when_another_pool_has_the_writer() {
+        use super::super::files::{TapeIdent, TapeLimits};
+        let ctx = test_context();
+        ctx.files.bind_pool("p1");
+        ctx.files.close_waiting(1, Some("p1".into()), "等待驱动");
+        let writer = ctx.files.add_lane("p2");
+        let index = crate::ltfs::index::LtfsIndex::empty(uuid::Uuid::new_v4(), "test".into(), 'b');
+        writer.open(
+            1,
+            TapeIdent {
+                pool_uuid: "p2".into(),
+                barcode: "TEST02L8".into(),
+            },
+            TapeLimits {
+                file_limit: 100,
+                usable_capacity: 100,
+            },
+            &index,
+            100,
+            true,
+        );
+        let response = exchange(
+            router(ctx.clone()),
+            b"GET /cluster HTTP/1.1\r\nHost: x\r\n\r\n",
+        );
+        assert!(response.contains("\"serving_round\":1"), "{response}");
+        ctx.files.close_all("done");
+    }
+
+    #[test]
+    fn explicit_pool_routes_isolate_uploads_and_reject_ambiguous_default() {
+        use super::super::{
+            directory::PoolRow,
+            files::{TapeIdent, TapeLimits},
+        };
+        let ctx = test_context();
+        ctx.files.bind_pool("p1");
+        let two = ctx.files.add_lane("p2");
+        let index = crate::ltfs::index::LtfsIndex::empty(uuid::Uuid::new_v4(), "test".into(), 'b');
+        for (files, pool, barcode) in [
+            (ctx.files.clone(), "p1", "TEST01L8"),
+            (two.clone(), "p2", "TEST02L8"),
+        ] {
+            files.open(
+                1,
+                TapeIdent {
+                    pool_uuid: pool.into(),
+                    barcode: barcode.into(),
+                },
+                TapeLimits {
+                    file_limit: 100,
+                    usable_capacity: 1000,
+                },
+                &index,
+                1000,
+                true,
+            );
+        }
+        ctx.status.lock().unwrap().pools = vec![
+            PoolRow {
+                uuid: "p1".into(),
+                name: "one".into(),
+                file_limit: 100,
+                tapes: vec!["TEST01L8".into()],
+            },
+            PoolRow {
+                uuid: "p2".into(),
+                name: "two".into(),
+                file_limit: 100,
+                tapes: vec!["TEST02L8".into()],
+            },
+        ];
+        let app = router(ctx.clone());
+        for (pool, body) in [("one", "a"), ("p2", "b")] {
+            let request = format!(
+                "PUT /pools/{pool}/files/same HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\n\r\n{body}"
+            );
+            let response = exchange(app.clone(), request.as_bytes());
+            assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+        }
+        let response = exchange(
+            app.clone(),
+            b"PUT /files/unsafe HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 400") && response.contains("pool_required"),
+            "{response}"
+        );
+        let response = exchange(
+            app,
+            b"GET /pools/missing/stat/same HTTP/1.1\r\nHost: x\r\n\r\n",
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 404") && response.contains("pool_not_found"),
+            "{response}"
+        );
+        for (files, want) in [(ctx.files.clone(), b"a".as_slice()), (two, b"b".as_slice())] {
+            let (_, uploads) = files.take_batch_now(1).unwrap();
+            assert_eq!(std::fs::read(&uploads[0].spool).unwrap(), want);
+        }
+        ctx.files.close_all("test done");
+    }
+
+    #[test]
+    fn management_capacity_and_status_match_ee_fields_without_inventing_observations() {
+        let ctx = test_context();
+        {
+            let mut s = ctx.status.lock().unwrap();
+            s.executor = Some(Executor {
+                node: 2,
+                round: 9,
+                term: 1,
+                fenced: true,
+            });
+            s.pools.push(super::super::directory::PoolRow {
+                uuid: "p".into(),
+                name: "pool".into(),
+                file_limit: 100,
+                tapes: vec!["B".into()],
+            });
+            s.tapes.insert(
+                "B".into(),
+                super::super::node::TapeRow {
+                    volume_uuid: "volume-b".into(),
+                    state: "appendable".into(),
+                    generation: 8,
+                    bytes_used: 10,
+                    ..Default::default()
+                },
+            );
+            let mut m = super::super::management::empty();
+            m["tapes"]["B"] = json!({"offline":"maintenance","capacity":{"volume_uuid":"volume-b","generation":7,"maximum":1024,"remaining":512,"observed_at":"2026-10-20T00:00:00Z"}});
+            m["inventory"] = json!({"owner":1,"round":5,"observed_at":"2026-10-20T00:00:00Z","volumes":[{"barcode":"B","address":1007,"element_type":2},{"barcode":"U","address":1008,"element_type":2}],"drives":[{"serial":"D","address":1,"barcode":null}]});
+            s.management = Arc::new(m);
+        }
+        let get = |path: &str| -> Value {
+            let request = format!("GET {path} HTTP/1.1\r\nHost: test\r\n\r\n");
+            let raw = exchange(router(ctx.clone()), request.as_bytes());
+            assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
+            serde_json::from_str(raw.split_once("\r\n\r\n").unwrap().1).unwrap()
+        };
+        let tape = get("/admin/tapes/B")["payload"].clone();
+        assert_eq!(tape["capacity"], 1024);
+        assert_eq!(tape["free_space"], 0);
+        assert_eq!(tape["non_appendable_space"], 512);
+        assert_eq!(tape["appendable"], "no");
+        assert_eq!(tape["non_appendable"], tape["non_appendable_space"]);
+        assert_eq!(tape["capacity_cached"], true);
+        assert_eq!(tape["capacity_generation_matches"], false);
+        assert_eq!(tape["partitions"]["data"]["capacity"], 1024);
+        assert!(tape["partitions"]["index"]["capacity"].is_null());
+        assert!(tape["volume_capacity"]["capacity"].is_null());
+        assert!(tape["policy"].get("capacity").is_none());
+        assert_eq!(tape["state"], "offline");
+        assert_eq!(tape["status"], "ok");
+        assert_eq!(tape["volume_state"], "appendable");
+        assert_eq!(tape["offline_msg"], "maintenance");
+        assert_eq!(tape["pool_name"], "pool");
+        assert_eq!(tape["location_type"], "homeslot");
+        assert_eq!(tape["inventory_observation"]["owner"], 1);
+        assert_eq!(
+            tape["inventory_observation"]["owner_matches_current"],
+            false
+        );
+        assert_eq!(get("/admin/tapes")["payload"]["tapes"][0], tape);
+        assert_eq!(get("/admin/status")["payload"]["tapes"][0], tape);
+        let drive = get("/admin/drives/D")["payload"].clone();
+        assert_eq!(
+            drive["inventory_observation"],
+            tape["inventory_observation"]
+        );
+        let unknown = get("/admin/tapes/U")["payload"].clone();
+        assert_eq!(unknown["state"], "unassigned");
+        assert_eq!(unknown["capacity"], 0);
+        assert_eq!(unknown["capacity_source"], "unassigned");
+        assert!(unknown["partitions"]["data"]["capacity"].is_null());
+        assert_eq!(unknown["status"], "ok");
+        {
+            let mut s = ctx.status.lock().unwrap();
+            let mut m = (*s.management).clone();
+            m["tapes"]["B"]["capacity"]["generation"] = json!(8);
+            m["tapes"]["B"]["capacity"]["partition"] = json!(1);
+            m["tapes"]["B"]["index_capacity"] = json!({"volume_uuid":"volume-b","generation":8,"partition":0,"maximum":128,"remaining":64,"observed_at":"2026-10-20T00:00:00Z"});
+            s.management = Arc::new(m);
+        }
+        let tape = get("/admin/tapes/B")["payload"].clone();
+        assert_eq!(tape["capacity"], 1024);
+        assert_eq!(tape["free_space"], 0);
+        assert_eq!(tape["non_appendable_space"], 512);
+        assert_eq!(tape["used_space"], 512);
+        assert_eq!(tape["capacity_unit"], "bytes");
+        assert_eq!(tape["capacity_partition"], "DP");
+        assert!(tape["reclaimable_space"].is_null());
+        assert!(tape["reclaimable_percent"].is_null());
+        assert_eq!(tape["partitions"]["data"]["partition_number"], 1);
+        assert_eq!(tape["partitions"]["index"]["partition_number"], 0);
+        assert_eq!(tape["partitions"]["index"]["capacity"], 128);
+        assert_eq!(tape["partitions"]["index"]["used_space"], 64);
+        assert_eq!(tape["partitions"]["index"]["free_space"], 64);
+        assert_eq!(tape["volume_capacity"]["capacity"], 1152);
+        assert_eq!(tape["volume_capacity"]["used_space"], 576);
+        assert_eq!(tape["volume_capacity"]["free_space"], 576);
+        assert_eq!(tape["volume_capacity"]["capacity_partition"], "IP+DP");
+        for p in [
+            get("/admin/pools")["pools"][0].clone(),
+            get("/admin/pools/p")["payload"].clone(),
+        ] {
+            assert_eq!(p["capacity"], tape["capacity"]);
+            assert_eq!(p["used_space"], tape["used_space"]);
+            assert_eq!(p["free_space"], tape["free_space"]);
+            assert_eq!(p["non_appendable_space"], tape["non_appendable_space"]);
+            assert_eq!(p["num_of_tapes"], 1);
+            assert_eq!(p["capacity_complete"], true);
+            assert_eq!(p["capacity_known_tapes"], 1);
+            assert_eq!(p["capacity_unknown_tapes"], 0);
+            assert_eq!(p["partitions"]["index"]["capacity"], 128);
+            assert_eq!(p["volume_capacity"]["capacity"], 1152);
+        }
+        {
+            let mut s = ctx.status.lock().unwrap();
+            let mut m = (*s.management).clone();
+            m["tapes"]["B"]["offline"] = Value::Null;
+            s.management = Arc::new(m);
+        }
+        let online = get("/admin/tapes/B")["payload"].clone();
+        assert_eq!(online["appendable"], "yes");
+        assert_eq!(online["status"], "ok");
+        assert_eq!(online["free_space"], 512);
+        assert_eq!(online["non_appendable_space"], 0);
+        {
+            let mut s = ctx.status.lock().unwrap();
+            s.tapes.remove("B");
+            s.pools[0].tapes.clear();
+        }
+        let unassigned = get("/admin/tapes/B")["payload"].clone();
+        assert_eq!(unassigned["state"], "unassigned");
+        assert!(unassigned["pool_id"].is_null());
+        assert_eq!(unassigned["capacity"], 0);
+        assert_eq!(unassigned["used_space"], 0);
+        assert_eq!(unassigned["capacity_source"], "unassigned");
+        assert_eq!(unassigned["capacity_cached"], false);
+        assert_eq!(unassigned["status"], "ok");
+        assert!(unassigned["capacity_observed_at"].is_null());
+        assert!(unassigned["appendable"].is_null());
+        assert_eq!(unassigned["free_space"], 0);
+        assert_eq!(unassigned["non_appendable_space"], 0);
+        let mut history = online["partitions"].clone();
+        for partition in ["data", "index"] {
+            // 解除分配也移除了目录摘要；未知代数关系不能误报为不匹配。
+            history[partition]["capacity_generation_matches"] = Value::Null;
+        }
+        assert_eq!(unassigned["partitions"], history);
+        assert_eq!(unassigned["partitions"]["data"]["capacity"], 1024);
+        assert_eq!(unassigned["partitions"]["data"]["capacity_cached"], true);
+        assert_eq!(get("/admin/tapes")["payload"]["tapes"][0], unassigned);
+        assert_eq!(get("/admin/status")["payload"]["tapes"][0], unassigned);
+        let empty = get("/admin/pools/p")["payload"].clone();
+        assert_eq!(empty["capacity"], 0);
+        assert_eq!(empty["capacity_complete"], true);
+        assert_eq!(empty["capacity_known_tapes"], 0);
+    }
+
+    #[test]
+    fn management_rejects_bad_bodies_and_unknown_actions_before_dispatch() {
+        let ctx = test_context();
+        for (request,status) in [
+            (b"POST /admin/tapes/B/offline HTTP/1.1\r\nHost: test\r\nContent-Length: 1\r\n\r\n{".as_slice(),"400"),
+            (b"POST /admin/tapes/B/offline HTTP/1.1\r\nHost: test\r\nContent-Length: 2\r\n\r\n[]".as_slice(),"400"),
+            (b"POST /admin/tapes/B/offline HTTP/1.1\r\nHost: test\r\nContent-Length: 16385\r\nExpect: 100-continue\r\n\r\n".as_slice(),"413"),
+            (b"POST /admin/tapes/B/typo HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\n\r\n".as_slice(),"404"),
+        ] {
+            let reply=exchange(router(ctx.clone()),request);
+            assert!(reply.starts_with(&format!("HTTP/1.1 {status}")),"{reply}");
+        }
+    }
+
+    #[test]
     fn protocol_limits_reject_conflicting_lengths_and_oversized_headers() {
         let ctx = test_context();
         let response = exchange(
@@ -1294,6 +2175,101 @@ mod tests {
         let response = exchange(router(test_context()), b"PUT /files/a HTTP/1.1\r\nHost: x\r\nContent-Length: 8388608\r\nExpect: 100-continue\r\n\r\n");
         assert!(response.starts_with("HTTP/1.1 503"), "{response}");
         assert!(!response.contains("100 Continue"), "准入之前不得请求内容");
+    }
+
+    #[test]
+    fn rejected_forwarded_slow_body_releases_request_permit() {
+        use std::net::TcpStream;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let ctx = test_context();
+        ctx.status.lock().unwrap().catalog_pending = true;
+        let requests = Arc::new(Semaphore::new(1));
+        let app = Router::new().fallback(dispatch).with_state(HttpState {
+            ctx,
+            requests: requests.clone(),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                    let (conn, _) = listener.accept().await.unwrap();
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(10), serve_connection(conn, app))
+                            .await;
+                });
+            });
+            let mut conn = TcpStream::connect(address).unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+            conn.write_all(b"PUT /files/a HTTP/1.1\r\nHost: x\r\nX-Tapers-Forwarded: 1\r\nContent-Length: 16777216\r\nConnection: close\r\n\r\n").unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let writer_stop = stop.clone();
+            let mut writer = conn.try_clone().unwrap();
+            scope.spawn(move || {
+                while !writer_stop.load(Ordering::Relaxed) {
+                    if writer.write_all(b"x").is_err() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            });
+            let mut response = [0u8; 1024];
+            let result = conn.read(&mut response);
+            stop.store(true, Ordering::Relaxed);
+            assert!(result.is_ok(), "拒绝后缓慢正文不应无限占用许可: {result:?}");
+            assert!(
+                String::from_utf8_lossy(&response[..result.unwrap()]).starts_with("HTTP/1.1 503")
+            );
+        });
+        assert_eq!(requests.available_permits(), 1);
+    }
+
+    #[test]
+    fn forwarded_catalog_rejection_consumes_body_before_reply() {
+        use std::net::TcpStream;
+        let ctx = test_context();
+        ctx.status.lock().unwrap().catalog_pending = true;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                    let (conn, _) = listener.accept().await.unwrap();
+                    tokio::time::timeout(
+                        Duration::from_secs(10),
+                        serve_connection(conn, router(ctx)),
+                    )
+                    .await
+                    .unwrap();
+                });
+            });
+            let mut conn = TcpStream::connect(address).unwrap();
+            conn.set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            conn.write_all(b"PUT /files/a HTTP/1.1\r\nHost: x\r\nX-Tapers-Forwarded: 1\r\nContent-Length: 16777216\r\nConnection: close\r\n\r\n").unwrap();
+            let data = [42u8; 256 * 1024];
+            for _ in 0..64 {
+                conn.write_all(&data).expect("拒绝前必须接收已转发的正文");
+            }
+            let mut response = String::new();
+            conn.read_to_string(&mut response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+            assert!(response.contains("catalog_pending"), "{response}");
+        });
     }
 
     #[test]

@@ -86,6 +86,8 @@ impl SimPartition {
 #[derive(Debug, Clone)]
 pub struct SimCartridge {
     pub barcode: String,
+    /// SMC READ ELEMENT STATUS 介质类型；1=data，2=cleaning。
+    pub medium_type: u8,
     pub partitions: Vec<SimPartition>,
     /// MAM：(partition, attribute id) → (format, value)。
     pub mam: BTreeMap<(u8, u16), (u8, Vec<u8>)>,
@@ -101,6 +103,7 @@ impl SimCartridge {
     pub fn blank(barcode: &str, capacity: u64) -> Self {
         Self {
             barcode: barcode.to_string(),
+            medium_type: 1,
             partitions: vec![SimPartition::empty(capacity)],
             mam: BTreeMap::new(),
             write_protected: false,
@@ -119,6 +122,7 @@ struct DriveState {
     pos: usize,
     /// MODE SELECT page 0x11 设定、下一次 FORMAT 生效的分区数。
     pending_partitions: usize,
+    densities: Vec<(u8, bool)>,
     /// 待上报的 UNIT ATTENTION (asc, ascq)：下一条非 INQUIRY 命令不执行、先返回它。
     pending_ua: Vec<(u8, u8)>,
     /// 持久预留状态，按发起方区分。
@@ -251,6 +255,11 @@ fn lock(m: &Mutex<LibState>) -> MutexGuard<'_, LibState> {
 }
 
 impl SimLibrary {
+    /// 为调度测试设置真实设备可读密度及 WRTOK；不改变磁带内容。
+    pub fn set_drive_densities(&self, drive: usize, densities: Vec<(u8, bool)>) {
+        lock(&self.state).drives[drive].densities = densities;
+    }
+
     pub fn new(drives: usize, storage_slots: usize, ie_slots: usize) -> Self {
         let drives = (0..drives)
             .map(|i| DriveState {
@@ -260,6 +269,14 @@ impl SimLibrary {
                 partition: 0,
                 pos: 0,
                 pending_partitions: 1,
+                densities: vec![
+                    (0x58, true),
+                    (0x5a, true),
+                    (0x5c, true),
+                    (0x5d, true),
+                    (0x5e, true),
+                    (0x60, true),
+                ],
                 pending_ua: Vec::new(),
                 pr: PrState::default(),
             })
@@ -880,6 +897,10 @@ fn read_element_status(st: &LibState, cdb: &[u8], out: Option<&mut [u8]>) -> Res
             let mut d = vec![0u8; desc_len as usize];
             d[0..2].copy_from_slice(&addr.to_be_bytes());
             d[2] = if bc.is_some() { 0x01 } else { 0x00 };
+            d[9] = bc
+                .as_ref()
+                .and_then(|b| st.cartridges.get(b))
+                .map_or(0, |c| c.medium_type & 7);
             if voltag {
                 let mut tag = [b' '; 36];
                 tag[32..].fill(0);
@@ -1074,7 +1095,21 @@ fn drive_command(
             return inquiry_response(0x01, "TAPE-RS DRIVE", &serial, cdb, out);
         }
         opcode::PREVENT_ALLOW_MEDIUM_REMOVAL | opcode::SEND_DIAGNOSTIC => return good(0),
-        opcode::RECEIVE_DIAGNOSTIC_RESULTS | opcode::REPORT_DENSITY_SUPPORT => {
+        opcode::REPORT_DENSITY_SUPPORT => {
+            let mut response = vec![0u8; 4];
+            for (code, write) in &st.drives[idx].densities {
+                let mut desc = [0u8; 52];
+                desc[0] = *code;
+                desc[1] = *code;
+                desc[2] = if *write { 0x80 } else { 0 };
+                response.extend_from_slice(&desc);
+            }
+            let len = (response.len() - 2) as u16;
+            response[..2].copy_from_slice(&len.to_be_bytes());
+            let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as usize;
+            return good(copy_out(out, &response, alloc));
+        }
+        opcode::RECEIVE_DIAGNOSTIC_RESULTS => {
             let alloc = u16::from_be_bytes([cdb[3], cdb[4]]) as usize;
             let n = copy_out(out, &[0u8; 4], alloc);
             return good(n);
@@ -1383,7 +1418,8 @@ fn drive_media_command(
             cart.partitions = if n == 1 {
                 vec![SimPartition::empty(total)]
             } else {
-                let p0 = (total / 32).max(1 << 20);
+                // MAM 以整 MiB 报告；微型测试卷也保留能报告非零剩余的索引分区。
+                let p0 = (total / 32).max(2 << 20).min(total / 2);
                 let mut v = vec![SimPartition::empty(p0)];
                 let rest = total.saturating_sub(p0) / (n as u64 - 1);
                 for _ in 1..n {

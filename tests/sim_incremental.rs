@@ -27,6 +27,41 @@ fn formatted() -> (SimLibrary, SimTransport) {
 }
 
 #[test]
+fn committed_identity_requires_clean_volume_and_current_reservation() {
+    use tape_rs::error::TapeError;
+    use tape_rs::scsi::reservation::{ReservationKey, fence};
+
+    let (_lib, dev) = formatted();
+    let mut vol = LtfsVolume::mount(&dev).unwrap();
+    assert!(matches!(
+        vol.verified_committed_index_construct(),
+        Err(TapeError::Refused { .. })
+    ));
+
+    let first = ReservationKey::new(1, 7);
+    fence(&dev, first).unwrap();
+    vol.set_reservation_guard(Some(first));
+    let baseline = vol.verified_committed_index_construct().unwrap();
+    vol.append_file("/new", &mut Cursor::new(b"payload"))
+        .unwrap();
+    assert!(matches!(
+        vol.verified_committed_index_construct(),
+        Err(TapeError::Refused { .. })
+    ));
+    vol.sync_batch().unwrap();
+    let committed = vol.verified_committed_index_construct().unwrap();
+    assert_eq!(committed.generation, baseline.generation + 1);
+    assert_eq!(committed, vol.committed_index_construct());
+
+    fence(&dev, ReservationKey::new(2, 8)).unwrap();
+    assert!(matches!(
+        vol.verified_committed_index_construct(),
+        Err(TapeError::OwnershipLost { .. })
+    ));
+    assert!(!vol.writable());
+}
+
+#[test]
 fn increments_recover_and_clean_unmount_writes_full_on_both_partitions() {
     let (lib, dev) = formatted();
     let mut vol = LtfsVolume::mount(&dev).unwrap();
@@ -591,6 +626,10 @@ fn adaptive_batch_uses_full_when_delta_saves_no_index_blocks() {
             .unwrap();
     }
     vol.sync_batch().unwrap();
+    let committed = vol.committed_index_construct();
+    assert_eq!(committed.generation, vol.index().generation);
+    assert_eq!(committed.location, vol.index().self_location);
+    assert!(!committed.incremental);
     assert!(
         !vol.index().incremental,
         "同为一个索引块时应直接提交DP Full"
@@ -599,10 +638,12 @@ fn adaptive_batch_uses_full_when_delta_saves_no_index_blocks() {
     let generation = vol.index().generation;
     vol.sync_batch().unwrap();
     assert_eq!(vol.index().generation, generation, "干净同步不制造新索引");
+    assert_eq!(vol.committed_index_construct(), committed);
     drop(vol);
     lib.power_cut();
     let vol = LtfsVolume::mount(&dev).unwrap();
     assert!(!vol.index().incremental);
+    assert_eq!(vol.committed_index_construct(), committed);
     for n in 0..3 {
         let mut out = Vec::new();
         vol.read_file_to_writer(&format!("/batch/{n}"), &mut out)
@@ -671,6 +712,7 @@ fn adaptive_batch_barrier_failure_never_acknowledges_full_or_delta() {
             large_baseline(&mut vol);
         }
         let generation = vol.index().generation;
+        let committed = vol.committed_index_construct();
         vol.append_file("/pending", &mut Cursor::new(b"pending"))
             .unwrap();
         dev.inject(Fault {
@@ -685,6 +727,11 @@ fn adaptive_batch_barrier_failure_never_acknowledges_full_or_delta() {
         });
         assert!(vol.sync_batch().is_err());
         assert_eq!(vol.index().generation, generation);
+        assert_eq!(vol.committed_index_construct(), committed);
+        assert!(matches!(
+            vol.verified_committed_index_construct(),
+            Err(tape_rs::error::TapeError::RecoveryRestricted { .. })
+        ));
         assert!(vol.index().find_file("/pending").is_none());
         assert!(!vol.writable());
         drop(vol);
@@ -715,6 +762,9 @@ fn batch_incremental_takeover_stops_at_its_full_baseline() {
         vol.sync_batch().unwrap();
         assert!(vol.index().incremental, "必须覆盖真实批次增量提交路径");
     }
+    let committed = vol.committed_index_construct();
+    assert!(committed.incremental);
+    assert_eq!(committed.generation, vol.index().generation);
     let generation = vol.index().generation;
     drop(vol);
     lib.power_cut();
@@ -731,6 +781,11 @@ fn batch_incremental_takeover_stops_at_its_full_baseline() {
         vol.recovery().incremental_depth
     );
     assert_eq!(vol.index().generation, generation);
+    assert_eq!(vol.committed_index_construct(), committed);
+    assert_eq!(
+        vol.recovery().view().unwrap().construct_sha256,
+        committed.sha256
+    );
     assert_eq!(vol.recovery().incremental_depth, 3);
     assert!(vol.writable() && vol.recovery().ip_debt);
     assert!(

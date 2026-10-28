@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 use log::{error, info, warn};
 use sha2::{Digest, Sha256};
 
+#[path = "executor_management.rs"]
+mod management;
+
 use super::files::{FileService, TapeIdent, TapeLimits, catalog_of, is_directory};
 use super::node::SharedStatus;
 use super::permission::{GuardedTransport, Permission};
@@ -69,6 +72,7 @@ pub trait DeviceProvider: Send + Sync {
 /// 真实设备：按 VPD 0x80 序列号在 `/dev/sg*` 里定位，不依赖会变化的设备名。
 pub struct SgProvider {
     pub changer_serial: Option<String>,
+    pub changer_target_port: Option<String>,
     pub drive_serials: Vec<String>,
 }
 
@@ -85,6 +89,11 @@ impl DeviceProvider for SgProvider {
         if wanted.is_empty() {
             return Ok(Vec::new());
         }
+        let changer_port = self
+            .changer_target_port
+            .as_deref()
+            .map(crate::scsi::inquiry::normalize_fc_target_port)
+            .transpose()?;
         let mut found = Vec::new();
         for path in enumerate_sg_nodes()? {
             let Some(p) = path.to_str() else { continue };
@@ -95,7 +104,28 @@ impl DeviceProvider for SgProvider {
             let Some(serial) = read_unit_serial(&dev) else {
                 continue;
             };
+            if self.changer_serial.as_deref() == Some(serial.as_str()) && changer_port.is_none() {
+                if crate::scsi::inquiry::fc_target_port(&path)?.is_some() {
+                    return Err(TapeError::NotReady(
+                        "FC 换带器必须配置 changer_target_port，禁止按 sg 顺序选择预留域".into(),
+                    ));
+                }
+                if found
+                    .iter()
+                    .any(|d: &ManagedDevice| d.kind == DeviceKind::Changer)
+                {
+                    return Err(TapeError::NotReady(
+                        "非 FC 换带器存在多个路径，无法确认统一预留域".into(),
+                    ));
+                }
+            }
             if let Some(i) = wanted.iter().position(|(s, _)| *s == serial) {
+                if wanted[i].1 == DeviceKind::Changer
+                    && crate::scsi::inquiry::fc_target_port(&path)?.as_ref()
+                        != changer_port.as_ref()
+                {
+                    continue;
+                }
                 let (s, kind) = wanted.remove(i);
                 found.push(ManagedDevice {
                     name: format!("{} ({})", s, p),
@@ -106,7 +136,10 @@ impl DeviceProvider for SgProvider {
             }
         }
         if let Some((s, _)) = wanted.first() {
-            return Err(TapeError::NotReady(format!("找不到序列号为 {} 的设备", s)));
+            return Err(TapeError::NotReady(format!(
+                "找不到序列号为 {} 的设备（换带器须匹配 FC 目标端口 {:?}）",
+                s, changer_port
+            )));
         }
         Ok(found)
     }
@@ -125,6 +158,12 @@ pub enum ExecRequest {
     Stop { round: Option<u64>, reason: String },
     /// 文件服务有已完成的上传等待落带。
     Work,
+    /// 已解析的池/驱动作用域，内部请求只能是 Read、ReadTo 或 Sync。
+    Scoped {
+        pool: String,
+        lane: usize,
+        request: Box<ExecRequest>,
+    },
     /// 读出一个已提交文件的内容。
     Read {
         path: String,
@@ -176,6 +215,19 @@ impl std::fmt::Display for ReadError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecEvent {
+    Management {
+        round: u64,
+        command: super::state::Command,
+    },
+    FileTask {
+        task: u64,
+        round: u64,
+        pool: String,
+        path: String,
+        status: String,
+        generation: Option<u64>,
+        reason: String,
+    },
     Capability {
         drives: usize,
         eligible: bool,
@@ -250,7 +302,25 @@ pub struct ExecOptions {
     pub read_idle: Duration,
 }
 
+struct Writer {
+    drive: Option<usize>,
+    session: Option<VolumeSession>,
+    files: Arc<FileService>,
+}
+
+#[cfg(feature = "fdb")]
+#[path = "executor_fdb_loading.rs"]
+mod fdb_loading;
+
 struct Active {
+    #[cfg(feature = "fdb")]
+    fdb_reads: std::collections::BTreeMap<usize, fdb_loading::Mount>,
+    files: Arc<FileService>,
+    writers: Vec<Writer>,
+    next_seq: Arc<std::sync::atomic::AtomicU64>,
+    density_support: std::collections::BTreeMap<usize, std::collections::BTreeMap<u8, bool>>,
+    deferred: std::collections::BTreeMap<String, Instant>,
+    management: Option<(u64, bool)>,
     round: u64,
     key: ReservationKey,
     devices: Vec<ManagedDevice>,
@@ -306,6 +376,7 @@ pub fn run(
     files: Arc<FileService>,
     status: SharedStatus,
 ) {
+    let root_files = files.clone();
     let provider: Arc<dyn DeviceProvider> = Arc::from(provider);
     let mut permission: Option<Arc<Permission>> = None;
     struct ProbeStop(Arc<std::sync::atomic::AtomicBool>);
@@ -318,16 +389,75 @@ pub fn run(
     let mut active: Option<Active> = None;
     let mut next_work = Instant::now() + opts.interval;
     loop {
+        if let Some(a) = active.as_mut() {
+            activate_writer(a, &root_files);
+        }
+        if let Some(a) = active.as_mut().filter(|a| a.serving)
+            && let Err(reason) = management::drive(a, &opts, &files, &status, &tx)
+        {
+            let round = a.round;
+            root_files.close_all(&reason);
+            active = None;
+            let _ = tx.send(ExecEvent::Lost { round, reason });
+        }
         let mut wait = next_work.saturating_duration_since(Instant::now());
         // 有一批上传快到期时提前醒来
-        if let Some(due) = active
-            .as_ref()
-            .filter(|a| a.serving)
-            .and_then(|a| files.due_in(a.round))
-        {
+        if let Some(due) = active.as_ref().filter(|a| a.serving).and_then(|a| {
+            root_files
+                .lanes()
+                .iter()
+                .filter_map(|f| f.due_in(a.round))
+                .min()
+        }) {
             wait = wait.min(due);
         }
-        match rx.recv_timeout(wait) {
+        let received = rx.recv_timeout(wait);
+        let mut files = root_files.clone();
+        let received = match received {
+            Ok(ExecRequest::Scoped {
+                pool,
+                lane,
+                request,
+            }) => {
+                if let Some(target) = root_files
+                    .lanes()
+                    .into_iter()
+                    .find(|p| p.target_pool().as_deref() == Some(&pool) && p.lane_id() == lane)
+                {
+                    if let Some(a) = active.as_mut() {
+                        activate_writer(a, &target);
+                    }
+                    files = target;
+                } else {
+                    match *request {
+                        ExecRequest::Read { reply, .. } => {
+                            let _ = reply.send(Err(ReadError::Busy("目标池已失效".into())));
+                        }
+                        ExecRequest::ReadTo { reply, .. } => {
+                            let _ = reply.send(Err(ReadError::Busy("目标池已失效".into())));
+                        }
+                        ExecRequest::Sync { reply, .. } => {
+                            let _ = reply.send(Err("目标池已失效".into()));
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                Ok(*request)
+            }
+            other => other,
+        };
+        if let Ok(ExecRequest::Read { path, .. } | ExecRequest::ReadTo { path, .. }) = &received
+            && let Some(pool) = files.target_pool()
+            && let Some(target) = root_files.select_pool(&pool, Some(path), true, false)
+        {
+            if let Some(a) = active.as_mut() {
+                activate_writer(a, &target);
+            }
+            files = target;
+        }
+        match received {
+            Ok(ExecRequest::Scoped { .. }) => unreachable!("HTTP 不生成嵌套作用域"),
             Ok(ExecRequest::AttachPermission {
                 permission: attached,
             }) => {
@@ -373,15 +503,33 @@ pub fn run(
                 if round.is_some() && active.as_ref().map(|a| a.round) != round {
                     continue;
                 }
-                files.close(&reason);
+                root_files.close_all(&reason);
                 if let Some(a) = active.take() {
                     info!("执行线程: 停手（轮次 {}）: {}", a.round, reason);
                 }
             }
             Ok(ExecRequest::Takeover { round }) => {
-                files.close("正在接管");
+                root_files.close_all("正在接管");
                 active = None;
-                match takeover(provider.as_ref(), &opts, round, permission.as_ref()) {
+                if status
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .catalog_frozen_index
+                    .is_some()
+                {
+                    let _ = tx.send(ExecEvent::FenceFailed {
+                        round,
+                        reason: "旧目录已冻结，必须使用 FDB owner 执行器".into(),
+                    });
+                    continue;
+                }
+                match takeover(
+                    provider.as_ref(),
+                    &opts,
+                    round,
+                    permission.as_ref(),
+                    files.clone(),
+                ) {
                     Ok(a) => {
                         active = Some(a);
                         let _ = tx.send(ExecEvent::Fenced { round });
@@ -403,7 +551,7 @@ pub fn run(
                     let _ = tx.send(ExecEvent::Lost { round, reason });
                     continue;
                 };
-                match ensure_write_tape(a, &opts, &files, &status, &tx) {
+                match ensure_writers(a, &opts, &root_files, &status, &tx) {
                     Ok(summary) => {
                         a.serving = true;
                         next_work = Instant::now() + opts.interval;
@@ -411,51 +559,62 @@ pub fn run(
                     }
                     Err(e) => {
                         let reason = format!("恢复失败: {}", e);
-                        files.close(&reason);
+                        root_files.close_all(&reason);
                         active = None;
                         let _ = tx.send(ExecEvent::Lost { round, reason });
                     }
                 }
             }
             Ok(ExecRequest::Work) => {
+                if active.as_ref().is_some_and(|a| a.management.is_some()) {
+                    continue;
+                }
                 let Some(a) = active.as_mut().filter(|a| a.serving) else {
                     continue;
                 };
-                let mut worked = process_uploads(a, &files, &tx, false);
-                if let (Ok(()), Some(new_state)) = (&worked, files.switch_requested(a.round)) {
-                    worked =
-                        switch_tape(a, &opts, &files, &status, &tx, new_state).map(|summary| {
-                            let _ = tx.send(ExecEvent::Serving {
-                                round: a.round,
-                                summary,
-                            });
-                        });
+                let mut worked = if root_files.lanes().iter().any(|f| f.requested()) {
+                    ensure_writers(a, &opts, &root_files, &status, &tx)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                } else {
+                    Ok(())
+                };
+                if worked.is_ok() {
+                    worked = process_all_uploads(a, &tx, false, usize::MAX, None);
+                }
+                if worked.is_ok() {
+                    worked = switch_writers(a, &opts, &root_files, &status, &tx);
                 }
                 if let Err(reason) = worked {
                     let round = a.round;
                     error!("执行线程: 轮次 {} 落带失败，放弃本轮: {}", round, reason);
-                    files.close(&reason);
+                    root_files.close_all(&reason);
                     active = None;
                     let _ = tx.send(ExecEvent::Lost { round, reason });
                 }
             }
             Ok(ExecRequest::Sync { round, reply }) => {
+                if active.as_ref().is_some_and(|a| a.management.is_some()) {
+                    let _ = reply.send(Err("管理维护期间同步未执行，请稍后重试".into()));
+                    continue;
+                }
                 let result = match active.as_mut().filter(|a| a.serving && a.round == round) {
                     Some(a) if a.drive.is_some() && files.serving_round() == Some(round) => {
-                        process_uploads_limited(a, &files, &tx, true, 1).and_then(|()| {
-                            if files.serving_round() == Some(round) {
-                                Ok(())
-                            } else {
-                                Err("同步期间执行轮次已失效".into())
-                            }
-                        })
+                        process_all_uploads(a, &tx, true, 1, files.target_pool().as_deref())
+                            .and_then(|()| {
+                                if files.serving_round() == Some(round) {
+                                    Ok(())
+                                } else {
+                                    Err("同步期间执行轮次已失效".into())
+                                }
+                            })
                     }
                     _ => Err("同步目标未就绪或执行轮次已失效".into()),
                 };
                 if let Err(reason) = &result {
                     // 不继续使用可能部分提交的卷，也不把换届后的空队列当作旧同步成功。
                     if active.as_ref().is_some_and(|a| a.round == round) {
-                        files.close(reason);
+                        root_files.close_all(reason);
                         active = None;
                         let _ = tx.send(ExecEvent::Lost {
                             round,
@@ -468,13 +627,28 @@ pub fn run(
             Ok(ExecRequest::Read { path, reply }) => {
                 let was_serving = active.as_ref().is_some_and(|a| a.serving);
                 let res = match active.as_mut().filter(|a| a.serving) {
-                    Some(a) => {
+                    Some(a) if a.management.is_none() => {
                         let mut out = Vec::new();
-                        read_any(a, &opts, &files, &status, &tx, &path, &mut out).map(|_| out)
+                        prepare_read(a, &opts, &files, &status, &tx, &path)
+                            .and_then(|()| {
+                                read_any(a, &opts, &files, &status, &tx, &path, &mut out)
+                            })
+                            .map(|_| out)
                     }
-                    None => Err(ReadError::Busy("本节点不在服务".to_string())),
+                    _ => Err(ReadError::Busy(
+                        "本节点不在服务或正在执行管理维护".to_string(),
+                    )),
                 };
-                if was_serving && active.as_ref().is_some_and(|a| !a.serving) {
+                if let Err(ReadError::Lost(reason)) = &res {
+                    if let Some(a) = active.take() {
+                        root_files.close_all(reason);
+                        let _ = tx.send(ExecEvent::Lost {
+                            round: a.round,
+                            reason: reason.clone(),
+                        });
+                    }
+                } else if was_serving && active.as_ref().is_some_and(|a| !a.serving) {
+                    root_files.close_all("读取期间写入卷失效");
                     active = None;
                 }
                 let _ = reply.send(res);
@@ -486,17 +660,36 @@ pub fn run(
             }) => {
                 let was_serving = active.as_ref().is_some_and(|a| a.serving);
                 let res = match active.as_mut().filter(|a| a.serving) {
-                    Some(a) => {
-                        read_any(a, &opts, &files, &status, &tx, &path, &mut file).map(|_| file)
+                    Some(a) if a.management.is_none() => {
+                        prepare_read(a, &opts, &files, &status, &tx, &path)
+                            .and_then(|()| {
+                                read_any(a, &opts, &files, &status, &tx, &path, &mut file)
+                            })
+                            .map(|_| file)
                     }
-                    None => Err(ReadError::Busy("本节点不在服务".to_string())),
+                    _ => Err(ReadError::Busy(
+                        "本节点不在服务或正在执行管理维护".to_string(),
+                    )),
                 };
-                if was_serving && active.as_ref().is_some_and(|a| !a.serving) {
+                if let Err(ReadError::Lost(reason)) = &res {
+                    if let Some(a) = active.take() {
+                        root_files.close_all(reason);
+                        let _ = tx.send(ExecEvent::Lost {
+                            round: a.round,
+                            reason: reason.clone(),
+                        });
+                    }
+                } else if was_serving && active.as_ref().is_some_and(|a| !a.serving) {
+                    root_files.close_all("读取期间写入卷失效");
                     active = None;
                 }
                 let _ = reply.send(res);
             }
             Err(RecvTimeoutError::Timeout) => {
+                if active.as_ref().is_some_and(|a| a.management.is_some()) {
+                    next_work = Instant::now() + opts.interval;
+                    continue;
+                }
                 let Some(a) = active.as_mut().filter(|a| a.serving) else {
                     next_work = Instant::now() + opts.interval;
                     continue;
@@ -506,38 +699,51 @@ pub fn run(
                 if periodic_due {
                     next_work = Instant::now() + opts.interval;
                 }
-                let mut worked = process_uploads(a, &files, &tx, false);
-                if let (Ok(()), Some(new_state)) = (&worked, files.switch_requested(a.round)) {
-                    worked =
-                        switch_tape(a, &opts, &files, &status, &tx, new_state).map(|summary| {
-                            let _ = tx.send(ExecEvent::Serving {
-                                round: a.round,
-                                summary,
-                            });
-                        });
+                let mut worked = process_all_uploads(a, &tx, false, usize::MAX, None);
+                if worked.is_ok() {
+                    worked = switch_writers(a, &opts, &root_files, &status, &tx);
                 }
                 if periodic_due && worked.is_ok() {
-                    if a.drive.is_none() {
-                        // 还没有可服务的带（例如装着的带刚被归入池）：再试一次
-                        match ensure_write_tape(a, &opts, &files, &status, &tx) {
-                            Ok(summary) if a.drive.is_some() => {
-                                let _ = tx.send(ExecEvent::Serving {
-                                    round: a.round,
-                                    summary,
-                                });
-                            }
-                            Ok(_) => {}
-                            Err(e) => worked = Err(e.to_string()),
-                        }
+                    match ensure_writers(a, &opts, &root_files, &status, &tx) {
+                        Ok(_) => {}
+                        Err(e) => worked = Err(e.to_string()),
                     }
                     // 重新选带失败说明已经不能再服务了，这时不该再去做周期自检把结论盖掉
                     if worked.is_ok() {
-                        worked = periodic(a, &opts, permission.is_some());
+                        worked = periodic(a, &opts, permission.is_some(), &files, &tx);
                     }
                 }
                 // 回收：一次搬一个批次就回到这里，读请求和客户端上传不会被长时间的回收饿死
                 if worked.is_ok() && (a.reclaim.is_some() || periodic_due) {
-                    match drive_reclaim(a, &opts, &files, &status, &tx) {
+                    let reclaim_barcode = a
+                        .reclaim
+                        .as_ref()
+                        .map(|r| r.barcode.clone())
+                        .or_else(|| pending_reclaim(&status));
+                    let reclaim_files = reclaim_barcode
+                        .as_deref()
+                        .and_then(|barcode| pool_of(&status, barcode))
+                        .and_then(|(pool, _)| root_files.select_pool(&pool, None, false, false))
+                        .unwrap_or_else(|| root_files.clone());
+                    if a.reclaim.is_none()
+                        && reclaim_barcode.is_some()
+                        && let Some(victim) = root_files
+                            .lanes()
+                            .into_iter()
+                            .find(|f| !Arc::ptr_eq(f, &reclaim_files) && f.write_side_idle(a.round))
+                    {
+                        victim.pause_admission();
+                        if victim.write_side_idle(a.round) {
+                            activate_writer(a, &victim);
+                            if let Err(e) = management::quiesce(a, &victim, &tx) {
+                                worked = Err(e.to_string());
+                            }
+                        } else {
+                            victim.resume_admission(a.round);
+                        }
+                    }
+                    activate_writer(a, &reclaim_files);
+                    match drive_reclaim(a, &opts, &reclaim_files, &status, &tx) {
                         Ok(true) => next_work = Instant::now(),
                         Ok(false) => {}
                         Err(e) => worked = Err(e),
@@ -546,13 +752,987 @@ pub fn run(
                 if let Err(reason) = worked {
                     let round = a.round;
                     error!("执行线程: 轮次 {} 失去执行资格: {}", round, reason);
-                    files.close(&reason);
+                    root_files.close_all(&reason);
                     active = None;
                     let _ = tx.send(ExecEvent::Lost { round, reason });
                 }
             }
         }
     }
+}
+
+/// Read-only FDB owner. It participates in the normal Raft takeover and
+/// fences every device. Reads may load assigned media and retire verified
+/// read mounts; the legacy SQLite writer and active FDB writer stay closed.
+#[cfg(feature = "fdb")]
+pub struct FdbOwnerControl {
+    pub catalog: Arc<crate::managed_catalog::ManagedCatalog>,
+    pub serial: String,
+    pub route: crate::managed_catalog::ActiveLibraryRoute,
+    pub storage: super::fdb_read::ReadStorageBudget,
+}
+
+#[cfg(feature = "fdb")]
+pub fn run_fdb_owner(
+    provider: Box<dyn DeviceProvider>,
+    opts: ExecOptions,
+    rx: Receiver<ExecRequest>,
+    tx: Sender<ExecEvent>,
+    files: Arc<FileService>,
+    status: SharedStatus,
+    control: FdbOwnerControl,
+) {
+    use crate::managed_catalog::ActiveOwnerOutcome;
+
+    let provider: Arc<dyn DeviceProvider> = Arc::from(provider);
+    struct ProbeStop(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for ProbeStop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let probe_stop = ProbeStop(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            warn!("FDB owner 运行时启动失败: {error}");
+            return;
+        }
+    };
+    let mut permission: Option<Arc<Permission>> = None;
+    let mut active: Option<Active> = None;
+    let mut next_fence_check = Instant::now();
+    loop {
+        if Instant::now() >= next_fence_check {
+            next_fence_check = Instant::now() + Duration::from_secs(1);
+            let checked = active.as_ref().filter(|owner| owner.serving).map(|owner| {
+                let result = (|| -> Result<()> {
+                    let permit = permission.as_ref().ok_or_else(|| {
+                        TapeError::NotReady("FDB owner 缺少 Raft 多数派许可".into())
+                    })?;
+                    if !(permit.allows(owner.round, super::permission::Phase::Execution)
+                        || permit.allows(owner.round, super::permission::Phase::Serving))
+                    {
+                        return Err(TapeError::NotReady("FDB owner 多数派许可已失效".into()));
+                    }
+                    for device in &owner.devices {
+                        reservation::verify_holder(device.dev.as_ref(), owner.key)?;
+                    }
+                    let observed = runtime
+                        .block_on(control.catalog.active_library_owner(&control.serial))
+                        .map_err(|error| TapeError::Catalog(error.to_string()))?;
+                    if observed != Some((control.route, owner.round)) {
+                        return Err(TapeError::Catalog(
+                            "FDB 活动路由或 owner epoch 已改变".into(),
+                        ));
+                    }
+                    Ok(())
+                })();
+                (owner.round, result)
+            });
+            if let Some((round, Err(error))) = checked {
+                let reason = format!("FDB owner 运行期栅栏失效: {error}");
+                if let Some(permit) = permission.as_ref() {
+                    permit.close(round);
+                }
+                files.close_all(&reason);
+                active = None;
+                let _ = tx.send(ExecEvent::Lost { round, reason });
+            }
+        }
+        if let Some(owner) = active.as_mut().filter(|owner| owner.serving)
+            && let Some(permit) = permission.as_deref()
+            && let Some(drive) = owner
+                .fdb_reads
+                .iter()
+                .filter(|(_, mount)| mount.last_used.elapsed() >= opts.read_idle)
+                .min_by_key(|(_, mount)| mount.last_used)
+                .map(|(drive, _)| *drive)
+        {
+            match runtime.block_on(fdb_loading::unload(owner, permit, &control, &status, drive)) {
+                Ok(()) => {}
+                Err(ReadError::Busy(_)) => {
+                    if let Some(mount) = owner.fdb_reads.get_mut(&drive) {
+                        mount.last_used = Instant::now();
+                    }
+                }
+                Err(error) => {
+                    let round = owner.round;
+                    let reason = error.to_string();
+                    if let Some(permit) = permission.as_ref() {
+                        permit.close(round);
+                    }
+                    files.close_all(&reason);
+                    active = None;
+                    let _ = tx.send(ExecEvent::Lost { round, reason });
+                }
+            }
+        }
+        let request = match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(request) => request,
+            Err(RecvTimeoutError::Disconnected) => {
+                if let Some(owner) = &active
+                    && let Some(permit) = permission.as_ref()
+                {
+                    permit.close(owner.round);
+                }
+                files.close_all("FDB owner 控制通道已关闭");
+                return;
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if active.as_ref().is_some_and(|a| {
+                    a.serving
+                        && !permission.as_ref().is_some_and(|p| {
+                            p.allows(a.round, super::permission::Phase::Execution)
+                                || p.allows(a.round, super::permission::Phase::Serving)
+                        })
+                }) {
+                    let round = active.take().unwrap().round;
+                    files.close_all("FDB owner 多数派许可已失效");
+                    let _ = tx.send(ExecEvent::Lost {
+                        round,
+                        reason: "FDB owner 多数派许可已失效".into(),
+                    });
+                }
+                continue;
+            }
+        };
+        // Pool IDs come from FDB placement, independently of legacy SQLite
+        // lanes. FDB owner serializes reads across its entire device group.
+        let (pool, request) = match request {
+            ExecRequest::Scoped { pool, request, .. } => (Some(pool), *request),
+            request => (None, request),
+        };
+        match request {
+            ExecRequest::AttachPermission {
+                permission: attached,
+            } => {
+                if permission.is_none() && active.is_none() {
+                    files.set_permission(attached.clone());
+                    permission = Some(attached);
+                    let (provider, tx, stop) = (provider.clone(), tx.clone(), probe_stop.0.clone());
+                    let interval = opts.interval.min(Duration::from_secs(1));
+                    std::thread::spawn(move || {
+                        while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                            let event = match provider.probe() {
+                                Ok(drives) => ExecEvent::Capability {
+                                    drives,
+                                    eligible: true,
+                                },
+                                Err(_) => ExecEvent::Capability {
+                                    drives: 0,
+                                    eligible: false,
+                                },
+                            };
+                            if tx.send(event).is_err() {
+                                break;
+                            }
+                            std::thread::sleep(interval);
+                        }
+                    });
+                }
+            }
+            ExecRequest::Takeover { round } => {
+                files.close_all("FDB owner 正在接管");
+                active = None;
+                if permission.is_none() {
+                    let _ = tx.send(ExecEvent::FenceFailed {
+                        round,
+                        reason: "FDB owner 尚未安装 Raft 多数派许可".into(),
+                    });
+                    continue;
+                }
+                match takeover(
+                    provider.as_ref(),
+                    &opts,
+                    round,
+                    permission.as_ref(),
+                    files.clone(),
+                ) {
+                    Ok(owner) => {
+                        active = Some(owner);
+                        let _ = tx.send(ExecEvent::Fenced { round });
+                    }
+                    Err(error) => {
+                        if let Some(permit) = permission.as_ref() {
+                            permit.close(round);
+                        }
+                        let _ = tx.send(ExecEvent::FenceFailed {
+                            round,
+                            reason: error.to_string(),
+                        });
+                    }
+                }
+            }
+            ExecRequest::Recover { round } => {
+                let Some(owner) = active.as_mut().filter(|owner| owner.round == round) else {
+                    if let Some(permit) = permission.as_ref() {
+                        permit.close(round);
+                    }
+                    let _ = tx.send(ExecEvent::Lost {
+                        round,
+                        reason: "FDB owner 没有该轮次的已隔离设备".into(),
+                    });
+                    continue;
+                };
+                let result = (|| -> Result<usize> {
+                    let permit = permission.as_ref().ok_or_else(|| {
+                        TapeError::NotReady("FDB owner 缺少 Raft 多数派许可".into())
+                    })?;
+                    if !permit.allows(round, super::permission::Phase::Execution)
+                        || status
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .catalog_frozen_index
+                            != Some(control.route.frozen_index)
+                    {
+                        return Err(TapeError::NotReady(
+                            "FDB 路由与 Raft 冻结索引或执行许可不一致".into(),
+                        ));
+                    }
+                    if !owner.devices.iter().any(|d| d.kind == DeviceKind::Drive)
+                        || !owner.devices.iter().any(|d| d.kind == DeviceKind::Changer)
+                    {
+                        return Err(TapeError::NotReady("FDB owner 设备组不完整".into()));
+                    }
+                    for device in &owner.devices {
+                        reservation::verify_holder(device.dev.as_ref(), owner.key)?;
+                    }
+                    if runtime
+                        .block_on(control.catalog.active_library_route(&control.serial))
+                        .map_err(|error| TapeError::Catalog(error.to_string()))?
+                        != Some(control.route)
+                    {
+                        return Err(TapeError::Catalog("FDB 活动路由已改变".into()));
+                    }
+                    match runtime
+                        .block_on(
+                            control
+                                .catalog
+                                .claim_active_owner_epoch(&control.serial, round),
+                        )
+                        .map_err(|error| TapeError::Catalog(error.to_string()))?
+                    {
+                        ActiveOwnerOutcome::Advanced | ActiveOwnerOutcome::AlreadyCurrent => {}
+                        ActiveOwnerOutcome::Stale => {
+                            return Err(TapeError::Catalog("FDB owner 已由更新轮次持有".into()));
+                        }
+                    }
+                    let cache_dir = files.extent_cache_dir();
+                    if cache_dir.exists() {
+                        crate::local_read_storage::CacheBuild::new(&cache_dir, control.storage)?
+                            .trim_to_budget()?;
+                    }
+                    let loaded = inventory_inner(&owner.devices, true)?;
+                    let configured_drives = owner
+                        .devices
+                        .iter()
+                        .filter(|device| device.kind == DeviceKind::Drive)
+                        .count();
+                    let matched_drives = loaded
+                        .drives
+                        .iter()
+                        .map(|slot| slot.dev)
+                        .collect::<std::collections::BTreeSet<_>>();
+                    if matched_drives.len() != configured_drives
+                        || loaded.drives.len() != configured_drives
+                    {
+                        return Err(TapeError::NotReady(
+                            "FDB owner 库存无法唯一映射全部配置驱动器".into(),
+                        ));
+                    }
+                    let mut verified_volumes = 0usize;
+                    for slot in &loaded.drives {
+                        let Some((barcode, _)) = &slot.loaded else {
+                            continue;
+                        };
+                        let head = runtime
+                            .block_on(control.catalog.active_loaded_volume_head(
+                                &control.serial,
+                                barcode,
+                                control.route,
+                                round,
+                            ))
+                            .map_err(|error| TapeError::Catalog(error.to_string()))?;
+                        if let Some(head) = head {
+                            let management = super::management::policy_view(
+                                &status.lock().unwrap_or_else(|e| e.into_inner()),
+                            )
+                            .management;
+                            if !super::management::tape_allowed(&management, barcode)
+                                || !super::management::drive_allowed(
+                                    &management,
+                                    &owner.devices[slot.dev].serial,
+                                    u64::from(opts.node_id),
+                                    &head.pool_id.to_string(),
+                                    'r',
+                                )
+                            {
+                                continue;
+                            }
+                            let device = owner.devices[slot.dev].dev.as_ref();
+                            let drive = TapeDrive::new(device);
+                            if loaded.cleaning.contains(barcode) {
+                                return Err(TapeError::NotReady("FDB 分配指向清洗带".into()));
+                            }
+                            drive.load()?;
+                            wait_ready(device)?;
+                            let label = crate::ltfs::volume::read_label_only(device)?;
+                            if label.volume_uuid != head.volume_id
+                                || head.index.volume_uuid != head.volume_id
+                            {
+                                return Err(TapeError::Catalog(format!(
+                                    "已装载磁带 {} 的标签、FDB 卷和索引身份不一致",
+                                    barcode
+                                )));
+                            }
+                            let mut budget = crate::ltfs::recovery::RecoveryBudget::default();
+                            budget.index_scratch.directory = files.spool_dir().to_path_buf();
+                            budget.index_scratch.max_bytes = control.storage.index_bytes;
+                            budget.index_scratch.headroom_bytes = control.storage.headroom_bytes;
+                            let proof = crate::local_read_storage::retry_after_space_reclaim(
+                                || {
+                                    crate::ltfs::recovery::verify_dp_ip_head_with_evidence(
+                                        &drive,
+                                        &label,
+                                        crate::ltfs::volume::CommittedIndexConstruct {
+                                            volume_uuid: head.index.volume_uuid,
+                                            generation: head.index.generation,
+                                            location: head.index.location,
+                                            sha256: head.index.sha256,
+                                            incremental: head.index.incremental,
+                                        },
+                                        &budget,
+                                    )
+                                },
+                                || {
+                                    if cache_dir.exists() {
+                                        crate::local_read_storage::CacheBuild::new(
+                                            &cache_dir,
+                                            control.storage,
+                                        )?
+                                        .reclaim_unpinned()
+                                    } else {
+                                        Ok(false)
+                                    }
+                                },
+                            )?;
+                            runtime
+                                .block_on(
+                                    control.catalog.verify_active_index_predecessors(
+                                        &control.serial,
+                                        control.route,
+                                        round,
+                                        head.index,
+                                        &proof
+                                            .predecessors
+                                            .into_iter()
+                                            .map(crate::managed_catalog::ActiveIndexIdentity::from)
+                                            .collect::<Vec<_>>(),
+                                    ),
+                                )
+                                .map_err(|error| TapeError::Catalog(error.to_string()))?;
+                            let ip_generation = proof.ip_generation;
+                            owner.fdb_reads.insert(
+                                slot.dev,
+                                fdb_loading::Mount {
+                                    barcode: barcode.clone(),
+                                    volume: head.volume_id,
+                                    pool: head.pool_id,
+                                    last_used: Instant::now(),
+                                },
+                            );
+                            verified_volumes += 1;
+                            info!(
+                                "FDB owner 已核对装载介质 DP/IP 索引: 库={} 条码={} 卷={} DP代数={} IP代数={}",
+                                control.serial,
+                                barcode,
+                                head.volume_id,
+                                head.index.generation,
+                                ip_generation
+                            );
+                        }
+                    }
+                    if !permit.allows(round, super::permission::Phase::Execution) {
+                        return Err(TapeError::NotReady("FDB owner 执行许可已失效".into()));
+                    }
+                    for device in &owner.devices {
+                        reservation::verify_holder(device.dev.as_ref(), owner.key)?;
+                    }
+                    let current_owner = runtime
+                        .block_on(control.catalog.active_library_owner(&control.serial))
+                        .map_err(|error| TapeError::Catalog(error.to_string()))?;
+                    if current_owner != Some((control.route, round)) {
+                        return Err(TapeError::Catalog(
+                            "FDB owner 在库存核对期间已被更新轮次接管".into(),
+                        ));
+                    }
+                    Ok(verified_volumes)
+                })();
+                match result {
+                    Ok(verified_volumes) => {
+                        owner.serving = true;
+                        let _ = tx.send(ExecEvent::Serving {
+                            round,
+                            summary: format!(
+                                "FDB owner 只读模式，已核对 {} 卷 DP/IP 索引，支持按需装卸读取",
+                                verified_volumes
+                            ),
+                        });
+                    }
+                    Err(error) => {
+                        let reason = format!("FDB owner 恢复失败: {error}");
+                        if let Some(permit) = permission.as_ref() {
+                            permit.close(round);
+                        }
+                        files.close_all(&reason);
+                        active = None;
+                        let _ = tx.send(ExecEvent::Lost { round, reason });
+                    }
+                }
+            }
+            ExecRequest::Stop { round, reason } => {
+                if round.is_none() || active.as_ref().map(|a| a.round) == round {
+                    if let Some(owner) = &active
+                        && let Some(permit) = permission.as_ref()
+                    {
+                        permit.close(owner.round);
+                    }
+                    files.close_all(&reason);
+                    active = None;
+                }
+            }
+            ExecRequest::Shutdown { done } => {
+                files.close_all("FDB owner 正在停机");
+                if let Some(mut owner) = active.take() {
+                    let mut release = true;
+                    if let Some(permit) = permission.as_deref() {
+                        while let Some(drive) = owner.fdb_reads.keys().next().copied() {
+                            match runtime.block_on(fdb_loading::unload(
+                                &mut owner, permit, &control, &status, drive,
+                            )) {
+                                Ok(()) => {}
+                                Err(ReadError::Busy(reason)) => {
+                                    warn!("FDB 只读停机保留装载介质: {reason}");
+                                    break;
+                                }
+                                Err(error) => {
+                                    warn!("FDB 只读停机中止设备操作: {error}");
+                                    release = false;
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        release = false;
+                    }
+                    for device in owner.devices.iter().filter(|_| release) {
+                        if let Err(error) =
+                            reservation::release_and_unregister(device.dev.as_ref(), owner.key)
+                        {
+                            warn!("FDB owner {} 释放预留失败: {error}", device.name);
+                        }
+                    }
+                    if let Some(permit) = permission.as_ref() {
+                        permit.close(owner.round);
+                    }
+                }
+                if let Some(done) = done {
+                    let _ = done.send(());
+                }
+                return;
+            }
+            ExecRequest::Read { path, reply } => {
+                let result = match active.as_mut().filter(|owner| owner.serving) {
+                    Some(owner) => runtime.block_on(read_fdb(
+                        owner,
+                        permission.as_deref(),
+                        &control,
+                        &status,
+                        &path,
+                        pool.as_deref(),
+                    )),
+                    None => Err(ReadError::Busy("FDB owner 当前不在服务".into())),
+                };
+                if let Err(ReadError::Lost(reason)) = &result {
+                    files.close_all(reason);
+                    if let Some(owner) = active.take() {
+                        if let Some(permit) = permission.as_ref() {
+                            permit.close(owner.round);
+                        }
+                        let _ = tx.send(ExecEvent::Lost {
+                            round: owner.round,
+                            reason: reason.clone(),
+                        });
+                    }
+                }
+                let result = result.and_then(|mut file| {
+                    if file
+                        .metadata()
+                        .map_err(|error| ReadError::Failed(error.to_string()))?
+                        .len()
+                        > 256 * 1024 * 1024
+                    {
+                        return Err(ReadError::Failed(
+                            "FDB 内存读取上限为 256 MiB，请使用文件流读取".into(),
+                        ));
+                    }
+                    let mut bytes = Vec::new();
+                    std::io::Read::read_to_end(&mut file, &mut bytes)
+                        .map_err(|error| ReadError::Failed(error.to_string()))?;
+                    Ok(bytes)
+                });
+                let _ = reply.send(result);
+            }
+            ExecRequest::ReadTo { path, file, reply } => {
+                // The caller consumes the returned handle; retain only the
+                // fully verified anonymous file instead of copying it again.
+                drop(file);
+                let result = match active.as_mut().filter(|owner| owner.serving) {
+                    Some(owner) => runtime.block_on(read_fdb(
+                        owner,
+                        permission.as_deref(),
+                        &control,
+                        &status,
+                        &path,
+                        pool.as_deref(),
+                    )),
+                    None => Err(ReadError::Busy("FDB owner 当前不在服务".into())),
+                };
+                if let Err(ReadError::Lost(reason)) = &result {
+                    files.close_all(reason);
+                    if let Some(owner) = active.take() {
+                        if let Some(permit) = permission.as_ref() {
+                            permit.close(owner.round);
+                        }
+                        let _ = tx.send(ExecEvent::Lost {
+                            round: owner.round,
+                            reason: reason.clone(),
+                        });
+                    }
+                }
+                let _ = reply.send(result);
+            }
+            ExecRequest::Sync { reply, .. } => {
+                let _ = reply.send(Err("FDB owner 只读控制模式禁止旧文件同步".into()));
+            }
+            ExecRequest::Scoped { request, .. } => match *request {
+                ExecRequest::Read { reply, .. } => {
+                    let _ = reply.send(Err(ReadError::Busy("FDB owner 不接受嵌套池作用域".into())));
+                }
+                ExecRequest::ReadTo { reply, .. } => {
+                    let _ = reply.send(Err(ReadError::Busy("FDB owner 不接受嵌套池作用域".into())));
+                }
+                ExecRequest::Sync { reply, .. } => {
+                    let _ = reply.send(Err("FDB owner 只读控制模式禁止旧文件同步".into()));
+                }
+                _ => {}
+            },
+            ExecRequest::Work => {}
+        }
+    }
+}
+
+#[cfg(feature = "fdb")]
+async fn read_fdb(
+    owner: &mut Active,
+    permission: Option<&Permission>,
+    control: &FdbOwnerControl,
+    status: &SharedStatus,
+    path: &str,
+    pool: Option<&str>,
+) -> std::result::Result<std::fs::File, ReadError> {
+    let lost = |error: TapeError| ReadError::Lost(format!("FDB owner 读取失败: {error}"));
+    let permit = permission.ok_or_else(|| ReadError::Lost("FDB owner 缺少多数派许可".into()))?;
+    let pool = pool
+        .map(uuid::Uuid::parse_str)
+        .transpose()
+        .map_err(|_| ReadError::Failed("FDB 池作用域必须是 UUID".into()))?;
+    let source = control
+        .catalog
+        .resolve_active_read_source_for_owner(
+            &control.serial,
+            path.as_bytes(),
+            control.route,
+            owner.round,
+        )
+        .await
+        .map_err(|error| {
+            let reason = format!("FDB 读取来源不可用: {error}");
+            if matches!(error, crate::managed_catalog::CatalogError::Invalid(_)) {
+                ReadError::Failed(reason)
+            } else {
+                ReadError::Lost(reason)
+            }
+        })?
+        .ok_or_else(|| ReadError::Failed("FDB 路径不存在".into()))?;
+    if pool.is_some_and(|pool| pool != source.placement().pool_id) {
+        return Err(ReadError::Failed("FDB 文件不属于请求的池".into()));
+    }
+    let drive = fdb_loading::select(owner, permit, control, status, path, &source).await?;
+    let reader = super::fdb_read::ActiveMediaReader {
+        catalog: &control.catalog,
+        device: owner.devices[drive].dev.as_ref(),
+        serial: &control.serial,
+        route: control.route,
+        key: owner.key,
+        permission: permit,
+        storage: control.storage,
+    };
+    let result = reader
+        .read_with_cache_scoped(
+            path.as_bytes(),
+            pool,
+            &owner.files.extent_cache_dir(),
+            owner.files.spool_dir(),
+        )
+        .await
+        .map_err(
+            |error| match crate::local_read_storage::classify_error(error) {
+                TapeError::LocalCapacity { reason } | TapeError::LocalSpace { reason } => {
+                    ReadError::Busy(reason)
+                }
+                error => lost(error),
+            },
+        )?
+        .ok_or_else(|| ReadError::Failed("FDB 文件在读取前已消失".into()))?;
+    for device in &owner.devices {
+        reservation::verify_holder(device.dev.as_ref(), owner.key).map_err(lost)?;
+    }
+    if control
+        .catalog
+        .active_library_owner(&control.serial)
+        .await
+        .map_err(|error| ReadError::Lost(format!("FDB owner 读取后栅栏不可用: {error}")))?
+        != Some((control.route, owner.round))
+    {
+        return Err(ReadError::Lost("FDB owner 在读取期间改变".into()));
+    }
+    if !(permit.allows(owner.round, super::permission::Phase::Execution)
+        || permit.allows(owner.round, super::permission::Phase::Serving))
+    {
+        return Err(ReadError::Lost("FDB owner 读取后多数派许可失效".into()));
+    }
+    owner.fdb_reads.insert(
+        drive,
+        fdb_loading::Mount {
+            barcode: source.placement().barcode.clone(),
+            volume: source.source.volume_uuid,
+            pool: source.placement().pool_id,
+            last_used: Instant::now(),
+        },
+    );
+    Ok(result.file)
+}
+
+/// 只交换卷会话，设备句柄和机械手始终归本库 owner。
+fn activate_writer(a: &mut Active, files: &Arc<FileService>) {
+    if Arc::ptr_eq(&a.files, files) {
+        return;
+    }
+    if let Some(w) = a.writers.iter_mut().find(|w| Arc::ptr_eq(&w.files, files)) {
+        std::mem::swap(&mut a.drive, &mut w.drive);
+        std::mem::swap(&mut a.write_session, &mut w.session);
+        std::mem::swap(&mut a.files, &mut w.files);
+    }
+}
+
+fn ensure_writers(
+    a: &mut Active,
+    opts: &ExecOptions,
+    root: &Arc<FileService>,
+    status: &SharedStatus,
+    tx: &Sender<ExecEvent>,
+) -> Result<String> {
+    for (i, d) in a
+        .devices
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.kind == DeviceKind::Drive)
+    {
+        if a.density_support.contains_key(&i) {
+            continue;
+        }
+        match crate::scsi::transport::retry_unit_attention("调度密度能力查询", || {
+            TapeDrive::new(d.dev.as_ref()).report_density_support(false)
+        }) {
+            Ok(raw) => {
+                a.density_support
+                    .insert(i, super::scheduling::densities(&raw).unwrap_or_default());
+            }
+            Err(e) if ownership_lost(&e) => return Err(e),
+            Err(e) => {
+                warn!("{} 无法确认密度能力，不调度该驱动器: {}", d.name, e);
+                a.density_support.insert(i, Default::default());
+            }
+        }
+    }
+    root.set_parallelism(
+        a.devices
+            .iter()
+            .filter(|d| d.kind == DeviceKind::Drive)
+            .count(),
+    );
+    let pools = status
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pools
+        .clone();
+    if root.target_pool().is_none()
+        && let Some(pool) = pools.first()
+    {
+        root.bind_pool(&pool.uuid);
+    }
+    for pool in &pools {
+        if !root
+            .lanes()
+            .iter()
+            .any(|p| p.target_pool().as_deref() == Some(&pool.uuid))
+        {
+            let files = root.add_lane(&pool.uuid);
+            files.close_waiting(a.round, Some(pool.uuid.clone()), "等待可用的写入驱动器");
+            a.writers.push(Writer {
+                drive: None,
+                session: None,
+                files,
+            });
+        }
+    }
+    for lane in root.lanes() {
+        if !Arc::ptr_eq(&a.files, &lane) && !a.writers.iter().any(|w| Arc::ptr_eq(&w.files, &lane))
+        {
+            a.writers.push(Writer {
+                drive: None,
+                session: None,
+                files: lane,
+            });
+        }
+    }
+    let snapshot = status.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for lane in root.lanes() {
+        let Some(barcode) = lane.tape_barcode() else {
+            continue;
+        };
+        let allowed = pools
+            .iter()
+            .any(|p| Some(&p.uuid) == lane.target_pool().as_ref() && p.tapes.contains(&barcode))
+            && snapshot
+                .tapes
+                .get(&barcode)
+                .is_none_or(|t| t.state == tape_state::APPENDABLE)
+            && super::management::tape_allowed(&snapshot.management, &barcode);
+        if !allowed {
+            lane.pause_admission();
+            activate_writer(a, &lane);
+            process_uploads(a, &lane, tx, true).map_err(TapeError::Ltfs)?;
+            if lane.write_side_idle(a.round) {
+                management::quiesce(a, &lane, tx)?;
+            }
+        }
+    }
+    let requested: Vec<_> = root
+        .lanes()
+        .into_iter()
+        .filter(|f| f.requested() && f.tape_barcode().is_none())
+        .collect();
+    for target in &requested {
+        // 只有已排空的写入租约可以为另一个池让出驱动器。已装载的介质本身不占池配额。
+        let victim = root.lanes().into_iter().find(|f| {
+            f.target_pool() != target.target_pool() && f.write_side_idle(a.round) && !f.requested()
+        });
+        if let Some(victim) = victim {
+            victim.pause_admission();
+            if victim.write_side_idle(a.round) {
+                activate_writer(a, &victim);
+                management::quiesce(a, &victim, tx)?;
+            } else {
+                victim.resume_admission(a.round);
+            }
+        }
+    }
+    let mut summaries = Vec::new();
+    // 先各池一台，再补同池并发；不让第一个池在初次恢复时占掉全部资源。
+    let mut lanes = root.lanes();
+    lanes.sort_by_key(|f| !f.requested());
+    for files in lanes {
+        activate_writer(a, &files);
+        if files.needs_capacity()
+            && let Some(i) = a.drive
+        {
+            let barcode = files.tape_barcode().unwrap();
+            if a.deferred
+                .get(&barcode)
+                .is_none_or(|until| *until <= Instant::now())
+            {
+                a.deferred
+                    .insert(barcode.clone(), Instant::now() + Duration::from_secs(60));
+                let dev = a.devices[i].dev.as_ref();
+                let vol = match a.write_session.take() {
+                    Some(session) => session.resume(dev, a.key)?,
+                    None => LtfsVolume::mount(dev)?,
+                };
+                let mut entries = vol.list().len() as u64 + 1;
+                vol.index().walk_directories(|_, _| entries += 1);
+                let capacity = management::refresh_capacity(dev, &vol, a.round, &barcode, tx)?;
+                files.calibrate_capacity(
+                    super::scheduling::write_budget(&capacity, entries).map(|(_, free)| free),
+                );
+                a.write_session = vol.into_session();
+            }
+        }
+        if a.drive.is_none()
+            && pools
+                .iter()
+                .any(|p| Some(&p.uuid) == files.target_pool().as_ref())
+        {
+            summaries.push(ensure_write_tape(a, opts, &files, status, tx)?);
+        }
+    }
+    activate_writer(a, root);
+    Ok(summaries.join("；"))
+}
+
+/// 驱动器 Transport 只要求 Send。每个作业独占一台驱动器，期间没有机械手操作；
+/// 所有作业归还句柄后，owner 才能切带、维护、退带或释放整库 PR。
+fn process_all_uploads(
+    a: &mut Active,
+    tx: &Sender<ExecEvent>,
+    flush: bool,
+    max_batches: usize,
+    pool: Option<&str>,
+) -> std::result::Result<(), String> {
+    let primary = a.files.clone();
+    let mut writers = std::mem::take(&mut a.writers);
+    writers.push(Writer {
+        drive: a.drive.take(),
+        session: a.write_session.take(),
+        files: primary.clone(),
+    });
+    // 一台驱动的批次到期时，同步启动其他驱动已收齐的队列，避免毫秒级到期差造成串行。
+    // 普通工作每台只取一批，返回 owner 循环处理停手和维护请求。
+    let group_due = !flush
+        && writers.iter().any(|w| {
+            w.drive.is_some()
+                && pool.is_none_or(|p| w.files.target_pool().as_deref() == Some(p))
+                && w.files.due_in(a.round) == Some(Duration::ZERO)
+        });
+    let flush = flush || group_due;
+    let max_batches = if group_due { 1 } else { max_batches };
+    let mut results = Vec::new();
+    std::thread::scope(|scope| {
+        let mut jobs = Vec::new();
+        for mut writer in writers {
+            let Some(di) = writer
+                .drive
+                .filter(|_| pool.is_none_or(|p| writer.files.target_pool().as_deref() == Some(p)))
+            else {
+                results.push((writer, Ok(())));
+                continue;
+            };
+            let d = &mut a.devices[di];
+            let device = ManagedDevice {
+                name: d.name.clone(),
+                serial: d.serial.clone(),
+                kind: d.kind,
+                dev: std::mem::replace(&mut d.dev, Box::new(ClosedTransport)),
+            };
+            let mut job = Active {
+                #[cfg(feature = "fdb")]
+                fdb_reads: Default::default(),
+                files: writer.files.clone(),
+                writers: Vec::new(),
+                next_seq: a.next_seq.clone(),
+                density_support: Default::default(),
+                deferred: Default::default(),
+                management: None,
+                round: a.round,
+                key: a.key,
+                devices: vec![device],
+                serving: true,
+                drive: Some(0),
+                write_session: writer.session.take(),
+                read: None,
+                seq: a.seq,
+                reclaim: None,
+                reclaim_failures: 0,
+                reclaim_given_up: None,
+            };
+            jobs.push((
+                di,
+                scope.spawn(move || {
+                    let result =
+                        process_uploads_limited(&mut job, &writer.files, tx, flush, max_batches);
+                    writer.session = job.write_session.take();
+                    (writer, job.devices.remove(0), result)
+                }),
+            ));
+        }
+        for (di, job) in jobs {
+            match job.join() {
+                Ok((writer, device, result)) => {
+                    a.devices[di] = device;
+                    results.push((writer, result));
+                }
+                Err(_) => results.push((
+                    Writer {
+                        drive: Some(di),
+                        session: None,
+                        files: primary.clone(),
+                    },
+                    Err("驱动器写入作业异常退出，必须接管恢复".into()),
+                )),
+            }
+        }
+    });
+    let mut error = None;
+    for (writer, result) in results {
+        if let Err(e) = result {
+            error.get_or_insert(e);
+        }
+        if Arc::ptr_eq(&writer.files, &primary) {
+            a.drive = writer.drive;
+            a.write_session = writer.session;
+        } else {
+            a.writers.push(writer);
+        }
+    }
+    error.map_or(Ok(()), Err)
+}
+
+fn switch_writers(
+    a: &mut Active,
+    opts: &ExecOptions,
+    root: &Arc<FileService>,
+    status: &SharedStatus,
+    tx: &Sender<ExecEvent>,
+) -> std::result::Result<(), String> {
+    for files in root.lanes() {
+        activate_writer(a, &files);
+        if let Some(state) = files.switch_requested(a.round) {
+            switch_tape(a, opts, &files, status, tx, state)?;
+        }
+    }
+    activate_writer(a, root);
+    Ok(())
+}
+
+fn checkpoint_all(a: &mut Active, tx: &Sender<ExecEvent>) -> Result<()> {
+    let original = a.files.clone();
+    let lanes: Vec<_> = a
+        .writers
+        .iter()
+        .map(|w| w.files.clone())
+        .chain([original.clone()])
+        .collect();
+    for files in lanes {
+        activate_writer(a, &files);
+        checkpoint_write_tape(a, &files, tx)?;
+    }
+    activate_writer(a, &original);
+    Ok(())
 }
 
 /// 计划停机。顺序不能换：
@@ -566,23 +1746,30 @@ pub fn run(
 ///    但会在设备上留下一个已经不存在的持有者，让下一轮多绕一次抢占。正因为它是优化，
 ///    绝不能提前做——只有确认本线程不会再碰设备之后，放掉这层保护才是对的。
 fn shut_down(mut a: Active, files: &FileService, tx: &Sender<ExecEvent>) {
+    let root = a.files.clone();
     info!("执行线程: 轮次 {} 计划停机", a.round);
-    files.drain();
+    a.files.drain();
+    for writer in &a.writers {
+        writer.files.drain();
+    }
     if a.serving
-        && let Err(e) = process_uploads(&mut a, files, tx, true)
+        && let Err(e) = process_all_uploads(&mut a, tx, true, usize::MAX, None)
     {
         warn!("执行线程: 停机前落带失败: {}；卷留给下一个执行者收尾", e);
-        files.close("停机提交失败");
+        root.close_all("停机提交失败");
         return;
     }
     if a.serving
-        && let Err(e) = checkpoint_write_tape(&mut a, files, tx)
+        && let Err(e) = checkpoint_all(&mut a, tx)
     {
         warn!("执行线程: 停机检查点失败: {}；保留介质和预留，等待恢复", e);
-        files.close("停机检查点失败");
+        root.close_all("停机检查点失败");
         return;
     }
     files.close("正在停机");
+    for writer in &a.writers {
+        writer.files.close("正在停机");
+    }
     let mut drives: Vec<usize> = [
         a.drive,
         a.read.as_ref().map(|(i, ..)| *i),
@@ -591,6 +1778,7 @@ fn shut_down(mut a: Active, files: &FileService, tx: &Sender<ExecEvent>) {
     .into_iter()
     .flatten()
     .collect();
+    drives.extend(a.writers.iter().filter_map(|w| w.drive));
     drives.sort_unstable();
     drives.dedup();
     for i in drives {
@@ -612,6 +1800,7 @@ fn takeover(
     opts: &ExecOptions,
     round: u64,
     permission: Option<&Arc<Permission>>,
+    files: Arc<FileService>,
 ) -> Result<Active> {
     let key = ReservationKey::new(opts.node_id, round);
     let mut devices = provider.open_all()?;
@@ -656,6 +1845,14 @@ fn takeover(
         }
     }
     Ok(Active {
+        #[cfg(feature = "fdb")]
+        fdb_reads: Default::default(),
+        files,
+        writers: Vec::new(),
+        next_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        density_support: Default::default(),
+        deferred: Default::default(),
+        management: None,
         round,
         key,
         devices,
@@ -705,7 +1902,10 @@ fn bytes_written_on(dev: &dyn TapeTransport) -> u64 {
 
 /// 本轮写下的下一个版本号。轮次全局单调，一轮之内只有这一个执行者在串行写入。
 fn next_version(a: &mut Active) -> String {
-    a.seq += 1;
+    a.seq = a
+        .next_seq
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
     format!("{}.{}", a.round, a.seq)
 }
 
@@ -724,9 +1924,14 @@ struct Inventory {
     /// 条码 → 存储槽地址（不含已在驱动器里的）
     slots: std::collections::BTreeMap<String, u16>,
     empty_slots: Vec<u16>,
+    cleaning: std::collections::BTreeSet<String>,
 }
 
 fn inventory(devices: &[ManagedDevice]) -> Result<Inventory> {
+    inventory_inner(devices, false)
+}
+
+fn inventory_inner(devices: &[ManagedDevice], strict: bool) -> Result<Inventory> {
     let changer = devices
         .iter()
         .find(|d| d.kind == DeviceKind::Changer)
@@ -734,6 +1939,14 @@ fn inventory(devices: &[ManagedDevice]) -> Result<Inventory> {
     let mut mc = MediumChanger::new(changer.dev.as_ref());
     mc.load_address_map()?;
     let elems = mc.read_all_status()?;
+    inventory_elements(devices, &elems, strict)
+}
+
+fn inventory_elements(
+    devices: &[ManagedDevice],
+    elems: &[crate::changer::element::ElementStatus],
+    strict: bool,
+) -> Result<Inventory> {
     let tag = |e: &crate::changer::element::ElementStatus| {
         e.volume_tag
             .as_deref()
@@ -744,16 +1957,42 @@ fn inventory(devices: &[ManagedDevice]) -> Result<Inventory> {
         drives: Vec::new(),
         slots: Default::default(),
         empty_slots: Vec::new(),
+        cleaning: Default::default(),
     };
-    for e in &elems {
+    let mut barcodes = std::collections::BTreeSet::new();
+    let mut addresses = std::collections::BTreeSet::new();
+    for e in elems {
+        if strict
+            && (!addresses.insert(e.address)
+                || e.full && tag(e).is_none_or(|barcode| !barcodes.insert(barcode)))
+        {
+            return Err(TapeError::NotReady(
+                "FDB 库存存在重复地址/条码或无条码的占用元素".into(),
+            ));
+        }
+        if e.is_cleaning()
+            && let Some(b) = tag(e)
+        {
+            inv.cleaning.insert(b);
+        }
         match e.element_type {
             ElementType::DataTransfer => {
                 let Some(id) = e.drive_id.as_deref().map(str::trim) else {
                     continue;
                 };
-                let hit = devices.iter().position(|d| {
-                    d.kind == DeviceKind::Drive && (id.contains(&d.serial) || d.serial.contains(id))
-                });
+                let matches: Vec<_> = devices
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, d)| {
+                        d.kind == DeviceKind::Drive
+                            && (id.contains(&d.serial) || d.serial.contains(id))
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                if strict && (id.is_empty() || matches.len() > 1) {
+                    return Err(TapeError::NotReady("FDB 库存驱动器身份含糊".into()));
+                }
+                let hit = matches.first().copied();
                 if let Some(dev) = hit {
                     inv.drives.push(DriveSlot {
                         dev,
@@ -775,7 +2014,36 @@ fn inventory(devices: &[ManagedDevice]) -> Result<Inventory> {
             _ => {}
         }
     }
+    if strict {
+        let expected = devices
+            .iter()
+            .filter(|d| d.kind == DeviceKind::Drive)
+            .count();
+        let unique: std::collections::BTreeSet<_> = inv.drives.iter().map(|d| d.dev).collect();
+        if unique.len() != expected || inv.drives.len() != expected {
+            return Err(TapeError::NotReady(
+                "FDB 库存无法唯一映射全部配置驱动器".into(),
+            ));
+        }
+    }
     Ok(inv)
+}
+
+fn migration_allowed(a: &Active, st: &super::node::NodeStatus, pool: &str) -> bool {
+    let limit = st.management["pools"][pool]["mountlimit"]
+        .as_str()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    limit == 0
+        || a.writers
+            .iter()
+            .filter(|w| w.drive.is_some() && w.files.target_pool().as_deref() == Some(pool))
+            .count()
+            < limit
+}
+
+fn available_drive(a: &Active, i: usize) -> bool {
+    !a.writers.iter().any(|w| w.drive == Some(i)) && a.reclaim.as_ref().is_none_or(|r| r.drive != i)
 }
 
 fn move_medium(devices: &[ManagedDevice], from: u16, to: u16) -> Result<()> {
@@ -826,7 +2094,7 @@ struct Candidate {
     pool_uuid: String,
     pool_name: String,
     file_limit: u64,
-    bytes_used: u64,
+    fill: Option<(u64, u64)>,
 }
 
 /// 选一盘可写的带并开始服务：优先已在驱动器里的，其次已用得最多的（写满一盘再开下一盘，
@@ -841,13 +2109,32 @@ fn ensure_write_tape(
 ) -> Result<String> {
     a.write_session = None;
     a.drive = None;
+    if files.target_pool().is_none()
+        && let Some(pool) = status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pools
+            .first()
+    {
+        files.bind_pool(&pool.uuid);
+    }
+    let target_pool = files.target_pool();
     let mut inv = inventory(&a.devices)?;
     let mut cands: Vec<Candidate> = {
         let st = status.lock().unwrap_or_else(|e| e.into_inner());
         st.pools
             .iter()
+            .filter(|p| target_pool.as_ref().is_none_or(|target| target == &p.uuid))
             .flat_map(|p| p.tapes.iter().map(move |b| (p, b)))
             .filter(|(_, b)| {
+                if a.deferred
+                    .get(*b)
+                    .is_some_and(|until| *until > Instant::now())
+                    || inv.cleaning.contains(*b)
+                    || !super::management::tape_allowed(&st.management, b)
+                {
+                    return false;
+                }
                 st.tapes
                     .get(*b)
                     .is_none_or(|t| t.state == tape_state::APPENDABLE)
@@ -857,10 +2144,41 @@ fn ensure_write_tape(
                 pool_uuid: p.uuid.clone(),
                 pool_name: p.name.clone(),
                 file_limit: p.file_limit,
-                bytes_used: st.tapes.get(b).map(|t| t.bytes_used).unwrap_or(0),
+                fill: st.management["tapes"][b]["capacity"]["maximum"]
+                    .as_u64()
+                    .zip(st.management["tapes"][b]["capacity"]["remaining"].as_u64())
+                    .filter(|(total, remaining)| *total > 0 && remaining <= total)
+                    .map(|(total, remaining)| (total - remaining, total)),
             })
             .collect()
     };
+    let waiting = !cands.is_empty() && a.writers.iter().any(|w| w.drive.is_some());
+    {
+        let st = status.lock().unwrap_or_else(|e| e.into_inner());
+        cands.retain(|c| {
+            migration_allowed(a, &st, &c.pool_uuid)
+                && super::management::check_media(
+                    st.management["pools"][&c.pool_uuid]["mediarestriction"]
+                        .as_str()
+                        .unwrap_or("none"),
+                    &c.barcode,
+                )
+                .is_ok()
+                && inv.drives.iter().any(|d| {
+                    available_drive(a, d.dev)
+                        && a.density_support.get(&d.dev).is_some_and(|caps| {
+                            super::scheduling::compatible(caps, &c.barcode, true)
+                        })
+                        && super::management::drive_allowed(
+                            &st.management,
+                            &a.devices[d.dev].serial,
+                            u64::from(opts.node_id),
+                            &c.pool_uuid,
+                            'm',
+                        )
+                })
+        });
+    }
     let in_drive = |inv: &Inventory, b: &str| {
         inv.drives
             .iter()
@@ -870,7 +2188,7 @@ fn ensure_write_tape(
     cands.sort_by(|x, y| {
         in_drive(&inv, &y.barcode)
             .cmp(&in_drive(&inv, &x.barcode))
-            .then(y.bytes_used.cmp(&x.bytes_used))
+            .then(super::scheduling::fill_order(x.fill, y.fill))
             .then(x.barcode.cmp(&y.barcode))
     });
     let mut notes = Vec::new();
@@ -884,37 +2202,56 @@ fn ensure_write_tape(
     };
 
     for c in &cands {
-        // 1. 确保它在某个驱动器里
-        let slot = match inv
-            .drives
-            .iter()
-            .position(|d| d.loaded.as_ref().is_some_and(|(b, _)| *b == c.barcode))
-        {
-            Some(i) => i,
-            None => {
-                let Some(i) = inv.drives.iter().position(|d| d.loaded.is_none()) else {
-                    notes.push("没有空闲的驱动器".to_string());
-                    break;
-                };
-                let from = inv.slots[&c.barcode];
-                info!(
-                    "执行线程: 装载 {} (槽位 {:#06x}) -> 驱动器 {}",
-                    c.barcode, from, a.devices[inv.drives[i].dev].name
-                );
-                if let Err(e) = move_medium(&a.devices, from, inv.drives[i].addr)
-                    .and_then(|_| wait_ready(a.devices[inv.drives[i].dev].dev.as_ref()))
-                {
-                    notes.push(format!("{} 装载失败: {}", c.barcode, e));
-                    mark(&c.barcode, tape_state::CHECK);
-                    continue;
-                }
-                inv.drives[i].loaded = Some((c.barcode.clone(), Some(from)));
-                inv.slots.remove(&c.barcode);
-                inv.empty_slots.retain(|s| *s != from);
-                inv.empty_slots.insert(0, from);
-                i
-            }
+        let eligible = |d: &DriveSlot| {
+            let st = status.lock().unwrap_or_else(|e| e.into_inner());
+            available_drive(a, d.dev)
+                && a.density_support
+                    .get(&d.dev)
+                    .is_some_and(|caps| super::scheduling::compatible(caps, &c.barcode, true))
+                && super::management::drive_allowed(
+                    &st.management,
+                    &a.devices[d.dev].serial,
+                    u64::from(opts.node_id),
+                    &c.pool_uuid,
+                    'm',
+                )
         };
+        // 1. 确保它在某个驱动器里
+        let slot =
+            match inv.drives.iter().position(|d| {
+                eligible(d) && d.loaded.as_ref().is_some_and(|(b, _)| *b == c.barcode)
+            }) {
+                Some(i) => i,
+                None => {
+                    let Some(i) = inv
+                        .drives
+                        .iter()
+                        .position(|d| eligible(d) && d.loaded.is_none())
+                    else {
+                        notes.push("没有空闲的驱动器".to_string());
+                        break;
+                    };
+                    let Some(&from) = inv.slots.get(&c.barcode) else {
+                        continue;
+                    };
+                    info!(
+                        "执行线程: 装载 {} (槽位 {:#06x}) -> 驱动器 {}",
+                        c.barcode, from, a.devices[inv.drives[i].dev].name
+                    );
+                    if let Err(e) = move_medium(&a.devices, from, inv.drives[i].addr)
+                        .and_then(|_| wait_ready(a.devices[inv.drives[i].dev].dev.as_ref()))
+                    {
+                        notes.push(format!("{} 装载失败: {}", c.barcode, e));
+                        mark(&c.barcode, tape_state::CHECK);
+                        continue;
+                    }
+                    inv.drives[i].loaded = Some((c.barcode.clone(), Some(from)));
+                    inv.slots.remove(&c.barcode);
+                    inv.empty_slots.retain(|s| *s != from);
+                    inv.empty_slots.insert(0, from);
+                    i
+                }
+            };
         let di = inv.drives[slot].dev;
         // 驱动器转为写入用途，旧的只读索引及空闲卸带计时都不再适用。
         if a.read.as_ref().is_some_and(|(i, ..)| *i == di) {
@@ -931,7 +2268,12 @@ fn ensure_write_tape(
             Err((note, state)) => {
                 // 这盘不能用：记下原因，把它卸回槽位，驱动器留给下一盘候选
                 notes.push(note);
-                mark(&c.barcode, state);
+                if !state.is_empty() {
+                    mark(&c.barcode, state);
+                } else {
+                    a.deferred
+                        .insert(c.barcode.clone(), Instant::now() + Duration::from_secs(60));
+                }
                 if let Err(e) = unload_drive(&a.devices, &inv, &inv.drives[slot]) {
                     warn!("执行线程: 卸带 {} 失败: {}", c.barcode, e);
                 } else if let Some((b, home)) = inv.drives[slot].loaded.take() {
@@ -963,14 +2305,12 @@ fn ensure_write_tape(
     } else {
         notes.join("；")
     };
-    // 写不了不影响查：首版一个逻辑库一个池，查询落在这个池的目录上
-    let pool = status
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .pools
-        .first()
-        .map(|p| p.uuid.clone());
-    files.close_no_tape(a.round, pool, &why);
+    let pool = files.target_pool();
+    if waiting {
+        files.close_waiting(a.round, pool, &why);
+    } else {
+        files.close_no_tape(a.round, pool, &why);
+    }
     Ok(format!("仅持有预留：{}", why))
 }
 
@@ -990,10 +2330,28 @@ fn open_candidate(
     // 在本轮设备隔离后显式 LOAD，再等待就绪，不能把 02/04/02 误记为坏带。
     TapeDrive::new(dev).load()?;
     wait_ready(dev)?;
+    let media = crate::scsi::transport::retry_unit_attention("调度密度能力查询", || {
+        TapeDrive::new(dev).report_density_support(true)
+    })?;
+    if !super::scheduling::densities(&media)
+        .is_some_and(|caps| super::scheduling::compatible(&caps, &c.barcode, true))
+    {
+        return Ok(Err((
+            format!("{} 当前介质格式不可写，不修改介质", c.barcode),
+            "",
+        )));
+    }
     // 2. 带上是什么
     match probe_format(dev) {
         Ok(FormatProbe::Ltfs) => {}
         Ok(FormatProbe::Blank) => {
+            let _ = tx.send(ExecEvent::Management {
+                round: a.round,
+                command: super::state::Command::ObserveTape {
+                    barcode: c.barcode.clone(),
+                    observation: serde_json::json!({"invalidate":true,"reason":"空白带即将格式化"}),
+                },
+            });
             info!(
                 "执行线程: {} 是空白带，归属池 {}，首次使用前格式化",
                 c.barcode, c.pool_name
@@ -1100,22 +2458,39 @@ fn open_candidate(
     let files_now = list.iter().filter(|r| !is_directory(&r.metadata)).count() as u64;
     let mut index_entries = vol.list().len() as u64 + 1;
     vol.index().walk_directories(|_, _| index_entries += 1);
-    let (total, remaining) = crate::ltfs::mam::Mam::with_partition(dev, 1)
-        .read_partition_capacity()
-        .ok()
-        .flatten()
-        .map(|pc| (pc.maximum, pc.remaining)) // 已经是字节
-        .unwrap_or((1 << 50, 1 << 50));
-    // 保留空间：任何时候都要写得下收尾所需的索引
-    let index_bytes = index_entries * 1100;
-    let reserve = (total / 50).max(4 * index_bytes) + (total / 20).min(1 << 30);
+    let capacity = management::refresh_capacity(dev, &vol, a.round, &c.barcode, tx)?;
+    // 把这盘带的完整列表交给 Raft 层：目录落后于磁带时据此对账（以磁带为准）
+    let _ = tx.send(ExecEvent::Committed {
+        round: a.round,
+        barcode: c.barcode.clone(),
+        volume_uuid: vol.label().volume_uuid.to_string(),
+        generation: vol.index().generation,
+        files_total: list.iter().filter(|r| !is_directory(&r.metadata)).count() as u64,
+        bytes_used,
+        bytes_written: capacity["maximum"]
+            .as_u64()
+            .zip(capacity["remaining"].as_u64())
+            .map(|(m, r)| m.saturating_sub(r))
+            .unwrap_or(0),
+        files: list,
+        full: true,
+    });
+    let Some((usable_capacity, free_bytes)) =
+        super::scheduling::write_budget(&capacity, index_entries)
+    else {
+        return Ok(Err((
+            format!("{} MAM 容量未知，暂停写入准入；保留读取能力", c.barcode),
+            "",
+        )));
+    };
+    let remaining = capacity["remaining"].as_u64().unwrap();
     if files_now >= c.file_limit {
         return Ok(Err((
             format!("{} 文件数 {} 已到上限", c.barcode, files_now),
             tape_state::DATA_FULL,
         )));
     }
-    if remaining <= reserve {
+    if free_bytes == 0 {
         return Ok(Err((
             format!("{} 已满（剩余 {} MiB）", c.barcode, remaining >> 20),
             tape_state::FULL,
@@ -1130,28 +2505,16 @@ fn open_candidate(
         },
         TapeLimits {
             file_limit: c.file_limit,
-            usable_capacity: total.saturating_sub(reserve),
+            usable_capacity,
         },
         vol.index(),
-        remaining - reserve,
+        free_bytes,
         true,
     );
-    // 把这盘带的完整列表交给 Raft 层：目录落后于磁带时据此对账（以磁带为准）
-    let _ = tx.send(ExecEvent::Committed {
-        round: a.round,
-        barcode: c.barcode.clone(),
-        volume_uuid: vol.label().volume_uuid.to_string(),
-        generation: vol.index().generation,
-        files_total: list.iter().filter(|r| !is_directory(&r.metadata)).count() as u64,
-        bytes_used,
-        bytes_written: total.saturating_sub(remaining),
-        files: list,
-        full: true,
-    });
     if dev.session_epoch() == session_epoch {
         a.write_session = vol.into_session();
     }
-    summary.push_str(&format!("；可用 {} MiB", (remaining - reserve) >> 20));
+    summary.push_str(&format!("；可用 {} MiB", free_bytes >> 20));
     Ok(Ok(summary))
 }
 
@@ -1185,6 +2548,7 @@ fn checkpoint_write_tape(
     vol.set_reservation_guard(Some(a.key));
     vol.commit()?;
     let (list, bytes_used) = catalog_of(vol.index());
+    let capacity = management::refresh_capacity(dev, &vol, a.round, &tape.barcode, tx)?;
     let _ = tx.send(ExecEvent::Committed {
         round: a.round,
         barcode: tape.barcode,
@@ -1192,7 +2556,11 @@ fn checkpoint_write_tape(
         generation: vol.index().generation,
         files_total: list.iter().filter(|r| !is_directory(&r.metadata)).count() as u64,
         bytes_used,
-        bytes_written: bytes_written_on(dev),
+        bytes_written: capacity["maximum"]
+            .as_u64()
+            .zip(capacity["remaining"].as_u64())
+            .map(|(m, r)| m - r)
+            .unwrap_or(0),
         files: list,
         full: true,
     });
@@ -1298,10 +2666,18 @@ fn process_uploads_limited(
     } else {
         files.take_batch(a.round)
     } {
+        info!(
+            "执行线程: 开始批次 pool={} tape={} drive={} files={}",
+            files.target_pool().unwrap_or_default(),
+            files.tape_barcode().unwrap_or_default(),
+            a.devices[i].serial,
+            uploads.len()
+        );
         let dev = a.devices[i].dev.as_ref();
         let (round, key) = (a.round, a.key);
         let mut seq = a.seq;
         let session = a.write_session.take();
+        let mut sampled_budget = None;
         let result = (|| -> Result<ExecEvent> {
             let mut vol = match session {
                 Some(session) => session.resume(dev, key)?,
@@ -1310,7 +2686,10 @@ fn process_uploads_limited(
             vol.set_reservation_guard(Some(key));
             let mut changed = std::collections::BTreeSet::new();
             for u in &uploads {
-                seq += 1;
+                seq = a
+                    .next_seq
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
                 let ver = format!("{}.{}", round, seq);
                 if let Some(change) = &u.node_change {
                     vol.change_node_metadata(&u.path, change)?;
@@ -1437,15 +2816,25 @@ fn process_uploads_limited(
                 .cloned()
                 .collect();
             let session_epoch = dev.session_epoch();
+            let barcode = files.tape().map(|t| t.barcode).unwrap_or_default();
+            let capacity = management::refresh_capacity(dev, &vol, a.round, &barcode, tx)?;
+            let mut index_entries = all.len() as u64 + 1;
+            vol.index().walk_directories(|_, _| index_entries += 1);
+            sampled_budget =
+                super::scheduling::write_budget(&capacity, index_entries).map(|(_, free)| free);
             let event = ExecEvent::Committed {
                 round: a.round,
-                barcode: files.tape().map(|t| t.barcode).unwrap_or_default(),
+                barcode,
                 volume_uuid: vol.label().volume_uuid.to_string(),
                 generation: vol.index().generation,
                 files_total: all.iter().filter(|r| !is_directory(&r.metadata)).count() as u64,
                 bytes_used,
                 // 一次 MAM 读，不动磁带：可回收空间要靠它才算得准
-                bytes_written: bytes_written_on(dev),
+                bytes_written: capacity["maximum"]
+                    .as_u64()
+                    .zip(capacity["remaining"].as_u64())
+                    .map(|(m, r)| m - r)
+                    .unwrap_or(0),
                 files: written,
                 full: false,
             };
@@ -1461,6 +2850,7 @@ fn process_uploads_limited(
                 if let ExecEvent::Committed {
                     generation,
                     files: written,
+                    files_total,
                     ..
                 } = &ev
                 {
@@ -1473,7 +2863,14 @@ fn process_uploads_limited(
                         .iter()
                         .map(|r| (r.path.clone(), r.clone()))
                         .collect();
-                    files.batch_done(a.round, &batch, &uploads, Ok((*generation, hashes)));
+                    files.batch_done_counted(
+                        a.round,
+                        &batch,
+                        &uploads,
+                        Some(*files_total),
+                        Ok((*generation, hashes)),
+                    );
+                    files.calibrate_capacity(sampled_budget);
                 }
                 let _ = tx.send(ev);
             }
@@ -1497,6 +2894,72 @@ fn read_file<W: Write>(dev: &dyn TapeTransport, path: &str, out: &mut W) -> Resu
 
 /// 读一个文件，无论它在哪盘带上。目录给出条码；不在驱动器里就装载。
 /// 有第二个驱动器就用它（读带留在里面，空闲后卸回）；只有一个驱动器就临时换带，读完换回。
+/// 读请求可借用其他池的空闲写驱动；借用前关闭准入、再次确认排空并生成检查点。
+fn prepare_read(
+    a: &mut Active,
+    opts: &ExecOptions,
+    files: &Arc<FileService>,
+    status: &SharedStatus,
+    tx: &Sender<ExecEvent>,
+    path: &str,
+) -> std::result::Result<(), ReadError> {
+    let Some(record) = files
+        .stat(path)
+        .map_err(|e| ReadError::Failed(e.to_string()))?
+    else {
+        return Ok(());
+    };
+    let policy = super::management::policy_view(&status.lock().unwrap_or_else(|e| e.into_inner()));
+    let Some(pool) = policy
+        .pools
+        .iter()
+        .find(|p| p.tapes.contains(&record.barcode))
+    else {
+        return Ok(());
+    };
+    let eligible = |i: usize| {
+        a.density_support
+            .get(&i)
+            .is_some_and(|caps| super::scheduling::compatible(caps, &record.barcode, false))
+            && super::management::drive_allowed(
+                &policy.management,
+                &a.devices[i].serial,
+                u64::from(opts.node_id),
+                &pool.uuid,
+                'r',
+            )
+    };
+    let inv = inventory(&a.devices).map_err(|e| ReadError::device(e, "读取调度库存失败"))?;
+    if inv.drives.iter().any(|d| {
+        eligible(d.dev)
+            && available_drive(a, d.dev)
+            && (d.loaded.is_none()
+                || d.loaded.as_ref().is_some_and(|(b, _)| b == &record.barcode)
+                || a.drive == Some(d.dev) && files.write_side_idle(a.round))
+    }) {
+        return Ok(());
+    }
+    let victim = a
+        .writers
+        .iter()
+        .find(|w| w.drive.is_some_and(&eligible) && w.files.write_side_idle(a.round))
+        .map(|w| w.files.clone());
+    if let Some(victim) = victim {
+        victim.pause_admission();
+        if victim.write_side_idle(a.round) {
+            activate_writer(a, &victim);
+            let result = management::quiesce(a, &victim, tx);
+            activate_writer(a, files);
+            result.map_err(|e| {
+                ReadError::Lost(format!("借用读驱动前检查点失败，必须接管恢复: {e}"))
+            })?;
+        } else {
+            victim.resume_admission(a.round);
+        }
+    }
+    Ok(())
+}
+
 fn read_any<W: Write>(
     a: &mut Active,
     opts: &ExecOptions,
@@ -1535,6 +2998,45 @@ fn read_any_inner<W: Write>(
         .map_err(|e| Failed(e.to_string()))?
         .ok_or_else(|| Failed(format!("文件不存在: {}", path)))?;
     let barcode = st.barcode;
+    let policy = super::management::policy_view(&status.lock().unwrap_or_else(|e| e.into_inner()));
+    if !super::management::tape_allowed(&policy.management, &barcode) {
+        return Err(Failed("磁带已离线或在黑名单中".into()));
+    }
+    let pool = policy
+        .pools
+        .iter()
+        .find(|p| p.tapes.contains(&barcode))
+        .ok_or_else(|| Failed("磁带尚未分配".into()))?;
+    let serials: Vec<String> = a.devices.iter().map(|d| d.serial.clone()).collect();
+    let blocked: Vec<_> = a
+        .writers
+        .iter()
+        .filter_map(|w| w.drive)
+        .chain(a.reclaim.as_ref().map(|r| r.drive))
+        .collect();
+    let caps = a.density_support.clone();
+    let eligible = |i: usize| {
+        !blocked.contains(&i)
+            && caps
+                .get(&i)
+                .is_some_and(|caps| super::scheduling::compatible(caps, &barcode, false))
+            && super::management::drive_allowed(
+                &policy.management,
+                &serials[i],
+                u64::from(opts.node_id),
+                &pool.uuid,
+                'r',
+            )
+    };
+    if a.drive.is_some_and(|i| !eligible(i)) && files.tape().is_some_and(|t| t.barcode == barcode) {
+        return Err(Busy("当前驱动器没有读取资格".into()));
+    }
+    if a.read
+        .as_ref()
+        .is_some_and(|(i, b, ..)| b == &barcode && !eligible(*i))
+    {
+        return Err(Busy("读驱动器没有调度资格".into()));
+    }
     // 1. 就在写入带上
     if files.tape().is_some_and(|t| t.barcode == barcode)
         && let Some(i) = a.drive
@@ -1572,15 +3074,29 @@ fn read_any_inner<W: Write>(
     }
     // 3. 要装载。先找驱动器
     let inv = inventory(&a.devices).map_err(|e| ReadError::device(e, "读取库存失败"))?;
+    if inv.cleaning.contains(&barcode) {
+        return Err(Failed("清洗带不能执行 LTFS 数据操作".into()));
+    }
     let write_dev = a.drive;
     // 接管后进程内读带状态为空，介质却可能仍在第二驱动器里。
     let already_loaded = inv
         .drives
         .iter()
-        .find(|d| Some(d.dev) != write_dev && d.loaded.as_ref().is_some_and(|(b, _)| b == &barcode))
+        .find(|d| {
+            eligible(d.dev)
+                && Some(d.dev) != write_dev
+                && d.loaded.as_ref().is_some_and(|(b, _)| b == &barcode)
+        })
         .map(|d| d.dev);
     let from = inv.slots.get(&barcode).copied();
     if already_loaded.is_none() && from.is_none() {
+        if inv
+            .drives
+            .iter()
+            .any(|d| d.loaded.as_ref().is_some_and(|(b, _)| b == &barcode))
+        {
+            return Err(Busy("目标磁带所在驱动器当前不可借用".into()));
+        }
         return Err(Failed(format!("{} 不在库里的存储槽位或驱动器中", barcode)));
     }
     let mut target = already_loaded;
@@ -1590,14 +3106,16 @@ fn read_any_inner<W: Write>(
     {
         unload_drive(&a.devices, &inv, d)
             .map_err(|e| ReadError::device(e, &format!("卸下读带 {} 失败", b)))?;
-        target.get_or_insert(i);
+        if eligible(i) {
+            target.get_or_insert(i);
+        }
     }
     let inv = inventory(&a.devices).map_err(|e| ReadError::device(e, "读取库存失败"))?;
     if target.is_none() {
         target = inv
             .drives
             .iter()
-            .find(|d| d.loaded.is_none() && Some(d.dev) != write_dev)
+            .find(|d| eligible(d.dev) && d.loaded.is_none() && Some(d.dev) != write_dev)
             .map(|d| d.dev);
     }
     let mut swapped_write = false;
@@ -1606,6 +3124,9 @@ fn read_any_inner<W: Write>(
         let Some(w) = write_dev else {
             return Err(Failed("没有可用的驱动器".to_string()));
         };
+        if !eligible(w) {
+            return Err(Busy("没有具备读取资格的驱动器".into()));
+        }
         // 写入侧还在忙（队列、在途上传、提交中、待换带）就不换：让读请求稍后重试，
         // 而不是让写入等读。执行线程若在这里原地等，队列就没人落带了。
         if !files.write_side_idle(a.round) {
@@ -1662,6 +3183,8 @@ fn read_any_inner<W: Write>(
     let mut read_view = None;
     let result = match loaded {
         Ok(vol) => {
+            management::refresh_capacity(a.devices[i].dev.as_ref(), &vol, a.round, &barcode, tx)
+                .map_err(|e| ReadError::device(e, "刷新读取卷容量失败"))?;
             // 装载了就对账：目录若落后于磁带，以磁带为准
             let known = status
                 .lock()
@@ -1788,6 +3311,11 @@ fn drive_reclaim(
             }
             a.reclaim_given_up = None;
         }
+        if pool_of(status, &barcode)
+            .is_none_or(|(pool, _)| files.target_pool().as_deref() != Some(&pool))
+        {
+            return Ok(false);
+        }
         match start_reclaim(a, opts, files, status, tx, &barcode) {
             Ok(()) => a.reclaim_failures = 0,
             Err(e) if ownership_lost(&e) || reformatting(status, &barcode) => {
@@ -1868,10 +3396,11 @@ fn start_reclaim(
             summary,
         });
     }
-    let drive = load_aside(a, barcode)?;
+    let drive = load_aside(a, barcode, opts, status)?;
     let mut todo = Vec::new();
     if !reformatting(status, barcode) {
         let vol = LtfsVolume::mount(a.devices[drive].dev.as_ref())?;
+        management::refresh_capacity(a.devices[drive].dev.as_ref(), &vol, a.round, barcode, tx)?;
         vol.index().walk_files(|p, _| todo.push(format!("/{}", p)));
         vol.index().walk_directories(|p, _| {
             if p != ".tapers" && !p.starts_with(".tapers/") {
@@ -1901,13 +3430,46 @@ fn start_reclaim(
 }
 
 /// 把一盘带装进一台**不是写入带**的驱动器。必要时把读带卸回槽位腾地方。
-fn load_aside(a: &mut Active, barcode: &str) -> Result<usize> {
+fn load_aside(
+    a: &mut Active,
+    barcode: &str,
+    opts: &ExecOptions,
+    status: &SharedStatus,
+) -> Result<usize> {
+    let policy = super::management::policy_view(&status.lock().unwrap_or_else(|e| e.into_inner()));
+    if !super::management::tape_allowed(&policy.management, barcode) {
+        return Err(TapeError::NotReady("回收源带离线或在黑名单中".into()));
+    }
+    let pool = policy
+        .pools
+        .iter()
+        .find(|p| p.tapes.iter().any(|b| b == barcode))
+        .ok_or_else(|| TapeError::NotReady("回收源带未分配".into()))?;
+    let serials: Vec<String> = a.devices.iter().map(|d| d.serial.clone()).collect();
+    let blocked: Vec<_> = a.writers.iter().filter_map(|w| w.drive).collect();
+    let caps = a.density_support.clone();
+    let eligible = |i: usize| {
+        !blocked.contains(&i)
+            && caps
+                .get(&i)
+                .is_some_and(|c| super::scheduling::compatible(c, barcode, false))
+            && super::management::drive_allowed(
+                &policy.management,
+                &serials[i],
+                u64::from(opts.node_id),
+                &pool.uuid,
+                'g',
+            )
+    };
     {
         let inv = inventory(&a.devices)?;
+        if inv.cleaning.contains(barcode) {
+            return Err(TapeError::NotReady("清洗带不能执行 LTFS 数据操作".into()));
+        }
         if let Some(d) = inv
             .drives
             .iter()
-            .find(|d| d.loaded.as_ref().is_some_and(|(b, _)| b == barcode))
+            .find(|d| eligible(d.dev) && d.loaded.as_ref().is_some_and(|(b, _)| b == barcode))
         {
             return if Some(d.dev) == a.drive {
                 Err(TapeError::NotReady(format!("{} 还在写入驱动器里", barcode)))
@@ -1922,7 +3484,7 @@ fn load_aside(a: &mut Active, barcode: &str) -> Result<usize> {
         let free = inv
             .drives
             .iter()
-            .any(|d| d.loaded.is_none() && Some(d.dev) != a.drive);
+            .any(|d| eligible(d.dev) && d.loaded.is_none() && Some(d.dev) != a.drive);
         if !free
             && let Some((i, b, ..)) = a.read.take()
             && let Some(d) = inv.drives.iter().find(|d| d.dev == i)
@@ -1940,7 +3502,7 @@ fn load_aside(a: &mut Active, barcode: &str) -> Result<usize> {
     let d = inv
         .drives
         .iter()
-        .find(|d| d.loaded.is_none() && Some(d.dev) != a.drive)
+        .find(|d| eligible(d.dev) && d.loaded.is_none() && Some(d.dev) != a.drive)
         .ok_or_else(|| TapeError::NotReady("没有空闲的驱动器".into()))?;
     let (i, addr) = (d.dev, d.addr);
     info!("执行线程: 为回收装载 {} -> {}", barcode, a.devices[i].name);
@@ -2344,6 +3906,7 @@ fn finish_reclaim(
         vol.set_root_xattr(XATTR_POOL_UUID, &pool_uuid)?;
         vol.set_root_xattr(XATTR_POOL_NAME, &pool_name)?;
         vol.commit()?;
+        management::refresh_capacity(dev, &vol, a.round, &source, tx)?;
         vol.label().volume_uuid.to_string()
     };
     let _ = tx.send(ExecEvent::Reclaimed {
@@ -2410,6 +3973,8 @@ fn periodic(
     a: &mut Active,
     opts: &ExecOptions,
     strict_fencing: bool,
+    files: &FileService,
+    tx: &Sender<ExecEvent>,
 ) -> std::result::Result<(), String> {
     unload_idle_read_tape(a, opts);
     if let (true, Some(i)) = (opts.demo_write, a.drive) {
@@ -2426,7 +3991,11 @@ fn periodic(
                 &mut Cursor::new(body.into_bytes()),
                 &[(XATTR_VERSION, &ver)],
             )?;
-            vol.commit()
+            vol.commit()?;
+            if let Some(tape) = files.tape() {
+                management::refresh_capacity(dev, &vol, a.round, &tape.barcode, tx)?;
+            }
+            Ok(())
         })();
         match wrote {
             Ok(()) => info!("执行线程: 已提交 {}", name),
@@ -2482,5 +4051,57 @@ mod read_error_tests {
             ),
             ReadError::Lost(_)
         ));
+    }
+}
+
+#[cfg(test)]
+#[path = "executor_scheduling_tests.rs"]
+mod scheduling_tests;
+
+#[cfg(test)]
+mod sg_provider_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "真实 FC 设备只读发现；须设置 TAPE_RS_FC_LIBRARY/DRIVE/PORT，不注册预留或操作介质"]
+    fn hardware_changer_uses_configured_fc_port_without_fallback() {
+        let serial = std::env::var("TAPE_RS_FC_LIBRARY").expect("TAPE_RS_FC_LIBRARY");
+        let drive = std::env::var("TAPE_RS_FC_DRIVE").expect("TAPE_RS_FC_DRIVE");
+        let port = std::env::var("TAPE_RS_FC_PORT").expect("TAPE_RS_FC_PORT");
+        let provider = SgProvider {
+            changer_serial: Some(serial.clone()),
+            changer_target_port: Some(port.clone()),
+            drive_serials: vec![drive.clone()],
+        };
+        let devices = provider.open_all().unwrap();
+        let changer = devices
+            .iter()
+            .find(|d| d.kind == DeviceKind::Changer)
+            .unwrap();
+        assert_eq!(changer.serial, serial);
+        assert_eq!(
+            crate::scsi::inquiry::fc_target_port(std::path::Path::new(changer.dev.identity()))
+                .unwrap(),
+            Some(crate::scsi::inquiry::normalize_fc_target_port(&port).unwrap())
+        );
+        assert_eq!(
+            devices
+                .iter()
+                .filter(|d| d.kind == DeviceKind::Drive)
+                .count(),
+            1
+        );
+        drop(devices);
+        for wrong in [None, Some("0xffffffffffffffff".into())] {
+            let provider = SgProvider {
+                changer_serial: Some(serial.clone()),
+                changer_target_port: wrong,
+                drive_serials: vec![drive.clone()],
+            };
+            assert!(
+                provider.open_all().is_err(),
+                "禁止缺少端口或错误端口时退回其它 sg 路径"
+            );
+        }
     }
 }

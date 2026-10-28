@@ -91,6 +91,29 @@ pub const P0_INDEX_BLOCK: u64 = FIRST_INDEX_BLOCK;
 /// 默认块大小（字节）。LTFS 常用 512 KiB，可被 mkltfs 覆写。
 pub const DEFAULT_BLOCK_SIZE: u32 = 512 * 1024;
 
+/// Exact physical index construct that backs the published LTFS view. For an
+/// incremental commit this digest belongs to the delta XML, not a full index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommittedIndexConstruct {
+    pub volume_uuid: uuid::Uuid,
+    pub generation: u64,
+    pub location: IndexLocation,
+    pub sha256: [u8; 32],
+    pub incremental: bool,
+}
+
+impl CommittedIndexConstruct {
+    fn recovered(candidate: &recovery::IndexCandidate) -> Self {
+        Self {
+            volume_uuid: candidate.index.volume_uuid,
+            generation: candidate.index.generation,
+            location: candidate.index.self_location,
+            sha256: candidate.construct_sha256,
+            incremental: candidate.index.incremental,
+        }
+    }
+}
+
 pub struct LtfsVolume<'a> {
     device: &'a dyn crate::scsi::transport::TapeTransport,
     drive: TapeDrive<'a>,
@@ -100,6 +123,7 @@ pub struct LtfsVolume<'a> {
     working: LtfsIndex,
     /// 已发布的已提交视图（S5）：list/read/index() 只服务它。
     index: LtfsIndex,
+    committed_construct: CommittedIndexConstruct,
     block_size: u32,
     /// 顺序文件流复用对齐缓冲；借用切片写入不分配它。
     write_buffer: Option<crate::scsi::buffer::TransferBuffer>,
@@ -133,6 +157,7 @@ pub(crate) struct VolumeSession {
     working: LtfsIndex,
     /// 已发布的已提交视图（S5）：list/read/index() 只服务它。
     index: LtfsIndex,
+    committed_construct: CommittedIndexConstruct,
     block_size: u32,
     /// 顺序文件流复用对齐缓冲；借用切片写入不分配它。
     write_buffer: Option<crate::scsi::buffer::TransferBuffer>,
@@ -193,6 +218,7 @@ impl VolumeSession {
             label: self.label,
             working: self.working,
             index: self.index,
+            committed_construct: self.committed_construct,
             block_size: self.block_size,
             write_buffer: self.write_buffer,
             read_buffer: self.read_buffer,
@@ -265,8 +291,47 @@ fn read_index_file<W: Write>(
             ))),
         };
     }
-    if file.extents.is_empty() {
-        if file.length != 0 {
+    read_extents_to_writer(
+        &drive,
+        block_size,
+        partitions,
+        (path, file.length, &file.extents),
+        w,
+        read_buffer,
+    )
+}
+
+#[cfg(feature = "fdb")]
+pub(crate) fn read_cached_file_to_writer<W: Write>(
+    device: &dyn crate::scsi::transport::TapeTransport,
+    label: &LtfsLabel,
+    file: &crate::catalog::volume_extents::CachedFile,
+    w: &mut W,
+) -> Result<u64> {
+    if file.symlink.is_some() {
+        return Err(TapeError::Ltfs("读取计划仍包含未解析符号链接".into()));
+    }
+    read_extents_to_writer(
+        &TapeDrive::new(device),
+        label.blocksize,
+        [label.index_partition, label.data_partition],
+        (&file.path, file.length, &file.extents),
+        w,
+        &std::cell::RefCell::new(None),
+    )
+}
+
+fn read_extents_to_writer<W: Write>(
+    drive: &TapeDrive<'_>,
+    block_size: u32,
+    partitions: [char; 2],
+    file: (&str, u64, &[Extent]),
+    w: &mut W,
+    read_buffer: &std::cell::RefCell<Option<crate::scsi::buffer::TransferBuffer>>,
+) -> Result<u64> {
+    let (path, length, extents) = file;
+    if extents.is_empty() {
+        if length != 0 {
             return Err(TapeError::Ltfs(format!("文件 {} 缺少数据 extent", path)));
         }
         return Ok(0);
@@ -274,7 +339,7 @@ fn read_index_file<W: Write>(
 
     // 只支持从 0 开始、按索引顺序连续的布局；先核验全部 extent，避免输出错误前缀。
     let mut expected_offset = 0u64;
-    for ext in &file.extents {
+    for ext in extents {
         partition_char_to_num(ext.partition, partitions)?;
         if ext.file_offset != expected_offset {
             return Err(TapeError::Ltfs(format!(
@@ -295,10 +360,10 @@ fn read_index_file<W: Write>(
             )));
         }
     }
-    if expected_offset != file.length {
+    if expected_offset != length {
         return Err(TapeError::Ltfs(format!(
             "文件 {} 的 extent 长度不符: 索引 {}，extent {}",
-            path, file.length, expected_offset
+            path, length, expected_offset
         )));
     }
 
@@ -310,7 +375,7 @@ fn read_index_file<W: Write>(
         .get_or_insert_with(|| crate::scsi::buffer::TransferBuffer::new(block_size as usize))
         .as_mut_slice();
 
-    for ext in &file.extents {
+    for ext in extents {
         let partition = partition_char_to_num(ext.partition, partitions)?;
         drive.locate_if_needed(partition, ext.start_block)?;
 
@@ -346,10 +411,10 @@ fn read_index_file<W: Write>(
             first_block = false;
         }
     }
-    if total != file.length {
+    if total != length {
         return Err(TapeError::Ltfs(format!(
             "文件 {} 长度不符: 索引 {}，读取 {}",
-            path, file.length, total
+            path, length, total
         )));
     }
     w.flush()?;
@@ -369,6 +434,7 @@ impl<'a> LtfsVolume<'a> {
             label: self.label,
             working: self.working,
             index: self.index,
+            committed_construct: self.committed_construct,
             block_size: self.block_size,
             write_buffer: self.write_buffer,
             read_buffer: self.read_buffer,
@@ -411,8 +477,7 @@ impl<'a> LtfsVolume<'a> {
         let mam = Mam::new(device);
 
         // 1. 读 P0 label
-        let label_bytes = read_single_block(&drive, 0, LABEL_BLOCK, /*max=*/ 64 * 1024)?;
-        let label = LtfsLabel::parse(&label_bytes)?;
+        let label = read_label_only(device)?;
         let block_size = label.blocksize;
         info!(
             "LTFS label: version={} uuid={} blocksize={} compression={}",
@@ -432,6 +497,7 @@ impl<'a> LtfsVolume<'a> {
             .view()
             .expect("restricted_reason() checked view presence");
         let index = view.index.clone();
+        let committed_construct = CommittedIndexConstruct::recovered(view);
         info!(
             "index gen={} highest_uid={} (dp_tail={:?}, ip_tail={:?}, writable={})",
             index.generation,
@@ -503,6 +569,7 @@ impl<'a> LtfsVolume<'a> {
             label,
             working: index.clone(),
             index,
+            committed_construct,
             block_size,
             write_buffer: None,
             read_buffer: std::cell::RefCell::new(None),
@@ -545,6 +612,24 @@ impl<'a> LtfsVolume<'a> {
                 _ => out.push(p.to_string()),
             });
         out
+    }
+
+    /// One newly appended file before the index commit. This is only a
+    /// physical receipt candidate; readers must keep using `index()` until S4.
+    #[cfg(feature = "fdb")]
+    pub(crate) fn pending_file_node(&self, path: &str) -> Option<&super::index::FileNode> {
+        if !self.writable || !self.dirty {
+            return None;
+        }
+        let pending = self.working.find_file(path)?;
+        if self
+            .index
+            .find_file(path)
+            .is_some_and(|committed| committed.meta.file_uid == pending.meta.file_uid)
+        {
+            return None;
+        }
+        Some(pending)
     }
 
     /// 为 P0 与 P1 写入 VCI（各自的最新索引位置）。驱动器不提供 VCR 时跳过并记录。
@@ -610,6 +695,144 @@ impl<'a> LtfsVolume<'a> {
     /// 已发布的已提交视图。
     pub fn index(&self) -> &LtfsIndex {
         &self.index
+    }
+
+    /// S4 index identity from the last successful sync or a verified mount.
+    /// A failed/indeterminate commit never advances this published identity.
+    pub fn committed_index_construct(&self) -> CommittedIndexConstruct {
+        self.committed_construct
+    }
+
+    /// Raft round and permission identity enforced on every device command.
+    pub fn guarded_execution(&self) -> Option<(u64, usize)> {
+        self.device.execution_guard()
+    }
+
+    /// Return an index identity suitable for an owner-fenced catalog update.
+    /// A caller must still check its own control-plane owner epoch before
+    /// publishing anything. This check proves only the current device holder
+    /// and the last successful, clean LTFS view.
+    pub fn verified_committed_index_construct(&mut self) -> Result<CommittedIndexConstruct> {
+        self.ensure_writable()?;
+        if self.dirty {
+            return Err(TapeError::Refused {
+                reason: "卷仍有未提交的文件，不能记录活动索引".into(),
+            });
+        }
+        self.verified_recovery_index_construct()
+    }
+
+    /// Verify the PR and committed view even when T1/T2 makes the volume
+    /// read-only. A recovery caller must separately classify that tail.
+    pub fn verified_recovery_index_construct(&mut self) -> Result<CommittedIndexConstruct> {
+        if self.reservation_guard.is_none() {
+            return Err(TapeError::Refused {
+                reason: "卷没有设备预留守护，不能记录活动索引".into(),
+            });
+        }
+        self.check_reservation_guard()?;
+        if self.committed_construct.volume_uuid != self.label.volume_uuid
+            || self.committed_construct.generation != self.index.generation
+            || self.committed_construct.location != self.index.self_location
+        {
+            return Err(TapeError::Catalog("已提交索引与卷视图不一致".into()));
+        }
+        Ok(self.committed_construct)
+    }
+
+    /// Re-read the exact latest DP construct under the device PR. Mount may
+    /// materialize an incremental chain, so `recovery().view().index` is not
+    /// necessarily the raw S4 delta needed to audit a sealed FDB batch.
+    pub fn verified_committed_raw_dp_index(&mut self) -> Result<LtfsIndex> {
+        let current = self.verified_committed_index_construct()?;
+        let candidate = self
+            .recovery
+            .dp
+            .last_index
+            .as_ref()
+            .ok_or_else(|| TapeError::Ltfs("数据分区没有已提交索引".into()))?;
+        if candidate.index.generation != current.generation
+            || candidate.index.self_location != current.location
+            || candidate.construct_sha256 != current.sha256
+        {
+            return Err(TapeError::Ltfs("数据分区索引与已提交身份不一致".into()));
+        }
+        recovery::verified_raw_dp_index(
+            &self.drive,
+            &self.label,
+            candidate,
+            &RecoveryBudget::default(),
+        )
+    }
+
+    /// Re-read the FDB-observed predecessor under the same drive PR, then
+    /// materialize any incremental chain for a Full S4 difference audit.
+    #[cfg(feature = "fdb")]
+    pub(crate) fn verified_materialized_dp_index(
+        &mut self,
+        expected: CommittedIndexConstruct,
+    ) -> Result<(LtfsIndex, Vec<CommittedIndexConstruct>)> {
+        let current = self.verified_committed_index_construct()?;
+        if expected.volume_uuid != current.volume_uuid
+            || expected.generation.checked_add(1) != Some(current.generation)
+        {
+            return Err(TapeError::Catalog("前代索引与当前卷代数不连续".into()));
+        }
+        let (prior, predecessors) = recovery::verified_materialized_dp_index(
+            &self.drive,
+            &self.label,
+            expected.location,
+            expected.generation,
+            expected.sha256,
+            expected.incremental,
+            &RecoveryBudget::default(),
+        )?;
+        if self.verified_committed_index_construct()? != current {
+            return Err(TapeError::Catalog("核对前代期间当前介质索引已改变".into()));
+        }
+        Ok((
+            prior,
+            predecessors
+                .into_iter()
+                .map(|index| CommittedIndexConstruct {
+                    volume_uuid: expected.volume_uuid,
+                    generation: index.generation,
+                    location: index.location,
+                    sha256: index.sha256,
+                    incremental: index.incremental,
+                })
+                .collect(),
+        ))
+    }
+
+    /// Stream a Full DP construct under this volume's PR. Entries remain
+    /// provisional until the whole construct and the mounted head are checked.
+    #[cfg(feature = "fdb")]
+    pub(crate) fn scan_verified_full_dp_index<F>(
+        &mut self,
+        expected: CommittedIndexConstruct,
+        emit: F,
+    ) -> Result<LtfsIndex>
+    where
+        F: FnMut(crate::ltfs::index::IndexEntry) -> Result<()>,
+    {
+        let current = self.verified_committed_index_construct()?;
+        if expected.volume_uuid != current.volume_uuid || expected.incremental {
+            return Err(TapeError::Catalog("Full 索引与当前卷身份不一致".into()));
+        }
+        let index = recovery::scan_verified_full_dp_index(
+            &self.drive,
+            &self.label,
+            expected.location,
+            expected.generation,
+            expected.sha256,
+            &RecoveryBudget::default(),
+            emit,
+        )?;
+        if self.verified_committed_index_construct()? != current {
+            return Err(TapeError::Catalog("扫描期间当前介质索引已改变".into()));
+        }
+        Ok(index)
     }
 
     pub fn block_size(&self) -> u32 {
@@ -769,6 +992,17 @@ impl<'a> LtfsVolume<'a> {
             value: format!("{prev}{range}"),
             base64: false,
         });
+        if policy == TailPolicy::Discard {
+            self.working
+                .root
+                .xattrs
+                .retain(|x| x.key != XATTR_EMPTY_RECOVERY);
+            self.working.root.xattrs.push(super::index::Xattr {
+                key: XATTR_EMPTY_RECOVERY.to_string(),
+                value: empty_recovery_marker(self.committed_construct),
+                base64: false,
+            });
+        }
 
         info!(
             "收尾: DP 尾部 {:?}，放弃块 {}..{}，在 EOD {} 追加索引",
@@ -1464,6 +1698,7 @@ impl<'a> LtfsVolume<'a> {
         } else {
             self.working.to_xml().map_err(|e| ("encode", e))?
         };
+        let construct_sha256 = Sha256::digest(&xml).into();
         let blocks_written = write_bytes_in_blocks(&self.drive, &xml, self.block_size as usize)
             .map_err(|e| ("index_records", e))?;
         self.drive
@@ -1501,6 +1736,13 @@ impl<'a> LtfsVolume<'a> {
         }
         self.working.materialized = incremental;
         self.index = self.working.clone();
+        self.committed_construct = CommittedIndexConstruct {
+            volume_uuid: self.index.volume_uuid,
+            generation: self.index.generation,
+            location: self.index.self_location,
+            sha256: construct_sha256,
+            incremental,
+        };
         info!(
             "commit: gen {} @ DP {}, incremental={}, index_bytes={}, IP checkpoint={}",
             self.working.generation,
@@ -1715,6 +1957,24 @@ pub enum TailPolicy {
 
 /// 卷根扩展属性：历次收尾放弃的块范围，形如 `b:20-37;b:51-60`。
 pub const XATTR_ABANDONED: &str = "tapers.abandonedBlocks";
+/// Durable proof that this generation was created by Discard from the exact
+/// previous committed index; used when the owner dies after writing S4.
+pub const XATTR_EMPTY_RECOVERY: &str = "tapers.emptyRecovery";
+
+pub fn empty_recovery_marker(previous: CommittedIndexConstruct) -> String {
+    use std::fmt::Write;
+    let mut out = format!(
+        "{}:{}:{}:{}:",
+        previous.generation,
+        previous.location.partition,
+        previous.location.start_block,
+        u8::from(previous.incremental)
+    );
+    for byte in previous.sha256 {
+        write!(&mut out, "{byte:02x}").expect("writing to String");
+    }
+    out
+}
 /// 文件扩展属性：这一份内容的版本，形如 `轮次.序号`。
 ///
 /// 同一路径可以同时存在于多盘带上（重写、回收搬迁），目录必须能判断哪一份是当前版本。
@@ -1797,7 +2057,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// 把符号链接目标解析成卷内路径。只跟随一层；绝对路径和越出卷根的返回 None。
-fn resolve_symlink(link_path: &str, target: &str) -> Option<String> {
+pub(crate) fn resolve_symlink(link_path: &str, target: &str) -> Option<String> {
     if target.starts_with('/') {
         return None;
     }
@@ -1849,6 +2109,14 @@ fn ensure_dir<'d>(
         cur = &mut cur.subdirs[idx];
     }
     cur
+}
+
+/// Read only the P0 LTFS label without parsing an index or materializing a
+/// directory tree. The caller must hold the drive's execution authority.
+pub fn read_label_only(device: &dyn crate::scsi::transport::TapeTransport) -> Result<LtfsLabel> {
+    let drive = TapeDrive::new(device);
+    let label_bytes = read_single_block(&drive, 0, LABEL_BLOCK, /*max=*/ 64 * 1024)?;
+    LtfsLabel::parse(&label_bytes)
 }
 
 /// 读 P0 label 那类"已知单块、较小"的数据。先 LOCATE，然后 read_block 一次。

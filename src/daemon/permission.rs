@@ -162,6 +162,9 @@ impl TapeTransport for GuardedTransport {
     fn session_epoch(&self) -> Option<u64> {
         self.inner.session_epoch()
     }
+    fn execution_guard(&self) -> Option<(u64, usize)> {
+        Some((self.round, Arc::as_ptr(&self.permission) as usize))
+    }
     fn identity(&self) -> &str {
         self.inner.identity()
     }

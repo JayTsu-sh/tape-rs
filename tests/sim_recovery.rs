@@ -529,6 +529,295 @@ fn ip_ahead_with_back_pointer_to_dp_last_is_consistent() {
     assert!(vol.writable());
 }
 
+#[cfg(feature = "fdb")]
+#[test]
+fn fdb_owner_rejects_an_ip_view_newer_than_its_observed_dp_head() {
+    use tape_rs::ltfs::recovery::verify_ip_not_ahead;
+    use tape_rs::ltfs::volume::read_label_only;
+    use tape_rs::tape::commands::TapeDrive;
+
+    let (lib, dev) = setup();
+    let dp_generation = commit_file(&dev, "/a", 1);
+    let label = read_label_only(&dev).unwrap();
+    let drive = TapeDrive::new(&dev);
+    assert_eq!(
+        verify_ip_not_ahead(&drive, &label, dp_generation, &RecoveryBudget::default()).unwrap(),
+        dp_generation
+    );
+    lib.with_cartridge_mut(BARCODE, |c| {
+        let before = format!("<generationnumber>{dp_generation}</generationnumber>");
+        let after = format!("<generationnumber>{}</generationnumber>", dp_generation + 1);
+        let mut changed = false;
+        for object in &mut c.partitions[0].objects {
+            if let LogicalObject::Record(record) = object {
+                let text = String::from_utf8_lossy(record);
+                if text.contains("<ltfsindex") {
+                    assert!(text.contains(&before));
+                    *record = text.replace(&before, &after).into_bytes();
+                    changed = true;
+                }
+            }
+        }
+        assert!(changed);
+        c.vcr += 1;
+    });
+    let error =
+        verify_ip_not_ahead(&drive, &label, dp_generation, &RecoveryBudget::default()).unwrap_err();
+    assert!(error.to_string().contains("领先"), "{error}");
+}
+
+#[cfg(feature = "fdb")]
+#[test]
+fn fdb_owner_rejects_unindexed_ip_tail() {
+    use tape_rs::ltfs::recovery::verify_ip_not_ahead;
+    use tape_rs::ltfs::volume::read_label_only;
+    use tape_rs::tape::commands::TapeDrive;
+
+    let (lib, dev) = setup();
+    let dp_generation = commit_file(&dev, "/a", 1);
+    let label = read_label_only(&dev).unwrap();
+    lib.with_cartridge_mut(BARCODE, |cartridge| {
+        let ip = &mut cartridge.partitions[0];
+        ip.objects
+            .push(LogicalObject::Record(b"unindexed IP tail".to_vec()));
+        ip.flushed = ip.objects.len();
+    });
+    let error = verify_ip_not_ahead(
+        &TapeDrive::new(&dev),
+        &label,
+        dp_generation,
+        &RecoveryBudget::default(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("尾部不完整"), "{error}");
+}
+
+#[cfg(feature = "fdb")]
+#[test]
+fn fdb_owner_rejects_same_generation_ip_content_or_header_conflicts() {
+    use tape_rs::ltfs::recovery::verify_dp_ip_head;
+    use tape_rs::ltfs::volume::read_label_only;
+    use tape_rs::tape::commands::TapeDrive;
+
+    for (before, after) in [
+        ("<length>50000</length>", "<length>50001</length>"),
+        ("<readonly>false</readonly>", "<readonly>true</readonly>"),
+        (
+            "<highestfileuid>2</highestfileuid>",
+            "<highestfileuid>3</highestfileuid>",
+        ),
+        ("<fileoffset>0</fileoffset>", "<fileoffset>1</fileoffset>"),
+    ] {
+        let (lib, dev) = setup();
+        commit_file(&dev, "/a", 1);
+        let head = LtfsVolume::mount(&dev).unwrap().committed_index_construct();
+        let label = read_label_only(&dev).unwrap();
+        let drive = TapeDrive::new(&dev);
+        assert_eq!(
+            verify_dp_ip_head(&drive, &label, head, &RecoveryBudget::default()).unwrap(),
+            head.generation
+        );
+        lib.with_cartridge_mut(BARCODE, |cartridge| {
+            let mut changed = false;
+            for object in &mut cartridge.partitions[0].objects {
+                if let LogicalObject::Record(record) = object {
+                    let text = String::from_utf8_lossy(record);
+                    if text.contains(before) {
+                        *record = text.replace(before, after).into_bytes();
+                        changed = true;
+                    }
+                }
+            }
+            assert!(changed, "fixture missing {before}");
+        });
+        let error = verify_dp_ip_head(&drive, &label, head, &RecoveryBudget::default())
+            .expect_err("同代 IP 变化不得凭 DP 摘要放行");
+        assert!(error.to_string().contains("同代"), "{error}");
+    }
+}
+
+#[cfg(feature = "fdb")]
+#[test]
+fn fdb_owner_accepts_lagging_ip_but_gates_same_generation_incremental_view() {
+    use tape_rs::ltfs::recovery::verify_dp_ip_head;
+    use tape_rs::ltfs::volume::read_label_only;
+    use tape_rs::tape::commands::TapeDrive;
+
+    let (lib, dev) = setup();
+    let mut volume = LtfsVolume::mount(&dev).unwrap();
+    volume
+        .append_file("/a", &mut Cursor::new(payload(50_000, 1)))
+        .unwrap();
+    volume.commit_incremental().unwrap();
+    let head = volume.committed_index_construct();
+    assert!(head.incremental);
+    drop(volume);
+    let label = read_label_only(&dev).unwrap();
+    let drive = TapeDrive::new(&dev);
+    assert!(
+        verify_dp_ip_head(&drive, &label, head, &RecoveryBudget::default()).unwrap()
+            < head.generation
+    );
+    let mut wrong_identity = head;
+    wrong_identity.generation += 1;
+    let error =
+        verify_dp_ip_head(&drive, &label, wrong_identity, &RecoveryBudget::default()).unwrap_err();
+    assert!(error.to_string().contains("身份"), "{error}");
+    lib.with_cartridge_mut(BARCODE, |cartridge| {
+        for object in &mut cartridge.partitions[0].objects {
+            if let LogicalObject::Record(record) = object {
+                let text = String::from_utf8_lossy(record);
+                if text.contains("<ltfsindex") {
+                    *record = text
+                        .replace(
+                            "<generationnumber>1</generationnumber>",
+                            &format!("<generationnumber>{}</generationnumber>", head.generation),
+                        )
+                        .into_bytes();
+                }
+            }
+        }
+    });
+    let error = verify_dp_ip_head(&drive, &label, head, &RecoveryBudget::default()).unwrap_err();
+    assert!(error.to_string().contains("同代"), "{error}");
+}
+
+#[cfg(feature = "fdb")]
+#[test]
+fn fdb_owner_replays_delta_chain_for_same_generation_ip_read_view() {
+    use tape_rs::ltfs::index::IndexLocation;
+    use tape_rs::ltfs::recovery::verify_dp_ip_head;
+    use tape_rs::ltfs::volume::read_label_only;
+    use tape_rs::tape::commands::TapeDrive;
+
+    let (lib, dev) = setup();
+    let mut volume = LtfsVolume::mount(&dev).unwrap();
+    volume
+        .append_file("/baseline", &mut Cursor::new(b"kept"))
+        .unwrap();
+    volume.commit().unwrap();
+    volume
+        .append_file("/dir/a", &mut Cursor::new(b"one"))
+        .unwrap();
+    volume.commit_incremental().unwrap();
+    volume
+        .append_file("/dir/b", &mut Cursor::new(b"two"))
+        .unwrap();
+    volume.commit_incremental().unwrap();
+    volume.remove_file("/dir/a").unwrap();
+    volume.rename_path("/dir/b", "/moved").unwrap();
+    volume
+        .set_node_xattr(
+            "/moved",
+            tape_rs::ltfs::index::Xattr {
+                key: "source".into(),
+                value: "disk replay".into(),
+                base64: false,
+            },
+            false,
+            false,
+        )
+        .unwrap();
+    volume.commit_incremental().unwrap();
+    let head = volume.committed_index_construct();
+    let mut ip = volume.index().clone();
+    ip.incremental = false;
+    ip.previous_incremental_location = Some(head.location);
+    ip.self_location = IndexLocation {
+        partition: 'a',
+        start_block: 5,
+    };
+    let xml = ip.to_xml().unwrap();
+    drop(volume);
+    lib.with_cartridge_mut(BARCODE, |cartridge| {
+        let partition = &mut cartridge.partitions[0];
+        partition.objects.truncate(4);
+        partition.objects.push(LogicalObject::Filemark);
+        for record in xml.chunks(64 * 1024) {
+            partition
+                .objects
+                .push(LogicalObject::Record(record.to_vec()));
+        }
+        partition.objects.push(LogicalObject::Filemark);
+        partition.flushed = partition.objects.len();
+    });
+    let label = read_label_only(&dev).unwrap();
+    let drive = TapeDrive::new(&dev);
+    assert_eq!(
+        verify_dp_ip_head(&drive, &label, head, &RecoveryBudget::default()).unwrap(),
+        head.generation
+    );
+    let error = verify_dp_ip_head(
+        &drive,
+        &label,
+        head,
+        &RecoveryBudget {
+            max_chain_len: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("预算"), "{error}");
+    // A complete, parseable baseline with changed metadata must disagree with
+    // the materialized IP view. The latest delta's exact hash stays unchanged.
+    lib.with_cartridge_mut(BARCODE, |cartridge| {
+        for object in &mut cartridge.partitions[1].objects {
+            if let LogicalObject::Record(record) = object {
+                let text = String::from_utf8_lossy(record);
+                if text.contains("<ltfsindex") && text.contains("<name>baseline</name>") {
+                    *record = text
+                        .replace("<readonly>false</readonly>", "<readonly>true</readonly>")
+                        .into_bytes();
+                    break;
+                }
+            }
+        }
+    });
+    let error = verify_dp_ip_head(&drive, &label, head, &RecoveryBudget::default()).unwrap_err();
+    assert!(error.to_string().contains("同代"), "{error}");
+}
+
+#[cfg(feature = "fdb")]
+#[test]
+fn fdb_owner_accepts_full_checkpoint_with_a_historical_delta_back_pointer() {
+    use tape_rs::ltfs::recovery::verify_dp_ip_head;
+    use tape_rs::ltfs::volume::read_label_only;
+    use tape_rs::tape::commands::TapeDrive;
+
+    let (_library, device) = setup();
+    let mut volume = LtfsVolume::mount(&device).unwrap();
+    volume.append_file("/a", &mut Cursor::new(b"data")).unwrap();
+    volume.commit_incremental().unwrap();
+    volume.unmount().unwrap();
+    let volume = LtfsVolume::mount(&device).unwrap();
+    let head = volume.committed_index_construct();
+    assert!(!head.incremental);
+    assert!(volume.index().previous_incremental_location.is_some());
+    assert!(
+        volume
+            .recovery()
+            .ip
+            .last_index
+            .as_ref()
+            .unwrap()
+            .index
+            .previous_incremental_location
+            .is_none()
+    );
+    drop(volume);
+    let label = read_label_only(&device).unwrap();
+    assert_eq!(
+        verify_dp_ip_head(
+            &TapeDrive::new(&device),
+            &label,
+            head,
+            &RecoveryBudget::default()
+        )
+        .unwrap(),
+        head.generation
+    );
+}
+
 #[test]
 fn normal_clean_full_mount_skips_history_but_explicit_audit_checks_it() {
     let (lib, dev) = setup();
@@ -704,4 +993,223 @@ fn dp_full_does_not_skip_history_if_older_ip_points_beyond_it() {
     let vol = LtfsVolume::mount(&dev).unwrap();
     assert!(vol.recovery().history_checked);
     assert_eq!(vol.index().generation, 2);
+}
+
+#[cfg(feature = "fdb")]
+#[test]
+fn fdb_owner_denies_scratch_admission_before_full_or_delta_media_io() {
+    use tape_rs::ltfs::recovery::verify_dp_ip_head;
+    use tape_rs::ltfs::volume::read_label_only;
+    use tape_rs::tape::commands::TapeDrive;
+
+    let (_lib, dev) = setup();
+    let label = read_label_only(&dev).unwrap();
+    let mut volume = LtfsVolume::mount(&dev).unwrap();
+    volume
+        .append_file("/full", &mut Cursor::new(b"full"))
+        .unwrap();
+    volume.commit().unwrap();
+    let full = volume.committed_index_construct();
+    volume
+        .append_file("/delta", &mut Cursor::new(b"delta"))
+        .unwrap();
+    volume.commit_incremental().unwrap();
+    let delta = volume.committed_index_construct();
+    drop(volume);
+    let mut budget = RecoveryBudget::default();
+    budget.index_scratch.headroom_bytes = u64::MAX;
+    for head in [full, delta] {
+        let before = dev.command_log();
+        let error = verify_dp_ip_head(&TapeDrive::new(&dev), &label, head, &budget).unwrap_err();
+        assert!(error.to_string().contains("临时盘准入"), "{error}");
+        assert_eq!(
+            dev.command_log(),
+            before,
+            "no tape operation on denied admission"
+        );
+    }
+    verify_dp_ip_head(
+        &TapeDrive::new(&dev),
+        &label,
+        delta,
+        &RecoveryBudget::default(),
+    )
+    .unwrap();
+}
+
+#[cfg(feature = "fdb")]
+#[test]
+fn streamed_full_recovery_captures_exact_source_and_reads_without_a_volume_tree() {
+    use sha2::{Digest, Sha256};
+    use tape_rs::catalog::volume_extents::{ExpectedIndex, VolumeExtentCache};
+    use tape_rs::ltfs::{recovery::capture_full_recovery, volume::read_label_only};
+    use tape_rs::tape::commands::TapeDrive;
+
+    let (_lib, dev) = setup();
+    commit_file(&dev, "/a", 1);
+    commit_file(&dev, "/b", 2);
+    let volume = LtfsVolume::mount_with_budget(&dev, &RecoveryBudget::default()).unwrap();
+    let expected = volume.committed_index_construct();
+    let depth = volume.recovery().chain_depth;
+    let eod = volume.recovery().dp.eod;
+    drop(volume);
+    let label = read_label_only(&dev).unwrap();
+    let before = dev.command_log().len();
+    let mut xml = Vec::new();
+    let source = capture_full_recovery(
+        &TapeDrive::new(&dev),
+        &label,
+        &RecoveryBudget::default(),
+        &mut xml,
+    )
+    .unwrap();
+    assert_eq!(source.construct, expected);
+    assert_eq!(source.history_depth, depth);
+    assert!(!source.history_truncated);
+    assert_eq!(source.dp_eod, eod);
+    assert_eq!(source.ip_generation, expected.generation);
+    assert_eq!(source.source_bytes, xml.len() as u64);
+    assert_eq!(Sha256::digest(&xml).as_slice(), expected.sha256);
+    let path = std::env::temp_dir().join(format!("streamed-recovery-{}.db", uuid::Uuid::new_v4()));
+    let identity = ExpectedIndex {
+        volume_uuid: expected.volume_uuid,
+        generation: expected.generation,
+        location: expected.location,
+        sha256: expected.sha256,
+    };
+    VolumeExtentCache::build(&xml[..], &path, identity).unwrap();
+    let cache = VolumeExtentCache::open(&path, identity).unwrap();
+    let mut bytes = Vec::new();
+    assert_eq!(
+        cache
+            .read_file_to_writer(&dev, &label, "a", &mut bytes)
+            .unwrap(),
+        50_000
+    );
+    assert_eq!(bytes, payload(50_000, 1));
+    let mut wrong = label.clone();
+    wrong.volume_uuid = uuid::Uuid::new_v4();
+    let commands = dev.command_log().len();
+    assert!(
+        cache
+            .read_file_to_writer(&dev, &wrong, "a", &mut Vec::new())
+            .is_err()
+    );
+    assert_eq!(dev.command_log().len(), commands, "错卷在任何读带之前拒绝");
+    assert!(
+        !dev.command_log()[before..]
+            .iter()
+            .any(|op| matches!(op, 0x04 | 0x0a | 0x10 | 0x19 | 0x1b | 0x8d | 0xa5))
+    );
+    drop(cache);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[cfg(feature = "fdb")]
+#[test]
+fn streamed_full_recovery_rejects_unclean_tail_conflicting_ip_and_history() {
+    use tape_rs::ltfs::{recovery::capture_full_recovery, volume::read_label_only};
+    use tape_rs::tape::commands::TapeDrive;
+    for scenario in ["unindexed", "truncated", "ip", "history"] {
+        let (lib, dev) = setup();
+        commit_file(&dev, "/a", 1);
+        commit_file(&dev, "/b", 2);
+        let volume = LtfsVolume::mount(&dev).unwrap();
+        let mut prior = volume.index().clone();
+        let previous = prior.previous_location.unwrap();
+        prior.self_location = previous;
+        prior.previous_location = None;
+        prior.root.files.pop();
+        let prior_xml = prior.to_xml().unwrap().to_vec();
+        drop(volume);
+        let label = read_label_only(&dev).unwrap();
+        lib.with_cartridge_mut(BARCODE, |cartridge| match scenario {
+            "unindexed" => cartridge.partitions[1]
+                .objects
+                .push(LogicalObject::Record(b"unobserved bytes".to_vec())),
+            "truncated" => {
+                cartridge.partitions[1]
+                    .objects
+                    .push(LogicalObject::Filemark);
+                cartridge.partitions[1]
+                    .objects
+                    .push(LogicalObject::Record(b"<ltfsindex>".to_vec()));
+            }
+            "ip" => {
+                for object in &mut cartridge.partitions[0].objects {
+                    if let LogicalObject::Record(bytes) = object {
+                        let text = String::from_utf8_lossy(bytes);
+                        if text.contains("<ltfsindex") {
+                            *bytes = text
+                                .replace("<length>50000</length>", "<length>50001</length>")
+                                .into_bytes();
+                        }
+                    }
+                }
+            }
+            "history" => {
+                cartridge.partitions[1].objects[previous.start_block as usize] =
+                    LogicalObject::Record(prior_xml)
+            }
+            _ => unreachable!(),
+        });
+        flush_all(&lib);
+        let error = capture_full_recovery(
+            &TapeDrive::new(&dev),
+            &label,
+            &RecoveryBudget::default(),
+            &mut Vec::new(),
+        )
+        .expect_err(scenario);
+        if scenario == "history" {
+            assert!(error.to_string().contains("节点内容"), "{error}");
+        }
+    }
+}
+
+#[cfg(feature = "fdb")]
+#[test]
+fn streamed_full_recovery_preserves_budget_and_device_errors_and_rejects_deltas() {
+    use tape_rs::ltfs::{recovery::capture_full_recovery, volume::read_label_only};
+    use tape_rs::tape::commands::TapeDrive;
+    let (_lib, dev) = setup();
+    commit_file(&dev, "/a", 1);
+    let label = read_label_only(&dev).unwrap();
+    let tiny = RecoveryBudget {
+        max_index_bytes: 1,
+        ..Default::default()
+    };
+    let error =
+        capture_full_recovery(&TapeDrive::new(&dev), &label, &tiny, &mut Vec::new()).unwrap_err();
+    assert!(error.to_string().contains("超过预算"), "{error}");
+    dev.inject(Fault {
+        opcode: opcode::READ_6,
+        action: FaultAction::HostError(3),
+        after: 0,
+        remaining: 1,
+    });
+    let error = capture_full_recovery(
+        &TapeDrive::new(&dev),
+        &label,
+        &RecoveryBudget::default(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, TapeError::ScsiHost(3)), "{error}");
+    dev.clear_faults();
+    let mut volume = LtfsVolume::mount(&dev).unwrap();
+    volume
+        .append_file("/delta", &mut Cursor::new(payload(50_000, 3)))
+        .unwrap();
+    volume.commit_incremental().unwrap();
+    drop(volume);
+    assert!(
+        capture_full_recovery(
+            &TapeDrive::new(&dev),
+            &label,
+            &RecoveryBudget::default(),
+            &mut Vec::new()
+        )
+        .is_err()
+    );
 }

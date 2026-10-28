@@ -141,6 +141,13 @@ pub struct DirectoryNode {
     pub xattrs: Vec<Xattr>,
 }
 
+/// 完整索引逐条扫描得到的节点。目录在其子节点之后到达，路径相对卷根。
+#[derive(Debug)]
+pub enum IndexEntry {
+    File { path: String, node: FileNode },
+    Directory { path: String, node: DirectoryNode },
+}
+
 #[derive(Debug, Clone)]
 pub struct LtfsIndex {
     pub incremental: bool,
@@ -257,9 +264,56 @@ impl LtfsIndex {
 
     /// 从分段输入解析索引，不保留整份 XML；内存只含事件缓冲与文件树。
     pub fn parse_reader<R: std::io::BufRead>(input: R) -> Result<Self> {
+        Self::parse_with(input, false, false, true, |_| Ok(()))
+    }
+
+    /// 逐条扫描完整索引，避免把全部文件挂进内存目录树。回调失败立即停止；
+    /// 回调结果在函数成功返回前只是暂存数据，调用方不可提前发布。
+    /// 根目录也通过回调发出，路径为空；返回的索引仅包含头部和根目录属性，
+    /// `root.files/subdirs` 为空。
+    pub fn scan_full_reader<R: std::io::BufRead, F: FnMut(IndexEntry) -> Result<()>>(
+        input: R,
+        emit: F,
+    ) -> Result<Self> {
+        Self::parse_with(input, true, false, true, emit)
+    }
+
+    /// Stream a raw incremental construct without materializing the full
+    /// volume tree. Emitted nodes are delta entries, not complete file views.
+    pub fn scan_incremental_reader<R: std::io::BufRead, F: FnMut(IndexEntry) -> Result<()>>(
+        input: R,
+        emit: F,
+    ) -> Result<Self> {
+        Self::parse_with(input, true, true, true, emit)
+    }
+
+    /// The callback must enforce unique paths on disk and keep all output
+    /// provisional until this entire construct has been validated. This seam
+    /// avoids an in-memory set proportional to the number of delta entries.
+    #[cfg(feature = "fdb")]
+    pub(crate) fn scan_incremental_reader_to_disk<
+        R: std::io::BufRead,
+        F: FnMut(IndexEntry) -> Result<()>,
+    >(
+        input: R,
+        emit: F,
+    ) -> Result<Self> {
+        Self::parse_with(input, true, true, false, emit)
+    }
+
+    fn parse_with<R: std::io::BufRead, F: FnMut(IndexEntry) -> Result<()>>(
+        input: R,
+        streaming: bool,
+        incremental_stream: bool,
+        check_paths: bool,
+        mut emit: F,
+    ) -> Result<Self> {
         let mut reader = Reader::from_reader(input);
         reader.config_mut().trim_text(false);
         let mut p = IndexParser::new();
+        p.streaming = streaming;
+        p.incremental_stream = incremental_stream;
+        let mut seen_paths = BTreeSet::new();
         let mut bufv = Vec::new();
         loop {
             bufv.clear();
@@ -278,9 +332,30 @@ impl LtfsIndex {
                 ),
                 _ => {}
             }
+            if let Some(entry) = p.pending_entry.take() {
+                if incremental_stream {
+                    super::incremental::validate_incremental_entry(&entry)?;
+                    let path = match &entry {
+                        IndexEntry::File { path, .. } | IndexEntry::Directory { path, .. } => path,
+                    };
+                    if check_paths && !seen_paths.insert(path.clone()) {
+                        return Err(TapeError::Ltfs("增量索引包含重复路径".into()));
+                    }
+                }
+                emit(entry)?;
+            }
         }
         let index = p.finish()?;
+        if streaming && index.incremental != incremental_stream {
+            return Err(TapeError::Ltfs("逐条扫描的索引类型不匹配".into()));
+        }
         index.validate_incremental()?;
+        if streaming && !index.unknown_elements.is_empty() {
+            return Err(TapeError::Ltfs(format!(
+                "逐条扫描遇到无法保真的索引元素: {}",
+                index.unknown_elements.join(", ")
+            )));
+        }
         Ok(index)
     }
 
@@ -370,7 +445,7 @@ impl LtfsIndex {
         }
         write_u64(&mut w, "highestfileuid", self.highest_file_uid)?;
 
-        write_directory(&mut w, &self.root, /*is_root=*/ true)?;
+        write_directory(&mut w, &self.root, self.incremental)?;
 
         w.write_event(Event::End(BytesEnd::new(root_name)))?;
         Ok(())
@@ -521,7 +596,7 @@ fn write_xattrs<W: std::io::Write>(w: &mut Writer<W>, xattrs: &[Xattr]) -> Resul
     Ok(())
 }
 
-fn write_file<W: std::io::Write>(w: &mut Writer<W>, f: &FileNode) -> Result<()> {
+fn write_file<W: std::io::Write>(w: &mut Writer<W>, f: &FileNode, incremental: bool) -> Result<()> {
     w.write_event(Event::Start(BytesStart::new("file")))?;
     write_text(w, "name", &f.name)?;
     if f.delta_fields
@@ -538,7 +613,7 @@ fn write_file<W: std::io::Write>(w: &mut Writer<W>, f: &FileNode) -> Result<()> 
     write_meta(w, &f.meta, &f.delta_fields)?;
     if present(&f.delta_fields, "extendedattributes") {
         write_xattrs(w, &f.xattrs)?;
-        if f.xattrs.is_empty() && f.delta_fields.is_some() {
+        if f.xattrs.is_empty() && (incremental || f.delta_fields.is_some()) {
             w.write_event(Event::Empty(BytesStart::new("extendedattributes")))?;
         }
     }
@@ -574,10 +649,9 @@ fn write_file<W: std::io::Write>(w: &mut Writer<W>, f: &FileNode) -> Result<()> 
 fn write_directory<W: std::io::Write>(
     w: &mut Writer<W>,
     d: &DirectoryNode,
-    is_root: bool,
+    incremental: bool,
 ) -> Result<()> {
     w.write_event(Event::Start(BytesStart::new("directory")))?;
-    let _ = is_root;
     write_text(w, "name", &d.name)?;
     if d.delta_fields
         .as_ref()
@@ -590,16 +664,16 @@ fn write_directory<W: std::io::Write>(
     write_meta(w, &d.meta, &d.delta_fields)?;
     if present(&d.delta_fields, "extendedattributes") {
         write_xattrs(w, &d.xattrs)?;
-        if d.xattrs.is_empty() && d.delta_fields.is_some() {
+        if d.xattrs.is_empty() && (incremental || d.delta_fields.is_some()) {
             w.write_event(Event::Empty(BytesStart::new("extendedattributes")))?;
         }
     }
     w.write_event(Event::Start(BytesStart::new("contents")))?;
     for f in &d.files {
-        write_file(w, f)?;
+        write_file(w, f, incremental)?;
     }
     for sub in &d.subdirs {
-        write_directory(w, sub, false)?;
+        write_directory(w, sub, incremental)?;
     }
     w.write_event(Event::End(BytesEnd::new("contents")))?;
     w.write_event(Event::End(BytesEnd::new("directory")))?;
@@ -610,6 +684,10 @@ fn write_directory<W: std::io::Write>(
 
 /// 栈式 XML 状态机：维护 path 栈 + "当前"目录/文件/extent。
 struct IndexParser {
+    streaming: bool,
+    incremental_stream: bool,
+    root_seen: bool,
+    pending_entry: Option<IndexEntry>,
     incremental: bool,
     previous_incremental_location: Option<IndexLocation>,
     header_fields: BTreeSet<String>,
@@ -689,6 +767,10 @@ const KNOWN_ELEMENTS: &[&str] = &[
 impl IndexParser {
     fn new() -> Self {
         Self {
+            streaming: false,
+            incremental_stream: false,
+            root_seen: false,
+            pending_entry: None,
             incremental: false,
             previous_incremental_location: None,
             header_fields: BTreeSet::new(),
@@ -743,6 +825,14 @@ impl IndexParser {
         }
         match name.as_str() {
             "ltfsindex" | "ltfsincrementalindex" => {
+                if self.streaming && name == "ltfsincrementalindex" && !self.incremental_stream {
+                    return Err(TapeError::Ltfs(
+                        "逐条扫描仅支持完整索引；增量索引须先重放".into(),
+                    ));
+                }
+                if self.streaming && name == "ltfsindex" && self.incremental_stream {
+                    return Err(TapeError::Ltfs("增量逐条扫描收到完整索引".into()));
+                }
                 self.incremental = name == "ltfsincrementalindex";
                 for a in e.attributes().flatten() {
                     if a.key.as_ref() == b"version" {
@@ -751,6 +841,14 @@ impl IndexParser {
                 }
             }
             "directory" => {
+                if self.streaming
+                    && self.path.last().is_some_and(|parent| {
+                        parent == "ltfsindex" || parent == "ltfsincrementalindex"
+                    })
+                    && self.root_seen
+                {
+                    return Err(TapeError::Ltfs("完整索引包含多个根目录".into()));
+                }
                 self.dir_stack.push(DirectoryNode {
                     delta_fields: self.incremental.then(BTreeSet::new),
                     ..Default::default()
@@ -975,7 +1073,14 @@ impl IndexParser {
         // 离开 <file>：把它加到当前目录的 files 里
         if name == "file" {
             if let (Some(file), Some(dir)) = (self.file_stack.pop(), self.dir_stack.last_mut()) {
-                dir.files.push(file);
+                if self.streaming {
+                    let path = self.entry_path(&file.name);
+                    self.pending_entry = Some(IndexEntry::File { path, node: file });
+                } else {
+                    dir.files.push(file);
+                }
+            } else if self.streaming {
+                return Err(TapeError::Ltfs("索引文件缺少父目录".into()));
             }
             return Ok(());
         }
@@ -983,7 +1088,19 @@ impl IndexParser {
         // 离开 <directory>：pop 出来，附加到父目录 subdirs（若还有父目录）
         if name == "directory" {
             if let Some(done) = self.dir_stack.pop() {
-                if let Some(parent_dir) = self.dir_stack.last_mut() {
+                if self.streaming {
+                    let path = self.entry_path(&done.name);
+                    if self.dir_stack.is_empty() {
+                        self.root_seen = true;
+                        self.pending_entry = Some(IndexEntry::Directory {
+                            path,
+                            node: done.clone(),
+                        });
+                        self.dir_stack.push(done);
+                    } else {
+                        self.pending_entry = Some(IndexEntry::Directory { path, node: done });
+                    }
+                } else if let Some(parent_dir) = self.dir_stack.last_mut() {
                     parent_dir.subdirs.push(done);
                 } else {
                     // root：保留到 finish() 里取
@@ -994,6 +1111,23 @@ impl IndexParser {
         }
 
         Ok(())
+    }
+
+    fn entry_path(&self, name: &str) -> String {
+        let mut path = String::new();
+        for dir in self.dir_stack.iter().skip(1) {
+            if !path.is_empty() {
+                path.push('/');
+            }
+            path.push_str(&dir.name);
+        }
+        if !name.is_empty() {
+            if !path.is_empty() {
+                path.push('/');
+            }
+            path.push_str(name);
+        }
+        path
     }
 
     fn finish(mut self) -> Result<LtfsIndex> {
@@ -1081,6 +1215,8 @@ fn apply_meta(m: &mut NodeMeta, tag: &str, text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{OpenOptions, remove_file};
+    use std::io::{BufReader, BufWriter, Seek, Write};
 
     #[test]
     fn empty_roundtrip() {
@@ -1141,6 +1277,130 @@ mod tests {
         assert_eq!(f.length, 5);
         assert_eq!(f.extents.len(), 1);
         assert_eq!(f.extents[0].start_block, 10);
+    }
+
+    #[test]
+    fn streamed_full_index_preserves_nodes_without_retaining_children() {
+        let full = LtfsIndex::parse(IBM_STYLE.as_bytes()).unwrap();
+        let mut entries = Vec::new();
+        let scanned = LtfsIndex::scan_full_reader(IBM_STYLE.as_bytes(), |entry| {
+            entries.push(entry);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(scanned.volume_uuid, full.volume_uuid);
+        assert_eq!(scanned.generation, full.generation);
+        assert!(scanned.root.files.is_empty());
+        assert!(scanned.root.subdirs.is_empty());
+        assert_eq!(scanned.root.xattrs, full.root.xattrs);
+        let mut files = 0;
+        for entry in entries {
+            match entry {
+                IndexEntry::File { path, node } => {
+                    assert_eq!(&node, full.find_file(&path).unwrap());
+                    files += 1;
+                }
+                IndexEntry::Directory { path, node } => {
+                    assert!(node.files.is_empty() && node.subdirs.is_empty());
+                    if path.is_empty() {
+                        assert_eq!(node.meta, full.root.meta);
+                    } else {
+                        let parent = path.split('/').fold(&full.root, |dir, name| {
+                            dir.subdirs.iter().find(|child| child.name == name).unwrap()
+                        });
+                        assert_eq!(node.meta, parent.meta);
+                    }
+                }
+            }
+        }
+        assert_eq!(files, 2);
+    }
+
+    #[test]
+    fn streamed_index_rejects_incremental_and_propagates_callback_failure() {
+        let incremental = IBM_STYLE
+            .replace("<ltfsindex ", "<ltfsincrementalindex ")
+            .replace("</ltfsindex>", "</ltfsincrementalindex>");
+        assert!(LtfsIndex::scan_full_reader(incremental.as_bytes(), |_| Ok(())).is_err());
+        let mut emitted = 0;
+        assert!(
+            LtfsIndex::scan_full_reader(IBM_STYLE.as_bytes(), |_| {
+                emitted += 1;
+                Err(TapeError::Ltfs("暂存失败".into()))
+            })
+            .is_err()
+        );
+        assert_eq!(emitted, 1);
+        assert!(
+            LtfsIndex::scan_full_reader(&IBM_STYLE.as_bytes()[..IBM_STYLE.len() - 20], |_| {
+                Ok(())
+            })
+            .is_err()
+        );
+        let duplicate_root = IBM_STYLE.replace(
+            "</ltfsindex>",
+            "<directory><name>extra</name></directory></ltfsindex>",
+        );
+        assert!(LtfsIndex::scan_full_reader(duplicate_root.as_bytes(), |_| Ok(())).is_err());
+        let unknown = IBM_STYLE.replace(
+            "<highestfileuid>8</highestfileuid>",
+            "<highestfileuid>8</highestfileuid><vendor_extension/>",
+        );
+        assert!(LtfsIndex::scan_full_reader(unknown.as_bytes(), |_| Ok(())).is_err());
+    }
+
+    #[test]
+    #[ignore = "百万条索引解析压力测试，手工运行并测峰值 RSS"]
+    fn streamed_million_file_index_keeps_only_root_in_result() {
+        const COUNT: u64 = 1_000_000;
+        let path = std::env::temp_dir().join(format!(
+            "tape-rs-ltfs-index-scan-{}-{}.xml",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        {
+            let mut out = BufWriter::new(&mut file);
+            write!(
+                out,
+                "<ltfsindex version=\"2.4.0\"><creator>test</creator><volumeuuid>{}</volumeuuid>\
+                 <generationnumber>1</generationnumber><location><partition>b</partition>\
+                 <startblock>5</startblock></location><highestfileuid>{}</highestfileuid>\
+                 <directory><name></name><fileuid>1</fileuid><contents>",
+                Uuid::nil(),
+                COUNT + 1
+            )
+            .unwrap();
+            for number in 0..COUNT {
+                write!(
+                    out,
+                    "<file><name>f{number}</name><length>0</length><fileuid>{}</fileuid></file>",
+                    number + 2
+                )
+                .unwrap();
+            }
+            out.write_all(b"</contents></directory></ltfsindex>")
+                .unwrap();
+            out.flush().unwrap();
+        }
+        file.rewind().unwrap();
+        let mut count = 0;
+        let index = LtfsIndex::scan_full_reader(BufReader::new(file), |entry| {
+            if let IndexEntry::File { path, node } = entry {
+                assert_eq!(path, node.name);
+                count += 1;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, COUNT);
+        assert!(index.root.files.is_empty());
+        remove_file(path).unwrap();
     }
 
     #[test]

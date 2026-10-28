@@ -14,6 +14,7 @@ use slog::Drain;
 use super::coordinator::Coordinator;
 use super::directory::{Directory, PoolRow};
 use super::executor::{ExecEvent, ExecRequest};
+use super::files::FileService;
 use super::net::{AdminReply, DirectoryFetch, Network, NodeInput};
 use super::state::{Applied, Command, ControlSnapshot, ControlState, Executor, split_catalog};
 use super::store::{ControlStorage, RaftStore, SnapshotPolicy};
@@ -54,6 +55,7 @@ pub struct CoordinationConfig {
 /// 对外可见的节点状态快照。
 #[derive(Debug, Clone, Default)]
 pub struct NodeStatus {
+    pub management: Arc<serde_json::Value>,
     pub vips: std::collections::BTreeMap<std::net::Ipv4Addr, super::state::VipRecord>,
     pub id: u64,
     /// 已开始计划停机；HTTP VIP 应先撤下，设备许可仍可续持到安全收尾。
@@ -63,6 +65,10 @@ pub struct NodeStatus {
     pub leader: u64,
     pub executor: Option<Executor>,
     pub executor_ready: bool,
+    pub catalog_quiesce_index: Option<u64>,
+    pub catalog_frozen_index: Option<u64>,
+    /// 本库正在原子合并大目录；数据入口暂缓，设备许可继续续期。
+    pub catalog_pending: bool,
     pub candidates: std::collections::BTreeMap<u64, super::state::Candidate>,
     /// 本节点执行线程的最新状态
     pub local: String,
@@ -89,6 +95,7 @@ pub struct ReclaimRecord {
 /// 一盘带在控制状态里的概况。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TapeRow {
+    pub volume_uuid: String,
     pub state: String,
     pub generation: u64,
     /// 索引里的文件数
@@ -122,6 +129,21 @@ pub fn run(
 #[allow(clippy::too_many_arguments)]
 pub fn run_with(
     cfg: NodeConfig,
+    store: RaftStore,
+    net: Box<dyn Network>,
+    fetcher: Option<Arc<dyn DirectoryFetch>>,
+    self_tx: Option<Sender<NodeInput>>,
+    inbox: Receiver<NodeInput>,
+    exec: Sender<ExecRequest>,
+    status: SharedStatus,
+) -> Result<()> {
+    run_with_catalog(cfg, store, net, fetcher, self_tx, inbox, exec, status, None)
+}
+
+/// 生产入口把已应用的目录切换屏障同步到文件服务；旧测试入口仍可独立驱动状态机。
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_catalog(
+    cfg: NodeConfig,
     mut store: RaftStore,
     net: Box<dyn Network>,
     fetcher: Option<Arc<dyn DirectoryFetch>>,
@@ -129,6 +151,7 @@ pub fn run_with(
     inbox: Receiver<NodeInput>,
     exec: Sender<ExecRequest>,
     status: SharedStatus,
+    catalog_files: Option<Arc<FileService>>,
 ) -> Result<()> {
     let raft_cfg = Config {
         id: cfg.id,
@@ -155,6 +178,9 @@ pub fn run_with(
             }
             None => return Err(TapeError::Ltfs("快照里的控制状态无法解析".into())),
         }
+    }
+    if let Some(files) = catalog_files.as_ref() {
+        files.set_catalog_quiesced(ctl.catalog_quiesce_index.is_some());
     }
     let mut directory = match &cfg.directory_file {
         Some(p) => Some(Directory::open(p)?),
@@ -209,6 +235,9 @@ pub fn run_with(
         }
         let wait = next_tick.saturating_duration_since(Instant::now());
         match inbox.recv_timeout(wait) {
+            Ok(NodeInput::Library { .. }) => {
+                warn!("单库节点拒绝多库输入");
+            }
             Ok(NodeInput::Shutdown) => {
                 if shutdown.is_some() {
                     continue;
@@ -332,6 +361,35 @@ pub fn run_with(
                 } else {
                     let is_leader = node.raft.state == StateRole::Leader;
                     match ev {
+                        ExecEvent::Management { round, command } => {
+                            if my_round == Some(round) && is_leader {
+                                propose(&mut node, &command);
+                            }
+                        }
+                        ExecEvent::FileTask {
+                            task,
+                            round,
+                            pool,
+                            path,
+                            status,
+                            generation,
+                            reason,
+                        } => {
+                            if my_round == Some(round) && is_leader {
+                                propose(
+                                    &mut node,
+                                    &Command::FileTask {
+                                        task,
+                                        round,
+                                        pool,
+                                        path,
+                                        status,
+                                        generation,
+                                        reason,
+                                    },
+                                );
+                            }
+                        }
                         ExecEvent::Fenced { round } if my_round == Some(round) && is_leader => {
                             local = format!("轮次 {}：全部设备已隔离，等待多数派确认", round);
                             propose(
@@ -577,6 +635,9 @@ pub fn run_with(
             };
             info!("装入节点 {} 的快照，日志从索引 {} 起", s.source, index);
             ctl = s.control;
+            if let Some(files) = catalog_files.as_ref() {
+                files.set_catalog_quiesced(ctl.catalog_quiesce_index.is_some());
+            }
             applied = index;
             if let Some(r) = my_round.take() {
                 let _ = exec.send(ExecRequest::Stop {
@@ -605,6 +666,9 @@ pub fn run_with(
             let is_leader = node.raft.state == StateRole::Leader;
             let term = node.raft.term;
             let applied = ctl.apply(entry.index, &cmd);
+            if let Some(files) = catalog_files.as_ref() {
+                files.set_catalog_quiesced(ctl.catalog_quiesce_index.is_some());
+            }
             // 等目录库拉回来期间不写本地库：它马上要被整份替换，写进去的会一起丢掉
             if let Some(d) = directory.as_mut().filter(|_| directory_pending.is_none()) {
                 d.apply(entry.index, &cmd, &applied)?;
@@ -616,11 +680,14 @@ pub fn run_with(
                 let _ = tx.send(match &applied {
                     Applied::Admin(Ok(s)) => AdminReply::Ok(s.clone()),
                     Applied::Admin(Err(e)) => AdminReply::Rejected(e.clone()),
+                    Applied::CatalogRejected => {
+                        AdminReply::Rejected("旧目录已暂停或冻结，拒绝新的变更".into())
+                    }
                     _ => AdminReply::Ok("已应用".to_string()),
                 });
             }
             if let Some(c) = coordinator.as_mut() {
-                c.observe(&ctl);
+                c.observe(&ctl, directory_pending.is_none());
                 continue;
             }
             match applied {
@@ -805,7 +872,7 @@ fn yield_leadership(node: &mut RawNode<ControlStorage>, cfg: &NodeConfig) {
 
 /// raft-rs 的 Ready 处理。先持久化、再发送需要持久化之后才能发的消息。
 /// 返回 (本轮装入的快照, 已提交的条目)。
-fn on_ready(
+pub(super) fn on_ready(
     node: &mut RawNode<ControlStorage>,
     store: &mut RaftStore,
     net: &dyn Network,
@@ -845,7 +912,7 @@ fn on_ready(
     Ok((installed, committed, reads))
 }
 
-fn publish_status(
+pub(super) fn publish_status(
     cfg: &NodeConfig,
     node: &RawNode<ControlStorage>,
     ctl: &ControlState,
@@ -854,13 +921,28 @@ fn publish_status(
     shared: &SharedStatus,
     last: &mut String,
 ) {
+    let (shutting_down, catalog_pending) = {
+        let previous = shared.lock().unwrap_or_else(|e| e.into_inner());
+        (previous.shutting_down, previous.catalog_pending)
+    };
     let st = NodeStatus {
+        management: {
+            let previous = shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .management
+                .clone();
+            if previous["revision"] == ctl.management["revision"]
+                && (ctl.management.is_null() || ctl.management["revision"].is_number())
+            {
+                previous
+            } else {
+                Arc::new(ctl.management.clone())
+            }
+        },
         vips: ctl.vips.clone(),
         id: cfg.id,
-        shutting_down: shared
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .shutting_down,
+        shutting_down,
         drives: cfg.drives,
         last_reclaim: last_reclaim.clone(),
         role: format!("{:?}", node.raft.state),
@@ -868,6 +950,9 @@ fn publish_status(
         leader: node.raft.leader_id,
         executor: ctl.executor.clone(),
         executor_ready: ctl.executor_ready,
+        catalog_quiesce_index: ctl.catalog_quiesce_index,
+        catalog_frozen_index: ctl.catalog_frozen_index,
+        catalog_pending,
         candidates: ctl.candidates.clone(),
         local: local.to_string(),
         applied_index: ctl.applied_index,
@@ -899,6 +984,7 @@ fn publish_status(
                 (
                     b.clone(),
                     TapeRow {
+                        volume_uuid: su.volume_uuid,
                         state,
                         generation: su.generation,
                         files: su.files,

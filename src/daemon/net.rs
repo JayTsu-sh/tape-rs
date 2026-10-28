@@ -26,6 +26,11 @@ use crate::error::{Result, TapeError};
 /// Raft 循环的全部输入。
 #[derive(Debug)]
 pub enum NodeInput {
+    /// 多库模式的本机事件；不允许从网络反序列化。
+    Library {
+        library: String,
+        event: Box<NodeInput>,
+    },
     Raft(Box<Message>),
     Exec(ExecEvent),
     /// 本机 VIP 网络线程的幂等预约/撤址确认；经 Raft 转交 Leader，不走 HTTP 管理入口。

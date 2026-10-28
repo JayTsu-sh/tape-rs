@@ -12,6 +12,7 @@
 pub mod db;
 pub mod query;
 pub mod sync;
+pub mod volume_extents;
 
 pub use db::{Catalog, resolve_path};
 pub use query::{CapacitySnapshot, FileHit, VolumeRow};

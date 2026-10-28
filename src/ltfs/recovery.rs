@@ -19,6 +19,7 @@
 //! 实际构造，提示无效即退回标准反向搜索。EOD 与尾部分类不因快速路径省略。
 
 use log::{debug, info, warn};
+use sha2::{Digest, Sha256};
 use std::io::{BufRead, Read};
 
 use crate::error::{Result, TapeError};
@@ -29,6 +30,11 @@ use super::index::{IndexLocation, LtfsIndex};
 use super::label::LtfsLabel;
 use super::mam::{Mam, VolumeCoherencyInfo, vcr_is_valid, vcr_matches};
 use super::volume::P1_DATA_START;
+
+#[cfg(feature = "fdb")]
+mod streamed;
+#[cfg(feature = "fdb")]
+pub use streamed::{StreamedFullRecovery, capture_full_recovery};
 
 /// 末索引之后区域的分类（协议中的 T0—T4，另加"尚无索引的空数据区"）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,12 +66,29 @@ pub struct IndexCandidate {
     pub start_block: u64,
     /// 结束文件标记的块号。
     pub end_block: u64,
+    /// 该物理索引构造原文的摘要；增量重放后的内存视图不可据此建完整索引缓存。
+    pub construct_sha256: [u8; 32],
     pub index: LtfsIndex,
 }
+
+/// Identity of a predecessor construct read while replaying a DP delta chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IndexEvidence {
+    pub generation: u64,
+    pub location: IndexLocation,
+    pub sha256: [u8; 32],
+    pub incremental: bool,
+}
+
+#[cfg(feature = "fdb")]
+pub use super::index_scratch::IndexScratchBudget;
 
 /// 搜索预算。数值默认值仅为开发默认，正式值由 08/06 测量后确定。
 #[derive(Debug, Clone)]
 pub struct RecoveryBudget {
+    /// Disposable proof database; owner paths use the library data directory.
+    #[cfg(feature = "fdb")]
+    pub index_scratch: IndexScratchBudget,
     /// 每分区反向步进（构造）次数上限。
     pub max_back_steps: u32,
     /// 单个索引构造允许读取的最大字节数。
@@ -77,6 +100,8 @@ pub struct RecoveryBudget {
 impl Default for RecoveryBudget {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "fdb")]
+            index_scratch: IndexScratchBudget::default(),
             max_back_steps: 8,
             max_index_bytes: 8usize << 30,
             max_chain_len: 64,
@@ -203,6 +228,7 @@ fn back_fm(drive: &TapeDrive<'_>) -> Result<Option<u64>> {
 struct IndexConstruct {
     prefix: Vec<u8>,
     len: usize,
+    sha256: [u8; 32],
     parsed: Option<Result<LtfsIndex>>,
 }
 
@@ -228,6 +254,25 @@ struct ConstructReader<'a, 'd> {
     ended: bool,
     done: bool,
     error: Option<TapeError>,
+    sha: Sha256,
+}
+
+impl<'a, 'd> ConstructReader<'a, 'd> {
+    fn new(drive: &'a TapeDrive<'d>, start: u64, block_size: usize, max_bytes: usize) -> Self {
+        Self {
+            drive,
+            buf: vec![0; block_size],
+            offset: 0,
+            available: 0,
+            bytes: 0,
+            max_bytes,
+            next: start,
+            ended: false,
+            done: false,
+            error: None,
+            sha: Sha256::new(),
+        }
+    }
 }
 
 impl BufRead for ConstructReader<'_, '_> {
@@ -240,6 +285,7 @@ impl BufRead for ConstructReader<'_, '_> {
                     self.done = true;
                 }
                 Ok(n) => {
+                    self.sha.update(&self.buf[..n]);
                     self.next += 1;
                     self.bytes = self
                         .bytes
@@ -285,6 +331,69 @@ impl Read for ConstructReader<'_, '_> {
     }
 }
 
+/// 只读重读一个已由恢复协议核验的完整索引构造，EOF 同时核对结束文件标记位置。
+pub(crate) struct ConfirmedIndexReader<'a, 'd> {
+    inner: ConstructReader<'a, 'd>,
+    expected_next: u64,
+}
+
+impl ConfirmedIndexReader<'_, '_> {
+    pub(crate) fn take_device_error(&mut self) -> Option<TapeError> {
+        self.inner.error.take()
+    }
+}
+
+impl Read for ConfirmedIndexReader<'_, '_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let n = self.inner.read(out)?;
+        if n == 0 && (!self.inner.ended || self.inner.next != self.expected_next) {
+            return Err(std::io::Error::other("索引构造结束文件标记位置不符"));
+        }
+        Ok(n)
+    }
+}
+
+pub(crate) fn confirmed_index_reader<'a, 'd>(
+    drive: &'a TapeDrive<'d>,
+    label: &LtfsLabel,
+    candidate: &IndexCandidate,
+    budget: &RecoveryBudget,
+) -> Result<ConfirmedIndexReader<'a, 'd>> {
+    let part_char = candidate.index.self_location.partition;
+    let partition = match part_char {
+        'a' => 0,
+        'b' => 1,
+        _ => return Err(TapeError::Ltfs("索引分区代号非法".into())),
+    };
+    if candidate.index.incremental
+        || candidate.index.materialized
+        || candidate.end_block < candidate.start_block
+    {
+        return Err(TapeError::Ltfs(
+            "不能从增量或非完整索引建立 extent 缓存".into(),
+        ));
+    }
+    validate_candidate(&candidate.index, label, part_char, candidate.start_block)
+        .map_err(|reason| TapeError::RecoveryRestricted { reason })?;
+    let expected_next = candidate
+        .end_block
+        .checked_add(1)
+        .ok_or_else(|| TapeError::Ltfs("索引结束块号溢出".into()))?;
+    drive.locate(partition, candidate.start_block, true)?;
+    Ok(ConfirmedIndexReader {
+        inner: ConstructReader::new(
+            drive,
+            candidate.start_block,
+            label.blocksize as usize,
+            budget.max_index_bytes,
+        ),
+        expected_next,
+    })
+}
+
 fn read_until_fm(
     drive: &TapeDrive<'_>,
     partition: u8,
@@ -293,18 +402,7 @@ fn read_until_fm(
     max_bytes: usize,
 ) -> Result<(IndexConstruct, bool, u64)> {
     drive.locate(partition, start, true)?;
-    let mut reader = ConstructReader {
-        drive,
-        buf: vec![0; block_size],
-        offset: 0,
-        available: 0,
-        bytes: 0,
-        max_bytes,
-        next: start,
-        ended: false,
-        done: false,
-        error: None,
-    };
+    let mut reader = ConstructReader::new(drive, start, block_size, max_bytes);
     // 前缀可跨短记录，解析时将这些字节接回流的开头。
     let mut prefix = Vec::new();
     while prefix.len() < 512 {
@@ -322,6 +420,7 @@ fn read_until_fm(
     let mut result = IndexConstruct {
         prefix,
         len: 0,
+        sha256: [0; 32],
         parsed: None,
     };
     if looks_like_index(&result) {
@@ -341,7 +440,489 @@ fn read_until_fm(
         return Err(e);
     }
     result.len = reader.bytes;
+    result.sha256 = reader.sha.finalize().into();
     Ok((result, reader.ended, reader.next))
+}
+
+/// Re-read the exact latest DP construct after mount replay has materialized
+/// its in-memory view. The returned index remains the raw on-tape delta.
+pub(crate) fn verified_raw_dp_index(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    candidate: &IndexCandidate,
+    budget: &RecoveryBudget,
+) -> Result<LtfsIndex> {
+    if candidate.index.self_location.partition != label.data_partition {
+        return Err(TapeError::Ltfs("当前索引不在数据分区".into()));
+    }
+    let (bytes, ended, next) = read_until_fm(
+        drive,
+        1,
+        candidate.start_block,
+        label.blocksize as usize,
+        budget.max_index_bytes,
+    )?;
+    if !ended
+        || next
+            != candidate
+                .end_block
+                .checked_add(1)
+                .ok_or_else(|| TapeError::Ltfs("索引块位置溢出".into()))?
+        || bytes.sha256 != candidate.construct_sha256
+    {
+        return Err(TapeError::Ltfs("当前介质索引构造与挂载证明不一致".into()));
+    }
+    let raw = bytes.parse()?;
+    validate_candidate(&raw, label, label.data_partition, candidate.start_block)
+        .map_err(TapeError::Ltfs)?;
+    if raw.generation != candidate.index.generation
+        || raw.self_location != candidate.index.self_location
+        || raw.incremental != candidate.index.incremental
+    {
+        return Err(TapeError::Ltfs("当前介质索引身份与挂载视图不一致".into()));
+    }
+    Ok(raw)
+}
+
+/// Re-read a catalog-recorded DP generation from its exact physical location.
+/// The digest binds the entire construct; incremental predecessors are replayed
+/// only after the recorded construct itself has been verified.
+#[cfg(feature = "fdb")]
+pub(crate) fn verified_materialized_dp_index(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    location: IndexLocation,
+    generation: u64,
+    sha256: [u8; 32],
+    incremental: bool,
+    budget: &RecoveryBudget,
+) -> Result<(LtfsIndex, Vec<IndexEvidence>)> {
+    if location.partition != label.data_partition || location.start_block < P1_DATA_START {
+        return Err(TapeError::Ltfs("前代索引不在数据分区".into()));
+    }
+    let (bytes, ended, next) = read_until_fm(
+        drive,
+        1,
+        location.start_block,
+        label.blocksize as usize,
+        budget.max_index_bytes,
+    )?;
+    if !ended || bytes.sha256 != sha256 {
+        return Err(TapeError::Ltfs("前代索引构造残缺或摘要不符".into()));
+    }
+    let raw = bytes.parse()?;
+    validate_candidate(&raw, label, label.data_partition, location.start_block)
+        .map_err(TapeError::Ltfs)?;
+    if raw.generation != generation
+        || raw.self_location != location
+        || raw.incremental != incremental
+    {
+        return Err(TapeError::Ltfs("前代索引身份与 FDB 记录不符".into()));
+    }
+    let mut candidate = IndexCandidate {
+        start_block: location.start_block,
+        end_block: next
+            .checked_sub(1)
+            .ok_or_else(|| TapeError::Ltfs("前代索引结束块号溢出".into()))?,
+        construct_sha256: sha256,
+        index: raw,
+    };
+    let mut predecessors = Vec::new();
+    if incremental {
+        replay_incremental_chain_with_evidence(drive, label, &mut candidate, budget, |index| {
+            predecessors.push(index)
+        })?;
+    }
+    if candidate.index.generation != generation
+        || candidate.index.self_location != location
+        || candidate.index.volume_uuid != label.volume_uuid
+    {
+        return Err(TapeError::Ltfs("前代增量重放身份不一致".into()));
+    }
+    Ok((candidate.index, predecessors))
+}
+
+/// Consume a catalog-recorded DP construct without retaining its XML or tree.
+/// A caller's output stays provisional until the closing filemark and exact
+/// whole-construct SHA-256 have been checked. `require_latest` also proves
+/// that the construct ends at data-partition EOD.
+#[cfg(feature = "fdb")]
+pub(crate) fn with_verified_dp_construct<T>(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    location: IndexLocation,
+    sha256: [u8; 32],
+    budget: &RecoveryBudget,
+    require_latest: bool,
+    consume: impl FnOnce(&mut dyn Read) -> Result<T>,
+) -> Result<T> {
+    if location.partition != label.data_partition || location.start_block < P1_DATA_START {
+        return Err(TapeError::Ltfs("FDB 索引不在数据分区".into()));
+    }
+    drive.locate(1, location.start_block, true)?;
+    let mut reader = ConstructReader::new(
+        drive,
+        location.start_block,
+        label.blocksize as usize,
+        budget.max_index_bytes,
+    );
+    let value = match consume(&mut reader) {
+        Ok(value) => value,
+        Err(error) => return Err(reader.error.take().unwrap_or(error)),
+    };
+    if let Err(error) = std::io::copy(&mut reader, &mut std::io::sink()) {
+        return Err(reader.error.take().unwrap_or(TapeError::Io(error)));
+    }
+    if !reader.ended || reader.sha.finalize().as_slice() != sha256 {
+        return Err(TapeError::Ltfs("FDB 索引构造残缺或摘要不符".into()));
+    }
+    if require_latest {
+        let expected_eod = reader.next;
+        drive.locate_eod(1)?;
+        let position = drive.read_position()?;
+        if position.partition != 1 || position.block_number != expected_eod {
+            return Err(TapeError::RecoveryRestricted {
+                reason: format!(
+                    "FDB 索引不是介质末索引: 构造结束块 {}，数据分区 EOD {}:{}",
+                    expected_eod, position.partition, position.block_number
+                ),
+            });
+        }
+    }
+    Ok(value)
+}
+
+/// Verify an exact latest DP construct and the current IP view. Equal-generation
+/// Full views must agree in all logical fields and link to the same DP head.
+/// Entries spill to a disposable SQLite database with an 8 MiB page cache.
+/// Incremental heads require a complete disk-backed replay to a Full baseline.
+/// This is read evidence, never a clean-unmount or writable-volume verdict.
+#[cfg(feature = "fdb")]
+pub fn verify_dp_ip_head(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    expected: super::volume::CommittedIndexConstruct,
+    budget: &RecoveryBudget,
+) -> Result<u64> {
+    verify_dp_ip_head_with_evidence(drive, label, expected, budget).map(|proof| proof.ip_generation)
+}
+
+/// Every replayed predecessor must additionally match the caller's durable
+/// catalog evidence before any content is released.
+#[cfg(feature = "fdb")]
+pub(crate) struct VerifiedDpIpHead {
+    pub ip_generation: u64,
+    pub predecessors: Vec<super::volume::CommittedIndexConstruct>,
+}
+
+#[cfg(feature = "fdb")]
+pub(crate) fn verify_dp_ip_head_with_evidence(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    expected: super::volume::CommittedIndexConstruct,
+    budget: &RecoveryBudget,
+) -> Result<VerifiedDpIpHead> {
+    if expected.volume_uuid != label.volume_uuid {
+        return Err(TapeError::Ltfs("FDB 索引卷身份与介质标签不符".into()));
+    }
+    if expected.incremental {
+        return verify_incremental_dp_ip_head(drive, label, expected, budget);
+    }
+    let comparison = super::index_equivalence::FullIndexComparison::new(&budget.index_scratch)?;
+    let dp = with_verified_dp_construct(
+        drive,
+        label,
+        expected.location,
+        expected.sha256,
+        budget,
+        true,
+        |reader| {
+            LtfsIndex::scan_full_reader(std::io::BufReader::new(reader), |entry| {
+                comparison.record(false, entry)
+            })
+        },
+    )?;
+    validate_candidate(
+        &dp,
+        label,
+        label.data_partition,
+        expected.location.start_block,
+    )
+    .map_err(TapeError::Ltfs)?;
+    if dp.generation != expected.generation || dp.self_location != expected.location {
+        return Err(TapeError::Ltfs("DP Full 索引身份与 FDB 记录不符".into()));
+    }
+    comparison.validate_highest_uid(false, dp.highest_file_uid)?;
+    let ip = scan_ip_not_ahead(drive, label, expected.generation, budget, |entry| {
+        comparison.record(true, entry)
+    })?;
+    comparison.validate_highest_uid(true, ip.highest_file_uid)?;
+    if ip.generation == expected.generation {
+        if ip.previous_location != Some(dp.self_location)
+            || ip.previous_incremental_location.is_some()
+            || !same_streamed_logical_header(&dp, &ip)
+        {
+            return Err(TapeError::RecoveryRestricted {
+                reason: "同代 DP/IP Full 索引头或根目录属性不一致".into(),
+            });
+        }
+        comparison.require_equal()?;
+    }
+    Ok(VerifiedDpIpHead {
+        ip_generation: ip.generation,
+        predecessors: Vec::new(),
+    })
+}
+
+#[cfg(feature = "fdb")]
+fn verify_incremental_dp_ip_head(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    expected: super::volume::CommittedIndexConstruct,
+    budget: &RecoveryBudget,
+) -> Result<VerifiedDpIpHead> {
+    let replay = super::index_replay::IndexReplay::new(&budget.index_scratch)?;
+    let head = with_verified_dp_construct(
+        drive,
+        label,
+        expected.location,
+        expected.sha256,
+        budget,
+        true,
+        |reader| {
+            LtfsIndex::scan_incremental_reader_to_disk(std::io::BufReader::new(reader), |entry| {
+                replay.stage(0, entry)
+            })
+        },
+    )?;
+    validate_candidate(
+        &head,
+        label,
+        label.data_partition,
+        expected.location.start_block,
+    )
+    .map_err(TapeError::Ltfs)?;
+    if head.generation != expected.generation || head.self_location != expected.location {
+        return Err(TapeError::Ltfs("DP 增量索引身份与 FDB 记录不符".into()));
+    }
+    let mut chain = vec![head];
+    let mut predecessors = Vec::new();
+    while chain.last().unwrap().incremental {
+        if predecessors.len() >= budget.max_chain_len as usize {
+            return Err(TapeError::RecoveryRestricted {
+                reason: "增量链重放预算耗尽".into(),
+            });
+        }
+        let current = chain.last().unwrap();
+        let location = current
+            .previous_incremental_location
+            .or(current.previous_location)
+            .ok_or_else(|| TapeError::Ltfs("增量缺少基线位置".into()))?;
+        if location.partition != label.data_partition
+            || location.start_block < P1_DATA_START
+            || location.start_block >= current.self_location.start_block
+        {
+            return Err(TapeError::Ltfs("增量前驱分区或方向非法".into()));
+        }
+        let incremental = current.previous_incremental_location.is_some();
+        drive.locate(1, location.start_block, true)?;
+        let mut reader = ConstructReader::new(
+            drive,
+            location.start_block,
+            label.blocksize as usize,
+            budget.max_index_bytes,
+        );
+        let emit = |entry| replay.stage(chain.len() as u32, entry);
+        let parsed = if incremental {
+            LtfsIndex::scan_incremental_reader_to_disk(&mut reader, emit)
+        } else {
+            LtfsIndex::scan_full_reader(&mut reader, emit)
+        };
+        let prior = match parsed {
+            Ok(index) => index,
+            Err(error) => return Err(reader.error.take().unwrap_or(error)),
+        };
+        if !reader.ended || reader.next > current.self_location.start_block {
+            return Err(TapeError::Ltfs("增量前驱构造残缺或与后继重叠".into()));
+        }
+        validate_candidate(&prior, label, label.data_partition, location.start_block)
+            .map_err(TapeError::Ltfs)?;
+        if prior.generation >= current.generation || prior.incremental != incremental {
+            return Err(TapeError::Ltfs("增量前驱类型或代数不符".into()));
+        }
+        predecessors.push(super::volume::CommittedIndexConstruct {
+            volume_uuid: prior.volume_uuid,
+            generation: prior.generation,
+            location: prior.self_location,
+            sha256: reader.sha.finalize().into(),
+            incremental,
+        });
+        chain.push(prior);
+    }
+    let mut view = chain.last().unwrap().clone();
+    replay.load_full((chain.len() - 1) as u32, view.highest_file_uid)?;
+    for id in (0..chain.len() - 1).rev() {
+        // The streamed headers retain root attributes but no children. Reuse
+        // the existing header/anchor/root merge rules on this bounded view.
+        view = view.apply_incremental(&chain[id])?;
+        replay.apply_delta(id as u32, view.highest_file_uid)?;
+    }
+    let ip = scan_ip_not_ahead(drive, label, expected.generation, budget, |entry| {
+        replay.record_ip(entry)
+    })?;
+    replay.validate(true, ip.highest_file_uid)?;
+    if ip.generation == expected.generation {
+        if ip.previous_location != view.previous_location
+            || ip.previous_incremental_location != Some(view.self_location)
+            || !same_streamed_logical_header(&view, &ip)
+        {
+            return Err(TapeError::RecoveryRestricted {
+                reason: "同代 DP 增量重放与 IP Full 索引头或根目录不一致".into(),
+            });
+        }
+        replay.require_equal()?;
+    }
+    Ok(VerifiedDpIpHead {
+        ip_generation: ip.generation,
+        predecessors,
+    })
+}
+
+// Physical back pointers have different roles: a DP Full may retain the
+// preceding delta pointer; an IP Full pointing at that DP Full has none.
+// Only child-free streamed/replayed headers are passed here. Entries are
+// compared separately on disk, and each caller checks the physical pointers.
+#[cfg(feature = "fdb")]
+fn same_streamed_logical_header(a: &LtfsIndex, b: &LtfsIndex) -> bool {
+    a.unknown_elements.is_empty()
+        && b.unknown_elements.is_empty()
+        && a.volume_uuid == b.volume_uuid
+        && a.generation == b.generation
+        && a.version == b.version
+        && a.update_time == b.update_time
+        && a.allow_policy_update == b.allow_policy_update
+        && a.highest_file_uid == b.highest_file_uid
+        && a.volume_lock_state == b.volume_lock_state
+        && a.comment == b.comment
+        && a.root == b.root
+}
+
+/// Check IP generation and construct boundaries only. Content-serving callers
+/// must use `verify_dp_ip_head` for equal-generation logical view validation.
+#[cfg(feature = "fdb")]
+pub fn verify_ip_not_ahead(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    dp_generation: u64,
+    budget: &RecoveryBudget,
+) -> Result<u64> {
+    scan_ip_not_ahead(drive, label, dp_generation, budget, |_| Ok(())).map(|index| index.generation)
+}
+
+#[cfg(feature = "fdb")]
+fn scan_ip_not_ahead(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    dp_generation: u64,
+    budget: &RecoveryBudget,
+    emit: impl FnMut(super::index::IndexEntry) -> Result<()>,
+) -> Result<LtfsIndex> {
+    drive.locate_eod(0)?;
+    let eod = drive.read_position()?;
+    if eod.partition != 0 {
+        return Err(TapeError::RecoveryRestricted {
+            reason: format!("IP EOD 分区错误: {}", eod.partition),
+        });
+    }
+    let end_mark = back_fm(drive)?.ok_or_else(|| TapeError::RecoveryRestricted {
+        reason: "IP 末尾缺少结束文件标记".into(),
+    })?;
+    let start_mark = back_fm(drive)?.ok_or_else(|| TapeError::RecoveryRestricted {
+        reason: "IP 末尾缺少起始文件标记".into(),
+    })?;
+    let start = start_mark
+        .checked_add(1)
+        .ok_or_else(|| TapeError::Ltfs("IP 索引起始块溢出".into()))?;
+    if start >= end_mark {
+        return Err(TapeError::RecoveryRestricted {
+            reason: "IP 末索引缺少数据记录".into(),
+        });
+    }
+    drive.locate(0, start, true)?;
+    let mut reader = ConstructReader::new(
+        drive,
+        start,
+        label.blocksize as usize,
+        budget.max_index_bytes,
+    );
+    let parsed = LtfsIndex::scan_full_reader(&mut reader, emit);
+    let index = match parsed {
+        Ok(index) => index,
+        Err(error) => return Err(reader.error.take().unwrap_or(error)),
+    };
+    if !reader.ended
+        || end_mark.checked_add(1) != Some(reader.next)
+        || reader.next != eod.block_number
+    {
+        return Err(TapeError::RecoveryRestricted {
+            reason: "IP 末索引边界或尾部不完整".into(),
+        });
+    }
+    validate_candidate(&index, label, label.index_partition, start).map_err(TapeError::Ltfs)?;
+    if index.incremental {
+        return Err(TapeError::Ltfs("IP 末索引不是 Full 构造".into()));
+    }
+    if index.generation > dp_generation {
+        return Err(TapeError::RecoveryRestricted {
+            reason: format!(
+                "IP 索引代数 {} 领先 FDB 已观察 DP 代数 {}",
+                index.generation, dp_generation
+            ),
+        });
+    }
+    Ok(index)
+}
+
+/// Stream a catalog-recorded Full DP construct without retaining its XML or
+/// directory tree. Callers must treat emitted entries as provisional until the
+/// final filemark, SHA-256 and identity checks have all succeeded.
+#[cfg(feature = "fdb")]
+pub(crate) fn scan_verified_full_dp_index<F>(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    location: IndexLocation,
+    generation: u64,
+    sha256: [u8; 32],
+    budget: &RecoveryBudget,
+    emit: F,
+) -> Result<LtfsIndex>
+where
+    F: FnMut(crate::ltfs::index::IndexEntry) -> Result<()>,
+{
+    if location.partition != label.data_partition || location.start_block < P1_DATA_START {
+        return Err(TapeError::Ltfs("Full 索引不在数据分区".into()));
+    }
+    drive.locate(1, location.start_block, true)?;
+    let mut reader = ConstructReader::new(
+        drive,
+        location.start_block,
+        label.blocksize as usize,
+        budget.max_index_bytes,
+    );
+    let parsed = LtfsIndex::scan_full_reader(&mut reader, emit);
+    let index = match parsed {
+        Ok(index) => index,
+        Err(error) => return Err(reader.error.take().unwrap_or(error)),
+    };
+    if !reader.ended || reader.sha.finalize().as_slice() != sha256 {
+        return Err(TapeError::Ltfs("Full 索引构造残缺或摘要不符".into()));
+    }
+    validate_candidate(&index, label, label.data_partition, location.start_block)
+        .map_err(TapeError::Ltfs)?;
+    if index.incremental || index.generation != generation || index.self_location != location {
+        return Err(TapeError::Ltfs("Full 索引身份与 FDB 记录不符".into()));
+    }
+    Ok(index)
 }
 
 fn looks_like_index(bytes: &IndexConstruct) -> bool {
@@ -433,27 +1014,31 @@ pub fn scan_partition(
             notes.push(format!("VCI 提示块 {} 超出分区范围 (EOD {})", b, eod));
         } else {
             match read_until_fm(drive, partition, b, block_size, budget.max_index_bytes) {
-                Ok((bytes, true, next)) if looks_like_index(&bytes) => match bytes.parse() {
-                    Ok(idx) => match validate_candidate(&idx, label, part_char, b) {
-                        Ok(()) => {
-                            info!(
-                                "分区 {} VCI 快速路径命中 gen={} @ {}..{}",
-                                partition,
-                                idx.generation,
-                                b,
-                                next - 1
-                            );
-                            last_index = Some(IndexCandidate {
-                                start_block: b,
-                                end_block: next - 1,
-                                index: idx,
-                            });
-                            hint_used = true;
-                        }
-                        Err(why) => notes.push(format!("VCI 提示 @{} 无效: {}", b, why)),
-                    },
-                    Err(e) => notes.push(format!("VCI 提示 @{} 解析失败: {}", b, e)),
-                },
+                Ok((bytes, true, next)) if looks_like_index(&bytes) => {
+                    let construct_sha256 = bytes.sha256;
+                    match bytes.parse() {
+                        Ok(idx) => match validate_candidate(&idx, label, part_char, b) {
+                            Ok(()) => {
+                                info!(
+                                    "分区 {} VCI 快速路径命中 gen={} @ {}..{}",
+                                    partition,
+                                    idx.generation,
+                                    b,
+                                    next - 1
+                                );
+                                last_index = Some(IndexCandidate {
+                                    start_block: b,
+                                    end_block: next - 1,
+                                    construct_sha256,
+                                    index: idx,
+                                });
+                                hint_used = true;
+                            }
+                            Err(why) => notes.push(format!("VCI 提示 @{} 无效: {}", b, why)),
+                        },
+                        Err(e) => notes.push(format!("VCI 提示 @{} 解析失败: {}", b, e)),
+                    }
+                }
                 Ok(_) => notes.push(format!("VCI 提示 @{} 不是完整索引构造", b)),
                 Err(e) => notes.push(format!("VCI 提示 @{} 读取失败: {}", b, e)),
             }
@@ -509,6 +1094,7 @@ pub fn scan_partition(
             notes.push(format!("构造 [{}..{}] 边界核对失败", rec_start, up));
             saw_fake = true;
         } else if looks_like_index(&bytes) {
+            let construct_sha256 = bytes.sha256;
             match bytes.parse() {
                 Ok(idx) => match validate_candidate(&idx, label, part_char, rec_start) {
                     Ok(()) => {
@@ -519,6 +1105,7 @@ pub fn scan_partition(
                         last_index = Some(IndexCandidate {
                             start_block: rec_start,
                             end_block: up,
+                            construct_sha256,
                             index: idx,
                         });
                         break;
@@ -744,6 +1331,16 @@ fn replay_incremental_chain(
     candidate: &mut IndexCandidate,
     budget: &RecoveryBudget,
 ) -> Result<u32> {
+    replay_incremental_chain_with_evidence(drive, label, candidate, budget, |_| {})
+}
+
+fn replay_incremental_chain_with_evidence(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    candidate: &mut IndexCandidate,
+    budget: &RecoveryBudget,
+    mut record: impl FnMut(IndexEvidence),
+) -> Result<u32> {
     let mut chain = Vec::new();
     let mut current = candidate.index.clone();
     while current.incremental {
@@ -771,6 +1368,7 @@ fn replay_incremental_chain(
         if !ended {
             return Err(TapeError::Ltfs("增量前驱构造残缺".into()));
         }
+        let digest = bytes.sha256;
         let prior = bytes.parse()?;
         validate_candidate(&prior, label, label.data_partition, loc.start_block)
             .map_err(TapeError::Ltfs)?;
@@ -779,6 +1377,12 @@ fn replay_incremental_chain(
         {
             return Err(TapeError::Ltfs("增量前驱类型或代数不符".into()));
         }
+        record(IndexEvidence {
+            generation: prior.generation,
+            location: prior.self_location,
+            sha256: digest,
+            incremental: prior.incremental,
+        });
         chain.push(current);
         current = prior;
     }

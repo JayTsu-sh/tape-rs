@@ -7,6 +7,43 @@ use std::net::Ipv4Addr;
 /// 写入 Raft 日志的命令。用 JSON 编码，便于排查和以后扩展。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    /// 停止新的目录变更和设备接管；当前 owner 可完成在途报告后退出。
+    CatalogQuiesce,
+    /// 只有原暂停轮次仍有效时才能恢复旧目录写入；冻结后不允许恢复。
+    CatalogResume {
+        quiesce_index: u64,
+    },
+    /// 当前 owner 已退出且任务已结束后，永久封住旧目录权威；
+    /// 设备接任控制仍可推进，供 FDB owner 使用。
+    CatalogFreeze {
+        quiesce_index: u64,
+    },
+    /// 集群管理请求；配置及持久任务均由状态机决定。
+    Manage {
+        request: Value,
+    },
+    /// 当前 owner 对已装载磁带的容量观测；经实例/轮次/序号绑定的执行报告复制。
+    ObserveTape {
+        barcode: String,
+        observation: Value,
+    },
+    /// 当前 owner 的管理任务报告；必须绑定执行轮次。
+    ManagementReport {
+        task: u64,
+        round: u64,
+        phase: String,
+        result: Value,
+    },
+    /// 文件任务的受理和终态，经当前设备 owner 报告并由目录副本持久保存。
+    FileTask {
+        task: u64,
+        round: u64,
+        pool: String,
+        path: String,
+        status: String,
+        generation: Option<u64>,
+        reason: String,
+    },
     /// 仅预约 VIP；只有当前设备 owner 可申请，地址发布还须本地服务许可。
     VipAcquire {
         address: Ipv4Addr,
@@ -157,6 +194,37 @@ pub fn split_catalog(files: &[FileRec]) -> Vec<Vec<FileRec>> {
 impl Command {
     pub fn encode(&self) -> Vec<u8> {
         let v = match self {
+            Command::CatalogQuiesce => json!({"op":"catalog_quiesce"}),
+            Command::CatalogResume { quiesce_index } => {
+                json!({"op":"catalog_resume","quiesce_index":quiesce_index})
+            }
+            Command::CatalogFreeze { quiesce_index } => {
+                json!({"op":"catalog_freeze","quiesce_index":quiesce_index})
+            }
+            Command::Manage { request } => json!({"op":"manage","request":request}),
+            Command::ObserveTape {
+                barcode,
+                observation,
+            } => json!({"op":"observe_tape","barcode":barcode,"observation":observation}),
+            Command::ManagementReport {
+                task,
+                round,
+                phase,
+                result,
+            } => {
+                json!({"op":"management_report","task":task,"round":round,"phase":phase,"result":result})
+            }
+            Command::FileTask {
+                task,
+                round,
+                pool,
+                path,
+                status,
+                generation,
+                reason,
+            } => {
+                json!({"op":"file_task","task":task,"round":round,"pool":pool,"path":path,"status":status,"generation":generation,"reason":reason})
+            }
             Command::VipAcquire {
                 address,
                 node,
@@ -268,6 +336,47 @@ impl Command {
         let v: Value = serde_json::from_slice(data).ok()?;
         let text = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
         match v.get("op")?.as_str()? {
+            "catalog_quiesce" => return Some(Command::CatalogQuiesce),
+            "catalog_resume" => {
+                return Some(Command::CatalogResume {
+                    quiesce_index: v.get("quiesce_index")?.as_u64()?,
+                });
+            }
+            "catalog_freeze" => {
+                return Some(Command::CatalogFreeze {
+                    quiesce_index: v.get("quiesce_index")?.as_u64()?,
+                });
+            }
+            "observe_tape" => {
+                return Some(Command::ObserveTape {
+                    barcode: text("barcode")?,
+                    observation: v.get("observation")?.clone(),
+                });
+            }
+            "manage" => {
+                return Some(Command::Manage {
+                    request: v.get("request")?.clone(),
+                });
+            }
+            "management_report" => {
+                return Some(Command::ManagementReport {
+                    task: v.get("task")?.as_u64()?,
+                    round: v.get("round")?.as_u64()?,
+                    phase: text("phase")?,
+                    result: v.get("result")?.clone(),
+                });
+            }
+            "file_task" => {
+                return Some(Command::FileTask {
+                    task: v.get("task")?.as_u64()?,
+                    round: v.get("round")?.as_u64()?,
+                    pool: text("pool")?,
+                    path: text("path")?,
+                    status: text("status")?,
+                    generation: v.get("generation").and_then(Value::as_u64),
+                    reason: text("reason")?,
+                });
+            }
             "vip_acquire" => {
                 return Some(Command::VipAcquire {
                     address: text("address")?.parse().ok()?,
@@ -296,6 +405,9 @@ impl Command {
                         | "catalog_part"
                         | "tape_committed"
                         | "tape_reclaimed"
+                        | "management_report"
+                        | "file_task"
+                        | "observe_tape"
                 ) {
                     return None;
                 }
@@ -449,6 +561,7 @@ impl ControlSnapshot {
     pub fn encode(&self) -> Vec<u8> {
         let c = &self.control;
         json!({
+            "management": c.management,
             "source": self.source,
             "directory_index": self.directory_index,
             "applied_index": c.applied_index,
@@ -456,6 +569,8 @@ impl ControlSnapshot {
             "executor_instance": c.executor_instance,
             "executor_report_sequence": c.executor_report_sequence,
             "executor_ready": c.executor_ready,
+            "catalog_quiesce_index": c.catalog_quiesce_index,
+            "catalog_frozen_index": c.catalog_frozen_index,
             "vips": c.vips.iter().map(|(a,r)| json!([a.to_string(),r.token,r.holder.as_ref().map(|h|json!([h.node,h.round]))])).collect::<Vec<_>>(),
             "candidates": c.candidates.iter().map(|(n,c)| json!([n,c.instance,c.sequence,c.group,c.drives,c.eligible])).collect::<Vec<_>>(),
             "history": c.history.iter().map(|(r, n)| json!([r, n])).collect::<Vec<_>>(),
@@ -477,7 +592,14 @@ impl ControlSnapshot {
         let rows = |k: &str| -> Option<&Vec<Value>> { v.get(k)?.as_array() };
         let s = |x: Option<&Value>| -> Option<String> { Some(x?.as_str()?.to_string()) };
         let n = |x: Option<&Value>| -> Option<u64> { x?.as_u64() };
+        let optional_index = |key: &str| -> Option<Option<u64>> {
+            match v.get(key) {
+                None | Some(Value::Null) => Some(None),
+                Some(value) => value.as_u64().map(Some),
+            }
+        };
         let mut c = ControlState {
+            management: v.get("management").cloned().unwrap_or(Value::Null),
             applied_index: n(v.get("applied_index"))?,
             executor_instance: v
                 .get("executor_instance")
@@ -491,8 +613,18 @@ impl ControlSnapshot {
                 .get("executor_ready")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            catalog_quiesce_index: optional_index("catalog_quiesce_index")?,
+            catalog_frozen_index: optional_index("catalog_frozen_index")?,
             ..Default::default()
         };
+        if c.catalog_quiesce_index
+            .is_some_and(|i| i == 0 || i > c.applied_index)
+            || c.catalog_frozen_index.is_some_and(|i| {
+                i == 0 || i > c.applied_index || c.catalog_quiesce_index.is_none_or(|q| q > i)
+            })
+        {
+            return None;
+        }
         if let Some(rows) = v.get("vips") {
             for r in rows.as_array()? {
                 let address = s(r.get(0))?.parse().ok()?;
@@ -571,6 +703,9 @@ impl ControlSnapshot {
                 },
             );
         }
+        if !super::management::valid_snapshot(&c.management) {
+            return None;
+        }
         Some(Self {
             control: c,
             source: n(v.get("source"))?,
@@ -606,7 +741,10 @@ pub struct VipRecord {
 /// 应用一条命令后，本地需要知道的结论。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Applied {
+    /// 旧目录已冻结；目录投影仅推进日志索引，不得应用该命令的数据变更。
+    CatalogRejected,
     Reported(Box<Applied>),
+    Management(Value),
     /// 出现了新的执行者（可能是自己，也可能是别人）。
     NewExecutor(Executor),
     /// 某一轮的隔离得到确认，可以进入恢复。
@@ -672,6 +810,10 @@ pub const HISTORY_KEPT: usize = 64;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ControlState {
+    /// 两阶段切换屏障，均为本库 Raft 日志索引；不会随 owner 轮换清除。
+    pub catalog_quiesce_index: Option<u64>,
+    pub catalog_frozen_index: Option<u64>,
+    pub management: Value,
     /// 地址占用记录不随 owner 变更、超时或失联清除。
     pub vips: std::collections::BTreeMap<Ipv4Addr, VipRecord>,
     pub executor: Option<Executor>,
@@ -715,7 +857,98 @@ pub struct TapeSummary {
 impl ControlState {
     pub fn apply(&mut self, index: u64, cmd: &Command) -> Applied {
         self.applied_index = index;
+        if self.catalog_frozen_index.is_some()
+            && !matches!(
+                cmd,
+                Command::CatalogFreeze { .. }
+                    | Command::Candidate { .. }
+                    | Command::VipRelease { .. }
+                    | Command::AssignExecutor { .. }
+                    | Command::Takeover { .. }
+                    | Command::ExecutorReport { .. }
+                    | Command::Fenced { .. }
+                    | Command::ExecutorReady { .. }
+                    | Command::Abandoned { .. }
+            )
+        {
+            return Applied::CatalogRejected;
+        }
+        if self.catalog_quiesce_index.is_some()
+            && matches!(
+                cmd,
+                Command::Manage { .. }
+                    | Command::PoolCreate { .. }
+                    | Command::TapeAssign { .. }
+                    | Command::TapeUnassign { .. }
+                    | Command::TapeReclaim { .. }
+                    | Command::AssignExecutor { .. }
+                    | Command::Takeover { .. }
+            )
+            && self.catalog_frozen_index.is_none()
+        {
+            return Applied::CatalogRejected;
+        }
         match cmd {
+            Command::CatalogQuiesce => {
+                if super::management::active_tasks(&self.management)
+                    || self
+                        .tape_state
+                        .values()
+                        .any(|s| s == tape_state::RECLAIMING || s == tape_state::REFORMATTING)
+                {
+                    return Applied::Admin(Err("管理任务或回收仍未结束，不能暂停旧目录".into()));
+                }
+                let quiesce = *self.catalog_quiesce_index.get_or_insert(index);
+                Applied::Admin(Ok(json!({"quiesce_index":quiesce}).to_string()))
+            }
+            Command::CatalogResume { quiesce_index } => {
+                if *quiesce_index == 0 || self.catalog_quiesce_index != Some(*quiesce_index) {
+                    return Applied::Admin(Err("目录暂停轮次已变化".into()));
+                }
+                self.catalog_quiesce_index = None;
+                Applied::Admin(Ok(json!({"resumed":true}).to_string()))
+            }
+            Command::CatalogFreeze { quiesce_index } => {
+                if *quiesce_index == 0 || self.catalog_quiesce_index != Some(*quiesce_index) {
+                    return Applied::Admin(Err("目录暂停轮次已变化".into()));
+                }
+                if let Some(frozen) = self.catalog_frozen_index {
+                    return Applied::Admin(Ok(json!({"frozen_index":frozen}).to_string()));
+                }
+                if self.executor.is_some()
+                    || super::management::active_tasks(&self.management)
+                    || self
+                        .tape_state
+                        .values()
+                        .any(|s| s == tape_state::RECLAIMING || s == tape_state::REFORMATTING)
+                {
+                    return Applied::Admin(Err("设备 owner、管理任务或回收仍未结束".into()));
+                }
+                self.catalog_frozen_index = Some(index);
+                Applied::Admin(Ok(json!({"frozen_index":index}).to_string()))
+            }
+            Command::Manage { request } => {
+                Applied::Admin(super::management::apply(self, index, request))
+            }
+            Command::ObserveTape {
+                barcode,
+                observation,
+            } => {
+                super::management::observe_tape(self, barcode, observation, index);
+                Applied::Nothing
+            }
+            Command::ManagementReport {
+                task,
+                round,
+                phase,
+                result,
+            } => {
+                if super::management::report(self, *task, *round, phase, result) {
+                    Applied::Management(super::management::directory_changes(self, *task))
+                } else {
+                    Applied::Nothing
+                }
+            }
             Command::VipAcquire {
                 address,
                 node,
@@ -769,6 +1002,16 @@ impl ControlState {
                 sequence,
                 command,
             } => {
+                if self.catalog_frozen_index.is_some()
+                    && !matches!(
+                        command.as_ref(),
+                        Command::Fenced { .. }
+                            | Command::ExecutorReady { .. }
+                            | Command::Abandoned { .. }
+                    )
+                {
+                    return Applied::CatalogRejected;
+                }
                 let Some(e) = self
                     .executor
                     .as_ref()
@@ -794,6 +1037,9 @@ impl ControlState {
                         e.fenced && n == node && r == round
                     }
                     Command::TapeState { .. }
+                    | Command::FileTask { .. }
+                    | Command::ManagementReport { .. }
+                    | Command::ObserveTape { .. }
                     | Command::CatalogPart { .. }
                     | Command::TapeCommitted { .. }
                     | Command::TapeReclaimed { .. } => e.fenced,
@@ -872,6 +1118,7 @@ impl ControlState {
                 outcome
             }
             Command::Takeover { node, term } => {
+                super::management::interrupt(self);
                 self.executor_instance = 0;
                 self.executor_report_sequence = 0;
                 self.executor_ready = false;
@@ -901,6 +1148,7 @@ impl ControlState {
             },
             Command::Abandoned { node, round, .. } => match &self.executor {
                 Some(e) if e.round == *round && e.node == *node => {
+                    super::management::interrupt(self);
                     self.executor = None;
                     self.executor_ready = false;
                     Applied::ExecutorGone {
@@ -928,6 +1176,14 @@ impl ControlState {
                             .get(barcode)
                             .is_some_and(|s| s == tape_state::RECLAIMING))
                 {
+                    if state == tape_state::REFORMATTING {
+                        super::management::invalidate_capacity(
+                            self,
+                            barcode,
+                            "磁带即将重新格式化",
+                            index,
+                        );
+                    }
                     self.tape_state.insert(barcode.clone(), state.clone());
                 }
                 Applied::Nothing
@@ -943,6 +1199,7 @@ impl ControlState {
                     .get(barcode)
                     .is_some_and(|s| s == tape_state::RECLAIMING || s == tape_state::REFORMATTING)
                 {
+                    super::management::invalidate_other_volume(self, barcode, volume_uuid, index);
                     // 带被重新格式化了，摘要必须跟着回到第 1 代——这是唯一允许代数回退的地方
                     self.tape_summary.insert(
                         barcode.clone(),
@@ -963,6 +1220,7 @@ impl ControlState {
             }
             // 文件记录进目录库的暂存表，这里不处理
             Command::CatalogPart { .. } => Applied::Nothing,
+            Command::FileTask { .. } => Applied::Nothing,
             Command::TapeCommitted {
                 barcode,
                 volume_uuid,
@@ -978,6 +1236,18 @@ impl ControlState {
                     .get(barcode)
                     .is_none_or(|s| *generation >= s.generation);
                 if self.tapes.contains_key(barcode) && newer {
+                    if self
+                        .tape_summary
+                        .get(barcode)
+                        .is_some_and(|s| s.volume_uuid != *volume_uuid)
+                    {
+                        super::management::invalidate_other_volume(
+                            self,
+                            barcode,
+                            volume_uuid,
+                            index,
+                        );
+                    }
                     self.tape_summary.insert(
                         barcode.clone(),
                         TapeSummary {
@@ -1004,6 +1274,9 @@ impl ControlState {
         name: &str,
         file_limit: u64,
     ) -> std::result::Result<String, String> {
+        if super::management::active_tasks(&self.management) {
+            return Err("存在未结束管理任务".into());
+        }
         if name.is_empty() || name.contains('/') {
             return Err(format!("池名非法: {:?}", name));
         }
@@ -1027,6 +1300,9 @@ impl ControlState {
     }
 
     fn tape_unassign(&mut self, barcode: &str) -> std::result::Result<String, String> {
+        if super::management::active_tasks(&self.management) {
+            return Err("存在未结束管理任务".into());
+        }
         if !self.tapes.contains_key(barcode) {
             return Err(format!("{} 未归属任何池", barcode));
         }
@@ -1037,6 +1313,14 @@ impl ControlState {
                 barcode, s.files
             ));
         }
+        if let Some(options) = self
+            .management
+            .get_mut("tapes")
+            .and_then(Value::as_object_mut)
+        {
+            options.remove(barcode);
+            self.management["revision"] = json!(self.applied_index);
+        }
         self.tapes.remove(barcode);
         self.tape_summary.remove(barcode);
         self.tape_state.remove(barcode);
@@ -1045,6 +1329,12 @@ impl ControlState {
 
     /// 开始回收。只改状态：执行者按状态自己去干，中途换届后新执行者接着干。
     fn tape_reclaim(&mut self, barcode: &str) -> std::result::Result<String, String> {
+        if super::management::active_tasks(&self.management) {
+            return Err("存在未结束管理任务".into());
+        }
+        if !super::management::tape_allowed(&self.management, barcode) {
+            return Err("回收源带离线或在黑名单中".into());
+        }
         if !self.tapes.contains_key(barcode) {
             return Err(format!("{} 未归属任何池", barcode));
         }
@@ -1072,6 +1362,7 @@ impl ControlState {
         let has_target = self.tapes.iter().any(|(b, u)| {
             u == pool
                 && b != barcode
+                && super::management::tape_allowed(&self.management, b)
                 && self
                     .tape_state
                     .get(b)
@@ -1099,6 +1390,9 @@ impl ControlState {
     }
 
     fn tape_assign(&mut self, barcode: &str, pool: &str) -> std::result::Result<String, String> {
+        if super::management::active_tasks(&self.management) {
+            return Err("存在未结束管理任务".into());
+        }
         if barcode.is_empty() {
             return Err("条码为空".to_string());
         }
@@ -1109,6 +1403,13 @@ impl ControlState {
             let cur_name = self.pools.get(cur).map(|p| p.name.as_str()).unwrap_or("?");
             return Err(format!("{} 已归属池 {}", barcode, cur_name));
         }
+        super::management::require_data_tape(&self.management, barcode)?;
+        super::management::check_media(
+            self.management["pools"][&uuid]["mediarestriction"]
+                .as_str()
+                .unwrap_or("none"),
+            barcode,
+        )?;
         self.tapes.insert(barcode.to_string(), uuid);
         Ok(format!(
             "{} 已归入池 {}",
@@ -1124,6 +1425,9 @@ mod tests {
     #[test]
     fn commands_roundtrip() {
         for c in [
+            Command::CatalogQuiesce,
+            Command::CatalogResume { quiesce_index: 7 },
+            Command::CatalogFreeze { quiesce_index: 7 },
             Command::Takeover { node: 2, term: 7 },
             Command::Fenced { node: 2, round: 41 },
             Command::Abandoned {
@@ -1135,6 +1439,178 @@ mod tests {
             assert_eq!(Command::decode(&c.encode()), Some(c));
         }
         assert_eq!(Command::decode(b"{}"), None);
+    }
+
+    #[test]
+    fn catalog_freeze_requires_drained_owner_and_survives_snapshot() {
+        let mut s = ControlState::default();
+        s.apply(1, &Command::Takeover { node: 2, term: 1 });
+        s.apply(2, &Command::Fenced { node: 2, round: 1 });
+        assert!(matches!(
+            s.apply(3, &Command::CatalogQuiesce),
+            Applied::Admin(Ok(_))
+        ));
+        assert_eq!(s.catalog_quiesce_index, Some(3));
+        assert_eq!(
+            s.apply(4, &Command::Takeover { node: 3, term: 2 }),
+            Applied::CatalogRejected
+        );
+        assert_eq!(s.executor.as_ref().unwrap().node, 2);
+        assert!(matches!(
+            s.apply(5, &Command::CatalogFreeze { quiesce_index: 3 }),
+            Applied::Admin(Err(_))
+        ));
+        assert_eq!(s.catalog_frozen_index, None);
+        assert!(matches!(
+            s.apply(
+                6,
+                &Command::Abandoned {
+                    node: 2,
+                    round: 1,
+                    reason: "安全退出".into(),
+                }
+            ),
+            Applied::ExecutorGone { .. }
+        ));
+        assert!(matches!(
+            s.apply(7, &Command::CatalogFreeze { quiesce_index: 3 }),
+            Applied::Admin(Ok(_))
+        ));
+        assert_eq!(s.catalog_frozen_index, Some(7));
+        assert_eq!(
+            s.apply(
+                8,
+                &Command::CatalogPart {
+                    barcode: "A001L8".into(),
+                    generation: 1,
+                    part: 0,
+                    files: Vec::new(),
+                }
+            ),
+            Applied::CatalogRejected
+        );
+        assert_eq!(
+            s.apply(9, &Command::CatalogResume { quiesce_index: 3 }),
+            Applied::CatalogRejected
+        );
+        let snapshot = ControlSnapshot {
+            control: s.clone(),
+            source: 1,
+            directory_index: 9,
+        };
+        assert_eq!(
+            ControlSnapshot::decode(&snapshot.encode()),
+            Some(snapshot.clone())
+        );
+        let mut broken: Value = serde_json::from_slice(&snapshot.encode()).unwrap();
+        broken["catalog_quiesce_index"] = json!("3");
+        assert!(ControlSnapshot::decode(&serde_json::to_vec(&broken).unwrap()).is_none());
+        broken["catalog_quiesce_index"] = json!(3);
+        broken["catalog_frozen_index"] = json!(0);
+        assert!(ControlSnapshot::decode(&serde_json::to_vec(&broken).unwrap()).is_none());
+    }
+
+    #[test]
+    fn frozen_catalog_allows_only_owner_lifecycle_reports() {
+        let mut state = ControlState::default();
+        assert!(matches!(
+            state.apply(1, &Command::CatalogQuiesce),
+            Applied::Admin(Ok(_))
+        ));
+        assert!(matches!(
+            state.apply(2, &Command::CatalogFreeze { quiesce_index: 1 }),
+            Applied::Admin(Ok(_))
+        ));
+        state.apply(
+            3,
+            &Command::Candidate {
+                node: 71,
+                instance: 1,
+                sequence: 1,
+                group: "fdb".into(),
+                drives: 1,
+                eligible: true,
+            },
+        );
+        assert!(matches!(
+            state.apply(
+                4,
+                &Command::AssignExecutor {
+                    node: 71,
+                    instance: 1,
+                    term: 1,
+                    expected_round: None,
+                    group: "fdb".into(),
+                }
+            ),
+            Applied::NewExecutor(_)
+        ));
+        assert!(matches!(
+            state.apply(
+                5,
+                &Command::ExecutorReport {
+                    node: 71,
+                    instance: 1,
+                    round: 4,
+                    sequence: 1,
+                    command: Box::new(Command::Fenced { node: 71, round: 4 }),
+                }
+            ),
+            Applied::Reported(_)
+        ));
+        assert!(matches!(
+            state.apply(
+                6,
+                &Command::ExecutorReport {
+                    node: 71,
+                    instance: 1,
+                    round: 4,
+                    sequence: 2,
+                    command: Box::new(Command::ExecutorReady { node: 71, round: 4 }),
+                }
+            ),
+            Applied::Reported(_)
+        ));
+        assert!(state.executor_ready);
+        assert_eq!(
+            state.apply(
+                7,
+                &Command::ExecutorReport {
+                    node: 71,
+                    instance: 1,
+                    round: 4,
+                    sequence: 3,
+                    command: Box::new(Command::TapeState {
+                        barcode: "FROZEN1".into(),
+                        state: "full".into(),
+                    }),
+                }
+            ),
+            Applied::CatalogRejected
+        );
+        assert_eq!(state.executor_report_sequence, 2);
+        assert_eq!(state.catalog_frozen_index, Some(2));
+    }
+
+    #[test]
+    fn catalog_quiesce_refuses_inflight_management_and_reclaim() {
+        let mut s = ControlState {
+            management: json!({"tasks":{"1":{"state":"running"}}}),
+            ..Default::default()
+        };
+        assert!(matches!(
+            s.apply(2, &Command::CatalogQuiesce),
+            Applied::Admin(Err(_))
+        ));
+        assert_eq!(s.catalog_quiesce_index, None);
+        s.management = Value::Null;
+        s.tape_state
+            .insert("T1".into(), tape_state::RECLAIMING.into());
+        assert!(matches!(
+            s.apply(3, &Command::CatalogQuiesce),
+            Applied::Admin(Err(_))
+        ));
+        assert_eq!(s.catalog_quiesce_index, None);
     }
 
     #[test]
@@ -1286,6 +1762,26 @@ mod tests {
         assert_eq!(s.tapes.keys().collect::<Vec<_>>(), vec!["T2"]);
         // 被拒绝的命令不改变状态
         assert_eq!(s.pools.len(), 1);
+    }
+
+    #[test]
+    fn file_task_executor_report_roundtrips() {
+        let report = Command::ExecutorReport {
+            node: 1,
+            instance: 2,
+            round: 7,
+            sequence: 3,
+            command: Box::new(Command::FileTask {
+                task: (7 << 32) | 1,
+                round: 7,
+                pool: "pool".into(),
+                path: "/file".into(),
+                status: "staged".into(),
+                generation: None,
+                reason: String::new(),
+            }),
+        };
+        assert_eq!(Command::decode(&report.encode()), Some(report));
     }
 
     #[test]

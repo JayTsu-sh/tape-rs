@@ -15,11 +15,22 @@
 mod coordinator;
 pub mod directory;
 pub mod executor;
+#[cfg(feature = "fdb")]
+pub mod fdb_http;
+#[cfg(feature = "fdb")]
+pub mod fdb_media;
+#[cfg(feature = "fdb")]
+pub mod fdb_read;
 pub mod files;
+pub mod gateway;
 pub mod http;
+pub mod management;
+pub mod multilib;
 pub mod net;
 pub mod node;
 pub mod permission;
 pub mod state;
 pub mod store;
 pub mod vip;
+
+mod scheduling;

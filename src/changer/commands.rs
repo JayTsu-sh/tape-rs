@@ -301,6 +301,12 @@ fn parse_element_status_data(data: &[u8]) -> Result<Vec<ElementStatus>> {
         if desc_len == 0 {
             break;
         }
+        if desc_len < 4 {
+            return Err(TapeError::InvalidResponse {
+                expected: 4,
+                actual: desc_len,
+            });
+        }
 
         let has_pvoltag = (voltag_flags & 0x80) != 0;
         let has_avoltag = (voltag_flags & 0x40) != 0;
@@ -363,6 +369,7 @@ fn parse_descriptor(
         address,
         element_type,
         full,
+        medium_type: desc.get(9).filter(|_| full).map(|b| b & 0x07),
         volume_tag,
         source_address,
         drive_id,
@@ -405,4 +412,55 @@ fn extract_volume_tag(desc: &[u8]) -> Option<String> {
         .trim_matches(|c: char| c == '\0' || c.is_whitespace())
         .to_string();
     if tag.is_empty() { None } else { Some(tag) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleaning_medium_type_ignores_source_valid_and_disabled_bits() {
+        for ty in 1..=4 {
+            let mut desc = [0u8; 48];
+            desc[2] = 1;
+            desc[9] = 0xca; // SValid、Invert、ED 和 medium type 2
+            desc[10..12].copy_from_slice(&1007u16.to_be_bytes());
+            let e = parse_descriptor(&desc, ty, false, false);
+            assert_eq!(e.medium_type, Some(2));
+            assert_eq!(e.source_address, Some(1007));
+            assert!(e.is_cleaning()); // 无条码也可由设备识别
+            desc[2] = 0;
+            assert!(!parse_descriptor(&desc, ty, false, false).is_cleaning());
+        }
+        let e = parse_descriptor(&[0, 1, 1, 0], 2, false, false);
+        assert_eq!(e.medium_type, None);
+        assert!(!e.is_cleaning());
+    }
+
+    #[test]
+    fn cleaning_barcode_fallback_does_not_classify_data_l1() {
+        use crate::changer::element::cleaning_source;
+        for barcode in ["CLNU03L1", "CLN001", "CLNI01L1"] {
+            assert_eq!(cleaning_source(None, Some(barcode)), Some("barcode"));
+        }
+        for barcode in ["DATA01L1", "CLN", "CLNabcL1", "XCLNU03L1", "CLNU03L9"] {
+            assert_eq!(cleaning_source(None, Some(barcode)), None);
+        }
+        assert_eq!(
+            cleaning_source(Some(2), Some("CUSTOM")),
+            Some("element_status")
+        );
+    }
+
+    #[test]
+    fn short_descriptor_is_an_error_instead_of_a_panic() {
+        for len in 1..4 {
+            let mut data = vec![0u8; 16 + len];
+            data[7] = (8 + len) as u8;
+            data[8] = 2;
+            data[11] = len as u8;
+            data[15] = len as u8;
+            assert!(parse_element_status_data(&data).is_err());
+        }
+    }
 }

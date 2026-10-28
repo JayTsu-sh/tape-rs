@@ -104,6 +104,7 @@ pub fn errno_of(e: &ClientError) -> Errno {
         ClientError::NoLeader(_) => libc::EBUSY,
         ClientError::Io(_) => libc::EIO,
         ClientError::Indeterminate(_) => libc::EIO,
+        ClientError::Verification(_) => libc::EIO,
         ClientError::Rejected { status, body } => match status {
             409 => match serde_json::from_str::<serde_json::Value>(body)
                 .ok()

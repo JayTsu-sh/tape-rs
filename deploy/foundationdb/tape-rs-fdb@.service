@@ -1,0 +1,32 @@
+[Unit]
+Description=tape-rs FoundationDB metadata server on %i
+Documentation=https://apple.github.io/foundationdb/administration.html
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=tape-fdb
+Group=tape-fdb
+UMask=0077
+ExecStart=/usr/local/libexec/tape-rs-fdb/fdbserver -p %i:45151 -C /etc/tape-rs-fdb/fdb.cluster -d /var/lib/tape-rs-fdb/data -L /var/log/tape-rs-fdb -m 16GiB --cache-memory 8GiB -M 2GiB
+Restart=on-failure
+RestartSec=5s
+MemoryMax=20G
+LimitNOFILE=131072
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+DevicePolicy=closed
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/etc/tape-rs-fdb /var/lib/tape-rs-fdb /var/log/tape-rs-fdb
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+CapabilityBoundingSet=
+IPAddressDeny=any
+IPAddressAllow=localhost 10.131.7.207/32 10.131.7.208/32 10.131.7.209/32 10.131.9.10/32
+
+[Install]
+WantedBy=multi-user.target

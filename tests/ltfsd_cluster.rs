@@ -3296,6 +3296,11 @@ fn directory_tombstones_survive_reconciling_an_old_tape() {
     c.wait("接管后仍保留墓碑", || {
         c.services[&next].serving_round() == Some(next_round)
     });
+    // Raft 的新 owner 已开放时，被隔离的旧 owner 仍可能短暂接收 HTTP 请求；
+    // 先等旧文件服务停手，再验证稳定接管后的目录语义。
+    c.wait("旧目录服务停手", || {
+        c.services[&leader].serving_round().is_none()
+    });
     assert!(cl.stat("/gone").unwrap().is_none());
     cl.mkdir("/gone").unwrap();
     assert!(cl.list_dir("/gone", false).unwrap().is_empty());

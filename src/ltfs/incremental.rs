@@ -1,7 +1,7 @@
 //! LTFS 2.5 §9.2 的增量差分与原子重放。介质定位与链验证由 recovery 负责。
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::index::{DirectoryNode, FileNode, LtfsIndex, NodeMeta};
+use super::index::{DirectoryNode, FileNode, IndexEntry, LtfsIndex, NodeMeta};
 use crate::error::{Result, TapeError};
 
 type Fields = Option<BTreeSet<String>>;
@@ -209,6 +209,25 @@ fn validate_dir(d: &DirectoryNode, root: bool) -> Result<()> {
             return Err(bad("同一路径出现多次"));
         }
         validate_dir(child, false)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_incremental_entry(entry: &IndexEntry) -> Result<()> {
+    match entry {
+        IndexEntry::File { node, .. } => {
+            validate_fields(&node.delta_fields, &node.name, false, false)?;
+            if node
+                .delta_fields
+                .as_ref()
+                .is_some_and(|fields| fields.contains("symlink") && fields.contains("extentinfo"))
+            {
+                return Err(bad("symlink 与 extentinfo 互斥"));
+            }
+        }
+        IndexEntry::Directory { path, node } => {
+            validate_fields(&node.delta_fields, &node.name, true, path.is_empty())?;
+        }
     }
     Ok(())
 }
@@ -472,6 +491,20 @@ mod tests {
             .unwrap()
             .replace("<deleted/>", "<deleted>true</deleted>");
         assert!(LtfsIndex::parse(bad.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn complete_changed_nodes_can_clear_file_and_directory_xattrs_in_delta_xml() {
+        let mut old = base();
+        old.root.xattrs = old.root.files[0].xattrs.clone();
+        let mut new = next(&old);
+        new.root.xattrs.clear();
+        new.root.files[0].xattrs.clear();
+        let delta = new.incremental_since(&old).unwrap();
+        let parsed = LtfsIndex::parse(&delta.to_xml().unwrap()).unwrap();
+        let applied = old.apply_incremental(&parsed).unwrap();
+        assert!(applied.root.xattrs.is_empty());
+        assert!(applied.root.files[0].xattrs.is_empty());
     }
     #[test]
     #[ignore = "为独立 XSD 校验输出 XML，不属于默认测试"]

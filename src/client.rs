@@ -6,14 +6,16 @@
 //! - **结果未定的判定与安全重试**：上传途中连接断开，或服务端明确答"结果未定"时，
 //!   库到（新的）Leader 上查询该路径：已提交则视为成功，否则重传。归档成功始终以卷提交为准。
 //!
-//! 判定"已提交的就是我这次上传的"靠内容哈希：服务端写带时算出 sha256 并记在索引和目录里，
-//! 库把它与本地算出的值比对。
+//! 替换上传可用服务端记录的内容哈希核对结果；只创建上传丢失响应时，同内容文件
+//! 不足以证明归属，必须返回结果未定。
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use serde_json::Value;
+use sha2::Digest as _;
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -29,6 +31,8 @@ pub enum ClientError {
     Exists(String),
     /// 请求可能已执行，但没有拿到持久化确认；不得自动重发删除。
     Indeterminate(String),
+    /// 读取或落带后的内容与已确认的文件版本不符。
+    Verification(String),
     Io(std::io::Error),
 }
 
@@ -42,6 +46,7 @@ impl std::fmt::Display for ClientError {
             ClientError::NotFound => write!(f, "不存在"),
             ClientError::Exists(p) => write!(f, "路径已存在: {}", p),
             ClientError::Indeterminate(s) => write!(f, "结果未定，请核对后再操作: {}", s),
+            ClientError::Verification(s) => write!(f, "文件校验失败: {}", s),
             ClientError::Io(e) => write!(f, "I/O: {}", e),
         }
     }
@@ -72,6 +77,13 @@ pub struct FileStat {
     pub version: (u64, u64),
     /// 索引 modify_time/xattrs；旧服务端或旧缓存没有该字段时为 null。
     pub metadata: Value,
+}
+
+/// 一次显式文件复制的两端已提交版本；它不自动维护后续改写的副本关系。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyOutcome {
+    pub source: FileStat,
+    pub destination: FileStat,
 }
 
 /// 路径的状态（`stat_path`）。`state` 为 `committed`、`uploading` 或 `staged`。
@@ -110,6 +122,30 @@ fn file_stat(j: &Value) -> FileStat {
         ),
         metadata: j.get("metadata").cloned().unwrap_or(Value::Null),
     }
+}
+
+fn portable_xattrs(metadata: &Value) -> Vec<(String, String, bool)> {
+    let mut attrs = metadata["xattrs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|attr| {
+            let key = attr["key"].as_str()?;
+            if ["tapers.", "tape.", "ltfs."]
+                .iter()
+                .any(|prefix| key.starts_with(prefix))
+            {
+                return None;
+            }
+            Some((
+                key.to_owned(),
+                attr["value"].as_str()?.to_owned(),
+                attr["base64"].as_bool()?,
+            ))
+        })
+        .collect::<Vec<_>>();
+    attrs.sort();
+    attrs
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +239,14 @@ struct Response {
     body: Vec<u8>,
 }
 
+struct ScratchCopy(std::path::PathBuf);
+
+impl Drop for ScratchCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 impl Response {
     fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
@@ -212,6 +256,8 @@ impl Response {
 #[derive(Clone)]
 pub struct Client {
     endpoints: Vec<String>,
+    library: Option<String>,
+    pool: Option<String>,
     /// 上次成功服务的节点，优先尝试
     leader: Option<String>,
     /// 没有 Leader 或结果未定时，最多坚持多久
@@ -224,10 +270,40 @@ impl Client {
     pub fn new<S: Into<String>>(endpoints: impl IntoIterator<Item = S>) -> Self {
         Self {
             endpoints: endpoints.into_iter().map(Into::into).collect(),
+            library: None,
+            pool: None,
             leader: None,
             retry_for: Duration::from_secs(60),
             io_timeout: Duration::from_secs(600),
         }
+    }
+
+    /// 固定访问真实带库序列号；所有文件、任务及管理请求都保留该作用域。
+    pub fn with_library(mut self, serial: impl Into<String>) -> Result<Self> {
+        let serial = serial.into();
+        if serial.is_empty() || serial.trim() != serial || serial.chars().any(char::is_control) {
+            return Err(ClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "带库序列号不能为空、含首尾空白或控制字符",
+            )));
+        }
+        self.library = Some(serial);
+        self.leader = None;
+        Ok(self)
+    }
+
+    /// 固定文件命名空间到池名称或 UUID；管理请求仍在库作用域。
+    pub fn with_pool(mut self, pool: impl Into<String>) -> Result<Self> {
+        let pool = pool.into();
+        if pool.is_empty() || pool.trim() != pool || pool.chars().any(char::is_control) {
+            return Err(ClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "池名称或 UUID 无效",
+            )));
+        }
+        self.pool = Some(pool);
+        self.leader = None;
+        Ok(self)
     }
 
     /// 出错时第一项说明请求是否可能已经到达服务端：连接都没建立起来则为 false。
@@ -251,14 +327,31 @@ impl Client {
         headers: &[(&str, &str)],
         sink: Option<&mut (dyn Write + 'w)>,
     ) -> std::result::Result<Response, (bool, std::io::Error)> {
-        let sock = addr
+        let (authority, prefix) = addr.split_once('/').map_or((addr, ""), |(a, p)| (a, p));
+        // 旧客户端提示也可能自带库前缀；显式选库时始终保持调用方选择，
+        // 不让过期或不匹配的提示把后续查询/写入导向另一库。
+        let data_path = if let Some(pool) = &self.pool {
+            if path.starts_with("/admin/") || path == "/cluster" || path == "/readyz" {
+                encode_path(path)
+            } else {
+                format!("/pools/{}{}", encode_query(pool), encode_path(path))
+            }
+        } else {
+            encode_path(path)
+        };
+        let route = match &self.library {
+            Some(serial) => format!("/libraries/{}{}", encode_query(serial), data_path),
+            None if !prefix.is_empty() => format!("/{prefix}{}", data_path),
+            None => data_path,
+        };
+        let sock = authority
             .to_socket_addrs()
             .map_err(|e| (false, e))?
             .next()
             .ok_or_else(|| (false, std::io::Error::other("地址无法解析")))?;
         let conn =
             TcpStream::connect_timeout(&sock, Duration::from_secs(3)).map_err(|e| (false, e))?;
-        self.exchange(conn, addr, method, path, body, headers, sink)
+        self.exchange(conn, authority, method, &route, body, headers, sink)
             .map_err(|e| (true, e))
     }
 
@@ -279,9 +372,7 @@ impl Client {
         write!(
             conn,
             "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
-            method,
-            encode_path(path),
-            addr
+            method, path, addr
         )?;
         for (k, v) in headers {
             write!(conn, "{}: {}\r\n", k, v)?;
@@ -502,7 +593,7 @@ impl Client {
                 .map(|b| format!("{:02x}", b))
                 .collect()
         };
-        self.put_body(path, Body::Mem(data), &digest, create_only, true)
+        self.put_body(path, Body::Mem(data), &digest, create_only, true, None)
     }
 
     /// 上传本地文件，内容边读边发，不整个读进内存。`wait` 为假时服务端暂存即返回
@@ -516,7 +607,169 @@ impl Client {
     ) -> Result<PutOutcome> {
         let len = std::fs::metadata(local)?.len();
         let digest = sha256_file(local)?;
-        self.put_body(path, Body::File(local, len), &digest, create_only, wait)
+        self.put_body(
+            path,
+            Body::File(local, len),
+            &digest,
+            create_only,
+            wait,
+            None,
+        )
+    }
+
+    /// 显式复制一个已提交的普通文件到另一库/池的空路径。目标落带后重新读回字节，
+    /// 并核对两端版本和哈希；可读的原生文件属性随目标写入，不建立自动副本关系。
+    pub fn copy_verified_to(
+        &mut self,
+        destination: &mut Client,
+        source_path: &str,
+        destination_path: &str,
+        spool_dir: &std::path::Path,
+    ) -> Result<CopyOutcome> {
+        let before = self.stat_path(source_path)?.ok_or(ClientError::NotFound)?;
+        if before.state != "committed" {
+            return Err(ClientError::Verification("源路径有尚未提交的版本".into()));
+        }
+        let source = before.current.ok_or(ClientError::NotFound)?;
+        if !source.metadata.is_object()
+            || source
+                .metadata
+                .get("kind")
+                .is_some_and(|kind| kind != "file")
+        {
+            return Err(ClientError::Verification(
+                "源路径缺少普通文件类型元数据或类型不符".into(),
+            ));
+        }
+        if source.sha256.len() != 64 {
+            return Err(ClientError::Verification(
+                "源文件缺少可校验的 SHA-256".into(),
+            ));
+        }
+        std::fs::create_dir_all(spool_dir)?;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let scratch =
+            ScratchCopy(spool_dir.join(format!(".ltfsctl-copy-{}", uuid::Uuid::new_v4())));
+        let mut local = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&scratch.0)?;
+        let length = self.get_to(source_path, &mut local)?;
+        local.flush()?;
+        drop(local);
+        let digest = sha256_file(&scratch.0)?;
+        let after = self.stat_path(source_path)?.ok_or(ClientError::NotFound)?;
+        if length != source.length
+            || digest != source.sha256
+            || after.state != "committed"
+            || after.current.as_ref().is_none_or(|current| {
+                current.version != source.version
+                    || current.length != source.length
+                    || current.sha256 != source.sha256
+            })
+        {
+            return Err(ClientError::Verification(
+                "源文件在读取期间改变，目标未写入".into(),
+            ));
+        }
+        let preserve_metadata =
+            source.metadata["node"].is_object() && source.metadata["xattrs"].is_array();
+        let put = if preserve_metadata {
+            let len = std::fs::metadata(&scratch.0)?.len();
+            destination.put_body(
+                destination_path,
+                Body::File(&scratch.0, len),
+                &digest,
+                true,
+                true,
+                Some(&source.metadata),
+            )?
+        } else {
+            destination.put_file(destination_path, &scratch.0, true, true)?
+        };
+        if !put.committed {
+            return Err(ClientError::Indeterminate(format!(
+                "目标路径 {destination_path} 尚未确认落带"
+            )));
+        }
+        let copied = destination
+            .stat(destination_path)?
+            .ok_or_else(|| ClientError::Verification("目标落带后无法查询文件".into()))?;
+        if copied.length != length || copied.sha256 != digest {
+            return Err(ClientError::Verification(
+                "目标落带后的长度或 SHA-256 与源文件不符".into(),
+            ));
+        }
+        if preserve_metadata
+            && (copied.metadata["node"] != source.metadata["node"]
+                || portable_xattrs(&copied.metadata) != portable_xattrs(&source.metadata))
+        {
+            return Err(ClientError::Verification(format!(
+                "目标落带后的文件属性与源文件不符；目标路径 {} 保留",
+                destination_path
+            )));
+        }
+        let mut readback = Sha256Writer(sha2::Sha256::new());
+        let readback_length = destination
+            .get_to(destination_path, &mut readback)
+            .map_err(|e| {
+                ClientError::Indeterminate(format!(
+                    "目标已落带，但无法读回校验 {}；目标保留：{}",
+                    destination_path, e
+                ))
+            })?;
+        let readback_digest = format!("{:x}", readback.0.finalize());
+        if readback_length != length || readback_digest != digest {
+            return Err(ClientError::Verification(format!(
+                "目标 {} 已落带，但读回的长度或 SHA-256 不符；源和目标均保留",
+                destination_path
+            )));
+        }
+        let final_destination = destination.stat_path(destination_path).map_err(|e| {
+            ClientError::Indeterminate(format!(
+                "目标已读回，但无法复核其最终版本；目标路径 {} 保留：{}",
+                destination_path, e
+            ))
+        })?;
+        if final_destination.as_ref().is_none_or(|path| {
+            path.state != "committed"
+                || path.current.as_ref().is_none_or(|current| {
+                    current.version != copied.version
+                        || current.length != copied.length
+                        || current.sha256 != copied.sha256
+                        || current.barcode != copied.barcode
+                        || current.metadata != copied.metadata
+                })
+        }) {
+            return Err(ClientError::Verification(format!(
+                "目标 {} 在读回期间发生变化；源和目标均保留",
+                destination_path
+            )));
+        }
+        let final_source = self.stat_path(source_path).map_err(|e| {
+            ClientError::Indeterminate(format!(
+                "目标已落带，但无法复核源文件最终版本；目标路径 {} 保留：{}",
+                destination_path, e
+            ))
+        })?;
+        if final_source.as_ref().is_none_or(|path| {
+            path.state != "committed"
+                || path.current.as_ref().is_none_or(|current| {
+                    current.version != source.version
+                        || current.length != source.length
+                        || current.sha256 != source.sha256
+                })
+        }) {
+            return Err(ClientError::Verification(format!(
+                "目标已落带，但源文件在复制完成前发生变化；目标路径 {} 保留，禁止删除源",
+                destination_path
+            )));
+        }
+        Ok(CopyOutcome {
+            source,
+            destination: copied,
+        })
     }
 
     fn put_body(
@@ -526,12 +779,27 @@ impl Client {
         digest: &str,
         create_only: bool,
         wait: bool,
+        copy_metadata: Option<&Value>,
     ) -> Result<PutOutcome> {
-        let headers: &[(&str, &str)] = if create_only {
-            &[("If-None-Match", "*")]
+        let encoded_metadata = if let Some(metadata) = copy_metadata {
+            let bytes = serde_json::to_vec(metadata)
+                .map_err(|e| ClientError::Verification(format!("复制源元数据无法编码：{e}")))?;
+            if bytes.len() > 12 * 1024 {
+                return Err(ClientError::Verification(
+                    "复制源元数据超过 12 KiB，目标未写入".into(),
+                ));
+            }
+            Some(base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes))
         } else {
-            &[]
+            None
         };
+        let mut headers = Vec::new();
+        if create_only {
+            headers.push(("If-None-Match", "*"));
+        }
+        if let Some(encoded) = &encoded_metadata {
+            headers.push(("X-Tapers-Copy-Metadata", encoded.as_str()));
+        }
         let route = format!(
             "/files/{}{}",
             path.trim_start_matches('/'),
@@ -543,7 +811,7 @@ impl Client {
         loop {
             attempts += 1;
             let uncertain =
-                match self.request_leader_with("PUT", &route, Some(body.clone()), headers, None) {
+                match self.request_leader_with("PUT", &route, Some(body.clone()), &headers, None) {
                     Ok(r) if r.status == 201 => {
                         return Ok(PutOutcome {
                             generation: r.json()["generation"].as_u64().unwrap_or(0),
@@ -604,6 +872,14 @@ impl Client {
                     .and_then(|s| s.current)
                     .filter(|s| s.length == len && s.sha256 == digest)
                 {
+                    if create_only {
+                        // 相同内容不能证明这次只创建请求写下了该版本；它可能
+                        // 早已存在，或由另一个客户端在连接中断后创建。
+                        return Err(ClientError::Indeterminate(format!(
+                            "只创建上传 {} 的响应丢失；目标已有相同内容，无法确认归属（版本 {}.{})",
+                            path, cur.version.0, cur.version.1
+                        )));
+                    }
                     return Ok(PutOutcome {
                         generation: cur.generation,
                         attempts,
@@ -613,7 +889,14 @@ impl Client {
                 }
             }
             if Instant::now() >= deadline {
-                return Err(ClientError::NoLeader("上传在期限内没有得到确认".into()));
+                return Err(if create_only && uncertain {
+                    ClientError::Indeterminate(format!(
+                        "只创建上传 {} 在期限内没有得到提交确认",
+                        path
+                    ))
+                } else {
+                    ClientError::NoLeader("上传在期限内没有得到确认".into())
+                });
             }
         }
     }
@@ -638,6 +921,40 @@ impl Client {
             ))),
             500 if r.json()["status"] == "indeterminate" => Err(ClientError::Indeterminate(
                 format!("删除 {}: {}", path, String::from_utf8_lossy(&r.body)),
+            )),
+            s => Err(ClientError::Rejected {
+                status: s,
+                body: String::from_utf8_lossy(&r.body).into_owned(),
+            }),
+        }
+    }
+
+    /// 仅当源路径仍是已核验版本时写入墓碑；用于复制后安全地决定是否可删除源。
+    pub fn delete_if_version(&mut self, path: &str, version: (u64, u64)) -> Result<()> {
+        let route = format!("/files/{}?wait=1", path.trim_start_matches('/'));
+        let etag = format!("\"{}.{}\"", version.0, version.1);
+        let r = self
+            .request_leader_with("DELETE", &route, None, &[("If-Match", &etag)], None)
+            .map_err(|e| match e {
+                ClientError::Io(e) => {
+                    ClientError::Indeterminate(format!("条件删除 {}: {}", path, e))
+                }
+                other => other,
+            })?;
+        match r.status {
+            200 if r.json()["status"] == "committed" => Ok(()),
+            404 => Err(ClientError::NotFound),
+            412 => Err(ClientError::Verification(format!(
+                "{} 已不是版本 {}.{}",
+                path, version.0, version.1
+            ))),
+            202 | 504 => Err(ClientError::Indeterminate(format!(
+                "条件删除 {} 尚未取得落带确认: {}",
+                path,
+                String::from_utf8_lossy(&r.body)
+            ))),
+            500 if r.json()["status"] == "indeterminate" => Err(ClientError::Indeterminate(
+                format!("条件删除 {}: {}", path, String::from_utf8_lossy(&r.body)),
             )),
             s => Err(ClientError::Rejected {
                 status: s,
@@ -895,6 +1212,68 @@ impl Client {
 
     // ---------- 管理 ----------
 
+    /// 读取当前带库的集群管理资源。调用方传入 `/admin/...` 路径。
+    pub fn admin_get(&mut self, route: &str) -> Result<Value> {
+        if !route.starts_with("/admin/") {
+            return Err(ClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "管理查询路径必须以 /admin/ 开始",
+            )));
+        }
+        let r = self.request_leader("GET", route, None)?;
+        match r.status {
+            200 => Ok(r.json()),
+            s => Err(ClientError::Rejected {
+                status: s,
+                body: String::from_utf8_lossy(&r.body).into_owned(),
+            }),
+        }
+    }
+
+    /// 提交一条集群管理命令。返回值中的任务号需再用 `/admin/tasks/<id>` 查询终态。
+    pub fn admin_request(&mut self, method: &str, route: &str, body: Value) -> Result<Value> {
+        if !route.starts_with("/admin/") || !matches!(method, "POST" | "PATCH" | "DELETE") {
+            return Err(ClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "管理写入需要 /admin/ 路径及 POST、PATCH 或 DELETE",
+            )));
+        }
+        let bytes = serde_json::to_vec(&body).map_err(|e| {
+            ClientError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })?;
+        // 即使请求体为空，写请求一旦可能抵达服务端，也不能跨节点自动重发。
+        let r = self.request_leader(method, route, Some(&bytes))?;
+        match r.status {
+            200 | 202 => Ok(r.json()),
+            s => Err(ClientError::Rejected {
+                status: s,
+                body: String::from_utf8_lossy(&r.body).into_owned(),
+            }),
+        }
+    }
+
+    /// 列出同一集群内的全部带库，不受当前选库影响。
+    pub fn libraries(&mut self) -> Result<Value> {
+        let selected = self.library.take();
+        let leader = self.leader.take();
+        let result = self.admin_get("/admin/libraries");
+        self.library = selected;
+        self.leader = leader;
+        result
+    }
+
+    /// 查询当前库及池中的文件操作任务。
+    pub fn file_task(&mut self, id: u64) -> Result<Value> {
+        let r = self.request_leader("GET", &format!("/tasks/{id}"), None)?;
+        match r.status {
+            200 => Ok(r.json()),
+            s => Err(ClientError::Rejected {
+                status: s,
+                body: String::from_utf8_lossy(&r.body).into_owned(),
+            }),
+        }
+    }
+
     fn admin(&mut self, method: &str, route: &str) -> Result<String> {
         // 带一个空内容：管理命令和上传一样，一旦可能已送达就不能悄悄换节点重发
         let r = self.request_leader(method, route, Some(b""))?;
@@ -996,6 +1375,19 @@ struct CountingWriter<'a> {
     n: u64,
 }
 
+struct Sha256Writer(sha2::Sha256);
+
+impl Write for Sha256Writer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl Write for CountingWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let k = self.inner.write(buf)?;
@@ -1009,7 +1401,7 @@ impl Write for CountingWriter<'_> {
 }
 
 /// 查询参数值的百分号编码（`/` 也编码，服务端 `percent_decode` 还原）。
-fn encode_query(v: &str) -> String {
+pub(crate) fn encode_query(v: &str) -> String {
     let mut out = String::with_capacity(v.len());
     for b in v.bytes() {
         match b {
@@ -1047,6 +1439,517 @@ fn encode_path(path: &str) -> String {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn create_only_does_not_claim_preexisting_same_content_after_lost_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = Client::new([listener.local_addr().unwrap().to_string()]);
+        client.retry_for = Duration::ZERO;
+        let server = std::thread::spawn(move || {
+            let digest = format!("{:x}", sha2::Sha256::digest(b"abc"));
+            let (upload, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(&upload);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "PUT /files/target?wait=1 HTTP/1.1\r\n");
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let mut body = [0; 3];
+            reader.read_exact(&mut body).unwrap();
+            assert_eq!(&body, b"abc");
+            drop(reader);
+            drop(upload);
+
+            let (mut query, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(&query);
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "GET /stat/target HTTP/1.1\r\n");
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let body = serde_json::json!({
+                "state":"committed", "length":3, "generation":1,
+                "barcode":"TAPE01", "sha256":digest,
+                "version":[1,1], "metadata":{}
+            })
+            .to_string();
+            write!(
+                query,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        assert!(matches!(
+            client.put_new("/target", b"abc"),
+            Err(ClientError::Indeterminate(_))
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn verified_copy_refuses_changed_source_before_target_write() {
+        let source_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        target_listener.set_nonblocking(true).unwrap();
+        let mut source = Client::new([source_listener.local_addr().unwrap().to_string()]);
+        let mut target = Client::new([target_listener.local_addr().unwrap().to_string()]);
+        let scratch = std::env::temp_dir().join(format!("client-copy-{}", uuid::Uuid::new_v4()));
+        let server = std::thread::spawn(move || {
+            let digest = format!("{:x}", sha2::Sha256::digest(b"abc"));
+            for n in 0..3 {
+                let (mut stream, _) = source_listener.accept().unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(
+                    line,
+                    if n == 1 {
+                        "GET /files/source HTTP/1.1\r\n"
+                    } else {
+                        "GET /stat/source HTTP/1.1\r\n"
+                    }
+                );
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let body = if n == 1 {
+                    b"abc".to_vec()
+                } else {
+                    serde_json::json!({
+                        "state":"committed", "length":3, "generation":1,
+                        "barcode":"TAPE01", "sha256":digest,
+                        "metadata":{},
+                        "version":[if n == 0 { 1 } else { 2 }, 1],
+                    })
+                    .to_string()
+                    .into_bytes()
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(&body).unwrap();
+            }
+        });
+        assert!(matches!(
+            source.copy_verified_to(&mut target, "/source", "/target", &scratch),
+            Err(ClientError::Verification(_))
+        ));
+        server.join().unwrap();
+        assert!(target_listener.accept().is_err(), "源版本改变时不得写目标");
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+        std::fs::remove_dir(scratch).unwrap();
+    }
+
+    #[test]
+    fn verified_copy_reports_source_change_after_destination_commit() {
+        let source_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut source = Client::new([source_listener.local_addr().unwrap().to_string()]);
+        let mut target = Client::new([target_listener.local_addr().unwrap().to_string()]);
+        let scratch = std::env::temp_dir().join(format!("client-copy-{}", uuid::Uuid::new_v4()));
+        let digest = format!("{:x}", sha2::Sha256::digest(b"abc"));
+        let source_digest = digest.clone();
+        let source_server = std::thread::spawn(move || {
+            for n in 0..4 {
+                let (mut stream, _) = source_listener.accept().unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(
+                    line,
+                    if n == 1 {
+                        "GET /files/source HTTP/1.1\r\n"
+                    } else {
+                        "GET /stat/source HTTP/1.1\r\n"
+                    }
+                );
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let body = if n == 1 {
+                    b"abc".to_vec()
+                } else {
+                    serde_json::json!({
+                        "state":"committed", "length":3, "generation":1,
+                        "barcode":"TAPE01", "sha256":source_digest,
+                        "metadata":{}, "version":[if n == 3 { 2 } else { 1 }, 1],
+                    })
+                    .to_string()
+                    .into_bytes()
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(&body).unwrap();
+            }
+        });
+        let target_server = std::thread::spawn(move || {
+            for n in 0..4 {
+                let (mut stream, _) = target_listener.accept().unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(
+                    line,
+                    match n {
+                        0 => "PUT /files/target?wait=1 HTTP/1.1\r\n",
+                        2 => "GET /files/target HTTP/1.1\r\n",
+                        _ => "GET /stat/target HTTP/1.1\r\n",
+                    }
+                );
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    let mut body = [0; 3];
+                    reader.read_exact(&mut body).unwrap();
+                    assert_eq!(&body, b"abc");
+                }
+                let body = match n {
+                    0 => "{\"generation\":1}".to_string(),
+                    2 => "abc".to_string(),
+                    _ => serde_json::json!({
+                        "state":"committed", "length":3, "generation":1,
+                        "barcode":"TAPE02", "sha256":digest,
+                        "metadata":{}, "version":[1,2],
+                    })
+                    .to_string(),
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    if n == 0 { 201 } else { 200 },
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        assert!(matches!(
+            source.copy_verified_to(&mut target, "/source", "/target", &scratch),
+            Err(ClientError::Verification(message)) if message.contains("目标已落带")
+        ));
+        source_server.join().unwrap();
+        target_server.join().unwrap();
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+        std::fs::remove_dir(scratch).unwrap();
+    }
+
+    #[test]
+    fn verified_copy_rejects_corrupt_target_readback() {
+        let source_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut source = Client::new([source_listener.local_addr().unwrap().to_string()]);
+        let mut target = Client::new([target_listener.local_addr().unwrap().to_string()]);
+        let scratch = std::env::temp_dir().join(format!("client-copy-{}", uuid::Uuid::new_v4()));
+        let digest = format!("{:x}", sha2::Sha256::digest(b"abc"));
+        let source_digest = digest.clone();
+        let source_server = std::thread::spawn(move || {
+            for expected in [
+                "GET /stat/source HTTP/1.1\r\n",
+                "GET /files/source HTTP/1.1\r\n",
+                "GET /stat/source HTTP/1.1\r\n",
+            ] {
+                let (mut stream, _) = source_listener.accept().unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line, expected);
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let body = if expected.contains("/files/") {
+                    b"abc".to_vec()
+                } else {
+                    serde_json::json!({
+                        "state":"committed", "length":3, "generation":1,
+                        "barcode":"TAPE01", "sha256":source_digest,
+                        "metadata":{}, "version":[1,1]
+                    })
+                    .to_string()
+                    .into_bytes()
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(&body).unwrap();
+            }
+        });
+        let target_server = std::thread::spawn(move || {
+            for expected in [
+                "PUT /files/target?wait=1 HTTP/1.1\r\n",
+                "GET /stat/target HTTP/1.1\r\n",
+                "GET /files/target HTTP/1.1\r\n",
+            ] {
+                let (mut stream, _) = target_listener.accept().unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line, expected);
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                if expected.starts_with("PUT") {
+                    let mut body = [0; 3];
+                    reader.read_exact(&mut body).unwrap();
+                    assert_eq!(&body, b"abc");
+                }
+                let body = if expected.starts_with("PUT") {
+                    b"{\"generation\":1}".to_vec()
+                } else if expected.contains("/files/") {
+                    b"abd".to_vec()
+                } else {
+                    serde_json::json!({
+                        "state":"committed", "length":3, "generation":1,
+                        "barcode":"TAPE02", "sha256":digest,
+                        "metadata":{}, "version":[1,2]
+                    })
+                    .to_string()
+                    .into_bytes()
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    if expected.starts_with("PUT") {
+                        201
+                    } else {
+                        200
+                    },
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(&body).unwrap();
+            }
+        });
+        assert!(matches!(
+            source.copy_verified_to(&mut target, "/source", "/target", &scratch),
+            Err(ClientError::Verification(message)) if message.contains("读回")
+        ));
+        source_server.join().unwrap();
+        target_server.join().unwrap();
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+        std::fs::remove_dir(scratch).unwrap();
+    }
+
+    #[test]
+    fn verified_copy_refuses_symlink_before_reading_contents() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut source = Client::new([listener.local_addr().unwrap().to_string()]);
+        let mut destination = Client::new(["127.0.0.1:1"]);
+        source.retry_for = Duration::ZERO;
+        destination.retry_for = Duration::ZERO;
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(&stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "GET /stat/link HTTP/1.1\r\n");
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let body = serde_json::json!({
+                "state":"committed", "length":3, "generation":1,
+                "barcode":"TAPE01", "sha256":"a".repeat(64),
+                "version":[1,1], "metadata":{"kind":"symlink","symlink":"target"}
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        assert!(matches!(
+            source.copy_verified_to(&mut destination, "/link", "/target", &std::env::temp_dir()),
+            Err(ClientError::Verification(_))
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn management_queries_keep_library_scope_except_global_library_list() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = Client::new([listener.local_addr().unwrap().to_string()])
+            .with_library("SERIAL_B")
+            .unwrap()
+            .with_pool("pool")
+            .unwrap();
+        let server = std::thread::spawn(move || {
+            for expected in [
+                "/libraries/SERIAL_B/admin/tapes",
+                "/admin/libraries",
+                "/libraries/SERIAL_B/admin/drives",
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line, format!("GET {expected} HTTP/1.1\r\n"));
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let body = r#"{"ok":true}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        assert_eq!(client.admin_get("/admin/tapes").unwrap()["ok"], true);
+        assert_eq!(client.libraries().unwrap()["ok"], true);
+        assert_eq!(client.admin_get("/admin/drives").unwrap()["ok"], true);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn management_write_with_lost_response_is_not_replayed() {
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let second = TcpListener::bind("127.0.0.1:0").unwrap();
+        second.set_nonblocking(true).unwrap();
+        let mut client = Client::new([
+            first.local_addr().unwrap().to_string(),
+            second.local_addr().unwrap().to_string(),
+        ]);
+        client.retry_for = Duration::ZERO;
+        let server = std::thread::spawn(move || {
+            let (stream, _) = first.accept().unwrap();
+            let mut reader = BufReader::new(&stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "POST /admin/libraries/current/rescan HTTP/1.1\r\n");
+            let mut length = 0;
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.strip_prefix("Content-Length: ") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            assert_eq!(body, b"{}");
+            drop(reader);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            assert!(second.accept().is_err(), "结果未定的写入不得重发");
+        });
+        assert!(matches!(
+            client.admin_request(
+                "POST",
+                "/admin/libraries/current/rescan",
+                serde_json::json!({})
+            ),
+            Err(ClientError::Io(_))
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn selected_library_and_pool_survive_hints_without_switching_scope() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let mut client = Client::new([address.clone()])
+            .with_library("SERIAL/with space%")
+            .unwrap()
+            .with_pool("pool X%")
+            .unwrap();
+        let server = std::thread::spawn(move || {
+            for n in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                let mut reader = BufReader::new(&stream);
+                reader.read_line(&mut request).unwrap();
+                assert_eq!(
+                    request,
+                    "GET /libraries/SERIAL%2Fwith%20space%25/pools/pool%20X%25/stat/file?x=1 HTTP/1.1\r\n"
+                );
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let (code, body) = if n == 0 {
+                    (
+                        503,
+                        serde_json::json!({"leader_url":format!("http://{address}/libraries/OTHER")}),
+                    )
+                } else {
+                    (200, serde_json::json!({"ok":true}))
+                };
+                let body = body.to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 {code} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        assert_eq!(
+            client
+                .request_leader("GET", "/stat/file?x=1", None)
+                .unwrap()
+                .status,
+            200
+        );
+        server.join().unwrap();
+        assert!(Client::new(["localhost:1"]).with_library("").is_err());
+        assert!(Client::new(["localhost:1"]).with_pool("").is_err());
+    }
 
     #[test]
     fn waiting_upload_queries_after_staged_response() {

@@ -143,11 +143,16 @@ fn format_elem_head(elem: &ElementStatus, map: &ElementAddressMap) -> String {
     let state = if elem.full { "载带" } else { "空" };
     let tag = elem.volume_tag.as_deref().unwrap_or("-");
     format!(
-        "{} {:>3} [{}]: {}",
+        "{} {:>3} [{}]: {}{}",
         label,
         friendly_index(elem, map),
         state,
-        tag
+        tag,
+        if elem.is_cleaning() {
+            " [清洗带]"
+        } else {
+            ""
+        }
     )
 }
 
@@ -579,6 +584,7 @@ mod tests {
             address: addr,
             element_type: ty,
             full,
+            medium_type: None,
             volume_tag: tag.map(String::from),
             source_address: None,
             drive_id: None,

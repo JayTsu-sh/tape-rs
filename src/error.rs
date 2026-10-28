@@ -46,6 +46,12 @@ pub enum TapeError {
     #[error("Library state inconsistent after operation: {0}")]
     InconsistentState(String),
 
+    #[error("本地读取存储准入失败: {reason}")]
+    LocalCapacity { reason: String },
+
+    #[error("本地读取文件系统空间不足: {reason}")]
+    LocalSpace { reason: String },
+
     #[error("Device not ready: {0}")]
     NotReady(String),
 

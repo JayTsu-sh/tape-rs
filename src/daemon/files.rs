@@ -13,6 +13,7 @@
 //! 客户端路径不能落在里面。
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::io::{Read, Seek};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -23,10 +24,28 @@ use crate::core::volume_state::{
 };
 use crate::ltfs::index::{DirectoryNode, LtfsIndex};
 use crate::ltfs::volume::{XATTR_DELETED_PATH, XATTR_VERSION, is_tombstone_path};
+use sha2::{Digest, Sha256};
 
 use super::directory::Directory;
 use super::executor::ExecRequest;
 use super::state::FileRec;
+
+/// 运行节点签发的冻结目录快照；文件描述符已脱离路径，HTTP 可以安全地流式发送。
+pub struct CatalogSnapshotExport {
+    pub file: std::fs::File,
+    pub applied_index: u64,
+    pub frozen_index: u64,
+    pub sha256: [u8; 32],
+    pub(super) lease: CatalogExportLease,
+}
+
+pub(super) struct CatalogExportLease(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CatalogExportLease {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
 
 /// 一盘带索引里的全部目录记录与活着的字节数。墓碑按它记的被删路径报告（`deleted`），
 /// 墓碑目录下没有 `tapers.deletedPath` 的文件不认。同一盘带上一个路径只应有一条记录
@@ -111,6 +130,49 @@ pub(crate) fn directory_metadata(
         })
     };
     parse().ok_or_else(|| ServiceError::Io("目录属性损坏，拒绝有损搬迁".into()))
+}
+
+/// 跨库复制只接受普通文件的用户属性；卷内版本、摘要及设备私有属性由目标重建。
+pub(crate) fn copied_file_metadata(
+    value: &serde_json::Value,
+) -> Result<crate::ltfs::volume::FileMetadata, ServiceError> {
+    if value.get("kind").is_some_and(|kind| kind != "file") {
+        return Err(ServiceError::Io("复制源不是普通文件".into()));
+    }
+    let mut metadata = directory_metadata(value)?;
+    for time in [
+        &metadata.meta.creation_time,
+        &metadata.meta.change_time,
+        &metadata.meta.modify_time,
+        &metadata.meta.access_time,
+        &metadata.meta.backup_time,
+    ] {
+        crate::ltfs::index::MetadataChange {
+            modify_time: Some(time.clone()),
+            ..Default::default()
+        }
+        .validate()
+        .map_err(|e| ServiceError::Io(format!("复制源时间属性无效：{e}")))?;
+    }
+    metadata.xattrs.retain(|attr| {
+        !["tapers.", "tape.", "ltfs."]
+            .iter()
+            .any(|prefix| attr.key.starts_with(prefix))
+    });
+    let mut keys = std::collections::BTreeSet::new();
+    for attr in &metadata.xattrs {
+        writable_xattr_key(&format!("user.{}", attr.key))?;
+        if !keys.insert(&attr.key) {
+            return Err(ServiceError::Io("复制源扩展属性重复".into()));
+        }
+        if attr.base64 {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(&attr.value)
+                .map_err(|e| ServiceError::Io(format!("复制源扩展属性 Base64 无效：{e}")))?;
+        }
+    }
+    Ok(metadata)
 }
 
 pub(crate) fn is_directory(metadata: &serde_json::Value) -> bool {
@@ -209,6 +271,8 @@ pub enum ServiceError {
     Exists(String),
     /// 删除：路径没有已提交的当前版本（从未有过，或已被删除）。
     NotFound(String),
+    /// 条件删除：当前文件不是调用方核对过的那个版本。
+    VersionMismatch(String),
     IsDirectory(String),
     NotDirectory(String),
     NotEmpty(String),
@@ -241,6 +305,7 @@ impl std::fmt::Display for ServiceError {
             ServiceError::PathBusy(p) => write!(f, "路径或其父子路径正在变更: {}", p),
             ServiceError::Exists(p) => write!(f, "路径已存在: {}", p),
             ServiceError::NotFound(p) => write!(f, "路径不存在: {}", p),
+            ServiceError::VersionMismatch(p) => write!(f, "路径版本已改变: {}", p),
             ServiceError::IsDirectory(p) => write!(f, "路径是目录: {}", p),
             ServiceError::CrossDevice(p) => write!(f, "此元数据操作要求对象位于当前写入卷: {}", p),
             ServiceError::NoAttribute(p) => write!(f, "扩展属性不存在: {}", p),
@@ -376,6 +441,8 @@ pub enum DirEntry {
 
 struct Serving {
     draining: bool,
+    maintenance: bool,
+    capacity_known: bool,
     round: u64,
     state: Arc<VolumeState>,
     queue: VecDeque<Upload>,
@@ -385,11 +452,14 @@ struct Serving {
     newest: Option<Instant>,
     in_batch: Vec<u64>,
     namespace_pending: BTreeSet<String>,
+    external_pending: Vec<Arc<crate::core::volume_state::VolumeRoot>>,
     opened: Instant,
     tape: TapeIdent,
     limits: TapeLimits,
     /// 已准入的上传数（含尚未完成的），与带上已有文件数一起对照文件数上限
     admitted: u64,
+    /// 当前物理卷索引条目数；其他卷覆盖同名路径不能减少这里的文件数。
+    files_total: u64,
     /// 需要换带：新状态（data_full / full）。置位后不再准入，等执行线程把队列落带后换带
     switch: Option<&'static str>,
     /// 当前这盘带上的文件：开放服务时取自刚读到的索引，之后每次卷提交追加。
@@ -408,17 +478,68 @@ struct Inner {
     next_task: u64,
 }
 
+// 每个池只有一把准入锁和任务表。锁内切换当前驱动视图，避免跨驱动的路径准入竞态。
+struct PoolState {
+    current: Inner,
+    lane: usize,
+    others: BTreeMap<usize, Inner>,
+    recent: HashMap<String, Stat>,
+}
+
+struct ServiceGuard<'a>(MutexGuard<'a, PoolState>);
+impl std::ops::Deref for ServiceGuard<'_> {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        &self.0.current
+    }
+}
+impl std::ops::DerefMut for ServiceGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Inner {
+        &mut self.0.current
+    }
+}
+impl Drop for ServiceGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(s) = self.0.current.serving.as_mut() {
+            let recent = std::mem::take(&mut s.recent);
+            self.0.recent = recent;
+        }
+    }
+}
+
+impl Inner {
+    fn empty() -> Self {
+        Self {
+            serving: None,
+            why_not: "尚未接管".into(),
+            no_tape: false,
+            read_only: None,
+            tasks: HashMap::new(),
+            next_task: 1,
+        }
+    }
+}
+
 // Cached read-only catalog connection and its device/inode identity.
 type DirectoryReader = (Directory, Option<(u64, u64)>);
 
 pub struct FileService {
-    permission: Mutex<Option<Arc<super::permission::Permission>>>,
-    inner: Mutex<Inner>,
-    changed: Condvar,
+    permission: Arc<Mutex<Option<Arc<super::permission::Permission>>>>,
+    /// Raft 已应用的旧目录暂停屏障；所有池/驱动 lane 共用。
+    catalog_quiesced: Arc<std::sync::atomic::AtomicBool>,
+    inner: Arc<Mutex<PoolState>>,
+    lane: usize,
+    target_pool: Mutex<Option<String>>,
+    requested: std::sync::atomic::AtomicBool,
+    parallelism: std::sync::atomic::AtomicUsize,
+    peers: Mutex<Vec<Arc<FileService>>>,
+    changed: Arc<Condvar>,
     spool_dir: PathBuf,
-    exec: Mutex<Option<Sender<ExecRequest>>>,
+    exec: Arc<Mutex<Option<Sender<ExecRequest>>>>,
+    task_events: Arc<Mutex<Option<Sender<super::executor::ExecEvent>>>>,
     policy: BatchPolicy,
     directory_path: Option<PathBuf>,
+    export_active: Arc<std::sync::atomic::AtomicBool>,
     /// 只读连接，以及打开时该文件的 (设备号, inode)：文件被换掉就重开
     reader: Mutex<Option<DirectoryReader>>,
 }
@@ -447,7 +568,12 @@ fn descendant(path: &str, parent: &str) -> bool {
 }
 
 fn check_pending(s: &Serving, path: &str) -> Result<(), ServiceError> {
-    if s.state
+    if s.external_pending.iter().any(|root| {
+        root.pending
+            .keys()
+            .any(|p| p == path || descendant(p, path) || descendant(path, p))
+    }) || s
+        .state
         .load()
         .pending
         .keys()
@@ -498,6 +624,13 @@ fn map_state(e: StateError) -> ServiceError {
     }
 }
 
+fn task_id(round: u64, counter: u64) -> Result<u64, ServiceError> {
+    if round >= (1 << 31) || counter == 0 || counter > u32::MAX as u64 {
+        return Err(ServiceError::Io("文件任务号已耗尽，拒绝重复使用".into()));
+    }
+    Ok((round << 32) | counter)
+}
+
 /// 把卷索引转成卷状态模块的已提交视图。
 pub fn committed_view(index: &LtfsIndex) -> Arc<DirNode> {
     fn conv(d: &DirectoryNode) -> DirNode {
@@ -521,6 +654,22 @@ pub fn committed_view(index: &LtfsIndex) -> Arc<DirNode> {
 }
 
 impl FileService {
+    #[cfg(feature = "fdb")]
+    pub(crate) fn spool_dir(&self) -> &std::path::Path {
+        &self.spool_dir
+    }
+
+    #[cfg(feature = "fdb")]
+    pub(crate) fn extent_cache_dir(&self) -> PathBuf {
+        let mut name = self
+            .spool_dir
+            .file_name()
+            .unwrap_or_default()
+            .to_os_string();
+        name.push(".fdb-extents");
+        self.spool_dir.with_file_name(name)
+    }
+
     /// 下载暂存文件创建后立即 unlink，最后一个句柄关闭时由内核回收。
     pub fn read_spool(&self) -> std::io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
@@ -551,20 +700,26 @@ impl FileService {
         let _ = std::fs::remove_dir_all(&spool_dir);
         std::fs::create_dir_all(&spool_dir)?;
         Ok(Arc::new(Self {
-            permission: Mutex::new(None),
-            inner: Mutex::new(Inner {
-                serving: None,
-                why_not: "尚未接管".into(),
-                no_tape: false,
-                read_only: None,
-                tasks: HashMap::new(),
-                next_task: 1,
-            }),
-            changed: Condvar::new(),
+            permission: Arc::new(Mutex::new(None)),
+            catalog_quiesced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            inner: Arc::new(Mutex::new(PoolState {
+                current: Inner::empty(),
+                lane: 0,
+                others: BTreeMap::new(),
+                recent: HashMap::new(),
+            })),
+            lane: 0,
+            target_pool: Mutex::new(None),
+            requested: std::sync::atomic::AtomicBool::new(false),
+            parallelism: std::sync::atomic::AtomicUsize::new(1),
+            peers: Mutex::new(Vec::new()),
+            changed: Arc::new(Condvar::new()),
             spool_dir,
-            exec: Mutex::new(None),
+            exec: Arc::new(Mutex::new(None)),
+            task_events: Arc::new(Mutex::new(None)),
             policy,
             directory_path,
+            export_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reader: Mutex::new(None),
         }))
     }
@@ -573,8 +728,55 @@ impl FileService {
         *self.exec.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
     }
 
+    pub fn set_task_events(&self, tx: Sender<super::executor::ExecEvent>) {
+        *self.task_events.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    }
+
+    fn report_task(&self, task: u64, round: u64, pool: &str, path: &str, status: &TaskStatus) {
+        let (name, generation, reason) = match status {
+            TaskStatus::Staged => ("staged", None, String::new()),
+            TaskStatus::Committed { generation } => ("committed", Some(*generation), String::new()),
+            TaskStatus::Failed { reason } => ("failed", None, reason.clone()),
+            TaskStatus::Indeterminate { reason } => ("indeterminate", None, reason.clone()),
+        };
+        if let Some(tx) = self
+            .task_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            let _ = tx.send(super::executor::ExecEvent::FileTask {
+                task,
+                round,
+                pool: pool.to_owned(),
+                path: path.to_owned(),
+                status: name.into(),
+                generation,
+                reason: reason.chars().take(1024).collect(),
+            });
+        }
+    }
+
     pub fn set_permission(&self, permission: Arc<super::permission::Permission>) {
         *self.permission.lock().unwrap_or_else(|e| e.into_inner()) = Some(permission);
+    }
+
+    pub fn set_catalog_quiesced(&self, quiesced: bool) {
+        self.catalog_quiesced
+            .store(quiesced, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn require_catalog_writable(&self) -> Result<(), ServiceError> {
+        if self
+            .catalog_quiesced
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            Err(ServiceError::NotServing(
+                "旧目录已暂停，等待切换或恢复".into(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     /// HTTP VIP 只跟随新 HA 协议的有效 owner；不要求池里已有可写磁带。
@@ -604,14 +806,235 @@ impl FileService {
         Ok(())
     }
 
-    fn lock(&self) -> MutexGuard<'_, Inner> {
-        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        // VolumeState 延后销毁旧根；服务操作之间清理，避免整个服务轮次积累历史快照。
-        // reclaim 只释放没有读者的根，持有 Arc 的并发读者仍看到原来的完整状态。
-        if let Some(s) = &g.serving {
-            s.state.reclaim();
+    fn lock(&self) -> ServiceGuard<'_> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.lane != self.lane {
+            let mut next = g.others.remove(&self.lane).unwrap_or_else(Inner::empty);
+            std::mem::swap(&mut next.tasks, &mut g.current.tasks);
+            std::mem::swap(&mut next.next_task, &mut g.current.next_task);
+            let old = std::mem::replace(&mut g.current, next);
+            let lane = g.lane;
+            g.others.insert(lane, old);
+            g.lane = self.lane;
         }
-        g
+        let external = g
+            .others
+            .values()
+            .filter_map(|v| v.serving.as_ref())
+            .map(|s| s.state.load())
+            .collect();
+        let recent = std::mem::take(&mut g.recent);
+        if let Some(s) = g.current.serving.as_mut() {
+            s.state.reclaim();
+            s.external_pending = external;
+            s.recent = recent;
+        } else {
+            g.recent = recent;
+        }
+        ServiceGuard(g)
+    }
+
+    pub(super) fn set_parallelism(&self, drives: usize) {
+        self.parallelism
+            .store(drives, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(super) fn lane_id(&self) -> usize {
+        self.lane
+    }
+
+    pub(super) fn calibrate_capacity(&self, budget: Option<u64>) {
+        if let Some(s) = self.lock().serving.as_mut() {
+            s.capacity_known = budget.is_some();
+            if budget == Some(0) {
+                s.switch = Some(super::state::tape_state::FULL);
+            }
+            if let Some(free) = budget {
+                // ingest 表示磁盘暂存消耗，尚未落带的部分不在这次 MAM 读数中。
+                let staged = s
+                    .state
+                    .load()
+                    .pending
+                    .values()
+                    .fold(0u64, |n, p| n.saturating_add(p.staged_len));
+                s.state.calibrate(free.saturating_sub(staged));
+            }
+        }
+    }
+
+    pub(super) fn target_pool(&self) -> Option<String> {
+        self.target_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub(super) fn bind_pool(&self, pool: &str) {
+        *self.target_pool.lock().unwrap_or_else(|e| e.into_inner()) = Some(pool.into());
+    }
+
+    /// 新驱动共享同池的命名空间、任务号和发布视图；卷预算及批次仍各自独立。
+    pub(super) fn add_lane(self: &Arc<Self>, pool: &str) -> Arc<Self> {
+        self.add_lane_limited(pool, None).expect("不限制池视图创建")
+    }
+
+    fn add_lane_limited(self: &Arc<Self>, pool: &str, limit: Option<usize>) -> Option<Arc<Self>> {
+        let mut peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
+        let count = usize::from(self.target_pool().as_deref() == Some(pool))
+            + peers
+                .iter()
+                .filter(|p| p.target_pool().as_deref() == Some(pool))
+                .count();
+        if limit.is_some_and(|limit| count >= limit) {
+            return None;
+        }
+        let base = if self.target_pool().as_deref() == Some(pool) {
+            Some(self.clone())
+        } else {
+            peers
+                .iter()
+                .find(|p| p.target_pool().as_deref() == Some(pool))
+                .cloned()
+        };
+        let (inner, changed, lane) = match base {
+            Some(base) => {
+                let g = base.inner.lock().unwrap_or_else(|e| e.into_inner());
+                let lane = g.others.keys().copied().chain([g.lane]).max().unwrap_or(0) + 1;
+                (base.inner.clone(), base.changed.clone(), lane)
+            }
+            None => (
+                Arc::new(Mutex::new(PoolState {
+                    current: Inner::empty(),
+                    lane: 0,
+                    others: BTreeMap::new(),
+                    recent: HashMap::new(),
+                })),
+                Arc::new(Condvar::new()),
+                0,
+            ),
+        };
+        // 立即登记，连续分配驱动时 lane 号不会重复。
+        {
+            let mut g = inner.lock().unwrap_or_else(|e| e.into_inner());
+            if g.lane != lane {
+                g.others.entry(lane).or_insert_with(Inner::empty);
+            }
+        }
+        let service = Arc::new(Self {
+            permission: self.permission.clone(),
+            catalog_quiesced: self.catalog_quiesced.clone(),
+            inner,
+            lane,
+            target_pool: Mutex::new(Some(pool.into())),
+            requested: std::sync::atomic::AtomicBool::new(false),
+            parallelism: std::sync::atomic::AtomicUsize::new(1),
+            peers: Mutex::new(Vec::new()),
+            changed,
+            spool_dir: self.spool_dir.clone(),
+            exec: self.exec.clone(),
+            task_events: self.task_events.clone(),
+            policy: self.policy,
+            directory_path: self.directory_path.clone(),
+            export_active: self.export_active.clone(),
+            reader: Mutex::new(None),
+        });
+        peers.push(service.clone());
+        Some(service)
+    }
+
+    pub(super) fn lanes(self: &Arc<Self>) -> Vec<Arc<Self>> {
+        std::iter::once(self.clone())
+            .chain(
+                self.peers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .cloned(),
+            )
+            .collect()
+    }
+
+    pub(super) fn select_pool(
+        self: &Arc<Self>,
+        pool: &str,
+        path: Option<&str>,
+        pin: bool,
+        write: bool,
+    ) -> Option<Arc<Self>> {
+        let mut lanes: Vec<_> = self
+            .lanes()
+            .into_iter()
+            .filter(|p| p.target_pool().as_deref() == Some(pool))
+            .collect();
+        if pin
+            && let Some(path) = path
+            && let Some(st) = lanes.first().and_then(|p| p.stat(path).ok().flatten())
+            && let Some(lane) = lanes
+                .iter()
+                .find(|p| p.tape_barcode().as_deref() == Some(&st.barcode))
+        {
+            return Some(lane.clone());
+        }
+        lanes.sort_by_key(|p| {
+            let g = p.lock();
+            g.serving
+                .as_ref()
+                .map(|s| {
+                    (
+                        s.draining || s.maintenance || !s.capacity_known || s.switch.is_some(),
+                        s.admitted,
+                    )
+                })
+                .unwrap_or((true, u64::MAX))
+        });
+        if write
+            && !pin
+            && lanes.len() < self.parallelism.load(std::sync::atomic::Ordering::Acquire)
+            && lanes
+                .first()
+                .is_some_and(|lane| lane.lock().serving.as_ref().is_some_and(|s| s.admitted > 0))
+        {
+            let round = lanes[0].serving_round()?;
+            let Some(lane) = self.add_lane_limited(
+                pool,
+                Some(self.parallelism.load(std::sync::atomic::Ordering::Acquire)),
+            ) else {
+                return lanes.into_iter().next();
+            };
+            lane.close_waiting(round, Some(pool.into()), "正在申请并行写入驱动器");
+            lane.requested
+                .store(true, std::sync::atomic::Ordering::Release);
+            lane.kick();
+            return Some(lane);
+        }
+        let lane = lanes.into_iter().next()?;
+        if write && lane.tape_barcode().is_none() {
+            lane.requested
+                .store(true, std::sync::atomic::Ordering::Release);
+            lane.kick();
+        }
+        Some(lane)
+    }
+
+    pub(super) fn needs_capacity(&self) -> bool {
+        self.lock()
+            .serving
+            .as_ref()
+            .is_some_and(|s| !s.capacity_known)
+    }
+
+    pub(super) fn requested(&self) -> bool {
+        self.requested.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(super) fn tape_barcode(&self) -> Option<String> {
+        self.lock().serving.as_ref().map(|s| s.tape.barcode.clone())
+    }
+
+    pub(super) fn close_all(self: &Arc<Self>, reason: &str) {
+        for lane in self.lanes() {
+            lane.close(reason);
+        }
     }
 
     fn kick(&self) {
@@ -632,6 +1055,8 @@ impl FileService {
         free_bytes: u64,
         writable: bool,
     ) {
+        self.requested
+            .store(false, std::sync::atomic::Ordering::Release);
         let state = Arc::new(VolumeState::new(
             round,
             committed_view(index),
@@ -639,8 +1064,13 @@ impl FileService {
             free_bytes,
             writable,
         ));
+        let catalog = catalog_of(index).0;
+        let files_total = catalog
+            .iter()
+            .filter(|r| !is_directory(&r.metadata))
+            .count() as u64;
         let mut records = Vec::new();
-        for r in catalog_of(index).0 {
+        for r in catalog {
             if self.directory_path.is_some() {
                 match self.with_reader(|d| Some(d.lookup(&tape.pool_uuid, &r.path))) {
                     Some(Ok(Some(old)))
@@ -658,8 +1088,14 @@ impl FileService {
             records.push(r);
         }
         let mut g = self.lock();
+        let mut recent = std::mem::take(&mut g.0.recent);
+        if let Some(old) = g.serving.as_mut() {
+            recent.extend(std::mem::take(&mut old.recent));
+        }
         g.serving = Some(Serving {
             draining: false,
+            maintenance: false,
+            capacity_known: true,
             round,
             state,
             queue: VecDeque::new(),
@@ -668,9 +1104,11 @@ impl FileService {
             newest: None,
             in_batch: Vec::new(),
             namespace_pending: BTreeSet::new(),
+            external_pending: Vec::new(),
             opened: Instant::now(),
             limits,
             admitted: 0,
+            files_total,
             switch: None,
             recent: {
                 // 当前装着的这盘带以刚读到的索引为准，不必等目录经 Raft 对账。墓碑也记下：
@@ -694,6 +1132,17 @@ impl FileService {
             },
             tape,
         });
+        if let Some(s) = g.serving.as_mut() {
+            for (path, old) in recent {
+                if old.barcode != s.tape.barcode
+                    && s.recent
+                        .get(&path)
+                        .is_none_or(|new| new.version < old.version)
+                {
+                    s.recent.insert(path, old);
+                }
+            }
+        }
         g.why_not.clear();
         g.no_tape = false;
         self.changed.notify_all();
@@ -706,6 +1155,11 @@ impl FileService {
         let mut g = self.lock();
         g.no_tape = true;
         g.read_only = pool_uuid.map(|p| (round, p));
+    }
+
+    pub(super) fn close_waiting(&self, round: u64, pool: Option<String>, reason: &str) {
+        self.close_no_tape(round, pool, reason);
+        self.lock().no_tape = false;
     }
 
     /// 写入侧是否空闲：队列空、没有正在提交的批、没有已准入但未完成的上传、没有待处理的换带。
@@ -749,6 +1203,20 @@ impl FileService {
             .and_then(|s| s.switch)
     }
 
+    /// 维护期间关闭新操作准入，允许此前已准入上传完成并排队落带。
+    pub fn pause_admission(&self) {
+        if let Some(s) = self.lock().serving.as_mut() {
+            s.maintenance = true;
+        }
+    }
+
+    /// 维护任务在开始设备操作前取消时恢复准入；不会解除停机标记。
+    pub fn resume_admission(&self, round: u64) {
+        if let Some(s) = self.lock().serving.as_mut().filter(|s| s.round == round) {
+            s.maintenance = false;
+        }
+    }
+
     /// 关闭新入队入口，保留已完成队列供计划停机落带。
     pub fn drain(&self) {
         if let Some(s) = self.lock().serving.as_mut() {
@@ -759,20 +1227,20 @@ impl FileService {
     /// 停止服务。仅暂存的任务判失败，已进入提交批次的判结果未定。
     pub fn close(&self, reason: &str) {
         let mut g = self.lock();
-        let Some(s) = g.serving.take() else {
+        let Some(mut s) = g.serving.take() else {
             g.why_not = reason.to_string();
             g.no_tape = false;
             g.read_only = None;
             return;
         };
+        g.0.recent = std::mem::take(&mut s.recent);
         for u in &s.queue {
             let _ = std::fs::remove_file(&u.spool);
-            g.tasks.insert(
-                u.task,
-                TaskStatus::Failed {
-                    reason: format!("未落带：{}。请向新 Leader 重传", reason),
-                },
-            );
+            let status = TaskStatus::Failed {
+                reason: format!("未落带：{}。请向新 Leader 重传", reason),
+            };
+            self.report_task(u.task, s.round, &s.tape.pool_uuid, &u.path, &status);
+            g.tasks.insert(u.task, status);
         }
         for t in &s.in_batch {
             g.tasks.insert(
@@ -786,6 +1254,10 @@ impl FileService {
         g.no_tape = false;
         g.read_only = None;
         self.changed.notify_all();
+    }
+
+    pub(super) fn library_serving_round(self: &Arc<Self>) -> Option<u64> {
+        self.lanes().iter().find_map(|lane| lane.serving_round())
     }
 
     pub fn serving_round(&self) -> Option<u64> {
@@ -853,6 +1325,17 @@ impl FileService {
         uploads: &[Upload],
         result: Result<(u64, HashMap<String, FileRec>), String>,
     ) {
+        self.batch_done_counted(round, batch, uploads, None, result);
+    }
+
+    pub(super) fn batch_done_counted(
+        &self,
+        round: u64,
+        batch: &FrozenBatch,
+        uploads: &[Upload],
+        files_total: Option<u64>,
+        result: Result<(u64, HashMap<String, FileRec>), String>,
+    ) {
         let mut g = self.lock();
         let Some(s) = g.serving.as_mut().filter(|s| s.round == round) else {
             return;
@@ -878,6 +1361,8 @@ impl FileService {
                         .collect(),
                 ) {
                     Ok(_) => {
+                        s.files_total = files_total
+                            .unwrap_or_else(|| s.state.load().committed.count_files() as u64);
                         for u in uploads {
                             let st = Stat {
                                 len: u.len,
@@ -898,6 +1383,12 @@ impl FileService {
                             s.recent.insert(u.path.clone(), st);
                         }
                         for r in hashes.values() {
+                            if s.recent
+                                .get(&r.path)
+                                .is_some_and(|old| old.version > r.version)
+                            {
+                                continue;
+                            }
                             s.recent.insert(
                                 r.path.clone(),
                                 Stat {
@@ -919,6 +1410,7 @@ impl FileService {
             }
             Err(e) => Err(e),
         };
+        let pool_uuid = s.tape.pool_uuid.clone();
         for u in uploads {
             if !u.delete {
                 let _ = std::fs::remove_file(&u.spool);
@@ -929,6 +1421,7 @@ impl FileService {
                 },
                 Err(e) => TaskStatus::Indeterminate { reason: e.clone() },
             };
+            self.report_task(u.task, round, &pool_uuid, &u.path, &st);
             g.tasks.insert(u.task, st);
         }
         self.changed.notify_all();
@@ -1003,14 +1496,19 @@ impl FileService {
         let path = norm(path)?;
         let (state, live) = self.namespace_snapshot(&path)?;
         let mut g = self.lock();
-        let task = g.next_task;
+        self.require_catalog_writable()?;
+        let task = task_id(g.serving.as_ref().map_or(0, |s| s.round), g.next_task)?;
         let why = g.why_not.clone();
         if g.serving.is_none() && g.no_tape {
             return Err(ServiceError::NoTape(why));
         }
         let s = g.serving.as_mut().ok_or(ServiceError::NotServing(why))?;
-        if s.draining {
-            return Err(ServiceError::NotServing("正在停机".into()));
+        if s.draining || s.maintenance || !s.capacity_known {
+            return Err(ServiceError::NotServing(if !s.capacity_known {
+                "MAM 容量未知，暂停新写入并等待刷新".into()
+            } else {
+                "正在停机或管理维护".into()
+            }));
         }
         let live = Self::admission_view(s, &state, &path, live)?;
         if create_only && live.contains_key(&path) {
@@ -1029,13 +1527,7 @@ impl FileService {
                 s.tape.barcode, state
             )));
         }
-        if s.recent
-            .values()
-            .filter(|st| !is_directory(&st.metadata))
-            .count() as u64
-            + s.admitted
-            >= s.limits.file_limit
-        {
+        if s.files_total + s.admitted >= s.limits.file_limit {
             s.switch = Some(super::state::tape_state::DATA_FULL);
             let msg = format!(
                 "{} 的文件数已到上限 {}",
@@ -1070,7 +1562,9 @@ impl FileService {
         g.next_task += 1;
         Ok(UploadHandle {
             task,
-            spool: self.spool_dir.join(format!("task-{}.part", task)),
+            spool: self
+                .spool_dir
+                .join(format!("task-{}-{}.part", task, uuid::Uuid::new_v4())),
             path,
             round,
         })
@@ -1135,7 +1629,7 @@ impl FileService {
             self.abort(h);
             return Err(e);
         }
-        {
+        let pool = {
             let mut g = self.lock();
             let why = g.why_not.clone();
             let s = g
@@ -1143,6 +1637,7 @@ impl FileService {
                 .as_mut()
                 .filter(|s| s.round == h.round)
                 .ok_or(ServiceError::NotServing(why))?;
+            let pool = s.tape.pool_uuid.clone();
             if s.draining {
                 let _ = s.state.cancel(h.task);
                 s.admitted = s.admitted.saturating_sub(1);
@@ -1168,7 +1663,9 @@ impl FileService {
             s.oldest.get_or_insert(now);
             s.newest = Some(now);
             g.tasks.insert(h.task, TaskStatus::Staged);
-        }
+            pool
+        };
+        self.report_task(h.task, h.round, &pool, &h.path, &TaskStatus::Staged);
         self.kick();
         Ok(h.task)
     }
@@ -1186,19 +1683,85 @@ impl FileService {
         self.lock().tasks.get(&id).cloned()
     }
 
+    /// 复制目录是任务的权威状态；当前 owner 仅在受理报告尚未应用时提供本地暂态。
+    pub fn task_for_pool(&self, pool: &str, id: u64) -> Option<TaskStatus> {
+        if let Some(row) = self.with_reader(|d| d.file_task(pool, id).ok().flatten()) {
+            return match row.status.as_str() {
+                "staged" => Some(TaskStatus::Staged),
+                "committed" => Some(TaskStatus::Committed {
+                    generation: row.generation?,
+                }),
+                "failed" => Some(TaskStatus::Failed { reason: row.reason }),
+                "indeterminate" => Some(TaskStatus::Indeterminate { reason: row.reason }),
+                _ => None,
+            };
+        }
+        (self.target_pool().as_deref() == Some(pool) && self.serving_round() == Some(id >> 32))
+            .then(|| self.task(id))
+            .flatten()
+    }
+
+    /// 在给调用方确认任务号前，等待受理/终态进入复制目录；无集群报告通道的单元测试沿用本地语义。
+    pub fn task_recorded(&self, id: u64, expected: &TaskStatus, timeout: Duration) -> bool {
+        if self
+            .task_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none()
+        {
+            return true;
+        }
+        let Some(pool) = self.target_pool() else {
+            return false;
+        };
+        let deadline = Instant::now() + timeout;
+        loop {
+            let row = self.with_reader(|d| d.file_task(&pool, id).ok().flatten());
+            if let Some(row) = row {
+                let accepted = match expected {
+                    TaskStatus::Staged => true,
+                    TaskStatus::Committed { generation } => {
+                        row.status == "committed" && row.generation == Some(*generation)
+                    }
+                    TaskStatus::Failed { .. } => row.status == "failed",
+                    TaskStatus::Indeterminate { .. } => row.status == "indeterminate",
+                };
+                if accepted {
+                    return true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    pub fn wait_task_for_pool(&self, pool: &str, id: u64, timeout: Duration) -> Option<TaskStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.task_for_pool(pool, id) {
+                None if Instant::now() < deadline => {}
+                Some(TaskStatus::Staged) if Instant::now() < deadline => {}
+                status => return status,
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     /// 等到任务离开 `Staged`，或超时。
     pub fn wait_task(&self, id: u64, timeout: Duration) -> Option<TaskStatus> {
         let deadline = Instant::now() + timeout;
-        let mut g = self.lock();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            match g.tasks.get(&id) {
+            match g.current.tasks.get(&id) {
                 None => return None,
                 Some(TaskStatus::Staged) => {}
                 Some(done) => return Some(done.clone()),
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return g.tasks.get(&id).cloned();
+                return g.current.tasks.get(&id).cloned();
             }
             g = self
                 .changed
@@ -1206,6 +1769,81 @@ impl FileService {
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
+    }
+
+    /// 直接打开当前目录文件做只读切换审计，避免命中快照替换前的缓存连接。
+    pub fn catalog_cutover_audit(&self) -> crate::error::Result<super::directory::CutoverAudit> {
+        let path = self
+            .directory_path
+            .as_ref()
+            .ok_or_else(|| crate::error::TapeError::Ltfs("本节点没有目录库".into()))?;
+        super::directory::Directory::open_reader(path)?.cutover_audit()
+    }
+
+    /// 从本节点正在应用的目录库制作一致的离线快照。调用方须再次核对控制状态，
+    /// 因为 VACUUM 期间可能收到恢复命令；返回的 fd 已 unlink，不会被后续导出覆盖。
+    pub fn catalog_export_frozen_snapshot(
+        &self,
+        expected_frozen_index: u64,
+    ) -> crate::error::Result<CatalogSnapshotExport> {
+        use crate::error::TapeError;
+        if self
+            .export_active
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(TapeError::Ltfs("本库已有目录快照导出正在执行".into()));
+        }
+        let lease = CatalogExportLease(self.export_active.clone());
+        let path = self
+            .directory_path
+            .as_ref()
+            .ok_or_else(|| TapeError::Ltfs("本节点没有目录库".into()))?;
+        let live = Directory::open_reader(path)?;
+        let before = live.cutover_audit()?;
+        if expected_frozen_index == 0
+            || before.frozen_index != Some(expected_frozen_index)
+            || before.has_staging
+            || before.has_unresolved_file_tasks
+        {
+            return Err(TapeError::Ltfs("目录未在指定冻结点排空".into()));
+        }
+        let dest = path.with_extension(format!("cutover-{}.db", uuid::Uuid::new_v4()));
+        let tmp = dest.with_extension("tmp");
+        let result = (|| {
+            live.write_snapshot(&dest)?;
+            let copy = Directory::open_reader(&dest)?.cutover_audit()?;
+            if copy.applied_index < before.applied_index
+                || copy.frozen_index != before.frozen_index
+                || copy.has_staging
+                || copy.has_unresolved_file_tasks
+            {
+                return Err(TapeError::Ltfs(
+                    "目录快照冻结标记或债务与导出前审计不一致".into(),
+                ));
+            }
+            let mut file = std::fs::File::open(&dest)?;
+            std::fs::remove_file(&dest)?;
+            let mut digest = Sha256::new();
+            let mut buffer = [0u8; 1024 * 1024];
+            loop {
+                let count = file.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                digest.update(&buffer[..count]);
+            }
+            file.rewind()?;
+            Ok(CatalogSnapshotExport {
+                file,
+                applied_index: copy.applied_index,
+                frozen_index: expected_frozen_index,
+                sha256: digest.finalize().into(),
+                lease,
+            })
+        })();
+        let _ = std::fs::remove_file(dest);
+        let _ = std::fs::remove_file(tmp);
+        result
     }
 
     fn with_reader<T>(&self, f: impl FnOnce(&Directory) -> Option<T>) -> Option<T> {
@@ -1237,7 +1875,12 @@ impl FileService {
                     }
                     (s.round, s.tape.pool_uuid.clone())
                 }
-                (None, Some((round, pool))) => (*round, pool.clone()),
+                (None, Some((round, pool))) => {
+                    if let Some(st) = g.0.recent.get(&path) {
+                        return Ok((!st.deleted).then(|| st.clone()));
+                    }
+                    (*round, pool.clone())
+                }
                 (None, None) => return Err(ServiceError::NotServing(g.why_not.clone())),
             }
         };
@@ -1273,7 +1916,12 @@ impl FileService {
                     }
                     (s.round, s.tape.pool_uuid.clone())
                 }
-                (None, Some((round, pool))) => (*round, pool.clone()),
+                (None, Some((round, pool))) => {
+                    if let Some(st) = g.0.recent.get(&path) {
+                        return Ok(Some(st.clone()));
+                    }
+                    (*round, pool.clone())
+                }
                 (None, None) => return Err(ServiceError::NotServing(g.why_not.clone())),
             }
         };
@@ -1301,14 +1949,19 @@ impl FileService {
     /// 路径上有在途变更 → `PathBusy`。
     pub fn delete(&self, path: &str) -> Result<u64, ServiceError> {
         let path = norm(path)?;
-        self.enqueue_removal(path, true, false)
+        self.enqueue_removal(path, true, false, None)
+    }
+
+    pub fn delete_if_version(&self, path: &str, version: (u64, u64)) -> Result<u64, ServiceError> {
+        let path = norm(path)?;
+        self.enqueue_removal(path, true, false, Some(version))
     }
 
     /// 回收搬迁墓碑：源带上的墓碑要在别的带上重新落一次（新版本），源带才能格式化。
     /// 不检查路径是否存在——它本来就不存在。
     pub fn relocate_tombstone(&self, path: &str) -> Result<u64, ServiceError> {
         let path = norm(path)?;
-        self.enqueue_removal(path, false, false)
+        self.enqueue_removal(path, false, false, None)
     }
 
     pub(crate) fn relocate_tombstone_kind(
@@ -1316,7 +1969,7 @@ impl FileService {
         path: &str,
         directory: bool,
     ) -> Result<u64, ServiceError> {
-        self.enqueue_removal(norm(path)?, false, directory)
+        self.enqueue_removal(norm(path)?, false, directory, None)
     }
 
     fn enqueue_removal(
@@ -1324,30 +1977,54 @@ impl FileService {
         path: String,
         must_exist: bool,
         directory: bool,
+        expected_version: Option<(u64, u64)>,
     ) -> Result<u64, ServiceError> {
+        let observed = if expected_version.is_some() {
+            self.lookup(&path)?
+        } else {
+            None
+        };
         let (state, live) = self.namespace_snapshot(&path)?;
         {
             let mut g = self.lock();
-            let task = g.next_task;
+            self.require_catalog_writable()?;
+            let task = task_id(g.serving.as_ref().map_or(0, |s| s.round), g.next_task)?;
             let why = g.why_not.clone();
             if g.serving.is_none() && g.no_tape {
                 return Err(ServiceError::NoTape(why));
             }
             let s = g.serving.as_mut().ok_or(ServiceError::NotServing(why))?;
-            if s.draining {
-                return Err(ServiceError::NotServing("正在停机".into()));
+            if s.draining || s.maintenance || !s.capacity_known {
+                return Err(ServiceError::NotServing(if !s.capacity_known {
+                    "MAM 容量未知，暂停新写入并等待刷新".into()
+                } else {
+                    "正在停机或管理维护".into()
+                }));
             }
             let live = Self::admission_view(s, &state, &path, live)?;
             if must_exist {
                 check_file_namespace(s, &path, &live)?;
             } else {
                 check_pending(s, &path)?;
-                if s.recent.contains_key(&path) {
+                if s.recent
+                    .get(&path)
+                    .is_some_and(|st| st.barcode == s.tape.barcode)
+                {
                     return Err(ServiceError::Exists(path));
                 }
             }
             if must_exist && !live.contains_key(&path) {
                 return Err(ServiceError::NotFound(path));
+            }
+            if let Some(expected) = expected_version {
+                let actual = s
+                    .recent
+                    .get(&path)
+                    .map(|st| st.version)
+                    .or_else(|| observed.as_ref().map(|st| st.version));
+                if actual != Some(expected) {
+                    return Err(ServiceError::VersionMismatch(path));
+                }
             }
             if let Some(state) = s.switch {
                 return Err(ServiceError::SwitchingTape(format!(
@@ -1356,13 +2033,7 @@ impl FileService {
                 )));
             }
             // 墓碑也是索引里的一条
-            if s.recent
-                .values()
-                .filter(|st| !is_directory(&st.metadata))
-                .count() as u64
-                + s.admitted
-                >= s.limits.file_limit
-            {
+            if s.files_total + s.admitted >= s.limits.file_limit {
                 s.switch = Some(super::state::tape_state::DATA_FULL);
                 let msg = format!(
                     "{} 的文件数已到上限 {}",
@@ -1380,6 +2051,9 @@ impl FileService {
             if directory {
                 s.namespace_pending.insert(path.clone());
             }
+            let report_path = path.clone();
+            let report_pool = s.tape.pool_uuid.clone();
+            let report_round = s.round;
             s.queue.push_back(Upload {
                 task,
                 path,
@@ -1398,6 +2072,13 @@ impl FileService {
             s.newest = Some(now);
             g.tasks.insert(task, TaskStatus::Staged);
             g.next_task += 1;
+            self.report_task(
+                task,
+                report_round,
+                &report_pool,
+                &report_path,
+                &TaskStatus::Staged,
+            );
             drop(g);
             self.kick();
             Ok(task)
@@ -1423,11 +2104,16 @@ impl FileService {
         let path = norm(path)?;
         let (state, live) = self.namespace_snapshot(&path)?;
         let mut g = self.lock();
-        let task = g.next_task;
+        self.require_catalog_writable()?;
+        let task = task_id(g.serving.as_ref().map_or(0, |s| s.round), g.next_task)?;
         let why = g.why_not.clone();
         let s = g.serving.as_mut().ok_or(ServiceError::NotServing(why))?;
-        if s.draining {
-            return Err(ServiceError::NotServing("正在停机".into()));
+        if s.draining || s.maintenance || !s.capacity_known {
+            return Err(ServiceError::NotServing(if !s.capacity_known {
+                "MAM 容量未知，暂停新写入并等待刷新".into()
+            } else {
+                "正在停机或管理维护".into()
+            }));
         }
         let live = Self::admission_view(s, &state, &path, live)?;
         check_pending(s, &path)?;
@@ -1475,6 +2161,9 @@ impl FileService {
             value: base64::engine::general_purpose::STANDARD.encode(v),
             base64: true,
         });
+        let report_path = path.clone();
+        let report_pool = s.tape.pool_uuid.clone();
+        let report_round = s.round;
         s.queue.push_back(Upload {
             task,
             path,
@@ -1493,6 +2182,13 @@ impl FileService {
         s.newest = Some(now);
         g.tasks.insert(task, TaskStatus::Staged);
         g.next_task += 1;
+        self.report_task(
+            task,
+            report_round,
+            &report_pool,
+            &report_path,
+            &TaskStatus::Staged,
+        );
         drop(g);
         self.kick();
         Ok(task)
@@ -1513,11 +2209,16 @@ impl FileService {
         let path = norm(path)?;
         let (state, live) = self.namespace_snapshot(&path)?;
         let mut g = self.lock();
-        let task = g.next_task;
+        self.require_catalog_writable()?;
+        let task = task_id(g.serving.as_ref().map_or(0, |s| s.round), g.next_task)?;
         let why = g.why_not.clone();
         let s = g.serving.as_mut().ok_or(ServiceError::NotServing(why))?;
-        if s.draining {
-            return Err(ServiceError::NotServing("正在停机".into()));
+        if s.draining || s.maintenance || !s.capacity_known {
+            return Err(ServiceError::NotServing(if !s.capacity_known {
+                "MAM 容量未知，暂停新写入并等待刷新".into()
+            } else {
+                "正在停机或管理维护".into()
+            }));
         }
         let live = Self::admission_view(s, &state, &path, live)?;
         check_pending(s, &path)?;
@@ -1545,6 +2246,9 @@ impl FileService {
         }
         s.namespace_pending.insert(path.clone());
         s.admitted += 1;
+        let report_path = path.clone();
+        let report_pool = s.tape.pool_uuid.clone();
+        let report_round = s.round;
         s.queue.push_back(Upload {
             task,
             path,
@@ -1563,6 +2267,13 @@ impl FileService {
         s.newest = Some(now);
         g.tasks.insert(task, TaskStatus::Staged);
         g.next_task += 1;
+        self.report_task(
+            task,
+            report_round,
+            &report_pool,
+            &report_path,
+            &TaskStatus::Staged,
+        );
         drop(g);
         self.kick();
         Ok(task)
@@ -1619,16 +2330,25 @@ impl FileService {
         let path = norm(path)?;
         let (state, live) = self.namespace_snapshot(&path)?;
         let mut g = self.lock();
-        let task = g.next_task;
+        self.require_catalog_writable()?;
+        let task = task_id(g.serving.as_ref().map_or(0, |s| s.round), g.next_task)?;
         let why = g.why_not.clone();
         let s = g.serving.as_mut().ok_or(ServiceError::NotServing(why))?;
-        if s.draining {
-            return Err(ServiceError::NotServing("正在停机".into()));
+        if s.draining || s.maintenance || !s.capacity_known {
+            return Err(ServiceError::NotServing(if !s.capacity_known {
+                "MAM 容量未知，暂停新写入并等待刷新".into()
+            } else {
+                "正在停机或管理维护".into()
+            }));
         }
         let live = Self::admission_view(s, &state, &path, live)?;
         check_pending(s, &path)?;
         // 回收源带不再可写；当前写带刚发布的同名记录已取代这份源副本。
-        if metadata.is_some() && s.recent.contains_key(&path) {
+        if metadata.is_some()
+            && s.recent
+                .get(&path)
+                .is_some_and(|st| st.barcode == s.tape.barcode)
+        {
             return Err(ServiceError::Exists(path));
         }
         if let Some((p, _)) = live.iter().find(|(p, dir)| !**dir && descendant(&path, p)) {
@@ -1663,14 +2383,7 @@ impl FileService {
         if let Some(state) = s.switch {
             return Err(ServiceError::SwitchingTape(state.into()));
         }
-        if symlink_target.is_some()
-            && s.recent
-                .values()
-                .filter(|st| !is_directory(&st.metadata))
-                .count() as u64
-                + s.admitted
-                >= s.limits.file_limit
-        {
+        if symlink_target.is_some() && s.files_total + s.admitted >= s.limits.file_limit {
             s.switch = Some(super::state::tape_state::DATA_FULL);
             let message = format!(
                 "{} 的文件数已到上限 {}",
@@ -1690,6 +2403,9 @@ impl FileService {
         s.state.complete(&path).map_err(map_state)?;
         s.admitted += 1;
         s.namespace_pending.insert(path.clone());
+        let report_path = path.clone();
+        let report_pool = s.tape.pool_uuid.clone();
+        let report_round = s.round;
         s.queue.push_back(Upload {
             task,
             path,
@@ -1708,6 +2424,13 @@ impl FileService {
         s.newest = Some(now);
         g.tasks.insert(task, TaskStatus::Staged);
         g.next_task += 1;
+        self.report_task(
+            task,
+            report_round,
+            &report_pool,
+            &report_path,
+            &TaskStatus::Staged,
+        );
         drop(g);
         self.kick();
         Ok(task)
@@ -1720,11 +2443,16 @@ impl FileService {
         let (state, source) = self.namespace_snapshot(&from)?;
         let (target_state, target) = self.namespace_snapshot(&to)?;
         let mut g = self.lock();
-        let task = g.next_task;
+        self.require_catalog_writable()?;
+        let task = task_id(g.serving.as_ref().map_or(0, |s| s.round), g.next_task)?;
         let why = g.why_not.clone();
         let s = g.serving.as_mut().ok_or(ServiceError::NotServing(why))?;
-        if s.draining {
-            return Err(ServiceError::NotServing("正在停机".into()));
+        if s.draining || s.maintenance || !s.capacity_known {
+            return Err(ServiceError::NotServing(if !s.capacity_known {
+                "MAM 容量未知，暂停新写入并等待刷新".into()
+            } else {
+                "正在停机或管理维护".into()
+            }));
         }
         let source = Self::admission_view(s, &state, &from, source)?;
         let target = Self::admission_view(s, &target_state, &to, target)?;
@@ -1738,8 +2466,18 @@ impl FileService {
                 return Err(ServiceError::Exists(to));
             }
             let generation = s.state.load().generation;
+            let report_round = s.round;
+            let report_pool = s.tape.pool_uuid.clone();
             g.tasks.insert(task, TaskStatus::Committed { generation });
             g.next_task += 1;
+            self.report_task(task, report_round, &report_pool, &to, &TaskStatus::Staged);
+            self.report_task(
+                task,
+                report_round,
+                &report_pool,
+                &to,
+                &TaskStatus::Committed { generation },
+            );
             return Ok(task);
         }
         if descendant(&to, &from) || descendant(&from, &to) {
@@ -1840,11 +2578,14 @@ impl FileService {
         }
         s.admitted += uploads.len() as u64;
         s.queue.extend(uploads);
+        let report_pool = s.tape.pool_uuid.clone();
+        let report_round = s.round;
         let now = Instant::now();
         s.oldest.get_or_insert(now);
         s.newest = Some(now);
         g.tasks.insert(task, TaskStatus::Staged);
         g.next_task += 1;
+        self.report_task(task, report_round, &report_pool, &to, &TaskStatus::Staged);
         drop(g);
         self.kick();
         Ok(task)
@@ -1888,7 +2629,19 @@ impl FileService {
                         .map(|(p, _)| p.clone())
                         .collect::<std::collections::HashSet<_>>(),
                 ),
-                (None, Some((_, pool))) => (pool.clone(), BTreeMap::new(), Default::default()),
+                (None, Some((_, pool))) => (
+                    pool.clone(),
+                    g.0.recent
+                        .iter()
+                        .filter(|(p, st)| !st.deleted && in_scope(p))
+                        .map(|(p, st)| (p.clone(), NodeSummary::new(st.len, &st.metadata)))
+                        .collect(),
+                    g.0.recent
+                        .iter()
+                        .filter(|(p, st)| st.deleted && in_scope(p))
+                        .map(|(p, _)| p.clone())
+                        .collect(),
+                ),
                 (None, None) => return Err(ServiceError::NotServing(g.why_not.clone())),
             }
         };
@@ -1923,6 +2676,13 @@ impl FileService {
         let s = g.serving.as_ref()?;
         if s.namespace_pending.contains(path) {
             return None;
+        }
+        if let Some(entry) = s
+            .external_pending
+            .iter()
+            .find_map(|root| root.pending.get(path))
+        {
+            return Some((in_flight_of(entry), entry.staged_len));
         }
         let root = s.state.load();
         root.pending
@@ -1999,12 +2759,21 @@ impl FileService {
             let g = self.lock();
             match g.serving.as_ref() {
                 Some(s) => s
-                    .state
-                    .load()
-                    .pending
+                    .external_pending
                     .iter()
-                    .filter(|(p, _)| p.starts_with(&prefix) && !s.namespace_pending.contains(*p))
+                    .flat_map(|root| root.pending.iter())
+                    .filter(|(p, _)| p.starts_with(&prefix))
                     .map(|(p, e)| (p.clone(), (in_flight_of(e), e.staged_len)))
+                    .chain(
+                        s.state
+                            .load()
+                            .pending
+                            .iter()
+                            .filter(|(p, _)| {
+                                p.starts_with(&prefix) && !s.namespace_pending.contains(*p)
+                            })
+                            .map(|(p, e)| (p.clone(), (in_flight_of(e), e.staged_len))),
+                    )
                     .collect(),
                 None => Vec::new(),
             }
@@ -2034,6 +2803,192 @@ impl FileService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_quiesce_blocks_all_new_file_mutations_across_lanes() {
+        let dir = std::env::temp_dir().join(format!("catalog-quiesce-{}", uuid::Uuid::new_v4()));
+        let files = FileService::new(dir.clone()).unwrap();
+        files.bind_pool("pool");
+        let other = files.add_lane("pool");
+        let index = LtfsIndex::empty(uuid::Uuid::new_v4(), "test".into(), 'b');
+        for (lane, barcode) in [(&files, "TEST01L8"), (&other, "TEST02L8")] {
+            lane.open(
+                1,
+                TapeIdent {
+                    pool_uuid: "pool".into(),
+                    barcode: barcode.into(),
+                },
+                TapeLimits {
+                    file_limit: 100,
+                    usable_capacity: 100,
+                },
+                &index,
+                100,
+                true,
+            );
+        }
+        let admitted = files.begin("/before", 0).unwrap();
+        files.set_catalog_quiesced(true);
+        let denied = |result: Result<u64, ServiceError>| {
+            let detail = format!("{result:?}");
+            assert!(
+                matches!(result, Err(ServiceError::NotServing(s)) if s.contains("旧目录已暂停")),
+                "{detail}"
+            );
+        };
+        assert!(matches!(
+            other.begin("/after", 0),
+            Err(ServiceError::NotServing(s)) if s.contains("旧目录已暂停")
+        ));
+        denied(files.delete("/before"));
+        denied(files.change_xattr("/before", "user.note", Some(b"x"), 0));
+        denied(files.change_metadata(
+            "/before",
+            &crate::ltfs::index::MetadataChange {
+                readonly: Some(true),
+                ..Default::default()
+            },
+        ));
+        denied(files.mkdir("/dir"));
+        denied(files.symlink("/before", "/link"));
+        denied(files.rename("/before", "/renamed", false));
+        assert!(files.finish(admitted, 0).is_ok());
+        files.set_catalog_quiesced(false);
+        assert!(other.begin("/after", 0).is_ok());
+        files.close_all("done");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn copied_file_metadata_preserves_user_attributes_and_rejects_invalid_inputs() {
+        let timestamp = "2026-10-22T00:00:00.000000000Z";
+        let mut value = serde_json::json!({
+            "node": {
+                "readonly": true,
+                "creation_time": timestamp,
+                "change_time": timestamp,
+                "modify_time": timestamp,
+                "access_time": timestamp,
+                "backup_time": timestamp,
+            },
+            "xattrs": [
+                {"key":"note", "value":"cHJlc2VydmVk", "base64":true},
+                {"key":"tapers.version", "value":"7.1", "base64":false},
+            ],
+        });
+        let metadata = copied_file_metadata(&value).unwrap();
+        assert!(metadata.meta.readonly);
+        assert_eq!(metadata.meta.creation_time, timestamp);
+        assert_eq!(metadata.xattrs.len(), 1);
+        assert_eq!(metadata.xattrs[0].key, "note");
+        value["xattrs"][0]["value"] = serde_json::json!("invalid!");
+        assert!(copied_file_metadata(&value).is_err());
+        value["xattrs"][0]["value"] = serde_json::json!("cHJlc2VydmVk");
+        value["node"]["modify_time"] = serde_json::json!("2026-10-22T00:00:00Z");
+        assert!(copied_file_metadata(&value).is_err());
+    }
+
+    #[test]
+    fn another_volume_overwrite_does_not_free_physical_file_slots() {
+        let dir = std::env::temp_dir().join(format!("physical-count-{}", uuid::Uuid::new_v4()));
+        let one = FileService::new(dir.clone()).unwrap();
+        one.bind_pool("pool");
+        let two = one.add_lane("pool");
+        let index = LtfsIndex::empty(uuid::Uuid::new_v4(), "test".into(), 'b');
+        for (files, barcode, seq) in [(&one, "TEST01L8", 1), (&two, "TEST02L8", 2)] {
+            files.open(
+                1,
+                TapeIdent {
+                    pool_uuid: "pool".into(),
+                    barcode: barcode.into(),
+                },
+                TapeLimits {
+                    file_limit: 1,
+                    usable_capacity: 100,
+                },
+                &index,
+                100,
+                true,
+            );
+            let h = files.begin("/same", 0).unwrap();
+            files.finish(h, 0).unwrap();
+            let (batch, uploads) = files.take_batch_now(1).unwrap();
+            let rec = FileRec {
+                path: "/same".into(),
+                length: 0,
+                sha256: String::new(),
+                version: (1, seq),
+                metadata: serde_json::json!({"xattrs":[]}),
+                deleted: false,
+            };
+            files.batch_done_counted(
+                1,
+                &batch,
+                &uploads,
+                Some(1),
+                Ok((2, [(rec.path.clone(), rec)].into())),
+            );
+        }
+        assert_eq!(one.stat("/same").unwrap().unwrap().barcode, "TEST02L8");
+        assert!(matches!(
+            one.begin("/new", 0),
+            Err(ServiceError::SwitchingTape(_))
+        ));
+        one.close_all("done");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fresh_mam_budget_still_accounts_for_uploads_not_yet_written() {
+        let dir = std::env::temp_dir().join(format!("capacity-cut-{}", uuid::Uuid::new_v4()));
+        let files = FileService::new(dir.clone()).unwrap();
+        let index = LtfsIndex::empty(uuid::Uuid::new_v4(), "test".into(), 'b');
+        files.open(
+            1,
+            TapeIdent {
+                barcode: "TEST01L8".into(),
+                pool_uuid: "pool".into(),
+            },
+            TapeLimits {
+                file_limit: 100,
+                usable_capacity: 100,
+            },
+            &index,
+            100,
+            true,
+        );
+        let h = files.begin("/receiving", 80).unwrap();
+        files.ingest(&h, 40).unwrap();
+        files.calibrate_capacity(Some(100));
+        assert_eq!(
+            files
+                .lock()
+                .serving
+                .as_ref()
+                .unwrap()
+                .state
+                .load()
+                .ledger
+                .available(),
+            20
+        );
+        files.ingest(&h, 40).unwrap();
+        assert_eq!(
+            files
+                .lock()
+                .serving
+                .as_ref()
+                .unwrap()
+                .state
+                .load()
+                .ledger
+                .available(),
+            20
+        );
+        files.abort(h);
+        files.close("done");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn file_count_triggers_batch_without_capping_its_size() {

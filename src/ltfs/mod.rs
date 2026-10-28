@@ -12,6 +12,12 @@
 pub mod ee;
 pub mod incremental;
 pub mod index;
+#[cfg(feature = "fdb")]
+mod index_equivalence;
+#[cfg(feature = "fdb")]
+mod index_replay;
+#[cfg(feature = "fdb")]
+mod index_scratch;
 pub mod label;
 pub mod mam;
 pub mod mkltfs;

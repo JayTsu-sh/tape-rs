@@ -9,6 +9,50 @@ mod support;
 use support::Fixture;
 
 #[test]
+fn cleaning_cartridge_is_identified_and_rejected_without_loading() {
+    use tape_rs::scsi::sim::SimCartridge;
+    for barcode in ["CUSTOM", "CLNU03L1"] {
+        let f = Fixture::new();
+        let mut cart = SimCartridge::blank(barcode, 256 << 20);
+        cart.medium_type = if barcode == "CUSTOM" { 2 } else { 0 };
+        f.sim.insert_cartridge(cart, 2).unwrap();
+        let mut lib = f.open();
+        let status = lib.status().unwrap();
+        let row = status["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["barcode"] == barcode)
+            .unwrap();
+        assert_eq!(row["state"], "NON_SUPPORTED_TAPE");
+        assert_eq!(row["cleaning"], true);
+        assert!(
+            lib.assign("pool", barcode)
+                .unwrap_err()
+                .to_string()
+                .contains("清洗带")
+        );
+        // 模拟升级前已有的错误分配；即使没有 CLN 条码，也不能进入装载路径。
+        rusqlite::Connection::open(&f.path)
+            .unwrap()
+            .execute(
+                "INSERT INTO library_volumes(barcode,pool,home) VALUES(?1,'pool',1002)",
+                [barcode],
+            )
+            .unwrap();
+        assert!(
+            lib.read_to(&format!("/pool/{barcode}/file"), &mut Vec::new())
+                .unwrap_err()
+                .to_string()
+                .contains("清洗带")
+        );
+        assert!(f.sim.loaded_barcode(0).is_none());
+        assert!(!f.changer.command_log().contains(&0xa5));
+        assert!(!f.drive.command_log().contains(&0x1b));
+    }
+}
+
+#[test]
 fn assignment_blacklist_persistence_and_no_implicit_move() {
     let f = Fixture::new();
     let mut lib = f.open();

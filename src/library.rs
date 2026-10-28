@@ -240,6 +240,9 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
             .iter()
             .find(|e| e.full && e.volume_tag.as_deref() == Some(barcode))
             .ok_or_else(|| refuse("库存中不存在此条码"))?;
+        if e.is_cleaning() {
+            return Err(refuse("清洗带不能分配到数据池"));
+        }
         let home = if e.element_type == ElementType::Storage {
             e.address
         } else {
@@ -319,11 +322,20 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
             let row: Option<VolumeStatusRow> = self.db.query_row(
                 "SELECT pool,home,blacklist,phase,failure,last_failure FROM library_volumes WHERE barcode=?1", [barcode],
                 |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
-            volumes.push(match row {
-                Some((pool,home,blacklist,phase,failure,last_failure)) => json!({"barcode":barcode,"pool":pool,"home_slot":home.checked_sub(map.storage_start).filter(|n|*n<map.storage_count).map(|n|u32::from(n)+1),
-                    "address":e.address,"state":if blacklist.is_some(){"BLACKLISTED"}else{&phase},"blacklist":blacklist,"failure":failure,"last_failure":last_failure}),
+            let mut volume = match row {
+                Some((pool, home, blacklist, phase, failure, last_failure)) => {
+                    json!({"barcode":barcode,"pool":pool,"home_slot":home.checked_sub(map.storage_start).filter(|n|*n<map.storage_count).map(|n|u32::from(n)+1),
+                    "address":e.address,"state":if blacklist.is_some(){"BLACKLISTED"}else{&phase},"blacklist":blacklist,"failure":failure,"last_failure":last_failure})
+                }
                 None => json!({"barcode":barcode,"address":e.address,"state":"NEED_ASSIGN"}),
-            });
+            };
+            volume["medium_type"] = json!(e.medium_type);
+            volume["cleaning"] = json!(e.is_cleaning());
+            volume["cleaning_source"] = json!(e.cleaning_source());
+            if e.is_cleaning() {
+                volume["state"] = json!("NON_SUPPORTED_TAPE");
+            }
+            volumes.push(volume);
         }
         let drives: Vec<Value> = inv.iter().filter(|e| e.element_type == ElementType::DataTransfer).map(|e| json!({
             "offset":e.address-map.dt_start,"serial":e.drive_id,"barcode":e.volume_tag,"occupied":e.full,
@@ -485,6 +497,12 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
             |r| r.get(0),
         )?;
         let (map, inv) = self.inventory()?;
+        if inv
+            .iter()
+            .any(|e| e.volume_tag.as_deref() == Some(barcode) && e.is_cleaning())
+        {
+            return Err(refuse("清洗带不能执行 LTFS 数据操作"));
+        }
         let enabled = (0..self.drives.len())
             .map(|i| self.drive_eligible_in(i, &pool, role, &map, &inv))
             .collect::<Result<Vec<_>>>()?;
@@ -508,6 +526,9 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
             .iter()
             .find(|e| e.full && e.volume_tag.as_deref() == Some(barcode))
             .ok_or_else(|| refuse("目标介质不在库存"))?;
+        if source.is_cleaning() {
+            return Err(refuse("清洗带不能执行 LTFS 数据操作"));
+        }
         let configured = |i: usize| {
             inv.iter().find(|e| {
                 e.element_type == ElementType::DataTransfer

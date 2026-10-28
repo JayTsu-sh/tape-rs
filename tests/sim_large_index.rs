@@ -1,9 +1,14 @@
 //! 大构造/小输入分段回归：不需要真实设备，不把大 XML 复制到解析输入缓冲。
+use sha2::{Digest, Sha256};
+use tape_rs::catalog::volume_extents::{ExpectedIndex, VolumeExtentCache};
+use tape_rs::error::TapeError;
 use tape_rs::ltfs::index::LtfsIndex;
 use tape_rs::ltfs::mkltfs::{MkltfsOptions, mkltfs};
 use tape_rs::ltfs::recovery::RecoveryBudget;
 use tape_rs::ltfs::volume::LtfsVolume;
-use tape_rs::scsi::sim::{LogicalObject, SimCartridge, SimLibrary};
+use tape_rs::scsi::cdb::opcode;
+use tape_rs::scsi::sim::{Fault, FaultAction, LogicalObject, SimCartridge, SimLibrary};
+use tape_rs::tape::commands::TapeDrive;
 
 #[test]
 fn recovery_streams_index_over_64m_and_preserves_explicit_budget() {
@@ -99,12 +104,16 @@ fn index_prefix_and_xml_can_cross_short_tape_records() {
         },
     )
     .unwrap();
+    let mut data_index_sha = [0; 32];
     sim.with_cartridge_mut("SHORT1L8", |c| {
-        for part in &mut c.partitions {
+        for (partition, part) in c.partitions.iter_mut().enumerate() {
             let LogicalObject::Record(xml) = &part.objects[5] else {
                 panic!("缺少索引");
             };
             let xml = xml.clone();
+            if partition == 1 {
+                data_index_sha = Sha256::digest(&xml).into();
+            }
             part.objects.truncate(5);
             part.objects
                 .extend(xml.chunks(7).map(|v| LogicalObject::Record(v.to_vec())));
@@ -115,6 +124,139 @@ fn index_prefix_and_xml_can_cross_short_tape_records() {
     let vol = LtfsVolume::mount(&dev).unwrap();
     assert!(vol.writable());
     assert_eq!(vol.index().generation, 1);
+    assert_eq!(
+        vol.recovery().view().unwrap().construct_sha256,
+        data_index_sha
+    );
+    let candidate = vol.recovery().view().unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "tape-rs-confirmed-index-{}.db",
+        uuid::Uuid::new_v4()
+    ));
+    let drive = TapeDrive::new(&dev);
+    let mut wrong_boundary = candidate.clone();
+    wrong_boundary.end_block += 1;
+    assert!(
+        VolumeExtentCache::build_confirmed(
+            &drive,
+            vol.label(),
+            &wrong_boundary,
+            &RecoveryBudget::default(),
+            &path
+        )
+        .is_err()
+    );
+    assert!(!path.exists());
+    let stats = VolumeExtentCache::build_confirmed(
+        &drive,
+        vol.label(),
+        candidate,
+        &RecoveryBudget::default(),
+        &path,
+    )
+    .unwrap();
+    assert_eq!(stats.files, 0);
+    let expected = ExpectedIndex {
+        volume_uuid: candidate.index.volume_uuid,
+        generation: candidate.index.generation,
+        location: candidate.index.self_location,
+        sha256: data_index_sha,
+    };
+    VolumeExtentCache::open(&path, expected).unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn confirmed_index_cache_keeps_committed_file_extents() {
+    let sim = SimLibrary::new(1, 1, 0);
+    sim.insert_cartridge(SimCartridge::blank("CACHE1L8", 64 << 20), 0)
+        .unwrap();
+    sim.load_into_drive("CACHE1L8", 0).unwrap();
+    let dev = sim.drive(0);
+    mkltfs(
+        &dev,
+        &MkltfsOptions {
+            volume_id: "CACHE1".into(),
+            block_size: 64 << 10,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    {
+        let mut vol = LtfsVolume::mount(&dev).unwrap();
+        vol.append_file("/dir/data.bin", &mut std::io::Cursor::new(b"evidence"))
+            .unwrap();
+        vol.commit().unwrap();
+    }
+    let vol = LtfsVolume::mount(&dev).unwrap();
+    let file = vol.index().find_file("dir/data.bin").unwrap();
+    let candidate = vol.recovery().view().unwrap();
+    let path =
+        std::env::temp_dir().join(format!("tape-rs-extent-file-{}.db", uuid::Uuid::new_v4()));
+    let drive = TapeDrive::new(&dev);
+    let stats = VolumeExtentCache::build_confirmed(
+        &drive,
+        vol.label(),
+        candidate,
+        &RecoveryBudget::default(),
+        &path,
+    )
+    .unwrap();
+    assert_eq!(stats.files, 1);
+    let expected = ExpectedIndex {
+        volume_uuid: candidate.index.volume_uuid,
+        generation: candidate.index.generation,
+        location: candidate.index.self_location,
+        sha256: candidate.construct_sha256,
+    };
+    let cache = VolumeExtentCache::open(&path, expected).unwrap();
+    let cached = cache.file_by_uid(file.meta.file_uid).unwrap().unwrap();
+    assert_eq!(cached.path, "dir/data.bin");
+    assert_eq!(cached.length, file.length);
+    assert_eq!(cached.extents, file.extents);
+    drop(cache);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn confirmed_cache_read_failure_preserves_scsi_diagnostics() {
+    let sim = SimLibrary::new(1, 1, 0);
+    sim.insert_cartridge(SimCartridge::blank("CACHE2L8", 64 << 20), 0)
+        .unwrap();
+    sim.load_into_drive("CACHE2L8", 0).unwrap();
+    let dev = sim.drive(0);
+    mkltfs(&dev, &MkltfsOptions::default()).unwrap();
+    let vol = LtfsVolume::mount(&dev).unwrap();
+    let candidate = vol.recovery().view().unwrap();
+    dev.inject(Fault {
+        opcode: opcode::READ_6,
+        action: FaultAction::CheckCondition {
+            sense_key: 0x03,
+            asc: 0x11,
+            ascq: 0,
+        },
+        after: 0,
+        remaining: 1,
+    });
+    let path =
+        std::env::temp_dir().join(format!("tape-rs-extent-error-{}.db", uuid::Uuid::new_v4()));
+    let err = VolumeExtentCache::build_confirmed(
+        &TapeDrive::new(&dev),
+        vol.label(),
+        candidate,
+        &RecoveryBudget::default(),
+        &path,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        TapeError::ScsiCommand {
+            sense_key: 0x03,
+            asc: 0x11,
+            ..
+        }
+    ));
+    assert!(!path.exists());
 }
 
 /// 原报告规模的文件树回归；不构造整份输入XML，不接触设备。

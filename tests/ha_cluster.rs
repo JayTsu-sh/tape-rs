@@ -171,6 +171,11 @@ fn transferring_control_to_an_fc_follower_moves_ownership_and_preserves_committe
     scenario(11);
 }
 
+#[test]
+fn http_management_is_replicated_and_executed_by_the_follower_owner() {
+    scenario(12);
+}
+
 fn scenario(case: u8) {
     let dir = std::env::temp_dir().join(format!("ha-coordinator-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&dir).unwrap();
@@ -183,7 +188,12 @@ fn scenario(case: u8) {
         rxs.insert(id, rx);
     }
     let peers = Arc::new(txs);
-    let lib = SimLibrary::new(1, 2, 0);
+    let lib = SimLibrary::new(1, 2, if case == 12 { 1 } else { 0 });
+    if case == 12 {
+        let mut cleaner = tape_rs::scsi::sim::SimCartridge::blank("CUSTOM", 256 << 20);
+        cleaner.medium_type = 2;
+        lib.insert_cartridge(cleaner, 1).unwrap();
+    }
     if case != 5 {
         lib.enable_changer_pr();
     }
@@ -217,6 +227,7 @@ fn scenario(case: u8) {
     let mut services = HashMap::new();
     let mut execs = HashMap::new();
     let mut joins = Vec::new();
+    let stop_events = Arc::new(AtomicBool::new(false));
     for id in ids {
         let status = Arc::new(Mutex::new(NodeStatus::default()));
         statuses.insert(id, status.clone());
@@ -243,6 +254,7 @@ fn scenario(case: u8) {
         )
         .unwrap();
         files.set_executor(exec_tx.clone());
+        files.set_task_events(ev_tx.clone());
         services.insert(id, files.clone());
         let ex_status = status.clone();
         let exec_join = std::thread::spawn(move || {
@@ -263,10 +275,17 @@ fn scenario(case: u8) {
             )
         });
         let tx = peers[&id].clone();
+        let stop = stop_events.clone();
         let events = std::thread::spawn(move || {
-            for ev in ev_rx {
-                if tx.send(NodeInput::Exec(ev)).is_err() {
-                    break;
+            while !stop.load(Ordering::SeqCst) {
+                match ev_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(ev) => {
+                        if tx.send(NodeInput::Exec(ev)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
         });
@@ -398,6 +417,518 @@ fn scenario(case: u8) {
             services[&owner].serving_round().is_none(),
             "尚未分配磁带也必须保留 HTTP 入口"
         );
+    }
+    if success && case == 12 {
+        use serde_json::{Value, json};
+        use std::io::{Read, Write};
+        fn request(addr: &str, method: &str, path: &str, body: Value) -> (u16, Value) {
+            let body = body.to_string();
+            let mut conn = std::net::TcpStream::connect(addr).unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(15)))
+                .unwrap();
+            write!(conn,"{method} {path} HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",body.len()).unwrap();
+            let mut out = String::new();
+            conn.read_to_string(&mut out).unwrap();
+            let (headers, body) = out.split_once("\r\n\r\n").unwrap();
+            (
+                headers.split_whitespace().nth(1).unwrap().parse().unwrap(),
+                serde_json::from_str(body).unwrap(),
+            )
+        }
+        let mut addresses = HashMap::new();
+        for id in ids {
+            let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = socket.local_addr().unwrap().to_string();
+            drop(socket);
+            tape_rs::daemon::http::serve(
+                &addr,
+                Arc::new(tape_rs::daemon::http::HttpContext {
+                    files: services[&id].clone(),
+                    status: statuses[&id].clone(),
+                    exec: Mutex::new(execs[&id].clone()),
+                    node: Mutex::new(peers[&id].clone()),
+                    client_addrs: HashMap::new(),
+                    wait_timeout: Duration::from_secs(5),
+                }),
+            )
+            .unwrap();
+            addresses.insert(id, addr);
+        }
+        let wait_task = |id: &str| -> Value {
+            let until = Instant::now() + Duration::from_secs(10);
+            loop {
+                let row = statuses[&3].lock().unwrap().management["tasks"][id].clone();
+                if !row.is_null() && row["state"] != "queued" && row["state"] != "running" {
+                    let owner = statuses[&1].lock().unwrap().clone();
+                    assert_eq!(
+                        row["state"], "success",
+                        "{row}; owner_local={}; owner_executor={:?}; owner_leader={}; owner_applied={}",
+                        owner.local, owner.executor, owner.leader, owner.applied_index,
+                    );
+                    return row;
+                }
+                assert!(Instant::now() < until, "task {id}: {row}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let task = |method: &str, path: &str, p: Value| -> Value {
+            let until = Instant::now() + Duration::from_secs(10);
+            let reply = loop {
+                let (code, reply) = request(&addresses[&3], method, path, p.clone());
+                if code == 202 {
+                    break reply;
+                }
+                assert_eq!(code, 409, "{reply}");
+                assert!(
+                    matches!(
+                        reply["detail"].as_str(),
+                        Some("设备 owner 尚未就绪" | "驱动库存已过期，请先显式 rescan")
+                    ),
+                    "{path}: {reply}"
+                );
+                assert!(Instant::now() < until, "设备 owner 持续未就绪: {reply}");
+                if reply["detail"] == "驱动库存已过期，请先显式 rescan" {
+                    let (code, refreshed) = request(
+                        &addresses[&3],
+                        "POST",
+                        "/admin/libraries/current/rescan",
+                        json!({}),
+                    );
+                    if code == 202 {
+                        wait_task(&refreshed["task"].as_u64().unwrap().to_string());
+                    } else {
+                        assert_eq!(code, 409, "{refreshed}");
+                        assert_eq!(refreshed["detail"], "设备 owner 尚未就绪");
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            let id = reply["task"].as_u64().unwrap().to_string();
+            wait_task(&id)
+        };
+        assert_eq!(
+            request(&addresses[&3], "POST", "/admin/pools/manage", json!({})).0,
+            200
+        );
+        let before = lib
+            .changer()
+            .command_log()
+            .iter()
+            .filter(|c| **c == 0xa5)
+            .count();
+        let rescan = task("POST", "/admin/libraries/current/rescan", json!({}));
+        assert_eq!(rescan["owner"], 1);
+        let cleaner =
+            request(&addresses[&3], "GET", "/admin/tapes/CUSTOM", json!({})).1["payload"].clone();
+        assert_eq!(cleaner["cleaning"], true);
+        assert_eq!(cleaner["cleaning_source"], "element_status");
+        assert_eq!(cleaner["state"], "non_supported");
+        assert_eq!(cleaner["status"], "info");
+        assert_eq!(cleaner["appendable"], "no");
+        assert_eq!(cleaner["capacity"], 0);
+        let rejected = request(
+            &addresses[&3],
+            "POST",
+            "/admin/tapes/CUSTOM/assign",
+            json!({"pool":"manage"}),
+        );
+        assert_ne!(rejected.0, 202);
+        assert!(rejected.1.to_string().contains("清洗带"));
+        assert_eq!(
+            lib.changer()
+                .command_log()
+                .iter()
+                .filter(|c| **c == 0xa5)
+                .count(),
+            before,
+            "rescan 不搬带"
+        );
+        assert_eq!(
+            request(&addresses[&3], "GET", "/admin/tapes/HATESTL8", json!({})).1["payload"]["state"],
+            "unassigned"
+        );
+        // 非 Leader 不接受管理变更，也不会误报成功。
+        assert_eq!(
+            request(&addresses[&1], "POST", "/admin/nodegroups/G1", json!({})).0,
+            503
+        );
+        task(
+            "POST",
+            "/admin/tapes/HATESTL8/assign",
+            json!({"pool":"manage"}),
+        );
+        let until = Instant::now() + Duration::from_secs(5);
+        while services[&1].serving_round().is_none() {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let capacity_generation = loop {
+            let s = statuses[&3].lock().unwrap();
+            if let Some(generation) =
+                s.management["tapes"]["HATESTL8"]["capacity"]["generation"].as_u64()
+            {
+                assert!(
+                    s.management["tapes"]["HATESTL8"]["capacity"]["maximum"]
+                        .as_u64()
+                        .unwrap()
+                        > 0
+                );
+                assert!(
+                    s.management["tapes"]["HATESTL8"]["index_capacity"]["maximum"]
+                        .as_u64()
+                        .unwrap()
+                        > 0
+                );
+                assert_eq!(
+                    s.management["tapes"]["HATESTL8"]["capacity"]["partition"],
+                    1
+                );
+                assert_eq!(
+                    s.management["tapes"]["HATESTL8"]["index_capacity"]["partition"],
+                    0
+                );
+                break generation;
+            }
+            drop(s);
+            assert!(Instant::now() < until, "装载后须自动刷新容量");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let bytes = b"management-roundtrip";
+        let h = services[&1]
+            .begin("/admin-proof.bin", bytes.len() as u64)
+            .unwrap();
+        std::fs::write(&h.spool, bytes).unwrap();
+        services[&1].ingest(&h, bytes.len() as u64).unwrap();
+        let id = services[&1].finish(h, bytes.len() as u64).unwrap();
+        assert!(matches!(
+            services[&1].wait_task(id, Duration::from_secs(5)),
+            Some(tape_rs::daemon::files::TaskStatus::Committed { .. })
+        ));
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            let s = statuses[&3].lock().unwrap();
+            let cap = &s.management["tapes"]["HATESTL8"]["capacity"];
+            if cap["generation"].as_u64().is_some_and(|g| {
+                g > capacity_generation
+                    && Some(g) == s.tapes.get("HATESTL8").map(|t| t.generation)
+                    && s.management["tapes"]["HATESTL8"]["index_capacity"]["generation"].as_u64()
+                        == Some(g)
+            }) {
+                break;
+            }
+            drop(s);
+            assert!(Instant::now() < until, "普通写入提交后须自动刷新容量");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // offline 不得丢弃已经准入、尚未完成的上传。
+        let held = services[&1]
+            .begin("/held-before-offline.bin", bytes.len() as u64)
+            .unwrap();
+        std::fs::write(&held.spool, bytes).unwrap();
+        services[&1].ingest(&held, bytes.len() as u64).unwrap();
+        let (code, reply) = request(
+            &addresses[&3],
+            "POST",
+            "/admin/tapes/HATESTL8/offline",
+            json!({"message":"maintenance"}),
+        );
+        assert_eq!(code, 202);
+        let mut offline = reply["task"].as_u64().unwrap().to_string();
+        let until = Instant::now() + Duration::from_secs(5);
+        while statuses[&3].lock().unwrap().management["tasks"][&offline]["state"] != "running" {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            statuses[&3].lock().unwrap().management["tasks"][&offline]["state"],
+            "running"
+        );
+        let before_round = statuses[&1]
+            .lock()
+            .unwrap()
+            .executor
+            .as_ref()
+            .unwrap()
+            .round;
+        let (reply, rx) = mpsc::channel();
+        execs[&1]
+            .send(executor::ExecRequest::Sync {
+                round: before_round,
+                reply,
+            })
+            .unwrap();
+        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap().is_err());
+        assert_eq!(
+            statuses[&1]
+                .lock()
+                .unwrap()
+                .executor
+                .as_ref()
+                .unwrap()
+                .round,
+            before_round
+        );
+        assert_eq!(
+            request(
+                &addresses[&3],
+                "POST",
+                &format!("/admin/tasks/{offline}/cancel"),
+                json!({})
+            )
+            .0,
+            200
+        );
+        let until = Instant::now() + Duration::from_secs(5);
+        while statuses[&3].lock().unwrap().management["tasks"][&offline]["state"] != "cancelled" {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        loop {
+            match services[&1].begin("/after-cancel.bin", 0) {
+                Ok(h) => {
+                    services[&1].abort(h);
+                    break;
+                }
+                Err(tape_rs::daemon::files::ServiceError::NotServing(_)) => {}
+                Err(e) => panic!("取消后准入失败: {e:?}"),
+            }
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (code, reply) = request(
+            &addresses[&3],
+            "POST",
+            "/admin/tapes/HATESTL8/offline",
+            json!({"message":"maintenance"}),
+        );
+        assert_eq!(code, 202);
+        offline = reply["task"].as_u64().unwrap().to_string();
+        let id = services[&1].finish(held, bytes.len() as u64).unwrap();
+        assert!(matches!(
+            services[&1].wait_task(id, Duration::from_secs(5)),
+            Some(tape_rs::daemon::files::TaskStatus::Committed { .. })
+        ));
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            let row = statuses[&3].lock().unwrap().management["tasks"][&offline].clone();
+            if row["state"] == "success" {
+                break;
+            }
+            assert!(
+                ["running", "queued"].iter().any(|s| row["state"] == *s),
+                "{row}"
+            );
+            assert!(Instant::now() < until, "{row}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(lib.loaded_barcode(0).is_none());
+        task(
+            "POST",
+            "/admin/tapes/HATESTL8/move",
+            json!({"location":"ieslot"}),
+        );
+        task(
+            "POST",
+            "/admin/tapes/HATESTL8/move",
+            json!({"location":"homeslot"}),
+        );
+        assert_eq!(
+            request(&addresses[&3], "POST", "/admin/nodegroups/G1", json!({})).0,
+            200
+        );
+        assert_eq!(
+            request(&addresses[&3], "DELETE", "/admin/nodegroups/G1", json!({})).0,
+            200
+        );
+        // A fresh owner round invalidates the previous inventory even when
+        // the same node takes over again. Drive commands need a new rescan.
+        let previous_round = statuses[&3]
+            .lock()
+            .unwrap()
+            .executor
+            .as_ref()
+            .unwrap()
+            .round;
+        peers[&1]
+            .send(NodeInput::Exec(executor::ExecEvent::Lost {
+                round: previous_round,
+                reason: "测试同节点重新接任".into(),
+            }))
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = statuses[&3].lock().unwrap().clone();
+            if status.executor_ready
+                && status
+                    .executor
+                    .as_ref()
+                    .is_some_and(|owner| owner.node == 1 && owner.round > previous_round)
+            {
+                break;
+            }
+            assert!(Instant::now() < until, "同节点须以新轮次接任");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        task("POST", "/admin/drives/SIMDRV0000/down", json!({}));
+        task("POST", "/admin/drives/SIMDRV0000/up", json!({}));
+        task(
+            "POST",
+            "/admin/tapes/HATESTL8/blacklist",
+            json!({"reason":"inspection"}),
+        );
+        task("POST", "/admin/tapes/HATESTL8/clear-blacklist", json!({}));
+        assert_eq!(
+            request(&addresses[&3], "DELETE", "/admin/tasks", json!({})).0,
+            404
+        );
+        assert_eq!(
+            request(
+                &addresses[&3],
+                "POST",
+                "/admin/tasks/clearhistory",
+                json!({})
+            )
+            .0,
+            409
+        );
+        assert_eq!(
+            request(
+                &addresses[&3],
+                "POST",
+                "/admin/tapes/HATESTL8/typo",
+                json!({})
+            )
+            .0,
+            404
+        );
+        task(
+            "POST",
+            "/admin/drives/SIMDRV0000/role",
+            json!({"role":"rg"}),
+        );
+        task("POST", "/admin/tapes/HATESTL8/online", json!({}));
+        assert!(
+            services[&1].serving_round().is_none(),
+            "没有 m 角色不得重新开放写入"
+        );
+        task(
+            "POST",
+            "/admin/tapes/HATESTL8/validate",
+            json!({"full_read":true}),
+        );
+        task("POST", "/admin/tapes/HATESTL8/reconcile", json!({}));
+        task(
+            "POST",
+            "/admin/drives/SIMDRV0000/role",
+            json!({"role":"mrg"}),
+        );
+        let until = Instant::now() + Duration::from_secs(5);
+        while services[&1].serving_round().is_none() {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        task(
+            "PATCH",
+            "/admin/pools/manage",
+            json!({"attribute":"poolname","value":"renamed"}),
+        );
+        assert_eq!(
+            request(&addresses[&3], "GET", "/admin/pools/renamed", json!({})).0,
+            200
+        );
+        task(
+            "POST",
+            "/admin/tapes/HATESTL8/offline",
+            json!({"message":"handover"}),
+        );
+        fc[&2].store(true, Ordering::SeqCst);
+        fc[&1].store(false, Ordering::SeqCst);
+        let until = Instant::now() + Duration::from_secs(8);
+        loop {
+            let s = statuses[&3].lock().unwrap().clone();
+            if s.executor_ready && s.executor.as_ref().is_some_and(|e| e.node == 2) {
+                break;
+            }
+            assert!(Instant::now() < until, "{s:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            lib.loaded_barcode(0).is_none(),
+            "新 owner 保留 offline 策略"
+        );
+        let online = task("POST", "/admin/tapes/HATESTL8/online", json!({}));
+        assert_eq!(online["owner"], 2);
+        let until = Instant::now() + Duration::from_secs(5);
+        while services[&2].serving_round().is_none() {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (reply, rx) = mpsc::channel();
+        execs[&2]
+            .send(executor::ExecRequest::Read {
+                path: "/admin-proof.bin".into(),
+                reply,
+            })
+            .unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap(),
+            bytes
+        );
+        fc[&1].store(true, Ordering::SeqCst);
+        let until = Instant::now() + Duration::from_secs(5);
+        while !statuses[&3]
+            .lock()
+            .unwrap()
+            .candidates
+            .get(&1)
+            .is_some_and(|c| c.eligible)
+        {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        slow_checkpoint.store(true, Ordering::SeqCst);
+        let (code, reply) = request(
+            &addresses[&3],
+            "POST",
+            "/admin/tapes/HATESTL8/validate",
+            json!({"full_read":true}),
+        );
+        assert_eq!(code, 202);
+        let interrupted = reply["task"].as_u64().unwrap().to_string();
+        let until = Instant::now() + Duration::from_secs(5);
+        while slow_checkpoint.load(Ordering::SeqCst) {
+            assert!(Instant::now() < until, "管理设备调用未开始");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fc[&2].store(false, Ordering::SeqCst);
+        let until = Instant::now() + Duration::from_secs(8);
+        loop {
+            let s = statuses[&3].lock().unwrap().clone();
+            if s.executor_ready
+                && s.executor.as_ref().is_some_and(|e| e.node == 1)
+                && s.management["tasks"][&interrupted]["state"] == "indeterminate"
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "任务换届状态: {}",
+                s.management["tasks"][&interrupted]
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            statuses[&3].lock().unwrap().management["tasks"][&interrupted]["state"],
+            "indeterminate",
+            "已开始的管理任务不得在新 owner 自动重放"
+        );
+        for id in ids {
+            let (code, reply) = request(&addresses[&id], "GET", "/admin/tasks", json!({}));
+            assert_eq!(code, 200);
+            assert!(reply["payload"].as_array().unwrap().len() >= 10);
+        }
     }
     if success && case == 10 {
         use tape_rs::daemon::state::Command;
@@ -542,7 +1073,8 @@ fn scenario(case: u8) {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
-    if success && ((1..=4).contains(&case) || case >= 6) && case != 10 {
+    let mut committed_file_task = None;
+    if success && ((1..=4).contains(&case) || case >= 6) && case != 10 && case != 12 {
         let old = first.as_ref().unwrap();
         if case == 1 || case == 4 || case >= 6 {
             use tape_rs::daemon::state::Command;
@@ -579,6 +1111,18 @@ fn scenario(case: u8) {
                 svc.wait_task(task, Duration::from_secs(5)),
                 Some(tape_rs::daemon::files::TaskStatus::Committed { .. })
             ));
+            if case == 4 {
+                assert!(
+                    svc.task_recorded(
+                        task,
+                        &tape_rs::daemon::files::TaskStatus::Staged,
+                        Duration::from_secs(5),
+                    ),
+                    "task={task} status={:#?}",
+                    statuses[&3].lock().unwrap()
+                );
+                committed_file_task = Some(task);
+            }
         }
         if case == 9 {
             let other = if old.node == 1 { 2 } else { 1 };
@@ -789,6 +1333,19 @@ fn scenario(case: u8) {
                     rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap(),
                     vec![0x5a; 700_000]
                 );
+                if case == 4 {
+                    let task = committed_file_task.unwrap();
+                    let until = Instant::now() + Duration::from_secs(5);
+                    while !matches!(
+                        services[&owner]
+                            .task_for_pool("00000000-0000-4000-8000-000000000001", task,),
+                        Some(tape_rs::daemon::files::TaskStatus::Committed { .. })
+                            | Some(tape_rs::daemon::files::TaskStatus::Indeterminate { .. })
+                    ) {
+                        assert!(Instant::now() < until, "接管后原文件任务应可查询");
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
             }
         }
     }
@@ -811,12 +1368,18 @@ fn scenario(case: u8) {
         .values()
         .map(|s| s.lock().unwrap().clone())
         .collect();
+    drop(services);
     for tx in peers.values() {
         let _ = tx.send(NodeInput::Shutdown);
     }
+    let mut event_threads = Vec::new();
     for (node, exec, events) in joins {
         node.join().unwrap().unwrap();
         exec.join().unwrap();
+        event_threads.push(events);
+    }
+    stop_events.store(true, Ordering::SeqCst);
+    for events in event_threads {
         events.join().unwrap();
     }
     std::fs::remove_dir_all(dir).unwrap();

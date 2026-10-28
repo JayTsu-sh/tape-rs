@@ -27,6 +27,12 @@ struct Args {
         conflicts_with = "library_changer"
     )]
     endpoints: Vec<String>,
+    /// 目标带库的真实 changer 序列号；省略时访问默认库
+    #[arg(long = "library", conflicts_with = "library_changer")]
+    library_serial: Option<String>,
+    /// 文件命名空间的池名称或 UUID；库内有多个池时必填
+    #[arg(long, conflicts_with = "library_changer")]
+    pool: Option<String>,
     #[command(flatten)]
     library: tape_rs::library_cli::LibraryArgs,
     /// 已存在的挂载目录
@@ -552,10 +558,14 @@ fn main() {
             mounted?;
             closed
         } else {
-            let fs = TapeFs::new(
-                ClientBackend::new(Client::new(args.endpoints)),
-                args.cache_dir,
-            )?;
+            let mut client = Client::new(args.endpoints);
+            if let Some(serial) = args.library_serial {
+                client = client.with_library(serial).map_err(std::io::Error::other)?;
+            }
+            if let Some(pool) = args.pool {
+                client = client.with_pool(pool).map_err(std::io::Error::other)?;
+            }
+            let fs = TapeFs::new(ClientBackend::new(client), args.cache_dir)?;
             fuser::mount(Adapter::new(fs), args.mountpoint, &config)
         }
     })();
@@ -570,6 +580,43 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use tape_rs::tapefs::MemBackend;
+
+    #[test]
+    fn remote_mount_selects_serial_and_cannot_mix_local_device_mode() {
+        let args = Args::try_parse_from([
+            "tape-fuse",
+            "-e",
+            "127.0.0.1:7401",
+            "--library",
+            "55L3A78011W9LL01",
+            "--cache-dir",
+            "/tmp/cache",
+            "/tmp/mount",
+        ])
+        .unwrap();
+        assert_eq!(args.library_serial.as_deref(), Some("55L3A78011W9LL01"));
+        assert!(
+            Args::try_parse_from([
+                "tape-fuse",
+                "--library",
+                "55L3A78011W9LL01",
+                "--library-changer",
+                "/dev/sg0",
+                "--library-changer-serial",
+                "55L3A78011W9LL01",
+                "--library-state",
+                "/tmp/state",
+                "--library-drive",
+                "drive=/dev/sg1",
+                "--library-round",
+                "1",
+                "--cache-dir",
+                "/tmp/cache",
+                "/tmp/mount",
+            ])
+            .is_err()
+        );
+    }
 
     mod library_support {
         include!(concat!(

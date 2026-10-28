@@ -28,6 +28,12 @@ pub trait TapeTransport {
         None
     }
 
+    /// Raft round and opaque permission-object identity checked for every CDB.
+    /// The identity is compared only while both borrowed objects are alive.
+    fn execution_guard(&self) -> Option<(u64, usize)> {
+        None
+    }
+
     /// 设备身份描述，用于日志与错误信息（真实设备为 `/dev/sg*` 路径）。
     fn identity(&self) -> &str;
 }
