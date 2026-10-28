@@ -153,6 +153,12 @@ struct Args {
     /// 客户端接口（HTTP）的监听地址。不给则不开
     #[arg(long)]
     client_listen: Option<String>,
+    /// 匿名 S3 HTTP 监听地址（path-style）；不给则不开，使用原 pool 与文件服务
+    #[arg(long, requires_all = ["client_listen", "http_vip"])]
+    s3_listen: Option<String>,
+    /// 各节点 S3 端口，主机取自 --peer；须与各节点 --s3-listen 的端口一致
+    #[arg(long, default_value_t = 7402)]
+    s3_port: u16,
     /// 同子网 HTTP IPv4 VIP：单库跟随设备 owner，多库跟随统一入口；不给则不管理地址
     #[arg(long, requires_all = ["http_vip_interface", "client_listen"])]
     http_vip: Option<Ipv4Addr>,
@@ -219,6 +225,20 @@ fn install_signal_handler(inbox: std::sync::mpsc::Sender<NodeInput>) {
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
+    if let Err(error) = validate_s3_listen(args.s3_listen.as_deref(), args.s3_port) {
+        eprintln!("S3 VIP 监听配置失败：{error}");
+        std::process::exit(2);
+    }
+    if args.s3_listen.is_some() && args.libraries_config.is_none() && args.changer_serial.is_none()
+    {
+        eprintln!("S3 入口必须配置 --changer-serial 或 --libraries-config，以稳定标识带库");
+        std::process::exit(2);
+    }
+    #[cfg(feature = "fdb")]
+    if args.s3_listen.is_some() && (args.fdb_metadata_readonly || args.fdb_owner_readonly) {
+        eprintln!("S3 第一版不支持 FDB 只读模式，请使用现有可写文件目录后端");
+        std::process::exit(2);
+    }
     let mut peers: HashMap<u64, String> = HashMap::new();
     for p in &args.peers {
         let Some((id, addr)) = p.split_once('=') else {
@@ -580,6 +600,18 @@ fn main() {
             client_addrs,
             wait_timeout: Duration::from_secs(600),
         });
+        if let Some(s3_listen) = &args.s3_listen {
+            tape_rs::daemon::s3::serve(
+                s3_listen,
+                std::collections::BTreeMap::from([(
+                    args.changer_serial.clone().expect("已检查 S3 带库身份"),
+                    ctx.clone(),
+                )]),
+                ctx.clone(),
+                s3_peer_addrs(&args, &peers),
+            )
+            .expect("启动 S3 接口");
+        }
         http::serve(listen, ctx).expect("启动客户端接口");
         if let Some(vip) = http_vip.as_mut() {
             vip.start(status.clone(), files.clone(), inbox_tx.clone())
@@ -691,6 +723,31 @@ struct FdbOwnerMode {
     routes: std::collections::BTreeMap<String, tape_rs::managed_catalog::ActiveLibraryRoute>,
 }
 
+fn validate_s3_listen(listen: Option<&str>, port: u16) -> Result<(), String> {
+    if let Some(listen) = listen {
+        let address: std::net::SocketAddrV4 = listen.parse().map_err(|_| {
+            "S3 监听地址须为 0.0.0.0:<端口>，同时接收 VIP 请求和节点间转发".to_string()
+        })?;
+        if !address.ip().is_unspecified() || address.port() == 0 || address.port() != port {
+            return Err("S3 监听地址须为 0.0.0.0:<s3-port>，各节点端口必须一致".into());
+        }
+    }
+    Ok(())
+}
+
+fn s3_peer_addrs(args: &Args, peers: &HashMap<u64, String>) -> HashMap<u64, String> {
+    peers
+        .iter()
+        .map(|(id, address)| {
+            let host = address
+                .rsplit_once(':')
+                .map(|(host, _)| host)
+                .unwrap_or(address);
+            (*id, format!("{host}:{}", args.s3_port))
+        })
+        .collect()
+}
+
 /// 多库启动仍只有一份 RaftStore/TcpNet；每个库使用独立执行线程。
 fn run_libraries(
     args: Args,
@@ -771,7 +828,7 @@ fn run_libraries(
             )
         })
         .collect();
-    // 客户端的重试提示仍指向固定 VIP，内部路由单独使用物理节点地址。
+    // 管理入口使用 VIP；FUSE / Client 的数据访问与重试直接使用物理节点地址。
     let hints = args
         .http_vip
         .map(|address| {
@@ -860,7 +917,7 @@ fn run_libraries(
             status: status.clone(),
             exec: Mutex::new(exec.clone()),
             node: Mutex::new(scoped),
-            client_addrs: hints
+            client_addrs: client_addrs
                 .iter()
                 .map(|(id, a)| (*id, format!("{a}{}", library.http_prefix())))
                 .collect(),
@@ -922,6 +979,14 @@ fn run_libraries(
         client_addrs: hints,
         wait_timeout: Duration::from_secs(600),
     });
+    if let Some(listen) = &args.s3_listen {
+        tape_rs::daemon::s3::serve(
+            listen,
+            contexts.clone(),
+            gateway.clone(),
+            s3_peer_addrs(&args, &peers),
+        )?;
+    }
     if let Some(listen) = &args.client_listen {
         #[cfg(feature = "fdb")]
         if let Some(mode) = fdb_owner.as_ref() {
@@ -1083,5 +1148,44 @@ mod fdb_owner_cli_tests {
         let mut legacy_write = allowed;
         legacy_write.push("--demo-write");
         assert!(Args::try_parse_from(&legacy_write).is_err());
+    }
+}
+
+#[cfg(test)]
+mod s3_cli_tests {
+    use super::*;
+
+    #[test]
+    fn s3_listener_must_receive_both_vip_and_internal_forwarding() {
+        assert!(validate_s3_listen(Some("0.0.0.0:7402"), 7402).is_ok());
+        assert!(validate_s3_listen(None, 7402).is_ok());
+        for value in [
+            "127.0.0.1:7402",
+            "192.0.2.100:7402",
+            "0.0.0.0:7403",
+            "0.0.0.0:0",
+            "[::]:7402",
+        ] {
+            assert!(validate_s3_listen(Some(value), 7402).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn enabling_s3_requires_the_managed_vip() {
+        let result = Args::try_parse_from([
+            "ltfsd",
+            "--id",
+            "1",
+            "--listen",
+            "127.0.0.1:7001",
+            "--data-dir",
+            "/tmp/s3-cli-unused",
+            "--client-listen",
+            "0.0.0.0:7401",
+            "--s3-listen",
+            "0.0.0.0:7402",
+        ]);
+        assert!(result.is_err());
+        assert!(result.err().unwrap().to_string().contains("--http-vip"));
     }
 }

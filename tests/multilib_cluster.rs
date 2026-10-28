@@ -136,6 +136,15 @@ fn one_cluster_two_owners_and_fixed_http_entry_preserve_library_isolation() {
             (id, lib)
         })
         .collect();
+    let s3_listeners: Vec<_> = (0..3)
+        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let s3_addresses: HashMap<_, _> = s3_listeners
+        .iter()
+        .enumerate()
+        .map(|(n, l)| (n as u64 + 1, l.local_addr().unwrap().to_string()))
+        .collect();
+    drop(s3_listeners);
     let mut statuses = HashMap::<(u64, String), SharedStatus>::new();
     let mut flags = HashMap::new();
     let mut joins = Vec::new();
@@ -238,6 +247,13 @@ fn one_cluster_two_owners_and_fixed_http_entry_preserve_library_isolation() {
             });
         }
         let gateway = contexts.remove(GATEWAY).unwrap();
+        tape_rs::daemon::s3::serve(
+            &s3_addresses[&id],
+            contexts.clone(),
+            gateway.clone(),
+            s3_addresses.clone(),
+        )
+        .unwrap();
         gateway::serve(
             &addresses[&id],
             config.clone(),
@@ -310,6 +326,8 @@ fn one_cluster_two_owners_and_fixed_http_entry_preserve_library_isolation() {
             && owner("55L3A78011W9LL01") == Some(3)
             && owner(GATEWAY) == Some(3)
     });
+    // ExecutorReady 先于后续 Serving ReadIndex 许可，等待实际可服务状态。
+    wait(|| exchange(&s3_addresses[&3], "GET", "/", &[]).0 == 200);
     // 两库允许相同池名、UUID、条码和路径，目录与介质内容分别归属。
     let admin = |library: &str, cmd: Command| {
         let (reply, rx) = mpsc::channel();
@@ -342,6 +360,20 @@ fn one_cluster_two_owners_and_fixed_http_entry_preserve_library_isolation() {
         );
     }
     let endpoint = &addresses[&3];
+    // 新建/分配池的控制日志先提交，实际装带与准入随后就绪。
+    for library in ["55L3A7802K19LL01", "55L3A78011W9LL01"] {
+        wait(|| {
+            let (code, body) = exchange(
+                endpoint,
+                "GET",
+                &format!("/libraries/{library}/cluster"),
+                &[],
+            );
+            code == 200
+                && serde_json::from_slice::<serde_json::Value>(&body)
+                    .is_ok_and(|v| v["serving_round"].is_u64())
+        });
+    }
     let (code, body) = exchange(endpoint, "GET", "/admin/libraries", &[]);
     assert_eq!(code, 200);
     let public: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -394,6 +426,73 @@ fn one_cluster_two_owners_and_fixed_http_entry_preserve_library_isolation() {
     flags[&(1, "55L3A78011W9LL01")].store(false, Ordering::SeqCst);
     flags[&(2, "55L3A7802K19LL01")].store(false, Ordering::SeqCst);
     wait(|| owner("55L3A7802K19LL01") == Some(1) && owner("55L3A78011W9LL01") == Some(2));
+    // 同名、同 UUID 池投影为不同 bucket；固定节点 3 的 S3 入口分别转发到 owner 1/2。
+    let mut s3_buckets = Vec::new();
+    for (library, data) in [
+        ("55L3A7802K19LL01", b"S3 library A".as_slice()),
+        ("55L3A78011W9LL01", b"S3 library B".as_slice()),
+    ] {
+        let bucket = tape_rs::daemon::s3::bucket_name(library, "same-uuid");
+        assert!(!s3_buckets.contains(&bucket));
+        s3_buckets.push(bucket.clone());
+        wait(|| {
+            let put = exchange(
+                &s3_addresses[&3],
+                "PUT",
+                &format!("/{bucket}/s3-only"),
+                data,
+            );
+            assert!(
+                put.0 == 200 || put.0 == 503,
+                "{}: {}",
+                put.0,
+                String::from_utf8_lossy(&put.1)
+            );
+            put.0 == 200
+        });
+        assert_eq!(
+            exchange(&s3_addresses[&3], "GET", &format!("/{bucket}/s3-only"), &[]),
+            (200, data.to_vec())
+        );
+        assert_eq!(
+            exchange(
+                endpoint,
+                "GET",
+                &format!("/libraries/{library}/pools/same-uuid/files/s3-only"),
+                &[]
+            ),
+            (200, data.to_vec())
+        );
+    }
+    assert_eq!(
+        exchange(
+            &s3_addresses[&3],
+            "DELETE",
+            &format!("/{}/s3-only", s3_buckets[0]),
+            &[]
+        )
+        .0,
+        204
+    );
+    assert_eq!(
+        exchange(
+            &s3_addresses[&3],
+            "GET",
+            &format!("/{}/s3-only", s3_buckets[0]),
+            &[]
+        )
+        .0,
+        404
+    );
+    assert_eq!(
+        exchange(
+            &s3_addresses[&3],
+            "GET",
+            &format!("/{}/s3-only", s3_buckets[1]),
+            &[]
+        ),
+        (200, b"S3 library B".to_vec())
+    );
     let ctl =
         std::env::var_os("LTFSCTL_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_ltfsctl").into());
     let create = std::process::Command::new(&ctl)

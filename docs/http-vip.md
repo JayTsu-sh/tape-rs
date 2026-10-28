@@ -2,6 +2,8 @@
 
 `ltfsd` 内置同子网 IPv4 VIP，可让客户端固定访问一个地址。没有 Keepalived、VRRP、外部脚本或新增 Rust 依赖；地址管理使用 Linux rtnetlink，邻居缓存更新使用原生 ARP 公告。
 
+当前访问约定：管理 HTTP 与 [S3 HTTP](s3.md) 共用 VIP、使用不同端口；FUSE 与 Rust Client/lib 直连各节点物理地址。S3 监听随同一 VIP 漂移，不单独取得另一份地址占用。
+
 ## 配置
 
 所有可能成为设备 owner 的节点配置同一个专用 VIP；接口名称可以不同。示例地址仅用于说明，部署时替换为实际子网内已预留、未被其他设备使用的地址。

@@ -380,6 +380,36 @@ pub struct Stat {
     pub metadata: serde_json::Value,
 }
 
+impl Stat {
+    /// 与 Directory::object_page 的 SQL 投影一致，不复制 recent 中的大属性或链接目标。
+    fn listing_view(&self) -> Self {
+        let md5 = self.metadata["xattrs"]
+            .as_array()
+            .and_then(|attrs| {
+                attrs
+                    .iter()
+                    .find(|a| a["key"] == crate::ltfs::index::XATTR_MD5)
+            })
+            .and_then(|a| a["value"].as_str())
+            .filter(|v| v.len() <= 32);
+        Self {
+            len: self.len,
+            generation: self.generation,
+            round: self.round,
+            barcode: self.barcode.clone(),
+            sha256: self.sha256.clone(),
+            deleted: self.deleted,
+            version: self.version,
+            metadata: serde_json::json!({
+                "kind":if is_directory(&self.metadata) {"directory"} else {"file"},
+                "symlink":self.metadata["symlink"].as_str().map(|_| ""),
+                "modify_time":self.metadata["modify_time"].as_str().filter(|v| v.len()<=64),
+                "xattrs":[{"key":crate::ltfs::index::XATTR_MD5,"value":md5}]
+            }),
+        }
+    }
+}
+
 /// 路径上未提交的变更。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InFlight {
@@ -788,7 +818,7 @@ impl FileService {
             .and_then(|p| p.deadline(round, super::permission::Phase::Serving))
     }
 
-    fn check_permission(&self) -> Result<(), ServiceError> {
+    pub(super) fn check_permission(&self) -> Result<(), ServiceError> {
         let permission = self.permission.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = permission.as_ref() {
             let g = self.lock();
@@ -2598,6 +2628,58 @@ impl FileService {
             .filter(|(_, n)| !n.is_dir)
             .map(|(p, n)| (p, n.length))
             .collect())
+    }
+
+    /// 有界合并已提交目录与本轮发布视图。墓碑也占扫描位置，由调用方跳过。
+    pub(super) fn object_page(
+        &self,
+        prefix: &str,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, Stat)>, ServiceError> {
+        self.check_permission()?;
+        if limit == 0 || limit > 1001 || !prefix.starts_with('/') {
+            return Err(ServiceError::BadPath("对象分页参数非法".into()));
+        }
+        let g = self.lock();
+        let (round, pool, recent) = match (&g.serving, &g.read_only) {
+            (Some(s), _) => (s.round, s.tape.pool_uuid.as_str(), &s.recent),
+            (None, Some((round, pool))) => (*round, pool.as_str(), &g.0.recent),
+            _ => return Err(ServiceError::NotServing(g.why_not.clone())),
+        };
+        let mut page = BTreeMap::new();
+        if self.directory_path.is_some() {
+            let rows = self
+                .with_reader(|d| Some(d.object_page(pool, prefix, after, limit)))
+                .ok_or_else(|| ServiceError::Io("无法读取对象目录".into()))?
+                .map_err(|e| ServiceError::Io(e.to_string()))?;
+            for (path, row) in rows {
+                let st = recent.get(&path).map(Stat::listing_view).unwrap_or(Stat {
+                    len: row.length,
+                    generation: row.generation,
+                    round,
+                    barcode: row.barcode,
+                    sha256: row.sha256,
+                    deleted: row.deleted,
+                    version: row.version,
+                    metadata: row.metadata,
+                });
+                page.insert(path, st);
+            }
+        }
+        for (path, st) in recent {
+            if path.as_str() > after
+                && path.starts_with(prefix)
+                && (page.len() < limit
+                    || page.last_key_value().is_some_and(|(last, _)| path <= last))
+            {
+                page.insert(path.clone(), st.listing_view());
+                if page.len() > limit {
+                    page.pop_last();
+                }
+            }
+        }
+        Ok(page.into_iter().collect())
     }
 
     fn list_nodes(&self) -> Result<BTreeMap<String, NodeSummary>, ServiceError> {

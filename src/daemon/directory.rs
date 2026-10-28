@@ -658,6 +658,79 @@ impl Directory {
         Ok(self.lookup(pool_uuid, path)?.filter(|f| !f.deleted))
     }
 
+    /// S3 游标扫描使用主键范围；每行仅投影列举字段，不读取完整扩展属性。
+    pub(crate) fn object_page(
+        &self,
+        pool: &str,
+        prefix: &str,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, FileRow)>> {
+        let mut upper = prefix.to_owned();
+        while let Some(ch) = upper.pop() {
+            if ch != char::MAX {
+                let next = if ch == '\u{d7ff}' {
+                    '\u{e000}'
+                } else {
+                    char::from_u32(ch as u32 + 1).unwrap()
+                };
+                upper.push(next);
+                break;
+            }
+        }
+        let mut stmt = self
+            .db
+            .prepare(
+                "SELECT path,barcode,generation,length,sha256,ver_round,ver_seq,
+             json_object(
+               'kind',CASE WHEN json_extract(metadata,'$.kind')='directory' THEN 'directory' ELSE 'file' END,
+               'symlink',CASE WHEN json_type(metadata,'$.symlink')='text' THEN '' ELSE NULL END,
+               'modify_time',CASE WHEN json_type(metadata,'$.modify_time')='text' AND length(json_extract(metadata,'$.modify_time'))<=64 THEN json_extract(metadata,'$.modify_time') ELSE NULL END,
+               'xattrs',json_array(json_object('key',?6,'value',(
+                 SELECT CASE WHEN json_type(attr.value,'$.value')='text' AND length(json_extract(attr.value,'$.value'))<=32 THEN json_extract(attr.value,'$.value') ELSE NULL END
+                 FROM json_each(files.metadata,'$.xattrs') attr
+                 WHERE json_extract(attr.value,'$.key')=?6 LIMIT 1))))
+             FROM files WHERE pool_uuid=?1 AND path>=?2 AND path<?3 AND path>?4
+             AND deleted=0 ORDER BY path LIMIT ?5",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(
+                params![
+                    pool,
+                    prefix,
+                    upper,
+                    after,
+                    limit as i64,
+                    crate::ltfs::index::XATTR_MD5
+                ],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        FileRow {
+                            barcode: r.get(1)?,
+                            generation: r.get::<_, i64>(2)? as u64,
+                            length: r.get::<_, i64>(3)? as u64,
+                            sha256: r.get(4)?,
+                            deleted: false,
+                            version: (r.get::<_, i64>(5)? as u64, r.get::<_, i64>(6)? as u64),
+                            metadata: serde_json::from_str(&r.get::<_, String>(7)?).map_err(
+                                |e| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        7,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(e),
+                                    )
+                                },
+                            )?,
+                        },
+                    ))
+                },
+            )
+            .map_err(db_err)?;
+        rows.collect::<std::result::Result<_, _>>().map_err(db_err)
+    }
+
     /// 路径在目录里的那一行，墓碑也返回。回收用它判断带上的一份是不是已被别处的新版本
     /// （文件或墓碑）取代。
     pub fn lookup(&self, pool_uuid: &str, path: &str) -> Result<Option<FileRow>> {

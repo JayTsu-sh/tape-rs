@@ -113,6 +113,15 @@ pub fn serve(listen: &str, ctx: Arc<HttpContext>) -> std::io::Result<()> {
 }
 
 pub(crate) fn serve_router(listen: &str, app: Router) -> std::io::Result<()> {
+    serve_router_case(listen, app, true)
+}
+
+pub(super) fn serve_s3_router(listen: &str, app: Router) -> std::io::Result<()> {
+    // S3 SDK 对 x-amz-meta-* 的映射解析依赖小写字段名。
+    serve_router_case(listen, app, false)
+}
+
+fn serve_router_case(listen: &str, app: Router, title_case: bool) -> std::io::Result<()> {
     // 绑定与运行时创建在调用线程完成，启动失败仍同步返回给调用方。
     let listener = TcpListener::bind(listen)?;
     listener.set_nonblocking(true)?;
@@ -151,7 +160,7 @@ pub(crate) fn serve_router(listen: &str, app: Router) -> std::io::Result<()> {
                     let app = app.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
-                        serve_connection(conn, app).await;
+                        serve_connection(conn, app, title_case).await;
                     });
                 }
             });
@@ -159,10 +168,10 @@ pub(crate) fn serve_router(listen: &str, app: Router) -> std::io::Result<()> {
     Ok(())
 }
 
-async fn serve_connection(conn: tokio::net::TcpStream, app: Router) {
+async fn serve_connection(conn: tokio::net::TcpStream, app: Router, title_case: bool) {
     let mut http = hyper::server::conn::http1::Builder::new();
     http.keep_alive(false)
-        .title_case_headers(true)
+        .title_case_headers(title_case)
         .max_buf_size(32 * 1024)
         .max_header_size(32 * 1024)
         .timer(TokioTimer::new())
@@ -205,7 +214,25 @@ async fn dispatch(State(state): State<HttpState>, req: Request) -> Response {
     if req.method() == "GET" && req.uri().path() == "/readyz" {
         return ready_response(&state.ctx);
     }
+    dispatch_business(state, req, None).await
+}
+
+pub(super) async fn dispatch_s3_context(
+    ctx: Arc<HttpContext>,
+    requests: Arc<Semaphore>,
+    req: Request,
+    pool: String,
+) -> Response {
+    dispatch_business(HttpState { ctx, requests }, req, Some(pool)).await
+}
+
+async fn dispatch_business(state: HttpState, req: Request, s3_pool: Option<String>) -> Response {
+    let s3 = s3_pool.is_some();
+    let head = req.method() == "HEAD";
     let Ok(permit) = state.requests.try_acquire_owned() else {
+        if s3 {
+            return super::s3::error_response(503, "SlowDown", "HTTP 并发请求已达上限", head);
+        }
         return json_response(
             503,
             json!({"error":"http_busy", "detail":"HTTP 并发请求已达上限"}),
@@ -227,9 +254,18 @@ async fn dispatch(State(state): State<HttpState>, req: Request) -> Response {
             consumed: 0,
             deadline: None,
         };
-        if let Err(e) = handle(parts, &mut reader, &mut response, &state.ctx) {
+        let result = if let Some(pool) = s3_pool {
+            super::s3::handle(parts, &mut reader, &mut response, &state.ctx, &pool)
+        } else {
+            handle(parts, &mut reader, &mut response, &state.ctx)
+        };
+        if let Err(e) = result {
             warn!("HTTP 请求出错: {}", e);
-            response = json_response(400, json!({"error":"bad_request", "detail":e.to_string()}));
+            response = if s3 {
+                super::s3::error_response(400, "IncompleteBody", &e.to_string(), head)
+            } else {
+                json_response(400, json!({"error":"bad_request", "detail":e.to_string()}))
+            };
         }
         // VIP 已可能向客户端发出 100 Continue。owner 若提前拒绝，先读完已声明的
         // 请求体再返回错误，避免入口在客户端写正文时关闭连接。排空必须有总时间
@@ -259,6 +295,14 @@ async fn dispatch(State(state): State<HttpState>, req: Request) -> Response {
         Ok(response) => response,
         Err(e) => {
             warn!("HTTP 请求任务失败: {}", e);
+            if s3 {
+                return super::s3::error_response(
+                    500,
+                    "InternalError",
+                    "请求任务异常，操作结果未定",
+                    head,
+                );
+            }
             json_response(
                 500,
                 json!({"error":"indeterminate", "status":"indeterminate", "detail":"HTTP 请求任务异常，操作结果未定"}),
@@ -791,7 +835,7 @@ fn ready_response(ctx: &HttpContext) -> Response {
     )
 }
 
-fn scoped_request(files: &FileService, request: ExecRequest) -> ExecRequest {
+pub(super) fn scoped_request(files: &FileService, request: ExecRequest) -> ExecRequest {
     match files.target_pool() {
         Some(pool) => ExecRequest::Scoped {
             pool,
@@ -1849,7 +1893,7 @@ mod tests {
                 runtime.block_on(async move {
                     let listener = tokio::net::TcpListener::from_std(listener).unwrap();
                     let (conn, _) = listener.accept().await.unwrap();
-                    tokio::time::timeout(Duration::from_secs(3), serve_connection(conn, app))
+                    tokio::time::timeout(Duration::from_secs(3), serve_connection(conn, app, true))
                         .await
                         .unwrap();
                 });
@@ -2200,9 +2244,11 @@ mod tests {
                 runtime.block_on(async move {
                     let listener = tokio::net::TcpListener::from_std(listener).unwrap();
                     let (conn, _) = listener.accept().await.unwrap();
-                    let _ =
-                        tokio::time::timeout(Duration::from_secs(10), serve_connection(conn, app))
-                            .await;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        serve_connection(conn, app, true),
+                    )
+                    .await;
                 });
             });
             let mut conn = TcpStream::connect(address).unwrap();
@@ -2249,7 +2295,7 @@ mod tests {
                     let (conn, _) = listener.accept().await.unwrap();
                     tokio::time::timeout(
                         Duration::from_secs(10),
-                        serve_connection(conn, router(ctx)),
+                        serve_connection(conn, router(ctx), true),
                     )
                     .await
                     .unwrap();

@@ -6,6 +6,8 @@
 
 希望客户端固定访问一个地址时，可启用 [ltfsd 内置 HTTP VIP](http-vip.md)：首版支持同子网 IPv4，由有效设备 owner 持有，无需 Keepalived。
 
+FUSE 与 Rust Client/lib 使用各节点物理地址访问原文件接口，不使用 VIP；管理 HTTP 与 S3 使用 VIP，见 [S3 接口](s3.md)。
+
 数据访问现在以池为命名空间：`/libraries/<真实带库序列号>/pools/<池名称或UUID>/files/...`，`stat`、`list`、`tasks`、`sync`、目录、属性和改名操作也使用同一池前缀。库内恰好一个池时可以省略池；存在多个池时省略会返回 `400 pool_required`，避免把文件写入任意池。管理接口继续使用库作用域的 `/admin/...`。
 
 文件任务 ID 包含本次设备 owner 轮次，受理与终态随 Raft 日志复制到各节点目录。`GET /tasks/<id>` 在接管或进程重启后仍可查询；接管时尚未获多数派确认的任务会显示 `indeterminate`，此时应按路径查询内容与哈希。写入响应只有在任务记录已应用后才确认任务 ID；等待超时返回带任务 ID 的 504，不代表请求未执行。文件任务与 `/admin/tasks` 管理任务仍使用各自的查询路径。
@@ -13,8 +15,8 @@
 已持久化的文件任务通过固定 HTTP 入口在本地复制目录查询；即使该库暂时没有设备 owner，`GET /tasks/<id>` 和带池前缀的查询仍可返回终态。新任务受理与文件读写仍需要有效的设备 owner。目录快照正在发布时查询可暂时返回 `catalog_pending`，稍后重试。
 
 ```bash
-ltfsctl -e 10.131.7.219:17821 --library 55L3A78011W9LL01 --pool multilib-test put ./file.bin /file.bin
-tape-fuse -e 10.131.7.219:17821 --library 55L3A78011W9LL01 --pool multilib-test \
+ltfsctl -e 192.0.2.11:7401 --library 55L3A78011W9LL01 --pool multilib-test put ./file.bin /file.bin
+tape-fuse -e 192.0.2.11:7401 --library 55L3A78011W9LL01 --pool multilib-test \
   --cache-dir /var/cache/tape-client /mnt/tape
 ```
 

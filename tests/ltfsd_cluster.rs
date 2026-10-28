@@ -268,7 +268,7 @@ impl DeviceProvider for SimProvider {
             name: "changer".into(),
             serial: "SIMLIB0000000001".into(),
             kind: DeviceKind::Changer,
-            dev: Box::new(self.lib.changer()),
+            dev: Box::new(self.lib.changer_as(self.initiator)),
         });
         Ok(v)
     }
@@ -326,6 +326,25 @@ impl Cluster {
         claimed_drives: Option<usize>,
         format_pause: Option<Arc<FormatPause>>,
     ) -> Self {
+        Self::start_lib_configured(
+            name,
+            demo_write,
+            lib,
+            file_limit,
+            assign,
+            (claimed_drives, format_pause, false),
+        )
+    }
+
+    fn start_lib_configured(
+        name: &str,
+        demo_write: bool,
+        lib: SimLibrary,
+        file_limit: u64,
+        assign: &[&str],
+        setup: (Option<usize>, Option<Arc<FormatPause>>, bool),
+    ) -> Self {
+        let (claimed_drives, format_pause, coordinated) = setup;
         let dir = std::env::temp_dir().join(format!("ltfsd-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -378,6 +397,9 @@ impl Cluster {
             .unwrap();
             let status_for_exec = shared.clone();
             files.set_executor(exec_tx.clone());
+            if coordinated {
+                files.set_task_events(ev_tx.clone());
+            }
             services.insert(id, files.clone());
             execs.insert(id, exec_tx.clone());
             thread::spawn(move || {
@@ -392,7 +414,10 @@ impl Cluster {
                 }
             });
             let cfg = NodeConfig {
-                coordination: None,
+                coordination: coordinated.then(|| tape_rs::daemon::node::CoordinationConfig {
+                    group: "s3-test".into(),
+                    validity: Duration::from_secs(6),
+                }),
                 id,
                 peers: ids.to_vec(),
                 tick: Duration::from_millis(15),
@@ -4131,4 +4156,321 @@ fn native_metadata_updates_preserve_data_and_survive_takeover() {
         false
     );
     c.shutdown();
+}
+
+impl Cluster {
+    fn start_s3_fixture(name: &str) -> Self {
+        let lib = SimLibrary::new(1, 4, 1);
+        lib.enable_changer_pr();
+        lib.insert_cartridge(SimCartridge::blank(BARCODE, 256 << 20), 0)
+            .unwrap();
+        lib.load_into_drive(BARCODE, 0).unwrap();
+        mkltfs(
+            &lib.drive_as(0, 50),
+            &MkltfsOptions {
+                volume_id: "S3".into(),
+                block_size: 64 * 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        Self::start_lib_configured(name, false, lib, 200_000, &[BARCODE], (None, None, true))
+    }
+    fn start_s3(&self) -> HashMap<u64, String> {
+        for _ in 0..20 {
+            let listeners: Vec<_> = (0..3)
+                .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+                .collect();
+            let addrs: HashMap<_, _> = listeners
+                .iter()
+                .enumerate()
+                .map(|(i, l)| (i as u64 + 1, l.local_addr().unwrap().to_string()))
+                .collect();
+            drop(listeners);
+            let mut bound = true;
+            for id in 1..=3 {
+                let ctx = Arc::new(HttpContext {
+                    files: self.services[&id].clone(),
+                    status: self.status[&id].clone(),
+                    exec: Mutex::new(self.execs[&id].clone()),
+                    node: Mutex::new(self.inboxes[&id].clone()),
+                    client_addrs: addrs.clone(),
+                    wait_timeout: Duration::from_secs(20),
+                });
+                if tape_rs::daemon::s3::serve(
+                    &addrs[&id],
+                    [("TEST-S3".into(), ctx.clone())].into(),
+                    ctx,
+                    addrs.clone(),
+                )
+                .is_err()
+                {
+                    bound = false;
+                    break;
+                }
+            }
+            if bound {
+                return addrs;
+            }
+        }
+        panic!("找不到三个 S3 测试端口");
+    }
+}
+
+fn s3_http(
+    address: &str,
+    method: &str,
+    path: &str,
+    headers: &str,
+    body: &[u8],
+) -> (u16, String, Vec<u8>) {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    write!(stream,"{method} {path} HTTP/1.1\r\nHost: {address}\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n",body.len()).unwrap();
+    stream.write_all(body).unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    let end = response.windows(4).position(|s| s == b"\r\n\r\n").unwrap();
+    let header = String::from_utf8(response[..end].to_vec()).unwrap();
+    (
+        header.split_whitespace().nth(1).unwrap().parse().unwrap(),
+        header,
+        response[end + 4..].to_vec(),
+    )
+}
+
+#[test]
+fn s3_anonymous_objects_survive_owner_failover_and_share_file_namespace() {
+    let c = Cluster::start_s3_fixture("s3-anonymous");
+    let (owner, round) = c.wait_serving(None, 0);
+    let addrs = c.start_s3();
+    let bucket = tape_rs::daemon::s3::bucket_name("TEST-S3", POOL);
+    let via = if owner == 1 { 2 } else { 1 };
+    let address = &addrs[&via];
+    assert_eq!(s3_http(address, "PUT", "/does-not-exist", "", b"").0, 501);
+    let (status, _, body) = s3_http(address, "GET", "/", "", b"");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert!(String::from_utf8(body).unwrap().contains(&bucket));
+    for method in ["PUT", "DELETE"] {
+        assert_eq!(
+            s3_http(address, method, &format!("/{bucket}"), "", b"").0,
+            501
+        );
+    }
+    assert_eq!(
+        s3_http(
+            address,
+            "PUT",
+            &format!("/{bucket}/bad?uploads"),
+            "",
+            b"abc"
+        )
+        .0,
+        501
+    );
+    assert_eq!(
+        s3_http(address, "PUT", &format!("/{bucket}/a//b"), "", b"abc").0,
+        400
+    );
+    let path = format!("/{bucket}/dir/hello%20world");
+    let put = s3_http(
+        address,
+        "PUT",
+        &path,
+        "Content-Type: text/plain\r\nx-amz-meta-origin: s3\r\nContent-MD5: kAFQmDzST7DWlj99KOF/cg==\r\n",
+        b"abc",
+    );
+    assert_eq!(put.0, 200, "{}", String::from_utf8_lossy(&put.2));
+    assert!(put.1.contains("\"900150983cd24fb0d6963f7d28e17f72\""));
+    for method in ["PUT", "DELETE"] {
+        for condition in [
+            "If-Unmodified-Since: Thu, 01 Jan 1970 00:00:00 GMT\r\n",
+            "If-Modified-Since: Thu, 01 Jan 1970 00:00:00 GMT\r\n",
+            "x-amz-if-match-last-modified-time: 1970-01-01T00:00:00Z\r\n",
+            "x-amz-if-match-size: 123\r\n",
+        ] {
+            assert_eq!(
+                s3_http(address, method, &path, condition, b"new").0,
+                501,
+                "{method} {condition}"
+            );
+            assert_eq!(s3_http(address, "GET", &path, "", b"").2, b"abc");
+        }
+    }
+    assert_eq!(
+        s3_http(
+            address,
+            "GET",
+            &path,
+            "Range: bytes=1-2\r\nIf-Range: \"old-etag\"\r\n",
+            b""
+        )
+        .0,
+        501
+    );
+    assert!(
+        c.services[&owner]
+            .stat("/dir/hello world")
+            .unwrap()
+            .is_some()
+    );
+    let head = s3_http(address, "HEAD", &path, "", b"");
+    assert_eq!(head.0, 200);
+    assert!(head.2.is_empty());
+    assert!(head.1.to_ascii_lowercase().contains("content-length: 3"));
+    assert!(
+        head.1
+            .to_ascii_lowercase()
+            .contains("x-amz-meta-origin: s3")
+    );
+    assert_eq!(
+        s3_http(address, "GET", &path, "Range: bytes=1-2\r\n", b"").2,
+        b"bc"
+    );
+    assert_eq!(
+        s3_http(address, "GET", &path, "Range: bytes=3-\r\n", b"").0,
+        416
+    );
+    assert_eq!(
+        s3_http(
+            address,
+            "GET",
+            &path,
+            "If-None-Match: \"900150983cd24fb0d6963f7d28e17f72\"\r\n",
+            b""
+        )
+        .0,
+        304
+    );
+    assert_eq!(
+        s3_http(address, "PUT", &path, "If-None-Match: *\r\n", b"new").0,
+        412
+    );
+    let listed = s3_http(
+        address,
+        "GET",
+        &format!("/{bucket}?list-type=2&prefix=dir%2F"),
+        "",
+        b"",
+    );
+    assert_eq!(listed.0, 200);
+    assert!(String::from_utf8_lossy(&listed.2).contains("<Key>dir/hello world</Key>"));
+    c.isolated.lock().unwrap().insert(owner);
+    let (new_owner, _) = c.wait_serving(Some(owner), round + 1);
+    let read = s3_http(&addrs[&new_owner], "GET", &path, "", b"");
+    assert_eq!(read.0, 200, "{}", String::from_utf8_lossy(&read.2));
+    assert_eq!(read.2, b"abc");
+    assert!(read.1.contains("\"900150983cd24fb0d6963f7d28e17f72\""));
+    assert!(
+        read.1
+            .to_ascii_lowercase()
+            .contains("x-amz-meta-origin: s3")
+    );
+    // 文件接口覆盖 S3 文件后重新计算标准 MD5，不能继续返回旧 ETag。
+    assert!(matches!(
+        upload(&c.services[&new_owner], "/dir/hello world", b"new"),
+        Ok(TaskStatus::Committed { .. })
+    ));
+    let changed = s3_http(&addrs[&new_owner], "GET", &path, "", b"");
+    assert_eq!(changed.2, b"new");
+    assert!(changed.1.contains("\"22af645d1859cb5ca6da0c484f1f37ea\""));
+    let other = (1..=3).find(|id| *id != owner && *id != new_owner).unwrap();
+    c.isolated.lock().unwrap().insert(other);
+    c.wait("S3 丢多数派拒绝读取", || {
+        s3_http(&addrs[&new_owner], "GET", &path, "", b"").0 == 503
+    });
+    c.isolated.lock().unwrap().clear();
+    let (recovered, _) = c.wait_serving(None, 0);
+    c.wait("S3 多数派恢复读回", || {
+        s3_http(&addrs[&recovered], "GET", &path, "", b"").2 == b"new"
+    });
+    assert_eq!(s3_http(&addrs[&recovered], "DELETE", &path, "", b"").0, 204);
+    assert_eq!(s3_http(&addrs[&recovered], "DELETE", &path, "", b"").0, 204);
+    assert_eq!(s3_http(&addrs[&recovered], "GET", &path, "", b"").0, 404);
+    c.shutdown();
+}
+
+#[test]
+fn s3_buckets_follow_http_pool_management_without_media() {
+    let c = Cluster::start_s3_fixture("s3-pools");
+    let (owner, _) = c.wait_serving(None, 0);
+    let s3 = c.start_s3();
+    let management = c.start_http();
+    let result = s3_http(
+        &management[owner as usize - 1],
+        "POST",
+        "/admin/pools/S3EMPTY",
+        "",
+        b"",
+    );
+    assert_eq!(result.0, 200, "{}", String::from_utf8_lossy(&result.2));
+    let result: serde_json::Value = serde_json::from_slice(&result.2).unwrap();
+    let uuid = result["result"].as_str().unwrap();
+    let bucket = tape_rs::daemon::s3::bucket_name("TEST-S3", uuid);
+    c.wait("S3 pool 复制", || {
+        c.st(owner).pools.iter().any(|p| p.uuid == uuid)
+    });
+    let listed = s3_http(&s3[&owner], "GET", "/", "", b"");
+    assert_eq!(listed.0, 200);
+    assert!(String::from_utf8_lossy(&listed.2).contains(&bucket));
+    c.wait("S3 空池视图", || {
+        s3_http(
+            &s3[&owner],
+            "GET",
+            &format!("/{bucket}?list-type=2"),
+            "",
+            b"",
+        )
+        .0 == 200
+    });
+    assert_eq!(
+        s3_http(&s3[&owner], "HEAD", &format!("/{bucket}"), "", b"").0,
+        200
+    );
+    let put = s3_http(
+        &s3[&owner],
+        "PUT",
+        &format!("/{bucket}/no-tape"),
+        "",
+        b"abc",
+    );
+    assert_eq!(put.0, 503);
+    assert!(c.services[&owner].stat("/no-tape").unwrap().is_none());
+    let deleted = s3_http(
+        &management[owner as usize - 1],
+        "DELETE",
+        &format!("/admin/pools/{uuid}"),
+        "",
+        b"",
+    );
+    assert_eq!(deleted.0, 200, "{}", String::from_utf8_lossy(&deleted.2));
+    let listed = s3_http(&s3[&owner], "GET", "/", "", b"");
+    assert!(!String::from_utf8_lossy(&listed.2).contains(&bucket));
+    assert_eq!(
+        s3_http(&s3[&owner], "HEAD", &format!("/{bucket}"), "", b"").0,
+        404
+    );
+    c.shutdown();
+}
+
+/// 外部客户端仍访问内存 SimLibrary，不访问任何设备。Python 环境须安装 boto3/awscli/s3cmd。
+#[test]
+#[ignore = "需设置 TAPE_RS_S3_PYTHON，运行外部 AWS CLI、s3cmd 和 boto3 软件互操作"]
+fn s3_external_clients() {
+    let c = Cluster::start_s3_fixture("s3-clients");
+    let (owner, _) = c.wait_serving(None, 0);
+    let addresses = c.start_s3();
+    let via = if owner == 1 { 2 } else { 1 };
+    let python = std::env::var("TAPE_RS_S3_PYTHON").expect("TAPE_RS_S3_PYTHON");
+    let status = std::process::Command::new(python)
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/s3_clients.py"))
+        .arg(format!("http://{}", addresses[&via]))
+        .arg(tape_rs::daemon::s3::bucket_name("TEST-S3", POOL))
+        .status()
+        .unwrap();
+    c.shutdown();
+    assert!(status.success());
 }
