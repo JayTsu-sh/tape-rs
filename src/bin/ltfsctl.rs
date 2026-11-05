@@ -3,6 +3,9 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use tape_rs::client::Client;
 
+#[path = "ltfsctl/notify.rs"]
+mod notify;
+
 #[derive(Parser)]
 #[command(name = "ltfsctl", about = "ltfsd 客户端")]
 struct Args {
@@ -21,6 +24,11 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// FDB 持久通知订阅、显式确认和测试事件注入；需要 --library
+    Notify {
+        #[command(subcommand)]
+        cmd: notify::Command,
+    },
     /// 上传本地文件并等到落带（默认替换已有版本）
     Put {
         file: String,
@@ -228,6 +236,12 @@ fn main() {
             c = c.with_pool(pool.clone())?;
         }
         match args.cmd {
+            Cmd::Notify { cmd } => notify::run(
+                &tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?,
+                args.library.as_deref(),
+                args.pool.as_deref(),
+                cmd,
+            )?,
             Cmd::Put { file, path, new } => {
                 let local = std::path::Path::new(&file);
                 let len = std::fs::metadata(local)?.len();

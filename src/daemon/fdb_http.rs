@@ -24,11 +24,16 @@ use super::{
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+#[path = "fdb_http_notify.rs"]
+mod notify;
+
 #[derive(Clone)]
 struct Context {
     catalog: Arc<ManagedCatalog>,
     routes: BTreeMap<String, ActiveLibraryRoute>,
     owner: Option<OwnerReads>,
+    notify_streams: Arc<Semaphore>,
+    notify_requests: Arc<Semaphore>,
 }
 
 #[derive(Clone)]
@@ -290,6 +295,21 @@ fn metadata_router(ctx: Arc<Context>) -> Router {
         .route("/readyz", get(ready))
         .route("/v1/fdb/stat/{serial}", get(stat))
         .route("/v1/fdb/children/{serial}", get(children))
+        .route(
+            "/admin/notify/events/inject",
+            axum::routing::post(notify::inject),
+        )
+        .route("/admin/notify/consumers", get(notify::list))
+        .route(
+            "/admin/notify/consumers/{id}",
+            get(notify::show).put(notify::create).delete(notify::delete),
+        )
+        .route(
+            "/admin/notify/consumers/{id}/ack",
+            axum::routing::post(notify::ack),
+        )
+        .route("/admin/notify/consumers/{id}/events", get(notify::batch))
+        .route("/admin/notify/consumers/{id}/stream", get(notify::stream))
         .with_state(ctx)
 }
 
@@ -304,6 +324,8 @@ pub fn serve(
             catalog: Arc::new(catalog),
             routes,
             owner: None,
+            notify_streams: Arc::new(Semaphore::new(64)),
+            notify_requests: Arc::new(Semaphore::new(64)),
         })),
     )
 }
@@ -318,6 +340,8 @@ pub fn owner_router(
     let ctx = Arc::new(Context {
         catalog,
         routes,
+        notify_streams: Arc::new(Semaphore::new(64)),
+        notify_requests: Arc::new(Semaphore::new(64)),
         owner: Some(OwnerReads {
             libraries,
             peers,
@@ -662,3 +686,7 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "fdb_http_notify_tests.rs"]
+mod notify_tests;
