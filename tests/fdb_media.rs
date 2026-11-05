@@ -1638,8 +1638,8 @@ async fn simulated_media_commit() {
         baseline
     );
 
-    // The formal executor's FDB control mode must fence first, require the
-    // exact frozen Raft index, then advance the FDB owner epoch. It never
+    // The formal executor checks shared authority and the frozen index before
+    // fencing, then advances the FDB owner epoch only during recovery. It never
     // mounts, writes, or unloads this loaded simulated cartridge.
     let owner_catalog = Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());
     let owner_files = FileService::new(root.join("fdb-owner-spool")).unwrap();
@@ -1702,18 +1702,13 @@ async fn simulated_media_commit() {
     owner_tx.send(ExecRequest::Takeover { round: 10 }).unwrap();
     let first_event = next_owner_event(&event_rx);
     assert!(
-        matches!(&first_event, ExecEvent::Fenced { round: 10 }),
+        matches!(&first_event, ExecEvent::FenceFailed { round: 10, .. }),
         "{first_event:?}"
     );
-    assert!(owner_permission.renew(
+    assert!(!owner_permission.renew(
         10,
         Phase::Execution,
         Instant::now() + Duration::from_secs(120)
-    ));
-    owner_tx.send(ExecRequest::Recover { round: 10 }).unwrap();
-    assert!(matches!(
-        next_owner_event(&event_rx),
-        ExecEvent::Lost { round: 10, .. }
     ));
     assert_eq!(
         catalog.claim_active_owner_epoch(&serial, 11).await.unwrap(),

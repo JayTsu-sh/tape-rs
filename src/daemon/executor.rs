@@ -316,6 +316,10 @@ mod fdb_loading;
 #[path = "executor_fdb_observations.rs"]
 mod fdb_observations;
 
+#[cfg(feature = "fdb")]
+#[path = "executor_fdb_preflight.rs"]
+mod fdb_preflight;
+
 struct Active {
     #[cfg(feature = "fdb")]
     fdb_reads: std::collections::BTreeMap<usize, fdb_loading::Mount>,
@@ -978,13 +982,23 @@ pub fn run_fdb_owner(
                     });
                     continue;
                 }
-                match takeover(
-                    provider.as_ref(),
-                    &opts,
-                    round,
-                    permission.as_ref(),
-                    files.clone(),
-                ) {
+                let result = runtime
+                    .block_on(fdb_preflight::check(
+                        &control,
+                        permission.as_deref().expect("已检查多数派许可存在"),
+                        &status,
+                        round,
+                    ))
+                    .and_then(|()| {
+                        takeover(
+                            provider.as_ref(),
+                            &opts,
+                            round,
+                            permission.as_ref(),
+                            files.clone(),
+                        )
+                    });
+                match result {
                     Ok(owner) => {
                         active = Some(owner);
                         let _ = tx.send(ExecEvent::Fenced { round });
@@ -993,10 +1007,12 @@ pub fn run_fdb_owner(
                         if let Some(permit) = permission.as_ref() {
                             permit.close(round);
                         }
-                        let _ = tx.send(ExecEvent::FenceFailed {
-                            round,
-                            reason: error.to_string(),
-                        });
+                        let reason = format!(
+                            "库{} 节点{} 轮次{round} 接管未完成：{error}",
+                            control.serial, opts.node_id
+                        );
+                        warn!("{reason}");
+                        let _ = tx.send(ExecEvent::FenceFailed { round, reason });
                     }
                 }
             }
