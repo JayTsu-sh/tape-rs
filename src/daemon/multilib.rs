@@ -1471,6 +1471,8 @@ pub fn run(
         if pending.is_none() {
             advance_directories(&mut running, applied)?;
         }
+        // Directory jobs/fetches retain their own readiness barriers.
+        node.advance_apply_to(applied);
         for (id, r) in &mut running {
             let idle = directory_idle(r);
             r.runtime
@@ -1795,6 +1797,277 @@ mod tests {
     fn config() -> LibrariesConfig {
         LibrariesConfig::parse(&json!({"default_library":"a","libraries":[{"changer_serial":"b","drive_serials":["db"]},{"changer_serial":"a","drive_serials":["da"]}]})).unwrap()
     }
+    struct ApplyNetwork;
+    impl Network for ApplyNetwork {
+        fn send(&self, _: raft::eraftpb::Message) {}
+    }
+
+    fn ready_apply_node(
+        root: &Path,
+        commands: &[Vec<u8>],
+        applied: u64,
+    ) -> (RaftStore, RawNode<super::super::store::ControlStorage>) {
+        std::fs::create_dir_all(root).unwrap();
+        let mut store = RaftStore::open(&root.join("raft.db"), &[1, 2, 3]).unwrap();
+        let entries: Vec<_> = commands
+            .iter()
+            .enumerate()
+            .map(|(i, data)| raft::eraftpb::Entry {
+                index: i as u64 + 1,
+                term: 7,
+                data: data.clone().into(),
+                ..Default::default()
+            })
+            .collect();
+        store.append(&entries).unwrap();
+        store
+            .set_hardstate(&raft::eraftpb::HardState {
+                term: 7,
+                vote: 2,
+                commit: entries.len() as u64,
+                ..Default::default()
+            })
+            .unwrap();
+        let node = RawNode::new(
+            &Config {
+                id: 1,
+                applied,
+                ..Default::default()
+            },
+            store.raft_storage(),
+            &slog::Logger::root(slog::Discard, slog::o!()),
+        )
+        .unwrap();
+        (store, node)
+    }
+
+    #[test]
+    fn ready_apply_waits_for_multilib_controls_and_directories() {
+        let root = std::env::temp_dir().join(format!("multilib-apply-{}", uuid::Uuid::new_v4()));
+        let commands: Vec<_> = ["a", "b"]
+            .into_iter()
+            .map(|id| {
+                encode_command(
+                    id,
+                    &Command::PoolCreate {
+                        uuid: id.into(),
+                        name: id.into(),
+                        file_limit: 100,
+                    },
+                )
+            })
+            .collect();
+        let (mut store, mut node) = ready_apply_node(&root, &commands, 0);
+        let mut state = ClusterState::new(&config());
+        let mut running: BTreeMap<_, _> = ["a", "b"]
+            .into_iter()
+            .map(|id| (id.to_owned(), running(&root, id)))
+            .collect();
+        let (_, entries, _) = on_ready(&mut node, &mut store, &ApplyNetwork).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            node.raft.raft_log.applied, 0,
+            "多库 Ready 不得提前确认控制应用"
+        );
+        let mut applied = 0;
+        for entry in entries {
+            apply_entry(&mut state, &mut running, entry.index, &entry.data, true).unwrap();
+            applied = entry.index;
+            assert!(node.raft.raft_log.applied < applied);
+        }
+        advance_directories(&mut running, applied).unwrap();
+        node.advance_apply_to(applied);
+        assert_eq!(node.raft.raft_log.applied, 2);
+        for r in running.values() {
+            assert_eq!(r.directory.as_ref().unwrap().applied_index(), 2);
+            assert_eq!(r.directory.as_ref().unwrap().pools().unwrap().len(), 1);
+        }
+        drop((running, node, store));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ready_apply_multilib_snapshot_does_not_claim_directory_catchup() {
+        let root =
+            std::env::temp_dir().join(format!("multilib-snapshot-apply-{}", uuid::Uuid::new_v4()));
+        let (mut store, mut node) = ready_apply_node(&root, &[], 0);
+        let state = ClusterState::new(&config());
+        let mut snapshot = raft::eraftpb::Snapshot::default();
+        snapshot.mut_metadata().index = 50;
+        snapshot.mut_metadata().term = 7;
+        snapshot
+            .mut_metadata()
+            .set_conf_state(raft::eraftpb::ConfState::from((vec![1, 2, 3], vec![])));
+        snapshot.set_data(state.snapshot(2, 50).into());
+        let mut message = raft::eraftpb::Message {
+            msg_type: raft::eraftpb::MessageType::MsgSnapshot,
+            from: 2,
+            to: 1,
+            term: 8,
+            ..Default::default()
+        };
+        message.set_snapshot(snapshot);
+        node.step(message).unwrap();
+        let (snapshot, entries, _) = on_ready(&mut node, &mut store, &ApplyNetwork).unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(node.raft.raft_log.applied, 0, "多库控制快照须先恢复再确认");
+        let snapshot = snapshot.unwrap();
+        let (_, source, directory_index) =
+            ClusterState::restore(&config(), snapshot.get_data()).unwrap();
+        let running: BTreeMap<_, _> = ["a", "b"]
+            .into_iter()
+            .map(|id| (id.to_owned(), running(&root, id)))
+            .collect();
+        let pending = Some((source, directory_index));
+        node.advance_apply_to(snapshot.get_metadata().index);
+        assert_eq!(node.raft.raft_log.applied, 50);
+        assert_eq!(pending, Some((2, 50)));
+        assert!(
+            running
+                .values()
+                .all(|r| r.directory.as_ref().unwrap().applied_index() == 0)
+        );
+        drop((running, node, store));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ready_apply_multilib_tracks_control_separately_from_a_blocked_catalog_job() {
+        let root =
+            std::env::temp_dir().join(format!("multilib-job-apply-{}", uuid::Uuid::new_v4()));
+        let commands = vec![
+            encode_command(
+                "b",
+                &Command::PoolCreate {
+                    uuid: "p".into(),
+                    name: "p".into(),
+                    file_limit: 100,
+                },
+            ),
+            encode_command(
+                "b",
+                &Command::TapeAssign {
+                    barcode: "T".into(),
+                    pool: "p".into(),
+                },
+            ),
+            encode_command(
+                "b",
+                &Command::CatalogPart {
+                    barcode: "T".into(),
+                    generation: 1,
+                    part: 0,
+                    files: (0..4097)
+                        .map(|i| FileRec {
+                            path: format!("/{i}"),
+                            length: 1,
+                            sha256: String::new(),
+                            version: (0, 0),
+                            deleted: false,
+                            metadata: json!({}),
+                        })
+                        .collect(),
+                },
+            ),
+        ];
+        let (mut store, mut node) = ready_apply_node(&root, &commands, 3);
+        let mut state = ClusterState::new(&config());
+        let mut running: BTreeMap<_, _> = ["a", "b"]
+            .into_iter()
+            .map(|id| (id.to_owned(), running(&root, id)))
+            .collect();
+        for (i, data) in commands.iter().enumerate() {
+            apply_entry(&mut state, &mut running, i as u64 + 1, data, true).unwrap();
+        }
+        let blocker = rusqlite::Connection::open(root.join("b.db")).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let commands = [
+            encode_command(
+                "b",
+                &Command::TapeCommitted {
+                    barcode: "T".into(),
+                    volume_uuid: "v".into(),
+                    generation: 1,
+                    files: 4097,
+                    bytes_used: 4097,
+                    bytes_written: 4097,
+                    parts: 1,
+                    full: true,
+                },
+            ),
+            encode_command(
+                "b",
+                &Command::PoolCreate {
+                    uuid: "queued".into(),
+                    name: "queued".into(),
+                    file_limit: 100,
+                },
+            ),
+            encode_command(
+                "a",
+                &Command::PoolCreate {
+                    uuid: "other".into(),
+                    name: "other".into(),
+                    file_limit: 100,
+                },
+            ),
+        ];
+        let mut message = raft::eraftpb::Message {
+            msg_type: raft::eraftpb::MessageType::MsgAppend,
+            from: 2,
+            to: 1,
+            term: 8,
+            index: 3,
+            log_term: 7,
+            commit: 6,
+            ..Default::default()
+        };
+        message.set_entries(
+            commands
+                .into_iter()
+                .enumerate()
+                .map(|(i, data)| raft::eraftpb::Entry {
+                    index: i as u64 + 4,
+                    term: 8,
+                    data: data.into(),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>()
+                .into(),
+        );
+        node.step(message).unwrap();
+        let (_, entries, _) = on_ready(&mut node, &mut store, &ApplyNetwork).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            node.raft.raft_log.applied, 3,
+            "后台目录任务不能让 Ready 提前确认控制应用"
+        );
+        for entry in entries {
+            apply_entry(&mut state, &mut running, entry.index, &entry.data, true).unwrap();
+        }
+        advance_directories(&mut running, 6).unwrap();
+        node.advance_apply_to(6);
+        assert_eq!(node.raft.raft_log.applied, 6);
+        assert_eq!(state.controls["b"].applied_index, 5);
+        assert_eq!(state.controls["a"].applied_index, 6);
+        assert!(running["b"].catalog_job.is_some());
+        assert!(!directory_idle(&running["b"]));
+        assert_eq!(Directory::applied_index_of(&root.join("b.db")).unwrap(), 3);
+        assert_eq!(running["a"].directory.as_ref().unwrap().applied_index(), 6);
+        blocker.execute_batch("COMMIT").unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while !running.values().all(directory_idle) {
+            poll_directories(&mut running).unwrap();
+            advance_directories(&mut running, 6).unwrap();
+            assert!(Instant::now() < until);
+            std::thread::yield_now();
+        }
+        assert_eq!(running["b"].directory.as_ref().unwrap().applied_index(), 6);
+        assert_eq!(node.raft.raft_log.applied, 6);
+        drop((blocker, running, node, store));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn changer_fc_port_is_canonical_and_cannot_change_through_offline_edits() {
         let value = json!({"default_library":"A", "libraries":[{
