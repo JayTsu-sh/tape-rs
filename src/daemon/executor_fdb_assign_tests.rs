@@ -22,6 +22,8 @@ struct Faults {
     format_inflight: AtomicBool,
     release_format: AtomicBool,
     worker: Mutex<Option<std::thread::JoinHandle<Result<ScsiResult>>>>,
+    fail_index_reads: AtomicBool,
+    index_region: AtomicBool,
 }
 struct Trace {
     inner: Arc<SimTransport>,
@@ -61,6 +63,17 @@ impl TapeTransport for Trace {
                 device: self.inner.identity().into(),
             });
         }
+        if self.drive {
+            if cdb[0] == opcode::LOCATE_16 {
+                self.faults.index_region.store(
+                    u64::from_be_bytes(cdb[4..12].try_into().unwrap()) >= 5,
+                    Ordering::SeqCst,
+                );
+            }
+            if cdb[0] == opcode::SPACE_6 {
+                self.faults.index_region.store(true, Ordering::SeqCst);
+            }
+        }
         let r = self.inner.execute_no_data(cdb, timeout)?;
         self.faults.successful.lock().unwrap().push(cdb.to_vec());
         if cdb[0] == opcode::FORMAT_MEDIUM && self.faults.drop_format.swap(false, Ordering::SeqCst)
@@ -78,7 +91,15 @@ impl TapeTransport for Trace {
         Ok(r)
     }
     fn execute_read(&self, cdb: &[u8], buf: &mut [u8], timeout: u32) -> Result<ScsiResult> {
-        self.inner.execute_read(cdb, buf, timeout)
+        let result = self.inner.execute_read(cdb, buf, timeout)?;
+        if self.drive
+            && cdb[0] == opcode::READ_6
+            && self.faults.fail_index_reads.load(Ordering::SeqCst)
+            && self.faults.index_region.load(Ordering::SeqCst)
+        {
+            return Err(TapeError::ScsiHost(3));
+        }
+        Ok(result)
     }
     fn execute_write(&self, cdb: &[u8], buf: &[u8], timeout: u32) -> Result<ScsiResult> {
         let r = self.inner.execute_write(cdb, buf, timeout)?;
@@ -140,7 +161,7 @@ fn assignment_format_unknown_keeps_original_uuid_without_reformatting() {
         .build()
         .unwrap();
     let catalog = Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());
-    for case in 0..6 {
+    for case in 0..8 {
         let ns = Uuid::new_v4();
         let serial = format!("ASSIGN-FAULT-{ns}");
         let challenge = Uuid::new_v4();
@@ -160,12 +181,40 @@ fn assignment_format_unknown_keeps_original_uuid_without_reformatting() {
         };
         let lib = SimLibrary::new(1, 3, 1);
         lib.enable_changer_pr();
-        lib.insert_cartridge(SimCartridge::blank("TEST01L8", 1 << 20), 0)
+        let mut cartridge = SimCartridge::blank("TEST01L8", 1 << 20);
+        if case == 6 {
+            use crate::scsi::sim::LogicalObject::{Filemark, Record};
+            cartridge.partitions[0].objects = vec![
+                Record(crate::ltfs::label::Vol1Label::encode("TEST01", "").to_vec()),
+                Filemark,
+                Record(b"<invalid-label/>".to_vec()),
+                Filemark,
+            ];
+            cartridge.partitions[0].flushed = 4;
+        }
+        lib.insert_cartridge(cartridge, 0).unwrap();
+        if case == 7 {
+            lib.load_into_drive("TEST01L8", 0).unwrap();
+            crate::ltfs::mkltfs::mkltfs(
+                &lib.drive(0),
+                &crate::ltfs::mkltfs::MkltfsOptions::default(),
+            )
             .unwrap();
+            TapeDrive::new(&lib.drive(0)).unload().unwrap();
+            let transport = lib.changer();
+            let mut changer = MediumChanger::new(&transport);
+            let map = changer.load_address_map().unwrap().clone();
+            changer
+                .move_medium(map.dt_start, map.storage_start)
+                .unwrap();
+        }
         let root = std::env::temp_dir().join(format!("tapers-assign-fault-{ns}"));
         let files = FileService::new(root.join("spool")).unwrap();
         let permission = Arc::new(Permission::default());
         let faults = Arc::new(Faults::default());
+        if case == 7 {
+            faults.fail_index_reads.store(true, Ordering::SeqCst);
+        }
         let provider = Provider {
             library: lib.clone(),
             serial: serial.clone(),
@@ -218,6 +267,67 @@ fn assignment_format_unknown_keeps_original_uuid_without_reformatting() {
             .unwrap();
         let mut job = Job::new(request.clone(), &queued).unwrap();
         let mut publisher = Publisher::default();
+        if case >= 6 {
+            let mut terminal = false;
+            for _ in 0..16 {
+                let result = job.poll(context(), &mut publisher, &runtime).unwrap();
+                if matches!(result, Publication::Confirmed(true)) {
+                    terminal = true;
+                    break;
+                }
+            }
+            if case == 7 && job.diagnostic.is_some() {
+                let _ = job.poll(context(), &mut publisher, &runtime).unwrap();
+            }
+            let task = saved(context(), &runtime, &request);
+            if case == 6 {
+                assert!(
+                    terminal && task["status"] == "failed",
+                    "confirmed bad LTFS label must reject before FORMAT rather than remain running: {task}"
+                );
+                assert_eq!(task["execution"]["phase"], "inspecting");
+                assert_eq!(task["result"]["effects"], "loaded_not_formatted");
+                runtime
+                    .block_on(catalog.require_active_library_readable(&serial, route, round))
+                    .unwrap();
+            } else {
+                assert!(
+                    !terminal && task["status"] == "running",
+                    "transport uncertainty swallowed by recovery is not a confirmed format restriction: {task}"
+                );
+                assert_eq!(task["execution"]["phase"], "inspecting");
+                assert!(
+                    task["execution"]["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("SCSI host error"),
+                    "original transport diagnostic must survive: {task}"
+                );
+                assert!(
+                    runtime
+                        .block_on(catalog.require_active_library_readable(&serial, route, round))
+                        .is_err()
+                );
+            }
+            assert!(
+                runtime
+                    .block_on(catalog.tape_assignment(&serial, "TEST01L8"))
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                faults
+                    .successful
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|c| c[0] == opcode::FORMAT_MEDIUM)
+                    .count(),
+                0
+            );
+            std::fs::remove_dir_all(root).unwrap();
+            continue;
+        }
         if case == 0 {
             let snapshot = Snapshot::capture(&context()).unwrap();
             let original_plan = plan(&snapshot, &request, pool.revision, &status).unwrap();
@@ -338,6 +448,7 @@ fn assignment_format_unknown_keeps_original_uuid_without_reformatting() {
                 inner: active.devices[1].dev.as_ref(),
                 permanent: &Cell::new(false),
                 drive_serial: "SIMDRV0000",
+                probe_fault: None,
             };
             assert!(TapeDrive::new(&never).format(1, false).is_err());
             assert_eq!(

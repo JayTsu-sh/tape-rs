@@ -11,7 +11,7 @@ use crate::managed_catalog::{
 };
 use crate::scsi::device::ScsiResult;
 use serde_json::Value;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 fn refused(detail: impl Into<String>) -> TapeError {
     TapeError::Refused {
@@ -32,6 +32,18 @@ fn all_partitions_blank(device: &dyn TapeTransport) -> Result<bool> {
         }
     }
     Ok(true)
+}
+fn nonforce_empty(device: &dyn TapeTransport) -> Result<bool> {
+    match crate::ltfs::volume::probe_format(device)? {
+        crate::ltfs::volume::FormatProbe::Blank => all_partitions_blank(device),
+        crate::ltfs::volume::FormatProbe::Ltfs => {
+            let volume = crate::ltfs::volume::LtfsVolume::mount(device)?;
+            Ok(volume.writable()
+                && volume.index().root.files.is_empty()
+                && volume.index().root.subdirs.is_empty())
+        }
+        crate::ltfs::volume::FormatProbe::Foreign(_) => Ok(false),
+    }
 }
 /// Assignment proves the exact format it requested. Ordinary mount reads only
 /// the IP label; that alone cannot certify a newly formatted two-partition volume.
@@ -212,6 +224,7 @@ fn send_move(
         inner: changer.dev.as_ref(),
         permanent,
         drive_serial: p.drive.drive_serial.as_deref().expect("drive serial"),
+        probe_fault: None,
     };
     let mut changer = MediumChanger::new(&guard);
     if changer.load_address_map()? != &p.map {
@@ -232,8 +245,53 @@ struct CommandGuard<'a> {
     inner: &'a dyn TapeTransport,
     permanent: &'a Cell<bool>,
     drive_serial: &'a str,
+    probe_fault: Option<&'a RefCell<Option<ProbeFault>>>,
+}
+struct ProbeFault {
+    detail: String,
+    lost: bool,
 }
 impl CommandGuard<'_> {
+    fn record_fault(&self, error: &TapeError, guard_failed: bool) {
+        let completed = matches!(error, TapeError::ScsiCommand {status:2,sense_key,..}
+            if !matches!(sense_key,2|6|0x0b));
+        if !guard_failed && completed {
+            return;
+        }
+        if let Some(cell) = self.probe_fault {
+            let mut fault = cell.borrow_mut();
+            let lost = ownership_lost(error);
+            if fault.is_none() || lost {
+                *fault = Some(ProbeFault {
+                    detail: error.to_string(),
+                    lost,
+                });
+            }
+        }
+    }
+    fn invoke(&self, operation: impl FnOnce() -> Result<ScsiResult>) -> Result<ScsiResult> {
+        if let Some(cell) = self.probe_fault
+            && let Some(fault) = cell.borrow().as_ref()
+        {
+            return Err(if fault.lost {
+                self.context.lost(fault.detail.clone())
+            } else {
+                refused(format!(
+                    "本次只读检查已中断，保留原结果核对：{}",
+                    fault.detail
+                ))
+            });
+        }
+        if let Err(error) = self.check() {
+            self.record_fault(&error, true);
+            return Err(error);
+        }
+        let result = operation();
+        if let Err(error) = &result {
+            self.record_fault(error, false);
+        }
+        result
+    }
     fn check(&self) -> Result<()> {
         match publish(
             &self.context,
@@ -292,16 +350,13 @@ impl TapeTransport for CommandGuard<'_> {
         self.inner.session_epoch()
     }
     fn execute_no_data(&self, cdb: &[u8], timeout: u32) -> Result<ScsiResult> {
-        self.check()?;
-        self.inner.execute_no_data(cdb, timeout)
+        self.invoke(|| self.inner.execute_no_data(cdb, timeout))
     }
     fn execute_read(&self, cdb: &[u8], buf: &mut [u8], timeout: u32) -> Result<ScsiResult> {
-        self.check()?;
-        self.inner.execute_read(cdb, buf, timeout)
+        self.invoke(|| self.inner.execute_read(cdb, buf, timeout))
     }
     fn execute_write(&self, cdb: &[u8], buf: &[u8], timeout: u32) -> Result<ScsiResult> {
-        self.check()?;
-        self.inner.execute_write(cdb, buf, timeout)
+        self.invoke(|| self.inner.execute_write(cdb, buf, timeout))
     }
 }
 
@@ -595,6 +650,7 @@ impl Job {
                 inner,
                 permanent: &self.permanent,
                 drive_serial: &context.active.devices[drive].serial,
+                probe_fault: None,
             };
             if let Err(error) = TapeDrive::new(&guard).test_unit_ready() {
                 if ownership_lost(&error) {
@@ -620,6 +676,7 @@ impl Job {
             }));
         }
         if phase == AssignPhase::Inspecting {
+            let probe_fault = RefCell::new(None);
             let guard = CommandGuard {
                 context,
                 runtime,
@@ -628,21 +685,32 @@ impl Job {
                 inner,
                 permanent: &self.permanent,
                 drive_serial: &context.active.devices[drive].serial,
+                probe_fault: Some(&probe_fault),
             };
             if TapeDrive::new(&guard).write_protected()? {
                 self.reject = Some("磁带被写保护，未开始格式化".into());
                 return Ok(Publication::Confirmed(false));
             }
             if self.request.value()["change"]["force_format"] != true {
-                let safe = match crate::ltfs::volume::probe_format(&guard)? {
-                    crate::ltfs::volume::FormatProbe::Blank => all_partitions_blank(&guard)?,
-                    crate::ltfs::volume::FormatProbe::Ltfs => {
-                        let volume = crate::ltfs::volume::LtfsVolume::mount(&guard)?;
-                        volume.writable()
-                            && volume.index().root.files.is_empty()
-                            && volume.index().root.subdirs.is_empty()
+                let result = nonforce_empty(&guard);
+                // Recovery may deliberately fall back after a failed read. A
+                // transport/authority failure is never proof of invalid media,
+                // even when that fallback returns a semantic error or a view.
+                if let Some(fault) = probe_fault.into_inner() {
+                    return Err(if fault.lost {
+                        context.lost(fault.detail)
+                    } else {
+                        refused(format!("非强制索引检查结果未确认：{}", fault.detail))
+                    });
+                }
+                let safe = match result {
+                    Ok(safe) => safe,
+                    Err(error) => {
+                        self.reject = Some(bounded_error(&format!(
+                            "非强制检查已完成，LTFS标签或索引不可读：{error}；未开始格式化"
+                        )));
+                        return Ok(Publication::Confirmed(false));
                     }
-                    _ => false,
                 };
                 if !safe {
                     self.reject=Some("磁带包含文件对象、非LTFS数据或受限索引；保留数据请用tape import，确认清除须--force-format".into());
@@ -668,6 +736,7 @@ impl Job {
                 inner,
                 permanent: &self.permanent,
                 drive_serial: &context.active.devices[drive].serial,
+                probe_fault: None,
             };
             let expected = uuid::Uuid::parse_str(
                 self.request.value()["change"]["volume"]
