@@ -232,13 +232,12 @@ pub(super) fn quiesce(a: &mut Active, files: &FileService, tx: &Sender<ExecEvent
 }
 
 fn elements(
-    a: &Active,
+    devices: &[ManagedDevice],
 ) -> Result<(
     crate::changer::element::ElementAddressMap,
     Vec<crate::changer::element::ElementStatus>,
 )> {
-    let changer = a
-        .devices
+    let changer = devices
         .iter()
         .find(|d| d.kind == DeviceKind::Changer)
         .ok_or_else(|| error("没有换带器"))?;
@@ -248,12 +247,17 @@ fn elements(
     Ok((map, rows))
 }
 fn observe(a: &Active, opts: &ExecOptions) -> Result<Value> {
-    let (map, rows) = elements(a)?;
+    observe_devices(&a.devices, opts.node_id, a.round)
+}
+
+fn observe_devices(devices: &[ManagedDevice], node: u8, round: u64) -> Result<Value> {
+    let (map, rows) = elements(devices)?;
     let volumes:Vec<Value>=rows.iter().filter(|e|e.full && e.volume_tag.is_some()).map(|e|json!({"barcode":e.volume_tag,"address":e.address,"element_type":e.element_type as u8,"medium_type":e.medium_type,"source_address":e.source_address,"home_slot":e.address.checked_sub(map.storage_start).filter(|s|*s<map.storage_count).map(|s|u32::from(s)+1)})).collect();
-    let inv = inventory(&a.devices)?;
-    let drives:Vec<Value>=inv.drives.iter().map(|d|json!({"serial":a.devices[d.dev].serial,"address":d.addr,"barcode":d.loaded.as_ref().map(|l|&l.0)})).collect();
+    // Keep both projections tied to the same READ ELEMENT STATUS reply.
+    let inv = inventory_elements(devices, &rows, false)?;
+    let drives:Vec<Value>=inv.drives.iter().map(|d|json!({"serial":devices[d.dev].serial,"address":d.addr,"barcode":d.loaded.as_ref().map(|l|&l.0)})).collect();
     Ok(
-        json!({"library_serial":a.devices.iter().find(|d|d.kind==DeviceKind::Changer).map(|d|&d.serial),"owner":opts.node_id,"round":a.round,"observed_at":crate::ltfs::label::ltfs_time_now(),"volumes":volumes,"drives":drives}),
+        json!({"library_serial":devices.iter().find(|d|d.kind==DeviceKind::Changer).map(|d|&d.serial),"owner":node,"round":round,"observed_at":crate::ltfs::label::ltfs_time_now(),"volumes":volumes,"drives":drives}),
     )
 }
 
@@ -347,7 +351,7 @@ pub(super) fn execute(
         }
         return Ok(json!({"node":target,"scope":"cluster_scheduling_policy"}));
     }
-    let (map, rows) = elements(a)?;
+    let (map, rows) = elements(&a.devices)?;
     let entry = rows
         .iter()
         .find(|e| e.full && e.volume_tag.as_deref() == Some(target))
@@ -588,6 +592,116 @@ pub(super) fn execute(
         (Err(e), Ok(())) => Err(e),
         (Ok(_), Err(e)) => Err(error(format!("维护收尾失败，须核实库存和预留: {e}"))),
         (Err(e), Err(cleanup)) => Err(error(format!("{e}；收尾失败: {cleanup}"))),
+    }
+}
+
+#[cfg(test)]
+mod inventory_tests {
+    use super::*;
+    use crate::scsi::{
+        cdb::opcode,
+        device::ScsiResult,
+        sim::{Fault, FaultAction, SimCartridge, SimLibrary, SimTransport},
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Changer {
+        inner: SimTransport,
+        library: SimLibrary,
+        reads: Arc<AtomicUsize>,
+        move_after_read: bool,
+    }
+
+    impl TapeTransport for Changer {
+        fn identity(&self) -> &str {
+            self.inner.identity()
+        }
+        fn execute_no_data(&self, _: &[u8], _: u32) -> Result<ScsiResult> {
+            panic!("库存观测不能移动或改变设备")
+        }
+        fn execute_write(&self, _: &[u8], _: &[u8], _: u32) -> Result<ScsiResult> {
+            panic!("库存观测不能写入")
+        }
+        fn execute_read(&self, cdb: &[u8], out: &mut [u8], timeout: u32) -> Result<ScsiResult> {
+            let first = cdb[0] == opcode::READ_ELEMENT_STATUS
+                && self.reads.fetch_add(1, Ordering::SeqCst) == 0;
+            let result = self.inner.execute_read(cdb, out, timeout)?;
+            if first && self.move_after_read {
+                // Model an external position change immediately after the reply.
+                self.library.load_into_drive("TEST01L8", 0)?;
+            }
+            Ok(result)
+        }
+    }
+
+    fn devices(
+        library: &SimLibrary,
+        reads: &Arc<AtomicUsize>,
+        changer: SimTransport,
+        move_after_read: bool,
+    ) -> Vec<ManagedDevice> {
+        vec![
+            ManagedDevice {
+                name: "changer".into(),
+                serial: "SIMLIB0000000001".into(),
+                kind: DeviceKind::Changer,
+                dev: Box::new(Changer {
+                    inner: changer,
+                    library: library.clone(),
+                    reads: reads.clone(),
+                    move_after_read,
+                }),
+            },
+            ManagedDevice {
+                name: "drive".into(),
+                serial: "SIMDRV0000".into(),
+                kind: DeviceKind::Drive,
+                dev: Box::new(library.drive(0)),
+            },
+        ]
+    }
+
+    #[test]
+    fn observation_does_not_mix_positions_from_different_reads() {
+        let library = SimLibrary::new(1, 2, 0);
+        library
+            .insert_cartridge(SimCartridge::blank("TEST01L8", 1 << 20), 0)
+            .unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let devices = devices(&library, &reads, library.changer(), true);
+        let first = observe_devices(&devices, 2, 100).unwrap();
+        assert_eq!(library.loaded_barcode(0).as_deref(), Some("TEST01L8"));
+        assert_eq!(first["volumes"][0]["element_type"], 2);
+        assert!(first["drives"][0]["barcode"].is_null());
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(first["owner"], 2);
+        assert_eq!(first["round"], 100);
+
+        let next = observe_devices(&devices, 2, 100).unwrap();
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_eq!(next["volumes"][0]["element_type"], 4);
+        assert_eq!(next["volumes"][0]["barcode"], "TEST01L8");
+        assert_eq!(next["drives"][0]["barcode"], "TEST01L8");
+        assert_eq!(next["volumes"][0]["address"], next["drives"][0]["address"]);
+    }
+
+    #[test]
+    fn failed_inventory_read_does_not_publish_an_empty_observation() {
+        let library = SimLibrary::new(1, 2, 0);
+        let changer = library.changer();
+        changer.inject(Fault {
+            opcode: opcode::READ_ELEMENT_STATUS,
+            action: FaultAction::HostError(7),
+            after: 0,
+            remaining: 1,
+        });
+        let reads = Arc::new(AtomicUsize::new(0));
+        let devices = devices(&library, &reads, changer, false);
+        assert!(matches!(
+            observe_devices(&devices, 2, 100),
+            Err(TapeError::ScsiHost { .. })
+        ));
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
     }
 }
 
