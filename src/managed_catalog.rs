@@ -110,6 +110,8 @@ pub enum CatalogError {
     Incomplete,
     #[error("池或带库正在执行互斥操作")]
     PoolBusy,
+    #[error("管理任务队列已满，请稍后重试")]
+    ManagementQueueFull,
     #[error("目录维护任务已被新的执行者接管")]
     MaintenanceFenced,
     #[error("带库 owner 已由新的执行轮次接管")]
