@@ -581,6 +581,8 @@ mod removed_management_tests {
         assert!(
             Args::try_parse_from([
                 "ltfsctl",
+                "-e",
+                "127.0.0.1:7411",
                 "--library",
                 "LIB1",
                 "tape",
@@ -593,6 +595,8 @@ mod removed_management_tests {
         assert!(
             Args::try_parse_from([
                 "ltfsctl",
+                "-e",
+                "127.0.0.1:7411",
                 "--library",
                 "LIB1",
                 "tape",
@@ -607,6 +611,8 @@ mod removed_management_tests {
         assert!(
             Args::try_parse_from([
                 "ltfsctl",
+                "-e",
+                "127.0.0.1:7411",
                 "--library",
                 "LIB1",
                 "tape",
