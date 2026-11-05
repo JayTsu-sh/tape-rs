@@ -1232,6 +1232,55 @@ impl Client {
         }
     }
 
+    /// 向一个明确物理节点直接读取空目录屏障；不跟随 Leader，也不自动重试。
+    pub fn native_library_barrier(&self, challenge: uuid::Uuid) -> Result<Value> {
+        let invalid = || {
+            ClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "屏障查询须指定一个物理IP:port端点、--library、非nil challenge，且不能选pool",
+            ))
+        };
+        let serial = self.library.as_deref().ok_or_else(invalid)?;
+        if self.endpoints.len() != 1
+            || self.pool.is_some()
+            || challenge.is_nil()
+            || self.endpoints[0].parse::<std::net::SocketAddr>().is_err()
+        {
+            return Err(invalid());
+        }
+        let endpoint = &self.endpoints[0];
+        let reply = self
+            .request(
+                endpoint,
+                "GET",
+                &format!("/admin/catalog/current/native-barrier?challenge={challenge}"),
+                None,
+            )
+            .map_err(|(_, error)| ClientError::Io(error))?;
+        if reply.status != 200 {
+            return Err(ClientError::Rejected {
+                status: reply.status,
+                body: String::from_utf8_lossy(&reply.body).into_owned(),
+            });
+        }
+        let value = reply.json();
+        let id = value["node_id"]
+            .as_u64()
+            .filter(|id| (1..=255).contains(id));
+        if value["version"] != 1
+            || value["library_serial"] != serial
+            || value["challenge"] != challenge.to_string()
+            || id.is_none_or(|id| {
+                value["members"][id.to_string()].as_str() != Some(endpoint.as_str())
+            })
+        {
+            return Err(ClientError::Verification(
+                "屏障响应来源与指定节点、带库或challenge不符".into(),
+            ));
+        }
+        Ok(value)
+    }
+
     /// 提交一条集群管理命令。返回值中的任务号需再用 `/admin/tasks/<id>` 查询终态。
     pub fn admin_request(&mut self, method: &str, route: &str, body: Value) -> Result<Value> {
         if !route.starts_with("/admin/") || !matches!(method, "POST" | "PATCH" | "DELETE") {
@@ -2156,6 +2205,79 @@ mod tests {
             server.join().unwrap();
             assert_eq!(
                 second.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
+    #[test]
+    fn native_barrier_client_requires_exact_scope_and_never_follows_leader() {
+        use std::net::TcpListener;
+        let challenge = uuid::Uuid::new_v4();
+        for c in [
+            Client::new(["127.0.0.1:1"]),
+            Client::new(["127.0.0.1:1", "127.0.0.1:2"])
+                .with_library("B")
+                .unwrap(),
+            Client::new(["127.0.0.1:1"])
+                .with_library("B")
+                .unwrap()
+                .with_pool("P")
+                .unwrap(),
+        ] {
+            assert!(matches!(
+                c.native_library_barrier(challenge),
+                Err(ClientError::Io(_))
+            ));
+        }
+        for case in 0..5 {
+            let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = socket.local_addr().unwrap().to_string();
+            let target = TcpListener::bind("127.0.0.1:0").unwrap();
+            target.set_nonblocking(true).unwrap();
+            let other = target.local_addr().unwrap().to_string();
+            let endpoint = addr.clone();
+            let server = std::thread::spawn(move || {
+                let (mut conn, _) = socket.accept().unwrap();
+                let mut line = String::new();
+                let mut reader = BufReader::new(conn.try_clone().unwrap());
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(
+                    line,
+                    format!(
+                        "GET /libraries/B/admin/catalog/current/native-barrier?challenge={challenge} HTTP/1.1\r\n"
+                    )
+                );
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header == "\r\n" {
+                        break;
+                    }
+                }
+                let mut body = serde_json::json!({"version":1,"node_id":2,"library_serial":"B","challenge":challenge.to_string(),"members":{"2":endpoint}});
+                match case {
+                    1 => body["library_serial"] = serde_json::json!("A"),
+                    2 => body["challenge"] = serde_json::json!(uuid::Uuid::new_v4().to_string()),
+                    3 => body["members"]["2"] = serde_json::json!(other),
+                    _ => {}
+                }
+                let code = if case == 4 { 503 } else { 200 };
+                if case == 4 {
+                    body = serde_json::json!({"leader":other});
+                }
+                let body = body.to_string();
+                write!(conn,"HTTP/1.1 {code} Result\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            });
+            let c = Client::new([addr]).with_library("B").unwrap();
+            let result = c.native_library_barrier(challenge);
+            if case == 0 {
+                assert!(result.is_ok())
+            } else {
+                assert!(result.is_err())
+            }
+            server.join().unwrap();
+            assert_eq!(
+                target.accept().unwrap_err().kind(),
                 std::io::ErrorKind::WouldBlock
             );
         }

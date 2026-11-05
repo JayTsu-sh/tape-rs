@@ -63,7 +63,7 @@ LTFS 属性上传时为修改时间和允许的 S3 响应头创建不可变的�
 
 FDB 节点记录使用带 `N1` 标识的格式。目录必须持久保存非零的 `directory_version` 属性修订号，文件不使用该字段而继续由 `FileHead.version` 管理版本；目录内容仍由路径和范围冲突保护。命名空间摘要会绑定目录属性修订号，修改修订号即改变校验证明。无版本旧节点、目录零修订号或文件携带目录修订号均拒绝，不自动回填；本批提供后续目录属性变更和池根元数据的基础，未新增属性修改命令。
 
-原生空带库的 FDB 初始化存储入口为 `verify_native_barriers` 和 `ManagedCatalog::initialize_native_library`。每条屏障回复必须包含与目标带库匹配的 `library_serial`，缺失、错库或混用其他库的回复一律拒绝。调用方必须从三个已配置节点直接取得同一 challenge、term、leader、成员集合及冻结水位的屏障回复，确认执行器停止、目录无待提交状态且为空。初始化只接受未使用的 namespace，在一个事务内创建根、布局、请求窗口、路由与来源证书；遇到已有准备路由、证书或活动权威时拒绝覆盖，原成功请求重试只能返回已校验的结果，不能重置 owner。证书显式区分原生初始化（N）和目录导入（I），拒绝旧的无来源前缀证书。此接口不发设备命令，也不授予 Raft/PR 设备执行许可；CLI/HTTP 的屏障采集及管理接入仍需后续闭合。
+原生空带库的 FDB 初始化存储入口为 `verify_native_barriers` 和 `ManagedCatalog::initialize_native_library`。每条屏障回复必须包含与目标带库匹配的 `library_serial`，缺失、错库或混用其他库的回复一律拒绝。调用方必须从三个已配置节点直接取得同一 challenge、term、leader、成员集合及冻结水位的屏障回复，确认执行器停止、目录无待提交状态且为空。初始化只接受未使用的 namespace，在一个事务内创建根、布局、请求窗口、路由与来源证书；遇到已有准备路由、证书或活动权威时拒绝覆盖，原成功请求重试只能返回已校验的结果，不能重置 owner。证书显式区分原生初始化（N）和目录导入（I），拒绝旧的无来源前缀证书。此接口不发设备命令，也不授予 Raft/PR 设备执行许可；屏障采集现支持下述CLI/HTTP入口；将三份证明交给初始化存储方法的CLI/HTTP管理写入入口仍待闭合。
 
 管理请求的公共解码入口为 `ManagementRequest::parse`，固定包含 version、library、namespace、epoch、operation 和 change，总编码上限 4096 字节；UUID 必须非零且为规范形式，epoch 必须非零。change 严格按动作核对字段、目标身份和修订号：支持 library-rescan、pool/pool-delete、drive、tape 策略及 media-import/move/assign/unassign/validate/online 请求结构，拒绝 nodegroup、reconcile 和未知动作。池名、介质限制与创建记录共用校验规则；格式化分配必须显式确认，导入路径同时检查合并和按条码展开后的长度。
 

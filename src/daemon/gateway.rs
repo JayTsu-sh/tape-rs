@@ -18,6 +18,8 @@ use tokio::sync::Semaphore;
 use super::http::{self, HttpContext};
 use super::multilib::LibrariesConfig;
 
+mod native_barrier;
+
 const HOP: &str = "x-tapers-forwarded";
 
 #[derive(Clone)]
@@ -126,6 +128,9 @@ async fn dispatch(State(g): State<Gateway>, mut req: Request) -> Response {
     };
     let id = &library.changer_serial;
     let ctx = g.libraries[&library.changer_serial].clone();
+    if local_path == "/admin/catalog/current/native-barrier" {
+        return native_barrier::respond(id, &g.peers, ctx, g.requests, req).await;
+    }
     let status = ctx.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let admin = local_path.starts_with("/admin/");
     let target = if local_file_task_query(req.method(), &local_path) {
@@ -379,6 +384,136 @@ mod tests {
             received.try_recv().is_err(),
             "只读导出不得作为管理写命令提交"
         );
+        drop(ctx);
+        drop(directory);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_barriers_are_bound_to_the_selected_library_and_local_physical_node() {
+        use crate::daemon::{
+            directory::Directory,
+            files::{BatchPolicy, FileService},
+            node::NodeStatus,
+            state::{Command, ControlState},
+        };
+        use http_body_util::BodyExt;
+        use std::sync::{Mutex, mpsc};
+        let root = std::env::temp_dir().join(format!("native-barrier-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("directory.db");
+        let mut directory = Directory::open(&path).unwrap();
+        let mut ctl = ControlState::default();
+        for (index, cmd) in [
+            (1, Command::CatalogQuiesce),
+            (2, Command::CatalogFreeze { quiesce_index: 1 }),
+        ] {
+            let outcome = ctl.apply(index, &cmd);
+            directory.apply(index, &cmd, &outcome).unwrap();
+        }
+        let files =
+            FileService::with_options(root.join("spool"), BatchPolicy::default(), Some(path))
+                .unwrap();
+        let (exec, execution) = mpsc::channel();
+        let (node, received) = mpsc::channel();
+        let ctx = Arc::new(HttpContext {
+            files,
+            status: Arc::new(Mutex::new(NodeStatus {
+                id: 2,
+                leader: 1,
+                term: 7,
+                role: "Follower".into(),
+                applied_index: 2,
+                catalog_quiesce_index: Some(1),
+                catalog_frozen_index: Some(2),
+                ..Default::default()
+            })),
+            exec: Mutex::new(exec),
+            node: Mutex::new(node),
+            client_addrs: HashMap::from([
+                (1, "10.0.0.100:7401".into()),
+                (2, "10.0.0.100:7401".into()),
+                (3, "10.0.0.100:7401".into()),
+            ]),
+            wait_timeout: Duration::from_secs(1),
+        });
+        let g=Gateway{config:LibrariesConfig::parse(&json!({"default_library":"LIB-B","libraries":[{"changer_serial":"LIB-B","drive_serials":["D"]}]})).unwrap(),
+            libraries:BTreeMap::from([("LIB-B".into(),ctx.clone())]),gateway:ctx.clone(),
+            peers:HashMap::from([(1,"127.0.0.1:8011".into()),(2,"127.0.0.1:8012".into()),(3,"127.0.0.1:8013".into())]),requests:Arc::new(Semaphore::new(1))};
+        let challenge = uuid::Uuid::new_v4();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let path = format!(
+                "/libraries/LIB-B/admin/catalog/current/native-barrier?challenge={challenge}"
+            );
+            let mut replies = Vec::new();
+            for id in [1, 2, 3] {
+                {
+                    let mut status = ctx.status.lock().unwrap();
+                    status.id = id;
+                    status.role = if id == 1 { "Leader" } else { "Follower" }.into();
+                }
+                let request = Request::builder().uri(&path).body(Body::empty()).unwrap();
+                let response = dispatch(State(g.clone()), request).await;
+                assert_eq!(response.status(), 200);
+                let v: serde_json::Value = serde_json::from_slice(
+                    &response.into_body().collect().await.unwrap().to_bytes(),
+                )
+                .unwrap();
+                assert_eq!(v["node_id"], id);
+                assert_eq!(v["library_serial"], "LIB-B");
+                assert_eq!(v["members"][id.to_string()], g.peers[&id]);
+                replies.push(v);
+            }
+            #[cfg(feature = "fdb")]
+            {
+                assert!(
+                    crate::managed_catalog::verify_native_barriers("LIB-B", challenge, &replies)
+                        .is_ok()
+                );
+                assert!(
+                    crate::managed_catalog::verify_native_barriers("LIB-A", challenge, &replies)
+                        .is_err()
+                );
+            }
+            for query in [
+                "".to_owned(),
+                "?challenge=00000000-0000-0000-0000-000000000000".into(),
+                format!("?challenge={challenge}&challenge={challenge}"),
+                format!("?challenge={challenge}&extra=x"),
+            ] {
+                let request = Request::builder()
+                    .uri(format!(
+                        "/libraries/LIB-B/admin/catalog/current/native-barrier{query}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap();
+                assert_eq!(dispatch(State(g.clone()), request).await.status(), 400);
+            }
+            let request = Request::builder()
+                .method("POST")
+                .uri(&path)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(dispatch(State(g.clone()), request).await.status(), 405);
+            let request = Request::builder()
+                .uri(&path)
+                .header(header::CONTENT_LENGTH, "1")
+                .body(Body::from("x"))
+                .unwrap();
+            assert_eq!(dispatch(State(g.clone()), request).await.status(), 400);
+            let request = Request::builder()
+                .uri(path.replace("LIB-B", "LIB-A"))
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(dispatch(State(g.clone()), request).await.status(), 404);
+        });
+        assert!(execution.try_recv().is_err());
+        assert!(received.try_recv().is_err());
+        drop(g);
         drop(ctx);
         drop(directory);
         std::fs::remove_dir_all(root).unwrap();
