@@ -660,7 +660,9 @@ pub(super) fn candidate_head(receipt: &CommitReceipt) -> Result<FileHead> {
 pub(super) fn candidate_copy(receipt: &CommitReceipt, version: u64) -> PhysicalCopy {
     PhysicalCopy {
         version,
-        request_epoch: receipt.request_epoch,
+        origin: CopyOrigin::FileRequest {
+            request_epoch: receipt.request_epoch,
+        },
         volume_id: receipt.volume_id,
         volume_generation: receipt.volume_generation,
         volume_scan_id: receipt.volume_scan_id,

@@ -484,7 +484,11 @@ async fn verify_indexes(
                     return Err(CatalogError::Corrupt("副本 ID 不能为 nil"));
                 }
                 let stored = decode_stored_copy(&value)?;
-                if accepting.is_some_and(|epoch| stored.request_epoch() > epoch) {
+                if accepting.is_some_and(|epoch| {
+                    stored
+                        .receipt_epoch()
+                        .is_some_and(|request| request > epoch)
+                }) {
                     return Err(CatalogError::Corrupt("副本请求代次未开放"));
                 }
                 let head = decode_head(
@@ -923,7 +927,7 @@ pub(super) mod tests {
         };
         let mut copy = PhysicalCopy {
             version: 2,
-            request_epoch: 1,
+            origin: CopyOrigin::FileRequest { request_epoch: 1 },
             volume_id: Uuid::new_v4(),
             volume_generation: 1,
             volume_scan_id: Uuid::new_v4(),

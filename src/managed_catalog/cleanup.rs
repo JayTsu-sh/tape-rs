@@ -517,7 +517,7 @@ pub(super) mod tests {
         );
         assert!(
             catalog
-                .legacy_copy_record_for_test(
+                .unplaced_copy_record_for_test(
                     serving,
                     protected_receipt.file_id,
                     protected_receipt.copy_id

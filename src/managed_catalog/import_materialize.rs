@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use super::{
-    CatalogError, DirectoryOutcome, FileHead, ImportSourceBinding, MAX_DEPTH, ManagedCatalog,
-    MediaProvenance, NodeAttributes, NodeKind, PhysicalCopy, PoolRecord, Result, StagedImportEntry,
-    StagedSourceData, staged_import, validate_media, validate_name,
+    CatalogError, CopyOrigin, DirectoryOutcome, FileHead, ImportSourceBinding, MAX_DEPTH,
+    ManagedCatalog, MediaProvenance, NodeAttributes, NodeKind, PhysicalCopy, PoolRecord, Result,
+    StagedImportEntry, StagedSourceData, staged_import, validate_media, validate_name,
 };
 use super::{
     NamespaceDigest, NamespaceState, NamespaceSummary, Node, ScanState, StagedImportSummary,
@@ -925,7 +925,7 @@ pub(super) fn plan_data_file(
             binding: (*binding).clone(),
             copy: PhysicalCopy {
                 version: rank,
-                request_epoch: 1,
+                origin: CopyOrigin::Imported,
                 volume_id: source.volume_id,
                 volume_generation: binding.scan.generation,
                 volume_scan_id: binding.scan.id,
@@ -2206,6 +2206,12 @@ mod tests {
         let first = plan_data_file(namespace, &entry, &bindings)
             .unwrap()
             .unwrap();
+        assert!(
+            first
+                .copies
+                .iter()
+                .all(|copy| copy.copy.origin == CopyOrigin::Imported)
+        );
         assert_eq!(first.head.version, 2);
         assert_eq!(first.head.copy_id, first.copies[1].id);
         assert_eq!(first.copies[0].copy.version, 1);

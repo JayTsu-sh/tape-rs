@@ -77,8 +77,7 @@ impl ScanDigest {
         {
             return Err(CatalogError::Invalid("摘要条目不属于此卷扫描"));
         }
-        validate_name(&receipt.name)?;
-        validate_serial(&receipt.library_serial)?;
+        validate_receipt(receipt)?;
         let entry = Self::entry_key(receipt);
         if self.last.is_some_and(|last| last >= entry) {
             return Err(CatalogError::Invalid("扫描摘要必须有序且无重复条目"));
@@ -480,6 +479,51 @@ pub(super) mod tests {
     use super::*;
 
     #[test]
+    fn scan_digest_rejects_invalid_receipts_without_panicking_or_advancing() {
+        let volume = Uuid::new_v4();
+        let scan = VolumeScan {
+            generation: 1,
+            id: Uuid::new_v4(),
+        };
+        let valid = CommitReceipt {
+            namespace: Uuid::new_v4(),
+            parent: Uuid::nil(),
+            name: b"file".to_vec(),
+            file_id: Uuid::new_v4(),
+            expected_version: None,
+            operation_id: Uuid::new_v4(),
+            request_epoch: 1,
+            copy_id: Uuid::new_v4(),
+            library_serial: "SIM-DIGEST".into(),
+            pool_id: None,
+            owner_epoch: 1,
+            volume_id: volume,
+            volume_generation: scan.generation,
+            volume_scan_id: scan.id,
+            ltfs_file_uid: 1,
+            size: 0,
+            content_digest: ContentDigest::Unknown,
+            metadata_digest: None,
+        };
+        for zero_epoch in [true, false] {
+            let mut invalid = valid.clone();
+            if zero_epoch {
+                invalid.request_epoch = 0;
+            } else {
+                invalid.ltfs_file_uid = 0;
+            }
+            let mut digest = ScanDigest::new(volume, scan).unwrap();
+            let before = digest.summary();
+            assert!(digest.push(&invalid).is_err());
+            assert_eq!(digest.summary(), before);
+            assert_eq!(digest.last, None);
+            digest.push(&valid).unwrap();
+            assert_eq!(digest.summary().entries, 1);
+            assert_eq!(digest.last, Some(ScanDigest::entry_key(&valid)));
+        }
+    }
+
+    #[test]
     fn physical_copy_must_match_confirmed_index_uid_and_length() {
         use crate::catalog::volume_extents::ExpectedIndex;
         use crate::ltfs::index::{FileNode, LtfsIndex, NodeMeta};
@@ -509,7 +553,7 @@ pub(super) mod tests {
         let cache = VolumeExtentCache::open(&path, source).unwrap();
         let mut copy = PhysicalCopy {
             version: 1,
-            request_epoch: 1,
+            origin: CopyOrigin::FileRequest { request_epoch: 1 },
             volume_id: volume,
             volume_generation: index.generation,
             volume_scan_id: Uuid::new_v4(),
