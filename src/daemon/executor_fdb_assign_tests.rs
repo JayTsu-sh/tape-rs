@@ -18,16 +18,49 @@ struct Faults {
     drop_format: AtomicBool,
     drop_final: AtomicBool,
     attributes_written: AtomicBool,
+    hold_format: AtomicBool,
+    format_inflight: AtomicBool,
+    release_format: AtomicBool,
+    worker: Mutex<Option<std::thread::JoinHandle<Result<ScsiResult>>>>,
 }
 struct Trace {
     inner: Arc<SimTransport>,
     faults: Arc<Faults>,
+    drive: bool,
 }
 impl TapeTransport for Trace {
     fn identity(&self) -> &str {
         self.inner.identity()
     }
     fn execute_no_data(&self, cdb: &[u8], timeout: u32) -> Result<ScsiResult> {
+        if self.drive
+            && cdb[0] == opcode::FORMAT_MEDIUM
+            && self.faults.hold_format.swap(false, Ordering::SeqCst)
+        {
+            self.faults.format_inflight.store(true, Ordering::SeqCst);
+            let inner = self.inner.clone();
+            let faults = self.faults.clone();
+            let command = cdb.to_vec();
+            let worker = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !faults.release_format.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let result = inner.execute_no_data(&command, timeout);
+                if result.is_ok() {
+                    faults.successful.lock().unwrap().push(command);
+                }
+                faults.format_inflight.store(false, Ordering::SeqCst);
+                result
+            });
+            *self.faults.worker.lock().unwrap() = Some(worker);
+            return Err(TapeError::ScsiHost(3));
+        }
+        if self.drive && self.faults.format_inflight.load(Ordering::SeqCst) {
+            return Err(TapeError::Busy {
+                device: self.inner.identity().into(),
+            });
+        }
         let r = self.inner.execute_no_data(cdb, timeout)?;
         self.faults.successful.lock().unwrap().push(cdb.to_vec());
         if cdb[0] == opcode::FORMAT_MEDIUM && self.faults.drop_format.swap(false, Ordering::SeqCst)
@@ -70,6 +103,7 @@ impl DeviceProvider for Provider {
                 dev: Box::new(Trace {
                     inner: Arc::new(self.library.changer_as(2)),
                     faults: self.faults.clone(),
+                    drive: false,
                 }),
             },
             ManagedDevice {
@@ -79,6 +113,7 @@ impl DeviceProvider for Provider {
                 dev: Box::new(Trace {
                     inner: Arc::new(self.library.drive_as(0, 2)),
                     faults: self.faults.clone(),
+                    drive: true,
                 }),
             },
         ])
@@ -105,7 +140,7 @@ fn assignment_format_unknown_keeps_original_uuid_without_reformatting() {
         .build()
         .unwrap();
     let catalog = Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());
-    for case in 0..3 {
+    for case in 0..6 {
         let ns = Uuid::new_v4();
         let serial = format!("ASSIGN-FAULT-{ns}");
         let challenge = Uuid::new_v4();
@@ -183,6 +218,68 @@ fn assignment_format_unknown_keeps_original_uuid_without_reformatting() {
             .unwrap();
         let mut job = Job::new(request.clone(), &queued).unwrap();
         let mut publisher = Publisher::default();
+        if case == 0 {
+            let snapshot = Snapshot::capture(&context()).unwrap();
+            let original_plan = plan(&snapshot, &request, pool.revision, &status).unwrap();
+            runtime
+                .block_on(catalog.prepare_media_assign(
+                    &serial,
+                    route,
+                    round,
+                    &request,
+                    &original_plan,
+                ))
+                .unwrap();
+            runtime
+                .block_on(catalog.stage_media_assign(
+                    &serial,
+                    route,
+                    round,
+                    &request,
+                    AssignPhase::Moving,
+                ))
+                .unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let unavailable_file = root.join("move-unavailable.cluster");
+            std::fs::write(
+                &unavailable_file,
+                format!(
+                    "assignmove:{}@{}",
+                    Uuid::new_v4().simple(),
+                    listener.local_addr().unwrap()
+                ),
+            )
+            .unwrap();
+            let unavailable = FdbOwnerControl {
+                catalog: Arc::new(
+                    ManagedCatalog::open(Some(unavailable_file.to_str().unwrap())).unwrap(),
+                ),
+                serial: serial.clone(),
+                route,
+                storage: Default::default(),
+            };
+            let count = faults.successful.lock().unwrap().len();
+            assert!(
+                send_move(
+                    Context {
+                        control: &unavailable,
+                        ..context()
+                    },
+                    &runtime,
+                    &request,
+                    &original_plan,
+                    &Cell::new(false)
+                )
+                .is_err(),
+                "FDB loss after the acknowledged Moving stage must prevent MOVE"
+            );
+            assert_eq!(
+                faults.successful.lock().unwrap().len(),
+                count,
+                "no device command at the unconfirmed mechanical boundary"
+            );
+            job = Job::new(request.clone(), &saved(context(), &runtime, &request)).unwrap();
+        }
         for _ in 0..12 {
             let result = job.poll(context(), &mut publisher, &runtime).unwrap();
             assert!(!matches!(
@@ -194,6 +291,22 @@ fn assignment_format_unknown_keeps_original_uuid_without_reformatting() {
             }
         }
         if case == 0 {
+            let mut diagnostic_job =
+                Job::new(request.clone(), &saved(context(), &runtime, &request)).unwrap();
+            diagnostic_job.diagnostic =
+                Some(("持久事实损坏，应停止本轮而非反复包裹原诊断".into(), true));
+            assert!(
+                matches!(
+                    diagnostic_job
+                        .poll(context(), &mut publisher, &runtime)
+                        .unwrap(),
+                    Publication::Failed {
+                        permanent: true,
+                        ..
+                    }
+                ),
+                "persisted permanent diagnostics must reach the shared controller"
+            );
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let unavailable_file = root.join("unavailable.cluster");
             std::fs::write(
@@ -214,7 +327,7 @@ fn assignment_format_unknown_keeps_original_uuid_without_reformatting() {
                 storage: Default::default(),
             };
             let count = faults.successful.lock().unwrap().len();
-            let never = DriveGuard {
+            let never = CommandGuard {
                 context: Context {
                     control: &unavailable,
                     ..context()
@@ -246,15 +359,34 @@ fn assignment_format_unknown_keeps_original_uuid_without_reformatting() {
                 .block_on(catalog.require_active_library_readable(&serial, route, round))
                 .is_err()
         );
-        if case == 1 {
+        if matches!(case, 1 | 3 | 4) {
             faults.drop_final.store(true, Ordering::SeqCst);
         }
         if case == 2 {
             faults.drop_format.store(true, Ordering::SeqCst);
         }
+        if case == 5 {
+            faults.hold_format.store(true, Ordering::SeqCst);
+        }
         let result = job.poll(context(), &mut publisher, &runtime).unwrap();
         if case != 0 {
             assert!(matches!(result, Publication::Failed { .. }));
+        }
+        if matches!(case, 3 | 4) {
+            assert!(lib.with_cartridge_mut("TEST01L8", |cart| {
+                let crate::scsi::sim::LogicalObject::Record(bytes) =
+                    &mut cart.partitions[1].objects[crate::ltfs::volume::LABEL_BLOCK as usize]
+                else {
+                    panic!("missing actual P1 label");
+                };
+                if case == 3 {
+                    let mut label = crate::ltfs::label::LtfsLabel::parse(bytes).unwrap();
+                    label.volume_uuid = Uuid::new_v4();
+                    *bytes = label.to_xml().unwrap().to_vec();
+                } else {
+                    bytes.truncate(5);
+                }
+            }));
         }
         let original = saved(context(), &runtime, &request);
         if case != 0 {
@@ -300,8 +432,37 @@ fn assignment_format_unknown_keeps_original_uuid_without_reformatting() {
             }
         }
         let done = saved(context(), &runtime, &request);
-        if case == 2 {
-            assert!(!terminal);
+        if case >= 2 {
+            if case == 5 {
+                assert!(
+                    faults.format_inflight.load(Ordering::SeqCst),
+                    "new epoch did not abort original FORMAT on the same initiator"
+                );
+                assert_eq!(
+                    faults
+                        .successful
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|c| c[0] == opcode::FORMAT_MEDIUM)
+                        .count(),
+                    0
+                );
+                faults.release_format.store(true, Ordering::SeqCst);
+                faults
+                    .worker
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .join()
+                    .unwrap()
+                    .unwrap();
+            }
+            assert!(
+                !terminal,
+                "partial format or corrupt P1 label must not publish assignment: {done}"
+            );
             assert_eq!(done["status"], "running");
             assert_eq!(done["execution"]["phase"], "formatting");
             assert!(

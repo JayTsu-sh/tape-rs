@@ -33,6 +33,71 @@ fn all_partitions_blank(device: &dyn TapeTransport) -> Result<bool> {
     }
     Ok(true)
 }
+/// Assignment proves the exact format it requested. Ordinary mount reads only
+/// the IP label; that alone cannot certify a newly formatted two-partition volume.
+fn verify_assigned_labels(
+    device: &dyn TapeTransport,
+    expected: uuid::Uuid,
+    barcode: &str,
+) -> Result<()> {
+    use crate::ltfs::label::{
+        LTFS_VERSION, LtfsLabel, PART_DATA, PART_INDEX, VOL1_IMPL_ID, Vol1Label,
+    };
+    let drive = TapeDrive::new(device);
+    let mut buffer = vec![0; 64 * 1024];
+    let mut canonical = None;
+    for (partition, location) in [(0, PART_INDEX), (1, PART_DATA)] {
+        drive.locate(partition, crate::ltfs::volume::VOL1_BLOCK, true)?;
+        let n = drive.read_block(&mut buffer)?;
+        let record = buffer.get(..n).ok_or(TapeError::InvalidResponse {
+            expected: buffer.len(),
+            actual: n,
+        })?;
+        let vol1 = Vol1Label::parse(record)?;
+        if n != 80
+            || &buffer[24..37] != VOL1_IMPL_ID
+            || vol1.volume_id != barcode.chars().take(6).collect::<String>()
+            || !vol1.owner.is_empty()
+        {
+            return Err(refused(format!("分区{partition}的VOL1与原格式化参数不符")));
+        }
+        if drive.read_block(&mut buffer)? != 0 {
+            return Err(refused(format!("分区{partition}的VOL1缺少闭合文件标记")));
+        }
+        drive.locate(partition, crate::ltfs::volume::LABEL_BLOCK, true)?;
+        let n = drive.read_block(&mut buffer)?;
+        let record = buffer.get(..n).ok_or(TapeError::InvalidResponse {
+            expected: buffer.len(),
+            actual: n,
+        })?;
+        let mut label = LtfsLabel::parse(record)?;
+        if label.volume_uuid != expected
+            || label.location != location
+            || label.index_partition != PART_INDEX
+            || label.data_partition != PART_DATA
+            || label.version != LTFS_VERSION
+            || label.creator != crate::ltfs::mkltfs::APP_NAME
+            || label.blocksize != crate::ltfs::volume::DEFAULT_BLOCK_SIZE
+            || label.compression
+        {
+            return Err(refused(format!(
+                "分区{partition}的LTFS标签与原卷UUID或格式参数不符"
+            )));
+        }
+        if drive.read_block(&mut buffer)? != 0 {
+            return Err(refused(format!(
+                "分区{partition}的LTFS标签缺少闭合文件标记"
+            )));
+        }
+        label.location = PART_INDEX;
+        let normalized = label.to_xml()?;
+        if canonical.as_ref().is_some_and(|first| first != &normalized) {
+            return Err(refused("两分区LTFS标签公共字段不一致"));
+        }
+        canonical = Some(normalized);
+    }
+    Ok(())
+}
 fn plan(
     snapshot: &Snapshot,
     request: &ManagementRequest,
@@ -126,10 +191,40 @@ fn reconcile(snapshot: &Snapshot, plan: &AssignPlan) -> Result<bool> {
     Ok(false)
 }
 
+fn send_move(
+    context: Context<'_>,
+    runtime: &tokio::runtime::Runtime,
+    request: &ManagementRequest,
+    p: &AssignPlan,
+    permanent: &Cell<bool>,
+) -> Result<()> {
+    let changer = context
+        .active
+        .devices
+        .iter()
+        .find(|d| d.kind == DeviceKind::Changer)
+        .expect("verified changer");
+    let guard = CommandGuard {
+        context,
+        runtime,
+        request,
+        phase: AssignPhase::Moving,
+        inner: changer.dev.as_ref(),
+        permanent,
+        drive_serial: p.drive.drive_serial.as_deref().expect("drive serial"),
+    };
+    let mut changer = MediumChanger::new(&guard);
+    if changer.load_address_map()? != &p.map {
+        return Err(refused("MOVE前地址map已改变，保留原分配计划"));
+    }
+    changer.move_medium(p.source.address, p.drive.address)?;
+    Ok(())
+}
+
 /// Acknowledged task ownership and policy, FDB availability, local permission
-/// and physical PR are checked before each mkltfs/probe command, including all
-/// writes following a long FORMAT. This wraps the domain transport, not SG_IO.
-struct DriveGuard<'a> {
+/// and physical PR are checked before each mechanical/mkltfs/probe command,
+/// including all writes following a long FORMAT. This wraps the domain transport, not SG_IO.
+struct CommandGuard<'a> {
     context: Context<'a>,
     runtime: &'a tokio::runtime::Runtime,
     request: &'a ManagementRequest,
@@ -138,7 +233,7 @@ struct DriveGuard<'a> {
     permanent: &'a Cell<bool>,
     drive_serial: &'a str,
 }
-impl DriveGuard<'_> {
+impl CommandGuard<'_> {
     fn check(&self) -> Result<()> {
         match publish(
             &self.context,
@@ -177,14 +272,16 @@ impl DriveGuard<'_> {
         {
             return Err(refused("原磁带被运维策略禁止"));
         }
-        reservation::verify_holder(self.inner, self.context.active.key)?;
+        for device in &self.context.active.devices {
+            reservation::verify_holder(device.dev.as_ref(), self.context.active.key)?;
+        }
         if !self.context.ready() {
             return Err(self.context.lost("设备命令前Serving许可失效".into()));
         }
         Ok(())
     }
 }
-impl TapeTransport for DriveGuard<'_> {
+impl TapeTransport for CommandGuard<'_> {
     fn identity(&self) -> &str {
         self.inner.identity()
     }
@@ -281,6 +378,34 @@ impl Job {
         publisher: &mut Publisher,
         runtime: &tokio::runtime::Runtime,
     ) -> Result<Publication<bool>> {
+        if let Some((detail, permanent)) = self.diagnostic.clone() {
+            return Ok(
+                match publish(
+                    &context,
+                    runtime,
+                    context.control.catalog.defer_media_assign(
+                        &context.control.serial,
+                        context.control.route,
+                        context.active.round,
+                        &self.request,
+                        &detail,
+                    ),
+                ) {
+                    Publication::Confirmed(_) => {
+                        self.diagnostic = None;
+                        Publication::Failed { detail, permanent }
+                    }
+                    Publication::Failed {
+                        detail: current,
+                        permanent: p,
+                    } => Publication::Failed {
+                        detail: format!("原诊断{detail}；保存失败{current}"),
+                        permanent: p || permanent,
+                    },
+                    other => other.map(|_| false),
+                },
+            );
+        }
         let result = self.poll_inner(context, publisher, runtime);
         match result {
             Err(error) if ownership_lost(&error) => Err(error),
@@ -329,28 +454,6 @@ impl Job {
                 c.reject_media_assign(serial, route, owner, &self.request, &detail),
             )
             .map(|_| true));
-        }
-        if let Some((detail, permanent)) = self.diagnostic.clone() {
-            return Ok(
-                match publish(
-                    &context,
-                    runtime,
-                    c.defer_media_assign(serial, route, owner, &self.request, &detail),
-                ) {
-                    Publication::Confirmed(_) => {
-                        self.diagnostic = None;
-                        Publication::Failed { detail, permanent }
-                    }
-                    Publication::Failed {
-                        detail: current,
-                        permanent: p,
-                    } => Publication::Failed {
-                        detail: format!("原诊断{detail}；保存失败{current}"),
-                        permanent: p || permanent,
-                    },
-                    other => other.map(|_| false),
-                },
-            );
         }
         if self.plan.is_none() {
             let pool = uuid::Uuid::parse_str(
@@ -466,17 +569,7 @@ impl Job {
             if reconcile(&fresh, &p)? {
                 return Ok(Publication::Confirmed(false));
             }
-            let changer = context
-                .active
-                .devices
-                .iter()
-                .find(|d| d.kind == DeviceKind::Changer)
-                .expect("verified changer");
-            let mut changer = MediumChanger::new(changer.dev.as_ref());
-            if changer.load_address_map()? != &p.map {
-                return Err(refused("MOVE前地址map已改变，保留原分配计划"));
-            }
-            changer.move_medium(p.source.address, p.drive.address)?;
+            send_move(context, runtime, &self.request, &p, &self.permanent)?;
             return Ok(Publication::Confirmed(false));
         }
         if matches!(phase, AssignPhase::Prepared | AssignPhase::Moving) {
@@ -494,7 +587,7 @@ impl Job {
         }
         let inner = context.active.devices[drive].dev.as_ref();
         if phase == AssignPhase::Threading {
-            let guard = DriveGuard {
+            let guard = CommandGuard {
                 context,
                 runtime,
                 request: &self.request,
@@ -527,7 +620,7 @@ impl Job {
             }));
         }
         if phase == AssignPhase::Inspecting {
-            let guard = DriveGuard {
+            let guard = CommandGuard {
                 context,
                 runtime,
                 request: &self.request,
@@ -567,7 +660,7 @@ impl Job {
             }));
         }
         if phase == AssignPhase::Formatting {
-            let guard = DriveGuard {
+            let guard = CommandGuard {
                 context,
                 runtime,
                 request: &self.request,
@@ -601,6 +694,7 @@ impl Job {
                 )?;
             }
             TapeDrive::new(&guard).test_unit_ready()?;
+            verify_assigned_labels(&guard, expected, &p.barcode)?;
             let mut volume = crate::ltfs::volume::LtfsVolume::mount(&guard)?;
             volume.set_reservation_guard(Some(context.active.key));
             let recovery = volume.recovery();

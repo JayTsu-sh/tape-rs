@@ -3394,6 +3394,21 @@ fn native_owner_publishes_complete_inventory_without_legacy_catalog() {
     library
         .insert_cartridge(SimCartridge::blank("TEST01L8", 1 << 20), 0)
         .unwrap();
+    library
+        .insert_cartridge(SimCartridge::blank("TEST02L8", 1 << 20), 1)
+        .unwrap();
+    let assign_pool = tape_rs::managed_catalog::PoolRecord {
+        id: Uuid::new_v4(),
+        library_serial: serial.clone(),
+        name: "assign-pool".into(),
+        file_limit: 100,
+        created_at_millis: 1000,
+        policy: Default::default(),
+        revision: 1,
+    };
+    runtime
+        .block_on(catalog.create_active_pool(&serial, route, round, &assign_pool))
+        .unwrap();
     let root = std::env::temp_dir().join(format!("tapers-native-owner-observation-{ns}"));
     let files = FileService::new(root.join("spool")).unwrap();
     let permission = Arc::new(Permission::default());
@@ -3535,6 +3550,32 @@ fn native_owner_publishes_complete_inventory_without_legacy_catalog() {
         }
         std::thread::sleep(Duration::from_millis(30));
     }
+    let assigned_volume = Uuid::new_v4();
+    let assign_request=tape_rs::managed_catalog::ManagementRequest::parse(json!({"version":1,"library":serial,"namespace":ns.to_string(),"epoch":window.accepting,"operation":Uuid::new_v4().to_string(),"change":{"kind":"media-assign","pool":assign_pool.id.to_string(),"barcode":"TEST02L8","volume":assigned_volume.to_string(),"confirm_format":true,"force_format":false}})).unwrap();
+    runtime
+        .block_on(catalog.admit_management(&serial, route, round, &assign_request))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut assigned = None;
+    while Instant::now() < deadline {
+        let task = runtime
+            .block_on(catalog.management_task(
+                &serial,
+                route,
+                assign_request.epoch(),
+                assign_request.operation(),
+            ))
+            .unwrap()
+            .unwrap();
+        if matches!(
+            task["status"].as_str(),
+            Some("succeeded" | "failed" | "cancelled")
+        ) {
+            assigned = Some(task);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
     let (done, finished) = mpsc::channel();
     requests
         .send(ExecRequest::Shutdown { done: Some(done) })
@@ -3543,6 +3584,23 @@ fn native_owner_publishes_complete_inventory_without_legacy_catalog() {
     thread.join().unwrap();
     drop(files);
     fs::remove_dir_all(root).unwrap();
+    let assigned = assigned.expect("原生Serving设备线程须完成media-assign，不得仅持久排队");
+    assert_eq!(assigned["status"], "succeeded", "{assigned}");
+    assert_eq!(assigned["request"], *assign_request.value());
+    assert_eq!(
+        runtime
+            .block_on(catalog.tape_assignment(&serial, "TEST02L8"))
+            .unwrap()
+            .unwrap()
+            .volume_id,
+        Some(assigned_volume)
+    );
+    assert!(
+        runtime
+            .block_on(catalog.active_loaded_volume_head(&serial, "TEST02L8", route, round))
+            .unwrap()
+            .is_none()
+    );
     let moved = moved.expect("原生Serving设备线程必须执行持久media-move，不能一直queued");
     assert_eq!(moved["status"], "succeeded");
     assert_eq!(moved["request"], *move_request.value());
@@ -3553,7 +3611,7 @@ fn native_owner_publishes_complete_inventory_without_legacy_catalog() {
         observed.expect("Serving owner须实际发布FDB库存和巡检；不能一直保持None");
     assert_eq!(inventory["library_serial"], serial);
     assert_eq!(inventory["round"], round);
-    assert_eq!(inventory["volumes"].as_array().unwrap().len(), 1);
+    assert_eq!(inventory["volumes"].as_array().unwrap().len(), 2);
     assert_eq!(inventory["volumes"][0]["barcode"], "TEST01L8");
     assert_eq!(inventory["drives"].as_array().unwrap().len(), 1);
     assert_eq!(monitor["owner_epoch"], round);

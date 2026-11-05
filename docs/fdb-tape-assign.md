@@ -10,10 +10,12 @@ ltfsctl -e 10.131.7.207:7411 --library SERIAL task show --request /secure/assign
 
 `--confirm-format` 与请求文件必填，池参数是名称或 UUID。首次提交前保存原任务 UUID、新卷 UUID、namespace 与 pool UUID；重复执行使用同一请求文件，不重新解析归属或生成卷身份。请求文件是客户端恢复凭证，任务状态由 FDB 保存。HTTP `POST /libraries/SERIAL/admin/tapes/BARCODE/assign` 要求 namespace header 与原 media-assign envelope，返回202仅代表已受理；task show/cancel 沿用管理任务协议。
 
-执行计划固定完整地址 map、原源/home、目标驱动器序列号和池策略修订号；原机械线程与搬带、rescan、文件读挂载共享库级互锁。每条 FORMAT 后续写入及探测命令前，再确认 FDB 原任务/owner/池策略、PR和本地许可。格式化超时不缩短。空白介质须检查全部已定义分区；分区0空白不代表其他分区可覆盖。分区数依据 IBM GA32-0928-08 Table348，ready后读 MODE SENSE11h byte3+1。
+执行计划固定完整地址 map、原源/home、目标驱动器序列号和池策略修订号；原机械线程与搬带、rescan、文件读挂载共享库级互锁。每条 MOVE、FORMAT 后续写入及探测命令前，再确认 FDB 原任务/owner/池策略、PR和本地许可。格式化超时不缩短。空白介质须检查全部已定义分区；分区0空白不代表其他分区可覆盖。分区数依据 IBM GA32-0928-08 Table348，ready后读 MODE SENSE11h byte3+1。
 
-阶段为 prepared、moving、threading、inspecting、formatting、confirmed。FORMAT 可能已执行或仍执行时保留原请求、新卷 UUID、阶段、错误和互锁；恢复只读取并验证原卷，不再次调用格式化。完整初代空卷经恢复协议及原驱动器库存确认后才登记成功。新epoch自身不证明旧硬件命令已经被中止。阶段已持久但进程在发命令前退出，与命令仍在执行可能不可区分；若 LOAD 一直未完成或格式化只完成分区未写完标签，任务会保留为 running+诊断，需核对实际设备与原任务，不能靠清锁/新ID解决。当前尚无自动修复部分初始化的入口。
+阶段为 prepared、moving、threading、inspecting、formatting、confirmed。FORMAT 可能已执行或仍执行时保留原请求、新卷 UUID、阶段、错误和互锁；恢复只读取并验证原卷，不再次调用格式化。完整初代空卷须重读两分区 VOL1/LTFS 标签及其闭合文件标记，核对原 UUID、格式参数和标签公共字段，再经恢复协议及原驱动器库存确认后登记成功。新epoch自身不证明旧硬件命令已经被中止。阶段已持久但进程在发命令前退出，与命令仍在执行可能不可区分；若 LOAD 一直未完成或格式化只完成分区未写完标签，任务会保留为 running+诊断，需核对实际设备与原任务，不能靠清锁/新ID解决。当前尚无自动修复部分初始化的入口。
 
 成功事务同时登记磁带归属、卷放置及反向索引，保存不可变任务终态、产生通知并释放原队列/库互锁。新的卷 UUID 在格式化前跨库互斥保留，成功后保留该身份，避免复用历史卷身份。分配成功的 `index_imported=false`，本操作不发布文件 heads 或伪造 imported baseline；尚未导入的卷不可服务文件读写，且不会阻止其他磁带的 owner 恢复。queued 可取消，running 拒绝取消；非强制检查拒绝后可能已装入驱动器，结果明确标记 loaded_not_formatted。
 
 目前未部署本片代码，也未在真实 B 库执行 assign；纯软件检查与真实硬件结果分别记录，不能将 Sim 格式化测试当实物验证。真实 B 使用范围、A及备用路径禁用要求见最新本地交接记录。
+
+本片软件反例已复现并修复 MOVE 前 FDB 核验遗漏、数据分区标签未核对和永久诊断未上达控制器。私有 FDB + Sim 覆盖完整格式化回执丢失、部分初始化、P1 UUID 错误/截断、旧 FORMAT 仍在后台执行时同 initiator 新 epoch 接管，保持原 UUID/gate 且不重复 FORMAT；FDB TCP 黑洞在 Moving stage 已确认后及 FORMAT 前阻止新设备命令。这些不是物理设备故障注入结果。
