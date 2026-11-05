@@ -293,6 +293,173 @@ async fn run_pool_api(cluster: &str) {
         (202, cancelled)
     );
 
+    let movement = json!({"version":1,"library":serial,"namespace":namespace,"epoch":1,"operation":Uuid::new_v4().to_string(),"change":{"kind":"media-move","pool":null,"volume":null,"revision":null,"barcode":"TEST01L8","destination":"ieslot"}});
+    let move_path = format!("{root}/tapes/TEST01L8/move");
+    assert_eq!(
+        request(
+            &a,
+            "POST",
+            &move_path,
+            Some(&namespace),
+            movement.to_string().as_bytes()
+        )
+        .await
+        .0,
+        405
+    );
+    assert_eq!(
+        request(
+            &b,
+            "POST",
+            &move_path,
+            None,
+            movement.to_string().as_bytes()
+        )
+        .await
+        .0,
+        409
+    );
+    assert_eq!(
+        request(
+            &b,
+            "POST",
+            &format!("{root}/tapes/OTHER01L8/move"),
+            Some(&namespace),
+            movement.to_string().as_bytes()
+        )
+        .await
+        .0,
+        400
+    );
+    let (code, queued_move) = request(
+        &b,
+        "POST",
+        &move_path,
+        Some(&namespace),
+        movement.to_string().as_bytes(),
+    )
+    .await;
+    assert_eq!(code, 202, "{queued_move}");
+    assert_eq!(queued_move["status"], "queued");
+    assert_eq!(queued_move["request"], movement);
+    assert!(queued_move["execution"].is_null());
+    assert_eq!(
+        request(
+            &b,
+            "POST",
+            &move_path,
+            Some(&namespace),
+            movement.to_string().as_bytes()
+        )
+        .await,
+        (202, queued_move)
+    );
+    let task_path = format!("{root}/tasks/1/{}", movement["operation"].as_str().unwrap());
+    assert_eq!(
+        request(&b, "GET", &task_path, Some(&namespace), b"")
+            .await
+            .1["request"],
+        movement
+    );
+    assert_eq!(
+        request(
+            &b,
+            "POST",
+            &format!("{task_path}/cancel"),
+            Some(&namespace),
+            b""
+        )
+        .await
+        .1["status"],
+        "cancelled"
+    );
+    assert_eq!(
+        request(
+            &b,
+            "POST",
+            &move_path,
+            Some(&namespace),
+            movement.to_string().as_bytes()
+        )
+        .await
+        .1["status"],
+        "cancelled"
+    );
+
+    // SDK-only recovery facts: readyz yields to mechanical maintenance while
+    // management inspection remains usable. No hardware commands run here.
+    assert_eq!(request(&b, "GET", "/readyz", None, b"").await.0, 200);
+    let mut gated = movement.clone();
+    gated["operation"] = json!(Uuid::new_v4().to_string());
+    let intent = crate::managed_catalog::ManagementRequest::parse(gated.clone()).unwrap();
+    catalog
+        .admit_management(&serial, route, epoch, &intent)
+        .await
+        .unwrap();
+    let plan = crate::managed_catalog::MovePlan {
+        version: 1,
+        barcode: "TEST01L8".into(),
+        captured_at: crate::ltfs::label::ltfs_time_now(),
+        map: crate::changer::element::ElementAddressMap {
+            transport_start: 0,
+            transport_count: 1,
+            storage_start: 1001,
+            storage_count: 3,
+            ie_start: 101,
+            ie_count: 1,
+            dt_start: 1,
+            dt_count: 1,
+        },
+        source: crate::managed_catalog::MoveLocation {
+            address: 1001,
+            kind: crate::managed_catalog::MoveLocationKind::Storage,
+            drive_serial: None,
+        },
+        destination: crate::managed_catalog::MoveLocation {
+            address: 101,
+            kind: crate::managed_catalog::MoveLocationKind::ImportExport,
+            drive_serial: None,
+        },
+        home_address: Some(1001),
+    };
+    catalog
+        .prepare_media_move(&serial, route, epoch, &intent, &plan)
+        .await
+        .unwrap();
+    assert_eq!(request(&b, "GET", "/readyz", None, b"").await.0, 503);
+    let path = format!("{root}/tasks/1/{}", intent.operation());
+    assert_eq!(
+        request(&b, "GET", &path, Some(&namespace), b"").await.1["execution"]["phase"],
+        "prepared"
+    );
+    assert_eq!(
+        request(&b, "POST", &format!("{path}/cancel"), Some(&namespace), b"")
+            .await
+            .0,
+        400
+    );
+    assert_eq!(
+        request(&b, "GET", &format!("{root}/pools"), Some(&namespace), b"")
+            .await
+            .0,
+        200
+    );
+    let at = crate::ltfs::label::ltfs_time_now();
+    let observed = json!({"library_serial":serial,"owner":2,"round":epoch,"observed_at":at,"volumes":[{"barcode":"TEST01L8","address":101,"element_type":3,"medium_type":1,"source_address":1001,"home_slot":null}],"drives":[{"serial":"SIMDRV0000","address":1,"barcode":null}]});
+    catalog
+        .record_active_library_inventory(&serial, route, epoch, &observed)
+        .await
+        .unwrap();
+    catalog
+        .record_library_monitor(&serial, route, epoch, &at, None)
+        .await
+        .unwrap();
+    catalog
+        .complete_media_move(&serial, route, epoch, &intent, &at)
+        .await
+        .unwrap();
+    assert_eq!(request(&b, "GET", "/readyz", None, b"").await.0, 200);
+
     let id = Uuid::new_v4();
     let body=json!({"version":1,"id":id.to_string(),"name":"归档","file_limit":100,"created_at_millis":1_793_405_000_123u64,"policy":{"media_restriction":"none","mount_limit":0,"low_space_warning_enabled":true,"low_space_warning_threshold":0,"no_space_warning_enabled":true}}).to_string();
     let result = request(

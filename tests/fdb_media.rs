@@ -3389,7 +3389,7 @@ fn native_owner_publishes_complete_inventory_without_legacy_catalog() {
         .block_on(catalog.initialize_native_library(ns, &proof))
         .unwrap();
     let round = route.initial_owner_epoch;
-    let library = SimLibrary::new(1, 2, 0);
+    let library = SimLibrary::new(1, 2, 1);
     library.enable_changer_pr();
     library
         .insert_cartridge(SimCartridge::blank("TEST01L8", 1 << 20), 0)
@@ -3510,6 +3510,31 @@ fn native_owner_publishes_complete_inventory_without_legacy_catalog() {
         }
         std::thread::sleep(Duration::from_millis(30));
     }
+    let move_request=tape_rs::managed_catalog::ManagementRequest::parse(json!({"version":1,"library":serial,"namespace":ns.to_string(),"epoch":window.accepting,"operation":Uuid::new_v4().to_string(),"change":{"kind":"media-move","pool":null,"volume":null,"revision":null,"barcode":"TEST01L8","destination":"ieslot"}})).unwrap();
+    runtime
+        .block_on(catalog.admit_management(&serial, route, round, &move_request))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut moved = None;
+    while Instant::now() < deadline {
+        let task = runtime
+            .block_on(catalog.management_task(
+                &serial,
+                route,
+                move_request.epoch(),
+                move_request.operation(),
+            ))
+            .unwrap()
+            .unwrap();
+        if matches!(
+            task["status"].as_str(),
+            Some("succeeded" | "failed" | "cancelled")
+        ) {
+            moved = Some(task);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
     let (done, finished) = mpsc::channel();
     requests
         .send(ExecRequest::Shutdown { done: Some(done) })
@@ -3518,6 +3543,9 @@ fn native_owner_publishes_complete_inventory_without_legacy_catalog() {
     thread.join().unwrap();
     drop(files);
     fs::remove_dir_all(root).unwrap();
+    let moved = moved.expect("原生Serving设备线程必须执行持久media-move，不能一直queued");
+    assert_eq!(moved["status"], "succeeded");
+    assert_eq!(moved["request"], *move_request.value());
     let rescan = rescan.expect("原生Serving设备线程必须执行持久rescan，不能一直queued");
     assert_eq!(rescan["status"], "succeeded");
     assert_eq!(rescan["request"], *request.value());

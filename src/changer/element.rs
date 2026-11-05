@@ -26,7 +26,8 @@ impl ElementType {
 }
 
 /// Element 地址映射（通过 MODE SENSE page 0x1D 获取）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ElementAddressMap {
     pub transport_start: u16,
     pub transport_count: u16,
@@ -47,6 +48,14 @@ pub struct ElementStatus {
     pub element_type: ElementType,
     /// 是否有介质
     pub full: bool,
+    /// Access 位；机械手 descriptor 没有该字段。
+    pub accessible: Option<bool>,
+    /// Except 位；异常细节保留原始 ASC/ASCQ。
+    pub exception: bool,
+    pub asc: u8,
+    pub ascq: u8,
+    /// ED 位：元素被禁用。
+    pub disabled: bool,
     /// READ ELEMENT STATUS descriptor byte 9 bits 2..0；0 表示设备未指定。
     pub medium_type: Option<u8>,
     /// Volume Tag（磁带条码）

@@ -9,6 +9,9 @@ mod pools;
 #[path = "management_rescan.rs"]
 mod rescan;
 
+#[path = "management_move.rs"]
+pub(super) mod moves;
+
 const MAX_QUEUED: usize = 100;
 
 pub(crate) fn prefix(namespace: Uuid, kind: u8) -> Vec<u8> {
@@ -74,7 +77,9 @@ fn task(bytes: &[u8], serial: &str, namespace: Uuid, epoch: u64, operation: Uuid
     let value: Value =
         serde_json::from_slice(bytes).map_err(|_| CatalogError::Corrupt("管理回执 JSON"))?;
     if !value.as_object().is_some_and(|v| {
-        v.len() == 12
+        let moving = value["request"]["change"]["kind"] == "media-move";
+        v.len() == if moving { 13 } else { 12 }
+            && (!moving || v.contains_key("execution"))
             && [
                 "version",
                 "library_serial",
@@ -143,6 +148,7 @@ fn task(bytes: &[u8], serial: &str, namespace: Uuid, epoch: u64, operation: Uuid
     {
         return Err(CatalogError::Corrupt("终态管理回执无效"));
     }
+    moves::validate_execution(&value, &request)?;
     Ok(value)
 }
 async fn require_queue(
@@ -219,7 +225,15 @@ fn task_event_view(value: &Value) -> Value {
     } else {
         &change["pool"]
     };
-    json!({"task_id":format!("{}:{}:{}:{}",value["namespace"].as_str().expect("validated namespace"),value["library_serial"].as_str().expect("validated library"),value["epoch"].as_u64().expect("validated epoch"),value["operation"].as_str().expect("validated operation")),"kind":change["kind"],"pool":pool,"barcode":change["barcode"],"status":value["status"]})
+    let mut view = json!({"task_id":format!("{}:{}:{}:{}",value["namespace"].as_str().expect("validated namespace"),value["library_serial"].as_str().expect("validated library"),value["epoch"].as_u64().expect("validated epoch"),value["operation"].as_str().expect("validated operation")),"kind":change["kind"],"pool":pool,"barcode":change["barcode"],"status":value["status"]});
+    if change["kind"] == "media-move" {
+        view["execution"] = if value["execution"].is_null() {
+            Value::Null
+        } else {
+            json!({"phase":value["execution"]["phase"],"error":value["execution"]["error"]})
+        };
+    }
+    view
 }
 async fn write_task(tr: &Transaction, request: &ManagementRequest, value: &Value) -> Result<()> {
     let serial = request.value()["library"]
@@ -312,10 +326,11 @@ impl ManagedCatalog {
             if request.epoch()!=w.accepting {return Err(CatalogError::Invalid("管理请求代次已关闭"));}
             let queued=read_page(&tr,&library_prefix(ns,serial,b'q'),None,MAX_QUEUED,false).await?;
             if queued.items.len()>=MAX_QUEUED {return Err(CatalogError::ManagementQueueFull);}
-            let value=json!({"version":1,"library_serial":serial,"namespace":ns.to_string(),
+            let mut value=json!({"version":1,"library_serial":serial,"namespace":ns.to_string(),
                 "operation":request.operation().to_string(),"epoch":request.epoch(),"request":request.value(),
                 "fingerprint":request.fingerprint(),"status":"queued","created_at_millis":now(),
                 "completed_at_millis":null,"owner_epoch":0,"result":null});
+            if request.value()["change"]["kind"]=="media-move" {value["execution"]=Value::Null;}
             write_task(&tr,request,&value).await?;
             tr.set(&identity_key(ns,serial,b'q',request.epoch(),request.operation()),b"");
             Ok(value)

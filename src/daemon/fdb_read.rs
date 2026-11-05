@@ -62,6 +62,25 @@ impl ActiveMediaReader<'_> {
         verify_holder(self.device, self.key)
     }
 
+    async fn check_readable(&self) -> Result<()> {
+        self.catalog
+            .require_active_library_readable(self.serial, self.route, self.key.round())
+            .await
+            .map_err(|error| {
+                if matches!(
+                    error.domain(),
+                    crate::managed_catalog::CatalogError::PoolBusy
+                ) {
+                    TapeError::MaintenanceBusy {
+                        library: self.serial.into(),
+                    }
+                } else {
+                    TapeError::Catalog(error.to_string())
+                }
+            })?;
+        self.check_device_owner()
+    }
+
     async fn verify_media_head(
         &self,
         barcode: &str,
@@ -75,7 +94,7 @@ impl ActiveMediaReader<'_> {
             .await
             .map_err(|error| TapeError::Catalog(error.to_string()))?
             .ok_or_else(|| TapeError::Catalog("FDB 读取卷未绑定当前带库".into()))?;
-        self.check_device_owner()?;
+        self.check_readable().await?;
         let label = read_label_only(self.device)?;
         if label.volume_uuid != head.volume_id || label.volume_uuid != volume {
             return Err(TapeError::Catalog(
@@ -118,7 +137,7 @@ impl ActiveMediaReader<'_> {
             )
             .await
             .map_err(|error| TapeError::Catalog(error.to_string()))?;
-        self.check_device_owner()?;
+        self.check_readable().await?;
         Ok((label, head))
     }
 
@@ -142,7 +161,7 @@ impl ActiveMediaReader<'_> {
         cache_dir: &Path,
         spool_dir: &Path,
     ) -> Result<Option<ActiveMediaRead>> {
-        self.check_device_owner()?;
+        self.check_readable().await?;
         let source = self
             .catalog
             .resolve_active_read_source_for_owner(self.serial, path, self.route, self.key.round())
@@ -181,7 +200,7 @@ impl ActiveMediaReader<'_> {
                 )?;
                 storage.finish()?;
                 let pin = CachePin::open(&cache_path)?;
-                self.check_device_owner()?;
+                self.check_readable().await?;
                 let final_source = self
                     .catalog
                     .resolve_active_read_source_for_owner(
@@ -207,7 +226,7 @@ impl ActiveMediaReader<'_> {
                         "FDB 文件或卷头在缓存重建期间改变".into(),
                     ));
                 }
-                self.check_device_owner()?;
+                self.check_readable().await?;
                 pin
             }
             Err(error) => return Err(error),
@@ -237,7 +256,7 @@ impl ActiveMediaReader<'_> {
         spool_dir: &Path,
         managed_cache: Option<&Path>,
     ) -> Result<Option<ActiveMediaRead>> {
-        self.check_device_owner()?;
+        self.check_readable().await?;
         let _cache_pin = CachePin::open(cache_path)?;
         let plan = self
             .catalog
@@ -292,7 +311,7 @@ impl ActiveMediaReader<'_> {
         if actual != plan.read.copy.content_digest {
             return Err(TapeError::Catalog("FDB 文件读取摘要不符".into()));
         }
-        self.check_device_owner()?;
+        self.check_readable().await?;
         let final_plan = self
             .catalog
             .resolve_active_read_for_owner(
@@ -317,7 +336,7 @@ impl ActiveMediaReader<'_> {
         if final_plan.as_ref() != Some(&plan) || final_head != Some(head) {
             return Err(TapeError::Catalog("FDB 文件或卷头在读取期间改变".into()));
         }
-        self.check_device_owner()?;
+        self.check_readable().await?;
         writer.file.rewind()?;
         Ok(Some(ActiveMediaRead {
             metadata: plan.read,

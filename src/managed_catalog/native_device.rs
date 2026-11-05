@@ -7,7 +7,7 @@ fn domain(ns: Uuid, kind: u8) -> Vec<u8> {
     out
 }
 
-fn library_gate(ns: Uuid, serial: &str) -> Vec<u8> {
+pub(super) fn library_gate(ns: Uuid, serial: &str) -> Vec<u8> {
     let mut out = domain(ns, b'l');
     append_component(&mut out, serial.as_bytes());
     out

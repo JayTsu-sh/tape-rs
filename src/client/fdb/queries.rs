@@ -61,7 +61,7 @@ fn check_library(value: &Value, library: &str, namespace: &str) -> Result<()> {
     }
     Ok(())
 }
-fn barcode(value: &str) -> bool {
+pub(super) fn barcode(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
         && value

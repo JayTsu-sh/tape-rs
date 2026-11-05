@@ -30,7 +30,7 @@ impl Context<'_> {
             })
             && self.permission.allows(self.active.round, Phase::Serving)
     }
-    fn identity_error(&self) -> Option<String> {
+    pub(super) fn identity_error(&self) -> Option<String> {
         if self.active.key.node() != self.node || self.active.key.round() != self.active.round {
             return Some(format!(
                 "预留键节点/轮次为{}/{}，期望{}/{}",
@@ -114,7 +114,7 @@ impl Attempt {
         }
     }
 }
-fn bounded_error(text: &str) -> String {
+pub(super) fn bounded_error(text: &str) -> String {
     if text.len() <= 2048 {
         return text.into();
     }
@@ -130,18 +130,24 @@ pub(super) enum Publication<T> {
     Lost(String),
     Failed { detail: String, permanent: bool },
 }
+
+impl<T> Publication<T> {
+    pub(super) fn map<U>(self, f: impl FnOnce(T) -> U) -> Publication<U> {
+        match self {
+            Self::Confirmed(value) => Publication::Confirmed(f(value)),
+            Self::Paused => Publication::Paused,
+            Self::Lost(reason) => Publication::Lost(reason),
+            Self::Failed { detail, permanent } => Publication::Failed { detail, permanent },
+        }
+    }
+}
+
 fn catalog_result<T>(result: std::result::Result<T, CatalogError>) -> Publication<T> {
     let error = match result {
         Ok(value) => return Publication::Confirmed(value),
         Err(error) => error,
     };
-    let mut domain = &error;
-    while let CatalogError::Fdb(foundationdb::FdbBindingError::CustomError(inner)) = domain {
-        let Some(next) = inner.downcast_ref::<CatalogError>() else {
-            break;
-        };
-        domain = next;
-    }
+    let domain = error.domain();
     if matches!(
         domain,
         CatalogError::OwnerFenced | CatalogError::MaintenanceFenced
@@ -230,6 +236,22 @@ impl Publisher {
         assert!(self.idle(), "先结清原观测");
         self.completed = None;
         self.next = Instant::now();
+    }
+    /// Publish the exact reconciled reply; do not take an unrelated second sample.
+    pub(super) fn request_sample(&mut self, round: u64, inventory: Value) {
+        assert!(self.idle(), "先结清原观测");
+        self.round = round;
+        self.completed = None;
+        self.next = Instant::now();
+        self.pending = Some(Attempt {
+            captured_at: inventory["observed_at"]
+                .as_str()
+                .expect("capture time")
+                .into(),
+            inventory: Some(inventory),
+            inventory_confirmed: false,
+            error: None,
+        });
     }
     pub(super) fn take_completion(&mut self) -> Option<Completion> {
         self.completed.take()

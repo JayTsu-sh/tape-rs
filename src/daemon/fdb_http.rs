@@ -183,6 +183,13 @@ async fn ready(State(ctx): State<Arc<Context>>, request: Request) -> Response {
                 Ok(Some(actual)) if actual == (*route, executor.round) => {}
                 _ => return unavailable("FDB owner epoch 尚未就绪"),
             }
+            if let Err(error) = ctx
+                .catalog
+                .require_active_library_readable(serial, *route, executor.round)
+                .await
+            {
+                return unavailable(&format!("带库设备暂不可读：{error}"));
+            }
         }
     }
     reply(
@@ -304,6 +311,10 @@ fn metadata_router(ctx: Arc<Context>) -> Router {
         .route(
             "/libraries/{serial}/admin/library/rescan",
             axum::routing::post(pools::rescan),
+        )
+        .route(
+            "/libraries/{serial}/admin/tapes/{barcode}/move",
+            axum::routing::post(pools::tape_move),
         )
         .route("/libraries/{serial}/admin/tapes", get(queries::tapes))
         .route(

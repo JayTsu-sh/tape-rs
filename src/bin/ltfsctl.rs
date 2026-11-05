@@ -171,6 +171,14 @@ enum TapeCmd {
     },
     /// 查询磁带详情
     Show { barcode: String },
+    /// 异步将指定条码归槽或移至I/E；必须保存原请求身份
+    Move {
+        barcode: String,
+        #[arg(value_parser = ["homeslot", "ieslot"])]
+        destination: String,
+        #[arg(long)]
+        request: std::path::PathBuf,
+    },
     /// 把磁带（条码）归入池（名称或 UUID）
     Assign { barcode: String, pool: String },
     /// 解除归属
@@ -432,6 +440,29 @@ fn main() {
                 args.pool.as_deref(),
                 &barcode,
             )?,
+            Cmd::Tape {
+                cmd:
+                    TapeCmd::Move {
+                        barcode,
+                        destination,
+                        request,
+                    },
+            } => {
+                let library = args
+                    .library
+                    .as_deref()
+                    .ok_or("tape move必须通过 --library 指定带库")?;
+                print_json(pool::submit(
+                    &tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?,
+                    library,
+                    tape_rs::client::fdb::management::ManagementIntent::TapeMove {
+                        barcode,
+                        destination,
+                        pool_selector: args.pool.clone(),
+                    },
+                    request,
+                )?);
+            }
             Cmd::Tape {
                 cmd: TapeCmd::Assign { barcode, pool },
             } => println!("{}", c.tape_assign(&barcode, &pool)?),

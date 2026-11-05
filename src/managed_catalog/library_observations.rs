@@ -62,7 +62,7 @@ struct MonitorRecord {
     last_success: Option<String>,
     error: Option<String>,
 }
-fn valid_time(value: &str) -> bool {
+pub(super) fn valid_time(value: &str) -> bool {
     value.len() <= 64 && chrono::DateTime::parse_from_rfc3339(value).is_ok()
 }
 fn cache_key(ns: Uuid, serial: &str, kind: &[u8]) -> Vec<u8> {
