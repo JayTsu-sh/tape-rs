@@ -569,7 +569,7 @@ impl ManagedCatalog {
                                     return Ok(PublishOutcome::BatchClaimed);
                                 }
                             }
-                            if let Some((reserved, reserved_permit)) =
+                            let reserved = if let Some((reserved, reserved_permit)) =
                                 reservation::matching_at(&tr, &r).await?
                             {
                                 if reserved_permit != permit
@@ -577,9 +577,14 @@ impl ManagedCatalog {
                                 {
                                     return Err(CatalogError::Corrupt("取消请求的写前预约不一致"));
                                 }
-                                reservation::clear(&tr, &reserved);
-                            }
+                                Some(reserved)
+                            } else {
+                                None
+                            };
                             let release = maintenance::release(&tr, r.namespace, permit).await?;
+                            if let Some(reserved) = &reserved {
+                                reservation::clear(&tr, reserved);
+                            }
                             release.apply(&tr);
                             tr.set(&op, &terminal_value(&fingerprint, None));
                             tr.clear(&intent);

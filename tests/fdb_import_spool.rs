@@ -2273,6 +2273,80 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                     .unwrap(),
                 PublishOutcome::Registered
             );
+            // A domain error is returned through a committing FDB closure.
+            // Failing quota validation must preserve the original Q/I/claims.
+            let request_key = |kind: u8| {
+                let mut key = b"tape-rs/catalog/22/".to_vec();
+                key.extend_from_slice(&[kind, b'/']);
+                key.extend_from_slice(namespace.as_bytes());
+                key.extend_from_slice(&committed_request.request_epoch.to_be_bytes());
+                key.extend_from_slice(committed_request.operation_id.as_bytes());
+                key
+            };
+            let mut volume_key = b"tape-rs/catalog/22/2/".to_vec();
+            volume_key.extend_from_slice(committed_request.volume_id.as_bytes());
+            volume_key.extend_from_slice(&committed_request.volume_generation.to_be_bytes());
+            volume_key.extend_from_slice(&committed_request.request_epoch.to_be_bytes());
+            volume_key.extend_from_slice(committed_request.operation_id.as_bytes());
+            let mut upgrade_key = volume_key.clone();
+            upgrade_key[b"tape-rs/catalog/22/".len()] = b'4';
+            let mut path_claim = b"tape-rs/catalog/22/1/l/".to_vec();
+            path_claim.extend_from_slice(namespace.as_bytes());
+            path_claim.extend_from_slice(committed_request.parent.as_bytes());
+            for byte in &committed_request.name {
+                if *byte == 0 {
+                    path_claim.extend_from_slice(&[0, 255]);
+                } else {
+                    path_claim.push(*byte);
+                }
+            }
+            path_claim.extend_from_slice(&[0, 0]);
+            let mut file_claim = b"tape-rs/catalog/22/1/n/".to_vec();
+            file_claim.extend_from_slice(namespace.as_bytes());
+            file_claim.extend_from_slice(committed_request.file_id.as_bytes());
+            let tr = direct.create_trx().unwrap();
+            let intent = tr.get(&request_key(b'I'), false).await.unwrap().unwrap();
+            let payload: serde_json::Value = serde_json::from_slice(&intent[32..]).unwrap();
+            let shard = u16::try_from(payload["permit"].as_u64().unwrap()).unwrap();
+            let mut quota = b"tape-rs/catalog/22/B/".to_vec();
+            quota.extend_from_slice(namespace.as_bytes());
+            quota.extend_from_slice(&0_u64.to_be_bytes());
+            quota.extend_from_slice(&shard.to_be_bytes());
+            let saved_quota = tr.get(&quota, false).await.unwrap().unwrap().to_vec();
+            let keys = [
+                request_key(b'0'),
+                volume_key,
+                path_claim,
+                file_claim,
+                request_key(b'I'),
+                upgrade_key,
+                request_key(b'P'),
+            ];
+            let mut before = Vec::new();
+            for key in &keys {
+                before.push(tr.get(key, false).await.unwrap().map(|v| v.to_vec()));
+            }
+            assert!(before[..6].iter().all(Option::is_some));
+            assert!(before[6].is_none());
+            tr.clear(&quota);
+            tr.commit().await.unwrap();
+            assert!(matches!(
+                catalog.cancel_request(&committed_request).await,
+                Err(tape_rs::managed_catalog::CatalogError::Corrupt(_))
+            ));
+            let tr = direct.create_trx().unwrap();
+            for (key, expected) in keys.iter().zip(&before) {
+                assert_eq!(
+                    tr.get(key, false).await.unwrap().map(|v| v.to_vec()),
+                    *expected,
+                    "failed cancellation changed a durable checkpoint"
+                );
+            }
+            assert!(tr.get(&quota, false).await.unwrap().is_none());
+            // Repair only this fixture's injected quota fault, then continue
+            // the original batch to prove its retained request remains usable.
+            tr.set(&quota, &saved_quota);
+            tr.commit().await.unwrap();
             let baseline_source = bindings[0].source;
             let baseline_index = ActiveIndexIdentity::from(baseline_source);
             let volume_id = bindings[0].placement.volume_id;
