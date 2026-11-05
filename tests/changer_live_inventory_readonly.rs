@@ -9,7 +9,7 @@ use tape_rs::{
         cdb,
         device::{ScsiDevice, ScsiResult},
         inquiry::{fc_target_port, normalize_fc_target_port},
-        reservation::{ReservationKey, verify_holder},
+        reservation::{ReservationKey, read_status, verify_holder},
         transport::TapeTransport,
     },
 };
@@ -114,6 +114,7 @@ fn physical_changer_rejects_partial_inventory_and_accepts_complete_map() {
         serial
     );
     verify_holder(&device, key).unwrap();
+    let before = read_status(&device).unwrap();
     let mut cases = Vec::new();
     for (label, scope) in [
         ("header_only", ReplyScope::Header),
@@ -157,8 +158,12 @@ fn physical_changer_rejects_partial_inventory_and_accepts_complete_map() {
         cases.push(json!({"scope":label,"expected_elements":expected,"returned_count":count,"core_error":error,"replies":replies}));
     }
     verify_holder(&device, key).unwrap();
+    let after = read_status(&device).unwrap();
+    assert_eq!(before.generation, after.generation);
+    assert_eq!(before.keys, after.keys);
+    assert_eq!(before.holder, after.holder);
     println!(
         "LIVE_CHANGER_STATUS_READ_AUDIT {}",
-        json!({"device":path,"serial":serial,"port":port,"pr_key":format!("{:#018x}",key.0),"cases":cases,"no_media_or_PR_OUT_commands":true})
+        json!({"device":path,"serial":serial,"port":port,"pr_key":format!("{:#018x}",key.0),"cases":cases,"pr_generation_before_after":after.generation,"no_media_or_PR_OUT_commands":true})
     );
 }
