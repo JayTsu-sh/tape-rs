@@ -4396,7 +4396,7 @@ fn s3_anonymous_objects_survive_owner_failover_and_share_file_namespace() {
 #[test]
 fn s3_buckets_follow_http_pool_management_without_media() {
     let c = Cluster::start_s3_fixture("s3-pools");
-    let (owner, _) = c.wait_serving(None, 0);
+    let (owner, round) = c.wait_serving(None, 0);
     let s3 = c.start_s3();
     let management = c.start_http();
     let result = s3_http(
@@ -4438,21 +4438,95 @@ fn s3_buckets_follow_http_pool_management_without_media() {
         b"abc",
     );
     assert_eq!(put.0, 503);
-    assert!(c.services[&owner].stat("/no-tape").unwrap().is_none());
-    let deleted = s3_http(
-        &management[owner as usize - 1],
-        "DELETE",
-        &format!("/admin/pools/{uuid}"),
-        "",
-        b"",
-    );
-    assert_eq!(deleted.0, 200, "{}", String::from_utf8_lossy(&deleted.2));
-    let listed = s3_http(&s3[&owner], "GET", "/", "", b"");
-    assert!(!String::from_utf8_lossy(&listed.2).contains(&bucket));
-    assert_eq!(
-        s3_http(&s3[&owner], "HEAD", &format!("/{bucket}"), "", b"").0,
-        404
-    );
+    // 主动制造被拒绝 PUT 与读回之间的合法 fencing 窗口。
+    c.isolated.lock().unwrap().insert(owner);
+    c.wait("失败上传后旧 owner 丧失许可", || {
+        matches!(
+            c.services[&owner].stat("/no-tape"),
+            Err(ServiceError::NotServing(_))
+        )
+    });
+    c.wait_serving(Some(owner), round + 1);
+    c.isolated.lock().unwrap().clear();
+    let serving_nodes = || {
+        (1..=3)
+            .filter(|node| {
+                let status = c.st(*node);
+                status.executor_ready
+                    && status
+                        .executor
+                        .as_ref()
+                        .is_some_and(|e| e.node == *node && e.fenced)
+            })
+            .collect::<Vec<_>>()
+    };
+    c.wait("S3 确认失败上传未创建目标池对象", || {
+        for node in serving_nodes() {
+            let readback = s3_http(&s3[&node], "GET", &format!("/{bucket}/no-tape"), "", b"");
+            match readback.0 {
+                404 => {
+                    assert!(
+                        String::from_utf8_lossy(&readback.2).contains("<Code>NoSuchKey</Code>"),
+                        "{}",
+                        String::from_utf8_lossy(&readback.2)
+                    );
+                    return true;
+                }
+                503 => {}
+                code => panic!(
+                    "S3 失败上传读回状态 {code}: {}",
+                    String::from_utf8_lossy(&readback.2)
+                ),
+            }
+        }
+        false
+    });
+    c.wait("接管后删除空池", || {
+        for node in 1..=3 {
+            if c.st(node).role != "Leader" {
+                continue;
+            }
+            let deleted = s3_http(
+                &management[node as usize - 1],
+                "DELETE",
+                &format!("/admin/pools/{uuid}"),
+                "",
+                b"",
+            );
+            match deleted.0 {
+                200 => return true,
+                503 => {
+                    // 明确未受理才可重新找 Leader；超时/响应丢失绝不重放 DELETE。
+                    let rejected: serde_json::Value = serde_json::from_slice(&deleted.2).unwrap();
+                    assert_eq!(rejected["error"], "not_leader", "{rejected}");
+                }
+                code => panic!(
+                    "删除空池失败 {code}: {}",
+                    String::from_utf8_lossy(&deleted.2)
+                ),
+            }
+        }
+        false
+    });
+    c.wait("S3 已删除池不再可见", || {
+        for node in serving_nodes() {
+            let listed = s3_http(&s3[&node], "GET", "/", "", b"");
+            match listed.0 {
+                503 => continue,
+                200 => {}
+                code => panic!("S3 列表失败 {code}: {}", String::from_utf8_lossy(&listed.2)),
+            }
+            if String::from_utf8_lossy(&listed.2).contains(&bucket) {
+                continue;
+            }
+            match s3_http(&s3[&node], "HEAD", &format!("/{bucket}"), "", b"").0 {
+                404 => return true,
+                200 | 503 => {}
+                code => panic!("S3 删除池读回状态 {code}"),
+            }
+        }
+        false
+    });
     c.shutdown();
 }
 
