@@ -196,11 +196,17 @@ impl Snapshot {
     }
 }
 
+#[derive(Clone)]
+struct Diagnostic {
+    detail: String,
+    permanent: bool,
+}
 pub(super) struct Job {
     pub request: ManagementRequest,
     plan: Option<MovePlan>,
     execution: Option<MoveExecution>,
-    diagnostic: Option<String>,
+    unload_attempted: bool,
+    diagnostic: Option<Diagnostic>,
     completion: Option<super::fdb_observations::Completion>,
     publishing: bool,
     pub evicted_drive: Option<usize>,
@@ -215,15 +221,34 @@ impl Job {
                     .map_err(|e| refused(e.to_string()))?,
             )
         };
+        // An existing Unloading intent may already have submitted its command.
+        // A new owner cannot infer completion/abort from a new epoch alone.
+        let unload_attempted = execution
+            .as_ref()
+            .is_some_and(|e| e.phase != MovePhase::Prepared);
         Ok(Self {
             request,
             plan: execution.as_ref().map(|e| e.plan.clone()),
             execution,
+            unload_attempted,
             diagnostic: None,
             completion: None,
             publishing: false,
             evicted_drive: None,
         })
+    }
+    pub(super) fn diagnostic_identity(&self) -> String {
+        format!(
+            "{} 条码={} 原目标={} 已确认阶段={:?}",
+            self.request.operation(),
+            self.request.value()["change"]["barcode"]
+                .as_str()
+                .expect("barcode"),
+            self.request.value()["change"]["destination"]
+                .as_str()
+                .expect("destination"),
+            self.execution.as_ref().map(|e| e.phase)
+        )
     }
     fn accept(&mut self, receipt: Value) -> Publication<bool> {
         if receipt["status"] != "running" {
@@ -250,23 +275,30 @@ impl Job {
         let serial = &context.control.serial;
         let route = context.control.route;
         let round = context.active.round;
-        if let Some(detail) = self.diagnostic.clone() {
+        if let Some(diagnostic) = self.diagnostic.clone() {
             if self.execution.is_none() {
-                return Ok(self.fail_preparation(&context, runtime, &detail));
+                return Ok(self.fail_preparation(&context, runtime, &diagnostic.detail));
             }
             let result = publish(
                 &context,
                 runtime,
-                catalog.defer_media_move(serial, route, round, &self.request, &detail),
+                catalog.defer_media_move(serial, route, round, &self.request, &diagnostic.detail),
             );
             return Ok(match result {
                 Publication::Confirmed(_) => {
                     self.diagnostic = None;
                     Publication::Failed {
-                        detail: detail.clone(),
-                        permanent: false,
+                        detail: diagnostic.detail,
+                        permanent: diagnostic.permanent,
                     }
                 }
+                Publication::Failed { detail, permanent } => Publication::Failed {
+                    detail: format!(
+                        "机械诊断回执未确认：{detail}；原诊断：{}",
+                        diagnostic.detail
+                    ),
+                    permanent: permanent || diagnostic.permanent,
+                },
                 other => other.map(|_| false),
             });
         }
@@ -290,7 +322,10 @@ impl Job {
                 Ok(plan) => self.plan = Some(plan),
                 Err(error) if ownership_lost(&error) => return Err(error),
                 Err(error) => {
-                    self.diagnostic = Some(bounded_error(&error.to_string()));
+                    self.diagnostic = Some(Diagnostic {
+                        detail: bounded_error(&error.to_string()),
+                        permanent: false,
+                    });
                     return Ok(Publication::Confirmed(false));
                 }
             }
@@ -315,7 +350,10 @@ impl Job {
         });
         match result {
             Publication::Confirmed(Err(detail)) => {
-                self.diagnostic = Some(bounded_error(&detail));
+                self.diagnostic = Some(Diagnostic {
+                    detail: bounded_error(&detail),
+                    permanent: false,
+                });
                 return Ok(Publication::Confirmed(false));
             }
             Publication::Confirmed(Ok(receipt)) => match self.accept(receipt) {
@@ -347,21 +385,44 @@ impl Job {
             )
             .map(|_| true));
         }
-        let step = self.advance(&context, runtime);
-        match step {
-            Ok(Some(snapshot)) => {
+        match self.advance(&context, runtime) {
+            Ok(Publication::Confirmed(Some(snapshot))) => {
                 publisher.request_sample(round, snapshot.observation);
                 self.publishing = true;
                 Ok(Publication::Confirmed(false))
             }
-            Ok(None) => Ok(Publication::Confirmed(false)),
+            Ok(Publication::Failed { detail, permanent }) => {
+                self.diagnostic = Some(Diagnostic {
+                    detail: bounded_error(&detail),
+                    permanent,
+                });
+                // First persist the permanent diagnostic, then let the shared
+                // controller stop this round. No CDB is issued between these polls.
+                Ok(if permanent {
+                    Publication::Confirmed(false)
+                } else {
+                    Publication::Failed {
+                        detail,
+                        permanent: false,
+                    }
+                })
+            }
+            Ok(other) => Ok(other.map(|_| false)),
             Err(error) if ownership_lost(&error) => Err(error),
             Err(error) => {
-                self.diagnostic = Some(bounded_error(&error.to_string()));
-                Ok(Publication::Confirmed(false))
+                let detail = bounded_error(&error.to_string());
+                self.diagnostic = Some(Diagnostic {
+                    detail: detail.clone(),
+                    permanent: false,
+                });
+                Ok(Publication::Failed {
+                    detail,
+                    permanent: false,
+                })
             }
         }
     }
+
     fn fail_preparation(
         &self,
         context: &Context<'_>,
@@ -385,12 +446,12 @@ impl Job {
         &mut self,
         context: &Context<'_>,
         runtime: &tokio::runtime::Runtime,
-    ) -> Result<Option<Snapshot>> {
+    ) -> Result<Publication<Option<Snapshot>>> {
         let original_plan = self.plan.clone().expect("prepared plan");
         let plan = &original_plan;
         let snapshot = Snapshot::capture(context)?;
         if snapshot.reconcile(plan)? {
-            return Ok(Some(snapshot));
+            return Ok(Publication::Confirmed(Some(snapshot)));
         }
         let phase = self.execution.as_ref().expect("running execution").phase;
         let source = snapshot.at(plan.source.address)?;
@@ -411,6 +472,15 @@ impl Job {
         // this mount before returning to the read/idle-unload dispatch loop, even
         // when a CDB fails. The shared gate already excludes new hardware reads.
         self.evicted_drive = drive;
+        if drive.is_some()
+            && phase == MovePhase::Unloading
+            && source.accessible != Some(true)
+            && self.unload_attempted
+        {
+            return Err(refused(
+                "原UNLOAD阶段仍不可访问（Access=0）；保留检查点等待完成/中止核对，禁止重复UNLOAD",
+            ));
+        }
         let next = if drive.is_some()
             && (phase == MovePhase::Prepared || source.accessible != Some(true))
         {
@@ -436,26 +506,25 @@ impl Job {
         ) {
             Publication::Confirmed(receipt) => match self.accept(receipt) {
                 Publication::Confirmed(false) => {}
-                Publication::Confirmed(true) => {
-                    return Err(refused("机械阶段已终结，禁止继续发送命令"));
-                }
-                _ => return Err(refused("原机械阶段回执无效")),
+                Publication::Confirmed(true) => return Ok(Publication::Confirmed(None)),
+                other => return Ok(other.map(|_| None)),
             },
-            Publication::Lost(reason) => return Err(context.lost(reason)),
-            Publication::Paused => return Ok(None),
-            Publication::Failed { detail, .. } => return Err(refused(detail)),
+            other => return Ok(other.map(|_| None)),
         }
         // The phase ACK may have taken seconds: sample again and check the exact
         // original source/target before issuing this one command.
         let fresh = Snapshot::capture(context)?;
         if fresh.reconcile(plan)? {
-            return Ok(Some(fresh));
+            return Ok(Publication::Confirmed(Some(fresh)));
         }
         let source = fresh.at(plan.source.address)?;
         if next == MovePhase::Unloading {
             if source.accessible == Some(true) && phase != MovePhase::Prepared {
-                return Ok(None);
+                return Ok(Publication::Confirmed(None));
             }
+            // Keep this proof across a lost phase ACK, but mark the attempt
+            // before entering any synchronous device call, including errors.
+            self.unload_attempted = true;
             TapeDrive::new(
                 context.active.devices[drive.expect("unload drive")]
                     .dev
@@ -478,7 +547,7 @@ impl Job {
         }
         // Never issue UNLOAD and MOVE together. The next poll first rechecks
         // ownership, the saved phase, and a fresh complete inventory.
-        Ok(None)
+        Ok(Publication::Confirmed(None))
     }
 }
 

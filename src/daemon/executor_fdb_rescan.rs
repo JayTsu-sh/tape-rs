@@ -48,7 +48,9 @@ impl Observer {
                 Ok(Some(value))
             }
             Publication::Paused => Ok(None),
-            Publication::Lost(reason) => Err(context.lost(reason)),
+            Publication::Lost(reason) => {
+                Err(context.lost(format!("{stage} 原任务{}：{reason}", self.task_identity())))
+            }
             Publication::Failed { detail, permanent } => {
                 self.failures = self.failures.saturating_add(1);
                 self.next = Instant::now() + retry_delay(self.failures);
@@ -58,16 +60,24 @@ impl Observer {
                     context.control.serial,
                     stage,
                     self.round,
-                    self.task
-                        .as_ref()
-                        .map(|t| t.request.operation().to_string())
-                        .unwrap_or_else(|| "未选取".into()),
+                    self.task_identity(),
                     permanent,
                     detail
                 );
                 Ok(None)
             }
         }
+    }
+    fn task_identity(&self) -> String {
+        self.mechanical
+            .as_ref()
+            .map(fdb_move::Job::diagnostic_identity)
+            .or_else(|| {
+                self.task
+                    .as_ref()
+                    .map(|t| t.request.operation().to_string())
+            })
+            .unwrap_or_else(|| "未选取".into())
     }
     pub(super) fn poll_device(
         &mut self,
@@ -208,7 +218,9 @@ impl Observer {
                 self.evicted.push(drive);
             }
             self.mechanical = Some(job);
-            let result = result?;
+            let result = result.map_err(|error| {
+                context.lost(format!("搬带原任务{}：{error}", self.task_identity()))
+            })?;
             if self.confirmed(&context, "搬带", result)? == Some(true) {
                 self.mechanical = None;
                 self.next = Instant::now() + Duration::from_millis(250);

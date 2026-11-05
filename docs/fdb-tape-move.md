@@ -37,11 +37,15 @@ HTTP：POST `/libraries/SERIAL/admin/tapes/BARCODE/move`，使用 `x-tapers-cata
 
 执行前原子保存原计划与带库互斥检查点。任务 `execution` 包含原 map、采样时间、源/目的地址、驱动身份、home、阶段及诊断。阶段是 `prepared -> unloading -> moving -> confirmed`；存储或 I/E 源无需卸带，走 `prepared -> moving -> confirmed`。每个阶段回执确认后才发相应命令，UNLOAD 与 MOVE 分两次轮询并重新核对许可、PR 和真实库存，保留原硬件长超时。
 
-超时或进程退出不证明命令未执行。恢复保留原条码、目标和计划，先观察完整库存：原条码已在目标且原源为空则确认，不再 MOVE；仍在原源且原目标空则由当前已隔离 owner 继续原阶段；其他位置、冲突、不可观测或地址 map 改变则保留 running 和诊断，禁止重选目标、隐式回滚或清除互斥检查点。UNLOAD 回执丢失后，如新观测 Access=1，则继续核对 MOVE，避免盲目重发 UNLOAD。准备阶段确认尚未开始的错误才可 failed，并标记 `effects=not_started`。
+超时或进程退出不证明命令未执行。恢复保留原条码、目标和计划，先观察完整库存：原条码已在目标且原源为空则确认，不再 MOVE；仍在原源且原目标空则由当前已隔离 owner 继续原阶段；其他位置、冲突、不可观测或地址 map 改变则保留 running 和诊断，禁止重选目标、隐式回滚或清除互斥检查点。UNLOAD 回执丢失后，如新观测 Access=1，则继续核对 MOVE，避免盲目重发 UNLOAD。Access=0 不证明旧 UNLOAD 已结束；本执行器已尝试过命令，或接管时只拿到原 `unloading` 检查点，则保留 running、互斥检查点和诊断，继续观察，禁止重发 UNLOAD。换 owner 轮次本身也不等于旧命令已中止。同一执行器仍能证明尚未调用过 UNLOAD 时，可以在原阶段回执确认后首次发送。若进程在保存卸带意图后、发送命令前退出，接管节点无法区别“未发送”与“仍在执行”；任务可能持续等待，需要先核实设备与原命令的完成或中止状态，不能靠重提请求或清除检查点解除。准备阶段确认尚未开始的错误才可 failed，并标记 `effects=not_started`。
 
 机械检查点未结清时，新设备读和自动卸带返回忙，`/readyz` 反映设备暂不可读；元数据查询和任务检查仍可用。新 owner 优先恢复原机械任务，普通启动恢复不得先 LOAD 介质。周期库存和显式扫描共用同一设备线程发布器；目标结果的原库存及巡检样本确认后才写成功终态、清除本任务的互斥检查点，终态回执未知时不覆盖原样本。
 
 FDB 状态变更及 `task.status.changed` 通知在同一事务提交，机械阶段和诊断进入任务通知投影。沿用通知消费者的持久游标和显式 ACK，不以连接断开删除事件。
+
+永久损坏会停止当前轮次的管理执行器；即使原事实随后被修复，也不会在该轮次自动继续机械操作。日志保留原 operation、条码、目标、已确认阶段和原始错误；诊断回执失败同样不视为未执行。
+
+READ ELEMENT STATUS 保持 CurData=0；IBM 文档说明此时带库忙会返回 check condition，正常结果必须是有效库存，不改用可能返回不完整状态的 CurData=1。
 
 状态位依据 [IBM TS4300 SCSI Reference SC27-4641-00](https://www.ibm.com/support/pages/system/files/inline-files/%24FILE/SC27-4641-00_1.pdf) printed50–58。命令形式参考 EE 运维语义；不声称已观测到 EE 内部的相同 SCSI 时序。
 

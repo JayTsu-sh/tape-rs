@@ -20,9 +20,12 @@ struct Faults {
     drop_move: AtomicBool,
     drop_unload: AtomicBool,
     revoke_unload: AtomicBool,
+    hold_unload: AtomicBool,
+    release_unload: AtomicBool,
+    pending_unload: Mutex<Option<std::thread::JoinHandle<Result<ScsiResult>>>>,
 }
 struct Trace {
-    inner: SimTransport,
+    inner: Arc<SimTransport>,
     faults: Arc<Faults>,
     permission: Arc<Permission>,
     round: u64,
@@ -33,6 +36,23 @@ impl TapeTransport for Trace {
     }
     fn execute_no_data(&self, cdb: &[u8], timeout: u32) -> Result<ScsiResult> {
         self.faults.commands.lock().unwrap().push(cdb.to_vec());
+        if cdb[0] == opcode::LOAD_UNLOAD
+            && cdb[4] == 0
+            && self.faults.hold_unload.swap(false, Ordering::SeqCst)
+        {
+            let inner = self.inner.clone();
+            let faults = self.faults.clone();
+            let command = cdb.to_vec();
+            let pending = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !faults.release_unload.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                inner.execute_no_data(&command, timeout)
+            });
+            *self.faults.pending_unload.lock().unwrap() = Some(pending);
+            return Err(TapeError::ScsiHost(3)); // original work still outstanding
+        }
         let result = self.inner.execute_no_data(cdb, timeout)?;
         if cdb[0] == opcode::MOVE_MEDIUM && self.faults.drop_move.swap(false, Ordering::SeqCst) {
             return Err(TapeError::ScsiHost(3)); // actual effect already happened
@@ -67,7 +87,7 @@ impl DeviceProvider for Provider {
     fn open_all(&self) -> Result<Vec<ManagedDevice>> {
         let wrap = |inner| {
             Box::new(Trace {
-                inner,
+                inner: Arc::new(inner),
                 faults: self.faults.clone(),
                 permission: self.permission.clone(),
                 round: self.round,
@@ -106,6 +126,17 @@ fn enqueue(
         )
         .unwrap();
     request
+}
+fn plan_for_home(context: &Context<'_>, runtime: &tokio::runtime::Runtime) -> MovePlan {
+    runtime
+        .block_on(context.control.catalog.active_tape_home_plan(
+            &context.control.serial,
+            context.control.route,
+            context.active.round,
+            "TEST01L8",
+        ))
+        .unwrap()
+        .unwrap()
 }
 fn saved(context: &Context<'_>, runtime: &tokio::runtime::Runtime, r: &ManagementRequest) -> Value {
     runtime
@@ -218,7 +249,10 @@ fn original_mechanical_checkpoint_survives_ack_loss_and_takeover_without_duplica
     // but the wrapper returns a host error after that side effect.
     assert!(matches!(
         job.poll(context(), &mut publisher, &runtime).unwrap(),
-        Publication::Confirmed(false)
+        Publication::Failed {
+            permanent: false,
+            ..
+        }
     ));
     assert_eq!(
         saved(&context(), &runtime, &request)["execution"]["phase"],
@@ -454,6 +488,99 @@ fn original_mechanical_checkpoint_survives_ack_loss_and_takeover_without_duplica
         "succeeded"
     );
 
+    // The old command may outlive its host error. Keep its actual simulated
+    // effect in a worker until explicitly released; Access remains zero meanwhile.
+    move_medium(&active.devices, map.storage_start, map.dt_start).unwrap();
+    wait_ready(active.devices[1].dev.as_ref()).unwrap();
+    let pending_unload = enqueue(&context(), &runtime, "homeslot");
+    let mut unloading = Job::new(
+        pending_unload.clone(),
+        &saved(&context(), &runtime, &pending_unload),
+    )
+    .unwrap();
+    faults.hold_unload.store(true, Ordering::SeqCst);
+    faults.release_unload.store(false, Ordering::SeqCst);
+    faults.commands.lock().unwrap().clear();
+    unloading.poll(context(), &mut publisher, &runtime).unwrap();
+    assert!(faults.pending_unload.lock().unwrap().is_some());
+    for _ in 0..4 {
+        unloading.poll(context(), &mut publisher, &runtime).unwrap();
+    }
+    let mut recovered_unload = Job::new(
+        pending_unload.clone(),
+        &saved(&context(), &runtime, &pending_unload),
+    )
+    .unwrap();
+    for _ in 0..4 {
+        recovered_unload
+            .poll(context(), &mut publisher, &runtime)
+            .unwrap();
+    }
+    let attempts = faults
+        .commands
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c[0] == opcode::LOAD_UNLOAD && c[4] == 0)
+        .count();
+    faults.release_unload.store(true, Ordering::SeqCst);
+    let completed = faults
+        .pending_unload
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(attempts, 1, "原UNLOAD仍在执行且Access=0，不能重发UNLOAD");
+    completed.unwrap();
+    assert_eq!(
+        saved(&context(), &runtime, &pending_unload)["status"],
+        "running"
+    );
+    assert_eq!(
+        finish(context(), &runtime, &mut recovered_unload, &mut publisher)["status"],
+        "succeeded"
+    );
+
+    // A still-running original executor can prove no command was called when
+    // only the phase ACK was lost. It may confirm that exact phase and send once.
+    move_medium(&active.devices, map.storage_start, map.dt_start).unwrap();
+    wait_ready(active.devices[1].dev.as_ref()).unwrap();
+    let phase_lost = enqueue(&context(), &runtime, "homeslot");
+    let plan = Snapshot::capture(&context())
+        .unwrap()
+        .plan(&phase_lost, Some(&plan_for_home(&context(), &runtime)))
+        .unwrap();
+    let receipt = runtime
+        .block_on(catalog.prepare_media_move(&serial, route, round, &phase_lost, &plan))
+        .unwrap();
+    let mut local = Job::new(phase_lost.clone(), &receipt).unwrap();
+    runtime
+        .block_on(catalog.stage_media_move(
+            &serial,
+            route,
+            round,
+            &phase_lost,
+            MovePhase::Unloading,
+        ))
+        .unwrap(); // committed, ACK dropped locally
+    faults.commands.lock().unwrap().clear();
+    assert_eq!(
+        finish(context(), &runtime, &mut local, &mut publisher)["status"],
+        "succeeded"
+    );
+    assert_eq!(
+        faults
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c[0] == opcode::LOAD_UNLOAD && c[4] == 0)
+            .count(),
+        1
+    );
+
     // Revoke precisely after UNLOAD: the original journal stays running and no
     // MOVE is sent under that old permission. The next fenced owner resumes it.
     move_medium(&active.devices, map.storage_start, map.dt_start).unwrap();
@@ -566,6 +693,57 @@ fn original_mechanical_checkpoint_survives_ack_loss_and_takeover_without_duplica
             .unwrap()
             .is_none()
     );
+    // A permanent stage error must stop this controller even after somebody
+    // repairs the stored fact. No hidden same-round recovery or second CDB scan.
+    let broken = enqueue(&context, &runtime, "ieslot");
+    let plan = Snapshot::capture(&context)
+        .unwrap()
+        .plan(&broken, Some(&plan_for_home(&context, &runtime)))
+        .unwrap();
+    runtime
+        .block_on(catalog.prepare_media_move(&serial, route, next, &broken, &plan))
+        .unwrap();
+    let db = foundationdb::Database::from_path(&cluster).unwrap();
+    let mut reverse = b"tape-rs/catalog/22/c/".to_vec();
+    reverse.extend_from_slice(serial.as_bytes());
+    reverse.extend_from_slice(b"\0\0TEST01L8\0\0");
+    let orphan = Uuid::new_v4();
+    let tr = db.create_trx().unwrap();
+    assert!(runtime.block_on(tr.get(&reverse, false)).unwrap().is_none());
+    tr.set(&reverse, orphan.as_bytes());
+    runtime.block_on(tr.commit()).unwrap();
+    let mut blocked = super::super::fdb_rescan::Observer::default();
+    faults.commands.lock().unwrap().clear();
+    blocked.poll(context, &runtime).unwrap();
+    blocked.poll(context, &runtime).unwrap();
+    let count = faults.commands.lock().unwrap().len();
+    let task = saved(&context, &runtime, &broken);
+    assert_eq!(task["status"], "running");
+    assert!(
+        task["execution"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("损坏")
+    );
+    let tr = db.create_trx().unwrap();
+    assert_eq!(
+        runtime
+            .block_on(tr.get(&reverse, false))
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        orphan.as_bytes()
+    );
+    tr.clear(&reverse);
+    runtime.block_on(tr.commit()).unwrap();
+    std::thread::sleep(Duration::from_millis(1400));
+    blocked.poll(context, &runtime).unwrap();
+    assert_eq!(
+        faults.commands.lock().unwrap().len(),
+        count,
+        "永久Corrupt后修复事实也不能在本轮自动重试"
+    );
+    assert_eq!(saved(&context, &runtime, &broken)["status"], "running");
     drop(active);
     drop(files);
     std::fs::remove_dir_all(root).unwrap();
