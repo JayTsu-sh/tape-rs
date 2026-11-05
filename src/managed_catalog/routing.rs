@@ -65,13 +65,13 @@ pub enum ActiveOwnerOutcome {
     Stale,
 }
 
-fn active_key(serial: &str) -> Vec<u8> {
+pub(super) fn active_key(serial: &str) -> Vec<u8> {
     let mut out = key(b'A');
     append_component(&mut out, serial.as_bytes());
     out
 }
 
-fn encode_active(value: ActiveLibraryRoute) -> [u8; ACTIVE_ROUTE_LEN] {
+pub(super) fn encode_active(value: ActiveLibraryRoute) -> [u8; ACTIVE_ROUTE_LEN] {
     let mut out = [0; ACTIVE_ROUTE_LEN];
     out[0] = 1;
     out[1..17].copy_from_slice(value.route.namespace.as_bytes());
@@ -82,7 +82,7 @@ fn encode_active(value: ActiveLibraryRoute) -> [u8; ACTIVE_ROUTE_LEN] {
     out
 }
 
-fn decode_active(bytes: &[u8]) -> Result<ActiveLibraryRoute> {
+pub(super) fn decode_active(bytes: &[u8]) -> Result<ActiveLibraryRoute> {
     if bytes.len() != ACTIVE_ROUTE_LEN || bytes[0] != 1 {
         return Err(CatalogError::Corrupt("活动带库路由格式"));
     }
@@ -108,7 +108,7 @@ fn decode_active(bytes: &[u8]) -> Result<ActiveLibraryRoute> {
     Ok(value)
 }
 
-fn certificate_key(serial: &str) -> Vec<u8> {
+pub(super) fn certificate_key(serial: &str) -> Vec<u8> {
     let mut out = key(b'x');
     append_component(&mut out, serial.as_bytes());
     out
@@ -158,7 +158,7 @@ fn source_certificate(
     })
 }
 
-fn encode_certificate(value: CutoverCertificate) -> [u8; CUTOVER_CERTIFICATE_LEN] {
+fn encode_certificate(value: CutoverCertificate) -> Vec<u8> {
     let mut out = [0; CUTOVER_CERTIFICATE_LEN];
     out[0] = 1;
     out[1..17].copy_from_slice(value.route.namespace.as_bytes());
@@ -175,10 +175,13 @@ fn encode_certificate(value: CutoverCertificate) -> [u8; CUTOVER_CERTIFICATE_LEN
         out[at + 8..at + 16].copy_from_slice(&node.applied_index.to_be_bytes());
         out[at + 16..at + 48].copy_from_slice(&node.snapshot_sha256);
     }
-    out
+    [b"I".as_slice(), out.as_slice()].concat()
 }
 
 fn decode_certificate(bytes: &[u8]) -> Result<CutoverCertificate> {
+    let bytes = bytes
+        .strip_prefix(b"I")
+        .ok_or(CatalogError::Corrupt("导入激活证明类型"))?;
     if bytes.len() != CUTOVER_CERTIFICATE_LEN || bytes[0] != 1 {
         return Err(CatalogError::Corrupt("带库切换来源证明格式"));
     }
@@ -239,7 +242,7 @@ fn decode_certificate(bytes: &[u8]) -> Result<CutoverCertificate> {
     Ok(value)
 }
 
-fn route_key(serial: &str) -> Vec<u8> {
+pub(super) fn route_key(serial: &str) -> Vec<u8> {
     let mut out = key(b'z');
     append_component(&mut out, serial.as_bytes());
     out
@@ -260,7 +263,7 @@ fn decode_route(value: &[u8]) -> Result<PreparedLibraryRoute> {
     })
 }
 
-fn encode_route(route: PreparedLibraryRoute) -> [u8; 25] {
+pub(super) fn encode_route(route: PreparedLibraryRoute) -> [u8; 25] {
     let mut value = [0; 25];
     value[0] = 1;
     value[1..17].copy_from_slice(route.namespace.as_bytes());
@@ -319,11 +322,18 @@ async fn sealed_context(
     ))
 }
 
-async fn active_context(tr: &Transaction, serial: &str, active: ActiveLibraryRoute) -> Result<()> {
+pub(super) async fn active_context(
+    tr: &Transaction,
+    serial: &str,
+    active: ActiveLibraryRoute,
+) -> Result<()> {
     let certificate = tr
         .get(&certificate_key(serial), false)
         .await?
         .ok_or(CatalogError::Incomplete)?;
+    if certificate.first() == Some(&b'N') {
+        return native_init::active_context(tr, serial, active, &certificate).await;
+    }
     control::require_managed_layout(tr, active.route.namespace).await?;
     let decoded = decode_certificate(&certificate)?;
     if Sha256::digest(&certificate)[..] != active.certificate_sha256
@@ -901,6 +911,33 @@ impl ManagedCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imported_certificate_requires_explicit_provenance() {
+        let value = CutoverCertificate {
+            route: PreparedLibraryRoute {
+                namespace: Uuid::new_v4(),
+                revision: 1,
+            },
+            frozen_index: 90,
+            selected_node: 1,
+            catalog_sha256: [1; 32],
+            imported_snapshot_sha256: [2; 32],
+            manifest_sha256: [3; 32],
+            sealed_projection_sha256: [4; 32],
+            nodes: std::array::from_fn(|i| CutoverNode {
+                node_id: i as u64 + 1,
+                applied_index: 92,
+                snapshot_sha256: [2; 32],
+            }),
+        };
+        let encoded = encode_certificate(value);
+        assert_eq!(decode_certificate(&encoded).unwrap(), value);
+        assert!(decode_certificate(&encoded[1..]).is_err());
+        let mut wrong = encoded.clone();
+        wrong[0] = b'N';
+        assert!(decode_certificate(&wrong).is_err());
+    }
 
     #[test]
     fn active_route_encoding_rejects_corruption() {

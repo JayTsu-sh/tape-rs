@@ -38,8 +38,10 @@ mod physical;
 pub use physical::{
     ActiveFileIntent, PreparedActiveFile, prepare_active_file, prepare_committed_active_file,
 };
+mod native_init;
 mod requests;
 mod reservation;
+pub use native_init::{VerifiedNativeBarrier, verify_native_barriers};
 mod routing;
 mod staged_import;
 mod staged_sources;
@@ -581,6 +583,7 @@ impl ManagedCatalog {
                             if managed {
                                 tr.set(&managed_key, b"");
                                 control::initialize_managed_layout(&tr, namespace);
+                                control::management::initialize(&tr, namespace);
                                 tr.set(&source_revision_key, &0u64.to_be_bytes());
                             }
                             tr.set(

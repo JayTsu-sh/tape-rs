@@ -53,6 +53,8 @@ FDB 池记录使用 v4 格式，持久保存不可变的 `created_at_millis`，�
 
 受管目录初始化时原子保存布局证明；已有目录缺少证明或版本不受支持时，初始化重试、磁带归属读取/分配及活动路由的检查会拒绝，不自动补写证明。无根但含已知命名空间记录的数据也不能通过初始化补根。磁带归属倒排按 namespace、布局版本、pool、带库序列号和条码组织，读取时校验完整作用域与主归属一致；旧键格式不做兼容。此处仍为 FDB 目录基础能力，没有切换管理 HTTP 后端或改写现场数据库。
 
+原生空带库的 FDB 初始化存储入口为 `verify_native_barriers` 和 `ManagedCatalog::initialize_native_library`。每条屏障回复必须包含与目标带库匹配的 `library_serial`，缺失、错库或混用其他库的回复一律拒绝。调用方必须从三个已配置节点直接取得同一 challenge、term、leader、成员集合及冻结水位的屏障回复，确认执行器停止、目录无待提交状态且为空。初始化只接受未使用的 namespace，在一个事务内创建根、布局、请求窗口、路由与来源证书；遇到已有准备路由、证书或活动权威时拒绝覆盖，原成功请求重试只能返回已校验的结果，不能重置 owner。证书显式区分原生初始化（N）和目录导入（I），拒绝旧的无来源前缀证书。此接口不发设备命令，也不授予 Raft/PR 设备执行许可；CLI/HTTP 的屏障采集及管理接入仍需后续闭合。
+
 ## Raft/PR owner 只读接任阶段
 
 `--fdb-owner-readonly` 是独立于上述无设备只读入口的阶段性运行模式。它要求 `--fdb-cluster-file`、`--libraries-config` 和 `--client-listen`，并要求配置中的每个真实带库序列号已有有效 FDB Active 路由。此模式沿用原 `ltfsd` 三节点 Raft 数据目录和设备组配置：Raft 确定 owner 后，执行线程用同一多数派许可逐 CDB 守护并取得整个设备组的 PR；在 `Recover` 阶段逐设备回读 PR，核对本节点 Raft 的 `catalog_frozen_index` 等于 FDB 路由的 `frozen_index`，再推进 FDB owner epoch，之后再次核对许可和 PR。任一检查失败会报告该轮接任失败，不开放文件服务。
