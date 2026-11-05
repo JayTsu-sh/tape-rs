@@ -420,29 +420,33 @@ impl FdbClient {
             Some(&bytes),
             &[(NS, &p.namespace), ("content-type", "application/json")],
         );
-        let value = parsed(
-            response.map_err(|e| {
-                ClientError::Indeterminate(format!(
-                    "{}；保留请求文件{}，按原身份恢复",
-                    e,
-                    checkpoint.display()
-                ))
-            })?,
-            &statuses,
-        )?;
-        if matches!(p.input, PoolIntent::Create { .. }) {
-            scope(&value, &p.library, &p.namespace)?;
-            check_pool(&value["pool"], &p.library)?;
-            if value["pool"]["id"] != p.request["id"] {
-                return Err(ClientError::Indeterminate(
-                    "创建回执UUID不符，保留原请求文件".into(),
-                ));
-            }
-        } else {
-            check_task(&value, &p)?;
+        let unknown = |error: ClientError| {
+            ClientError::Indeterminate(format!(
+                "{}；保留请求文件{}，按原身份恢复",
+                error,
+                checkpoint.display()
+            ))
+        };
+        let response = response.map_err(unknown)?;
+        if !statuses.contains(&response.status) {
+            return Err(rejected(response));
         }
-        Ok(value)
+        let result = (|| {
+            let value = parsed(response, &statuses)?;
+            if matches!(p.input, PoolIntent::Create { .. }) {
+                scope(&value, &p.library, &p.namespace)?;
+                check_pool(&value["pool"], &p.library)?;
+                if value["pool"]["id"] != p.request["id"] {
+                    return Err(ClientError::Verification("创建回执UUID不符".into()));
+                }
+            } else {
+                check_task(&value, &p)?;
+            }
+            Ok(value)
+        })();
+        result.map_err(unknown)
     }
+
     pub fn pool_request_status(&self, checkpoint: &Path, cancel: bool) -> Result<Value> {
         let p = PoolRequest::load(checkpoint)?;
         if matches!(p.input, PoolIntent::Create { .. }) {
@@ -612,6 +616,32 @@ mod tests {
         assert!(a.starts_with("POST /libraries/LIB%20%E4%B8%AD%E6%96%87/admin/pools HTTP/1.1"));
         assert!(a.contains(&format!("x-tapers-catalog-namespace: {}", p.namespace)));
         assert_eq!(PoolRequest::load(&path).unwrap().request, p.request);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn malformed_success_receipts_are_unknown_without_changing_checkpoint() {
+        use super::super::tests::{response, server};
+        let p = prepared();
+        let dir = dir();
+        let path = dir.join("request");
+        p.save_new(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        for body in [
+            "null".to_owned(),
+            "bad JSON".to_owned(),
+            json!({"namespace":Uuid::new_v4().to_string(),"library_serial":p.library,"pool":{}})
+                .to_string(),
+        ] {
+            let (address, worker) = server(response(201, &body), Duration::ZERO);
+            let error = FdbClient::new([address])
+                .unwrap()
+                .submit_pool(&path)
+                .unwrap_err();
+            assert!(matches!(error, ClientError::Indeterminate(_)), "{error}");
+            let raw = String::from_utf8(worker.join().unwrap()).unwrap();
+            assert!(raw.ends_with(&p.request.to_string()));
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]

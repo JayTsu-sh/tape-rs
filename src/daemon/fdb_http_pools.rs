@@ -6,27 +6,66 @@ use uuid::Uuid;
 
 const NAMESPACE: &str = "x-tapers-catalog-namespace";
 
-fn route(ctx: &Context, serial: &str) -> Result<ActiveLibraryRoute, Response> {
+fn boxed_reply(status: StatusCode, body: Value) -> Box<Response> {
+    Box::new(reply(status, body))
+}
+fn bad(reason: &str) -> Box<Response> {
+    Box::new(invalid(reason))
+}
+fn busy(reason: &str) -> Box<Response> {
+    Box::new(unavailable(reason))
+}
+fn route(ctx: &Context, serial: &str) -> Result<ActiveLibraryRoute, Box<Response>> {
     ctx.routes.get(serial).copied().ok_or_else(|| {
-        reply(
+        boxed_reply(
             StatusCode::NOT_FOUND,
             json!({"error":"library_not_found","detail":"带库未配置"}),
         )
     })
 }
-fn namespace(headers: &HeaderMap, route: ActiveLibraryRoute) -> Result<(), Response> {
+fn namespace(headers: &HeaderMap, route: ActiveLibraryRoute) -> Result<(), Box<Response>> {
     if headers.get_all(NAMESPACE).iter().count() != 1
         || headers.get(NAMESPACE).and_then(|v| v.to_str().ok())
             != Some(route.route.namespace.to_string().as_str())
     {
-        return Err(reply(
+        return Err(boxed_reply(
             StatusCode::CONFLICT,
             json!({"error":"namespace_changed","detail":"目录命名空间缺失、重复或已改变；请核对原请求"}),
         ));
     }
     Ok(())
 }
-fn failure(error: CatalogError) -> Response {
+fn cursor_prefix(serial: &str, expected: ActiveLibraryRoute) -> Vec<u8> {
+    let mut prefix = b"P1/".to_vec();
+    prefix.extend_from_slice(&(serial.len() as u64).to_be_bytes());
+    prefix.extend_from_slice(serial.as_bytes());
+    prefix.extend_from_slice(expected.route.namespace.as_bytes());
+    prefix
+}
+pub(super) fn pool_cursor(serial: &str, expected: ActiveLibraryRoute, raw: &[u8]) -> String {
+    let mut bytes = cursor_prefix(serial, expected);
+    bytes.extend_from_slice(raw);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+pub(super) fn decode_pool_cursor(
+    serial: &str,
+    expected: ActiveLibraryRoute,
+    encoded: &str,
+) -> Result<Vec<u8>, Box<Response>> {
+    if encoded.len() > 4096 {
+        return Err(bad("池分页游标过长"));
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| bad("池分页游标无效"))?;
+    let prefix = cursor_prefix(serial, expected);
+    bytes
+        .strip_prefix(prefix.as_slice())
+        .filter(|v| !v.is_empty())
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| bad("池分页游标的带库或命名空间不符"))
+}
+pub(super) fn failure(error: CatalogError) -> Response {
     let mut domain = &error;
     while let CatalogError::Fdb(foundationdb::FdbBindingError::CustomError(inner)) = domain {
         let Some(next) = inner.downcast_ref::<CatalogError>() else {
@@ -37,15 +76,21 @@ fn failure(error: CatalogError) -> Response {
     let (status, kind) = match domain {
         CatalogError::Invalid(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
         CatalogError::ManagementQueueFull => (StatusCode::TOO_MANY_REQUESTS, "queue_full"),
+        CatalogError::Corrupt(_) | CatalogError::Cache(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "catalog_corrupt")
+        }
         _ => (StatusCode::SERVICE_UNAVAILABLE, "catalog_unavailable"),
     };
-    reply(status, json!({"error":kind,"detail":domain.to_string()}))
+    reply(
+        status,
+        json!({"error":kind,"detail":domain.to_string(),"retryable":matches!(status,StatusCode::SERVICE_UNAVAILABLE|StatusCode::TOO_MANY_REQUESTS)}),
+    )
 }
-fn budget(ctx: &Context) -> Result<OwnedSemaphorePermit, Response> {
+fn budget(ctx: &Context) -> Result<OwnedSemaphorePermit, Box<Response>> {
     ctx.admin_requests
         .clone()
         .try_acquire_owned()
-        .map_err(|_| unavailable("管理并发已达上限，请稍后重试"))
+        .map_err(|_| busy("管理并发已达上限，请稍后重试"))
 }
 pub(super) async fn context(
     State(ctx): State<Arc<Context>>,
@@ -53,11 +98,11 @@ pub(super) async fn context(
 ) -> Response {
     let _permit = match budget(&ctx) {
         Ok(p) => p,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let expected = match route(&ctx, &serial) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     match ctx
         .catalog
@@ -78,14 +123,14 @@ pub(super) async fn list(
 ) -> Response {
     let _permit = match budget(&ctx) {
         Ok(p) => p,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let expected = match route(&ctx, &serial) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if let Err(r) = namespace(request.headers(), expected) {
-        return r;
+        return *r;
     }
     let limit = match query_value(&request, "limit") {
         Ok(None) => 100,
@@ -97,9 +142,9 @@ pub(super) async fn list(
     };
     let after = match query_value(&request, "after") {
         Ok(None) => None,
-        Ok(Some(text)) => match URL_SAFE_NO_PAD.decode(text) {
-            Ok(raw) if !raw.is_empty() => Some(raw),
-            _ => return invalid("池分页游标无效"),
+        Ok(Some(text)) => match decode_pool_cursor(&serial, expected, text) {
+            Ok(raw) => Some(raw),
+            Err(response) => return *response,
         },
         Err(e) => return invalid(e),
     };
@@ -114,7 +159,7 @@ pub(super) async fn list(
             match items {
                 Ok(items) => reply(
                     StatusCode::OK,
-                    json!({"library_serial":serial,"namespace":expected.route.namespace.to_string(),"items":items,"next":page.next.map(|v|URL_SAFE_NO_PAD.encode(v))}),
+                    json!({"library_serial":serial,"namespace":expected.route.namespace.to_string(),"items":items,"next":page.next.map(|v|pool_cursor(&serial,expected,&v))}),
                 ),
                 Err(e) => failure(e),
             }
@@ -129,14 +174,14 @@ pub(super) async fn show(
 ) -> Response {
     let _permit = match budget(&ctx) {
         Ok(p) => p,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let expected = match route(&ctx, &serial) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if let Err(r) = namespace(request.headers(), expected) {
-        return r;
+        return *r;
     }
     // UUID selectors never fall through to a different pool's name.
     let result = match Uuid::parse_str(&selector) {
@@ -176,9 +221,13 @@ struct Serving {
     round: u64,
     local: bool,
 }
-fn serving(ctx: &Context, serial: &str, expected: ActiveLibraryRoute) -> Result<Serving, Response> {
+fn serving(
+    ctx: &Context,
+    serial: &str,
+    expected: ActiveLibraryRoute,
+) -> Result<Serving, Box<Response>> {
     let owner = ctx.owner.as_ref().ok_or_else(|| {
-        reply(
+        boxed_reply(
             StatusCode::METHOD_NOT_ALLOWED,
             json!({"error":"metadata_readonly","detail":"修改池需要受管owner运行模式"}),
         )
@@ -186,7 +235,7 @@ fn serving(ctx: &Context, serial: &str, expected: ActiveLibraryRoute) -> Result<
     let library = owner
         .libraries
         .get(serial)
-        .ok_or_else(|| unavailable("带库执行上下文不存在"))?
+        .ok_or_else(|| busy("带库执行上下文不存在"))?
         .clone();
     let status = library
         .status
@@ -198,12 +247,13 @@ fn serving(ctx: &Context, serial: &str, expected: ActiveLibraryRoute) -> Result<
         .as_ref()
         .filter(|e| {
             status.executor_ready
+                && !status.catalog_pending
                 && e.fenced
                 && e.node != 0
                 && !status.shutting_down
                 && status.catalog_frozen_index == Some(expected.frozen_index)
         })
-        .ok_or_else(|| unavailable("带库owner尚未就绪"))?;
+        .ok_or_else(|| busy("带库owner尚未就绪"))?;
     let result = Serving {
         library: library.clone(),
         node: executor.node,
@@ -211,7 +261,7 @@ fn serving(ctx: &Context, serial: &str, expected: ActiveLibraryRoute) -> Result<
         local: executor.node == status.id,
     };
     if result.local && !live(&result, expected) {
-        return Err(unavailable("带库Serving多数派许可已失效"));
+        return Err(busy("带库Serving多数派许可已失效"));
     }
     Ok(result)
 }
@@ -226,6 +276,7 @@ fn live(owner: &Serving, expected: ActiveLibraryRoute) -> bool {
         && !status.shutting_down
         && status.id == owner.node
         && status.executor_ready
+        && !status.catalog_pending
         && status.catalog_frozen_index == Some(expected.frozen_index)
         && status
             .executor
@@ -239,12 +290,12 @@ async fn permitted<T>(
     owner: &Serving,
     expected: ActiveLibraryRoute,
     future: impl std::future::Future<Output = Result<T, CatalogError>>,
-) -> Result<T, Response> {
+) -> Result<T, Box<Response>> {
     let mut future = std::pin::pin!(future);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         if !live(owner, expected) || std::time::Instant::now() >= deadline {
-            return Err(reply(
+            return Err(boxed_reply(
                 StatusCode::SERVICE_UNAVAILABLE,
                 json!({"error":"outcome_unknown","detail":"owner许可失效或FDB等待超时；保留原请求身份并查询"}),
             ));
@@ -252,9 +303,9 @@ async fn permitted<T>(
         match tokio::time::timeout(std::time::Duration::from_millis(25), &mut future).await {
             Ok(result) => {
                 return if live(owner, expected) {
-                    result.map_err(failure)
+                    result.map_err(|e| Box::new(failure(e)))
                 } else {
-                    Err(reply(
+                    Err(boxed_reply(
                         StatusCode::SERVICE_UNAVAILABLE,
                         json!({"error":"outcome_unknown","detail":"FDB回执期间owner已变化，请按原请求查询"}),
                     ))
@@ -269,25 +320,25 @@ async fn writer(
     serial: &str,
     expected: ActiveLibraryRoute,
     request: Request,
-) -> Result<(Serving, Request), Response> {
+) -> Result<(Serving, Request), Box<Response>> {
     let local = serving(ctx, serial, expected)?;
     if local.local {
         return Ok((local, request));
     }
     if request.headers().contains_key("x-tapers-forwarded") {
-        return Err(unavailable("owner已变化，请按原请求查询"));
+        return Err(busy("owner已变化，请按原请求查询"));
     }
     let owner = ctx.owner.as_ref().expect("serving verified owner context");
     let address = owner
         .peers
         .get(&local.node)
-        .ok_or_else(|| unavailable("owner物理地址未配置"))?;
+        .ok_or_else(|| busy("owner物理地址未配置"))?;
     let permit = owner
         .requests
         .clone()
         .try_acquire_owned()
-        .map_err(|_| unavailable("owner转发并发已达上限"))?;
-    Err(
+        .map_err(|_| busy("owner转发并发已达上限"))?;
+    Err(Box::new(
         match tokio::time::timeout(
             std::time::Duration::from_secs(30),
             gateway::forward_request(request, address, permit, serial),
@@ -300,28 +351,28 @@ async fn writer(
                 json!({"error":"outcome_unknown","detail":"管理回执超时；保留原请求身份并查询，不要换ID"}),
             ),
         },
-    )
+    ))
 }
-async fn body<T: serde::de::DeserializeOwned>(request: Request) -> Result<T, Response> {
+async fn body<T: serde::de::DeserializeOwned>(request: Request) -> Result<T, Box<Response>> {
     let bytes = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         axum::body::to_bytes(request.into_body(), 4096),
     )
     .await
     .map_err(|_| {
-        reply(
+        boxed_reply(
             StatusCode::REQUEST_TIMEOUT,
             json!({"error":"body_timeout","detail":"管理请求体读取超时"}),
         )
     })?
-    .map_err(|_| invalid("管理请求体读取失败或超过4KiB"))?;
-    serde_json::from_slice(&bytes).map_err(|_| invalid("管理JSON字段无效、重复或超出类型范围"))
+    .map_err(|_| bad("管理请求体读取失败或超过4KiB"))?;
+    serde_json::from_slice(&bytes).map_err(|_| bad("管理JSON字段无效、重复或超出类型范围"))
 }
-fn canonical_id(text: &str) -> Result<Uuid, Response> {
+fn canonical_id(text: &str) -> Result<Uuid, Box<Response>> {
     Uuid::parse_str(text)
         .ok()
         .filter(|id| !id.is_nil() && id.to_string() == text)
-        .ok_or_else(|| invalid("标识须为规范的非零UUID"))
+        .ok_or_else(|| bad("标识须为规范的非零UUID"))
 }
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -350,29 +401,29 @@ pub(super) async fn create(
     use crate::managed_catalog::{ActivePoolCreation, PoolPolicy, PoolRecord};
     let _permit = match budget(&ctx) {
         Ok(p) => p,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let expected = match route(&ctx, &serial) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if let Err(r) = namespace(request.headers(), expected) {
-        return r;
+        return *r;
     }
     let (owner, request) = match writer(&ctx, &serial, expected, request).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let input: NewPool = match body(request).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if input.version != 1 {
         return invalid("池创建请求版本无效");
     }
     let id = match canonical_id(&input.id) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let pool = PoolRecord {
         id,
@@ -434,7 +485,7 @@ pub(super) async fn create(
                 Err(e) => failure(e),
             }
         }
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -496,26 +547,26 @@ async fn admit(
     use crate::managed_catalog::ManagementRequest;
     let _permit = match budget(&ctx) {
         Ok(p) => p,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let expected = match route(&ctx, &serial) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if let Err(r) = namespace(request.headers(), expected) {
-        return r;
+        return *r;
     }
     let target = match canonical_id(&id) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let (owner, request) = match writer(&ctx, &serial, expected, request).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let envelope: Envelope = match body(request).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let envelope = serde_json::to_value(envelope).expect("validated envelope serializes");
     if envelope["change"]["id"] != target.to_string()
@@ -539,7 +590,7 @@ async fn admit(
     .await
     {
         Ok(task) => reply(StatusCode::ACCEPTED, task),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 pub(super) async fn set(
@@ -556,12 +607,12 @@ pub(super) async fn delete(
 ) -> Response {
     admit(ctx, serial, id, request, true).await
 }
-fn task_id(epoch: &str, id: &str) -> Result<(u64, Uuid), Response> {
+fn task_id(epoch: &str, id: &str) -> Result<(u64, Uuid), Box<Response>> {
     let number = epoch
         .parse::<u64>()
         .ok()
         .filter(|v| *v > 0 && v.to_string() == epoch)
-        .ok_or_else(|| invalid("管理请求代次必须为规范正整数"))?;
+        .ok_or_else(|| bad("管理请求代次必须为规范正整数"))?;
     Ok((number, canonical_id(id)?))
 }
 pub(super) async fn task(
@@ -571,18 +622,18 @@ pub(super) async fn task(
 ) -> Response {
     let _permit = match budget(&ctx) {
         Ok(p) => p,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let expected = match route(&ctx, &serial) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if let Err(r) = namespace(request.headers(), expected) {
-        return r;
+        return *r;
     }
     let (epoch, id) = match task_id(&epoch, &id) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     match ctx
         .catalog
@@ -601,14 +652,14 @@ pub(super) async fn tasks(
 ) -> Response {
     let _permit = match budget(&ctx) {
         Ok(p) => p,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let expected = match route(&ctx, &serial) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if let Err(r) = namespace(request.headers(), expected) {
-        return r;
+        return *r;
     }
     let limit = match query_value(&request, "limit") {
         Ok(None) => 100,
@@ -645,22 +696,22 @@ pub(super) async fn cancel(
 ) -> Response {
     let _permit = match budget(&ctx) {
         Ok(p) => p,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let expected = match route(&ctx, &serial) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if let Err(r) = namespace(request.headers(), expected) {
-        return r;
+        return *r;
     }
     let (epoch, id) = match task_id(&epoch, &id) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let (owner, _request) = match writer(&ctx, &serial, expected, request).await {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if !live(&owner, expected) {
         return unavailable("取消前owner许可已失效");
@@ -674,7 +725,7 @@ pub(super) async fn cancel(
     .await
     {
         Ok(task) => reply(StatusCode::OK, task),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -725,28 +776,32 @@ pub(super) async fn poll(
         ) {
             continue;
         }
-        if live(&owner, expected) {
-            if permitted(
-                &owner,
-                expected,
-                ctx.catalog.apply_pool_management(
-                    serial,
-                    expected,
-                    owner.round,
-                    identity.0,
-                    identity.1,
-                ),
-            )
+        if live(&owner, expected)
+            && permitted(&owner, expected, async {
+                let result = ctx
+                    .catalog
+                    .apply_pool_management(serial, expected, owner.round, identity.0, identity.1)
+                    .await;
+                if let Err(error) = &result {
+                    log::warn!(
+                        "带库{}池任务epoch={} operation={} FDB apply失败：{}",
+                        serial,
+                        identity.0,
+                        identity.1,
+                        error
+                    );
+                }
+                result
+            })
             .await
             .is_err()
-            {
-                log::warn!(
-                    "带库{}池任务epoch={} operation={}等待依赖或原回执核对",
-                    serial,
-                    identity.0,
-                    identity.1
-                );
-            }
+        {
+            log::warn!(
+                "带库{}池任务epoch={} operation={}等待依赖或原回执核对",
+                serial,
+                identity.0,
+                identity.1
+            );
         }
         return Ok(());
     }
