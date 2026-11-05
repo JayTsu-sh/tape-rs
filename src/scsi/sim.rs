@@ -548,12 +548,13 @@ impl SimTransport {
                     sense_key,
                     asc,
                     ascq,
-                } => Err(TapeError::ScsiCommand {
-                    status: 0x02,
-                    sense_key,
-                    asc,
-                    ascq,
-                }),
+                } => finish_command(
+                    0x02,
+                    SenseInfo::from_bytes(&sense_bytes(sense_key, asc, ascq)),
+                    0,
+                    0,
+                    &self.identity,
+                ),
                 FaultAction::HostError(h) => Err(TapeError::ScsiHost(h)),
                 FaultAction::Busy => Err(TapeError::Busy {
                     device: self.identity.clone(),

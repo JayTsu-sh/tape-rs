@@ -4007,6 +4007,7 @@ mod read_error_tests {
                     sense_key: key,
                     asc,
                     ascq,
+                    sense: None,
                 },
                 "读取测试",
             );

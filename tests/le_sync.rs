@@ -25,6 +25,7 @@ impl TapeTransport for Trace {
         self.no_data_timeouts.borrow_mut().push((c[0], t));
         if c[0] == 0x92 && c[1] & 0x38 == 0x18 && self.reject_eod.get() {
             return Err(tape_rs::error::TapeError::ScsiCommand {
+                sense: None,
                 status: 2,
                 sense_key: 5,
                 asc: 0x24,
@@ -551,6 +552,7 @@ fn unsupported_eod_fails_mount_without_fallback() {
             sense_key: 5,
             asc: 0x24,
             ascq: 0,
+            ..
         })
     ));
     let commands = dev.commands.borrow();
