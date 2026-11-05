@@ -341,3 +341,6 @@ ltfsctl -e 10.131.7.219:17821 --library 55L3A7802K19LL01 --pool P1 \
 源记录必须包含可判定普通文件类型的元数据和 SHA-256；旧目录记录缺这些字段时须先装带对账。
 
 `Client::delete_if_version` 和 `ltfsctl delete --if-version round.sequence` 只在路径当前版本仍与参数一致时提交删除墓碑；版本可从 `ltfsctl stat` 读取，版本变化返回 412，源内容不变。`If-Match` 请求头必须是双引号括起的 `round.sequence`。条件检查与路径预留在同一次写入准入中完成；结果未定时仍需查询路径和任务，不自动重发。它是后续迁池删除源的必要闸门，目前没有自动迁池命令。
+
+
+FDB 持久通知通过 `ltfsctl --library <序列号> notify create|list|show|read|watch|ack|delete|inject` 管理。断线或打印不会推进确认位置；各命令、HTTP/SSE 对应入口及类型扩展规则见 [FDB 通知参考](fdb-notifications.md)。

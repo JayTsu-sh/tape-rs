@@ -9,6 +9,8 @@
 //! 替换上传可用服务端记录的内容哈希核对结果；只创建上传丢失响应时，同内容文件
 //! 不足以证明归属，必须返回结果未定。
 
+pub mod fdb;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
