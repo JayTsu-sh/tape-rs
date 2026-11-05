@@ -9,6 +9,10 @@ pub(super) mod management;
 mod management_request;
 pub use management_request::ManagementRequest;
 
+#[path = "notifications.rs"]
+mod notifications;
+pub use notifications::{NotifyConnectionAction, NotifyFilter};
+
 #[path = "active_pools.rs"]
 mod active_pools;
 pub use active_pools::ActivePoolCreation;
