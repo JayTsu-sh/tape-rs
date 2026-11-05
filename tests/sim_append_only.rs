@@ -31,6 +31,7 @@ impl TapeTransport for AppendOnly<'_> {
             let p = TapeDrive::new(self.inner).read_position()?;
             if p.partition == 0 && p.block_number == 4 && self.permission.get() != Some((0, 4)) {
                 return Err(TapeError::ScsiCommand {
+                    sense: None,
                     status: 2,
                     sense_key: 7,
                     asc: 0x5a,

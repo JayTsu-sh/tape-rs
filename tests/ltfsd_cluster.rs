@@ -206,6 +206,7 @@ impl tape_rs::scsi::transport::TapeTransport for PausingTransport {
         {
             let medium = self.checkpoint_fault.medium_error.load(Ordering::SeqCst);
             return Err(tape_rs::error::TapeError::ScsiCommand {
+                sense: None,
                 status: 2,
                 sense_key: if medium { 3 } else { 6 },
                 asc: if medium { 0x11 } else { 0x2a },
