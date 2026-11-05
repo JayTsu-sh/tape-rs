@@ -309,6 +309,42 @@ pub(super) async fn observations_at(
     Ok((inventory, monitor))
 }
 
+pub(super) async fn rescan_result_at(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    owner: u64,
+    captured_at: &str,
+    error: Option<&str>,
+) -> Result<Value> {
+    if !valid_time(captured_at) || error.is_some_and(|s| s.len() > 2048) {
+        return Err(CatalogError::Invalid("rescan采样时间或诊断长度无效"));
+    }
+    let monitor = monitor_at(tr, ns, serial)
+        .await?
+        .ok_or(CatalogError::Corrupt("rescan巡检回执尚未发布"))?;
+    if monitor.owner_epoch != owner
+        || monitor.last_attempt != captured_at
+        || monitor.error.as_deref() != error
+    {
+        return Err(CatalogError::Corrupt("rescan巡检事实与原采样不符"));
+    }
+    if let Some(error) = error {
+        return Ok(json!({"captured_at":captured_at,"error":error}));
+    }
+    let inventory = inventory_at(tr, ns, serial)
+        .await?
+        .ok_or(CatalogError::Corrupt("rescan完整库存尚未发布"))?;
+    if inventory.owner_epoch != owner || inventory.observation.observed_at != captured_at {
+        return Err(CatalogError::Corrupt("rescan库存事实与原采样不符"));
+    }
+    let mut result = inventory_view(&inventory.observation);
+    result["captured_at"] = json!(captured_at);
+    result["node"] = json!(inventory.observation.owner);
+    result["round"] = json!(inventory.observation.round);
+    Ok(result)
+}
+
 impl ManagedCatalog {
     /// Persist one complete observation from a current, externally guarded owner.
     /// Identical physical inventory updates its timestamp without another event.

@@ -301,6 +301,10 @@ fn metadata_router(ctx: Arc<Context>) -> Router {
     Router::new()
         .route("/admin/libraries", get(queries::libraries))
         .route("/libraries/{serial}/admin/library", get(queries::library))
+        .route(
+            "/libraries/{serial}/admin/library/rescan",
+            axum::routing::post(pools::rescan),
+        )
         .route("/libraries/{serial}/admin/tapes", get(queries::tapes))
         .route(
             "/libraries/{serial}/admin/tapes/{barcode}",

@@ -1,6 +1,6 @@
 # 文件客户端与 FUSE 挂载
 
-当前 FDB 原生 `pool` / `task` 命令以[池管理参考](fdb-pool-management.md)为准；下文旧数字任务命令不能用于原生任务。
+当前 FDB 原生 `pool` / `task` 命令以[池管理参考](fdb-pool-management.md)为准，`library list/show` 与 `tape list/show` 见[管理查询](fdb-management-queries.md)，`library rescan --request FILE` 见[异步扫描](fdb-library-rescan.md)。下文旧数字任务命令不能用于原生任务。
 
 当前能力与部署状态见 [剩余实施队列](../.scratch/ltfs-ha/remaining-implementation.md) 和 [交接入口](CLAUDE-HANDOFF.md)。本文带日期的实验记录保留当时验证边界；后续记录取代早期状态。
 
@@ -53,7 +53,6 @@ HTTP 接入使用 axum / Hyper，保持现有端点、状态码、JSON 字段和
 | --- | --- | --- |
 | 管理状态 | `GET /admin/status` | 无 |
 | 带库查询 | `GET /admin/libraries`、`GET /admin/libraries/current` | 无 |
-| 重新读取库存 | `POST /admin/libraries/current/rescan` | `{}`；不执行 INITIALIZE，不装带或搬带 |
 | 池列表/详情 | `GET /admin/pools`、`GET /admin/pools/{pool}` | 无；pool 可用名称或 UUID |
 | 建池 | `POST /admin/pools/{name}` | 无；沿用 `?file_limit=200000` |
 | 删除空池 | `DELETE /admin/pools/{pool}` | 无 |
@@ -79,7 +78,7 @@ HTTP 接入使用 axum / Hyper，保持现有端点、状态码、JSON 字段和
 
 `ltfsctl` 现在可直接查询集群管理资源，例如 `library list`、`library show <序列号>`、`tape list/show`、`drive list/show`、`node list/show`、`pool show` 和 `task list/show`。除全局 `library list` 外，`--library <真实序列号>` 始终限定目标库。输出为管理接口的完整 JSON，容量与状态字段不经 CLI 二次计算。文件任务单独用 `file-task <id>` 查询。
 
-尚未有专用 CLI 语法的管理写入可用 `ltfsctl --library <序列号> admin post|patch|delete /admin/... --body '<JSON>'` 显式调用上述接口。例如 `admin post /admin/libraries/current/rescan --body '{}'`；设备任务返回 `task` 后用 `task show <id>` 查询终态。连接在写请求可能送达后断开时，客户端返回结果未定，不会自动重放请求。
+尚未有专用 CLI 语法的管理写入可用 `ltfsctl --library <序列号> admin post|patch|delete /admin/... --body '<JSON>'` 显式调用上述接口。原生 rescan 使用 `library rescan --request FILE` 提交、`task show --request FILE` 查询；其他设备任务须以对应原生接线与验收状态为准。连接在写请求可能送达后断开时，客户端返回结果未定，不会自动重放请求。
 
 池属性支持 `poolname`、`file_limit`、`mediarestriction`、`mountlimit`、`lowspacewarningenable`、`lowspacewarningthreshold`、`nospacewarningenable`。数字及 yes/no 属性沿用字符串值；mountlimit 为 0 时不限制池的写入驱动租约数，容量告警阈值单位为 TiB。容量采用最近一次有效 DP MAM 缓存：未装载时沿用旧值，装载及写入提交后由 owner 刷新并通过 Raft 复制；刷新失败保留同卷旧值并报告失败。未观测或已知卷身份失效时返回 null，不从文件大小推算剩余容量，也不冒充 EE 后台告警事件。m/r/g 分别控制写入、读取和维护；驱动启用状态、角色、介质兼容性和池挂载上限共同约束设备调度。
 

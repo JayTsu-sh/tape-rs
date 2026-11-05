@@ -242,7 +242,7 @@ fn serving(
     let owner = ctx.owner.as_ref().ok_or_else(|| {
         boxed_reply(
             StatusCode::METHOD_NOT_ALLOWED,
-            json!({"error":"metadata_readonly","detail":"修改池需要受管owner运行模式"}),
+            json!({"error":"metadata_readonly","detail":"管理变更需要受管owner运行模式"}),
         )
     })?;
     let library = owner
@@ -499,6 +499,66 @@ pub(super) async fn create(
             }
         }
         Err(response) => *response,
+    }
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+enum ReadOnlyChange {
+    #[serde(rename = "library-rescan")]
+    LibraryRescan {},
+}
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct RescanEnvelope {
+    version: u8,
+    library: String,
+    namespace: String,
+    epoch: u64,
+    operation: String,
+    change: ReadOnlyChange,
+}
+/// HTTP only admits the immutable intent; the guarded device thread executes it.
+pub(super) async fn rescan(
+    State(ctx): State<Arc<Context>>,
+    Path(serial): Path<String>,
+    request: Request,
+) -> Response {
+    let _permit = match budget(&ctx) {
+        Ok(p) => p,
+        Err(r) => return *r,
+    };
+    let expected = match route(&ctx, &serial) {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    if let Err(r) = namespace(request.headers(), expected) {
+        return *r;
+    }
+    let (owner, request) = match writer(&ctx, &serial, expected, request).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let envelope: RescanEnvelope = match body(request).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let intent = match crate::managed_catalog::ManagementRequest::parse(
+        serde_json::to_value(envelope).expect("validated envelope serializes"),
+    ) {
+        Ok(v) => v,
+        Err(e) => return failure(e),
+    };
+    match permitted(
+        &owner,
+        expected,
+        ctx.catalog
+            .admit_management(&serial, expected, owner.round, &intent),
+    )
+    .await
+    {
+        Ok(task) => reply(StatusCode::ACCEPTED, task),
+        Err(r) => *r,
     }
 }
 

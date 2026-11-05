@@ -4,8 +4,8 @@ use super::*;
 use http_body_util::BodyExt;
 use hyper_util::rt::TokioIo;
 use uuid::Uuid;
+pub mod management;
 mod notifications;
-pub mod pools;
 mod queries;
 
 fn invalid(reason: &str) -> ClientError {

@@ -54,6 +54,6 @@ Tape 清单合并已观测的物理条码与 FDB 分配记录，包含未分配�
 
 实际停止新 FDB 的两个原 server，使读取出现 1031 超时。四个 HTTP 查询分别返回可重试依赖错误，CLI library list 重试预算耗尽后非零退出且没有成功正文，没有返回伪造空库。故障窗口内三设备 PR generation、注册键及 holder 保持不变。恢复原 unit/data/cluster 后，四种 HTTP 查询及完整新采样恢复；原池、事件 56/57 字节和消费者 ACK 57 均保留。新旧 FDB 分别通过故障期间或恢复后的离散健康核对，不代表连续监测。
 
-最终严格 SDK 及独立 FDB/control/三设备 PR 审计一致：owner node 3 / epoch 179631，key `0x4c0300000002bdaf`，三节点就绪。A 库和备用 changer 域继续隔离；本次未分配、装卸、MOVE、格式化或读写介质文件。S3/FUSE 写入、rescan/import actor 和单盘健康采集仍待后续完成。
+最终严格 SDK 及独立 FDB/control/三设备 PR 审计一致：owner node 3 / epoch 179631，key `0x4c0300000002bdaf`，三节点就绪。A 库和备用 changer 域继续隔离；本次未分配、装卸、MOVE、格式化或读写介质文件。本次查询验收不覆盖 S3/FUSE 写入、rescan/import actor 或单盘健康采集；后续 rescan 进展见[原生异步扫描](fdb-library-rescan.md)。
 
 证据在 `/work/tmp/tape-native-library-tape-queries-physical-20261106/` 的 `BASIC-COMPLETE.json`、`SDK-basic.json`、`QUORUM-COMPLETE.json`、`SDK-recovery.json`、`OWNER-AUDIT-final.json` 及各 CLI/HTTP 原始记录。软件和实物故障结果分别保留；生产者的周期采样可以更新观测时间，不将正常时间变化误判为查询修改事实。

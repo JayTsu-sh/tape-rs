@@ -3485,6 +3485,31 @@ fn native_owner_publishes_complete_inventory_without_legacy_catalog() {
         }
         std::thread::sleep(Duration::from_millis(30));
     }
+    // Explicit rescan must be a durable device-thread task, not merely another
+    // periodic poll or a queued receipt with no executor.
+    let window = runtime
+        .block_on(catalog.active_management_window(&serial, route))
+        .unwrap();
+    let request=tape_rs::managed_catalog::ManagementRequest::parse(json!({"version":1,"library":serial,"namespace":ns.to_string(),"epoch":window.accepting,"operation":Uuid::new_v4().to_string(),"change":{"kind":"library-rescan"}})).unwrap();
+    runtime
+        .block_on(catalog.admit_management(&serial, route, round, &request))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut rescan = None;
+    while Instant::now() < deadline {
+        let task = runtime
+            .block_on(catalog.management_task(&serial, route, request.epoch(), request.operation()))
+            .unwrap()
+            .unwrap();
+        if matches!(
+            task["status"].as_str(),
+            Some("succeeded" | "failed" | "cancelled")
+        ) {
+            rescan = Some(task);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
     let (done, finished) = mpsc::channel();
     requests
         .send(ExecRequest::Shutdown { done: Some(done) })
@@ -3493,6 +3518,9 @@ fn native_owner_publishes_complete_inventory_without_legacy_catalog() {
     thread.join().unwrap();
     drop(files);
     fs::remove_dir_all(root).unwrap();
+    let rescan = rescan.expect("原生Serving设备线程必须执行持久rescan，不能一直queued");
+    assert_eq!(rescan["status"], "succeeded");
+    assert_eq!(rescan["request"], *request.value());
     let (inventory, monitor) =
         observed.expect("Serving owner须实际发布FDB库存和巡检；不能一直保持None");
     assert_eq!(inventory["library_serial"], serial);

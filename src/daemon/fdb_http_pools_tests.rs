@@ -200,6 +200,99 @@ async fn run_pool_api(cluster: &str) {
         ..(*readonly).clone()
     });
     let (b, tb) = serve(owner.clone()).await;
+    let rescan = json!({"version":1,"library":serial,"namespace":namespace,"epoch":1,"operation":Uuid::new_v4().to_string(),"change":{"kind":"library-rescan"}});
+    let rescan_path = format!("{root}/library/rescan");
+    assert_eq!(
+        request(
+            &a,
+            "POST",
+            &rescan_path,
+            Some(&namespace),
+            &serde_json::to_vec(&rescan).unwrap()
+        )
+        .await
+        .0,
+        405
+    );
+    assert_eq!(
+        request(
+            &b,
+            "POST",
+            &rescan_path,
+            None,
+            &serde_json::to_vec(&rescan).unwrap()
+        )
+        .await
+        .0,
+        409
+    );
+    for malformed in [
+        rescan.to_string().replace(
+            "\"library-rescan\"",
+            "\"library-rescan\",\"unexpected\":true",
+        ),
+        rescan
+            .to_string()
+            .replace("\"version\":1", "\"version\":1,\"version\":1"),
+    ] {
+        assert_eq!(
+            request(
+                &b,
+                "POST",
+                &rescan_path,
+                Some(&namespace),
+                malformed.as_bytes()
+            )
+            .await
+            .0,
+            400
+        );
+    }
+    let (code, queued_rescan) = request(
+        &b,
+        "POST",
+        &rescan_path,
+        Some(&namespace),
+        rescan.to_string().as_bytes(),
+    )
+    .await;
+    assert_eq!(code, 202, "{queued_rescan}");
+    assert_eq!(queued_rescan["status"], "queued");
+    assert_eq!(queued_rescan["request"], rescan);
+    assert_eq!(
+        request(
+            &b,
+            "POST",
+            &rescan_path,
+            Some(&namespace),
+            rescan.to_string().as_bytes()
+        )
+        .await,
+        (202, queued_rescan)
+    );
+    let cancelled = catalog
+        .cancel_management(
+            &serial,
+            route,
+            epoch,
+            1,
+            Uuid::parse_str(rescan["operation"].as_str().unwrap()).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancelled["status"], "cancelled");
+    assert_eq!(
+        request(
+            &b,
+            "POST",
+            &rescan_path,
+            Some(&namespace),
+            rescan.to_string().as_bytes()
+        )
+        .await,
+        (202, cancelled)
+    );
+
     let id = Uuid::new_v4();
     let body=json!({"version":1,"id":id.to_string(),"name":"归档","file_limit":100,"created_at_millis":1_793_405_000_123u64,"policy":{"media_restriction":"none","mount_limit":0,"low_space_warning_enabled":true,"low_space_warning_threshold":0,"no_space_warning_enabled":true}}).to_string();
     let result = request(

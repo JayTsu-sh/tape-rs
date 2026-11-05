@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use tape_rs::client::fdb::{
     FdbClient,
-    pools::{PoolIntent, PoolRequest},
+    management::{ManagementIntent, ManagementRequestFile},
 };
 
 #[derive(Subcommand)]
@@ -54,7 +54,7 @@ pub enum TaskCommand {
         request: PathBuf,
     },
 }
-fn library<'a>(
+pub(super) fn library<'a>(
     library: Option<&'a str>,
     pool: Option<&str>,
 ) -> Result<&'a str, Box<dyn std::error::Error>> {
@@ -63,31 +63,31 @@ fn library<'a>(
     }
     library.ok_or_else(|| "FDB管理接口必须通过 --library 指定带库序列号".into())
 }
-fn submit(
+pub(super) fn submit(
     client: &FdbClient,
     library: &str,
-    input: PoolIntent,
+    input: ManagementIntent,
     path: PathBuf,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    match PoolRequest::load(&path) {
+    match ManagementRequestFile::load(&path) {
         Ok(saved) => {
             if !saved.matches(library, &input) {
                 return Err("请求文件的带库或参数不同；禁止覆盖原请求".into());
             }
         }
         Err(tape_rs::client::ClientError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            client.prepare_pool(library, input)?.save_new(&path)?;
+            client.prepare_management(library, input)?.save_new(&path)?;
         }
         Err(e) => return Err(e.into()),
     }
-    Ok(client.submit_pool(&path)?)
+    Ok(client.submit_management(&path)?)
 }
 fn items(
     client: &FdbClient,
     library: &str,
     tasks: bool,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let context = client.pool_context(library)?;
+    let context = client.management_context(library)?;
     let ns = context["namespace"].as_str().ok_or("缺少目录命名空间")?;
     let mut after = None;
     let mut seen = std::collections::HashSet::new();
@@ -140,7 +140,7 @@ pub fn run(
         } => submit(
             client,
             library,
-            PoolIntent::Create { name, file_limit },
+            ManagementIntent::Create { name, file_limit },
             request,
         )?,
         Command::Set {
@@ -151,18 +151,21 @@ pub fn run(
         } => submit(
             client,
             library,
-            PoolIntent::Set {
+            ManagementIntent::Set {
                 selector,
                 attribute,
                 value,
             },
             request,
         )?,
-        Command::Delete { selector, request } => {
-            submit(client, library, PoolIntent::Delete { selector }, request)?
-        }
+        Command::Delete { selector, request } => submit(
+            client,
+            library,
+            ManagementIntent::Delete { selector },
+            request,
+        )?,
         Command::Show { selector } => {
-            let context = client.pool_context(library)?;
+            let context = client.management_context(library)?;
             client.pool(
                 library,
                 context["namespace"].as_str().ok_or("缺少命名空间")?,
@@ -204,11 +207,11 @@ pub fn task(
     match command {
         TaskCommand::List => print(items(client, library, true)?),
         TaskCommand::Show { request } | TaskCommand::Cancel { request } => {
-            let saved = PoolRequest::load(&request)?;
+            let saved = ManagementRequestFile::load(&request)?;
             if !saved.is_library(library) {
                 return Err("请求文件不属于指定带库".into());
             }
-            print(client.pool_request_status(&request, cancel)?)
+            print(client.management_request_status(&request, cancel)?)
         }
     }
 }

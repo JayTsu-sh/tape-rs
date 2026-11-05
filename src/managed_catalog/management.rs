@@ -6,6 +6,9 @@ use serde_json::{Value, json};
 #[path = "management_pools.rs"]
 mod pools;
 
+#[path = "management_rescan.rs"]
+mod rescan;
+
 const MAX_QUEUED: usize = 100;
 
 pub(crate) fn prefix(namespace: Uuid, kind: u8) -> Vec<u8> {

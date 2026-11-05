@@ -1,6 +1,6 @@
 # FDB 带库库存与巡检事实
 
-`ManagedCatalog::record_active_library_inventory` 和 `record_library_monitor` 分别在 FDB 事务中保存一项事实及其对应通知；库存和巡检记录按顺序提交，不构成一次联合快照。`active_library_inventory` 和 `active_library_monitor` 只读这些记录，查询不打开设备、不发 SCSI，也不调用 EE。原生 owner 的周期库存采集与巡检发布已接入，可通过 SDK 和现有 CLI/HTTP 通知接口观察；rescan actor、library/tape 管理查询及单盘 TapeAlert/MAM 健康采集仍待接入。
+`ManagedCatalog::record_active_library_inventory` 和 `record_library_monitor` 分别在 FDB 事务中保存一项事实及其对应通知；库存和巡检记录按顺序提交，不构成一次联合快照。`active_library_inventory` 和 `active_library_monitor` 只读这些记录，查询不打开设备、不发 SCSI，也不调用 EE。原生 owner 的周期库存采集与巡检发布已接入，可通过 SDK 和现有 CLI/HTTP 通知接口观察；原生 [library/tape 管理查询](fdb-management-queries.md) 和 [异步 rescan](fdb-library-rescan.md) 已接线；单盘 TapeAlert/MAM 健康采集仍待接入。
 
 写入要求精确活动路由和当前 FDB owner epoch，库存 round 必须等于该 epoch。设备调用方还须在采集前后核对自己的 Raft/PR 执行许可；FDB 校验不代替设备隔离。旧 owner 在接管后不能覆盖事实或生成事件。读取返回原采集节点、轮次和时间，之后发生接管也不会将历史观察改成新 owner 的实时库存；派发机械操作必须另行核验实际设备。
 
