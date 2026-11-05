@@ -75,11 +75,16 @@ fn path_key(intent: &ActiveFileIntent) -> Vec<u8> {
     path_key_for(intent.namespace, intent.parent, &intent.name)
 }
 
-pub(super) fn path_key_for(namespace: Uuid, parent: Uuid, name: &[u8]) -> Vec<u8> {
+pub(super) fn path_prefix_for(namespace: Uuid, parent: Uuid) -> Vec<u8> {
     let mut out = key(b'1');
     out.extend_from_slice(b"l/");
     out.extend_from_slice(namespace.as_bytes());
     out.extend_from_slice(parent.as_bytes());
+    out
+}
+
+pub(super) fn path_key_for(namespace: Uuid, parent: Uuid, name: &[u8]) -> Vec<u8> {
+    let mut out = path_prefix_for(namespace, parent);
     append_component(&mut out, name);
     out
 }

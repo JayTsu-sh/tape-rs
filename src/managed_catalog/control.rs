@@ -36,6 +36,24 @@ pub struct PoolRecord {
     pub revision: u64,
 }
 
+impl PoolRecord {
+    /// Canonical management view. Validate caller-constructed records as well as
+    /// decoded ones so an invalid timestamp cannot panic during serialization.
+    pub fn to_json(&self) -> Result<serde_json::Value> {
+        validate_pool(self)?;
+        let created_at = chrono::DateTime::from_timestamp_millis(self.created_at_millis as i64)
+            .ok_or(CatalogError::Invalid("池创建时间无法转换为UTC"))?
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        Ok(
+            serde_json::json!({"id":self.id.to_string(),"library_serial":self.library_serial,"name":self.name,
+            "file_limit":self.file_limit,"revision":self.revision,"created_at_millis":self.created_at_millis,
+            "created_at":created_at,"policy":{"media_restriction":self.policy.media_restriction,
+            "mount_limit":self.policy.mount_limit,"low_space_warning_enabled":self.policy.low_space_warning_enabled,
+            "low_space_warning_threshold":self.policy.low_space_warning_threshold,"no_space_warning_enabled":self.policy.no_space_warning_enabled}}),
+        )
+    }
+}
+
 /// Pool placement and warning policy shared by every owner of a logical library.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolPolicy {
