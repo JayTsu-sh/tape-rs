@@ -350,6 +350,7 @@ async fn external_media_import_is_bound_sealed_and_requires_empty_node_exports()
                     id: pool,
                     name: "external".into(),
                     file_limit: 1000,
+                    created_at_millis: 1_793_405_000_123,
                     policy: PoolPolicy::default(),
                     revision: 1
                 }
@@ -814,6 +815,7 @@ async fn confirmed_tombstone_is_private_and_verified_with_full_scan() {
                     id: pool,
                     name: "tomb".into(),
                     file_limit: 1_000_000,
+                    created_at_millis: 1_793_405_000_123,
                     policy: PoolPolicy::default(),
                     revision: 1,
                 },
@@ -1209,6 +1211,7 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                     id: pool,
                     name: "stage".into(),
                     file_limit: 1_000_000,
+                    created_at_millis: 1_793_405_000_123,
                     policy: PoolPolicy::default(),
                     revision: 1,
                 },
@@ -1675,6 +1678,7 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                             id: Uuid::new_v4(),
                             name: "late".into(),
                             file_limit: 1,
+                            created_at_millis: 1_793_405_000_123,
                             policy: PoolPolicy::default(),
                             revision: 1,
                         }
@@ -4644,6 +4648,7 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                             id: Uuid::new_v4(),
                             name: "lateactive".into(),
                             file_limit: 1,
+                            created_at_millis: 1_793_405_000_123,
                             policy: PoolPolicy::default(),
                             revision: 1,
                         }

@@ -370,6 +370,10 @@ async fn external_sources(
                     name: name.into(),
                     library_serial: serial.into(),
                     file_limit: 100_000_000,
+                    // Retained in the input so retries use the same creation event.
+                    created_at_millis: row["pool_created_at_millis"]
+                        .as_u64()
+                        .ok_or("目标池创建时间 pool_created_at_millis 缺失")?,
                     policy: PoolPolicy::default(),
                     revision: 1,
                 },

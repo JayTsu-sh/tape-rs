@@ -68,6 +68,7 @@ async fn fixture(cluster: &str) -> Fixture {
                         id: *pool,
                         name,
                         file_limit: 1_000_000,
+                        created_at_millis: 1_793_405_000_123,
                         policy: PoolPolicy::default(),
                         revision: 1
                     }

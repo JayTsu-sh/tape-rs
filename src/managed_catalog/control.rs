@@ -9,6 +9,8 @@ pub struct PoolRecord {
     pub library_serial: String,
     pub name: String,
     pub file_limit: u64,
+    /// UTC milliseconds of the original pool creation event; immutable.
+    pub created_at_millis: u64,
     pub policy: PoolPolicy,
     /// Monotonic CAS token; starts at one and advances on every update.
     pub revision: u64,
@@ -451,6 +453,9 @@ fn validate_pool(pool: &PoolRecord) -> Result<()> {
             "pool ID、revision 和文件数上限必须有效",
         ));
     }
+    if !(1..=253_402_300_799_999).contains(&pool.created_at_millis) {
+        return Err(CatalogError::Invalid("pool 创建时间超出有效 UTC 毫秒范围"));
+    }
     if pool.name.is_empty()
         || pool.name.len() > MAX_NAME
         || pool.name.as_bytes().contains(&0)
@@ -476,9 +481,9 @@ fn validate_pool(pool: &PoolRecord) -> Result<()> {
 fn encode_pool(pool: &PoolRecord) -> Vec<u8> {
     let policy = &pool.policy;
     let mut value = Vec::with_capacity(
-        26 + pool.name.len() + policy.media_restriction.len() + pool.library_serial.len(),
+        34 + pool.name.len() + policy.media_restriction.len() + pool.library_serial.len(),
     );
-    value.push(3);
+    value.push(4);
     value.extend_from_slice(&pool.revision.to_be_bytes());
     value.extend_from_slice(&pool.file_limit.to_be_bytes());
     value.extend_from_slice(&policy.mount_limit.to_be_bytes());
@@ -490,6 +495,7 @@ fn encode_pool(pool: &PoolRecord) -> Vec<u8> {
     value.extend_from_slice(&(pool.name.len() as u16).to_be_bytes());
     value.push(policy.media_restriction.len() as u8);
     value.push(pool.library_serial.len() as u8);
+    value.extend_from_slice(&pool.created_at_millis.to_be_bytes());
     value.extend_from_slice(pool.name.as_bytes());
     value.extend_from_slice(policy.media_restriction.as_bytes());
     value.extend_from_slice(pool.library_serial.as_bytes());
@@ -497,27 +503,25 @@ fn encode_pool(pool: &PoolRecord) -> Vec<u8> {
 }
 
 fn decode_pool(id: Uuid, value: &[u8]) -> Result<PoolRecord> {
-    if value.first() != Some(&3) {
-        return Err(CatalogError::Corrupt(
-            "pool 记录版本不支持；旧候选需重新导入明确的带库归属",
-        ));
+    if value.first() != Some(&4) {
+        return Err(CatalogError::Corrupt("pool 记录版本无效"));
     }
-    if value.len() < 26 || value[21] & !0b11 != 0 {
+    if value.len() < 34 || value[21] & !0b11 != 0 {
         return Err(CatalogError::Corrupt("pool 记录长度"));
     }
     let name_len = u16::from_be_bytes([value[22], value[23]]) as usize;
     let media_len = value[24] as usize;
     let serial_len = value[25] as usize;
-    if value.len() != 26 + name_len + media_len + serial_len {
+    if value.len() != 34 + name_len + media_len + serial_len {
         return Err(CatalogError::Corrupt("pool 可变字段长度"));
     }
-    let name = std::str::from_utf8(&value[26..26 + name_len])
+    let name = std::str::from_utf8(&value[34..34 + name_len])
         .map_err(|_| CatalogError::Corrupt("pool 名称编码"))?
         .to_owned();
-    let media = std::str::from_utf8(&value[26 + name_len..26 + name_len + media_len])
+    let media = std::str::from_utf8(&value[34 + name_len..34 + name_len + media_len])
         .map_err(|_| CatalogError::Corrupt("pool 介质限制编码"))?
         .to_owned();
-    let library_serial = std::str::from_utf8(&value[26 + name_len + media_len..])
+    let library_serial = std::str::from_utf8(&value[34 + name_len + media_len..])
         .map_err(|_| CatalogError::Corrupt("pool 带库序列号编码"))?
         .to_owned();
     let pool = PoolRecord {
@@ -525,6 +529,7 @@ fn decode_pool(id: Uuid, value: &[u8]) -> Result<PoolRecord> {
         library_serial,
         name,
         file_limit: read_u64(&value[9..17]),
+        created_at_millis: read_u64(&value[26..34]),
         policy: PoolPolicy {
             media_restriction: media,
             mount_limit: u16::from_be_bytes([value[17], value[18]]),
@@ -717,6 +722,9 @@ impl ManagedCatalog {
         }
         if expected.id != replacement.id {
             return Err(CatalogError::Invalid("不能改变 pool ID"));
+        }
+        if expected.created_at_millis != replacement.created_at_millis {
+            return Err(CatalogError::Invalid("不能改变 pool 创建时间"));
         }
         if expected.revision.checked_add(1) != Some(replacement.revision) {
             return Err(CatalogError::Invalid("pool revision 必须递增 1"));
@@ -1476,6 +1484,7 @@ pub(super) mod tests {
             library_serial: "SERIAL_A".into(),
             name: "归档".into(),
             file_limit: 200_000,
+            created_at_millis: 1_793_405_000_123,
             policy: PoolPolicy {
                 media_restriction: "L9".into(),
                 mount_limit: 7,
@@ -1487,12 +1496,12 @@ pub(super) mod tests {
             revision: 1,
         };
         let encoded = encode_pool(&record);
-        for old_version in [1, 2] {
+        for old_version in [1, 2, 3] {
             let mut legacy = encoded.clone();
             legacy[0] = old_version;
             assert!(
                 decode_pool(id, &legacy).is_err(),
-                "旧节点组池记录不能用于新管理模型"
+                "旧池记录不能用于新的创建时间模型"
             );
         }
         for serial in ["", "wrong/serial"] {
@@ -1503,6 +1512,28 @@ pub(super) mod tests {
                 })
                 .is_err()
             );
+        }
+        for timestamp in [0, 253_402_300_800_000, u64::MAX] {
+            assert!(
+                validate_pool(&PoolRecord {
+                    created_at_millis: timestamp,
+                    ..record.clone()
+                })
+                .is_err()
+            );
+            let mut broken = encoded.clone();
+            broken[26..34].copy_from_slice(&timestamp.to_be_bytes());
+            assert!(matches!(
+                decode_pool(id, &broken),
+                Err(CatalogError::Corrupt(_))
+            ));
+        }
+        for timestamp in [1, 253_402_300_799_999] {
+            let boundary = PoolRecord {
+                created_at_millis: timestamp,
+                ..record.clone()
+            };
+            assert_eq!(decode_pool(id, &encode_pool(&boundary)).unwrap(), boundary);
         }
         assert_eq!(decode_pool(id, &encoded).unwrap(), record);
         for n in 0..encoded.len() {
@@ -1637,6 +1668,7 @@ pub(super) mod tests {
             library_serial: serial.clone(),
             name: "单库归档".into(),
             file_limit: 200_000,
+            created_at_millis: 1_793_405_000_123,
             policy: PoolPolicy::default(),
             revision: 1,
         };
@@ -2174,6 +2206,7 @@ pub(super) mod tests {
             library_serial: serial.clone(),
             name: "受管导入池".into(),
             file_limit: 200_000,
+            created_at_millis: 1_793_405_000_123,
             policy: PoolPolicy::default(),
             revision: 1,
         };
@@ -2466,6 +2499,7 @@ pub(super) mod tests {
             library_serial: abandoned_serial.clone(),
             name: "废弃候选池".into(),
             file_limit: 100,
+            created_at_millis: 1_793_405_000_123,
             policy: PoolPolicy::default(),
             revision: 1,
         };
@@ -2696,6 +2730,7 @@ pub(super) mod tests {
             library_serial: "SERIAL_A".into(),
             name: "Archive".into(),
             file_limit: 200_000,
+            created_at_millis: 1_793_405_000_123,
             policy: PoolPolicy::default(),
             revision: 1,
         };
@@ -2763,6 +2798,7 @@ pub(super) mod tests {
                 library_serial: "SERIAL_A".into(),
                 name: format!("P-{n}"),
                 file_limit: 1,
+                created_at_millis: 1_793_405_000_123,
                 policy: PoolPolicy::default(),
                 revision: 1,
             };
@@ -2815,6 +2851,20 @@ pub(super) mod tests {
                 .unwrap(),
             ControlOutcome::NameConflict
         );
+        assert_eq!(reopened.pool(ns, p.id).await.unwrap(), Some(p.clone()));
+        assert!(matches!(
+            catalog
+                .update_pool(
+                    ns,
+                    &p,
+                    &PoolRecord {
+                        created_at_millis: p.created_at_millis + 1,
+                        ..changed.clone()
+                    }
+                )
+                .await,
+            Err(CatalogError::Invalid(_))
+        ));
         assert_eq!(reopened.pool(ns, p.id).await.unwrap(), Some(p.clone()));
         assert_eq!(
             catalog.update_pool(ns, &p, &changed).await.unwrap(),

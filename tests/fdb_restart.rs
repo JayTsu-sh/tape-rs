@@ -34,6 +34,7 @@ async fn isolated_fdb_server_restart_recovery() {
         library_serial: serial.clone(),
         name: "恢复验收池".into(),
         file_limit: 100,
+        created_at_millis: 1_793_405_000_123,
         policy: PoolPolicy::default(),
         revision: 1,
     };
@@ -57,6 +58,7 @@ async fn isolated_fdb_server_restart_recovery() {
         library_serial: candidate_serial.clone(),
         name: "故障恢复导入池".into(),
         file_limit: 200_000,
+        created_at_millis: 1_793_405_000_123,
         policy: PoolPolicy::default(),
         revision: 1,
     };
