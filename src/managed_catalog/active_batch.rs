@@ -3261,7 +3261,7 @@ impl ManagedCatalog {
         let publication = tr.get(&publication_key(volume, generation), false).await?;
         if completed {
             let Some((observed_batch, _)) =
-                active_volume::observed_batch_at(&tr, serial, volume, generation).await?
+                active_volume::observed_completed_batch_at(&tr, serial, volume, generation).await?
             else {
                 return Err(CatalogError::Corrupt("已完成批次缺少物理索引观察"));
             };

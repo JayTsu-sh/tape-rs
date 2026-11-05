@@ -2839,11 +2839,11 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                     .unwrap(),
                 Some(committed_attributes.clone())
             );
-            let mut prepared_chunk = b"tape-rs/catalog/22/p/a/".to_vec();
-            prepared_chunk.extend_from_slice(volume_id.as_bytes());
-            prepared_chunk.extend_from_slice(&observed_index.generation.to_be_bytes());
-            prepared_chunk.extend_from_slice(&committed_request.request_epoch.to_be_bytes());
-            prepared_chunk.extend_from_slice(committed_request.operation_id.as_bytes());
+            // Prepared attributes are stored in the immutable namespace object.
+            let mut prepared_chunk = b"tape-rs/catalog/22/M/".to_vec();
+            prepared_chunk.extend_from_slice(namespace.as_bytes());
+            prepared_chunk.extend_from_slice(&committed_attributes.digest());
+            prepared_chunk.push(1);
             prepared_chunk.extend_from_slice(&1_u16.to_be_bytes());
             let tr = direct.create_trx().unwrap();
             let saved_chunk = tr
@@ -4305,6 +4305,78 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
             assert_eq!(completed_status.batch_id, batch_id);
             assert_eq!(completed_status.pages, 1);
             assert!(completed_status.completed);
+
+            // Model the durable result of re-importing this exact on-tape head:
+            // the import scan becomes the baseline and its active cursor is
+            // cleared, while the already compacted batch and history survive.
+            let mut ready_key = b"tape-rs/catalog/22/M/".to_vec();
+            ready_key.extend_from_slice(volume_id.as_bytes());
+            let mut source_key = b"tape-rs/catalog/22/K/".to_vec();
+            source_key.extend_from_slice(volume_id.as_bytes());
+            source_key.extend_from_slice(bindings[0].scan.id.as_bytes());
+            let mut cursor_key = b"tape-rs/catalog/22/r/".to_vec();
+            cursor_key.extend_from_slice(volume_id.as_bytes());
+            let mut imported_history_key = cursor_key.clone();
+            imported_history_key.extend_from_slice(&observed_index.generation.to_be_bytes());
+            let tr = direct.create_trx().unwrap();
+            let ready_before = tr.get(&ready_key, false).await.unwrap().unwrap().to_vec();
+            let source_before = tr.get(&source_key, false).await.unwrap().unwrap().to_vec();
+            let cursor_before = tr.get(&cursor_key, false).await.unwrap().unwrap().to_vec();
+            let imported_history = tr
+                .get(&imported_history_key, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            assert_eq!(source_before.len(), 42);
+            let mut imported_ready = ready_before.clone();
+            imported_ready[..8].copy_from_slice(&observed_index.generation.to_be_bytes());
+            let mut imported_source = source_before.clone();
+            imported_source[1..42].copy_from_slice(&imported_history[25..66]);
+            tr.set(&ready_key, &imported_ready);
+            tr.set(&source_key, &imported_source);
+            tr.clear(&cursor_key);
+            tr.commit().await.unwrap();
+            // This branch imports Full indexes only. An incremental historical
+            // head cannot prove a Full baseline, even with identical SHA.
+            assert!(
+                reopened
+                    .active_batch_status(&serial, volume_id, observed_index.generation)
+                    .await
+                    .is_err()
+            );
+            // Construct the matching synthetic Full completed index, retaining
+            // its exact generation, position, SHA and original batch identity.
+            let mut full_history = imported_history.clone();
+            full_history[66] = 0;
+            let tr = direct.create_trx().unwrap();
+            tr.set(&imported_history_key, &full_history);
+            tr.commit().await.unwrap();
+            let imported_status = reopened
+                .active_batch_status(&serial, volume_id, observed_index.generation)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(imported_status.completed);
+            assert_eq!(imported_status.batch_id, batch_id);
+            // Same generation alone is not sufficient: reject a different head.
+            let mut mismatched_source = imported_source;
+            mismatched_source[10] ^= 1;
+            let tr = direct.create_trx().unwrap();
+            tr.set(&source_key, &mismatched_source);
+            tr.commit().await.unwrap();
+            assert!(
+                reopened
+                    .active_batch_status(&serial, volume_id, observed_index.generation)
+                    .await
+                    .is_err()
+            );
+            let tr = direct.create_trx().unwrap();
+            tr.set(&ready_key, &ready_before);
+            tr.set(&source_key, &source_before);
+            tr.set(&cursor_key, &cursor_before);
+            tr.set(&imported_history_key, &imported_history);
+            tr.commit().await.unwrap();
             assert!(
                 reopened
                     .recover_observed_active_batch_page(

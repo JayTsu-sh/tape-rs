@@ -280,6 +280,30 @@ pub(super) async fn observed_batch_at(
     Ok((!batch_id.is_nil()).then_some((batch_id, index)))
 }
 
+/// A re-import can make a completed batch's exact index the new baseline.
+/// Only completed-batch recovery may reuse that immutable historical proof.
+pub(super) async fn observed_completed_batch_at(
+    tr: &Transaction,
+    serial: &str,
+    volume: Uuid,
+    generation: u64,
+) -> Result<Option<(Uuid, ActiveIndexIdentity)>> {
+    let (scan, _) = observed_at(tr, serial, volume).await?;
+    if generation != scan.generation {
+        return observed_batch_at(tr, serial, volume, generation).await;
+    }
+    let (_, baseline) = active_baseline(tr, serial, volume).await?;
+    let raw = tr
+        .get(&generation_key(volume, generation), false)
+        .await?
+        .ok_or(CatalogError::Corrupt("已完成批次缺少物理索引观察"))?;
+    let (batch, index) = decode_history(volume, &raw)?;
+    if index != baseline {
+        return Err(CatalogError::Corrupt("已完成批次与导入基线索引身份不一致"));
+    }
+    Ok((!batch.is_nil()).then_some((batch, index)))
+}
+
 impl ManagedCatalog {
     /// Resolve loaded-tape placement and the observed DP head from one FDB
     /// read version, after verifying the exact route and owner epoch.
