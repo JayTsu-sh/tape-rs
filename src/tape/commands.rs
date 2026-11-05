@@ -386,6 +386,24 @@ impl<'a> TapeDrive<'a> {
         mode_write_protected(&data[..result.transferred])
     }
 
+    /// 当前已装介质的分区数，GA32-0928-08 Table 348 byte3 + 1。
+    /// 调用方先确认驱动器 ready；不采用待 FORMAT 的 MODE SELECT 参数。
+    pub fn defined_partitions(&self) -> Result<u8> {
+        self.test_unit_ready()?;
+        let mut data = [0; 512];
+        let result = retry_unit_attention("读取已定义分区", || {
+            self.device
+                .execute_read(&cdb::mode_sense_10(0x11, 512), &mut data, 30_000)
+        })?;
+        let data = data
+            .get(..result.transferred)
+            .ok_or(TapeError::InvalidResponse {
+                expected: data.len(),
+                actual: result.transferred,
+            })?;
+        defined_partition_count(data)
+    }
+
     /// 查询 SSC Device Configuration Extension 10h/01h 的 WRITE MODE。
     /// 不支持此子页的旧设备沿用原写路径；截断/错误页不能猜测模式。
     pub fn append_only_mode(&self) -> Result<bool> {
@@ -598,6 +616,24 @@ fn tape_alerts(data: &[u8]) -> Result<Vec<u16>> {
     Ok(alerts)
 }
 
+fn defined_partition_count(data: &[u8]) -> Result<u8> {
+    let invalid = || TapeError::Ltfs("已定义分区页缺失、截断或字段无效".into());
+    if data.len() < 8 {
+        return Err(invalid());
+    }
+    let end = usize::from(u16::from_be_bytes([data[0], data[1]])) + 2;
+    let start = 8 + usize::from(u16::from_be_bytes([data[6], data[7]]));
+    let page = data.get(start..end).ok_or_else(invalid)?;
+    if page.len() < 8 || page[0] & 0x7f != 0x11 {
+        return Err(invalid());
+    }
+    let len = usize::from(page[1]) + 2;
+    if len < 10 + 2 * usize::from(page[3]) || len > page.len() || page[3] > page[2] || page[3] > 3 {
+        return Err(invalid());
+    }
+    Ok(page[3] + 1)
+}
+
 fn mode_write_protected(data: &[u8]) -> Result<bool> {
     if data.len() < 8 {
         return Err(TapeError::InvalidResponse {
@@ -782,5 +818,30 @@ mod monitor_parser_tests {
         assert!(mode_write_protected(&data).is_err());
         data[1] = 0;
         assert!(mode_write_protected(&data).is_err());
+    }
+}
+
+#[cfg(test)]
+mod partition_count_tests {
+    use super::*;
+    #[test]
+    fn defined_partition_count_checks_header_page_and_descriptors() {
+        let mut v = vec![
+            0, 22, 0, 0, 0, 0, 0, 0, 0x11, 14, 3, 1, 0x3c, 3, 0x19, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert_eq!(defined_partition_count(&v).unwrap(), 2);
+        for end in 0..v.len() {
+            assert!(defined_partition_count(&v[..end]).is_err());
+        }
+        v[11] = 0;
+        assert_eq!(defined_partition_count(&v).unwrap(), 1);
+        v[11] = 4;
+        assert!(defined_partition_count(&v).is_err());
+        v[11] = 1;
+        v[8] = 0x51;
+        assert!(defined_partition_count(&v).is_err());
+        v[8] = 0x11;
+        v[7] = 255;
+        assert!(defined_partition_count(&v).is_err());
     }
 }

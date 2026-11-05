@@ -316,6 +316,10 @@ fn metadata_router(ctx: Arc<Context>) -> Router {
             "/libraries/{serial}/admin/tapes/{barcode}/move",
             axum::routing::post(pools::tape_move),
         )
+        .route(
+            "/libraries/{serial}/admin/tapes/{barcode}/assign",
+            axum::routing::post(pools::tape_assign),
+        )
         .route("/libraries/{serial}/admin/tapes", get(queries::tapes))
         .route(
             "/libraries/{serial}/admin/tapes/{barcode}",

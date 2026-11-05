@@ -559,6 +559,14 @@ pub(super) async fn rescan(
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 enum MechanicalChange {
+    #[serde(rename = "media-assign")]
+    Assign {
+        barcode: String,
+        pool: String,
+        volume: String,
+        confirm_format: bool,
+        force_format: bool,
+    },
     #[serde(rename = "media-move")]
     Move {
         barcode: String,
@@ -584,6 +592,22 @@ pub(super) async fn tape_move(
     Path((serial, barcode)): Path<(String, String)>,
     request: Request,
 ) -> Response {
+    tape_mechanical(ctx, serial, barcode, request, "media-move").await
+}
+pub(super) async fn tape_assign(
+    State(ctx): State<Arc<Context>>,
+    Path((serial, barcode)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    tape_mechanical(ctx, serial, barcode, request, "media-assign").await
+}
+async fn tape_mechanical(
+    ctx: Arc<Context>,
+    serial: String,
+    barcode: String,
+    request: Request,
+    kind: &str,
+) -> Response {
     let _permit = match budget(&ctx) {
         Ok(p) => p,
         Err(r) => return *r,
@@ -604,8 +628,8 @@ pub(super) async fn tape_move(
         Err(r) => return *r,
     };
     let value = serde_json::to_value(envelope).expect("move envelope serializes");
-    if value["change"]["barcode"] != barcode {
-        return invalid("搬带条码与HTTP路径不符");
+    if value["change"]["barcode"] != barcode || value["change"]["kind"] != kind {
+        return invalid("介质请求条码或种类与HTTP路径不符");
     }
     let intent = match crate::managed_catalog::ManagementRequest::parse(value) {
         Ok(v) => v,

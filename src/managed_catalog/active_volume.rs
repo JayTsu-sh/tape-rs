@@ -307,7 +307,7 @@ pub(super) async fn observed_completed_batch_at(
 impl ManagedCatalog {
     /// Resolve loaded-tape placement and the observed DP head from one FDB
     /// read version, after verifying the exact route and owner epoch.
-    /// Unassigned and assigned-but-unbound cartridges return None and must
+    /// Unassigned, unbound and explicitly unavailable/unimported cartridges return None and must
     /// not be probed by the device executor.
     pub async fn active_loaded_volume_head(
         &self,
@@ -329,6 +329,23 @@ impl ManagedCatalog {
         let Some(volume_id) = assignment.volume_id else {
             return Ok(None);
         };
+        if let Some(unavailable) = tr
+            .get(&unavailable_volume_key(namespace, volume_id), false)
+            .await?
+        {
+            if !unavailable.is_empty() {
+                return Err(CatalogError::Corrupt("未就绪卷标记字段无效"));
+            }
+            if tr.get(&ready_volume_key(volume_id), false).await?.is_none() {
+                // A successful assign has a bound physical identity but no
+                // imported baseline yet. It must not prevent other tapes or
+                // management jobs from recovering on an owner takeover.
+                control::verified_placement(&tr, volume_id)
+                    .await?
+                    .ok_or(CatalogError::Corrupt("未导入卷缺少分配放置证明"))?;
+                return Ok(None);
+            }
+        }
         let (_, index) = observed_at(&tr, serial, volume_id).await?;
         Ok(Some(ActiveLoadedVolumeHead {
             volume_id,

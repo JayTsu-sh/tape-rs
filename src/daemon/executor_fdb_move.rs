@@ -14,13 +14,13 @@ fn refused(detail: impl Into<String>) -> TapeError {
         reason: detail.into(),
     }
 }
-struct Snapshot {
-    map: ElementAddressMap,
-    rows: Vec<ElementStatus>,
-    observation: Value,
+pub(super) struct Snapshot {
+    pub(super) map: ElementAddressMap,
+    pub(super) rows: Vec<ElementStatus>,
+    pub(super) observation: Value,
 }
 impl Snapshot {
-    fn capture(context: &Context<'_>) -> Result<Self> {
+    pub(super) fn capture(context: &Context<'_>) -> Result<Self> {
         if !context.ready() {
             return Err(context.lost("机械操作缺少当前 Serving 许可".into()));
         }
@@ -54,19 +54,19 @@ impl Snapshot {
             observation,
         })
     }
-    fn at(&self, address: u16) -> Result<&ElementStatus> {
+    pub(super) fn at(&self, address: u16) -> Result<&ElementStatus> {
         self.rows
             .iter()
             .find(|e| e.address == address)
             .ok_or_else(|| refused(format!("完整库存缺少元素 {address:#06x}")))
     }
-    fn barcode(&self, barcode: &str) -> Result<&ElementStatus> {
+    pub(super) fn barcode(&self, barcode: &str) -> Result<&ElementStatus> {
         self.rows
             .iter()
             .find(|e| e.full && e.volume_tag.as_deref() == Some(barcode))
             .ok_or_else(|| refused(format!("完整库存中未找到条码 {barcode}")))
     }
-    fn enabled(element: &ElementStatus, access: bool) -> Result<()> {
+    pub(super) fn enabled(element: &ElementStatus, access: bool) -> Result<()> {
         if element.exception || element.disabled || access && element.accessible != Some(true) {
             return Err(refused(format!(
                 "元素{:#06x}不可移动：Access={:?} Except={} ED={} ASC/ASCQ={:02x}/{:02x}",
@@ -80,7 +80,7 @@ impl Snapshot {
         }
         Ok(())
     }
-    fn location(element: &ElementStatus) -> Result<MoveLocation> {
+    pub(super) fn location(element: &ElementStatus) -> Result<MoveLocation> {
         let kind = match element.element_type {
             ElementType::Storage => MoveLocationKind::Storage,
             ElementType::ImportExport => MoveLocationKind::ImportExport,
@@ -97,7 +97,7 @@ impl Snapshot {
             },
         })
     }
-    fn robot(&self) -> Result<()> {
+    pub(super) fn robot(&self) -> Result<()> {
         for transport in self
             .rows
             .iter()

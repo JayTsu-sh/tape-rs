@@ -324,6 +324,10 @@ mod fdb_rescan;
 #[path = "executor_fdb_move.rs"]
 mod fdb_move;
 
+#[cfg(feature = "fdb")]
+#[path = "executor_fdb_assign.rs"]
+mod fdb_assign;
+
 #[cfg(all(test, feature = "fdb"))]
 #[path = "executor_fdb_observations_fixture.rs"]
 mod fdb_observations_fixture;

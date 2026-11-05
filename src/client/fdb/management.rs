@@ -12,6 +12,12 @@ const NS: &str = "x-tapers-catalog-namespace";
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum ManagementIntent {
     LibraryRescan,
+    TapeAssign {
+        barcode: String,
+        pool_selector: String,
+        confirm_format: bool,
+        force_format: bool,
+    },
     TapeMove {
         barcode: String,
         destination: String,
@@ -146,6 +152,33 @@ impl ManagementRequestFile {
             return Err(invalid("管理请求文件版本或校验不符"));
         }
         let expected = match &self.input {
+            ManagementIntent::TapeAssign {
+                barcode,
+                pool_selector,
+                confirm_format,
+                force_format,
+            } => {
+                if !super::queries::barcode(barcode) || !name(pool_selector) || !confirm_format {
+                    return Err(invalid("分配条码、池或显式格式化确认无效"));
+                }
+                uuid(
+                    self.request["operation"]
+                        .as_str()
+                        .ok_or_else(|| invalid("分配原任务UUID缺失"))?,
+                )?;
+                let change = &self.request["change"];
+                for field in ["pool", "volume"] {
+                    uuid(
+                        change[field]
+                            .as_str()
+                            .ok_or_else(|| invalid("分配池或原卷UUID缺失"))?,
+                    )?;
+                }
+                if !self.request["epoch"].as_u64().is_some_and(|n| n > 0) {
+                    return Err(invalid("分配任务代次无效"));
+                }
+                json!({"version":1,"library":self.library,"namespace":self.namespace,"epoch":self.request["epoch"],"operation":self.request["operation"],"change":{"kind":"media-assign","barcode":barcode,"pool":change["pool"],"volume":change["volume"],"confirm_format":confirm_format,"force_format":force_format}})
+            }
             ManagementIntent::LibraryRescan => {
                 uuid(
                     self.request["operation"]
@@ -398,6 +431,12 @@ impl FdbClient {
         // Validate command parameters before contacting the server.
         match &input {
             ManagementIntent::LibraryRescan => {}
+            ManagementIntent::TapeAssign {
+                barcode,
+                pool_selector,
+                confirm_format,
+                ..
+            } if super::queries::barcode(barcode) && name(pool_selector) && *confirm_format => {}
             ManagementIntent::TapeMove {
                 barcode,
                 destination,
@@ -425,6 +464,19 @@ impl FdbClient {
             .expect("validated namespace")
             .to_owned();
         let request = match &input {
+            ManagementIntent::TapeAssign {
+                barcode,
+                pool_selector,
+                confirm_format,
+                force_format,
+            } => {
+                let pool = self.pool(library, &namespace, pool_selector)?;
+                let tape = self.tape(library, &namespace, None, barcode)?;
+                if !tape["tape"]["assignment"].is_null() {
+                    return Err(invalid("分配仅支持未分配磁带"));
+                }
+                json!({"version":1,"library":library,"namespace":namespace,"epoch":context["window"]["accepting"],"operation":Uuid::new_v4().to_string(),"change":{"kind":"media-assign","barcode":barcode,"pool":pool["pool"]["id"],"volume":Uuid::new_v4().to_string(),"confirm_format":confirm_format,"force_format":force_format}})
+            }
             ManagementIntent::LibraryRescan => {
                 json!({"version":1,"library":library,"namespace":namespace,"epoch":context["window"]["accepting"],"operation":Uuid::new_v4().to_string(),"change":{"kind":"library-rescan"}})
             }
@@ -495,6 +547,15 @@ impl FdbClient {
         )?
         .sync_all()?;
         let (method, route, statuses) = match &p.input {
+            ManagementIntent::TapeAssign { barcode, .. } => (
+                "POST",
+                format!(
+                    "{}/tapes/{}/assign",
+                    base(&p.library)?,
+                    encode_query(barcode)
+                ),
+                vec![202],
+            ),
             ManagementIntent::LibraryRescan => (
                 "POST",
                 format!("{}/library/rescan", base(&p.library)?),
@@ -660,6 +721,46 @@ mod tests {
         let p = std::env::temp_dir().join(format!("tapers-pool-client-{}", Uuid::new_v4()));
         std::fs::create_dir(&p).unwrap();
         p
+    }
+    #[test]
+    fn assignment_checkpoint_pins_volume_and_requires_explicit_format_confirmation() {
+        use super::super::tests::{response, server};
+        let mut p = prepared();
+        p.input = ManagementIntent::TapeAssign {
+            barcode: "TEST01L8".into(),
+            pool_selector: "archive".into(),
+            confirm_format: true,
+            force_format: true,
+        };
+        p.request = json!({"version":1,"library":p.library,"namespace":p.namespace,"epoch":1,"operation":Uuid::new_v4().to_string(),"change":{"kind":"media-assign","barcode":"TEST01L8","pool":Uuid::new_v4().to_string(),"volume":Uuid::new_v4().to_string(),"confirm_format":true,"force_format":true}});
+        p.fingerprint = p.digest();
+        let root = dir();
+        let path = root.join("assign.json");
+        p.save_new(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let receipt = json!({"library_serial":p.library,"namespace":p.namespace,"epoch":1,"operation":p.request["operation"],"request":p.request,"status":"queued"});
+        let (address, worker) = server(response(202, &receipt.to_string()), Duration::ZERO);
+        assert_eq!(
+            FdbClient::new([address])
+                .unwrap()
+                .submit_management(&path)
+                .unwrap(),
+            receipt
+        );
+        assert!(
+            String::from_utf8(worker.join().unwrap())
+                .unwrap()
+                .starts_with(
+                    "POST /libraries/LIB%20%E4%B8%AD%E6%96%87/admin/tapes/TEST01L8/assign "
+                )
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        if let ManagementIntent::TapeAssign { confirm_format, .. } = &mut p.input {
+            *confirm_format = false;
+        }
+        p.fingerprint = p.digest();
+        assert!(p.validate().is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn rescan_reuses_the_durable_management_protocol_and_rejects_bad_receipts() {

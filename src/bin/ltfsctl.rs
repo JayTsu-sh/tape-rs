@@ -179,8 +179,17 @@ enum TapeCmd {
         #[arg(long)]
         request: std::path::PathBuf,
     },
-    /// 把磁带（条码）归入池（名称或 UUID）
-    Assign { barcode: String, pool: String },
+    /// 格式化未分配磁带并归入池；原请求文件用于查询及恢复异步任务
+    Assign {
+        barcode: String,
+        pool: String,
+        #[arg(long, required = true)]
+        confirm_format: bool,
+        #[arg(long)]
+        force_format: bool,
+        #[arg(long)]
+        request: std::path::PathBuf,
+    },
     /// 解除归属
     Unassign { barcode: String },
     /// 将已分配磁带设为离线；返回管理任务号
@@ -464,8 +473,31 @@ fn main() {
                 )?);
             }
             Cmd::Tape {
-                cmd: TapeCmd::Assign { barcode, pool },
-            } => println!("{}", c.tape_assign(&barcode, &pool)?),
+                cmd:
+                    TapeCmd::Assign {
+                        barcode,
+                        pool: pool_selector,
+                        confirm_format,
+                        force_format,
+                        request,
+                    },
+            } => {
+                let library = args
+                    .library
+                    .as_deref()
+                    .ok_or("tape assign必须通过 --library 指定带库")?;
+                print_json(pool::submit(
+                    &tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?,
+                    library,
+                    tape_rs::client::fdb::management::ManagementIntent::TapeAssign {
+                        barcode,
+                        pool_selector,
+                        confirm_format,
+                        force_format,
+                    },
+                    request,
+                )?);
+            }
             Cmd::Tape {
                 cmd: TapeCmd::Unassign { barcode },
             } => println!("{}", c.tape_unassign(&barcode)?),
@@ -544,6 +576,50 @@ fn print_json(value: serde_json::Value) {
 mod removed_management_tests {
     use super::*;
 
+    #[test]
+    fn assign_requires_explicit_format_confirmation_and_request_checkpoint() {
+        assert!(
+            Args::try_parse_from([
+                "ltfsctl",
+                "--library",
+                "LIB1",
+                "tape",
+                "assign",
+                "TEST01L8",
+                "archive"
+            ])
+            .is_err()
+        );
+        assert!(
+            Args::try_parse_from([
+                "ltfsctl",
+                "--library",
+                "LIB1",
+                "tape",
+                "assign",
+                "TEST01L8",
+                "archive",
+                "--request",
+                "original.json"
+            ])
+            .is_err()
+        );
+        assert!(
+            Args::try_parse_from([
+                "ltfsctl",
+                "--library",
+                "LIB1",
+                "tape",
+                "assign",
+                "TEST01L8",
+                "archive",
+                "--confirm-format",
+                "--request",
+                "original.json"
+            ])
+            .is_ok()
+        );
+    }
     #[test]
     fn obsolete_group_and_reconcile_commands_are_rejected() {
         for command in [

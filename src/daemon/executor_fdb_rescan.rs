@@ -14,6 +14,7 @@ pub(super) struct Observer {
     publisher: Publisher,
     task: Option<Task>,
     mechanical: Option<fdb_move::Job>,
+    assignment: Option<fdb_assign::Job>,
     evicted: Vec<usize>,
     cursor: Option<(u64, uuid::Uuid)>,
     next: Instant,
@@ -27,6 +28,7 @@ impl Default for Observer {
             publisher: Publisher::default(),
             task: None,
             mechanical: None,
+            assignment: None,
             evicted: Vec::new(),
             cursor: None,
             next: Instant::now(),
@@ -72,6 +74,11 @@ impl Observer {
         self.mechanical
             .as_ref()
             .map(fdb_move::Job::diagnostic_identity)
+            .or_else(|| {
+                self.assignment
+                    .as_ref()
+                    .map(fdb_assign::Job::diagnostic_identity)
+            })
             .or_else(|| {
                 self.task
                     .as_ref()
@@ -125,7 +132,7 @@ impl Observer {
         }
         // A pending final receipt pins the original published timestamp. In
         // particular, periodic sampling cannot overwrite it while its ACK is lost.
-        if self.task.is_none() && self.mechanical.is_none() {
+        if self.task.is_none() && self.mechanical.is_none() && self.assignment.is_none() {
             // Settle an existing sample, but never start a new periodic CDB
             // before checking a persistent mechanical recovery checkpoint.
             if !self.publisher.idle() {
@@ -153,10 +160,14 @@ impl Observer {
             if let Some(task) = pending {
                 let request = ManagementRequest::parse(task["request"].clone())
                     .map_err(|e| TapeError::Catalog(e.to_string()))?;
-                self.mechanical = Some(fdb_move::Job::new(request, &task)?);
+                if request.value()["change"]["kind"] == "media-assign" {
+                    self.assignment = Some(fdb_assign::Job::new(request, &task)?);
+                } else {
+                    self.mechanical = Some(fdb_move::Job::new(request, &task)?);
+                }
             }
         }
-        if self.task.is_none() && self.mechanical.is_none() {
+        if self.task.is_none() && self.mechanical.is_none() && self.assignment.is_none() {
             self.publisher.poll(context, runtime)?;
             self.publisher.take_completion();
             if !self.publisher.idle() || Instant::now() < self.next {
@@ -198,6 +209,8 @@ impl Observer {
             self.cursor = Some(cursor);
             if request.value()["change"]["kind"] == "media-move" {
                 self.mechanical = Some(fdb_move::Job::new(request, &saved)?);
+            } else if request.value()["change"]["kind"] == "media-assign" {
+                self.assignment = Some(fdb_assign::Job::new(request, &saved)?);
             } else if request.value()["change"]["kind"] == "library-rescan" {
                 self.task = Some(Task {
                     request,
@@ -210,6 +223,21 @@ impl Observer {
             self.next = Instant::now();
         }
         if Instant::now() < self.next {
+            return Ok(());
+        }
+        if let Some(mut job) = self.assignment.take() {
+            let result = job.poll(context, &mut self.publisher, runtime);
+            if let Some(drive) = job.evicted_drive.take() {
+                self.evicted.push(drive);
+            }
+            self.assignment = Some(job);
+            let result = result.map_err(|error| {
+                context.lost(format!("分配原任务{}：{error}", self.task_identity()))
+            })?;
+            if self.confirmed(&context, "分配", result)? == Some(true) {
+                self.assignment = None;
+                self.next = Instant::now() + Duration::from_millis(250);
+            }
             return Ok(());
         }
         if let Some(mut job) = self.mechanical.take() {

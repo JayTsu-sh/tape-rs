@@ -49,7 +49,7 @@ async fn original(tr: &Transaction, serial: &str, request: &ManagementRequest) -
     }
     Ok(task)
 }
-async fn pending_at(tr: &Transaction, ns: Uuid, serial: &str) -> Result<Option<Value>> {
+pub(super) async fn pending_at(tr: &Transaction, ns: Uuid, serial: &str) -> Result<Option<Value>> {
     let Some(raw) = tr
         .get(&native_device::library_gate(ns, serial), false)
         .await?
@@ -88,14 +88,17 @@ async fn pending_at(tr: &Transaction, ns: Uuid, serial: &str) -> Result<Option<V
         .await?
         .ok_or(CatalogError::Corrupt("机械任务gate缺少原任务"))?;
     if task["status"] != "running"
-        || task["request"]["change"]["kind"] != "media-move"
+        || !matches!(
+            task["request"]["change"]["kind"].as_str(),
+            Some("media-move" | "media-assign")
+        )
         || task["fingerprint"] != gate["fingerprint"]
     {
         return Err(CatalogError::Corrupt("机械任务gate与原执行检查点不符"));
     }
     Ok(Some(task))
 }
-async fn require_gate(
+pub(super) async fn require_gate(
     tr: &Transaction,
     ns: Uuid,
     serial: &str,
