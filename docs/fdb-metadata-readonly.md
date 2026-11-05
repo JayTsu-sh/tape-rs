@@ -65,6 +65,10 @@ FDB 节点记录使用带 `N1` 标识的格式。目录必须持久保存非零�
 
 原生空带库的 FDB 初始化存储入口为 `verify_native_barriers` 和 `ManagedCatalog::initialize_native_library`。每条屏障回复必须包含与目标带库匹配的 `library_serial`，缺失、错库或混用其他库的回复一律拒绝。调用方必须从三个已配置节点直接取得同一 challenge、term、leader、成员集合及冻结水位的屏障回复，确认执行器停止、目录无待提交状态且为空。初始化只接受未使用的 namespace，在一个事务内创建根、布局、请求窗口、路由与来源证书；遇到已有准备路由、证书或活动权威时拒绝覆盖，原成功请求重试只能返回已校验的结果，不能重置 owner。证书显式区分原生初始化（N）和目录导入（I），拒绝旧的无来源前缀证书。此接口不发设备命令，也不授予 Raft/PR 设备执行许可；CLI/HTTP 的屏障采集及管理接入仍需后续闭合。
 
+管理请求的公共解码入口为 `ManagementRequest::parse`，固定包含 version、library、namespace、epoch、operation 和 change，总编码上限 4096 字节；UUID 必须非零且为规范形式，epoch 必须非零。change 严格按动作核对字段、目标身份和修订号：支持 library-rescan、pool/pool-delete、drive、tape 策略及 media-import/move/assign/unassign/validate/online 请求结构，拒绝 nodegroup、reconcile 和未知动作。池名、介质限制与创建记录共用校验规则；格式化分配必须显式确认，导入路径同时检查合并和按条码展开后的长度。
+
+`value()` 只读返回原请求，`fingerprint()` 将完整请求绑定为 SHA-256 身份。公共解析入口同时检查结构与静态准入规则，直接禁止通过策略 patch 设置 online=true，上线只能使用单独的实带核验任务；解析不写 FDB、不排队，也不核实实时状态或授予执行许可。本批仅统一请求协议，持久管理任务账本、CLI/HTTP 接线及硬件执行尚未完成；不提供旧动作或旧回执兼容解码。
+
 ## Raft/PR owner 只读接任阶段
 
 `--fdb-owner-readonly` 是独立于上述无设备只读入口的阶段性运行模式。它要求 `--fdb-cluster-file`、`--libraries-config` 和 `--client-listen`，并要求配置中的每个真实带库序列号已有有效 FDB Active 路由。此模式沿用原 `ltfsd` 三节点 Raft 数据目录和设备组配置：Raft 确定 owner 后，执行线程用同一多数派许可逐 CDB 守护并取得整个设备组的 PR；在 `Recover` 阶段逐设备回读 PR，核对本节点 Raft 的 `catalog_frozen_index` 等于 FDB 路由的 `frozen_index`，再推进 FDB owner epoch，之后再次核对许可和 PR。任一检查失败会报告该轮接任失败，不开放文件服务。

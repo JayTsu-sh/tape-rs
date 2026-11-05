@@ -53,6 +53,7 @@ mod routing;
 mod staged_import;
 mod staged_sources;
 pub use cleanup::PurgeProgress;
+pub use control::ManagementRequest;
 pub use control::{
     ActivePoolCreation, ControlOutcome, PoolPolicy, PoolRecord, TapeAssignment, VolumePlacement,
 };
