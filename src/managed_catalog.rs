@@ -53,10 +53,10 @@ mod routing;
 mod staged_import;
 mod staged_sources;
 pub use cleanup::PurgeProgress;
-pub use control::ManagementRequest;
 pub use control::{
     ActivePoolCreation, ControlOutcome, PoolPolicy, PoolRecord, TapeAssignment, VolumePlacement,
 };
+pub use control::{ManagementRequest, NotifyConnectionAction, NotifyFilter};
 pub use cutover::{
     FrozenSnapshotIdentity, VerifiedNodeExport, inspect_frozen_snapshot, verify_node_export,
 };
