@@ -1948,6 +1948,7 @@ mod tests {
                         library_serial: "STAGED_TEST".into(),
                         name: "import-test".into(),
                         file_limit: 100,
+                        created_at_millis: 1_793_405_000_123,
                         policy: PoolPolicy::default(),
                         revision: 1,
                     },

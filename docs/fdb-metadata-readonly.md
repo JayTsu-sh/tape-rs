@@ -49,6 +49,8 @@ POST /libraries/{serial}/admin/catalog/current/export
 
 节点导出始终由收到请求的本机处理，多库网关不会将这个只读 POST 转发到 Leader。响应返回该节点编号、应用水位、冻结索引和快照 SHA-256；验收须将下载文件与响应头一起交给 `verify_node_export`，使用三个实际节点的导出生成证书。`examples/fdb_empty_cutover.rs` 仅服务隔离空目录演练，要求显式环境门控，拒绝导入含池、磁带、文件或任务的快照，不访问设备，也不提供一般生产迁移功能。清单必须包含冻结前已经实际取得 PR 的旧 owner 轮次，作为 FDB owner epoch 基线；不凭冻结索引推算轮次。重试仅可复用节点、应用水位及摘要完全一致的既有预备证书，拒绝覆盖不同证书或再次激活活动路由。
 
+FDB 池记录使用 v4 格式，持久保存不可变的 `created_at_millis`，有效 UTC 毫秒范围为 1..253402300799999；重命名和策略更新不能更改它，旧池记录版本直接拒绝。上述隔离验收示例的外部介质清单中，每个 source 须提供 `pool_created_at_millis`；同一池的各 source 及重试必须使用同一个原始创建时间，不在每次执行时重新取当前时间。此字段是后续池详情和目录元数据的基础，当前不代表管理 HTTP 后端已整体切换到 FDB。
+
 ## Raft/PR owner 只读接任阶段
 
 `--fdb-owner-readonly` 是独立于上述无设备只读入口的阶段性运行模式。它要求 `--fdb-cluster-file`、`--libraries-config` 和 `--client-listen`，并要求配置中的每个真实带库序列号已有有效 FDB Active 路由。此模式沿用原 `ltfsd` 三节点 Raft 数据目录和设备组配置：Raft 确定 owner 后，执行线程用同一多数派许可逐 CDB 守护并取得整个设备组的 PR；在 `Recover` 阶段逐设备回读 PR，核对本节点 Raft 的 `catalog_frozen_index` 等于 FDB 路由的 `frozen_index`，再推进 FDB owner epoch，之后再次核对许可和 PR。任一检查失败会报告该轮接任失败，不开放文件服务。
