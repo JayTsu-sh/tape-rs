@@ -5,6 +5,10 @@ use super::*;
 #[path = "management.rs"]
 pub(super) mod management;
 
+#[path = "management_request.rs"]
+mod management_request;
+pub use management_request::ManagementRequest;
+
 #[path = "active_pools.rs"]
 mod active_pools;
 pub use active_pools::ActivePoolCreation;
@@ -578,6 +582,25 @@ fn pool_name_key(namespace: Uuid, name: &str) -> Vec<u8> {
     k
 }
 
+fn valid_media_restriction(value: &str) -> bool {
+    [
+        "none", "L5", "L6", "L7", "L8", "L9", "M8", "JB", "JC", "JD", "JE", "JY", "JZ", "JV", "JK",
+        "JL", "JM", "JF",
+    ]
+    .contains(&value)
+}
+
+fn validate_pool_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > MAX_NAME
+        || name.as_bytes().contains(&0)
+        || name.as_bytes().contains(&b'/')
+    {
+        return Err(CatalogError::Invalid("pool 名称为空、过长或含非法字符"));
+    }
+    Ok(())
+}
+
 fn validate_pool(pool: &PoolRecord) -> Result<()> {
     validate_physical_serial(&pool.library_serial)?;
     if pool.id.is_nil() || pool.file_limit == 0 || pool.revision == 0 {
@@ -588,20 +611,9 @@ fn validate_pool(pool: &PoolRecord) -> Result<()> {
     if !(1..=253_402_300_799_999).contains(&pool.created_at_millis) {
         return Err(CatalogError::Invalid("pool 创建时间超出有效 UTC 毫秒范围"));
     }
-    if pool.name.is_empty()
-        || pool.name.len() > MAX_NAME
-        || pool.name.as_bytes().contains(&0)
-        || pool.name.as_bytes().contains(&b'/')
-    {
-        return Err(CatalogError::Invalid("pool 名称为空、过长或含非法字符"));
-    }
+    validate_pool_name(&pool.name)?;
     let policy = &pool.policy;
-    if ![
-        "none", "L5", "L6", "L7", "L8", "L9", "M8", "JB", "JC", "JD", "JE", "JY", "JZ", "JV", "JK",
-        "JL", "JM", "JF",
-    ]
-    .contains(&policy.media_restriction.as_str())
-    {
+    if !valid_media_restriction(&policy.media_restriction) {
         return Err(CatalogError::Invalid("pool 介质限制非法"));
     }
     if policy.mount_limit > 32767 || policy.low_space_warning_threshold > 32767 {
