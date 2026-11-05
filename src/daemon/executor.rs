@@ -316,10 +316,11 @@ mod fdb_loading;
 #[path = "executor_fdb_observations.rs"]
 mod fdb_observations;
 
+#[cfg(feature = "fdb")]
 #[path = "executor_fdb_rescan.rs"]
 mod fdb_rescan;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fdb"))]
 #[path = "executor_fdb_observations_fixture.rs"]
 mod fdb_observations_fixture;
 
