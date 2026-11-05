@@ -474,7 +474,6 @@ impl ManagedCatalog {
         let state_key = namespace_key(namespace);
         let managed_key = control::managed_key(namespace);
         let source_revision_key = source_revision_key(namespace);
-        let default_group = control::node_group_key(namespace, "G0");
         let value = encode_node(&Node {
             kind: NodeKind::Directory,
             parent: Uuid::nil(),
@@ -487,14 +486,12 @@ impl ManagedCatalog {
                 let state_key = state_key.clone();
                 let managed_key = managed_key.clone();
                 let source_revision_key = source_revision_key.clone();
-                let default_group = default_group.clone();
                 let value = value.clone();
                 async move {
                     let old_root = tr.get(&root, false).await?;
                     let old_state = tr.get(&state_key, false).await?;
                     let old_managed = tr.get(&managed_key, false).await?;
                     let old_source_revision = tr.get(&source_revision_key, false).await?;
-                    let old_group = tr.get(&default_group, false).await?;
                     if old_state.as_deref() == Some(&[NamespaceState::Discarded as u8]) {
                         return Ok(Err(CatalogError::Invalid("废弃的 namespace ID 不能复用")));
                     }
@@ -530,9 +527,6 @@ impl ManagedCatalog {
                                     "非受管命名空间存在扫描修订号",
                                 )));
                             }
-                            if old_group.as_deref() != Some(&[][..]) {
-                                return Ok(Err(CatalogError::Corrupt("默认节点组缺失或损坏")));
-                            }
                             let window = tr.get(&requests::window_key(namespace), false).await?;
                             if window
                                 .as_deref()
@@ -546,15 +540,11 @@ impl ManagedCatalog {
                             Ok(Ok(false))
                         }
                         (None, None) => {
-                            if old_managed.is_some()
-                                || old_group.is_some()
-                                || old_source_revision.is_some()
-                            {
+                            if old_managed.is_some() || old_source_revision.is_some() {
                                 return Ok(Err(CatalogError::Corrupt("受管命名空间缺少根记录")));
                             }
                             tr.set(&root, &value);
                             tr.set(&state_key, &[state as u8]);
-                            tr.set(&default_group, b"");
                             if managed {
                                 tr.set(&managed_key, b"");
                                 tr.set(&source_revision_key, &0u64.to_be_bytes());

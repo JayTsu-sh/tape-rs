@@ -75,7 +75,7 @@ pub(super) fn handle(
                     .map(|b| (b.clone(), model::tape_policy(&m, b)))
                     .collect();
                 Some(
-                    json!({"inventory":m["inventory"],"inventory_observation":model::inventory_observation(&s),"pools":s.pools.iter().map(|p|model::pool_view(&s,p)).collect::<Vec<_>>(),"tapes":model::tape_views(&s),"drives":model::drive_views(&s),"tape_policies":policies,"drive_policies":m["drives"],"nodegroups":m["nodegroups"],"nodes":m["nodes"]}),
+                    json!({"inventory":m["inventory"],"inventory_observation":model::inventory_observation(&s),"pools":s.pools.iter().map(|p|model::pool_view(&s,p)).collect::<Vec<_>>(),"tapes":model::tape_views(&s),"drives":model::drive_views(&s),"tape_policies":policies,"drive_policies":m["drives"]}),
                 )
             }
             "tasks" if action.is_empty() => {
@@ -90,20 +90,8 @@ pub(super) fn handle(
             "libraries" if action.is_empty() && (target.is_empty() || target == "current") => Some(
                 json!({"scope":"cluster_device_group","inventory":m["inventory"],"inventory_observation":model::inventory_observation(&s),"executor":s.executor.as_ref().map(|e|json!({"node":e.node,"round":e.round})),"executor_ready":s.executor_ready,"catalog_quiesce_index":s.catalog_quiesce_index,"catalog_frozen_index":s.catalog_frozen_index}),
             ),
-            "nodegroups" if action.is_empty() => {
-                if target.is_empty() {
-                    Some(m["nodegroups"].clone())
-                } else {
-                    m["nodegroups"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .find(|g| *g == target)
-                        .map(|_| json!({"name":target,"nodes":m["nodes"],"drives":m["drives"]}))
-                }
-            }
             "nodes" if action.is_empty() => {
-                let rows: Vec<Value> = s.candidates.iter().map(|(id,c)|json!({"id":id,"instance":c.instance,"device_group":c.group,"drives":c.drives,"eligible":c.eligible,"nodegroup":m["nodes"].get(id.to_string()).cloned().unwrap_or(json!("G0"))})).collect();
+                let rows: Vec<Value> = s.candidates.iter().map(|(id,c)|json!({"id":id,"instance":c.instance,"device_group":c.group,"drives":c.drives,"eligible":c.eligible})).collect();
                 if target.is_empty() {
                     Some(json!(rows))
                 } else {
@@ -202,8 +190,6 @@ pub(super) fn handle(
         ("POST", "catalog", "quiesce" | "resume" | "freeze") if target == "current" => Some(action),
         ("PATCH", "pools", "") if !target.is_empty() => Some("set"),
         ("DELETE", "pools", "") if !target.is_empty() => Some("delete"),
-        ("POST", "nodegroups", "") if !target.is_empty() => Some("create"),
-        ("DELETE", "nodegroups", "") if !target.is_empty() => Some("delete"),
         ("POST", "tasks", "") if target == "clearhistory" => Some("clearhistory"),
         ("POST", "tasks", "cancel") => Some("cancel"),
         ("POST", "libraries", "rescan") if target == "current" => Some("rescan"),
@@ -211,10 +197,9 @@ pub(super) fn handle(
             "POST",
             "tapes",
             "assign" | "unassign" | "offline" | "online" | "blacklist" | "clear-blacklist" | "move"
-            | "validate" | "reconcile" | "objects" | "restore",
+            | "validate" | "objects" | "restore",
         ) => Some(action),
-        ("POST", "drives", "up" | "down" | "role" | "assign") => Some(action),
-        ("POST", "nodes", "assign") => Some("assign"),
+        ("POST", "drives", "up" | "down" | "role") => Some(action),
         _ => None,
     };
     if let Some(op) = op {

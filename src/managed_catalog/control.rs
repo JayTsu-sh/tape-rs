@@ -19,7 +19,6 @@ pub struct PoolRecord {
 pub struct PoolPolicy {
     pub media_restriction: String,
     pub mount_limit: u16,
-    pub node_group: String,
     pub low_space_warning_enabled: bool,
     pub low_space_warning_threshold: u16,
     pub no_space_warning_enabled: bool,
@@ -30,7 +29,6 @@ impl Default for PoolPolicy {
         Self {
             media_restriction: "none".into(),
             mount_limit: 0,
-            node_group: "G0".into(),
             low_space_warning_enabled: true,
             low_space_warning_threshold: 0,
             no_space_warning_enabled: true,
@@ -446,68 +444,6 @@ fn pool_name_key(namespace: Uuid, name: &str) -> Vec<u8> {
     k
 }
 
-fn node_group_prefix(namespace: Uuid) -> Vec<u8> {
-    let mut k = key(b'Y');
-    k.extend_from_slice(namespace.as_bytes());
-    k
-}
-
-pub(super) fn node_group_key(namespace: Uuid, name: &str) -> Vec<u8> {
-    let mut k = node_group_prefix(namespace);
-    append_component(&mut k, name.as_bytes());
-    k
-}
-
-fn group_pool_prefix(namespace: Uuid, name: &str) -> Vec<u8> {
-    let mut k = key(b'y');
-    k.extend_from_slice(namespace.as_bytes());
-    append_component(&mut k, name.as_bytes());
-    k
-}
-
-fn group_pool_key(namespace: Uuid, name: &str, pool: Uuid) -> Vec<u8> {
-    let mut k = group_pool_prefix(namespace, name);
-    k.extend_from_slice(pool.as_bytes());
-    k
-}
-
-fn validate_node_group(name: &str) -> Result<()> {
-    if name.is_empty()
-        || name.len() > 16
-        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    {
-        return Err(CatalogError::Invalid(
-            "节点组名称须为 1–16 个 ASCII 字母、数字或下划线",
-        ));
-    }
-    Ok(())
-}
-
-async fn require_node_group(tr: &Transaction, namespace: Uuid, name: &str) -> Result<()> {
-    match tr.get(&node_group_key(namespace, name), false).await? {
-        Some(value) if value.is_empty() => Ok(()),
-        Some(_) => Err(CatalogError::Corrupt("节点组记录损坏")),
-        None => Err(CatalogError::Invalid("pool 节点组不存在")),
-    }
-}
-
-async fn require_group_pool_index(
-    tr: &Transaction,
-    namespace: Uuid,
-    pool: &PoolRecord,
-) -> Result<()> {
-    match tr
-        .get(
-            &group_pool_key(namespace, &pool.policy.node_group, pool.id),
-            false,
-        )
-        .await?
-    {
-        Some(value) if value.is_empty() => Ok(()),
-        _ => Err(CatalogError::Corrupt("pool 节点组引用索引缺失或损坏")),
-    }
-}
-
 fn validate_pool(pool: &PoolRecord) -> Result<()> {
     validate_physical_serial(&pool.library_serial)?;
     if pool.id.is_nil() || pool.file_limit == 0 || pool.revision == 0 {
@@ -534,19 +470,15 @@ fn validate_pool(pool: &PoolRecord) -> Result<()> {
     if policy.mount_limit > 32767 || policy.low_space_warning_threshold > 32767 {
         return Err(CatalogError::Invalid("pool 挂载或低空间阈值超出范围"));
     }
-    validate_node_group(&policy.node_group)?;
     Ok(())
 }
 
 fn encode_pool(pool: &PoolRecord) -> Vec<u8> {
     let policy = &pool.policy;
     let mut value = Vec::with_capacity(
-        27 + pool.name.len()
-            + policy.media_restriction.len()
-            + policy.node_group.len()
-            + pool.library_serial.len(),
+        26 + pool.name.len() + policy.media_restriction.len() + pool.library_serial.len(),
     );
-    value.push(2);
+    value.push(3);
     value.extend_from_slice(&pool.revision.to_be_bytes());
     value.extend_from_slice(&pool.file_limit.to_be_bytes());
     value.extend_from_slice(&policy.mount_limit.to_be_bytes());
@@ -557,43 +489,35 @@ fn encode_pool(pool: &PoolRecord) -> Vec<u8> {
     );
     value.extend_from_slice(&(pool.name.len() as u16).to_be_bytes());
     value.push(policy.media_restriction.len() as u8);
-    value.push(policy.node_group.len() as u8);
     value.push(pool.library_serial.len() as u8);
     value.extend_from_slice(pool.name.as_bytes());
     value.extend_from_slice(policy.media_restriction.as_bytes());
-    value.extend_from_slice(policy.node_group.as_bytes());
     value.extend_from_slice(pool.library_serial.as_bytes());
     value
 }
 
 fn decode_pool(id: Uuid, value: &[u8]) -> Result<PoolRecord> {
-    if value.first() != Some(&2) {
+    if value.first() != Some(&3) {
         return Err(CatalogError::Corrupt(
             "pool 记录版本不支持；旧候选需重新导入明确的带库归属",
         ));
     }
-    if value.len() < 27 || value[21] & !0b11 != 0 {
+    if value.len() < 26 || value[21] & !0b11 != 0 {
         return Err(CatalogError::Corrupt("pool 记录长度"));
     }
     let name_len = u16::from_be_bytes([value[22], value[23]]) as usize;
     let media_len = value[24] as usize;
-    let group_len = value[25] as usize;
-    let serial_len = value[26] as usize;
-    if value.len() != 27 + name_len + media_len + group_len + serial_len {
+    let serial_len = value[25] as usize;
+    if value.len() != 26 + name_len + media_len + serial_len {
         return Err(CatalogError::Corrupt("pool 可变字段长度"));
     }
-    let name = std::str::from_utf8(&value[27..27 + name_len])
+    let name = std::str::from_utf8(&value[26..26 + name_len])
         .map_err(|_| CatalogError::Corrupt("pool 名称编码"))?
         .to_owned();
-    let media = std::str::from_utf8(&value[27 + name_len..27 + name_len + media_len])
+    let media = std::str::from_utf8(&value[26 + name_len..26 + name_len + media_len])
         .map_err(|_| CatalogError::Corrupt("pool 介质限制编码"))?
         .to_owned();
-    let group = std::str::from_utf8(
-        &value[27 + name_len + media_len..27 + name_len + media_len + group_len],
-    )
-    .map_err(|_| CatalogError::Corrupt("pool 节点组编码"))?
-    .to_owned();
-    let library_serial = std::str::from_utf8(&value[27 + name_len + media_len + group_len..])
+    let library_serial = std::str::from_utf8(&value[26 + name_len + media_len..])
         .map_err(|_| CatalogError::Corrupt("pool 带库序列号编码"))?
         .to_owned();
     let pool = PoolRecord {
@@ -604,7 +528,6 @@ fn decode_pool(id: Uuid, value: &[u8]) -> Result<PoolRecord> {
         policy: PoolPolicy {
             media_restriction: media,
             mount_limit: u16::from_be_bytes([value[17], value[18]]),
-            node_group: group,
             low_space_warning_enabled: value[21] & 1 != 0,
             low_space_warning_threshold: u16::from_be_bytes([value[19], value[20]]),
             no_space_warning_enabled: value[21] & 2 != 0,
@@ -662,8 +585,6 @@ async fn require_pool_library(
             "pool 不属于目标物理带库，跨库操作必须使用另一个池",
         ));
     }
-    require_node_group(tr, namespace, &pool.policy.node_group).await?;
-    require_group_pool_index(tr, namespace, &pool).await?;
     let library = tr
         .get(&library_key(namespace, serial), false)
         .await?
@@ -686,110 +607,6 @@ impl ManagedCatalog {
             .map(|value| decode_pool(id, &value).map(|_| true))
             .transpose()
             .map(|value| value.unwrap_or(false))
-    }
-
-    /// Node groups are namespace-scoped. G0 is created with the namespace.
-    pub async fn register_node_group(&self, namespace: Uuid, name: &str) -> Result<bool> {
-        validate_node_group(name)?;
-        let record = node_group_key(namespace, name);
-        self.db
-            .run(|tr, _| {
-                let record = record.clone();
-                async move {
-                    requests::retry_result(
-                        async {
-                            require_control_building_or_ready(&tr, namespace).await?;
-                            match tr.get(&record, false).await? {
-                                Some(value) if value.is_empty() => Ok(false),
-                                Some(_) => Err(CatalogError::Corrupt("节点组记录损坏")),
-                                None => {
-                                    tr.set(&record, b"");
-                                    Ok(true)
-                                }
-                            }
-                        }
-                        .await,
-                    )
-                }
-            })
-            .await?
-    }
-
-    /// Reject deleting a group while any pool still references it.
-    pub async fn remove_node_group(&self, namespace: Uuid, name: &str) -> Result<bool> {
-        validate_node_group(name)?;
-        if name == "G0" {
-            return Err(CatalogError::Invalid("默认节点组 G0 不能删除"));
-        }
-        let record = node_group_key(namespace, name);
-        let prefix = group_pool_prefix(namespace, name);
-        self.db
-            .run(|tr, _| {
-                let record = record.clone();
-                let prefix = prefix.clone();
-                async move {
-                    requests::retry_result(
-                        async {
-                            require_control_namespace(&tr, namespace).await?;
-                            let Some(value) = tr.get(&record, false).await? else {
-                                return Ok(false);
-                            };
-                            if !value.is_empty() {
-                                return Err(CatalogError::Corrupt("节点组记录损坏"));
-                            }
-                            let range = RangeOption {
-                                begin: KeySelector::first_greater_or_equal(prefix.clone()),
-                                end: KeySelector::first_greater_or_equal(prefix_end(&prefix)),
-                                limit: Some(1),
-                                ..RangeOption::default()
-                            };
-                            if !tr.get_range(&range, 1, false).await?.is_empty() {
-                                return Err(CatalogError::Invalid("节点组仍被 pool 引用"));
-                            }
-                            tr.clear(&record);
-                            Ok(true)
-                        }
-                        .await,
-                    )
-                }
-            })
-            .await?
-    }
-
-    pub async fn list_node_groups(
-        &self,
-        namespace: Uuid,
-        after: Option<&[u8]>,
-        limit: usize,
-    ) -> Result<Page<String>> {
-        let prefix = node_group_prefix(namespace);
-        if after.is_some_and(|cursor| {
-            !cursor.starts_with(&prefix)
-                || cursor.len() > prefix.len() + 18
-                || decode_name(&cursor[prefix.len()..]).is_err()
-        }) {
-            return Err(CatalogError::Invalid("节点组分页游标无效"));
-        }
-        let rows = self
-            .page_range(&prefix, after, limit, Some(namespace), None)
-            .await?;
-        let items = rows
-            .items
-            .into_iter()
-            .map(|(k, v)| {
-                if !v.is_empty() {
-                    return Err(CatalogError::Corrupt("节点组记录损坏"));
-                }
-                let name = String::from_utf8(decode_name(&k[prefix.len()..])?)
-                    .map_err(|_| CatalogError::Corrupt("节点组名称编码"))?;
-                validate_node_group(&name).map_err(|_| CatalogError::Corrupt("节点组名称非法"))?;
-                Ok(name)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Page {
-            items,
-            next: rows.next,
-        })
     }
 
     /// Declare a physical changer by its real serial within one logical namespace.
@@ -828,16 +645,10 @@ impl ManagedCatalog {
         }
         let record = pool_key(namespace, pool.id);
         let name = pool_name_key(namespace, &pool.name);
-        let group_index = group_pool_key(namespace, &pool.policy.node_group, pool.id);
         let value = encode_pool(pool);
         self.db
             .run(|tr, _| {
-                let (record, name, group_index, value) = (
-                    record.clone(),
-                    name.clone(),
-                    group_index.clone(),
-                    value.clone(),
-                );
+                let (record, name, value) = (record.clone(), name.clone(), value.clone());
                 async move {
                     requests::retry_result(
                         async {
@@ -854,12 +665,11 @@ impl ManagedCatalog {
                                     ));
                                 }
                             }
-                            require_node_group(&tr, namespace, &pool.policy.node_group).await?;
+
                             let old = tr.get(&record, false).await?;
                             let named = tr.get(&name, false).await?;
                             if let Some(ref bytes) = old {
-                                let saved = decode_pool(pool.id, bytes)?;
-                                require_group_pool_index(&tr, namespace, &saved).await?;
+                                decode_pool(pool.id, bytes)?;
                             }
                             if let Some(ref bytes) = named {
                                 uuid_from(bytes)?;
@@ -879,12 +689,8 @@ impl ManagedCatalog {
                                 (Some(_), _) => Ok(ControlOutcome::IdConflict),
                                 (_, Some(_)) => Ok(ControlOutcome::NameConflict),
                                 (None, None) => {
-                                    if tr.get(&group_index, false).await?.is_some() {
-                                        return Err(CatalogError::Corrupt("pool 节点组索引孤儿"));
-                                    }
                                     tr.set(&record, &value);
                                     tr.set(&name, pool.id.as_bytes());
-                                    tr.set(&group_index, b"");
                                     Ok(ControlOutcome::Created)
                                 }
                             }
@@ -918,17 +724,13 @@ impl ManagedCatalog {
         let record = pool_key(namespace, expected.id);
         let old_name = pool_name_key(namespace, &expected.name);
         let new_name = pool_name_key(namespace, &replacement.name);
-        let old_group = group_pool_key(namespace, &expected.policy.node_group, expected.id);
-        let new_group = group_pool_key(namespace, &replacement.policy.node_group, replacement.id);
         let replacement_value = encode_pool(replacement);
         self.db
             .run(|tr, _| {
-                let (record, old_name, new_name, old_group, new_group, replacement_value) = (
+                let (record, old_name, new_name, replacement_value) = (
                     record.clone(),
                     old_name.clone(),
                     new_name.clone(),
-                    old_group.clone(),
-                    new_group.clone(),
                     replacement_value.clone(),
                 );
                 async move {
@@ -939,8 +741,7 @@ impl ManagedCatalog {
                                 return Ok(ControlOutcome::IdConflict);
                             };
                             let current = decode_pool(expected.id, &current)?;
-                            require_node_group(&tr, namespace, &current.policy.node_group).await?;
-                            require_group_pool_index(&tr, namespace, &current).await?;
+
                             let actual_name = pool_name_key(namespace, &current.name);
                             match tr.get(&actual_name, false).await? {
                                 Some(id) if id.as_ref() == current.id.as_bytes() => {}
@@ -952,8 +753,7 @@ impl ManagedCatalog {
                             if current != *expected {
                                 return Ok(ControlOutcome::StaleVersion);
                             }
-                            require_node_group(&tr, namespace, &replacement.policy.node_group)
-                                .await?;
+
                             if old_name != new_name {
                                 if let Some(id) = tr.get(&new_name, false).await? {
                                     if uuid_from(&id)? == expected.id {
@@ -963,13 +763,6 @@ impl ManagedCatalog {
                                 }
                                 tr.clear(&old_name);
                                 tr.set(&new_name, expected.id.as_bytes());
-                            }
-                            if old_group != new_group {
-                                if tr.get(&new_group, false).await?.is_some() {
-                                    return Err(CatalogError::Corrupt("pool 目标节点组索引孤儿"));
-                                }
-                                tr.clear(&old_group);
-                                tr.set(&new_group, b"");
                             }
                             tr.set(&record, &replacement_value);
                             Ok(ControlOutcome::Updated)
@@ -1686,7 +1479,7 @@ pub(super) mod tests {
             policy: PoolPolicy {
                 media_restriction: "L9".into(),
                 mount_limit: 7,
-                node_group: "G2".into(),
+
                 low_space_warning_enabled: false,
                 low_space_warning_threshold: 32767,
                 no_space_warning_enabled: true,
@@ -1694,12 +1487,14 @@ pub(super) mod tests {
             revision: 1,
         };
         let encoded = encode_pool(&record);
-        let mut legacy = encoded.clone();
-        legacy[0] = 1;
-        assert!(
-            decode_pool(id, &legacy).is_err(),
-            "没有明确带库归属的旧池记录不得被默认为可读"
-        );
+        for old_version in [1, 2] {
+            let mut legacy = encoded.clone();
+            legacy[0] = old_version;
+            assert!(
+                decode_pool(id, &legacy).is_err(),
+                "旧节点组池记录不能用于新管理模型"
+            );
+        }
         for serial in ["", "wrong/serial"] {
             assert!(
                 validate_pool(&PoolRecord {
@@ -2833,34 +2628,21 @@ pub(super) mod tests {
         let other = Uuid::new_v4();
         assert!(catalog.create_namespace(ns).await.unwrap());
         assert!(catalog.create_namespace(other).await.unwrap());
-        assert_eq!(
-            catalog.list_node_groups(ns, None, 1).await.unwrap().items,
-            vec!["G0"]
-        );
-        assert!(!catalog.register_node_group(ns, "G0").await.unwrap());
-        assert!(catalog.register_node_group(ns, "G1").await.unwrap());
-        assert!(catalog.register_node_group(ns, "G2").await.unwrap());
-        assert!(!catalog.register_node_group(ns, "G2").await.unwrap());
-        assert!(catalog.register_node_group(ns, "bad/group").await.is_err());
-        assert!(catalog.remove_node_group(ns, "G0").await.is_err());
-        let groups = catalog.list_node_groups(ns, None, 2).await.unwrap();
-        assert_eq!(groups.items, vec!["G0", "G1"]);
-        assert_eq!(
-            catalog
-                .list_node_groups(ns, groups.next.as_deref(), 2)
-                .await
-                .unwrap()
-                .items,
-            vec!["G2"]
-        );
+        // A new namespace has no implicit node-group record or membership.
+        let mut obsolete_group = b"tape-rs/catalog/22/Y/".to_vec();
+        obsolete_group.extend_from_slice(ns.as_bytes());
+        obsolete_group.extend_from_slice(b"G0");
+        obsolete_group.extend_from_slice(&[0, 0]);
         assert!(
             catalog
-                .list_node_groups(other, groups.next.as_deref(), 1)
+                .db
+                .create_trx()
+                .unwrap()
+                .get(&obsolete_group, false)
                 .await
-                .is_err()
+                .unwrap()
+                .is_none()
         );
-        assert!(catalog.remove_node_group(ns, "G1").await.unwrap());
-        assert!(!catalog.remove_node_group(ns, "G1").await.unwrap());
         assert_eq!(
             catalog
                 .register_physical_library(ns, "SERIAL_A")
@@ -2917,21 +2699,6 @@ pub(super) mod tests {
             policy: PoolPolicy::default(),
             revision: 1,
         };
-        assert!(
-            catalog
-                .create_pool(
-                    ns,
-                    &PoolRecord {
-                        policy: PoolPolicy {
-                            node_group: "G3".into(),
-                            ..p.policy.clone()
-                        },
-                        ..p.clone()
-                    }
-                )
-                .await
-                .is_err()
-        );
         assert!(
             catalog
                 .create_pool(
@@ -3027,7 +2794,7 @@ pub(super) mod tests {
             policy: PoolPolicy {
                 media_restriction: "L8".into(),
                 mount_limit: 10,
-                node_group: "G2".into(),
+
                 low_space_warning_threshold: 12,
                 ..PoolPolicy::default()
             },
@@ -3076,7 +2843,7 @@ pub(super) mod tests {
             reopened.pool(ns, p.id).await.unwrap(),
             Some(changed.clone())
         );
-        assert!(catalog.remove_node_group(ns, "G2").await.is_err());
+
         assert_eq!(
             catalog
                 .create_pool(

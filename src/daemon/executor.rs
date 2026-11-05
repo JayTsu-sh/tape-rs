@@ -1066,8 +1066,6 @@ pub fn run_fdb_owner(
                                 || !super::management::drive_allowed(
                                     &management,
                                     &owner.devices[slot.dev].serial,
-                                    u64::from(opts.node_id),
-                                    &head.pool_id.to_string(),
                                     'r',
                                 )
                             {
@@ -2172,8 +2170,6 @@ fn ensure_write_tape(
                         && super::management::drive_allowed(
                             &st.management,
                             &a.devices[d.dev].serial,
-                            u64::from(opts.node_id),
-                            &c.pool_uuid,
                             'm',
                         )
                 })
@@ -2208,13 +2204,7 @@ fn ensure_write_tape(
                 && a.density_support
                     .get(&d.dev)
                     .is_some_and(|caps| super::scheduling::compatible(caps, &c.barcode, true))
-                && super::management::drive_allowed(
-                    &st.management,
-                    &a.devices[d.dev].serial,
-                    u64::from(opts.node_id),
-                    &c.pool_uuid,
-                    'm',
-                )
+                && super::management::drive_allowed(&st.management, &a.devices[d.dev].serial, 'm')
         };
         // 1. 确保它在某个驱动器里
         let slot =
@@ -2897,7 +2887,7 @@ fn read_file<W: Write>(dev: &dyn TapeTransport, path: &str, out: &mut W) -> Resu
 /// 读请求可借用其他池的空闲写驱动；借用前关闭准入、再次确认排空并生成检查点。
 fn prepare_read(
     a: &mut Active,
-    opts: &ExecOptions,
+    _opts: &ExecOptions,
     files: &Arc<FileService>,
     status: &SharedStatus,
     tx: &Sender<ExecEvent>,
@@ -2910,7 +2900,7 @@ fn prepare_read(
         return Ok(());
     };
     let policy = super::management::policy_view(&status.lock().unwrap_or_else(|e| e.into_inner()));
-    let Some(pool) = policy
+    let Some(_pool) = policy
         .pools
         .iter()
         .find(|p| p.tapes.contains(&record.barcode))
@@ -2921,13 +2911,7 @@ fn prepare_read(
         a.density_support
             .get(&i)
             .is_some_and(|caps| super::scheduling::compatible(caps, &record.barcode, false))
-            && super::management::drive_allowed(
-                &policy.management,
-                &a.devices[i].serial,
-                u64::from(opts.node_id),
-                &pool.uuid,
-                'r',
-            )
+            && super::management::drive_allowed(&policy.management, &a.devices[i].serial, 'r')
     };
     let inv = inventory(&a.devices).map_err(|e| ReadError::device(e, "读取调度库存失败"))?;
     if inv.drives.iter().any(|d| {
@@ -3002,7 +2986,7 @@ fn read_any_inner<W: Write>(
     if !super::management::tape_allowed(&policy.management, &barcode) {
         return Err(Failed("磁带已离线或在黑名单中".into()));
     }
-    let pool = policy
+    let _pool = policy
         .pools
         .iter()
         .find(|p| p.tapes.contains(&barcode))
@@ -3020,13 +3004,7 @@ fn read_any_inner<W: Write>(
             && caps
                 .get(&i)
                 .is_some_and(|caps| super::scheduling::compatible(caps, &barcode, false))
-            && super::management::drive_allowed(
-                &policy.management,
-                &serials[i],
-                u64::from(opts.node_id),
-                &pool.uuid,
-                'r',
-            )
+            && super::management::drive_allowed(&policy.management, &serials[i], 'r')
     };
     if a.drive.is_some_and(|i| !eligible(i)) && files.tape().is_some_and(|t| t.barcode == barcode) {
         return Err(Busy("当前驱动器没有读取资格".into()));
@@ -3433,14 +3411,14 @@ fn start_reclaim(
 fn load_aside(
     a: &mut Active,
     barcode: &str,
-    opts: &ExecOptions,
+    _opts: &ExecOptions,
     status: &SharedStatus,
 ) -> Result<usize> {
     let policy = super::management::policy_view(&status.lock().unwrap_or_else(|e| e.into_inner()));
     if !super::management::tape_allowed(&policy.management, barcode) {
         return Err(TapeError::NotReady("回收源带离线或在黑名单中".into()));
     }
-    let pool = policy
+    let _pool = policy
         .pools
         .iter()
         .find(|p| p.tapes.iter().any(|b| b == barcode))
@@ -3453,13 +3431,7 @@ fn load_aside(
             && caps
                 .get(&i)
                 .is_some_and(|c| super::scheduling::compatible(c, barcode, false))
-            && super::management::drive_allowed(
-                &policy.management,
-                &serials[i],
-                u64::from(opts.node_id),
-                &pool.uuid,
-                'g',
-            )
+            && super::management::drive_allowed(&policy.management, &serials[i], 'g')
     };
     {
         let inv = inventory(&a.devices)?;

@@ -493,62 +493,20 @@ fn one_cluster_two_owners_and_fixed_http_entry_preserve_library_isolation() {
         ),
         (200, b"S3 library B".to_vec())
     );
-    let ctl =
-        std::env::var_os("LTFSCTL_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_ltfsctl").into());
-    let create = std::process::Command::new(&ctl)
-        .args([
-            "-e",
-            endpoint,
-            "--library",
-            "55L3A78011W9LL01",
-            "nodegroup",
-            "create",
-            "TESTG",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        create.status.success(),
-        "{}",
-        String::from_utf8_lossy(&create.stderr)
-    );
-    assert_eq!(
-        exchange(
-            endpoint,
-            "GET",
-            "/libraries/55L3A78011W9LL01/admin/nodegroups/TESTG",
-            &[]
-        )
-        .0,
-        200
-    );
-    assert_eq!(
-        exchange(
-            endpoint,
-            "GET",
-            "/libraries/55L3A7802K19LL01/admin/nodegroups/TESTG",
-            &[]
-        )
-        .0,
-        404
-    );
-    let remove = std::process::Command::new(&ctl)
-        .args([
-            "-e",
-            endpoint,
-            "--library",
-            "55L3A78011W9LL01",
-            "nodegroup",
-            "delete",
-            "TESTG",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        remove.status.success(),
-        "{}",
-        String::from_utf8_lossy(&remove.stderr)
-    );
+    for library in ["55L3A7802K19LL01", "55L3A78011W9LL01"] {
+        for method in ["GET", "POST", "DELETE"] {
+            assert_eq!(
+                exchange(
+                    endpoint,
+                    method,
+                    &format!("/libraries/{library}/admin/nodegroups/obsolete"),
+                    b"{}"
+                )
+                .0,
+                404
+            );
+        }
+    }
     for (name, task) in &file_tasks {
         wait(|| {
             let (code, body) = exchange(

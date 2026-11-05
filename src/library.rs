@@ -507,7 +507,7 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
             .map(|i| self.drive_eligible_in(i, &pool, role, &map, &inv))
             .collect::<Result<Vec<_>>>()?;
         if !enabled.iter().any(|enabled| *enabled) {
-            return Err(refuse(format!("没有符合角色 {role} 和节点组约束的驱动器")));
+            return Err(refuse(format!("没有符合角色 {role} 且已启用的驱动器")));
         }
         self.check_task(8, "挂载限额调整前检查")?;
         self.task_outcome(

@@ -197,7 +197,21 @@ impl Drop for Fixture {
 }
 
 #[test]
-fn reconcile_accepts_unmarked_external_volume_without_writing_pool_marker() {
+fn removed_management_action_cannot_touch_devices() {
+    let mut f = Fixture::new(false, 1);
+    let changer = f.lib.changer().command_log();
+    let drive = f.lib.drive(0).command_log();
+    let task = serde_json::json!({"id":1,"request":{"resource":"tapes","action":"reconcile","target":"TEST01L8","params":{}}});
+    assert!(
+        management::execute(&mut f.active, &f.options, &f.status, &f.root, &f.tx, &task).is_err()
+    );
+    assert_eq!(f.lib.changer().command_log(), changer);
+    assert_eq!(f.lib.drive(0).command_log(), drive);
+    assert!(f.events.try_iter().next().is_none());
+}
+
+#[test]
+fn validate_accepts_unmarked_external_volume_without_writing_pool_marker() {
     let mut f = Fixture::new(false, 1);
     f.lib.load_into_drive("TEST01L8", 0).unwrap();
     let di = f
@@ -214,7 +228,7 @@ fn reconcile_accepts_unmarked_external_volume_without_writing_pool_marker() {
     let inv = inventory(&f.active.devices).unwrap();
     let drive = inv.drives.iter().find(|d| d.dev == di).unwrap();
     unload_drive(&f.active.devices, &inv, drive).unwrap();
-    let task = serde_json::json!({"id":1,"request":{"resource":"tapes","action":"reconcile","target":"TEST01L8","params":{}}});
+    let task = serde_json::json!({"id":1,"request":{"resource":"tapes","action":"validate","target":"TEST01L8","params":{}}});
     assert!(
         management::execute(&mut f.active, &f.options, &f.status, &f.root, &f.tx, &task).is_ok()
     );
@@ -230,7 +244,7 @@ fn reconcile_accepts_unmarked_external_volume_without_writing_pool_marker() {
 }
 
 #[test]
-fn reconcile_rejects_a_different_volume_with_the_same_barcode() {
+fn validate_rejects_a_different_volume_with_the_same_barcode() {
     let mut f = Fixture::new(false, 1);
     f.recover();
     let lane = f
@@ -242,7 +256,7 @@ fn reconcile_rejects_a_different_volume_with_the_same_barcode() {
     let barcode = lane.tape().unwrap().barcode;
     activate_writer(&mut f.active, &lane);
     management::quiesce(&mut f.active, &lane, &f.tx).unwrap();
-    let task = serde_json::json!({"id":1,"request":{"resource":"tapes","action":"reconcile","target":barcode,"params":{}}});
+    let task = serde_json::json!({"id":1,"request":{"resource":"tapes","action":"validate","target":barcode,"params":{}}});
     let first =
         management::execute(&mut f.active, &f.options, &f.status, &lane, &f.tx, &task).unwrap();
     let uuid = first["volume_uuid"].as_str().unwrap().to_owned();

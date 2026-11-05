@@ -39,11 +39,6 @@ enum Command {
         #[command(subcommand)]
         action: DriveCommand,
     },
-    /// 单进程本地节点组与驱动归属；不是 HA 节点注册
-    Nodegroup {
-        #[command(subcommand)]
-        action: NodegroupCommand,
-    },
     /// 将已知条码分配到逻辑池；不写介质
     Assign { pool: String, barcode: String },
     /// 取消已归槽卷的 assignment
@@ -132,10 +127,6 @@ enum TapeCommand {
         #[arg(long)]
         full_read: bool,
     },
-    /// 从磁带刷新本地索引缓存，不做 GPFS/HSM 对账
-    Reconcile {
-        barcode: String,
-    },
     /// 解释 EE 保存对象的原类型、路径和链接
     Objects {
         barcode: String,
@@ -149,42 +140,10 @@ enum TapeCommand {
 #[derive(Subcommand, Debug)]
 enum DriveCommand {
     List,
-    Show {
-        serial: String,
-    },
-    Up {
-        serial: String,
-    },
-    Down {
-        serial: String,
-    },
-    Role {
-        serial: String,
-        role: String,
-    },
-    /// 分配本地驱动到节点组，- 表示解除分配
-    Assign {
-        serial: String,
-        group: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum NodegroupCommand {
-    Create {
-        name: String,
-    },
-    Delete {
-        name: String,
-    },
-    List,
-    Show {
-        name: String,
-    },
-    /// 指定此本地控制器所属组，- 表示停用本地调度
-    Local {
-        name: String,
-    },
+    Show { serial: String },
+    Up { serial: String },
+    Down { serial: String },
+    Role { serial: String, role: String },
 }
 
 fn query(
@@ -244,20 +203,6 @@ fn query(
             })
             .cloned()
             .ok_or_else(refuse)?,
-        Command::Nodegroup {
-            action: NodegroupCommand::List,
-        } => status["nodegroups"].clone(),
-        Command::Nodegroup {
-            action: NodegroupCommand::Show { name },
-        } => status["nodegroups"]
-            .as_array()
-            .and_then(|items| {
-                items
-                    .iter()
-                    .find(|item| item["name"].as_str() == Some(name))
-            })
-            .cloned()
-            .ok_or_else(refuse)?,
         _ => return Ok(None),
     };
     Ok(Some(
@@ -280,9 +225,6 @@ fn read_only(command: &Command) -> bool {
             }
             | Command::Pool {
                 action: PoolCommand::List | PoolCommand::Show { .. }
-            }
-            | Command::Nodegroup {
-                action: NodegroupCommand::List | NodegroupCommand::Show { .. }
             }
     )
 }
@@ -419,9 +361,6 @@ fn main() {
                     TapeCommand::Validate { barcode, full_read } => {
                         println!("{}", lib.tape_validate(&barcode, full_read)?);
                     }
-                    TapeCommand::Reconcile { barcode } => {
-                        println!("{}", lib.tape_reconcile(&barcode)?);
-                    }
                     TapeCommand::Objects { barcode } => {
                         let path = volume_path(&lib, &barcode)?;
                         lib.inspect_volume(&path, |volume, _| {
@@ -455,18 +394,7 @@ fn main() {
                     DriveCommand::Up { serial } => lib.drive_set_enabled(&serial, true)?,
                     DriveCommand::Down { serial } => lib.drive_set_enabled(&serial, false)?,
                     DriveCommand::Role { serial, role } => lib.drive_set_role(&serial, &role)?,
-                    DriveCommand::Assign { serial, group } => {
-                        lib.drive_set_nodegroup(&serial, (group != "-").then_some(group.as_str()))?
-                    }
                     DriveCommand::List | DriveCommand::Show { .. } => unreachable!(),
-                },
-                Command::Nodegroup { action } => match action {
-                    NodegroupCommand::Create { name } => lib.nodegroup_create(&name)?,
-                    NodegroupCommand::Delete { name } => lib.nodegroup_delete(&name)?,
-                    NodegroupCommand::Local { name } => {
-                        lib.nodegroup_set_local((name != "-").then_some(name.as_str()))?
-                    }
-                    NodegroupCommand::List | NodegroupCommand::Show { .. } => unreachable!(),
                 },
                 Command::Library { .. } => unreachable!(),
             }
@@ -514,4 +442,26 @@ fn volume_path<
     Err(tape_rs::error::TapeError::Refused {
         reason: "NEED_ASSIGN".into(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removed_group_commands_are_rejected_while_drive_policy_commands_remain() {
+        for arguments in [
+            vec!["tape-library", "nodegroup", "list"],
+            vec!["tape-library", "drive", "assign", "SERIAL", "obsolete"],
+        ] {
+            assert!(Args::try_parse_from(arguments).is_err());
+        }
+        for arguments in [
+            vec!["tape-library", "drive", "role", "SERIAL", "rg"],
+            vec!["tape-library", "drive", "down", "SERIAL"],
+            vec!["tape-library", "pool", "show", "pool"],
+        ] {
+            assert!(Args::try_parse_from(arguments).is_ok());
+        }
+    }
 }

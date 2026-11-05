@@ -94,42 +94,29 @@ fn capacity_warnings_use_complete_observations_and_persist_configuration() {
 }
 
 #[test]
-fn pool_nodegroups_survive_rename_and_restrict_real_drive_eligibility() {
+fn removed_pool_group_attribute_is_rejected_without_changing_assignments() {
     let fixture = Fixture::new();
     let mut lib = fixture.open();
     lib.assign("pool", "LIB001L8").unwrap();
-    assert_eq!(lib.pool_nodegroup("pool").unwrap(), "G0");
-    assert!(lib.pool_nodegroup("missing").is_err());
-    assert!(lib.pool_set("pool", "nodegroup", "missing").is_err());
-    assert_eq!(lib.pool_show("pool").unwrap()["explicit"], false);
-    lib.nodegroup_create("G1").unwrap();
-    lib.pool_set("pool", "nodegroup", "G1").unwrap();
-    assert!(!lib.drive_eligible(0, "pool", 'r').unwrap());
-    lib.drive_set_nodegroup("SIMDRV0000", Some("G1")).unwrap();
-    assert!(!lib.drive_eligible(0, "pool", 'r').unwrap());
-    lib.nodegroup_set_local(Some("G1")).unwrap();
+    let before = lib.pool_list().unwrap();
+    assert!(lib.pool_set("pool", "nodegroup", "obsolete").is_err());
+    assert_eq!(lib.pool_list().unwrap(), before);
+    assert_eq!(lib.volumes("pool").unwrap(), vec!["LIB001L8"]);
+    assert!(
+        lib.pool_show("pool")
+            .unwrap()
+            .get("nodegroup_name")
+            .is_none()
+    );
     assert!(lib.drive_eligible(0, "pool", 'r').unwrap());
     lib.pool_set("pool", "poolname", "renamed").unwrap();
-    assert_eq!(lib.pool_nodegroup("renamed").unwrap(), "G1");
-    assert_eq!(lib.pool_show("renamed").unwrap()["nodegroup_name"], "G1");
+    assert!(lib.drive_eligible(0, "renamed", 'r').unwrap());
     let cached = tape_rs::library::cached_status_if_active(&fixture.path)
         .unwrap()
         .unwrap();
-    assert_eq!(cached["pools"][0]["nodegroup_name"], "G1");
-    assert_eq!(cached["nodegroups"], lib.nodegroup_list().unwrap());
-    assert_eq!(cached["local_nodegroup"], "G1");
-    lib.drive_set_nodegroup("SIMDRV0000", None).unwrap();
-    lib.nodegroup_set_local(None).unwrap();
-    assert!(lib.nodegroup_delete("G1").is_err());
-    lib.unassign("LIB001L8").unwrap();
-    assert!(lib.nodegroup_delete("G1").is_err());
+    assert!(cached["pools"][0].get("nodegroup_name").is_none());
     drop(lib);
-    let mut lib = fixture.open();
-    assert_eq!(lib.pool_nodegroup("renamed").unwrap(), "G1");
-    lib.pool_delete("renamed").unwrap();
-    lib.nodegroup_delete("G1").unwrap();
-    lib.pool_create("renamed").unwrap();
-    assert_eq!(lib.pool_nodegroup("renamed").unwrap(), "G0");
+    assert!(fixture.open().drive_eligible(0, "renamed", 'r').unwrap());
 }
 
 #[test]
@@ -265,8 +252,7 @@ fn legacy_database_and_names_remain_implicit_until_set() {
     assert_eq!(lib.pools().unwrap(), vec![legacy]);
     let shown = lib.pool_show(legacy).unwrap();
     for (key, value) in json!({"name":legacy, "uuid":null, "explicit":false,
-               "media_restriction":"none", "mount_limit":0, "num_of_tapes":1,
-               "nodegroup_name":"G0"})
+               "media_restriction":"none", "mount_limit":0, "num_of_tapes":1})
     .as_object()
     .unwrap()
     {
