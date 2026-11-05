@@ -2825,7 +2825,7 @@ pub(super) mod tests {
         let tr = catalog.db.create_trx().unwrap();
         let original_copy = tr.get(&copy_key, false).await.unwrap().unwrap();
         let mut wrong_uid = original_copy.to_vec();
-        let uid_offset = wrong_uid.len() - 16;
+        let uid_offset = 50; // R1 stores the data UID before the digest and origin.
         wrong_uid[uid_offset..uid_offset + 8].copy_from_slice(&2u64.to_be_bytes());
         tr.set(&copy_key, &wrong_uid);
         tr.commit().await.unwrap();

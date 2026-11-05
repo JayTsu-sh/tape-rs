@@ -27,8 +27,13 @@ mod verification;
 pub use verification::{ScanDigest, ScanSummary, VerificationOutcome};
 mod cleanup;
 mod control;
+mod copy_records;
 mod cutover;
 mod history;
+pub use copy_records::CopyOrigin;
+use copy_records::{
+    StoredCopy, decode_copy, decode_stored_copy, encode_physical_copy, encode_reclaimed_copy,
+};
 mod import_materialize;
 mod import_reconcile;
 mod import_spool;
@@ -378,15 +383,15 @@ pub struct FileHead {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PhysicalCopy {
     pub version: u64,
-    pub request_epoch: u64,
+    pub origin: CopyOrigin,
     pub volume_id: Uuid,
     pub volume_generation: u64,
     pub volume_scan_id: Uuid,
     pub ltfs_file_uid: u64,
     pub size: u64,
     pub content_digest: ContentDigest,
-    /// Exact on-medium identity for imported files. Legacy storage records may
-    /// lack provenance; serving reads still require verified managed placement.
+    /// Exact on-medium identity required by whole-volume imports. Single-file
+    /// receipts still require verified managed placement when serving reads.
     pub media: Option<MediaProvenance>,
 }
 
@@ -400,27 +405,6 @@ pub struct MediaProvenance {
     pub ee_alias: bool,
     /// A zero-data LTFS link, retained as metadata and never read as payload.
     pub native_symlink: bool,
-}
-
-enum StoredCopy {
-    Present(PhysicalCopy),
-    Reclaimed { version: u64, request_epoch: u64 },
-}
-
-impl StoredCopy {
-    fn version(&self) -> u64 {
-        match self {
-            Self::Present(copy) => copy.version,
-            Self::Reclaimed { version, .. } => *version,
-        }
-    }
-
-    fn request_epoch(&self) -> u64 {
-        match self {
-            Self::Present(copy) => copy.request_epoch,
-            Self::Reclaimed { request_epoch, .. } => *request_epoch,
-        }
-    }
 }
 
 /// Stable across retries and owner takeover; a fresh ID isolates each scan,
@@ -2318,65 +2302,6 @@ fn decode_head(bytes: &[u8]) -> Result<FileHead> {
     })
 }
 
-fn decode_copy(bytes: &[u8]) -> Result<PhysicalCopy> {
-    let digest_tag = *bytes
-        .get(48)
-        .ok_or(CatalogError::Corrupt("物理副本摘要算法"))?;
-    let extended = digest_tag & 0x80 != 0;
-    let digest_len = match digest_tag & 0x7f {
-        0 => 0,
-        1 => 32,
-        2 => 16,
-        _ => return Err(CatalogError::Corrupt("物理副本摘要算法")),
-    };
-    let epoch_offset = 49 + digest_len;
-    let uid_offset = epoch_offset + 8;
-    let size_offset = uid_offset + 8;
-    let base_end = size_offset + 8;
-    if bytes.len() < base_end
-        || read_u64(bytes) == 0
-        || read_u64(&bytes[epoch_offset..]) == 0
-        || read_u64(&bytes[uid_offset..]) == 0
-    {
-        return Err(CatalogError::Corrupt("物理副本长度或版本"));
-    }
-    let volume_id = uuid_from(&bytes[8..24])?;
-    let volume_generation = read_u64(&bytes[24..32]);
-    let volume_scan_id = uuid_from(&bytes[32..48])?;
-    validate_scan(
-        volume_id,
-        VolumeScan {
-            generation: volume_generation,
-            id: volume_scan_id,
-        },
-    )
-    .map_err(|_| CatalogError::Corrupt("物理副本卷或扫描 ID"))?;
-    let ltfs_file_uid = read_u64(&bytes[uid_offset..]);
-    let media = if extended {
-        Some(decode_media(&bytes[base_end..], ltfs_file_uid)?)
-    } else if bytes.len() == base_end {
-        None
-    } else {
-        return Err(CatalogError::Corrupt("旧物理副本含多余尾部"));
-    };
-    if media.as_ref().is_some_and(|media| media.native_symlink)
-        && (read_u64(&bytes[size_offset..]) != 0 || digest_tag & 0x7f != 0)
-    {
-        return Err(CatalogError::Corrupt("原生符号链接不能包含数据副本"));
-    }
-    Ok(PhysicalCopy {
-        version: read_u64(bytes),
-        request_epoch: read_u64(&bytes[epoch_offset..]),
-        volume_id,
-        volume_generation,
-        volume_scan_id,
-        ltfs_file_uid,
-        size: read_u64(&bytes[size_offset..]),
-        content_digest: ContentDigest::decode_compact(digest_tag & 0x7f, &bytes[49..epoch_offset])?,
-        media,
-    })
-}
-
 fn validate_media(media: &MediaProvenance, data_uid: u64) -> Result<()> {
     if media.logical_file_uid == 0
         || media.physical_path.len() > u16::MAX as usize
@@ -2390,48 +2315,6 @@ fn validate_media(media: &MediaProvenance, data_uid: u64) -> Result<()> {
         return Err(CatalogError::Invalid("物理副本介质来源无效"));
     }
     Ok(())
-}
-
-fn decode_media(bytes: &[u8], data_uid: u64) -> Result<MediaProvenance> {
-    if bytes.len() < 28 || !matches!((bytes[0], bytes[1]), (1, 0 | 1) | (2, 2)) {
-        return Err(CatalogError::Corrupt("物理副本介质来源版本或长度"));
-    }
-    let length = u16::from_be_bytes(bytes[26..28].try_into().unwrap()) as usize;
-    if bytes.len() != 28 + length {
-        return Err(CatalogError::Corrupt("物理副本介质路径长度"));
-    }
-    let media = MediaProvenance {
-        version: (read_u64(&bytes[2..10]), read_u64(&bytes[10..18])),
-        logical_file_uid: read_u64(&bytes[18..26]),
-        physical_path: std::str::from_utf8(&bytes[28..])
-            .map_err(|_| CatalogError::Corrupt("物理副本介质路径 UTF-8"))?
-            .to_owned(),
-        ee_alias: bytes[1] == 1,
-        native_symlink: bytes[1] == 2,
-    };
-    validate_media(&media, data_uid).map_err(|_| CatalogError::Corrupt("物理副本介质来源字段"))?;
-    Ok(media)
-}
-
-fn encode_reclaimed_copy(version: u64, request_epoch: u64) -> Vec<u8> {
-    let mut value = vec![0xff];
-    value.extend_from_slice(&version.to_be_bytes());
-    value.extend_from_slice(&request_epoch.to_be_bytes());
-    value
-}
-
-fn decode_stored_copy(bytes: &[u8]) -> Result<StoredCopy> {
-    if bytes.len() == 17
-        && bytes[0] == 0xff
-        && read_u64(&bytes[1..]) != 0
-        && read_u64(&bytes[9..]) != 0
-    {
-        return Ok(StoredCopy::Reclaimed {
-            version: read_u64(&bytes[1..]),
-            request_epoch: read_u64(&bytes[9..]),
-        });
-    }
-    decode_copy(bytes).map(StoredCopy::Present)
 }
 
 fn copy_prefix(ns: Uuid) -> Vec<u8> {
@@ -2504,7 +2387,9 @@ fn decode_name(bytes: &[u8]) -> Result<Vec<u8>> {
 fn encode_copy(receipt: &CommitReceipt, version: u64) -> Vec<u8> {
     encode_physical_copy(&PhysicalCopy {
         version,
-        request_epoch: receipt.request_epoch,
+        origin: CopyOrigin::FileRequest {
+            request_epoch: receipt.request_epoch,
+        },
         volume_id: receipt.volume_id,
         volume_generation: receipt.volume_generation,
         volume_scan_id: receipt.volume_scan_id,
@@ -2513,60 +2398,7 @@ fn encode_copy(receipt: &CommitReceipt, version: u64) -> Vec<u8> {
         content_digest: receipt.content_digest,
         media: None,
     })
-    .expect("legacy media commit has no variable-length provenance")
-}
-
-fn encode_physical_copy(copy: &PhysicalCopy) -> Result<Vec<u8>> {
-    if copy.media.is_some()
-        && (copy.version == 0
-            || copy.request_epoch == 0
-            || copy.ltfs_file_uid == 0
-            || validate_scan(
-                copy.volume_id,
-                VolumeScan {
-                    generation: copy.volume_generation,
-                    id: copy.volume_scan_id,
-                },
-            )
-            .is_err())
-    {
-        return Err(CatalogError::Invalid("导入物理副本基础身份无效"));
-    }
-    let mut value = Vec::with_capacity(
-        73 + copy.content_digest.compact_len()
-            + copy
-                .media
-                .as_ref()
-                .map_or(0, |media| 28 + media.physical_path.len()),
-    );
-    value.extend_from_slice(&copy.version.to_be_bytes());
-    value.extend_from_slice(copy.volume_id.as_bytes());
-    value.extend_from_slice(&copy.volume_generation.to_be_bytes());
-    value.extend_from_slice(copy.volume_scan_id.as_bytes());
-    value.push(copy.content_digest.tag() | if copy.media.is_some() { 0x80 } else { 0 });
-    value.extend_from_slice(&copy.content_digest.payload()[..copy.content_digest.compact_len()]);
-    value.extend_from_slice(&copy.request_epoch.to_be_bytes());
-    value.extend_from_slice(&copy.ltfs_file_uid.to_be_bytes());
-    value.extend_from_slice(&copy.size.to_be_bytes());
-    if let Some(media) = &copy.media {
-        validate_media(media, copy.ltfs_file_uid)?;
-        if media.native_symlink && (copy.size != 0 || copy.content_digest != ContentDigest::Unknown)
-        {
-            return Err(CatalogError::Invalid("原生符号链接不能包含数据副本"));
-        }
-        value.push(if media.native_symlink { 2 } else { 1 });
-        value.push(if media.native_symlink {
-            2
-        } else {
-            u8::from(media.ee_alias)
-        });
-        value.extend_from_slice(&media.version.0.to_be_bytes());
-        value.extend_from_slice(&media.version.1.to_be_bytes());
-        value.extend_from_slice(&media.logical_file_uid.to_be_bytes());
-        value.extend_from_slice(&(media.physical_path.len() as u16).to_be_bytes());
-        value.extend_from_slice(media.physical_path.as_bytes());
-    }
-    Ok(value)
+    .expect("validated file receipt encodes a physical description")
 }
 
 /// Stable copy identity. A fresh epoch/operation/file version cannot reuse an
@@ -2692,7 +2524,7 @@ async fn test_publish_imported(
 // public serving API rejects them. Never use this helper in managed/owner tests.
 #[cfg(test)]
 impl ManagedCatalog {
-    async fn legacy_copy_record_for_test(
+    async fn unplaced_copy_record_for_test(
         &self,
         namespace: Uuid,
         file_id: Uuid,
@@ -2860,7 +2692,7 @@ mod tests {
         assert_eq!(decode_copy(&bytes).unwrap().size, u64::MAX - 1);
         assert!(decode_copy(&bytes[..bytes.len() - 1]).is_err());
         let mut missing = bytes;
-        missing[89..97].fill(0);
+        missing[50..58].fill(0);
         assert!(decode_copy(&missing).is_err());
         let mut invalid = receipt;
         invalid.ltfs_file_uid = 0;
@@ -2890,7 +2722,7 @@ mod tests {
             metadata_digest: None,
         });
         let unknown_fingerprint = receipt_fingerprint(&receipt);
-        assert_eq!(encode_copy(&receipt, 1).len(), 73);
+        assert_eq!(encode_copy(&receipt, 1).len(), 77);
         assert_eq!(
             decode_copy(&encode_copy(&receipt, 1))
                 .unwrap()
@@ -2900,7 +2732,7 @@ mod tests {
         receipt.content_digest = ContentDigest::Md5([7; 16]);
         assert_ne!(receipt_fingerprint(&receipt), unknown_fingerprint);
         let md5 = encode_copy(&receipt, 1);
-        assert_eq!(md5.len(), 89);
+        assert_eq!(md5.len(), 93);
         assert_eq!(
             decode_copy(&md5).unwrap().content_digest,
             receipt.content_digest
@@ -2909,10 +2741,10 @@ mod tests {
         invalid.push(1);
         assert!(decode_copy(&invalid).is_err());
         invalid = md5;
-        invalid[48] = 3;
+        invalid[66] = 3;
         assert!(decode_copy(&invalid).is_err());
         receipt.content_digest = ContentDigest::Sha256([0; 32]);
-        assert_eq!(encode_copy(&receipt, 1).len(), 105);
+        assert_eq!(encode_copy(&receipt, 1).len(), 109);
         assert_eq!(
             decode_copy(&encode_copy(&receipt, 1))
                 .unwrap()
@@ -2926,7 +2758,7 @@ mod tests {
     fn native_symlink_copy_codec_never_accepts_payload_or_alias_flags() {
         let mut copy = PhysicalCopy {
             version: 1,
-            request_epoch: 1,
+            origin: CopyOrigin::Imported,
             volume_id: Uuid::new_v4(),
             volume_generation: 1,
             volume_scan_id: Uuid::new_v4(),
@@ -2944,10 +2776,10 @@ mod tests {
         let bytes = encode_physical_copy(&copy).unwrap();
         assert_eq!(decode_copy(&bytes).unwrap(), copy);
         let mut corrupt = bytes.clone();
-        corrupt[72] = 1;
+        corrupt[65] = 1; // R1 size must remain zero for a native link.
         assert!(decode_copy(&corrupt).is_err());
         corrupt = bytes;
-        corrupt[73] = 1; // Version 1 cannot encode a native link.
+        corrupt[68] = 2; // EE aliases cannot reuse their data UID.
         assert!(decode_copy(&corrupt).is_err());
         copy.size = 1;
         assert!(encode_physical_copy(&copy).is_err());
@@ -2981,9 +2813,10 @@ mod tests {
             content_digest: ContentDigest::Sha256([7; 32]),
             metadata_digest: None,
         });
-        let legacy = encode_copy(&receipt, 1);
-        assert!(decode_copy(&legacy).unwrap().media.is_none());
-        let mut copy = decode_copy(&legacy).unwrap();
+        let receipt_copy = encode_copy(&receipt, 1);
+        assert!(decode_copy(&receipt_copy).unwrap().media.is_none());
+        let mut copy = decode_copy(&receipt_copy).unwrap();
+        copy.origin = CopyOrigin::Imported;
         copy.media = Some(MediaProvenance {
             version: (u64::MAX, u64::MAX),
             logical_file_uid: 33,
@@ -2993,18 +2826,18 @@ mod tests {
         });
         let encoded = encode_physical_copy(&copy).unwrap();
         assert_eq!(decode_copy(&encoded).unwrap(), copy);
-        for end in legacy.len()..encoded.len() {
+        for end in 0..encoded.len() {
             assert!(decode_copy(&encoded[..end]).is_err());
         }
         let mut bad = encoded.clone();
-        bad[legacy.len()] = 2;
+        bad[100] = 4; // Unknown media kind after the Imported origin.
         assert!(decode_copy(&bad).is_err());
         bad = encoded.clone();
-        bad[legacy.len() + 1] = 2;
+        bad[117..125].copy_from_slice(&copy.ltfs_file_uid.to_be_bytes());
         assert!(decode_copy(&bad).is_err());
         bad = encoded;
-        bad[legacy.len() + 26] = 0;
-        bad[legacy.len() + 27] = 1;
+        bad[125] = 0;
+        bad[126] = 1;
         assert!(decode_copy(&bad).is_err());
 
         let mut invalid = copy;
@@ -3546,7 +3379,7 @@ mod tests {
         );
         assert!(matches!(
             catalog
-                .legacy_copy_record_for_test(
+                .unplaced_copy_record_for_test(
                     old_receipt.namespace,
                     old_receipt.file_id,
                     old_receipt.copy_id
@@ -3555,7 +3388,7 @@ mod tests {
             Err(CatalogError::Incomplete)
         ));
         let current = catalog
-            .legacy_copy_record_for_test(receipt.namespace, receipt.file_id, receipt.copy_id)
+            .unplaced_copy_record_for_test(receipt.namespace, receipt.file_id, receipt.copy_id)
             .await
             .unwrap()
             .unwrap();
@@ -3719,7 +3552,7 @@ mod tests {
         ));
         assert!(matches!(
             catalog
-                .legacy_copy_record_for_test(receipt.namespace, receipt.file_id, receipt.copy_id)
+                .unplaced_copy_record_for_test(receipt.namespace, receipt.file_id, receipt.copy_id)
                 .await,
             Err(CatalogError::Incomplete)
         ));
@@ -3792,7 +3625,7 @@ mod tests {
         assert_eq!(copies.items[0].copy_id, receipt.copy_id);
         assert!(
             catalog
-                .legacy_copy_record_for_test(receipt.namespace, receipt.file_id, receipt.copy_id)
+                .unplaced_copy_record_for_test(receipt.namespace, receipt.file_id, receipt.copy_id)
                 .await
                 .unwrap()
                 .is_some()
@@ -4109,7 +3942,7 @@ mod tests {
         let id = Uuid::new_v4();
         let copy = PhysicalCopy {
             version: 1,
-            request_epoch: 1,
+            origin: CopyOrigin::FileRequest { request_epoch: 1 },
             volume_id: Uuid::new_v4(),
             volume_generation: 7,
             volume_scan_id: Uuid::new_v4(),
@@ -4324,11 +4157,11 @@ mod tests {
         );
         assert_eq!(
             catalog
-                .legacy_copy_record_for_test(namespace, a.file_id, a.copy_id)
+                .unplaced_copy_record_for_test(namespace, a.file_id, a.copy_id)
                 .await
                 .unwrap(),
             Some(PhysicalCopy {
-                request_epoch: 1,
+                origin: CopyOrigin::FileRequest { request_epoch: 1 },
                 version: 1,
                 volume_id,
                 volume_generation: 1,
@@ -4480,7 +4313,7 @@ mod tests {
         ));
         assert!(matches!(
             catalog
-                .legacy_copy_record_for_test(namespace, a.file_id, a.copy_id)
+                .unplaced_copy_record_for_test(namespace, a.file_id, a.copy_id)
                 .await,
             Err(CatalogError::Incomplete)
         ));
@@ -4526,7 +4359,7 @@ mod tests {
         assert_eq!(current.items[0].file_id, replacement.file_id);
         assert_eq!(
             catalog
-                .legacy_copy_record_for_test(
+                .unplaced_copy_record_for_test(
                     replacement_ns,
                     replacement.file_id,
                     replacement.copy_id
@@ -4572,13 +4405,13 @@ mod tests {
         );
         assert!(matches!(
             catalog
-                .legacy_copy_record_for_test(namespace, a.file_id, a.copy_id)
+                .unplaced_copy_record_for_test(namespace, a.file_id, a.copy_id)
                 .await,
             Err(CatalogError::Incomplete)
         ));
         assert!(
             catalog
-                .legacy_copy_record_for_test(
+                .unplaced_copy_record_for_test(
                     replacement_ns,
                     replacement.file_id,
                     replacement.copy_id
@@ -4714,7 +4547,7 @@ mod tests {
         );
         assert!(matches!(
             catalog
-                .legacy_copy_record_for_test(import_ns, imported.file_id, imported.copy_id)
+                .unplaced_copy_record_for_test(import_ns, imported.file_id, imported.copy_id)
                 .await,
             Err(CatalogError::Incomplete)
         ));

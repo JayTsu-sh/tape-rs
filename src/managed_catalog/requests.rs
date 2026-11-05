@@ -1097,7 +1097,13 @@ pub(super) mod tests {
         let page = c.compact_superseded_copies(ns, None, 100).await.unwrap();
         assert_eq!((page.compacted, page.forgotten), (1, 0));
         let old_copy = copy_key(ns, first.file_id, first.copy_id);
-        assert_eq!(raw(c, &old_copy).await.unwrap().len(), 17);
+        assert!(matches!(
+            decode_stored_copy(&raw(c, &old_copy).await.unwrap()).unwrap(),
+            StoredCopy::Reclaimed {
+                version: 1,
+                origin: CopyOrigin::FileRequest { request_epoch: 1 }
+            }
+        ));
 
         // A history pin racing the empty-range check must prevent expiry.
         let in_flight = c.db.create_trx().unwrap();
@@ -1178,13 +1184,21 @@ pub(super) mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert_eq!(
-            raw(c, &copy_key(ns, published[2].file_id, published[2].copy_id))
+        let kept = decode_copy(
+            &raw(c, &copy_key(ns, published[2].file_id, published[2].copy_id))
                 .await
-                .unwrap()
-                .len(),
-            105
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(kept.version, published[2].expected_version.unwrap_or(0) + 1);
+        assert_eq!(
+            kept.origin,
+            CopyOrigin::FileRequest {
+                request_epoch: published[2].request_epoch
+            }
         );
+        assert_eq!(kept.ltfs_file_uid, published[2].ltfs_file_uid);
+        assert_eq!(kept.content_digest, published[2].content_digest);
         let reuse = CommitReceipt {
             request_epoch: 2,
             operation_id: Uuid::new_v4(),
