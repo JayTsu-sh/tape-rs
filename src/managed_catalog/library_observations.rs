@@ -358,15 +358,23 @@ impl ManagedCatalog {
     }
     /// Record a completed monitor attempt. The actual periodic device poller is
     /// separate; an absent error must only be supplied after a successful poll.
+    /// Capture the completion timestamp before submitting; retries preserve it.
     pub async fn record_library_monitor(
         &self,
         serial: &str,
         route: ActiveLibraryRoute,
         owner: u64,
+        captured_at: &str,
         error: Option<&str>,
     ) -> Result<()> {
-        if owner == 0 || owner > MAX_OWNER_EPOCH || error.is_some_and(|s| s.len() > 2048) {
-            return Err(CatalogError::Invalid("带库巡检轮次或错误长度无效"));
+        if owner == 0
+            || owner > MAX_OWNER_EPOCH
+            || !valid_time(captured_at)
+            || error.is_some_and(|s| s.len() > 2048)
+        {
+            return Err(CatalogError::Invalid(
+                "带库巡检轮次、采样时间或错误长度无效",
+            ));
         }
         self.db
             .run(|tr, _| async move {
@@ -375,16 +383,15 @@ impl ManagedCatalog {
                         let ns = routing::require_runtime_active_owner(&tr, serial, route, owner)
                             .await?;
                         let old = monitor_at(&tr, ns, serial).await?;
-                        let now = crate::ltfs::label::ltfs_time_now();
                         let record = MonitorRecord {
                             version: 1,
                             namespace: ns.to_string(),
                             library_serial: serial.into(),
                             owner_epoch: owner,
                             interval_seconds: 30,
-                            last_attempt: now.clone(),
+                            last_attempt: captured_at.into(),
                             last_success: if error.is_none() {
-                                Some(now)
+                                Some(captured_at.into())
                             } else {
                                 old.as_ref().and_then(|r| r.last_success.clone())
                             },

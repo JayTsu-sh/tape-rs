@@ -268,9 +268,15 @@ async fn library_observations_are_scoped_deduplicated_fenced_and_atomic_with_eve
         .unwrap()
         .unwrap();
     assert_eq!(canonical["drives"][0]["barcode"], "A001L8");
-    c.record_library_monitor(&serial, route, current, Some("timeout"))
-        .await
-        .unwrap();
+    c.record_library_monitor(
+        &serial,
+        route,
+        current,
+        &crate::ltfs::label::ltfs_time_now(),
+        Some("timeout"),
+    )
+    .await
+    .unwrap();
     assert!(
         c.active_library_monitor(&serial, route)
             .await
@@ -278,13 +284,25 @@ async fn library_observations_are_scoped_deduplicated_fenced_and_atomic_with_eve
             .unwrap()["last_success"]
             .is_null()
     );
-    c.record_library_monitor(&serial, route, current, Some("timeout"))
-        .await
-        .unwrap();
+    c.record_library_monitor(
+        &serial,
+        route,
+        current,
+        &crate::ltfs::label::ltfs_time_now(),
+        Some("timeout"),
+    )
+    .await
+    .unwrap();
     let escaped = "\0".repeat(2048);
-    c.record_library_monitor(&serial, route, current, Some(&escaped))
-        .await
-        .unwrap();
+    c.record_library_monitor(
+        &serial,
+        route,
+        current,
+        &crate::ltfs::label::ltfs_time_now(),
+        Some(&escaped),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         c.active_library_monitor(&serial, route)
             .await
@@ -292,12 +310,24 @@ async fn library_observations_are_scoped_deduplicated_fenced_and_atomic_with_eve
             .unwrap()["error"],
         escaped
     );
-    c.record_library_monitor(&serial, route, current, None)
-        .await
-        .unwrap();
-    c.record_library_monitor(&serial, route, current, None)
-        .await
-        .unwrap();
+    c.record_library_monitor(
+        &serial,
+        route,
+        current,
+        &crate::ltfs::label::ltfs_time_now(),
+        None,
+    )
+    .await
+    .unwrap();
+    c.record_library_monitor(
+        &serial,
+        route,
+        current,
+        &crate::ltfs::label::ltfs_time_now(),
+        None,
+    )
+    .await
+    .unwrap();
     let success = c
         .active_library_monitor(&serial, route)
         .await
@@ -320,17 +350,29 @@ async fn library_observations_are_scoped_deduplicated_fenced_and_atomic_with_eve
     ));
     let before = rows(&c, std::slice::from_ref(&monitor)).await;
     assert!(
-        c.record_library_monitor(&serial, route, current, None)
-            .await
-            .is_err()
+        c.record_library_monitor(
+            &serial,
+            route,
+            current,
+            &crate::ltfs::label::ltfs_time_now(),
+            None
+        )
+        .await
+        .is_err()
     );
     assert_eq!(rows(&c, std::slice::from_ref(&monitor)).await, before);
     let tr = c.db.create_trx().unwrap();
     tr.set(&monitor, &saved_healthy);
     tr.commit().await.unwrap();
-    c.record_library_monitor(&serial, route, current, Some("drive unavailable"))
-        .await
-        .unwrap();
+    c.record_library_monitor(
+        &serial,
+        route,
+        current,
+        &crate::ltfs::label::ltfs_time_now(),
+        Some("drive unavailable"),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         c.active_library_monitor(&serial, route)
             .await
@@ -345,7 +387,14 @@ async fn library_observations_are_scoped_deduplicated_fenced_and_atomic_with_eve
     let keys = vec![cache.clone(), monitor_key(ns, &serial), head.clone()];
     let before = rows(&c, &keys).await;
     assert!(matches!(
-        c.record_library_monitor(&serial, route, owner, None).await,
+        c.record_library_monitor(
+            &serial,
+            route,
+            owner,
+            &crate::ltfs::label::ltfs_time_now(),
+            None
+        )
+        .await,
         Err(CatalogError::OwnerFenced)
     ));
     let mut oversized = observation(&serial, current);
@@ -362,9 +411,15 @@ async fn library_observations_are_scoped_deduplicated_fenced_and_atomic_with_eve
     c.record_active_library_inventory(&serial_b, route_b, owner_b, &other)
         .await
         .unwrap();
-    c.record_library_monitor(&serial_b, route_b, owner_b, None)
-        .await
-        .unwrap();
+    c.record_library_monitor(
+        &serial_b,
+        route_b,
+        owner_b,
+        &crate::ltfs::label::ltfs_time_now(),
+        None,
+    )
+    .await
+    .unwrap();
     let other_key = inventory_key(ns_b, &serial_b);
     let tr = c.db.create_trx().unwrap();
     let saved_other = tr.get(&other_key, false).await.unwrap().unwrap().to_vec();
@@ -455,7 +510,13 @@ async fn library_observations_are_scoped_deduplicated_fenced_and_atomic_with_eve
         .unwrap_err();
     assert!(error.to_string().contains("通知序号耗尽"), "{error}");
     let error = c
-        .record_library_monitor(&serial, route, current, Some("new error"))
+        .record_library_monitor(
+            &serial,
+            route,
+            current,
+            &crate::ltfs::label::ltfs_time_now(),
+            Some("new error"),
+        )
         .await
         .unwrap_err();
     assert!(error.to_string().contains("通知序号耗尽"), "{error}");
@@ -466,9 +527,15 @@ async fn library_observations_are_scoped_deduplicated_fenced_and_atomic_with_eve
     c.record_active_library_inventory(&serial, route, current, &changed)
         .await
         .unwrap();
-    c.record_library_monitor(&serial, route, current, Some("new error"))
-        .await
-        .unwrap();
+    c.record_library_monitor(
+        &serial,
+        route,
+        current,
+        &crate::ltfs::label::ltfs_time_now(),
+        Some("new error"),
+    )
+    .await
+    .unwrap();
     let batch = c
         .notify_batch(&serial, route, "audit", generation)
         .await
