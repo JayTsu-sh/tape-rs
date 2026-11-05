@@ -13,6 +13,8 @@ pub(super) struct Observer {
     round: u64,
     publisher: Publisher,
     task: Option<Task>,
+    mechanical: Option<fdb_move::Job>,
+    evicted: Vec<usize>,
     cursor: Option<(u64, uuid::Uuid)>,
     next: Instant,
     failures: u32,
@@ -24,6 +26,8 @@ impl Default for Observer {
             round: 0,
             publisher: Publisher::default(),
             task: None,
+            mechanical: None,
+            evicted: Vec::new(),
             cursor: None,
             next: Instant::now(),
             failures: 0,
@@ -50,7 +54,7 @@ impl Observer {
                 self.next = Instant::now() + retry_delay(self.failures);
                 self.blocked = permanent;
                 warn!(
-                    "带库{} rescan阶段{}失败（轮次{}，原任务{}，需修复持久事实={}）：{}",
+                    "带库{} 管理阶段{}失败（轮次{}，原任务{}，需修复持久事实={}）：{}",
                     context.control.serial,
                     stage,
                     self.round,
@@ -64,6 +68,32 @@ impl Observer {
                 Ok(None)
             }
         }
+    }
+    pub(super) fn poll_device(
+        &mut self,
+        active: &mut Active,
+        permission: &Permission,
+        control: &FdbOwnerControl,
+        status: &SharedStatus,
+        node: u8,
+        runtime: &tokio::runtime::Runtime,
+    ) -> Result<()> {
+        let result = self.poll(
+            Context {
+                active,
+                permission,
+                control,
+                status,
+                node,
+            },
+            runtime,
+        );
+        // Single device thread: invalidate the original mount before any queued
+        // read or idle-unload can run, including after an unknown CDB outcome.
+        for drive in self.evicted.drain(..) {
+            active.fdb_reads.remove(&drive);
+        }
+        result
     }
     pub(super) fn poll(
         &mut self,
@@ -85,7 +115,38 @@ impl Observer {
         }
         // A pending final receipt pins the original published timestamp. In
         // particular, periodic sampling cannot overwrite it while its ACK is lost.
-        if self.task.is_none() {
+        if self.task.is_none() && self.mechanical.is_none() {
+            // Settle an existing sample, but never start a new periodic CDB
+            // before checking a persistent mechanical recovery checkpoint.
+            if !self.publisher.idle() {
+                self.publisher.poll(context, runtime)?;
+                self.publisher.take_completion();
+                if !self.publisher.idle() {
+                    return Ok(());
+                }
+            }
+            if Instant::now() < self.next {
+                return Ok(());
+            }
+            let pending = publish(
+                &context,
+                runtime,
+                context.control.catalog.active_library_mechanical_task(
+                    &context.control.serial,
+                    context.control.route,
+                    round,
+                ),
+            );
+            let Some(pending) = self.confirmed(&context, "机械恢复检查", pending)? else {
+                return Ok(());
+            };
+            if let Some(task) = pending {
+                let request = ManagementRequest::parse(task["request"].clone())
+                    .map_err(|e| TapeError::Catalog(e.to_string()))?;
+                self.mechanical = Some(fdb_move::Job::new(request, &task)?);
+            }
+        }
+        if self.task.is_none() && self.mechanical.is_none() {
             self.publisher.poll(context, runtime)?;
             self.publisher.take_completion();
             if !self.publisher.idle() || Instant::now() < self.next {
@@ -115,26 +176,43 @@ impl Observer {
                 Ok(Some((
                     (epoch, operation),
                     ManagementRequest::parse(task["request"].clone())?,
+                    task,
                 )))
             });
             let Some(selected) = self.confirmed(&context, "选取", selected)? else {
                 return Ok(());
             };
-            let Some((cursor, request)) = selected else {
+            let Some((cursor, request, saved)) = selected else {
                 return Ok(());
             };
             self.cursor = Some(cursor);
-            if request.value()["change"]["kind"] != "library-rescan" {
+            if request.value()["change"]["kind"] == "media-move" {
+                self.mechanical = Some(fdb_move::Job::new(request, &saved)?);
+            } else if request.value()["change"]["kind"] == "library-rescan" {
+                self.task = Some(Task {
+                    request,
+                    running: false,
+                    completion: None,
+                });
+            } else {
                 return Ok(());
             }
-            self.task = Some(Task {
-                request,
-                running: false,
-                completion: None,
-            });
             self.next = Instant::now();
         }
         if Instant::now() < self.next {
+            return Ok(());
+        }
+        if let Some(mut job) = self.mechanical.take() {
+            let result = job.poll(context, &mut self.publisher, runtime);
+            if let Some(drive) = job.evicted_drive.take() {
+                self.evicted.push(drive);
+            }
+            self.mechanical = Some(job);
+            let result = result?;
+            if self.confirmed(&context, "搬带", result)? == Some(true) {
+                self.mechanical = None;
+                self.next = Instant::now() + Duration::from_millis(250);
+            }
             return Ok(());
         }
         let task = self.task.as_ref().expect("selected task");

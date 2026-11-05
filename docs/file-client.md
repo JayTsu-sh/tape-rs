@@ -1,6 +1,6 @@
 # 文件客户端与 FUSE 挂载
 
-当前 FDB 原生 `pool` / `task` 命令以[池管理参考](fdb-pool-management.md)为准，`library list/show` 与 `tape list/show` 见[管理查询](fdb-management-queries.md)，`library rescan --request FILE` 见[异步扫描](fdb-library-rescan.md)。下文旧数字任务命令不能用于原生任务。
+当前 FDB 原生 `pool` / `task` 命令以[池管理参考](fdb-pool-management.md)为准，`library list/show` 与 `tape list/show` 见[管理查询](fdb-management-queries.md)，`library rescan --request FILE` 见[异步扫描](fdb-library-rescan.md)，`tape move BARCODE homeslot|ieslot --request FILE` 见[异步搬带](fdb-tape-move.md)。下文旧数字任务命令不能用于原生任务。
 
 当前能力与部署状态见 [剩余实施队列](../.scratch/ltfs-ha/remaining-implementation.md) 和 [交接入口](CLAUDE-HANDOFF.md)。本文带日期的实验记录保留当时验证边界；后续记录取代早期状态。
 

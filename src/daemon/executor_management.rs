@@ -231,7 +231,7 @@ pub(super) fn quiesce(a: &mut Active, files: &FileService, tx: &Sender<ExecEvent
     Ok(())
 }
 
-fn elements(
+pub(super) fn elements(
     devices: &[ManagedDevice],
 ) -> Result<(
     crate::changer::element::ElementAddressMap,
@@ -252,9 +252,19 @@ fn observe(a: &Active, opts: &ExecOptions) -> Result<Value> {
 
 pub(super) fn observe_devices(devices: &[ManagedDevice], node: u8, round: u64) -> Result<Value> {
     let (map, rows) = elements(devices)?;
+    observation_from_elements(devices, node, round, &map, &rows)
+}
+
+pub(super) fn observation_from_elements(
+    devices: &[ManagedDevice],
+    node: u8,
+    round: u64,
+    map: &crate::changer::element::ElementAddressMap,
+    rows: &[crate::changer::element::ElementStatus],
+) -> Result<Value> {
     let volumes:Vec<Value>=rows.iter().filter(|e|e.full && e.volume_tag.is_some()).map(|e|json!({"barcode":e.volume_tag,"address":e.address,"element_type":e.element_type as u8,"medium_type":e.medium_type,"source_address":e.source_address,"home_slot":e.address.checked_sub(map.storage_start).filter(|s|*s<map.storage_count).map(|s|u32::from(s)+1)})).collect();
     // Keep both projections tied to the same READ ELEMENT STATUS reply.
-    let inv = inventory_elements(devices, &rows, true)?;
+    let inv = inventory_elements(devices, rows, true)?;
     let drives:Vec<Value>=inv.drives.iter().map(|d|json!({"serial":devices[d.dev].serial,"address":d.addr,"barcode":d.loaded.as_ref().map(|l|&l.0)})).collect();
     Ok(
         json!({"library_serial":devices.iter().find(|d|d.kind==DeviceKind::Changer).map(|d|&d.serial),"owner":node,"round":round,"observed_at":crate::ltfs::label::ltfs_time_now(),"volumes":volumes,"drives":drives}),

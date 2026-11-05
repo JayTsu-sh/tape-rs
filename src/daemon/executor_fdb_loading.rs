@@ -32,6 +32,20 @@ async fn guard(
     {
         return Err(lost("FDB route/owner epoch 已改变"));
     }
+    control
+        .catalog
+        .require_active_library_readable(&control.serial, control.route, owner.round)
+        .await
+        .map_err(|error| {
+            if matches!(
+                error.domain(),
+                crate::managed_catalog::CatalogError::PoolBusy
+            ) {
+                ReadError::Busy("带库正在执行机械维护，等待原任务核实结果".into())
+            } else {
+                lost(error)
+            }
+        })?;
     for device in &owner.devices {
         reservation::verify_holder(device.dev.as_ref(), owner.key).map_err(lost)?;
     }
@@ -180,6 +194,24 @@ pub(super) async fn select(
                 return Err(lost("已装载介质与本轮挂载记录不一致"));
             }
             mount.last_used = Instant::now();
+        } else {
+            // Recovery deliberately skipped LOAD while a mechanical gate was
+            // unresolved. An explicit read may now thread only its exact bound
+            // volume; ActiveMediaReader verifies label/index before publishing.
+            let head = control
+                .catalog
+                .active_loaded_volume_head(&control.serial, barcode, control.route, owner.round)
+                .await
+                .map_err(lost)?
+                .ok_or_else(|| lost("读取目标没有当前归属"))?;
+            if head.volume_id != source.source.volume_uuid || head.pool_id != placement.pool_id {
+                return Err(lost("按需装载的当前卷或池身份不符"));
+            }
+            guard(owner, permit, control).await?;
+            let drive = TapeDrive::new(owner.devices[slot.dev].dev.as_ref());
+            drive.load().map_err(lost)?;
+            wait_ready(owner.devices[slot.dev].dev.as_ref()).map_err(lost)?;
+            guard(owner, permit, control).await?;
         }
         return Ok(slot.dev);
     }
@@ -340,6 +372,11 @@ mod tests {
             address: 20,
             element_type: ElementType::DataTransfer,
             full: false,
+            accessible: Some(true),
+            exception: false,
+            asc: 0,
+            ascq: 0,
+            disabled: false,
             medium_type: None,
             volume_tag: None,
             source_address: None,
@@ -351,6 +388,11 @@ mod tests {
             address: 1000,
             element_type: ElementType::Storage,
             full: true,
+            accessible: Some(true),
+            exception: false,
+            asc: 0,
+            ascq: 0,
+            disabled: false,
             medium_type: Some(1),
             volume_tag: Some("TEST01L8".into()),
             source_address: None,

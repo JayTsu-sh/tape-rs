@@ -118,6 +118,7 @@ struct DriveState {
     serial: String,
     cartridge: Option<String>,
     loaded: bool,
+    source_address: Option<u16>,
     partition: u8,
     pos: usize,
     /// MODE SELECT page 0x11 设定、下一次 FORMAT 生效的分区数。
@@ -266,6 +267,7 @@ impl SimLibrary {
                 serial: format!("SIMDRV{:04}", i),
                 cartridge: None,
                 loaded: false,
+                source_address: None,
                 partition: 0,
                 pos: 0,
                 pending_partitions: 1,
@@ -348,6 +350,7 @@ impl SimLibrary {
         let d = &mut st.drives[drive];
         d.cartridge = Some(barcode.to_string());
         d.loaded = true;
+        d.source_address = None; // fixture直接装载不能继承上一盘的home证明
         d.partition = 0;
         d.pos = 0;
         Ok(())
@@ -829,6 +832,7 @@ fn changer_command(st: &mut LibState, cdb: &[u8], out: Option<&mut [u8]>) -> Res
             *st.slot_mut(d).unwrap() = Some(bc);
             if let ElemRef::Drive(i) = d {
                 st.drives[i].loaded = true;
+                st.drives[i].source_address = Some(src);
                 st.drives[i].pos = 0;
                 st.drives[i].partition = 0;
                 // NOT READY TO READY CHANGE, MEDIUM MAY HAVE CHANGED
@@ -898,10 +902,21 @@ fn read_element_status(st: &LibState, cdb: &[u8], out: Option<&mut [u8]>) -> Res
             let mut d = vec![0u8; desc_len as usize];
             d[0..2].copy_from_slice(&addr.to_be_bytes());
             d[2] = if bc.is_some() { 0x01 } else { 0x00 };
+            // 已穿带的驱动不允许机械手访问；UNLOAD 后才可移出。
+            if *t != 1 && (*t != 4 || !st.drives[(*addr - DT_START) as usize].loaded) {
+                d[2] |= 0x08;
+            }
             d[9] = bc
                 .as_ref()
                 .and_then(|b| st.cartridges.get(b))
                 .map_or(0, |c| c.medium_type & 7);
+            if *t == 4
+                && bc.is_some()
+                && let Some(home) = st.drives[(*addr - DT_START) as usize].source_address
+            {
+                d[9] |= 0x80;
+                d[10..12].copy_from_slice(&home.to_be_bytes());
+            }
             if voltag {
                 let mut tag = [b' '; 36];
                 tag[32..].fill(0);

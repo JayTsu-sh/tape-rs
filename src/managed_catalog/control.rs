@@ -4,6 +4,7 @@ use super::*;
 
 #[path = "management.rs"]
 pub(super) mod management;
+pub use management::moves::{MoveExecution, MoveLocation, MoveLocationKind, MovePhase, MovePlan};
 
 #[path = "management_request.rs"]
 mod management_request;

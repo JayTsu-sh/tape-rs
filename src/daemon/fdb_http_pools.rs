@@ -69,13 +69,7 @@ pub(super) fn decode_pool_cursor(
         .ok_or_else(|| bad("池分页游标的带库或命名空间不符"))
 }
 pub(super) fn failure(error: CatalogError) -> Response {
-    let mut domain = &error;
-    while let CatalogError::Fdb(foundationdb::FdbBindingError::CustomError(inner)) = domain {
-        let Some(next) = inner.downcast_ref::<CatalogError>() else {
-            break;
-        };
-        domain = next;
-    }
+    let domain = error.domain();
     let (status, kind) = match domain {
         CatalogError::Invalid(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
         CatalogError::ManagementQueueFull => (StatusCode::TOO_MANY_REQUESTS, "queue_full"),
@@ -562,6 +556,74 @@ pub(super) async fn rescan(
     }
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+enum MechanicalChange {
+    #[serde(rename = "media-move")]
+    Move {
+        barcode: String,
+        destination: String,
+        pool: Value,
+        volume: Value,
+        revision: Value,
+    },
+}
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct MoveEnvelope {
+    version: u8,
+    library: String,
+    namespace: String,
+    epoch: u64,
+    operation: String,
+    change: MechanicalChange,
+}
+/// Admission only. No request handler opens or controls a hardware device.
+pub(super) async fn tape_move(
+    State(ctx): State<Arc<Context>>,
+    Path((serial, barcode)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    let _permit = match budget(&ctx) {
+        Ok(p) => p,
+        Err(r) => return *r,
+    };
+    let expected = match route(&ctx, &serial) {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    if let Err(r) = namespace(request.headers(), expected) {
+        return *r;
+    }
+    let (owner, request) = match writer(&ctx, &serial, expected, request).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let envelope: MoveEnvelope = match body(request).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let value = serde_json::to_value(envelope).expect("move envelope serializes");
+    if value["change"]["barcode"] != barcode {
+        return invalid("搬带条码与HTTP路径不符");
+    }
+    let intent = match crate::managed_catalog::ManagementRequest::parse(value) {
+        Ok(v) => v,
+        Err(e) => return failure(e),
+    };
+    match permitted(
+        &owner,
+        expected,
+        ctx.catalog
+            .admit_management(&serial, expected, owner.round, &intent),
+    )
+    .await
+    {
+        Ok(task) => reply(StatusCode::ACCEPTED, task),
+        Err(r) => *r,
+    }
+}
+
 #[derive(serde::Serialize)]
 struct UniquePatch(std::collections::BTreeMap<String, Value>);
 impl<'de> serde::Deserialize<'de> for UniquePatch {
@@ -940,6 +1002,29 @@ pub(super) fn start_worker(ctx: &Arc<Context>) -> std::io::Result<()> {
 #[cfg(test)]
 mod backoff_tests {
     use super::*;
+    #[test]
+    fn move_body_requires_explicit_nulls_and_rejects_duplicate_fields() {
+        let body = json!({"version":1,"library":"LIB1","namespace":Uuid::new_v4().to_string(),"epoch":1,"operation":Uuid::new_v4().to_string(),"change":{"kind":"media-move","barcode":"TEST01L8","destination":"ieslot","pool":null,"volume":null,"revision":null}});
+        assert!(serde_json::from_value::<MoveEnvelope>(body.clone()).is_ok());
+        for field in ["pool", "volume", "revision", "barcode", "destination"] {
+            let mut absent = body.clone();
+            absent["change"].as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<MoveEnvelope>(absent).is_err(),
+                "{field}"
+            );
+        }
+        for (from, to) in [
+            ("\"barcode\":", "\"barcode\":\"OTHER01L8\",\"barcode\":"),
+            ("\"pool\":", "\"pool\":null,\"pool\":"),
+            ("\"version\":", "\"version\":1,\"version\":"),
+        ] {
+            assert!(
+                serde_json::from_str::<MoveEnvelope>(&body.to_string().replacen(from, to, 1))
+                    .is_err()
+            );
+        }
+    }
     #[test]
     fn dependency_failures_back_off_with_a_bounded_budget() {
         assert_eq!(poll_delay(0), std::time::Duration::from_millis(250));

@@ -320,6 +320,10 @@ mod fdb_observations;
 #[path = "executor_fdb_rescan.rs"]
 mod fdb_rescan;
 
+#[cfg(feature = "fdb")]
+#[path = "executor_fdb_move.rs"]
+mod fdb_move;
+
 #[cfg(all(test, feature = "fdb"))]
 #[path = "executor_fdb_observations_fixture.rs"]
 mod fdb_observations_fixture;
@@ -861,21 +865,12 @@ pub fn run_fdb_owner(
             }
         }
         let observation_failure = active
-            .as_ref()
+            .as_mut()
             .filter(|owner| owner.serving)
             .and_then(|owner| {
                 let permission = permission.as_deref()?;
                 observations
-                    .poll(
-                        fdb_observations::Context {
-                            active: owner,
-                            permission,
-                            control: &control,
-                            status: &status,
-                            node: opts.node_id,
-                        },
-                        &runtime,
-                    )
+                    .poll_device(owner, permission, &control, &status, opts.node_id, &runtime)
                     .err()
                     .map(|error| (owner.round, error))
             });
@@ -1077,6 +1072,19 @@ pub fn run_fdb_owner(
                         ActiveOwnerOutcome::Stale => {
                             return Err(TapeError::Catalog("FDB owner 已由更新轮次持有".into()));
                         }
+                    }
+                    // A takeover first settles the original mechanical task.
+                    // Ordinary recovery must not LOAD an unknown UNLOAD/MOVE.
+                    if runtime
+                        .block_on(control.catalog.active_library_mechanical_task(
+                            &control.serial,
+                            control.route,
+                            round,
+                        ))
+                        .map_err(|error| TapeError::Catalog(error.to_string()))?
+                        .is_some()
+                    {
+                        return Ok(0);
                     }
                     let cache_dir = files.extent_cache_dir();
                     if cache_dir.exists() {
@@ -1450,6 +1458,7 @@ async fn read_fdb(
                 TapeError::LocalCapacity { reason } | TapeError::LocalSpace { reason } => {
                     ReadError::Busy(reason)
                 }
+                error @ TapeError::MaintenanceBusy { .. } => ReadError::Busy(error.to_string()),
                 error => lost(error),
             },
         )?

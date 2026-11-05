@@ -29,6 +29,9 @@ pub enum TapeError {
     #[error("执行资格已失去 ({device}): {detail}")]
     OwnershipLost { device: String, detail: String },
 
+    #[error("带库{library}正在执行机械维护，请稍后重试")]
+    MaintenanceBusy { library: String },
+
     /// SCSI status 0x08: 目标暂忙（例如机械手或 drive 正在执行其它命令）。
     #[error("SCSI target busy on {device}")]
     Busy { device: String },

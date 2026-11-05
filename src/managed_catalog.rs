@@ -56,7 +56,10 @@ pub use cleanup::PurgeProgress;
 pub use control::{
     ActivePoolCreation, ControlOutcome, PoolPolicy, PoolRecord, TapeAssignment, VolumePlacement,
 };
-pub use control::{ManagementRequest, NotifyConnectionAction, NotifyFilter};
+pub use control::{
+    ManagementRequest, MoveExecution, MoveLocation, MoveLocationKind, MovePhase, MovePlan,
+    NotifyConnectionAction, NotifyFilter,
+};
 pub use cutover::{
     FrozenSnapshotIdentity, VerifiedNodeExport, inspect_frozen_snapshot, verify_node_export,
 };
@@ -116,6 +119,20 @@ pub enum CatalogError {
     MaintenanceFenced,
     #[error("带库 owner 已由新的执行轮次接管")]
     OwnerFenced,
+}
+
+impl CatalogError {
+    /// FDB transaction callbacks preserve domain errors inside CustomError.
+    pub fn domain(&self) -> &Self {
+        let mut current = self;
+        while let Self::Fdb(FdbBindingError::CustomError(inner)) = current {
+            let Some(next) = inner.downcast_ref::<Self>() else {
+                break;
+            };
+            current = next;
+        }
+        current
+    }
 }
 
 pub type Result<T> = std::result::Result<T, CatalogError>;

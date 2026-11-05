@@ -12,6 +12,11 @@ const NS: &str = "x-tapers-catalog-namespace";
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum ManagementIntent {
     LibraryRescan,
+    TapeMove {
+        barcode: String,
+        destination: String,
+        pool_selector: Option<String>,
+    },
     Create {
         name: String,
         file_limit: u64,
@@ -151,6 +156,50 @@ impl ManagementRequestFile {
                     return Err(invalid("任务代次无效"));
                 }
                 json!({"version":1,"library":self.library,"namespace":self.namespace,"epoch":self.request["epoch"],"operation":self.request["operation"],"change":{"kind":"library-rescan"}})
+            }
+            ManagementIntent::TapeMove {
+                barcode,
+                destination,
+                pool_selector,
+            } => {
+                if !super::queries::barcode(barcode)
+                    || !matches!(destination.as_str(), "homeslot" | "ieslot")
+                    || pool_selector.as_ref().is_some_and(|s| !name(s))
+                {
+                    return Err(invalid("搬带条码、目标或池选择器无效"));
+                }
+                uuid(
+                    self.request["operation"]
+                        .as_str()
+                        .ok_or_else(|| invalid("任务UUID缺失"))?,
+                )?;
+                if !self.request["epoch"].as_u64().is_some_and(|n| n > 0) {
+                    return Err(invalid("任务代次无效"));
+                }
+                let change = &self.request["change"];
+                if change["pool"].is_null() {
+                    if pool_selector.is_some()
+                        || !change["volume"].is_null()
+                        || !change["revision"].is_null()
+                    {
+                        return Err(invalid("未分配搬带请求的池、卷和修订号必须为空"));
+                    }
+                } else {
+                    uuid(
+                        change["pool"]
+                            .as_str()
+                            .ok_or_else(|| invalid("池UUID无效"))?,
+                    )?;
+                    uuid(
+                        change["volume"]
+                            .as_str()
+                            .ok_or_else(|| invalid("卷UUID无效"))?,
+                    )?;
+                    if !change["revision"].as_u64().is_some_and(|n| n > 0) {
+                        return Err(invalid("磁带修订号无效"));
+                    }
+                }
+                json!({"version":1,"library":self.library,"namespace":self.namespace,"epoch":self.request["epoch"],"operation":self.request["operation"],"change":{"kind":"media-move","barcode":barcode,"destination":destination,"pool":change["pool"],"volume":change["volume"],"revision":change["revision"]}})
             }
             ManagementIntent::Create {
                 name: n,
@@ -349,6 +398,13 @@ impl FdbClient {
         // Validate command parameters before contacting the server.
         match &input {
             ManagementIntent::LibraryRescan => {}
+            ManagementIntent::TapeMove {
+                barcode,
+                destination,
+                pool_selector,
+            } if super::queries::barcode(barcode)
+                && matches!(destination.as_str(), "homeslot" | "ieslot")
+                && pool_selector.as_ref().is_none_or(|s| name(s)) => {}
             ManagementIntent::Create {
                 name: n,
                 file_limit,
@@ -371,6 +427,25 @@ impl FdbClient {
         let request = match &input {
             ManagementIntent::LibraryRescan => {
                 json!({"version":1,"library":library,"namespace":namespace,"epoch":context["window"]["accepting"],"operation":Uuid::new_v4().to_string(),"change":{"kind":"library-rescan"}})
+            }
+            ManagementIntent::TapeMove {
+                barcode,
+                destination,
+                pool_selector,
+            } => {
+                let pool = pool_selector
+                    .as_ref()
+                    .map(|selector| self.pool(library, &namespace, selector))
+                    .transpose()?;
+                let pool_id = pool
+                    .as_ref()
+                    .map(|p| p["pool"]["id"].as_str().expect("validated pool"));
+                let tape = self.tape(library, &namespace, pool_id, barcode)?;
+                let assignment = &tape["tape"]["assignment"];
+                if !assignment.is_null() && assignment["volume"].is_null() {
+                    return Err(invalid("已分配磁带尚未绑定卷身份，不能准备搬带请求"));
+                }
+                json!({"version":1,"library":library,"namespace":namespace,"epoch":context["window"]["accepting"],"operation":Uuid::new_v4().to_string(),"change":{"kind":"media-move","barcode":barcode,"destination":destination,"pool":assignment["pool"],"volume":assignment["volume"],"revision":assignment["revision"]}})
             }
             ManagementIntent::Create { name, file_limit } => {
                 let time = std::time::SystemTime::now()
@@ -419,10 +494,15 @@ impl FdbClient {
                 .unwrap_or(Path::new(".")),
         )?
         .sync_all()?;
-        let (method, route, statuses) = match p.input {
+        let (method, route, statuses) = match &p.input {
             ManagementIntent::LibraryRescan => (
                 "POST",
                 format!("{}/library/rescan", base(&p.library)?),
+                vec![202],
+            ),
+            ManagementIntent::TapeMove { barcode, .. } => (
+                "POST",
+                format!("{}/tapes/{}/move", base(&p.library)?, encode_query(barcode)),
                 vec![202],
             ),
             ManagementIntent::Create { .. } => (
@@ -618,6 +698,66 @@ mod tests {
         p.request["change"]["force"] = json!(true);
         p.fingerprint = p.digest();
         assert!(p.validate().is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn move_checkpoint_pins_assignment_and_never_re_resolves_during_replay() {
+        use super::super::tests::{response, server};
+        let mut p = prepared();
+        p.input = ManagementIntent::TapeMove {
+            barcode: "TEST01L8".into(),
+            destination: "homeslot".into(),
+            pool_selector: None,
+        };
+        p.request = json!({"version":1,"library":p.library,"namespace":p.namespace,"epoch":1,"operation":Uuid::new_v4().to_string(),"change":{"kind":"media-move","barcode":"TEST01L8","destination":"homeslot","pool":null,"volume":null,"revision":null}});
+        p.fingerprint = p.digest();
+        let dir = dir();
+        let path = dir.join("move.json");
+        p.save_new(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let receipt = json!({"library_serial":p.library,"namespace":p.namespace,"epoch":1,"operation":p.request["operation"],"request":p.request,"status":"queued","execution":null});
+        let (address, worker) = server(response(202, &receipt.to_string()), Duration::ZERO);
+        assert_eq!(
+            FdbClient::new([address])
+                .unwrap()
+                .submit_management(&path)
+                .unwrap(),
+            receipt
+        );
+        let raw = String::from_utf8(worker.join().unwrap()).unwrap();
+        assert!(
+            raw.starts_with("POST /libraries/LIB%20%E4%B8%AD%E6%96%87/admin/tapes/TEST01L8/move ")
+        );
+        assert!(raw.ends_with(&p.request.to_string()));
+        let (address, worker) = server(response(202, "{}"), Duration::ZERO);
+        assert!(matches!(
+            FdbClient::new([address]).unwrap().submit_management(&path),
+            Err(ClientError::Indeterminate(_))
+        ));
+        worker.join().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        for field in ["pool", "volume", "revision"] {
+            let mut malformed = p.request.clone();
+            malformed["change"].as_object_mut().unwrap().remove(field);
+            let original = std::mem::replace(&mut p.request, malformed);
+            p.fingerprint = p.digest();
+            assert!(p.validate().is_err());
+            p.request = original;
+        }
+        p.request["change"]["pool"] = json!(Uuid::new_v4().to_string());
+        p.request["change"]["volume"] = json!(Uuid::new_v4().to_string());
+        p.request["change"]["revision"] = json!(17);
+        p.fingerprint = p.digest();
+        p.validate().unwrap();
+        let mut drift = p.input.clone();
+        if let ManagementIntent::TapeMove {
+            ref mut destination,
+            ..
+        } = drift
+        {
+            *destination = "ieslot".into();
+        }
+        assert!(!p.matches(&p.library, &drift));
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]

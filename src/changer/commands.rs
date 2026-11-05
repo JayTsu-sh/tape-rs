@@ -447,6 +447,12 @@ fn parse_descriptor(
         address,
         element_type,
         full,
+        // IBM TS4300 SC27-4641-00，printed50–58；固定 descriptor 前缀为12字节。
+        accessible: (element_type != ElementType::Transport).then_some(desc[2] & 0x08 != 0),
+        exception: desc[2] & 0x04 != 0,
+        asc: desc.get(4).copied().unwrap_or(0),
+        ascq: desc.get(5).copied().unwrap_or(0),
+        disabled: desc.get(9).is_some_and(|b| b & 0x08 != 0),
         medium_type: desc.get(9).filter(|_| full).map(|b| b & 0x07),
         volume_tag,
         source_address,
@@ -513,6 +519,26 @@ mod tests {
         let e = parse_descriptor(&[0, 1, 1, 0], 2, false, false);
         assert_eq!(e.medium_type, None);
         assert!(!e.is_cleaning());
+    }
+
+    #[test]
+    fn element_qualifiers_preserve_access_exception_disabled_and_raw_sense() {
+        for ty in 1..=4 {
+            let mut desc = [0u8; 12];
+            desc[2] = 0x0d;
+            desc[4] = 0x3b;
+            desc[5] = 0x11;
+            desc[9] = 0x08;
+            let e = parse_descriptor(&desc, ty, false, false);
+            assert_eq!(e.accessible, (ty != 1).then_some(true));
+            assert!(e.exception && e.disabled && e.full);
+            assert_eq!((e.asc, e.ascq), (0x3b, 0x11));
+            desc[2] = 0;
+            desc[9] = 0;
+            let e = parse_descriptor(&desc, ty, false, false);
+            assert_eq!(e.accessible, (ty != 1).then_some(false));
+            assert!(!e.exception && !e.disabled && !e.full);
+        }
     }
 
     #[test]
