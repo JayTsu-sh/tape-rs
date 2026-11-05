@@ -82,6 +82,26 @@ pub struct TapeAssignment {
     pub barcode: String,
     /// None until the owner has read and verified the LTFS volume identity.
     pub volume_id: Option<Uuid>,
+    /// Administrative policy CAS revision; volume binding is checked separately.
+    pub revision: u64,
+    pub online: bool,
+    pub blacklisted: bool,
+}
+
+impl TapeAssignment {
+    /// Logical policy only; media identity, hardware and owner checks remain separate.
+    pub fn allows_io(&self) -> bool {
+        self.online && !self.blacklisted
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "library":self.library_serial,"namespace":self.namespace.to_string(),
+            "pool":self.pool_id.to_string(),"barcode":self.barcode,
+            "volume":self.volume_id.map(|id| id.to_string()),
+            "revision":self.revision,"online":self.online,"blacklisted":self.blacklisted,
+        })
+    }
 }
 
 pub(super) fn managed_key(namespace: Uuid) -> Vec<u8> {
@@ -206,35 +226,58 @@ pub(super) fn decode_namespace_assignment(
 }
 
 fn encode_assignment(namespace: Uuid, pool: Uuid, volume: Option<Uuid>) -> Vec<u8> {
-    let mut value = vec![0; if volume.is_some() { 49 } else { 33 }];
-    value[0] = if volume.is_some() { 2 } else { 1 };
-    value[1..17].copy_from_slice(namespace.as_bytes());
-    value[17..33].copy_from_slice(pool.as_bytes());
+    encode_assignment_state(namespace, pool, volume, 1, true, false)
+}
+
+fn encode_assignment_state(
+    namespace: Uuid,
+    pool: Uuid,
+    volume: Option<Uuid>,
+    revision: u64,
+    online: bool,
+    blacklisted: bool,
+) -> Vec<u8> {
+    let mut value = vec![0; if volume.is_some() { 60 } else { 44 }];
+    value[0] = 1;
+    value[1] = u8::from(volume.is_some());
+    value[2..18].copy_from_slice(namespace.as_bytes());
+    value[18..34].copy_from_slice(pool.as_bytes());
+    value[34..42].copy_from_slice(&revision.to_be_bytes());
+    value[42] = u8::from(online);
+    value[43] = u8::from(blacklisted);
     if let Some(volume) = volume {
-        value[33..49].copy_from_slice(volume.as_bytes());
+        value[44..60].copy_from_slice(volume.as_bytes());
     }
     value
 }
 
 fn decode_assignment(serial: &str, barcode: &str, bytes: &[u8]) -> Result<TapeAssignment> {
     if !matches!(
-        (bytes.first().copied(), bytes.len()),
-        (Some(1), 33) | (Some(2), 49)
-    ) {
+        (bytes.first().copied(), bytes.get(1).copied(), bytes.len()),
+        (Some(1), Some(0), 44) | (Some(1), Some(1), 60)
+    ) || bytes[42] > 1
+        || bytes[43] > 1
+    {
         return Err(CatalogError::Corrupt("磁带分配记录版本或长度"));
     }
     let assignment = TapeAssignment {
-        namespace: uuid_from(&bytes[1..17])?,
-        pool_id: uuid_from(&bytes[17..33])?,
+        namespace: uuid_from(&bytes[2..18])?,
+        pool_id: uuid_from(&bytes[18..34])?,
         library_serial: serial.to_owned(),
         barcode: barcode.to_owned(),
-        volume_id: (bytes.len() == 49)
-            .then(|| uuid_from(&bytes[33..49]))
+        volume_id: (bytes[1] == 1)
+            .then(|| uuid_from(&bytes[44..60]))
             .transpose()?,
+        revision: read_u64(&bytes[34..42]),
+        online: bytes[42] == 1,
+        blacklisted: bytes[43] == 1,
     };
     if assignment.namespace.is_nil()
         || assignment.pool_id.is_nil()
         || assignment.volume_id.is_some_and(|id| id.is_nil())
+        || assignment.revision == 0
+        || (assignment.volume_id.is_none()
+            && (assignment.revision != 1 || !assignment.online || assignment.blacklisted))
     {
         return Err(CatalogError::Corrupt("磁带分配记录标识"));
     }
@@ -1641,6 +1684,121 @@ pub(super) mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；只验证目录策略持久化与幂等，不访问设备"]
+    async fn assignment_retries_preserve_policy_and_reject_missing_placement() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog = ManagedCatalog::open(Some(&cluster)).unwrap();
+        let namespace = Uuid::new_v4();
+        let serial = format!("POLICY-{namespace}");
+        catalog.create_managed_namespace(namespace).await.unwrap();
+        catalog
+            .register_physical_library(namespace, &serial)
+            .await
+            .unwrap();
+        let pool = PoolRecord {
+            id: Uuid::new_v4(),
+            library_serial: serial.clone(),
+            name: "policy".into(),
+            file_limit: 100,
+            created_at_millis: 1_793_405_000_123,
+            policy: PoolPolicy::default(),
+            revision: 1,
+        };
+        catalog.create_pool(namespace, &pool).await.unwrap();
+        let placement = VolumePlacement {
+            namespace,
+            pool_id: pool.id,
+            library_serial: serial.clone(),
+            barcode: "AA0001L8".into(),
+            volume_id: Uuid::new_v4(),
+        };
+        assert_eq!(
+            catalog
+                .assign_tape(namespace, pool.id, &serial, &placement.barcode)
+                .await
+                .unwrap(),
+            ControlOutcome::Created
+        );
+        assert!(catalog.advance_owner_epoch(&serial, 10).await.unwrap());
+        // Synthetic catalog identity only; this test does not prove any media content.
+        assert_eq!(
+            catalog
+                .register_volume_placement(&placement, 10)
+                .await
+                .unwrap(),
+            ControlOutcome::Created
+        );
+        let key = assignment_key(&serial, &placement.barcode);
+        let saved = encode_assignment_state(
+            namespace,
+            pool.id,
+            Some(placement.volume_id),
+            7,
+            false,
+            true,
+        );
+        let tr = catalog.db.create_trx().unwrap();
+        tr.set(&key, &saved);
+        tr.commit().await.unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                catalog
+                    .assign_tape(namespace, pool.id, &serial, &placement.barcode)
+                    .await
+                    .unwrap(),
+                ControlOutcome::AlreadyExists
+            );
+            assert_eq!(
+                catalog
+                    .register_volume_placement(&placement, 10)
+                    .await
+                    .unwrap(),
+                ControlOutcome::AlreadyExists
+            );
+            let assignment = catalog
+                .tape_assignment(&serial, &placement.barcode)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(assignment.revision, 7);
+            assert!(!assignment.online && assignment.blacklisted && !assignment.allows_io());
+            assert_eq!(assignment.to_json()["revision"], 7);
+            assert_eq!(assignment.to_json()["online"], false);
+            assert_eq!(assignment.to_json()["blacklisted"], true);
+            let tr = catalog.db.create_trx().unwrap();
+            assert_eq!(
+                tr.get(&key, false).await.unwrap().unwrap().as_ref(),
+                saved.as_slice()
+            );
+        }
+        let reverse = barcode_key(&serial, &placement.barcode);
+        let tr = catalog.db.create_trx().unwrap();
+        tr.clear(&reverse);
+        tr.commit().await.unwrap();
+        assert!(matches!(
+            catalog.tape_assignment(&serial, &placement.barcode).await,
+            Err(CatalogError::Corrupt(_))
+        ));
+        assert!(matches!(
+            catalog
+                .assign_tape(namespace, pool.id, &serial, &placement.barcode)
+                .await,
+            Err(CatalogError::Corrupt(_))
+        ));
+        assert!(matches!(
+            catalog.register_volume_placement(&placement, 10).await,
+            Err(CatalogError::Corrupt(_))
+        ));
+        let tr = catalog.db.create_trx().unwrap();
+        assert!(tr.get(&reverse, false).await.unwrap().is_none());
+        assert_eq!(
+            tr.get(&key, false).await.unwrap().unwrap().as_ref(),
+            saved.as_slice()
+        );
+    }
+
+    #[tokio::test]
     #[ignore = "需要隔离 FDB_TEST_CLUSTER；池声明冻结、真实事务冲突与拒绝无副作用，不操作设备"]
     async fn pool_declaration_freeze_is_conflict_tracked_and_preserves_retries() {
         let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
@@ -2042,6 +2200,9 @@ pub(super) mod tests {
             assert_eq!(assignment.namespace, namespace);
             assert_eq!(assignment.pool_id, pool);
             assert_eq!(assignment.volume_id, expected);
+            assert_eq!(assignment.revision, 1);
+            assert!(assignment.online && !assignment.blacklisted && assignment.allows_io());
+            assert_eq!(encoded.len(), if expected.is_some() { 60 } else { 44 });
             for end in 0..encoded.len() {
                 assert!(decode_assignment("SERIAL_A", "AA0001L8", &encoded[..end]).is_err());
             }
@@ -2050,8 +2211,51 @@ pub(super) mod tests {
             assert!(decode_assignment("SERIAL_A", "AA0001L8", &invalid).is_err());
         }
         let mut nil_volume = encode_assignment(namespace, pool, Some(volume));
-        nil_volume[33..49].fill(0);
+        nil_volume[44..60].fill(0);
         assert!(decode_assignment("SERIAL_A", "AA0001L8", &nil_volume).is_err());
+        for length in [33, 49] {
+            assert!(decode_assignment("SERIAL_A", "AA0001L8", &vec![1; length]).is_err());
+        }
+        for volume_id in [None, Some(volume)] {
+            for offset in [1, 42, 43] {
+                let mut invalid = encode_assignment(namespace, pool, volume_id);
+                invalid[offset] = 2;
+                assert!(decode_assignment("SERIAL_A", "AA0001L8", &invalid).is_err());
+            }
+            let mut invalid = encode_assignment(namespace, pool, volume_id);
+            invalid[34..42].fill(0);
+            assert!(decode_assignment("SERIAL_A", "AA0001L8", &invalid).is_err());
+        }
+        for (online, blacklisted) in [(false, false), (true, false), (false, true), (true, true)] {
+            let encoded = encode_assignment_state(
+                namespace,
+                pool,
+                Some(volume),
+                u64::MAX,
+                online,
+                blacklisted,
+            );
+            let decoded = decode_assignment("SERIAL_A", "AA0001L8", &encoded).unwrap();
+            assert_eq!(decoded.revision, u64::MAX);
+            assert_eq!(decoded.allows_io(), online && !blacklisted);
+            assert_eq!(decoded.to_json()["volume"], volume.to_string());
+        }
+        assert!(
+            decode_assignment(
+                "SERIAL_A",
+                "AA0001L8",
+                &encode_assignment_state(namespace, pool, None, 2, true, false)
+            )
+            .is_err()
+        );
+        assert!(
+            decode_assignment(
+                "SERIAL_A",
+                "AA0001L8",
+                &encode_assignment_state(namespace, pool, None, 1, false, false)
+            )
+            .is_err()
+        );
         let index = namespace_assignment_key(namespace, pool, "SERIAL_A", "AA0001L8");
         let value = encode_namespace_assignment("SERIAL_A", "AA0001L8");
         assert_eq!(
