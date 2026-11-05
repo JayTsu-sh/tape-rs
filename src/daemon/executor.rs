@@ -312,6 +312,10 @@ struct Writer {
 #[path = "executor_fdb_loading.rs"]
 mod fdb_loading;
 
+#[cfg(feature = "fdb")]
+#[path = "executor_fdb_observations.rs"]
+mod fdb_observations;
+
 struct Active {
     #[cfg(feature = "fdb")]
     fdb_reads: std::collections::BTreeMap<usize, fdb_loading::Mount>,
@@ -805,6 +809,7 @@ pub fn run_fdb_owner(
     let mut permission: Option<Arc<Permission>> = None;
     let mut active: Option<Active> = None;
     let mut next_fence_check = Instant::now();
+    let mut observations = fdb_observations::Publisher::default();
     loop {
         if Instant::now() >= next_fence_check {
             next_fence_check = Instant::now() + Duration::from_secs(1);
@@ -842,6 +847,34 @@ pub fn run_fdb_owner(
                 active = None;
                 let _ = tx.send(ExecEvent::Lost { round, reason });
             }
+        }
+        let observation_failure = active
+            .as_ref()
+            .filter(|owner| owner.serving)
+            .and_then(|owner| {
+                let permission = permission.as_deref()?;
+                observations
+                    .poll(
+                        fdb_observations::Context {
+                            active: owner,
+                            permission,
+                            control: &control,
+                            status: &status,
+                            node: opts.node_id,
+                        },
+                        &runtime,
+                    )
+                    .err()
+                    .map(|error| (owner.round, error))
+            });
+        if let Some((round, error)) = observation_failure {
+            let reason = format!("FDB 库巡检执行权失效：{error}");
+            if let Some(permission) = permission.as_ref() {
+                permission.close(round);
+            }
+            files.close_all(&reason);
+            active = None;
+            let _ = tx.send(ExecEvent::Lost { round, reason });
         }
         if let Some(owner) = active.as_mut().filter(|owner| owner.serving)
             && let Some(permit) = permission.as_deref()

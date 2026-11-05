@@ -3351,3 +3351,161 @@ async fn simulated_media_commit() {
 
 #[path = "support/fdb_owner_scheduling.rs"]
 mod owner_scheduling;
+
+#[test]
+#[ignore = "需要显式隔离FDB_TEST_CLUSTER；仅模拟设备，验证原生owner库存后台发布"]
+fn native_owner_publishes_complete_inventory_without_legacy_catalog() {
+    struct ObservationProvider {
+        library: SimLibrary,
+        serial: String,
+    }
+    impl DeviceProvider for ObservationProvider {
+        fn open_all(&self) -> tape_rs::error::Result<Vec<ManagedDevice>> {
+            Ok(vec![
+                ManagedDevice {
+                    name: "changer".into(),
+                    serial: self.serial.clone(),
+                    kind: DeviceKind::Changer,
+                    dev: Box::new(self.library.changer()),
+                },
+                ManagedDevice {
+                    name: "drive".into(),
+                    serial: "SIMDRV0000".into(),
+                    kind: DeviceKind::Drive,
+                    dev: Box::new(self.library.drive(0)),
+                },
+            ])
+        }
+    }
+    let cluster = std::env::var("FDB_TEST_CLUSTER").expect("显式隔离FDB");
+    let _network = unsafe { foundationdb::boot() };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let catalog = Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());
+    let ns = Uuid::new_v4();
+    let serial = format!("OWNER-OBS-{ns}");
+    let challenge = Uuid::new_v4();
+    let replies=(1..=3).map(|id|json!({"version":1,"library_serial":serial,"challenge":challenge.to_string(),"node_id":id,"term":7,"leader":2,"role":if id==2{"Leader"}else{"Follower"},"members":{"1":"a:1","2":"b:2","3":"c:3"},"quiesce_index":89,"frozen_index":90,"applied_index":92,"executor_absent":true,"catalog_pending":false,"shutting_down":false,"catalog_empty":true})).collect::<Vec<_>>();
+    let proof =
+        tape_rs::managed_catalog::verify_native_barriers(&serial, challenge, &replies).unwrap();
+    let route = runtime
+        .block_on(catalog.initialize_native_library(ns, &proof))
+        .unwrap();
+    let round = route.initial_owner_epoch;
+    let library = SimLibrary::new(1, 2, 0);
+    library.enable_changer_pr();
+    library
+        .insert_cartridge(SimCartridge::blank("TEST01L8", 1 << 20), 0)
+        .unwrap();
+    let root = std::env::temp_dir().join(format!("tapers-native-owner-observation-{ns}"));
+    let files = FileService::new(root.join("spool")).unwrap();
+    let permission = Arc::new(Permission::default());
+    let status = Arc::new(Mutex::new(NodeStatus {
+        id: 2,
+        catalog_frozen_index: Some(route.frozen_index),
+        ..Default::default()
+    }));
+    let (requests, rx) = mpsc::channel();
+    let (events, event_rx) = mpsc::channel();
+    let thread = std::thread::spawn({
+        let catalog = catalog.clone();
+        let files = files.clone();
+        let status = status.clone();
+        let serial = serial.clone();
+        move || {
+            tape_rs::daemon::executor::run_fdb_owner(
+                Box::new(ObservationProvider {
+                    library,
+                    serial: serial.clone(),
+                }),
+                ExecOptions {
+                    node_id: 2,
+                    interval: Duration::from_millis(100),
+                    demo_write: false,
+                    salvage: false,
+                    block_size: 64 * 1024,
+                    read_idle: Duration::from_secs(30),
+                },
+                rx,
+                events,
+                files,
+                status,
+                FdbOwnerControl {
+                    catalog,
+                    serial,
+                    route,
+                    storage: Default::default(),
+                },
+            );
+        }
+    });
+    requests
+        .send(ExecRequest::AttachPermission {
+            permission: permission.clone(),
+        })
+        .unwrap();
+    permission.renew(
+        round,
+        Phase::Fencing,
+        Instant::now() + Duration::from_secs(120),
+    );
+    requests.send(ExecRequest::Takeover { round }).unwrap();
+    assert!(matches!(next_owner_event(&event_rx),ExecEvent::Fenced{round:r} if r==round));
+    permission.renew(
+        round,
+        Phase::Execution,
+        Instant::now() + Duration::from_secs(120),
+    );
+    requests.send(ExecRequest::Recover { round }).unwrap();
+    assert!(matches!(next_owner_event(&event_rx),ExecEvent::Serving{round:r,..} if r==round));
+    {
+        let mut state = status.lock().unwrap();
+        state.executor = Some(tape_rs::daemon::state::Executor {
+            node: 2,
+            round,
+            term: 7,
+            fenced: true,
+        });
+        state.executor_ready = true;
+    }
+    permission.renew(
+        round,
+        Phase::Serving,
+        Instant::now() + Duration::from_secs(120),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut observed = None;
+    while Instant::now() < deadline {
+        let inventory = runtime
+            .block_on(catalog.active_library_inventory(&serial, route))
+            .unwrap();
+        let monitor = runtime
+            .block_on(catalog.active_library_monitor(&serial, route))
+            .unwrap();
+        if inventory.is_some() && monitor.is_some() {
+            observed = Some((inventory.unwrap(), monitor.unwrap()));
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let (done, finished) = mpsc::channel();
+    requests
+        .send(ExecRequest::Shutdown { done: Some(done) })
+        .unwrap();
+    finished.recv_timeout(Duration::from_secs(10)).unwrap();
+    thread.join().unwrap();
+    drop(files);
+    fs::remove_dir_all(root).unwrap();
+    let (inventory, monitor) =
+        observed.expect("Serving owner须实际发布FDB库存和巡检；不能一直保持None");
+    assert_eq!(inventory["library_serial"], serial);
+    assert_eq!(inventory["round"], round);
+    assert_eq!(inventory["volumes"].as_array().unwrap().len(), 1);
+    assert_eq!(inventory["volumes"][0]["barcode"], "TEST01L8");
+    assert_eq!(inventory["drives"].as_array().unwrap().len(), 1);
+    assert_eq!(monitor["owner_epoch"], round);
+    assert!(monitor["error"].is_null());
+    assert_eq!(monitor["last_success"], monitor["last_attempt"]);
+}

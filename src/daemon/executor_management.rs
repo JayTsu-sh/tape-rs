@@ -250,11 +250,11 @@ fn observe(a: &Active, opts: &ExecOptions) -> Result<Value> {
     observe_devices(&a.devices, opts.node_id, a.round)
 }
 
-fn observe_devices(devices: &[ManagedDevice], node: u8, round: u64) -> Result<Value> {
+pub(super) fn observe_devices(devices: &[ManagedDevice], node: u8, round: u64) -> Result<Value> {
     let (map, rows) = elements(devices)?;
     let volumes:Vec<Value>=rows.iter().filter(|e|e.full && e.volume_tag.is_some()).map(|e|json!({"barcode":e.volume_tag,"address":e.address,"element_type":e.element_type as u8,"medium_type":e.medium_type,"source_address":e.source_address,"home_slot":e.address.checked_sub(map.storage_start).filter(|s|*s<map.storage_count).map(|s|u32::from(s)+1)})).collect();
     // Keep both projections tied to the same READ ELEMENT STATUS reply.
-    let inv = inventory_elements(devices, &rows, false)?;
+    let inv = inventory_elements(devices, &rows, true)?;
     let drives:Vec<Value>=inv.drives.iter().map(|d|json!({"serial":devices[d.dev].serial,"address":d.addr,"barcode":d.loaded.as_ref().map(|l|&l.0)})).collect();
     Ok(
         json!({"library_serial":devices.iter().find(|d|d.kind==DeviceKind::Changer).map(|d|&d.serial),"owner":node,"round":round,"observed_at":crate::ltfs::label::ltfs_time_now(),"volumes":volumes,"drives":drives}),
@@ -706,6 +706,35 @@ mod inventory_tests {
             Err(TapeError::ScsiHost { .. })
         ));
         assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn observation_rejects_full_element_without_readable_barcode() {
+        let library = SimLibrary::new(1, 2, 0);
+        library
+            .insert_cartridge(SimCartridge::blank("", 1 << 20), 0)
+            .unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let devices = devices(&library, &reads, library.changer(), false);
+        assert!(
+            observe_devices(&devices, 2, 100).is_err(),
+            "full但没有条码不能发布成空库存"
+        );
+    }
+    #[test]
+    fn observation_rejects_missing_configured_drive() {
+        let library = SimLibrary::new(1, 2, 0);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut devices = devices(&library, &reads, library.changer(), false);
+        devices.push(ManagedDevice {
+            name: "missing".into(),
+            serial: "NOT-PRESENT".into(),
+            kind: DeviceKind::Drive,
+            dev: Box::new(library.drive(0)),
+        });
+        assert!(
+            observe_devices(&devices, 2, 100).is_err(),
+            "不能把未映射的配置驱动静默省略"
+        );
     }
 }
 
