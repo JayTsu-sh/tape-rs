@@ -1,6 +1,6 @@
 # FDB 持久通知存储
 
-通知事件日志、消费者、待确认批次与注入收据保存在 FDB。外部系统主动连接本项目的 HTTP/SSE 入口，无需配置外部回调地址。`ltfsctl notify` 提供相同操作；服务端需要启用 FDB，客户端默认构建即可。管理任务的排队和安全取消已在同一 FDB 事务中生成真实 task.status.changed；真实库存和磁带监控生产者仍待后续集成，不应把测试注入当成设备状态变化。
+通知事件日志、消费者、待确认批次与注入收据保存在 FDB。外部系统主动连接本项目的 HTTP/SSE 入口，无需配置外部回调地址。`ltfsctl notify` 提供相同操作；服务端需要启用 FDB，客户端默认构建即可。管理任务的排队和安全取消已在同一 FDB 事务中生成真实 task.status.changed；带库库存/巡检存储方法也可同事务生成库级业务通知；周期设备采集、磁带监控及管理展示仍待后续接线，不应把测试注入或合成库存当成设备状态变化。
 
 消费者以带库、活动 namespace 和稳定的消费者 ID 标识，创建时返回 generation。连接可在不同进程重新建立，只有显式 ACK 才推进进度；断线、租约到期、发送次数增加都不会丢弃积压。外部系统需要保存消费者 ID，并在重连时查询原 generation，不能每次创建新 ID 来代替恢复原订阅。
 
@@ -57,3 +57,5 @@ ltfsctl -e 192.0.2.11:7401 --library LIBRARY_SERIAL notify inject --operation OP
 `create --from-start` 才回放已有历史，否则从创建时的日志头之后开始；重复 create 的资源过滤和 from-start 必须与首次相同。`create --barcode` 可重复；全局 `--pool` 用于 create 的资源过滤时须为规范的非零池 UUID。`watch --all-event-types` 扩大到全部类型；不传类型选项沿用原集合，不能缩小。普通命令输出 JSON，watch 每批输出并刷新一行 JSON；打印与进程正常退出都不是 ACK。接收程序须完整、可靠地保存或处理整个批次后再 ACK，使用 event_id 幂等，不能对每条事件部分确认。
 
 SDK 是同步接口；在异步应用中应通过 `spawn_blocking` 调用。watch 在网络轮询的运行时之外执行用户回调，回调内可以在处理完成后显式调用 `acknowledge_notify`，然后返回 true 继续接收下一批。
+
+带库库存与巡检事件源、缓存新鲜度和输入边界见 [FDB 带库观测](fdb-library-observations.md)。
