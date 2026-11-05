@@ -107,24 +107,39 @@ impl<'a> MediumChanger<'a> {
             self.device.execute_read(&cdb_bytes, &mut buf, 60_000)
         })?;
 
-        // 检测 kernel 是否把响应截断（用户态 buffer 不够装下 device 想发的所有 element）。
-        // 截断时 data 头里的 Byte Count of Report Available 大于实际传回字节数，
-        // 部分末尾 element 会被静默丢弃，导致 inventory 少行。
-        if result.transferred >= 8 {
-            let advertised = u32::from_be_bytes([0, buf[5], buf[6], buf[7]]) as usize + 8;
-            if advertised > result.transferred {
-                log::warn!(
-                    "READ ELEMENT STATUS 截断：device 想发 {} 字节，只收到 {}（alloc_len={}），\
-                     末尾 element 可能丢失",
-                    advertised,
-                    result.transferred,
-                    alloc_len
-                );
+        let elements = parse_element_status_data(&buf[..result.transferred])?;
+        // This call requests the whole map. A protocol-valid partial reply is
+        // still insufficient to infer absence or choose a mechanical target.
+        if elements.len() != total_u32 as usize {
+            return Err(TapeError::Refused {
+                reason: format!(
+                    "READ ELEMENT STATUS 元素数 {} 与地址map中的 {} 不符",
+                    elements.len(),
+                    total_u32
+                ),
+            });
+        }
+        let mut addresses = std::collections::BTreeSet::new();
+        for element in &elements {
+            let (start, count) = match element.element_type {
+                ElementType::Transport => (map.transport_start, map.transport_count),
+                ElementType::Storage => (map.storage_start, map.storage_count),
+                ElementType::ImportExport => (map.ie_start, map.ie_count),
+                ElementType::DataTransfer => (map.dt_start, map.dt_count),
+            };
+            if !addresses.insert(element.address)
+                || !(u32::from(start)..u32::from(start) + u32::from(count))
+                    .contains(&u32::from(element.address))
+            {
+                return Err(TapeError::Refused {
+                    reason: format!(
+                        "READ ELEMENT STATUS 元素 {:#06x}/{:?} 重复或不属于当前地址map",
+                        element.address, element.element_type
+                    ),
+                });
             }
         }
-
-        // 解析返回数据（parser 只需 &[u8]，通过 BytesMut 的 Deref 传入）
-        parse_element_status_data(&buf[..result.transferred])
+        Ok(elements)
     }
 
     /// 移动磁带
@@ -285,13 +300,30 @@ fn parse_element_status_data(data: &[u8]) -> Result<Vec<ElementStatus>> {
 
     // Data header: byte 5-7 = Byte Count of Report Available（u24 BE）
     let byte_count = u32::from_be_bytes([0, data[5], data[6], data[7]]) as usize;
-    let data_end = (8 + byte_count).min(data.len());
+    let data_end = 8 + byte_count;
+    if data_end > data.len() {
+        return Err(TapeError::InvalidResponse {
+            expected: data_end,
+            actual: data.len(),
+        });
+    }
 
     let mut elements = Vec::new();
     let mut offset = 8;
 
-    while offset + 8 <= data_end {
+    while offset < data_end {
+        if data_end - offset < 8 {
+            return Err(TapeError::InvalidResponse {
+                expected: 8,
+                actual: data_end - offset,
+            });
+        }
         let elem_type_code = data[offset];
+        if ElementType::from_u8(elem_type_code).is_none() {
+            return Err(TapeError::Refused {
+                reason: format!("READ ELEMENT STATUS 页类型 {elem_type_code} 无效"),
+            });
+        }
         let voltag_flags = data[offset + 1];
         let desc_len = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
         let desc_byte_count =
@@ -299,21 +331,57 @@ fn parse_element_status_data(data: &[u8]) -> Result<Vec<ElementStatus>> {
         offset += 8;
 
         if desc_len == 0 {
-            break;
+            if desc_byte_count == 0 {
+                continue;
+            }
+            return Err(TapeError::Refused {
+                reason: "READ ELEMENT STATUS 非空页的描述符长度为零".into(),
+            });
         }
-        if desc_len < 4 {
+        let has_pvoltag = (voltag_flags & 0x80) != 0;
+        let has_avoltag = (voltag_flags & 0x40) != 0;
+        // Fixed fields occupy 12 bytes; each declared volume tag occupies 36.
+        // A missing tag is not an empty tag when the page says it is present.
+        let fixed_and_tags = 12 + 36 * (usize::from(has_pvoltag) + usize::from(has_avoltag));
+        if desc_len < fixed_and_tags {
             return Err(TapeError::InvalidResponse {
-                expected: 4,
+                expected: fixed_and_tags,
                 actual: desc_len,
             });
         }
-
-        let has_pvoltag = (voltag_flags & 0x80) != 0;
-        let has_avoltag = (voltag_flags & 0x40) != 0;
-        let page_end = (offset + desc_byte_count).min(data_end);
+        let page_end = offset + desc_byte_count;
+        if page_end > data_end {
+            return Err(TapeError::InvalidResponse {
+                expected: page_end,
+                actual: data_end,
+            });
+        }
+        if !desc_byte_count.is_multiple_of(desc_len) {
+            return Err(TapeError::Refused {
+                reason: format!(
+                    "READ ELEMENT STATUS 页长度 {desc_byte_count} 不能整除描述符长度 {desc_len}"
+                ),
+            });
+        }
 
         while offset + desc_len <= page_end {
             let desc = &data[offset..offset + desc_len];
+            if elem_type_code == ElementType::DataTransfer as u8 && desc_len > fixed_and_tags {
+                let id_start = fixed_and_tags + 4;
+                if desc_len < id_start {
+                    return Err(TapeError::InvalidResponse {
+                        expected: id_start,
+                        actual: desc_len,
+                    });
+                }
+                let id_end = id_start + usize::from(desc[fixed_and_tags + 3]);
+                if id_end > desc_len {
+                    return Err(TapeError::InvalidResponse {
+                        expected: id_end,
+                        actual: desc_len,
+                    });
+                }
+            }
             elements.push(parse_descriptor(
                 desc,
                 elem_type_code,
@@ -324,10 +392,20 @@ fn parse_element_status_data(data: &[u8]) -> Result<Vec<ElementStatus>> {
         }
     }
 
+    let reported = u16::from_be_bytes([data[2], data[3]]) as usize;
+    if elements.len() != reported {
+        return Err(TapeError::Refused {
+            reason: format!(
+                "READ ELEMENT STATUS 描述符数 {} 与声明元素数 {} 不符",
+                elements.len(),
+                reported
+            ),
+        });
+    }
     Ok(elements)
 }
 
-/// 解析单个 Element Descriptor。descriptor 最低 4 字节已由调用方保证存在。
+/// 调用方已校验固定字段、声明卷标及存在的 DVCID 扩展范围。
 fn parse_descriptor(
     desc: &[u8],
     elem_type_code: u8,
@@ -452,6 +530,207 @@ mod tests {
         );
     }
 
+    fn one_element_report() -> Vec<u8> {
+        let mut bytes = vec![0u8; 28];
+        bytes[0..2].copy_from_slice(&1001u16.to_be_bytes());
+        bytes[2..4].copy_from_slice(&1u16.to_be_bytes());
+        bytes[7] = 20;
+        bytes[8] = 2;
+        bytes[11] = 12;
+        bytes[15] = 12;
+        bytes[16..18].copy_from_slice(&1001u16.to_be_bytes());
+        bytes
+    }
+    #[test]
+    fn complete_status_rejects_every_truncated_prefix_and_inconsistent_counts() {
+        let bytes = one_element_report();
+        assert_eq!(parse_element_status_data(&bytes).unwrap().len(), 1);
+        for length in 0..bytes.len() {
+            assert!(
+                parse_element_status_data(&bytes[..length]).is_err(),
+                "截断到{length}字节不能当完整状态"
+            );
+        }
+        let mut wrong = bytes.clone();
+        wrong[3] = 2;
+        assert!(
+            parse_element_status_data(&wrong).is_err(),
+            "头部声称两个元素但只返回一个"
+        );
+        let mut partial = bytes.clone();
+        partial.push(0);
+        partial[7] += 1;
+        partial[15] += 1;
+        assert!(
+            parse_element_status_data(&partial).is_err(),
+            "页内残缺描述符不能忽略"
+        );
+        let mut tail = bytes.clone();
+        tail.push(0);
+        tail[7] += 1;
+        assert!(
+            parse_element_status_data(&tail).is_err(),
+            "报告内残缺页头不能忽略"
+        );
+        let mut zero = bytes.clone();
+        zero[11] = 0;
+        assert!(
+            parse_element_status_data(&zero).is_err(),
+            "非空页不能使用零描述符长度"
+        );
+        let mut unknown = bytes.clone();
+        unknown[8] = 5;
+        assert!(
+            parse_element_status_data(&unknown).is_err(),
+            "未知页类型不能当作已知元素"
+        );
+        let mut empty_page = bytes[..8].to_vec();
+        empty_page.extend_from_slice(&[2, 0, 0, 0, 0, 0, 0, 0]);
+        empty_page.extend_from_slice(&bytes[8..]);
+        empty_page[7] += 8;
+        assert_eq!(
+            parse_element_status_data(&empty_page).unwrap().len(),
+            1,
+            "空页后仍须继续解析其他页"
+        );
+        let mut padded = bytes.clone();
+        padded.extend_from_slice(&[0; 16]);
+        assert_eq!(
+            parse_element_status_data(&padded).unwrap().len(),
+            1,
+            "报告后填充不属于状态数据"
+        );
+    }
+    fn descriptor_report(kind: u8, flags: u8, descriptor: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; 16 + descriptor.len()];
+        bytes[2..4].copy_from_slice(&1u16.to_be_bytes());
+        bytes[5..8].copy_from_slice(&(8u32 + descriptor.len() as u32).to_be_bytes()[1..]);
+        bytes[8] = kind;
+        bytes[9] = flags;
+        bytes[10..12].copy_from_slice(&(descriptor.len() as u16).to_be_bytes());
+        bytes[13..16].copy_from_slice(&(descriptor.len() as u32).to_be_bytes()[1..]);
+        bytes[16..].copy_from_slice(descriptor);
+        bytes
+    }
+    #[test]
+    fn complete_status_rejects_truncated_fixed_descriptor() {
+        for length in [4, 11] {
+            assert!(
+                parse_element_status_data(&descriptor_report(2, 0, &vec![0; length])).is_err(),
+                "固定字段不能截断到{length}"
+            );
+        }
+    }
+    #[test]
+    fn complete_status_rejects_truncated_declared_volume_tags() {
+        for (flags, minimum) in [(0x80, 48usize), (0x40, 48), (0xc0, 84)] {
+            for length in [12, minimum - 4, minimum - 1] {
+                assert!(
+                    parse_element_status_data(&descriptor_report(2, flags, &vec![0; length]))
+                        .is_err(),
+                    "声明卷标{flags:#x}不能截断到{length}"
+                );
+            }
+            assert_eq!(
+                parse_element_status_data(&descriptor_report(2, flags, &vec![0; minimum]))
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+    #[test]
+    fn complete_status_rejects_truncated_device_identifier() {
+        for length in 13..16 {
+            assert!(
+                parse_element_status_data(&descriptor_report(4, 0, &vec![0; length])).is_err(),
+                "已出现的DVCID头不能缺字段"
+            );
+        }
+        for (flags, base) in [(0, 12usize), (0x80, 48), (0xc0, 84)] {
+            let mut descriptor = vec![0; base + 4];
+            descriptor[base + 3] = 3;
+            assert!(
+                parse_element_status_data(&descriptor_report(4, flags, &descriptor)).is_err(),
+                "DVCID声明正文不能越界"
+            );
+            descriptor.extend_from_slice(b"ABC");
+            let rows =
+                parse_element_status_data(&descriptor_report(4, flags, &descriptor)).unwrap();
+            assert_eq!(rows[0].drive_id.as_deref(), Some("ABC"));
+        }
+    }
+    struct OmitOneStorage(crate::scsi::sim::SimTransport);
+    impl crate::scsi::transport::TapeTransport for OmitOneStorage {
+        fn identity(&self) -> &str {
+            self.0.identity()
+        }
+        fn execute_no_data(
+            &self,
+            cdb: &[u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            self.0.execute_no_data(cdb, timeout)
+        }
+        fn execute_write(
+            &self,
+            cdb: &[u8],
+            data: &[u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            self.0.execute_write(cdb, data, timeout)
+        }
+        fn execute_read(
+            &self,
+            cdb: &[u8],
+            data: &mut [u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            let mut result = self.0.execute_read(cdb, data, timeout)?;
+            if cdb[0] == crate::scsi::cdb::opcode::READ_ELEMENT_STATUS {
+                let mut offset = 8;
+                while offset + 8 <= result.transferred {
+                    let size = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
+                    let count = u32::from_be_bytes([
+                        0,
+                        data[offset + 5],
+                        data[offset + 6],
+                        data[offset + 7],
+                    ]) as usize;
+                    if data[offset] == 2 && count >= size && size > 0 {
+                        let end = offset + 8 + count;
+                        data.copy_within(end..result.transferred, end - size);
+                        let remaining = (count - size) as u32;
+                        data[offset + 5..offset + 8].copy_from_slice(&remaining.to_be_bytes()[1..]);
+                        let elements = u16::from_be_bytes([data[2], data[3]]) - 1;
+                        data[2..4].copy_from_slice(&elements.to_be_bytes());
+                        let bytes =
+                            u32::from_be_bytes([0, data[5], data[6], data[7]]) - size as u32;
+                        data[5..8].copy_from_slice(&bytes.to_be_bytes()[1..]);
+                        result.transferred -= size;
+                        break;
+                    }
+                    offset += 8 + count;
+                }
+            }
+            Ok(result)
+        }
+    }
+    #[test]
+    fn complete_status_requires_every_mapped_address_even_for_a_valid_short_report() {
+        let library = crate::scsi::sim::SimLibrary::new(1, 3, 1);
+        let device = library.changer();
+        let mut changer = MediumChanger::new(&device);
+        changer.load_address_map().unwrap();
+        assert_eq!(changer.read_all_status().unwrap().len(), 6);
+        let short = OmitOneStorage(library.changer());
+        let mut changer = MediumChanger::new(&short);
+        changer.load_address_map().unwrap();
+        assert!(
+            changer.read_all_status().is_err(),
+            "协议长度自洽也不能缺少map中的一个槽位"
+        );
+    }
     #[test]
     fn short_descriptor_is_an_error_instead_of_a_panic() {
         for len in 1..4 {
