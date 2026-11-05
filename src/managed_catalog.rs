@@ -491,6 +491,9 @@ impl ManagedCatalog {
                     let old_root = tr.get(&root, false).await?;
                     let old_state = tr.get(&state_key, false).await?;
                     let old_managed = tr.get(&managed_key, false).await?;
+                    let old_layout = tr
+                        .get(&control::managed_layout_key(namespace), false)
+                        .await?;
                     let old_source_revision = tr.get(&source_revision_key, false).await?;
                     if old_state.as_deref() == Some(&[NamespaceState::Discarded as u8]) {
                         return Ok(Err(CatalogError::Invalid("废弃的 namespace ID 不能复用")));
@@ -511,6 +514,17 @@ impl ManagedCatalog {
                             if old_managed.is_some() != managed {
                                 return Ok(Err(CatalogError::Invalid(
                                     "namespace 管理模式不能更改",
+                                )));
+                            }
+                            if managed {
+                                if let Err(error) =
+                                    control::validate_managed_layout(old_layout.as_deref())
+                                {
+                                    return Ok(Err(error));
+                                }
+                            } else if old_layout.is_some() {
+                                return Ok(Err(CatalogError::Corrupt(
+                                    "非受管命名空间存在受管布局记录",
                                 )));
                             }
                             if managed
@@ -540,13 +554,33 @@ impl ManagedCatalog {
                             Ok(Ok(false))
                         }
                         (None, None) => {
-                            if old_managed.is_some() || old_source_revision.is_some() {
+                            if old_managed.is_some()
+                                || old_layout.is_some()
+                                || old_source_revision.is_some()
+                            {
                                 return Ok(Err(CatalogError::Corrupt("受管命名空间缺少根记录")));
+                            }
+                            // Never bless orphan rows by adding a new namespace header.
+                            for &kind in cleanup::NAMESPACE_ROWS {
+                                let mut prefix = key(kind);
+                                prefix.extend_from_slice(namespace.as_bytes());
+                                let range = RangeOption {
+                                    begin: KeySelector::first_greater_or_equal(prefix.clone()),
+                                    end: KeySelector::first_greater_or_equal(prefix_end(&prefix)),
+                                    limit: Some(1),
+                                    ..RangeOption::default()
+                                };
+                                if !tr.get_range(&range, 1, false).await?.is_empty() {
+                                    return Ok(Err(CatalogError::Corrupt(
+                                        "命名空间存在无根的目录记录",
+                                    )));
+                                }
                             }
                             tr.set(&root, &value);
                             tr.set(&state_key, &[state as u8]);
                             if managed {
                                 tr.set(&managed_key, b"");
+                                control::initialize_managed_layout(&tr, namespace);
                                 tr.set(&source_revision_key, &0u64.to_be_bytes());
                             }
                             tr.set(

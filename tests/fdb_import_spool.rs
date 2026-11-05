@@ -1825,6 +1825,29 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                 .activate_prepared_cutover(&serial, certificate)
                 .await
                 .unwrap();
+            let mut layout_key = b"tape-rs/catalog/22/a/".to_vec();
+            layout_key.extend_from_slice(namespace.as_bytes());
+            layout_key.extend_from_slice(b"/layout");
+            let tr = direct.create_trx().unwrap();
+            let layout = tr.get(&layout_key, false).await.unwrap().unwrap().to_vec();
+            tr.clear(&layout_key);
+            tr.commit().await.unwrap();
+            assert!(matches!(
+                reopened.active_library_route(&serial).await,
+                Err(tape_rs::managed_catalog::CatalogError::Corrupt(_))
+            ));
+            assert!(matches!(
+                reopened.claim_active_owner_epoch(&serial, 12).await,
+                Err(tape_rs::managed_catalog::CatalogError::Corrupt(_))
+            ));
+            let tr = direct.create_trx().unwrap();
+            assert!(tr.get(&layout_key, false).await.unwrap().is_none());
+            tr.set(&layout_key, &layout);
+            tr.commit().await.unwrap();
+            assert_eq!(
+                reopened.active_library_owner(&serial).await.unwrap(),
+                Some((active, 11))
+            );
             assert_eq!(active.route, route);
             assert_eq!(active.frozen_index, 90);
             assert_eq!(active.initial_owner_epoch, 11);

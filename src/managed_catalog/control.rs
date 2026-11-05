@@ -78,6 +78,35 @@ pub(super) fn managed_key(namespace: Uuid) -> Vec<u8> {
     k
 }
 
+pub(super) const MANAGED_LAYOUT_VERSION: u8 = 2;
+
+pub(super) fn managed_layout_key(namespace: Uuid) -> Vec<u8> {
+    // Keep the layout assertion with the managed marker: namespace cleanup
+    // releases all assignment rows before clearing either of these records.
+    let mut k = managed_key(namespace);
+    k.extend_from_slice(b"/layout");
+    k
+}
+
+pub(super) fn validate_managed_layout(value: Option<&[u8]>) -> Result<()> {
+    if value != Some(&[MANAGED_LAYOUT_VERSION]) {
+        return Err(CatalogError::Corrupt("受管目录布局缺失或不支持"));
+    }
+    Ok(())
+}
+
+pub(super) fn initialize_managed_layout(tr: &Transaction, namespace: Uuid) {
+    tr.set(&managed_layout_key(namespace), &[MANAGED_LAYOUT_VERSION]);
+}
+
+pub(super) async fn require_managed_layout(tr: &Transaction, namespace: Uuid) -> Result<()> {
+    validate_managed_layout(
+        tr.get(&managed_layout_key(namespace), false)
+            .await?
+            .as_deref(),
+    )
+}
+
 fn placement_key(volume: Uuid) -> Vec<u8> {
     let mut k = key(b'b');
     k.extend_from_slice(volume.as_bytes());
@@ -98,9 +127,21 @@ fn assignment_key(serial: &str, barcode: &str) -> Vec<u8> {
     k
 }
 
-pub(super) fn namespace_assignment_key(namespace: Uuid, serial: &str, barcode: &str) -> Vec<u8> {
+pub(super) fn pool_assignment_prefix(namespace: Uuid, pool: Uuid) -> Vec<u8> {
     let mut k = key(b'e');
     k.extend_from_slice(namespace.as_bytes());
+    k.push(MANAGED_LAYOUT_VERSION);
+    k.extend_from_slice(pool.as_bytes());
+    k
+}
+
+pub(super) fn namespace_assignment_key(
+    namespace: Uuid,
+    pool: Uuid,
+    serial: &str,
+    barcode: &str,
+) -> Vec<u8> {
+    let mut k = pool_assignment_prefix(namespace, pool);
     append_component(&mut k, serial.as_bytes());
     append_component(&mut k, barcode.as_bytes());
     k
@@ -117,9 +158,19 @@ fn encode_namespace_assignment(serial: &str, barcode: &str) -> Vec<u8> {
 
 pub(super) fn decode_namespace_assignment(
     namespace: Uuid,
-    key: &[u8],
+    row_key: &[u8],
     bytes: &[u8],
-) -> Result<(String, String)> {
+) -> Result<(Uuid, String, String)> {
+    let mut prefix = key(b'e');
+    prefix.extend_from_slice(namespace.as_bytes());
+    prefix.push(MANAGED_LAYOUT_VERSION);
+    if namespace.is_nil() || !row_key.starts_with(&prefix) || row_key.len() < prefix.len() + 16 {
+        return Err(CatalogError::Corrupt("磁带归属索引布局或作用域"));
+    }
+    let pool = uuid_from(&row_key[prefix.len()..prefix.len() + 16])?;
+    if pool.is_nil() {
+        return Err(CatalogError::Corrupt("磁带归属索引池身份"));
+    }
     let serial_len = *bytes
         .first()
         .ok_or(CatalogError::Corrupt("磁带归属索引长度"))? as usize;
@@ -136,10 +187,10 @@ pub(super) fn decode_namespace_assignment(
         .map_err(|_| CatalogError::Corrupt("磁带归属索引条码"))?;
     validate_physical_serial(serial).map_err(|_| CatalogError::Corrupt("磁带归属索引序列号"))?;
     validate_barcode(barcode).map_err(|_| CatalogError::Corrupt("磁带归属索引条码"))?;
-    if namespace_assignment_key(namespace, serial, barcode) != key {
+    if namespace_assignment_key(namespace, pool, serial, barcode) != row_key {
         return Err(CatalogError::Corrupt("磁带归属索引键值不一致"));
     }
-    Ok((serial.to_owned(), barcode.to_owned()))
+    Ok((pool, serial.to_owned(), barcode.to_owned()))
 }
 
 fn encode_assignment(namespace: Uuid, pool: Uuid, volume: Option<Uuid>) -> Vec<u8> {
@@ -179,8 +230,10 @@ fn decode_assignment(serial: &str, barcode: &str, bytes: &[u8]) -> Result<TapeAs
 }
 
 async fn require_assignment_index(tr: &Transaction, assignment: &TapeAssignment) -> Result<()> {
+    require_managed_layout(tr, assignment.namespace).await?;
     let key = namespace_assignment_key(
         assignment.namespace,
+        assignment.pool_id,
         &assignment.library_serial,
         &assignment.barcode,
     );
@@ -567,7 +620,7 @@ async fn require_managed_pool_library(
 ) -> Result<()> {
     require_control_building_or_ready(tr, namespace).await?;
     match tr.get(&managed_key(namespace), false).await?.as_deref() {
-        Some([]) => {}
+        Some([]) => require_managed_layout(tr, namespace).await?,
         Some(_) => return Err(CatalogError::Corrupt("受管命名空间标记")),
         None => return Err(CatalogError::Invalid("磁带只能分配到受管命名空间")),
     }
@@ -799,7 +852,7 @@ impl ManagedCatalog {
         let barcode = barcode.to_owned();
         let record = assignment_key(&serial, &barcode);
         let reverse = barcode_key(&serial, &barcode);
-        let index = namespace_assignment_key(namespace, &serial, &barcode);
+        let index = namespace_assignment_key(namespace, pool_id, &serial, &barcode);
         let value = encode_assignment(namespace, pool_id, None);
         let index_value = encode_namespace_assignment(&serial, &barcode);
         self.db
@@ -890,7 +943,7 @@ impl ManagedCatalog {
         let barcode = barcode.to_owned();
         let record = assignment_key(&serial, &barcode);
         let reverse = barcode_key(&serial, &barcode);
-        let index = namespace_assignment_key(namespace, &serial, &barcode);
+        let index = namespace_assignment_key(namespace, pool_id, &serial, &barcode);
         self.db
             .run(|tr, _| {
                 let (serial, barcode, record, reverse, index) = (
@@ -1098,7 +1151,8 @@ impl ManagedCatalog {
                                 None => return Ok(ControlOutcome::StaleOwner),
                             }
                             let record = assignment_key(&serial, &barcode);
-                            let index = namespace_assignment_key(namespace, &serial, &barcode);
+                            let index =
+                                namespace_assignment_key(namespace, pool_id, &serial, &barcode);
                             let reverse = barcode_key(&serial, &barcode);
                             let assigned = tr.get(&record, false).await?;
                             let indexed = tr.get(&index, false).await?;
@@ -1476,6 +1530,159 @@ impl ManagedCatalog {
 pub(super) mod tests {
     use super::*;
 
+    #[tokio::test]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；布局缺失/版本拒绝与孤立记录检查，不访问设备"]
+    async fn isolated_managed_layout_never_backfills_old_or_orphan_data() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog = ManagedCatalog::open(Some(&cluster)).unwrap();
+        let ns = Uuid::new_v4();
+        let serial = format!("LAYOUT-{ns}");
+        catalog.create_managed_namespace(ns).await.unwrap();
+        catalog
+            .register_physical_library(ns, &serial)
+            .await
+            .unwrap();
+        let pool = PoolRecord {
+            id: Uuid::new_v4(),
+            library_serial: serial.clone(),
+            name: "layout".into(),
+            file_limit: 100,
+            created_at_millis: 1_793_405_000_123,
+            policy: PoolPolicy::default(),
+            revision: 1,
+        };
+        catalog.create_pool(ns, &pool).await.unwrap();
+        catalog
+            .assign_tape(ns, pool.id, &serial, "AA0001L8")
+            .await
+            .unwrap();
+        let saved = catalog.tape_assignment(&serial, "AA0001L8").await.unwrap();
+        let expected_index = namespace_assignment_key(ns, pool.id, &serial, "AA0001L8");
+        let other_pool_index = namespace_assignment_key(ns, Uuid::new_v4(), &serial, "AA0001L8");
+        let tr = catalog.db.create_trx().unwrap();
+        let index_value = tr
+            .get(&expected_index, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .to_vec();
+        tr.clear(&expected_index);
+        tr.set(&other_pool_index, &index_value);
+        tr.commit().await.unwrap();
+        assert!(matches!(
+            catalog.tape_assignment(&serial, "AA0001L8").await,
+            Err(CatalogError::Corrupt(_))
+        ));
+        assert!(matches!(
+            catalog.assign_tape(ns, pool.id, &serial, "AA0001L8").await,
+            Err(CatalogError::Corrupt(_))
+        ));
+        let tr = catalog.db.create_trx().unwrap();
+        assert!(tr.get(&expected_index, false).await.unwrap().is_none());
+        assert_eq!(
+            tr.get(&other_pool_index, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            index_value.as_slice()
+        );
+        tr.set(&expected_index, &index_value);
+        tr.clear(&other_pool_index);
+        tr.commit().await.unwrap();
+        assert_eq!(
+            catalog.tape_assignment(&serial, "AA0001L8").await.unwrap(),
+            saved
+        );
+        let layout = managed_layout_key(ns);
+        for invalid in [
+            None,
+            Some(vec![1]),
+            Some(vec![MANAGED_LAYOUT_VERSION + 1]),
+            Some(vec![]),
+        ] {
+            let tr = catalog.db.create_trx().unwrap();
+            match &invalid {
+                None => tr.clear(&layout),
+                Some(value) => tr.set(&layout, value),
+            }
+            tr.commit().await.unwrap();
+            assert!(matches!(
+                catalog.create_managed_namespace(ns).await,
+                Err(CatalogError::Corrupt(_))
+            ));
+            assert!(matches!(
+                catalog.tape_assignment(&serial, "AA0001L8").await,
+                Err(CatalogError::Corrupt(_))
+            ));
+            assert!(matches!(
+                catalog.assign_tape(ns, pool.id, &serial, "AA0002L8").await,
+                Err(CatalogError::Corrupt(_))
+            ));
+            let tr = catalog.db.create_trx().unwrap();
+            assert_eq!(
+                tr.get(&layout, false).await.unwrap().map(|v| v.to_vec()),
+                invalid
+            );
+            assert!(
+                tr.get(&assignment_key(&serial, "AA0002L8"), false)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                tr.get(
+                    &namespace_assignment_key(ns, pool.id, &serial, "AA0002L8"),
+                    false
+                )
+                .await
+                .unwrap()
+                .is_none()
+            );
+        }
+        let tr = catalog.db.create_trx().unwrap();
+        initialize_managed_layout(&tr, ns);
+        tr.commit().await.unwrap();
+        assert!(!catalog.create_managed_namespace(ns).await.unwrap());
+        assert_eq!(
+            catalog.tape_assignment(&serial, "AA0001L8").await.unwrap(),
+            saved
+        );
+
+        // An old unversioned reverse row cannot be legitimized by creating a header.
+        let orphan = Uuid::new_v4();
+        let mut row = key(b'e');
+        row.extend_from_slice(orphan.as_bytes());
+        append_component(&mut row, serial.as_bytes());
+        append_component(&mut row, b"AA0001L8");
+        let bytes = encode_namespace_assignment(&serial, "AA0001L8");
+        let tr = catalog.db.create_trx().unwrap();
+        tr.set(&row, &bytes);
+        tr.commit().await.unwrap();
+        assert!(matches!(
+            catalog.begin_managed_import(orphan).await,
+            Err(CatalogError::Corrupt(_))
+        ));
+        let tr = catalog.db.create_trx().unwrap();
+        assert_eq!(
+            tr.get(&row, false).await.unwrap().unwrap().as_ref(),
+            bytes.as_slice()
+        );
+        assert!(
+            tr.get(&namespace_key(orphan), false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            tr.get(&managed_layout_key(orphan), false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn pool_codec_rejects_bad_lengths_and_values() {
         let id = Uuid::new_v4();
@@ -1620,16 +1827,26 @@ pub(super) mod tests {
         let mut nil_volume = encode_assignment(namespace, pool, Some(volume));
         nil_volume[33..49].fill(0);
         assert!(decode_assignment("SERIAL_A", "AA0001L8", &nil_volume).is_err());
-        let index = namespace_assignment_key(namespace, "SERIAL_A", "AA0001L8");
+        let index = namespace_assignment_key(namespace, pool, "SERIAL_A", "AA0001L8");
         let value = encode_namespace_assignment("SERIAL_A", "AA0001L8");
         assert_eq!(
             decode_namespace_assignment(namespace, &index, &value).unwrap(),
-            ("SERIAL_A".into(), "AA0001L8".into())
+            (pool, "SERIAL_A".into(), "AA0001L8".into())
         );
         for end in 0..value.len() {
             assert!(decode_namespace_assignment(namespace, &index, &value[..end]).is_err());
         }
         assert!(decode_namespace_assignment(Uuid::new_v4(), &index, &value).is_err());
+        let mut unknown = index.clone();
+        unknown[key(b'e').len() + 16] = MANAGED_LAYOUT_VERSION + 1;
+        assert!(decode_namespace_assignment(namespace, &unknown, &value).is_err());
+        let mut nil_pool = index.clone();
+        let offset = key(b'e').len() + 17;
+        nil_pool[offset..offset + 16].fill(0);
+        assert!(decode_namespace_assignment(namespace, &nil_pool, &value).is_err());
+        for end in 0..index.len() {
+            assert!(decode_namespace_assignment(namespace, &index[..end], &value).is_err());
+        }
         let mut wrong = value;
         *wrong.last_mut().unwrap() = b'9';
         assert!(decode_namespace_assignment(namespace, &index, &wrong).is_err());

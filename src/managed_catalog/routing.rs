@@ -283,6 +283,7 @@ async fn sealed_context(
         return Err(CatalogError::Incomplete);
     }
     import_materialize::require_sealed_ready(tr, route.namespace).await?;
+    control::require_managed_layout(tr, route.namespace).await?;
     if tr
         .get(&control::library_key(route.namespace, serial), false)
         .await?
@@ -323,6 +324,7 @@ async fn active_context(tr: &Transaction, serial: &str, active: ActiveLibraryRou
         .get(&certificate_key(serial), false)
         .await?
         .ok_or(CatalogError::Incomplete)?;
+    control::require_managed_layout(tr, active.route.namespace).await?;
     let decoded = decode_certificate(&certificate)?;
     if Sha256::digest(&certificate)[..] != active.certificate_sha256
         || decoded.route != active.route
@@ -757,6 +759,7 @@ impl ManagedCatalog {
             .map(|route| route.filter(|route| !route.namespace.is_nil()))?;
         if let Some(route) = route {
             import_materialize::require_sealed_ready(&tr, route.namespace).await?;
+            control::require_managed_layout(&tr, route.namespace).await?;
             if tr
                 .get(&control::library_key(route.namespace, serial), false)
                 .await?
@@ -796,6 +799,7 @@ impl ManagedCatalog {
                                 return Err(CatalogError::Invalid("活动带库不能改写预备路由"));
                             }
                             import_materialize::require_sealed_ready(&tr, namespace).await?;
+                            control::require_managed_layout(&tr, namespace).await?;
                             if tr.get(&library, false).await?.as_deref() != Some(&[][..]) {
                                 return Err(CatalogError::Incomplete);
                             }
