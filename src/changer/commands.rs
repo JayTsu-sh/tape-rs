@@ -338,15 +338,17 @@ fn parse_element_status_data(data: &[u8]) -> Result<Vec<ElementStatus>> {
                 reason: "READ ELEMENT STATUS 非空页的描述符长度为零".into(),
             });
         }
-        if desc_len < 4 {
+        let has_pvoltag = (voltag_flags & 0x80) != 0;
+        let has_avoltag = (voltag_flags & 0x40) != 0;
+        // Fixed fields occupy 12 bytes; each declared volume tag occupies 36.
+        // A missing tag is not an empty tag when the page says it is present.
+        let fixed_and_tags = 12 + 36 * (usize::from(has_pvoltag) + usize::from(has_avoltag));
+        if desc_len < fixed_and_tags {
             return Err(TapeError::InvalidResponse {
-                expected: 4,
+                expected: fixed_and_tags,
                 actual: desc_len,
             });
         }
-
-        let has_pvoltag = (voltag_flags & 0x80) != 0;
-        let has_avoltag = (voltag_flags & 0x40) != 0;
         let page_end = offset + desc_byte_count;
         if page_end > data_end {
             return Err(TapeError::InvalidResponse {
@@ -364,6 +366,22 @@ fn parse_element_status_data(data: &[u8]) -> Result<Vec<ElementStatus>> {
 
         while offset + desc_len <= page_end {
             let desc = &data[offset..offset + desc_len];
+            if elem_type_code == ElementType::DataTransfer as u8 && desc_len > fixed_and_tags {
+                let id_start = fixed_and_tags + 4;
+                if desc_len < id_start {
+                    return Err(TapeError::InvalidResponse {
+                        expected: id_start,
+                        actual: desc_len,
+                    });
+                }
+                let id_end = id_start + usize::from(desc[fixed_and_tags + 3]);
+                if id_end > desc_len {
+                    return Err(TapeError::InvalidResponse {
+                        expected: id_end,
+                        actual: desc_len,
+                    });
+                }
+            }
             elements.push(parse_descriptor(
                 desc,
                 elem_type_code,
@@ -387,7 +405,7 @@ fn parse_element_status_data(data: &[u8]) -> Result<Vec<ElementStatus>> {
     Ok(elements)
 }
 
-/// 解析单个 Element Descriptor。descriptor 最低 4 字节已由调用方保证存在。
+/// 调用方已校验固定字段、声明卷标及存在的 DVCID 扩展范围。
 fn parse_descriptor(
     desc: &[u8],
     elem_type_code: u8,
@@ -564,7 +582,7 @@ mod tests {
         unknown[8] = 5;
         assert!(
             parse_element_status_data(&unknown).is_err(),
-            "未知页类型不能当机械手"
+            "未知页类型不能当作已知元素"
         );
         let mut empty_page = bytes[..8].to_vec();
         empty_page.extend_from_slice(&[2, 0, 0, 0, 0, 0, 0, 0]);
@@ -582,6 +600,65 @@ mod tests {
             1,
             "报告后填充不属于状态数据"
         );
+    }
+    fn descriptor_report(kind: u8, flags: u8, descriptor: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; 16 + descriptor.len()];
+        bytes[2..4].copy_from_slice(&1u16.to_be_bytes());
+        bytes[5..8].copy_from_slice(&(8u32 + descriptor.len() as u32).to_be_bytes()[1..]);
+        bytes[8] = kind;
+        bytes[9] = flags;
+        bytes[10..12].copy_from_slice(&(descriptor.len() as u16).to_be_bytes());
+        bytes[13..16].copy_from_slice(&(descriptor.len() as u32).to_be_bytes()[1..]);
+        bytes[16..].copy_from_slice(descriptor);
+        bytes
+    }
+    #[test]
+    fn complete_status_rejects_truncated_fixed_descriptor() {
+        for length in [4, 11] {
+            assert!(
+                parse_element_status_data(&descriptor_report(2, 0, &vec![0; length])).is_err(),
+                "固定字段不能截断到{length}"
+            );
+        }
+    }
+    #[test]
+    fn complete_status_rejects_truncated_declared_volume_tags() {
+        for (flags, minimum) in [(0x80, 48usize), (0x40, 48), (0xc0, 84)] {
+            for length in [12, minimum - 4, minimum - 1] {
+                assert!(
+                    parse_element_status_data(&descriptor_report(2, flags, &vec![0; length]))
+                        .is_err(),
+                    "声明卷标{flags:#x}不能截断到{length}"
+                );
+            }
+            assert_eq!(
+                parse_element_status_data(&descriptor_report(2, flags, &vec![0; minimum]))
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+    #[test]
+    fn complete_status_rejects_truncated_device_identifier() {
+        for length in 13..16 {
+            assert!(
+                parse_element_status_data(&descriptor_report(4, 0, &vec![0; length])).is_err(),
+                "已出现的DVCID头不能缺字段"
+            );
+        }
+        for (flags, base) in [(0, 12usize), (0x80, 48), (0xc0, 84)] {
+            let mut descriptor = vec![0; base + 4];
+            descriptor[base + 3] = 3;
+            assert!(
+                parse_element_status_data(&descriptor_report(4, flags, &descriptor)).is_err(),
+                "DVCID声明正文不能越界"
+            );
+            descriptor.extend_from_slice(b"ABC");
+            let rows =
+                parse_element_status_data(&descriptor_report(4, flags, &descriptor)).unwrap();
+            assert_eq!(rows[0].drive_id.as_deref(), Some("ABC"));
+        }
     }
     struct OmitOneStorage(crate::scsi::sim::SimTransport);
     impl crate::scsi::transport::TapeTransport for OmitOneStorage {

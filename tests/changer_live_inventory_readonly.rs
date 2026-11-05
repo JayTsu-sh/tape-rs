@@ -1,5 +1,6 @@
 //! Opt-in physical changer reads. Never MOVE, INITIALIZE, LOAD, PR OUT or write.
 use serde_json::{Value, json};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
 use std::sync::Mutex;
 use tape_rs::{
@@ -88,6 +89,29 @@ impl TapeTransport for ReadProbe<'_> {
 #[ignore = "显式指定真实changer路径、序列号、FC主端口及当前PR键；只读三种状态响应，不改介质或预留"]
 fn physical_changer_rejects_partial_inventory_and_accepts_complete_map() {
     let path = std::env::var("TAPE_RS_HW_CHANGER").expect("须指定当前主路径changer");
+    let path = std::fs::canonicalize(&path).unwrap();
+    assert_eq!(
+        path.parent(),
+        Some(Path::new("/dev")),
+        "须解析到实际/dev/sg节点"
+    );
+    let metadata = std::fs::metadata(&path).unwrap();
+    assert!(metadata.file_type().is_char_device());
+    let expected_device = std::fs::read_to_string(
+        Path::new("/sys/class/scsi_generic")
+            .join(path.file_name().unwrap())
+            .join("dev"),
+    )
+    .unwrap();
+    assert_eq!(
+        expected_device.trim(),
+        format!(
+            "{}:{}",
+            nix::sys::stat::major(metadata.rdev()),
+            nix::sys::stat::minor(metadata.rdev())
+        )
+    );
+    let path = path.to_str().unwrap().to_owned();
     let serial = std::env::var("TAPE_RS_HW_CHANGER_SERIAL").expect("须指定真实序列号");
     let port =
         normalize_fc_target_port(&std::env::var("TAPE_RS_HW_CHANGER_PORT").expect("须指定主WWPN"))
