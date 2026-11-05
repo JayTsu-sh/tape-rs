@@ -338,6 +338,9 @@ async fn append_event_at(
     injection: Option<Uuid>,
 ) -> Result<u64> {
     let result = async {
+        if !EVENT_TYPES.contains(&kind) || !data.is_object() || injection.is_some_and(|id| id.is_nil()) {
+            return Err(CatalogError::Invalid("通知事件类型、内容或注入身份无效"));
+        }
         let head = head_at(tr, ns, serial).await?;
         let sequence = head.checked_add(1)
             .ok_or(CatalogError::Corrupt("通知序号耗尽"))?;
@@ -361,6 +364,79 @@ async fn append_event_at(
         Ok(sequence)
     }
     .await;
+    result.map_err(atomic_error)
+}
+
+pub(super) async fn require_changed_at(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    entity: &str,
+    kind: &str,
+    expected: Option<&Value>,
+) -> Result<()> {
+    let raw = tr.get(&entity_key(ns, serial, b's', entity), false).await?;
+    match (raw, expected) {
+        (None, None) => Ok(()),
+        (Some(raw), Some(expected)) => {
+            let state = decode(&raw)?;
+            let sequence = state["sequence"]
+                .as_u64()
+                .filter(|n| *n > 0)
+                .ok_or(CatalogError::Corrupt("通知投影序号损坏"))?;
+            if state.to_string().as_bytes() != raw.as_ref()
+                || !state.as_object().is_some_and(|v| {
+                    v.len() == 4
+                        && ["version", "sequence", "current", "event_sha256"]
+                            .iter()
+                            .all(|k| v.contains_key(*k))
+                })
+                || state["version"] != 1
+                || state["current"] != *expected
+                || !expected.is_object()
+                || sequence > head_at(tr, ns, serial).await?
+            {
+                return Err(CatalogError::Corrupt("通知投影与原状态不符"));
+            }
+            let event = tr
+                .get(&event_key(ns, serial, sequence), false)
+                .await?
+                .ok_or(CatalogError::Corrupt("通知投影对应的原事件缺失"))?;
+            let value = decode_event(&event, ns, serial, sequence)?;
+            if state["event_sha256"] != format!("{:x}", Sha256::digest(&event))
+                || value["event_type"] != kind
+                || value["injected"] != false
+                || value["data"]["current"] != *expected
+                || value["data"]["pool"] != expected["pool"]
+                || value["data"]["barcode"] != expected["barcode"]
+            {
+                return Err(CatalogError::Corrupt("通知投影与原事件不符"));
+            }
+            Ok(())
+        }
+        _ => Err(CatalogError::Corrupt("通知投影孤立或缺失")),
+    }
+}
+
+pub(super) async fn changed_at(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    entity: &str,
+    kind: &str,
+    previous: Option<&Value>,
+    current: Value,
+) -> Result<()> {
+    let result=async {
+        if !current.is_object() {return Err(CatalogError::Invalid("通知状态必须为 JSON 对象"));}
+        require_changed_at(tr,ns,serial,entity,kind,previous).await?;
+        if previous==Some(&current) {return Ok(());}
+        let sequence=append_event_at(tr,ns,serial,kind,
+            json!({"previous":previous,"current":current,"pool":current["pool"],"barcode":current["barcode"]}),None).await?;
+        let event=tr.get(&event_key(ns,serial,sequence),false).await?.ok_or(CatalogError::Corrupt("刚写入的通知事件缺失"))?;
+        tr.set(&entity_key(ns,serial,b's',entity),json!({"version":1,"sequence":sequence,"event_sha256":format!("{:x}",Sha256::digest(&event)),"current":current}).to_string().as_bytes());
+        Ok(())
+    }.await;
     result.map_err(atomic_error)
 }
 
