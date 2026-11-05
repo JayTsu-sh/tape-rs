@@ -5,6 +5,15 @@ use super::*;
 #[path = "management.rs"]
 pub(super) mod management;
 
+#[path = "active_pools.rs"]
+mod active_pools;
+pub use active_pools::ActivePoolCreation;
+#[path = "pool_roots.rs"]
+mod pool_roots;
+pub(super) use pool_roots::{initial_pool_root, reject_generic_pool_root_at};
+#[path = "native_device.rs"]
+pub(super) mod native_device;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolRecord {
     pub id: Uuid,
@@ -495,6 +504,30 @@ fn pool_key(namespace: Uuid, id: Uuid) -> Vec<u8> {
     k
 }
 
+pub(super) fn retired_pool_key(namespace: Uuid, pool: Uuid) -> Vec<u8> {
+    let mut k = management::prefix(namespace, b'r');
+    k.extend_from_slice(pool.as_bytes());
+    k
+}
+
+pub(super) async fn retired_pool_revision_at(
+    tr: &Transaction,
+    namespace: Uuid,
+    pool: Uuid,
+) -> Result<Option<u64>> {
+    tr.get(&retired_pool_key(namespace, pool), false)
+        .await?
+        .map(|value| decode_pool_retirement(&value))
+        .transpose()
+}
+
+fn decode_pool_retirement(value: &[u8]) -> Result<u64> {
+    if value.len() != 9 || value[0] != 1 || read_u64(&value[1..]) < 2 {
+        return Err(CatalogError::Corrupt("池退役记录格式或修订号"));
+    }
+    Ok(read_u64(&value[1..]))
+}
+
 fn pool_name_key(namespace: Uuid, name: &str) -> Vec<u8> {
     let mut k = key(b'X');
     k.extend_from_slice(namespace.as_bytes());
@@ -599,6 +632,18 @@ fn decode_pool(id: Uuid, value: &[u8]) -> Result<PoolRecord> {
     Ok(pool)
 }
 
+// The staging manifest freezes declarations before the pool pages are read.
+async fn require_pool_declarations_open(tr: &Transaction, namespace: Uuid) -> Result<()> {
+    if tr
+        .get(&staged_import::manifest_key(namespace), false)
+        .await?
+        .is_some()
+    {
+        return Err(CatalogError::Invalid("导入已开始，不能更改池声明"));
+    }
+    Ok(())
+}
+
 async fn require_control_namespace(tr: &Transaction, namespace: Uuid) -> Result<()> {
     let state = tr.get(&namespace_key(namespace), false).await?;
     match state.as_deref().map(decode_namespace_state).transpose()? {
@@ -668,6 +713,64 @@ impl ManagedCatalog {
             .map(|value| decode_pool(id, &value).map(|_| true))
             .transpose()
             .map(|value| value.unwrap_or(false))
+    }
+
+    pub(super) async fn import_pools(
+        &self,
+        namespace: Uuid,
+        after: Option<&[u8]>,
+    ) -> Result<Page<PoolRecord>> {
+        let prefix = pool_prefix(namespace);
+        let tr = self.db.create_trx()?;
+        if tr.get(&namespace_key(namespace), true).await?.as_deref()
+            != Some(&[NamespaceState::Building as u8][..])
+        {
+            return Err(CatalogError::Incomplete);
+        }
+        let page = read_page(&tr, &prefix, after, 100, true).await?;
+        Ok(Page {
+            items: page
+                .items
+                .into_iter()
+                .map(|(key, value)| decode_pool(uuid_from(&key[prefix.len()..])?, &value))
+                .collect::<Result<Vec<_>>>()?,
+            next: page.next,
+        })
+    }
+
+    pub async fn list_active_pools_for_route(
+        &self,
+        serial: &str,
+        route: ActiveLibraryRoute,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Page<PoolRecord>> {
+        validate_physical_serial(serial)?;
+        if !(1..=100).contains(&limit) {
+            return Err(CatalogError::Invalid("池分页大小必须在 1..=100"));
+        }
+        let prefix = pool_prefix(route.route.namespace);
+        if after
+            .is_some_and(|cursor| !cursor.starts_with(&prefix) || cursor.len() != prefix.len() + 16)
+        {
+            return Err(CatalogError::Invalid("池分页游标无效"));
+        }
+        let tr = self.db.create_trx()?;
+        routing::require_expected_active_namespace(&tr, serial, Some(route)).await?;
+        let page = read_page(&tr, &prefix, after, limit, true).await?;
+        let mut items = Vec::new();
+        for (key, value) in page.items {
+            let pool = decode_pool(uuid_from(&key[prefix.len()..])?, &value)?;
+            if pool.library_serial == serial {
+                require_pool_library(&tr, route.route.namespace, pool.id, serial).await?;
+                active_pools::require_indexes(&tr, route.route.namespace, &pool).await?;
+                items.push(pool);
+            }
+        }
+        Ok(Page {
+            items,
+            next: page.next,
+        })
     }
 
     /// Declare a physical changer by its real serial within one logical namespace.
@@ -750,6 +853,7 @@ impl ManagedCatalog {
                                 (Some(_), _) => Ok(ControlOutcome::IdConflict),
                                 (_, Some(_)) => Ok(ControlOutcome::NameConflict),
                                 (None, None) => {
+                                    require_pool_declarations_open(&tr, namespace).await?;
                                     tr.set(&record, &value);
                                     tr.set(&name, pool.id.as_bytes());
                                     Ok(ControlOutcome::Created)
@@ -818,13 +922,16 @@ impl ManagedCatalog {
                                 return Ok(ControlOutcome::StaleVersion);
                             }
 
-                            if old_name != new_name {
-                                if let Some(id) = tr.get(&new_name, false).await? {
-                                    if uuid_from(&id)? == expected.id {
-                                        return Err(CatalogError::Corrupt("pool 重复名称索引"));
-                                    }
-                                    return Ok(ControlOutcome::NameConflict);
+                            if old_name != new_name
+                                && let Some(id) = tr.get(&new_name, false).await?
+                            {
+                                if uuid_from(&id)? == expected.id {
+                                    return Err(CatalogError::Corrupt("pool 重复名称索引"));
                                 }
+                                return Ok(ControlOutcome::NameConflict);
+                            }
+                            require_pool_declarations_open(&tr, namespace).await?;
+                            if old_name != new_name {
                                 tr.clear(&old_name);
                                 tr.set(&new_name, expected.id.as_bytes());
                             }
@@ -1532,6 +1639,121 @@ impl ManagedCatalog {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；池声明冻结、真实事务冲突与拒绝无副作用，不操作设备"]
+    async fn pool_declaration_freeze_is_conflict_tracked_and_preserves_retries() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog = ManagedCatalog::open(Some(&cluster)).unwrap();
+        let ns = Uuid::new_v4();
+        let serial = format!("FREEZE-{ns}");
+        catalog.create_managed_namespace(ns).await.unwrap();
+        catalog
+            .register_physical_library(ns, &serial)
+            .await
+            .unwrap();
+        let first = PoolRecord {
+            id: Uuid::new_v4(),
+            library_serial: serial,
+            name: "first".into(),
+            file_limit: 100,
+            created_at_millis: 1_793_405_000_123,
+            policy: PoolPolicy::default(),
+            revision: 1,
+        };
+        catalog.create_pool(ns, &first).await.unwrap();
+        let second = PoolRecord {
+            id: Uuid::new_v4(),
+            name: "second".into(),
+            ..first.clone()
+        };
+        catalog.create_pool(ns, &second).await.unwrap();
+        let updated = PoolRecord {
+            file_limit: 101,
+            revision: 2,
+            ..second.clone()
+        };
+        assert_eq!(
+            catalog.update_pool(ns, &second, &updated).await.unwrap(),
+            ControlOutcome::Updated
+        );
+        let prepared = catalog.db.create_trx().unwrap();
+        require_pool_declarations_open(&prepared, ns).await.unwrap();
+        let manifest = staged_import::manifest_key(ns);
+        let tr = catalog.db.create_trx().unwrap();
+        tr.set(&manifest, b"retained-stage-freeze");
+        tr.commit().await.unwrap();
+        let probe = pool_key(ns, Uuid::new_v4());
+        prepared.set(&probe, b"must-not-commit");
+        assert_eq!(prepared.commit().await.unwrap_err().code(), 1020);
+        let third = PoolRecord {
+            id: Uuid::new_v4(),
+            name: "late".into(),
+            ..first.clone()
+        };
+        assert!(matches!(
+            catalog.create_pool(ns, &third).await,
+            Err(CatalogError::Invalid(_))
+        ));
+        let renamed = PoolRecord {
+            name: "renamed".into(),
+            revision: 3,
+            ..updated.clone()
+        };
+        assert!(matches!(
+            catalog.update_pool(ns, &updated, &renamed).await,
+            Err(CatalogError::Invalid(_))
+        ));
+        assert_eq!(
+            catalog.create_pool(ns, &first).await.unwrap(),
+            ControlOutcome::AlreadyExists
+        );
+        assert_eq!(
+            catalog.update_pool(ns, &second, &updated).await.unwrap(),
+            ControlOutcome::AlreadyExists
+        );
+        let tr = catalog.db.create_trx().unwrap();
+        assert!(tr.get(&probe, false).await.unwrap().is_none());
+        assert!(
+            tr.get(&pool_key(ns, third.id), false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            tr.get(&pool_name_key(ns, &third.name), false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            tr.get(&pool_name_key(ns, &renamed.name), false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            tr.get(&pool_key(ns, updated.id), false)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            encode_pool(&updated).as_slice()
+        );
+        assert_eq!(
+            tr.get(&pool_name_key(ns, &updated.name), false)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            updated.id.as_bytes()
+        );
+        assert_eq!(
+            tr.get(&manifest, false).await.unwrap().unwrap().as_ref(),
+            b"retained-stage-freeze"
+        );
+    }
 
     #[tokio::test]
     #[ignore = "需要隔离 FDB_TEST_CLUSTER；布局缺失/版本拒绝与孤立记录检查，不访问设备"]
@@ -2623,6 +2845,7 @@ pub(super) mod tests {
             catalog.resolve_path(namespace, b"/").await.unwrap(),
             Some(ResolvedPath::Directory {
                 id: Uuid::nil(),
+                version: 1,
                 attributes: None
             })
         );

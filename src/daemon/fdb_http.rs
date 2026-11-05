@@ -196,9 +196,9 @@ async fn stat(
         .resolve_active_metadata_for_route(&serial, &path, expected)
         .await
     {
-        Ok(Some(ResolvedPath::Directory { id, .. })) => reply(
+        Ok(Some(ResolvedPath::Directory { id, version, .. })) => reply(
             StatusCode::OK,
-            json!({"kind":"directory", "id":id.to_string(), "library_serial":serial}),
+            json!({"kind":"directory", "id":id.to_string(), "version":version, "library_serial":serial}),
         ),
         Ok(Some(ResolvedPath::File {
             id,

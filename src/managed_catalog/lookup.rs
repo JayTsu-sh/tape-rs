@@ -10,6 +10,7 @@ use crate::catalog::volume_extents::{CachedFile, ExpectedIndex, VolumeExtentCach
 pub enum ResolvedPath {
     Directory {
         id: Uuid,
+        version: u64,
         attributes: Option<NodeAttributes>,
     },
     File {
@@ -1013,6 +1014,9 @@ async fn resolve_path_at_mode(
         }
         return Ok(Some(ResolvedPath::Directory {
             id,
+            version: node
+                .directory_version
+                .ok_or(CatalogError::Corrupt("目录属性版本缺失"))?,
             attributes: node.attributes,
         }));
     }

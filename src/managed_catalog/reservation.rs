@@ -75,7 +75,7 @@ fn path_key(intent: &ActiveFileIntent) -> Vec<u8> {
     path_key_for(intent.namespace, intent.parent, &intent.name)
 }
 
-fn path_key_for(namespace: Uuid, parent: Uuid, name: &[u8]) -> Vec<u8> {
+pub(super) fn path_key_for(namespace: Uuid, parent: Uuid, name: &[u8]) -> Vec<u8> {
     let mut out = key(b'1');
     out.extend_from_slice(b"l/");
     out.extend_from_slice(namespace.as_bytes());
@@ -88,7 +88,7 @@ fn file_key(intent: &ActiveFileIntent) -> Vec<u8> {
     file_key_for(intent.namespace, intent.file_id)
 }
 
-fn file_key_for(namespace: Uuid, file: Uuid) -> Vec<u8> {
+pub(super) fn file_key_for(namespace: Uuid, file: Uuid) -> Vec<u8> {
     let mut out = key(b'1');
     out.extend_from_slice(b"n/");
     out.extend_from_slice(namespace.as_bytes());

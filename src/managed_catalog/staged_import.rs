@@ -813,9 +813,22 @@ impl ManagedCatalog {
             .iter()
             .map(|volume| (volume.barcode.as_str(), volume.spool))
             .collect::<std::collections::HashMap<_, _>>();
+        // Freeze pool declarations before capturing any page of the pool set.
+        // A failed scratch build retains this original audit for a safe retry.
+        self.begin_stage(namespace, audit).await?;
         let mut projection =
             super::import_materialize::ProjectionScratch::new(namespace, projection_scratch_dir)?;
-        self.begin_stage(namespace, audit).await?;
+        let mut pools_after = None;
+        loop {
+            let page = self.import_pools(namespace, pools_after.as_deref()).await?;
+            for pool in page.items {
+                projection.add_pool(&pool)?;
+            }
+            pools_after = page.next;
+            if pools_after.is_none() {
+                break;
+            }
+        }
         self.stage_source_bindings(namespace, audit, bindings)
             .await?;
         let mut merged = ImportReconciler::new(volumes.clone())?;
