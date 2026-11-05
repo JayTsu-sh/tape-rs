@@ -729,6 +729,8 @@ pub fn run_with_catalog(
                 _ => {}
             }
         }
+        // Confirm control application only after the snapshot and entries are applied.
+        node.advance_apply_to(applied);
         if let Some(c) = coordinator.as_mut() {
             c.confirm(reads, &node, &ctl, applied, directory_pending.is_none());
         }
@@ -889,26 +891,17 @@ pub(super) fn on_ready(
     let mut ready = node.ready();
     let reads = ready.take_read_states();
     send(ready.take_messages());
-    // 快照要在日志之前落盘：它会让本地整段日志作废，之后的条目才接得上
-    let mut installed = None;
-    if !ready.snapshot().is_empty() {
-        let snap = ready.snapshot().clone();
-        store.install_snapshot(&snap)?;
-        installed = Some(snap);
-    }
+    // 同一 Ready 的快照、后续日志和完整 HardState 必须原子持久化。
+    let installed = (!ready.snapshot().is_empty()).then(|| ready.snapshot().clone());
+    store.persist_ready(installed.as_ref(), ready.entries(), ready.hs())?;
     committed.extend(ready.take_committed_entries());
-    store.append(ready.entries())?;
-    if let Some(hs) = ready.hs() {
-        store.set_hardstate(hs)?;
-    }
     send(ready.take_persisted_messages());
-    let mut light = node.advance(ready);
+    let mut light = node.advance_append(ready);
     if let Some(commit) = light.commit_index() {
         store.set_commit(commit)?;
     }
     send(light.take_messages());
     committed.extend(light.take_committed_entries());
-    node.advance_apply();
     Ok((installed, committed, reads))
 }
 
@@ -1020,6 +1013,382 @@ pub(super) fn publish_status(
         let tmp = path.with_extension("tmp");
         if std::fs::write(&tmp, &text).is_ok() {
             let _ = std::fs::rename(&tmp, path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod ready_apply_tests {
+    use super::*;
+    use raft::eraftpb::{ConfState, HardState, MessageType};
+
+    struct Sink;
+    impl Network for Sink {
+        fn send(&self, _: Message) {}
+    }
+
+    fn entry(index: u64, term: u64) -> Entry {
+        Entry {
+            index,
+            term,
+            data: Command::PoolCreate {
+                uuid: format!("p{index}"),
+                name: format!("p{index}"),
+                file_limit: 100,
+            }
+            .encode()
+            .into(),
+            ..Default::default()
+        }
+    }
+
+    fn follower(root: &std::path::Path) -> (RaftStore, RawNode<ControlStorage>) {
+        std::fs::create_dir(root).unwrap();
+        let mut store = RaftStore::open(&root.join("raft.db"), &[1, 2, 3]).unwrap();
+        store.append(&[entry(1, 7), entry(2, 7)]).unwrap();
+        store
+            .set_hardstate(&HardState {
+                term: 7,
+                vote: 2,
+                commit: 2,
+                ..Default::default()
+            })
+            .unwrap();
+        let node = RawNode::new(
+            &Config {
+                id: 1,
+                ..Default::default()
+            },
+            store.raft_storage(),
+            &slog::Logger::root(slog::Discard, slog::o!()),
+        )
+        .unwrap();
+        (store, node)
+    }
+
+    #[test]
+    fn ready_apply_waits_for_single_library_control_and_directory() {
+        let root = std::env::temp_dir().join(format!("ready-apply-{}", uuid::Uuid::new_v4()));
+        let (mut store, mut node) = follower(&root);
+        let mut control = ControlState::default();
+        let mut directory = Directory::open(&root.join("directory.db")).unwrap();
+        let (_, entries, _) = on_ready(&mut node, &mut store, &Sink).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(node.raft.raft_log.applied, 0, "Ready 交付不等于实际应用");
+        for entry in entries {
+            let command = Command::decode(&entry.data).unwrap();
+            let outcome = control.apply(entry.index, &command);
+            directory.apply(entry.index, &command, &outcome).unwrap();
+            assert!(node.raft.raft_log.applied < entry.index);
+            node.advance_apply_to(entry.index);
+        }
+        assert_eq!(control.applied_index, 2);
+        assert_eq!(directory.applied_index(), 2);
+        assert_eq!(node.raft.raft_log.applied, 2);
+        let (snapshot, entries, reads) = on_ready(&mut node, &mut store, &Sink).unwrap();
+        assert!(snapshot.is_none() && entries.is_empty() && reads.is_empty());
+        assert_eq!(node.raft.raft_log.applied, 2, "空 Ready 不改变应用位置");
+        drop((directory, node, store));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ready_apply_waits_for_light_ready_entries_including_the_leader_noop() {
+        let root = std::env::temp_dir().join(format!("light-apply-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let mut store = RaftStore::open(&root.join("raft.db"), &[1]).unwrap();
+        let mut node = RawNode::new(
+            &Config {
+                id: 1,
+                ..Default::default()
+            },
+            store.raft_storage(),
+            &slog::Logger::root(slog::Discard, slog::o!()),
+        )
+        .unwrap();
+        node.campaign().unwrap();
+        node.propose(vec![], entry(2, 1).data.to_vec()).unwrap();
+        assert_eq!(
+            node.raft.raft_log.committed, 0,
+            "只有持久化后才产生本轮 LightReady 提交"
+        );
+        let (_, entries, _) = on_ready(&mut node, &mut store, &Sink).unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.index).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(entries[0].data.is_empty());
+        assert_eq!(
+            node.raft.raft_log.applied, 0,
+            "LightReady 也必须等待实际应用"
+        );
+        let mut control = ControlState::default();
+        for entry in entries {
+            if let Some(command) = Command::decode(&entry.data) {
+                control.apply(entry.index, &command);
+            }
+            node.advance_apply_to(entry.index);
+        }
+        assert_eq!(control.applied_index, 2);
+        assert_eq!(node.raft.raft_log.applied, 2);
+        node.propose(vec![], entry(3, 1).data.to_vec()).unwrap();
+        let (_, entries, _) = on_ready(&mut node, &mut store, &Sink).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(node.raft.raft_log.applied, 2);
+        control.apply(3, &Command::decode(&entries[0].data).unwrap());
+        node.advance_apply_to(3);
+        assert_eq!(node.raft.raft_log.applied, control.applied_index);
+        drop((node, store));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ready_apply_waits_for_received_control_snapshot() {
+        snapshot_case(false);
+    }
+
+    #[test]
+    fn ready_apply_waits_for_received_snapshot_and_following_entries() {
+        snapshot_case(true);
+    }
+
+    fn snapshot_case(with_entries: bool) {
+        let root = std::env::temp_dir().join(format!("snapshot-apply-{}", uuid::Uuid::new_v4()));
+        let (mut store, mut node) = follower(&root);
+        let mut base = ControlState::default();
+        base.apply(50, &Command::decode(&entry(50, 7).data).unwrap());
+        let mut snapshot = Snapshot::default();
+        snapshot.mut_metadata().index = 50;
+        snapshot.mut_metadata().term = 7;
+        snapshot
+            .mut_metadata()
+            .set_conf_state(ConfState::from((vec![1, 2, 3], vec![])));
+        snapshot.set_data(
+            ControlSnapshot {
+                control: base,
+                source: 2,
+                directory_index: 50,
+            }
+            .encode()
+            .into(),
+        );
+        node.step(Message {
+            msg_type: MessageType::MsgSnapshot,
+            from: 2,
+            to: 1,
+            term: 8,
+            snapshot: Some(snapshot).into(),
+            ..Default::default()
+        })
+        .unwrap();
+        if with_entries {
+            let mut message = Message {
+                msg_type: MessageType::MsgAppend,
+                from: 2,
+                to: 1,
+                term: 8,
+                index: 50,
+                log_term: 7,
+                commit: 52,
+                ..Default::default()
+            };
+            message.set_entries(vec![entry(51, 8), entry(52, 8)].into());
+            node.step(message).unwrap();
+        }
+        let (snapshot, entries, _) = on_ready(&mut node, &mut store, &Sink).unwrap();
+        assert_eq!(
+            node.raft.raft_log.applied, 0,
+            "持久化快照不能代替控制状态恢复"
+        );
+        let snapshot = snapshot.unwrap();
+        let restored = ControlSnapshot::decode(snapshot.get_data()).unwrap();
+        let mut control = restored.control;
+        let directory = Directory::open(&root.join("directory.db")).unwrap();
+        let directory_pending = directory.applied_index() < restored.directory_index;
+        node.advance_apply_to(snapshot.get_metadata().index);
+        assert_eq!(node.raft.raft_log.applied, control.applied_index);
+        assert_eq!(node.raft.raft_log.applied, 50);
+        assert!(
+            directory_pending,
+            "控制恢复后目录仍须独立拉取，不能称目录已应用"
+        );
+        for entry in entries {
+            control.apply(entry.index, &Command::decode(&entry.data).unwrap());
+            node.advance_apply_to(entry.index);
+        }
+        assert_eq!(
+            node.raft.raft_log.applied,
+            if with_entries { 52 } else { 50 }
+        );
+        assert_eq!(directory.applied_index(), 0);
+        drop((directory, node, store));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod ready_persistence_tests {
+    use super::*;
+    use protobuf::Message as _;
+    use raft::eraftpb::{ConfState, HardState, MessageType};
+    struct RecordingNetwork {
+        messages: Mutex<Vec<Message>>,
+        path: PathBuf,
+    }
+    impl Network for RecordingNetwork {
+        fn send(&self, message: Message) {
+            let db = rusqlite::Connection::open(&self.path).unwrap();
+            let bytes: Vec<u8> = db
+                .query_row("SELECT data FROM hardstate WHERE id=1", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let hs = HardState::parse_from_bytes(&bytes).unwrap();
+            let entries: u64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE idx IN(51,52)",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                (hs.term, hs.vote, hs.commit, entries),
+                (8, 0, 52, 2),
+                "成功回复前必须读到完整 Ready 的持久状态"
+            );
+            self.messages.lock().unwrap().push(message);
+        }
+    }
+    #[test]
+    fn a_ready_with_snapshot_and_entries_rolls_back_when_an_entry_write_fails() {
+        ready_case(Some("entry"));
+    }
+    #[test]
+    fn a_ready_with_snapshot_and_entries_rolls_back_when_hardstate_write_fails() {
+        ready_case(Some("hardstate"));
+    }
+    #[test]
+    fn a_complete_ready_is_durable_before_success_replies_and_survives_reopen() {
+        ready_case(None);
+    }
+    fn ready_case(failure: Option<&str>) {
+        let root = std::env::temp_dir().join(format!("ready-atomic-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("raft.db");
+        let mut store = RaftStore::open(&path, &[1, 2, 3]).unwrap();
+        let entry = |index, term| Entry {
+            index,
+            term,
+            ..Default::default()
+        };
+        store.append(&[entry(1, 1), entry(2, 1)]).unwrap();
+        store
+            .set_hardstate(&HardState {
+                term: 7,
+                vote: 2,
+                commit: 2,
+                ..Default::default()
+            })
+            .unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        if let Some(failure) = failure {
+            connection.execute_batch(if failure == "entry" {
+                "CREATE TRIGGER fail_entry BEFORE INSERT ON entries WHEN NEW.idx=52 BEGIN SELECT RAISE(ABORT,'injected entry failure'); END;"
+            } else {
+                "CREATE TRIGGER fail_hardstate BEFORE INSERT ON hardstate BEGIN SELECT RAISE(ABORT,'injected hardstate failure'); END;"
+            }).unwrap();
+        }
+        drop(connection);
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+        let mut node = RawNode::new(
+            &Config {
+                id: 1,
+                ..Default::default()
+            },
+            store.raft_storage(),
+            &logger,
+        )
+        .unwrap();
+        let mut snap = Snapshot::default();
+        snap.mut_metadata().set_index(50);
+        snap.mut_metadata().set_term(7);
+        snap.mut_metadata()
+            .set_conf_state(ConfState::from((vec![1, 2, 3], vec![])));
+        let mut message = Message::default();
+        message.set_msg_type(MessageType::MsgSnapshot);
+        message.from = 2;
+        message.to = 1;
+        message.term = 8;
+        message.set_snapshot(snap);
+        node.step(message).unwrap();
+        let mut message = Message::default();
+        message.set_msg_type(MessageType::MsgAppend);
+        message.from = 2;
+        message.to = 1;
+        message.term = 8;
+        message.index = 50;
+        message.log_term = 7;
+        message.commit = 52;
+        message.set_entries(vec![entry(51, 8), entry(52, 8)].into());
+        node.step(message).unwrap();
+        let network = RecordingNetwork {
+            messages: Mutex::new(Vec::new()),
+            path: path.clone(),
+        };
+        let outcome = on_ready(&mut node, &mut store, &network);
+        assert_eq!(outcome.is_err(), failure.is_some());
+        if failure.is_none() {
+            let (snapshot, committed, _) = outcome.unwrap();
+            assert_eq!(snapshot.unwrap().get_metadata().index, 50);
+            assert_eq!(
+                committed
+                    .iter()
+                    .map(|entry| entry.index)
+                    .collect::<Vec<_>>(),
+                vec![51, 52]
+            );
+        }
+        let in_memory = store
+            .raft_storage()
+            .initial_state()
+            .unwrap()
+            .hard_state
+            .commit;
+        let replies = network.messages.lock().unwrap().len();
+        drop(node);
+        drop(store);
+        let reopened = RaftStore::open(&path, &[1, 2, 3]).unwrap();
+        let hs = reopened.raft_storage().initial_state().unwrap().hard_state;
+        let restored = (
+            reopened.snapshot_index(),
+            reopened.raft_storage().last_index().unwrap(),
+            hs.term,
+            hs.vote,
+            hs.commit,
+        );
+        RawNode::new(
+            &Config {
+                id: 1,
+                ..Default::default()
+            },
+            reopened.raft_storage(),
+            &logger,
+        )
+        .unwrap();
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+        if failure.is_some() {
+            assert_eq!(replies, 0, "未落盘的 follower 不得回复复制成功");
+            assert_eq!(in_memory, 2, "Ready 失败不得改变持久缓存");
+            assert_eq!(
+                restored,
+                (0, 2, 7, 2, 2),
+                "snapshot、entries、term、vote、commit 必须整轮原子回滚"
+            );
+        } else {
+            assert!(replies > 0);
+            assert_eq!(in_memory, 52);
+            assert_eq!(restored, (50, 52, 8, 0, 52));
         }
     }
 }
