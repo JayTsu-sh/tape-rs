@@ -142,6 +142,11 @@ enum PoolCmd {
 
 #[derive(Subcommand)]
 enum LibraryCmd {
+    /// 从单一物理节点读取已冻结空目录屏障，不写FDB或磁带
+    NativeBarrier {
+        #[arg(long)]
+        challenge: uuid::Uuid,
+    },
     /// 列出集群内所有带库
     List,
     /// 查询一台带库；省略时使用 --library 所选库或默认库
@@ -428,6 +433,9 @@ fn main() {
                 &format!("/admin/pools/{name}"),
                 serde_json::json!({}),
             )?),
+            Cmd::Library {
+                cmd: LibraryCmd::NativeBarrier { challenge },
+            } => print_json(c.native_library_barrier(challenge)?),
             Cmd::Library {
                 cmd: LibraryCmd::List,
             } => print_json(c.libraries()?),

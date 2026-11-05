@@ -64,6 +64,8 @@ pub struct CutoverAudit {
     pub frozen_index: Option<u64>,
     pub has_staging: bool,
     pub has_unresolved_file_tasks: bool,
+    /// 原生初始化要求无池、磁带、文件（含墓碑）及任何文件任务历史。
+    pub has_catalog_rows: bool,
 }
 
 impl Directory {
@@ -157,18 +159,22 @@ impl Directory {
     }
 
     pub fn cutover_audit(&self) -> Result<CutoverAudit> {
-        let (applied, frozen, staging, tasks): (Option<i64>, Option<i64>, i64, i64) = self
-            .db
-            .query_row(
-                "SELECT (SELECT v FROM meta WHERE k='applied_index'),
+        let (applied, frozen, staging, tasks, rows): (Option<i64>, Option<i64>, i64, i64, i64) =
+            self.db
+                .query_row(
+                    "SELECT (SELECT v FROM meta WHERE k='applied_index'),
                         (SELECT v FROM meta WHERE k='catalog_frozen_index'),
                         EXISTS(SELECT 1 FROM staging LIMIT 1),
                         EXISTS(SELECT 1 FROM file_tasks
-                               WHERE status NOT IN ('committed','failed') LIMIT 1)",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .map_err(db_err)?;
+                               WHERE status NOT IN ('committed','failed') LIMIT 1),
+                        EXISTS(SELECT 1 FROM pools LIMIT 1) OR
+                        EXISTS(SELECT 1 FROM tapes LIMIT 1) OR
+                        EXISTS(SELECT 1 FROM files LIMIT 1) OR
+                        EXISTS(SELECT 1 FROM file_tasks LIMIT 1)",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .map_err(db_err)?;
         let applied_index = applied
             .and_then(|index| u64::try_from(index).ok())
             .ok_or_else(|| TapeError::Ltfs("目录库缺少有效的已应用日志索引".into()))?;
@@ -185,6 +191,7 @@ impl Directory {
             frozen_index,
             has_staging: staging != 0,
             has_unresolved_file_tasks: tasks != 0,
+            has_catalog_rows: rows != 0,
         })
     }
 
@@ -883,6 +890,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_empty_audit_keeps_tombstones_empty_pools_and_history() {
+        let root = std::env::temp_dir().join(format!("native-empty-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut d = Directory::open(&root.join("directory.db")).unwrap();
+        d.apply(1, &Command::CatalogQuiesce, &Applied::Nothing)
+            .unwrap();
+        for (table, sql) in [
+            ("pools", "INSERT INTO pools VALUES('P','p',0)"),
+            (
+                "tapes",
+                "INSERT INTO tapes(barcode,pool_uuid) VALUES('T','P')",
+            ),
+            (
+                "files",
+                "INSERT INTO files(pool_uuid,path,barcode,generation,length,sha256,deleted) VALUES('P','/x','T',1,0,'',1)",
+            ),
+            (
+                "file_tasks",
+                "INSERT INTO file_tasks(pool_uuid,task,round,path,status) VALUES('P',1,1,'/x','committed')",
+            ),
+        ] {
+            assert!(!d.cutover_audit().unwrap().has_catalog_rows);
+            if table == "tapes" {
+                d.db.execute("INSERT INTO pools VALUES('P','p',0)", [])
+                    .unwrap();
+            }
+            d.db.execute(sql, []).unwrap();
+            let audit = d.cutover_audit().unwrap();
+            assert!(audit.has_catalog_rows, "{table}");
+            assert!(!audit.has_unresolved_file_tasks);
+            d.db.execute(&format!("DELETE FROM {table}"), []).unwrap();
+            d.db.execute("DELETE FROM pools", []).unwrap();
+        }
+        drop(d);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn cutover_audit_reads_one_local_snapshot_and_rejects_invalid_index() {
         let root = std::env::temp_dir().join(format!("cutover-audit-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
@@ -901,6 +946,7 @@ mod tests {
                 frozen_index: None,
                 has_staging: false,
                 has_unresolved_file_tasks: false,
+                has_catalog_rows: false,
             }
         );
         directory.db.execute(
