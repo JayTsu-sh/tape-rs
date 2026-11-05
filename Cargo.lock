@@ -1611,6 +1611,7 @@ dependencies = [
  "quick-xml",
  "raft",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2",
  "slog",
