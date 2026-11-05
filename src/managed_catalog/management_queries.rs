@@ -46,13 +46,20 @@ async fn tape(
     barcode: &str,
     location: Option<&Value>,
 ) -> Result<Option<Value>> {
-    let assignment = ManagedCatalog::verified_assignment(tr, serial, barcode).await?;
-    if assignment
-        .as_ref()
-        .is_some_and(|a| a.namespace != route.route.namespace)
-    {
-        return Err(CatalogError::Corrupt("磁带归属不在当前带库命名空间"));
+    // Inputs were validated by this reader. A stored cross-namespace record or
+    // an Invalid result from its referenced pool is corruption, not bad input.
+    if let Some(raw) = tr.get(&assignment_key(serial, barcode), false).await? {
+        let record = decode_assignment(serial, barcode, &raw)?;
+        if record.namespace != route.route.namespace {
+            return Err(CatalogError::Corrupt("磁带归属不在当前带库命名空间"));
+        }
     }
+    let assignment = ManagedCatalog::verified_assignment(tr, serial, barcode)
+        .await
+        .map_err(|error| match error {
+            CatalogError::Invalid(detail) => CatalogError::Corrupt(detail),
+            other => other,
+        })?;
     if assignment.is_none() && location.is_none() {
         return Ok(None);
     }

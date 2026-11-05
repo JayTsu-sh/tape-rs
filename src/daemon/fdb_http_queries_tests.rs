@@ -462,6 +462,60 @@ async fn run_queries(cluster: &str) {
             .is_null()
     );
     status.lock().unwrap().catalog_pending = false;
+    let mut pool_key = b"tape-rs/catalog/22/T/".to_vec();
+    pool_key.extend_from_slice(ns.as_bytes());
+    pool_key.extend_from_slice(first_pool.id.as_bytes());
+    let tr = db.create_trx().unwrap();
+    let saved_pool = tr.get(&pool_key, false).await.unwrap().unwrap().to_vec();
+    tr.clear(&pool_key);
+    tr.commit().await.unwrap();
+    for path in [format!("{prefix}/tapes"), format!("{prefix}/tapes/AOFFL8")] {
+        let (code, error) = request(&address, &path, Some(&ns.to_string())).await;
+        assert_eq!(
+            code, 500,
+            "stored assignment references a missing pool: {error}"
+        );
+        assert_eq!(error["retryable"], false);
+    }
+    let tr = db.create_trx().unwrap();
+    assert!(tr.get(&pool_key, false).await.unwrap().is_none());
+    tr.set(&pool_key, &saved_pool);
+    tr.commit().await.unwrap();
+    let mut assignment_key = b"tape-rs/catalog/22/d/".to_vec();
+    assignment_key.extend_from_slice(serial.as_bytes());
+    assignment_key.extend_from_slice(b"\0\0AOFFL8\0\0");
+    let tr = db.create_trx().unwrap();
+    let saved_assignment = tr
+        .get(&assignment_key, false)
+        .await
+        .unwrap()
+        .unwrap()
+        .to_vec();
+    let mut wrong_assignment = saved_assignment.clone();
+    wrong_assignment[2..18].copy_from_slice(Uuid::new_v4().as_bytes());
+    tr.set(&assignment_key, &wrong_assignment);
+    tr.commit().await.unwrap();
+    assert_eq!(
+        request(
+            &address,
+            &format!("{prefix}/tapes/AOFFL8"),
+            Some(&ns.to_string())
+        )
+        .await
+        .0,
+        500
+    );
+    let tr = db.create_trx().unwrap();
+    assert_eq!(
+        tr.get(&assignment_key, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        wrong_assignment
+    );
+    tr.set(&assignment_key, &saved_assignment);
+    tr.commit().await.unwrap();
     catalog
         .claim_active_owner_epoch(&serial, epoch + 1)
         .await

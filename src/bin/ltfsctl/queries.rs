@@ -176,6 +176,10 @@ pub fn tapes(
     if json_output {
         return print(value);
     }
+    println!("{}", tape_table(&value));
+    Ok(())
+}
+fn tape_table(value: &Value) -> String {
     let rows = value["items"]
         .as_array()
         .unwrap()
@@ -193,24 +197,26 @@ pub fn tapes(
             ]
         })
         .collect();
-    println!(
-        "{}",
-        table(
-            &[
-                "BARCODE",
-                "PRESENCE",
-                "ADDRESS",
-                "ONLINE",
-                "BLACKLISTED",
-                "POOL_UUID",
-                "OBSERVED_AT",
-                "POOL_NAME"
-            ],
-            rows
-        )
+    let body = table(
+        &[
+            "BARCODE",
+            "PRESENCE",
+            "ADDRESS",
+            "ONLINE",
+            "BLACKLISTED",
+            "POOL_UUID",
+            "OBSERVED_AT",
+            "POOL_NAME",
+        ],
+        rows,
     );
-    Ok(())
+    if value["inventory_available"] != true {
+        format!("库存尚无观测；下表仅显示已有 FDB 归属。\n{body}")
+    } else {
+        body
+    }
 }
+
 pub fn tape(
     client: &FdbClient,
     library: Option<&str>,
@@ -241,5 +247,15 @@ mod tests {
         assert_eq!(lines[0].find("NAME"), lines[1].find("归档"));
         assert_eq!(lines[1].find("归档"), lines[2].find("归档"));
         assert!(out.contains("归档\\n二"));
+    }
+    #[test]
+    fn missing_inventory_is_explicit_in_default_tape_output() {
+        let absent = json!({"inventory_available":false,"items":[]});
+        assert!(tape_table(&absent).contains("库存尚无观测"));
+        let empty = json!({"inventory_available":true,"items":[]});
+        assert!(!tape_table(&empty).contains("库存尚无观测"));
+        let assigned = json!({"inventory_available":false,"items":[{"barcode":"AA0001L8","presence":"unknown"}]});
+        let text = tape_table(&assigned);
+        assert!(text.contains("库存尚无观测") && text.contains("AA0001L8"));
     }
 }
