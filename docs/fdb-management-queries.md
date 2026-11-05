@@ -45,3 +45,15 @@ Tape 清单合并已观测的物理条码与 FDB 分配记录，包含未分配�
 `assignment` 保留池、volume、online、blacklisted 及修订号，`location` 与 `observation` 保留物理观测及来源。online 是管理策略，不等于介质健康或当前可读；没有单盘采集事实时 health/capacity 为 null，不推断健康、零容量或可写。metadata volume 绑定也不单独证明文件索引已导入或 S3 内容可读。
 
 查询验证活动路由、缓存/通知证明、所读取的归属索引、池和卷反向绑定。损坏返回 500 且不可重试，临时 FDB 不可用返回 503；不自动补字段、修复记录或从本地状态伪造成功。查询并发沿用有界管理预算。实际设备操作与异步任务仍须单独验收。
+
+## 真实 B 库验收（2026-11-06）
+
+源码 `954098a36306ff8cab46ac1f28ae0b425f35f3b0` 已部署到 207–209 的原隔离服务，沿用 45152 FDB 集群与 namespace。非 owner 的 207 实际完成四类 CLI 查询；三节点 HTTP 也分别完成 list/show、limit=3 的条码有序分页、namespace 缺失/错误/重复拒绝、跨池游标拒绝及未知条码/库查询。CLI 的默认表格列对齐和 JSON 均通过。
+
+实际库存为 8 盒磁带（含清洗带）、2 个驱动器，nodes 为 1/2/3，active_node 与当时 FDB/control owner 一致。8 盘均未分配，逐盘 show 的 health/capacity 保持 null，online/blacklisted 未推定为默认值；lto8 池过滤返回空清单。非 owner 查询前后均未持有原始设备句柄，原 pool revision 6、通知 ACK 57 和三节点 PID 保持不变。已分配/离线但未观测到的盘及损坏引用，由明确合成记录的隔离 FDB 测试覆盖，未冒称已在本次 0-assignment 实物环境复现。
+
+实际停止新 FDB 的两个原 server，使读取出现 1031 超时。四个 HTTP 查询分别返回可重试依赖错误，CLI library list 重试预算耗尽后非零退出且没有成功正文，没有返回伪造空库。故障窗口内三设备 PR generation、注册键及 holder 保持不变。恢复原 unit/data/cluster 后，四种 HTTP 查询及完整新采样恢复；原池、事件 56/57 字节和消费者 ACK 57 均保留。新旧 FDB 分别通过故障期间或恢复后的离散健康核对，不代表连续监测。
+
+最终严格 SDK 及独立 FDB/control/三设备 PR 审计一致：owner node 3 / epoch 179631，key `0x4c0300000002bdaf`，三节点就绪。A 库和备用 changer 域继续隔离；本次未分配、装卸、MOVE、格式化或读写介质文件。S3/FUSE 写入、rescan/import actor 和单盘健康采集仍待后续完成。
+
+证据在 `/work/tmp/tape-native-library-tape-queries-physical-20261106/` 的 `BASIC-COMPLETE.json`、`SDK-basic.json`、`QUORUM-COMPLETE.json`、`SDK-recovery.json`、`OWNER-AUDIT-final.json` 及各 CLI/HTTP 原始记录。软件和实物故障结果分别保留；生产者的周期采样可以更新观测时间，不将正常时间变化误判为查询修改事实。
