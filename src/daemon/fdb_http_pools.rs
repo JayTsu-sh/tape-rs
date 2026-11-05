@@ -815,19 +815,6 @@ fn poll_delay(failures: u32) -> std::time::Duration {
     let base = (250u64 << failures.min(7)).min(30_000);
     std::time::Duration::from_millis(base + u64::from(Uuid::new_v4().as_bytes()[0]))
 }
-#[cfg(test)]
-mod backoff_tests {
-    use super::*;
-    #[test]
-    fn dependency_failures_back_off_with_a_bounded_budget() {
-        assert_eq!(poll_delay(0), std::time::Duration::from_millis(250));
-        for failures in [1, 2, 7, u32::MAX] {
-            let ms = poll_delay(failures).as_millis();
-            let base = (250u128 << failures.min(7)).min(30_000);
-            assert!((base..=base + 255).contains(&ms));
-        }
-    }
-}
 /// The worker holds only Weak<Context> between polls. It never runs device work
 /// or blocks the Raft thread; each library has an independently paced future.
 pub(super) fn start_worker(ctx: &Arc<Context>) -> std::io::Result<()> {
@@ -875,4 +862,18 @@ pub(super) fn start_worker(ctx: &Arc<Context>) -> std::io::Result<()> {
             })
         })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+    #[test]
+    fn dependency_failures_back_off_with_a_bounded_budget() {
+        assert_eq!(poll_delay(0), std::time::Duration::from_millis(250));
+        for failures in [1, 2, 7, u32::MAX] {
+            let ms = poll_delay(failures).as_millis();
+            let base = (250u128 << failures.min(7)).min(30_000);
+            assert!((base..=base + 255).contains(&ms));
+        }
+    }
 }
