@@ -45,6 +45,6 @@ HTTP 路由以 `/libraries/SERIAL/admin` 为前缀：
 
 删除 change 为 `{"kind":"pool-delete","id":"POOL_UUID","revision":2}`。原请求字段、UUID 和 epoch 不得在重试时改变。未知或重复字段、其他尚未接入执行器的任务类型会在入队前拒绝。完整格式参见 [持久任务账本](fdb-management-intents.md)。
 
-元数据只读模式允许查询；修改要求目标库 owner Ready、已 fenced、冻结点匹配且 Serving 多数派许可有效，FDB 事务还校验当前 owner epoch。非 owner 入口最多转发一次。后台元数据执行不占 SCSI/Raft 线程，逐库隔离，限制队列和并发。FDB 故障、失权或回执未知时停止本次等待，保留原 UUID/任务，不回退 SQLite；按原请求查询或重试。已经提交的事务不能因 HTTP 超时而推断未执行。
+元数据只读模式允许查询；修改要求目标库 owner Ready、已 fenced、冻结点匹配且 Serving 多数派许可有效，FDB 事务还校验当前 owner epoch。非 owner 入口最多转发一次。后台元数据执行不占 SCSI/Raft 线程，逐库隔离，限制队列和并发；依赖失败按库指数退避并加入抖动，最长约30秒，恢复后回到正常轮询。永久损坏返回500及原诊断，不伪装成临时503。FDB 故障、失权或回执未知时停止本次等待，保留原 UUID/任务，不回退 SQLite；按原请求查询或重试。已经提交的事务不能因 HTTP 超时而推断未执行。
 
 本文件描述当前原生接口；历史物理验收报告中的旧数字任务 ID、旧池命令参数和端口不适用于该接口。设备管理命令与 S3/FUSE 写入仍需各自的原生接线和实际带库验收，不能由本片池元数据验证代替。

@@ -103,7 +103,11 @@ fn defaults() -> Value {
 }
 fn parsed(response: Response, statuses: &[u16]) -> Result<Value> {
     if !statuses.contains(&response.status) {
-        return Err(rejected(response));
+        return Err(if (200..300).contains(&response.status) {
+            ClientError::Verification(format!("管理响应成功状态{}与协议不符", response.status))
+        } else {
+            rejected(response)
+        });
     }
     serde_json::from_slice(&response.body)
         .ok()
@@ -429,7 +433,17 @@ impl FdbClient {
         );
         let response = response.map_err(|e| unknown(checkpoint, e))?;
         if !statuses.contains(&response.status) {
-            return Err(rejected(response));
+            return Err(if (200..300).contains(&response.status) {
+                unknown(
+                    checkpoint,
+                    ClientError::Verification(format!(
+                        "管理响应成功状态{}与协议不符",
+                        response.status
+                    )),
+                )
+            } else {
+                rejected(response)
+            });
         }
         let result = (|| {
             let value = parsed(response, &statuses)?;
@@ -636,13 +650,15 @@ mod tests {
         let path = dir.join("request");
         p.save_new(&path).unwrap();
         let original = std::fs::read(&path).unwrap();
-        for body in [
-            "null".to_owned(),
-            "bad JSON".to_owned(),
-            json!({"namespace":Uuid::new_v4().to_string(),"library_serial":p.library,"pool":{}})
-                .to_string(),
+        for (status,body) in [
+            (204, String::new()),
+            (202, "{}".to_owned()),
+            (201, "null".to_owned()),
+            (201, "bad JSON".to_owned()),
+            (201, json!({"namespace":Uuid::new_v4().to_string(),"library_serial":p.library,"pool":{}})
+                .to_string()),
         ] {
-            let (address, worker) = server(response(201, &body), Duration::ZERO);
+            let (address, worker) = server(response(status, &body), Duration::ZERO);
             let error = FdbClient::new([address])
                 .unwrap()
                 .submit_pool(&path)

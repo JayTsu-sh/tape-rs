@@ -802,10 +802,31 @@ pub(super) async fn poll(
                 identity.0,
                 identity.1
             );
+            return Err(CatalogError::Incomplete);
         }
         return Ok(());
     }
     Ok(())
+}
+fn poll_delay(failures: u32) -> std::time::Duration {
+    if failures == 0 {
+        return std::time::Duration::from_millis(250);
+    }
+    let base = (250u64 << failures.min(7)).min(30_000);
+    std::time::Duration::from_millis(base + u64::from(Uuid::new_v4().as_bytes()[0]))
+}
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+    #[test]
+    fn dependency_failures_back_off_with_a_bounded_budget() {
+        assert_eq!(poll_delay(0), std::time::Duration::from_millis(250));
+        for failures in [1, 2, 7, u32::MAX] {
+            let ms = poll_delay(failures).as_millis();
+            let base = (250u128 << failures.min(7)).min(30_000);
+            assert!((base..=base + 255).contains(&ms));
+        }
+    }
 }
 /// The worker holds only Weak<Context> between polls. It never runs device work
 /// or blocks the Raft thread; each library has an independently paced future.
@@ -824,20 +845,25 @@ pub(super) fn start_worker(ctx: &Arc<Context>) -> std::io::Result<()> {
                     let weak = weak.clone();
                     jobs.spawn(async move {
                         let mut after = None;
+                        let mut failures = 0u32;
                         loop {
                             let Some(context) = weak.upgrade() else {
                                 return;
                             };
-                            if let Err(error) = poll(&context, &serial, &mut after).await {
-                                log::warn!(
-                                    "带库{}池管理依赖不可用，保留原任务（游标{:?}）：{}",
-                                    serial,
-                                    after,
-                                    error
-                                );
+                            match poll(&context, &serial, &mut after).await {
+                                Ok(()) => failures = 0,
+                                Err(error) => {
+                                    failures = failures.saturating_add(1);
+                                    log::warn!(
+                                        "带库{}池管理依赖不可用，保留原任务（游标{:?}）：{}",
+                                        serial,
+                                        after,
+                                        error
+                                    );
+                                }
                             }
                             drop(context);
-                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                            tokio::time::sleep(poll_delay(failures)).await;
                         }
                     });
                 }

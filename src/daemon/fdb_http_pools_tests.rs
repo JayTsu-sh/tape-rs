@@ -380,7 +380,7 @@ async fn run_pool_api(cluster: &str) {
     assert_eq!(broken.1["retryable"], false);
     assert!(broken.1["detail"].as_str().unwrap().contains("索引"));
     let mut cursor = None;
-    pools::poll(&owner, &serial, &mut cursor).await.unwrap();
+    assert!(pools::poll(&owner, &serial, &mut cursor).await.is_err());
     assert_eq!(
         request(&a, "GET", &taskpath, Some(&namespace), b"").await.1["status"],
         "queued"
