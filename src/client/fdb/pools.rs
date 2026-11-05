@@ -118,6 +118,13 @@ fn scope(value: &Value, library: &str, namespace: &str) -> Result<()> {
     }
     Ok(())
 }
+fn unknown(checkpoint: &Path, error: ClientError) -> ClientError {
+    ClientError::Indeterminate(format!(
+        "{}；保留请求文件{}，按原身份恢复",
+        error,
+        checkpoint.display()
+    ))
+}
 impl PoolRequest {
     fn digest(&self) -> String {
         format!("{:x}", sha2::Sha256::digest(serde_json::to_vec(&json!({"version":self.version,"library":self.library,"namespace":self.namespace,"input":self.input,"request":self.request})).expect("JSON serializes")))
@@ -420,14 +427,7 @@ impl FdbClient {
             Some(&bytes),
             &[(NS, &p.namespace), ("content-type", "application/json")],
         );
-        let unknown = |error: ClientError| {
-            ClientError::Indeterminate(format!(
-                "{}；保留请求文件{}，按原身份恢复",
-                error,
-                checkpoint.display()
-            ))
-        };
-        let response = response.map_err(unknown)?;
+        let response = response.map_err(|e| unknown(checkpoint, e))?;
         if !statuses.contains(&response.status) {
             return Err(rejected(response));
         }
@@ -444,7 +444,7 @@ impl FdbClient {
             }
             Ok(value)
         })();
-        result.map_err(unknown)
+        result.map_err(|e| unknown(checkpoint, e))
     }
 
     pub fn pool_request_status(&self, checkpoint: &Path, cancel: bool) -> Result<Value> {
@@ -468,17 +468,27 @@ impl FdbClient {
                 .expect("validated operation"),
             if cancel { "/cancel" } else { "" }
         );
-        let value = parsed(
-            self.retry_request(
-                if cancel { "POST" } else { "GET" },
-                &route,
-                None,
-                &[(NS, &p.namespace)],
-            )?,
-            &[200],
-        )?;
-        check_task(&value, &p)?;
-        Ok(value)
+        let result = (|| {
+            let value = parsed(
+                self.retry_request(
+                    if cancel { "POST" } else { "GET" },
+                    &route,
+                    None,
+                    &[(NS, &p.namespace)],
+                )?,
+                &[200],
+            )?;
+            check_task(&value, &p)?;
+            Ok(value)
+        })();
+        if cancel {
+            result.map_err(|error| match error {
+                ClientError::Rejected { .. } => error,
+                _ => unknown(checkpoint, error),
+            })
+        } else {
+            result
+        }
     }
 }
 fn check_pool(p: &Value, library: &str) -> Result<()> {
@@ -642,6 +652,43 @@ mod tests {
             assert!(raw.ends_with(&p.request.to_string()));
             assert_eq!(std::fs::read(&path).unwrap(), original);
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn cancellation_with_a_lost_or_invalid_receipt_preserves_original_task_identity() {
+        use super::super::tests::{response, server};
+        let mut p = prepared();
+        p.input = PoolIntent::Set {
+            selector: "归档".into(),
+            attribute: "file_limit".into(),
+            value: "101".into(),
+        };
+        p.request = json!({"version":1,"library":p.library,"namespace":p.namespace,"epoch":1,"operation":Uuid::new_v4().to_string(),"change":{"kind":"pool","id":Uuid::new_v4().to_string(),"revision":1,"patch":{"file_limit":101}}});
+        p.fingerprint = p.digest();
+        let dir = dir();
+        let path = dir.join("request");
+        p.save_new(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let (address, worker) = server(response(200, "null"), Duration::ZERO);
+        let result = FdbClient::new([address])
+            .unwrap()
+            .pool_request_status(&path, true);
+        assert!(matches!(result, Err(ClientError::Indeterminate(_))));
+        let raw = String::from_utf8(worker.join().unwrap()).unwrap();
+        assert!(raw.starts_with(&format!(
+            "POST /libraries/LIB%20%E4%B8%AD%E6%96%87/admin/tasks/1/{}/cancel",
+            p.request["operation"].as_str().unwrap()
+        )));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let result = FdbClient::new([address])
+            .unwrap()
+            .with_timeouts(Duration::from_millis(30), Duration::from_millis(20))
+            .pool_request_status(&path, true);
+        assert!(matches!(result, Err(ClientError::Indeterminate(_))));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
