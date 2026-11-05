@@ -30,6 +30,9 @@ mod notify;
 #[path = "fdb_http_pools.rs"]
 mod pools;
 
+#[path = "fdb_http_queries.rs"]
+mod queries;
+
 #[derive(Clone)]
 struct Context {
     catalog: Arc<ManagedCatalog>,
@@ -296,6 +299,13 @@ async fn children(
 
 fn metadata_router(ctx: Arc<Context>) -> Router {
     Router::new()
+        .route("/admin/libraries", get(queries::libraries))
+        .route("/libraries/{serial}/admin/library", get(queries::library))
+        .route("/libraries/{serial}/admin/tapes", get(queries::tapes))
+        .route(
+            "/libraries/{serial}/admin/tapes/{barcode}",
+            get(queries::tape),
+        )
         .route("/libraries/{serial}/admin/context", get(pools::context))
         .route(
             "/libraries/{serial}/admin/pools",
@@ -719,3 +729,7 @@ mod notify_tests;
 #[cfg(test)]
 #[path = "fdb_http_pools_tests.rs"]
 mod pools_tests;
+
+#[cfg(test)]
+#[path = "fdb_http_queries_tests.rs"]
+mod queries_tests;

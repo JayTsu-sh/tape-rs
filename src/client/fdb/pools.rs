@@ -34,7 +34,7 @@ pub struct PoolRequest {
     request: Value,
     fingerprint: String,
 }
-fn uuid(text: &str) -> Result<Uuid> {
+pub(super) fn uuid(text: &str) -> Result<Uuid> {
     Uuid::parse_str(text)
         .ok()
         .filter(|id| !id.is_nil() && id.to_string() == text)
@@ -43,7 +43,7 @@ fn uuid(text: &str) -> Result<Uuid> {
 fn name(text: &str) -> bool {
     !text.is_empty() && text.len() <= 255 && !text.contains(['/', '\0'])
 }
-fn base(library: &str) -> Result<String> {
+pub(super) fn base(library: &str) -> Result<String> {
     Client::new(Vec::<String>::new()).with_library(library)?;
     Ok(format!("/libraries/{}/admin", encode_query(library)))
 }
@@ -101,7 +101,7 @@ fn patch(attribute: &str, value: &str) -> Result<Value> {
 fn defaults() -> Value {
     json!({"media_restriction":"none","mount_limit":0,"low_space_warning_enabled":true,"low_space_warning_threshold":0,"no_space_warning_enabled":true})
 }
-fn parsed(response: Response, statuses: &[u16]) -> Result<Value> {
+pub(super) fn parsed(response: Response, statuses: &[u16]) -> Result<Value> {
     if !statuses.contains(&response.status) {
         return Err(if (200..300).contains(&response.status) {
             ClientError::Verification(format!("管理响应成功状态{}与协议不符", response.status))
@@ -114,7 +114,7 @@ fn parsed(response: Response, statuses: &[u16]) -> Result<Value> {
         .filter(Value::is_object)
         .ok_or_else(|| ClientError::Verification("池管理响应不是JSON对象".into()))
 }
-fn scope(value: &Value, library: &str, namespace: &str) -> Result<()> {
+pub(super) fn scope(value: &Value, library: &str, namespace: &str) -> Result<()> {
     if value["library_serial"] != library || value["namespace"] != namespace {
         return Err(ClientError::Verification(
             "管理响应的带库或命名空间不符".into(),
@@ -505,7 +505,7 @@ impl FdbClient {
         }
     }
 }
-fn check_pool(p: &Value, library: &str) -> Result<()> {
+pub(super) fn check_pool(p: &Value, library: &str) -> Result<()> {
     uuid(p["id"].as_str().ok_or_else(|| invalid("池回执缺少UUID"))?)?;
     if p["library_serial"] != library
         || !p["name"].as_str().is_some_and(name)

@@ -6,6 +6,7 @@ use hyper_util::rt::TokioIo;
 use uuid::Uuid;
 mod notifications;
 pub mod pools;
+mod queries;
 
 fn invalid(reason: &str) -> ClientError {
     ClientError::Io(std::io::Error::new(

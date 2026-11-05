@@ -12,6 +12,9 @@ pub use management_request::ManagementRequest;
 #[path = "library_observations.rs"]
 mod library_observations;
 
+#[path = "management_queries.rs"]
+mod management_queries;
+
 #[path = "notifications.rs"]
 mod notifications;
 pub use notifications::{NotifyConnectionAction, NotifyFilter};

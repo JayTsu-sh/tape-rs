@@ -7,6 +7,8 @@ use tape_rs::client::Client;
 mod notify;
 #[path = "ltfsctl/pool.rs"]
 mod pool;
+#[path = "ltfsctl/queries.rs"]
+mod queries;
 
 #[derive(Parser)]
 #[command(name = "ltfsctl", about = "ltfsd 客户端")]
@@ -123,9 +125,12 @@ enum LibraryCmd {
         #[arg(long)]
         challenge: uuid::Uuid,
     },
-    /// 列出集群内所有带库
-    List,
-    /// 查询一台带库；省略时使用 --library 所选库或默认库
+    /// 列出原生FDB带库；--library可筛选单库
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 查询带库，须给出序列号或--library
     Show { serial: Option<String> },
     /// 显式刷新当前库的设备库存
     Rescan,
@@ -155,8 +160,11 @@ enum AdminMethod {
 
 #[derive(Subcommand)]
 enum TapeCmd {
-    /// 列出磁带状态和容量
-    List,
+    /// 列出物理观测及FDB归属；未知健康/容量不推测
+    List {
+        #[arg(long)]
+        json: bool,
+    },
     /// 查询磁带详情
     Show { barcode: String },
     /// 把磁带（条码）归入池（名称或 UUID）
@@ -331,16 +339,21 @@ fn main() {
                 cmd: LibraryCmd::NativeBarrier { challenge },
             } => print_json(c.native_library_barrier(challenge)?),
             Cmd::Library {
-                cmd: LibraryCmd::List,
-            } => print_json(c.libraries()?),
+                cmd: LibraryCmd::List { json },
+            } => queries::libraries(
+                &tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?,
+                args.library.as_deref(),
+                args.pool.as_deref(),
+                json,
+            )?,
             Cmd::Library {
                 cmd: LibraryCmd::Show { serial },
-            } => {
-                if let Some(serial) = serial {
-                    c = c.with_library(serial)?;
-                }
-                print_json(c.admin_get("/admin/libraries/current")?);
-            }
+            } => queries::library(
+                &tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?,
+                args.library.as_deref(),
+                serial.as_deref(),
+                args.pool.as_deref(),
+            )?,
             Cmd::Library {
                 cmd: LibraryCmd::Rescan,
             } => print_json(c.admin_request(
@@ -395,10 +408,22 @@ fn main() {
                     .unwrap_or_else(|| serde_json::json!({}));
                 print_json(c.admin_request(method, &route, body)?);
             }
-            Cmd::Tape { cmd: TapeCmd::List } => print_json(c.admin_get("/admin/tapes")?),
+            Cmd::Tape {
+                cmd: TapeCmd::List { json },
+            } => queries::tapes(
+                &tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?,
+                args.library.as_deref(),
+                args.pool.as_deref(),
+                json,
+            )?,
             Cmd::Tape {
                 cmd: TapeCmd::Show { barcode },
-            } => print_json(c.admin_get(&format!("/admin/tapes/{barcode}"))?),
+            } => queries::tape(
+                &tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?,
+                args.library.as_deref(),
+                args.pool.as_deref(),
+                &barcode,
+            )?,
             Cmd::Tape {
                 cmd: TapeCmd::Assign { barcode, pool },
             } => println!("{}", c.tape_assign(&barcode, &pool)?),
