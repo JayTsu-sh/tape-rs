@@ -48,7 +48,7 @@ Tape 清单合并已观测的物理条码与 FDB 分配记录，包含未分配�
 
 ## 真实 B 库验收（2026-11-06）
 
-源码 `954098a36306ff8cab46ac1f28ae0b425f35f3b0` 已部署到 207–209 的原隔离服务，沿用 45152 FDB 集群与 namespace。非 owner 的 207 实际完成四类 CLI 查询；三节点 HTTP 也分别完成 list/show、limit=3 的条码有序分页、namespace 缺失/错误/重复拒绝、跨池游标拒绝及未知条码/库查询。CLI 的默认表格列对齐和 JSON 均通过。
+源码 `954098a36306ff8cab46ac1f28ae0b425f35f3b0` 已部署到 207–209 的原隔离服务，沿用 45152 FDB 集群与 namespace。非 owner 的 207 实际完成四类 CLI 查询；三节点 HTTP 分别完成 list/show 和 limit=3 的条码有序分页。namespace 缺失/错误/重复、跨池游标及未知条码/库的拒绝边界在 207 入口验证。CLI 的默认表格列对齐和 JSON 均通过。
 
 实际库存为 8 盒磁带（含清洗带）、2 个驱动器，nodes 为 1/2/3，active_node 与当时 FDB/control owner 一致。8 盘均未分配，逐盘 show 的 health/capacity 保持 null，online/blacklisted 未推定为默认值；lto8 池过滤返回空清单。非 owner 查询前后均未持有原始设备句柄，原 pool revision 6、通知 ACK 57 和三节点 PID 保持不变。已分配/离线但未观测到的盘及损坏引用，由明确合成记录的隔离 FDB 测试覆盖，未冒称已在本次 0-assignment 实物环境复现。
 
