@@ -297,6 +297,18 @@ async fn monitor_at(tr: &Transaction, ns: Uuid, serial: &str) -> Result<Option<M
     .await?;
     Ok(record)
 }
+pub(super) async fn observations_at(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+) -> Result<(Option<Value>, Option<Value>)> {
+    let inventory = inventory_at(tr, ns, serial)
+        .await?
+        .map(|r| json_value(&r.observation));
+    let monitor = monitor_at(tr, ns, serial).await?.map(|r| json_value(&r));
+    Ok((inventory, monitor))
+}
+
 impl ManagedCatalog {
     /// Persist one complete observation from a current, externally guarded owner.
     /// Identical physical inventory updates its timestamp without another event.

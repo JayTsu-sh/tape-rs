@@ -15,7 +15,7 @@ fn bad(reason: &str) -> Box<Response> {
 fn busy(reason: &str) -> Box<Response> {
     Box::new(unavailable(reason))
 }
-fn route(ctx: &Context, serial: &str) -> Result<ActiveLibraryRoute, Box<Response>> {
+pub(super) fn route(ctx: &Context, serial: &str) -> Result<ActiveLibraryRoute, Box<Response>> {
     ctx.routes.get(serial).copied().ok_or_else(|| {
         boxed_reply(
             StatusCode::NOT_FOUND,
@@ -23,7 +23,10 @@ fn route(ctx: &Context, serial: &str) -> Result<ActiveLibraryRoute, Box<Response
         )
     })
 }
-fn namespace(headers: &HeaderMap, route: ActiveLibraryRoute) -> Result<(), Box<Response>> {
+pub(super) fn namespace(
+    headers: &HeaderMap,
+    route: ActiveLibraryRoute,
+) -> Result<(), Box<Response>> {
     if headers.get_all(NAMESPACE).iter().count() != 1
         || headers.get(NAMESPACE).and_then(|v| v.to_str().ok())
             != Some(route.route.namespace.to_string().as_str())
@@ -86,7 +89,7 @@ pub(super) fn failure(error: CatalogError) -> Response {
         json!({"error":kind,"detail":domain.to_string(),"retryable":matches!(status,StatusCode::SERVICE_UNAVAILABLE|StatusCode::TOO_MANY_REQUESTS)}),
     )
 }
-fn budget(ctx: &Context) -> Result<OwnedSemaphorePermit, Box<Response>> {
+pub(super) fn budget(ctx: &Context) -> Result<OwnedSemaphorePermit, Box<Response>> {
     ctx.admin_requests
         .clone()
         .try_acquire_owned()
@@ -167,6 +170,31 @@ pub(super) async fn list(
         Err(e) => failure(e),
     }
 }
+pub(super) async fn resolve(
+    ctx: &Context,
+    serial: &str,
+    expected: ActiveLibraryRoute,
+    selector: &str,
+) -> Result<Option<crate::managed_catalog::PoolRecord>, Box<Response>> {
+    // UUID selectors never fall through to a different pool's name.
+    let result = match Uuid::parse_str(selector) {
+        Ok(id) => {
+            if id.is_nil() || id.to_string() != selector {
+                return Err(Box::new(invalid("池UUID须规范且非零")));
+            }
+            ctx.catalog
+                .active_pool_for_route(serial, expected, id)
+                .await
+        }
+        Err(_) => {
+            ctx.catalog
+                .active_pool_named_for_route(serial, expected, selector)
+                .await
+        }
+    };
+    result.map_err(|error| Box::new(failure(error)))
+}
+
 pub(super) async fn show(
     State(ctx): State<Arc<Context>>,
     Path((serial, selector)): Path<(String, String)>,
@@ -183,22 +211,7 @@ pub(super) async fn show(
     if let Err(r) = namespace(request.headers(), expected) {
         return *r;
     }
-    // UUID selectors never fall through to a different pool's name.
-    let result = match Uuid::parse_str(&selector) {
-        Ok(id) => {
-            if id.is_nil() || id.to_string() != selector {
-                return invalid("池UUID须规范且非零");
-            }
-            ctx.catalog
-                .active_pool_for_route(&serial, expected, id)
-                .await
-        }
-        Err(_) => {
-            ctx.catalog
-                .active_pool_named_for_route(&serial, expected, &selector)
-                .await
-        }
-    };
+    let result = resolve(&ctx, &serial, expected, &selector).await;
     match result {
         Ok(Some(pool)) => match pool.to_json() {
             Ok(p) => reply(
@@ -211,7 +224,7 @@ pub(super) async fn show(
             StatusCode::NOT_FOUND,
             json!({"error":"pool_not_found","detail":"目标带库中没有该池"}),
         ),
-        Err(e) => failure(e),
+        Err(e) => *e,
     }
 }
 
