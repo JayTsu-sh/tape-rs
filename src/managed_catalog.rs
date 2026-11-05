@@ -48,7 +48,9 @@ mod routing;
 mod staged_import;
 mod staged_sources;
 pub use cleanup::PurgeProgress;
-pub use control::{ControlOutcome, PoolPolicy, PoolRecord, TapeAssignment, VolumePlacement};
+pub use control::{
+    ActivePoolCreation, ControlOutcome, PoolPolicy, PoolRecord, TapeAssignment, VolumePlacement,
+};
 pub use cutover::{
     FrozenSnapshotIdentity, VerifiedNodeExport, inspect_frozen_snapshot, verify_node_export,
 };
@@ -84,6 +86,7 @@ const PREFIX: &[u8] = b"tape-rs/catalog/22/";
 const MAX_PAGE: usize = 1000;
 const MAX_NAME: usize = 255;
 const MAX_DEPTH: u16 = 1024;
+const MAX_POOL_PATH_BYTES: usize = 2048;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
@@ -99,6 +102,8 @@ pub enum CatalogError {
     Cache(String),
     #[error("目录索引未完成，暂不能判定文件是否存在")]
     Incomplete,
+    #[error("池或带库正在执行互斥操作")]
+    PoolBusy,
     #[error("目录维护任务已被新的执行者接管")]
     MaintenanceFenced,
     #[error("带库 owner 已由新的执行轮次接管")]
@@ -106,6 +111,21 @@ pub enum CatalogError {
 }
 
 pub type Result<T> = std::result::Result<T, CatalogError>;
+
+/// Resolve a public pool-relative path without writing pool UUIDs into tape paths.
+pub fn pool_catalog_path(pool: Uuid, path: &[u8]) -> Result<Vec<u8>> {
+    if pool.is_nil()
+        || path.len() > MAX_POOL_PATH_BYTES
+        || lookup::path_components(path)?.len() >= usize::from(MAX_DEPTH)
+    {
+        return Err(CatalogError::Invalid("池或池内路径无效"));
+    }
+    let mut full = format!("/{pool}").into_bytes();
+    if path != b"/" {
+        full.extend_from_slice(path);
+    }
+    Ok(full)
+}
 
 /// Preferred checksum carried by the LTFS index. `Unknown` does not prove
 /// that the file's content has been verified.
@@ -796,6 +816,10 @@ impl ManagedCatalog {
         if namespace.is_nil() || id.is_nil() {
             return Err(CatalogError::Invalid("namespace 和目录 inode 不能为 nil"));
         }
+        if parent.is_nil() {
+            control::reject_generic_pool_root_at(&self.db.create_trx()?, namespace, parent, name)
+                .await?;
+        }
         if let Some(attributes) = attributes {
             self.upload_attributes(namespace, attributes).await?;
         }
@@ -832,6 +856,11 @@ impl ManagedCatalog {
                         }
                         Ok(None) => return Ok(Err(CatalogError::Incomplete)),
                         Err(error) => return Ok(Err(error)),
+                    }
+                    if let Err(error) =
+                        control::reject_generic_pool_root_at(&tr, namespace, parent, &name).await
+                    {
+                        return requests::retry_result(Err(error));
                     }
                     let Some(parent_bytes) = tr.get(&parent_key, false).await? else {
                         return Ok(Ok(DirectoryOutcome::MissingParent));
@@ -2707,6 +2736,29 @@ impl ManagedCatalog {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pool_paths_are_canonical_and_isolated() {
+        let pool = uuid::Uuid::new_v4();
+        assert_eq!(
+            super::pool_catalog_path(pool, b"/").unwrap(),
+            format!("/{pool}").as_bytes()
+        );
+        assert_eq!(
+            super::pool_catalog_path(pool, b"/a/b").unwrap(),
+            format!("/{pool}/a/b").as_bytes()
+        );
+        for path in [
+            b"".as_slice(),
+            b"relative",
+            b"/a/",
+            b"//a",
+            b"/../a",
+            b"/a\0b",
+        ] {
+            assert!(super::pool_catalog_path(pool, path).is_err());
+        }
+        assert!(super::pool_catalog_path(uuid::Uuid::nil(), b"/").is_err());
+    }
     use super::*;
 
     #[test]

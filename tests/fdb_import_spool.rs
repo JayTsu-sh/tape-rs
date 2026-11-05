@@ -1568,6 +1568,38 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                 .unwrap()
                 .complete()
         );
+        // The captured pool set cannot gain an unprojected empty pool.
+        let late_pool = PoolRecord {
+            id: Uuid::new_v4(),
+            library_serial: serial.clone(),
+            name: "late-empty".into(),
+            file_limit: 1_000_000,
+            created_at_millis: 1_793_405_000_123,
+            policy: PoolPolicy::default(),
+            revision: 1,
+        };
+        let retained_stage = catalog.staged_import_summary(namespace).await.unwrap();
+        let outcome = catalog.create_pool(namespace, &late_pool).await;
+        let mut late_key = b"tape-rs/catalog/22/T/".to_vec();
+        late_key.extend_from_slice(namespace.as_bytes());
+        late_key.extend_from_slice(late_pool.id.as_bytes());
+        let tr = direct.create_trx().unwrap();
+        assert!(
+            tr.get(&late_key, false).await.unwrap().is_none(),
+            "不能增加未投影空池；结果 {outcome:?}"
+        );
+        assert!(matches!(
+            outcome,
+            Err(tape_rs::managed_catalog::CatalogError::Invalid(_))
+        ));
+        assert_eq!(
+            catalog.staged_import_summary(namespace).await.unwrap(),
+            retained_stage
+        );
+        assert_eq!(
+            catalog.namespace_state(namespace).await.unwrap(),
+            Some(NamespaceState::Building)
+        );
         assert_eq!(
             catalog.freeze_bound_staged_import(namespace).await.unwrap(),
             NamespaceVerificationOutcome::Frozen
