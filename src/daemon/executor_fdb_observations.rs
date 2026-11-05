@@ -8,6 +8,7 @@ use serde_json::Value;
 const INTERVAL: Duration = Duration::from_secs(30);
 const RPC_BUDGET: Duration = Duration::from_secs(5);
 
+#[derive(Clone, Copy)]
 pub(super) struct Context<'a> {
     pub active: &'a Active,
     pub permission: &'a Permission,
@@ -16,7 +17,7 @@ pub(super) struct Context<'a> {
     pub node: u8,
 }
 impl Context<'_> {
-    fn ready(&self) -> bool {
+    pub(super) fn ready(&self) -> bool {
         let status = self.status.lock().unwrap_or_else(|e| e.into_inner());
         self.active.serving
             && !status.shutting_down
@@ -71,7 +72,7 @@ impl Context<'_> {
                 )
             })
     }
-    fn lost(&self, reason: String) -> TapeError {
+    pub(super) fn lost(&self, reason: String) -> TapeError {
         TapeError::OwnershipLost {
             device: self.control.serial.clone(),
             detail: format!("库观测发布已失去原执行权：{reason}"),
@@ -123,15 +124,16 @@ fn bounded_error(text: &str) -> String {
     }
     format!("{}…", &text[..end])
 }
-enum Publication {
-    Confirmed,
+pub(super) enum Publication<T> {
+    Confirmed(T),
     Paused,
     Lost(String),
     Failed { detail: String, permanent: bool },
 }
-fn catalog_result(result: std::result::Result<(), CatalogError>) -> Publication {
-    let Err(error) = result else {
-        return Publication::Confirmed;
+fn catalog_result<T>(result: std::result::Result<T, CatalogError>) -> Publication<T> {
+    let error = match result {
+        Ok(value) => return Publication::Confirmed(value),
+        Err(error) => error,
     };
     let mut domain = &error;
     while let CatalogError::Fdb(foundationdb::FdbBindingError::CustomError(inner)) = domain {
@@ -158,11 +160,11 @@ fn catalog_result(result: std::result::Result<(), CatalogError>) -> Publication 
         permanent,
     }
 }
-fn publish(
+pub(super) fn publish<T>(
     context: &Context<'_>,
     runtime: &tokio::runtime::Runtime,
-    future: impl std::future::Future<Output = std::result::Result<(), CatalogError>>,
-) -> Publication {
+    future: impl std::future::Future<Output = std::result::Result<T, CatalogError>>,
+) -> Publication<T> {
     runtime.block_on(async {
         let mut future = std::pin::pin!(future);
         let deadline = Instant::now() + RPC_BUDGET;
@@ -173,7 +175,7 @@ fn publish(
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return Publication::Failed {
-                    detail: "FDB回执等待超时，保留原观测核对；不视为未提交".into(),
+                    detail: "FDB回执等待超时，保留原请求和观测核对；不视为未提交".into(),
                     permanent: false,
                 };
             }
@@ -191,10 +193,16 @@ fn publish(
     })
 }
 
+pub(super) struct Completion {
+    pub captured_at: String,
+    pub error: Option<String>,
+}
+
 pub(super) struct Publisher {
     round: u64,
     next: Instant,
     pending: Option<Attempt>,
+    completed: Option<Completion>,
     failures: u32,
     blocked: bool,
 }
@@ -204,19 +212,36 @@ impl Default for Publisher {
             round: 0,
             next: Instant::now(),
             pending: None,
+            completed: None,
             failures: 0,
             blocked: false,
         }
     }
 }
-fn retry_delay(failures: u32) -> Duration {
+pub(super) fn retry_delay(failures: u32) -> Duration {
     let millis = (500u64 << failures.min(6)).min(30_000);
     Duration::from_millis(millis + u64::from(uuid::Uuid::new_v4().as_bytes()[0]))
 }
 impl Publisher {
-    fn accept(&mut self, context: &Context<'_>, stage: &str, result: Publication) -> Result<bool> {
+    pub(super) fn idle(&self) -> bool {
+        !self.blocked && self.pending.is_none()
+    }
+    pub(super) fn request_fresh(&mut self) {
+        assert!(self.idle(), "先结清原观测");
+        self.completed = None;
+        self.next = Instant::now();
+    }
+    pub(super) fn take_completion(&mut self) -> Option<Completion> {
+        self.completed.take()
+    }
+    fn accept(
+        &mut self,
+        context: &Context<'_>,
+        stage: &str,
+        result: Publication<()>,
+    ) -> Result<bool> {
         match result {
-            Publication::Confirmed => Ok(true),
+            Publication::Confirmed(()) => Ok(true),
             Publication::Paused => Ok(false),
             Publication::Lost(reason) => Err(context.lost(reason)),
             Publication::Failed { detail, permanent } => {
@@ -313,12 +338,12 @@ impl Publisher {
         if !self.accept(&context, "monitor", result)? {
             return Ok(());
         }
-        let failed = self
-            .pending
-            .take()
-            .expect("confirmed monitor")
-            .error
-            .is_some();
+        let attempt = self.pending.take().expect("confirmed monitor");
+        let failed = attempt.error.is_some();
+        self.completed = Some(Completion {
+            captured_at: attempt.captured_at,
+            error: attempt.error,
+        });
         if failed {
             self.failures = self.failures.saturating_add(1);
         } else {

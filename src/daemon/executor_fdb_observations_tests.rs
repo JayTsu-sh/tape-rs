@@ -1,10 +1,9 @@
+use super::super::fdb_observations_fixture::{Provider, make_status, options};
 use super::*;
-use crate::daemon::{node::NodeStatus, state::Executor};
 use crate::managed_catalog::{ManagedCatalog, NotifyFilter, verify_native_barriers};
 use crate::scsi::{
     cdb::opcode,
-    device::ScsiResult,
-    sim::{Fault, FaultAction, SimCartridge, SimLibrary, SimTransport},
+    sim::{Fault, FaultAction, SimCartridge, SimLibrary},
 };
 use serde_json::json;
 use std::sync::{
@@ -23,14 +22,14 @@ fn diagnostics_stay_valid_utf8_and_keep_the_storage_bound() {
 #[test]
 fn invalid_facts_are_permanent_and_owner_fences_stop_publication() {
     assert!(matches!(
-        catalog_result(Err(CatalogError::Corrupt("bad cache"))),
+        catalog_result::<()>(Err(CatalogError::Corrupt("bad cache"))),
         Publication::Failed {
             permanent: true,
             ..
         }
     ));
     assert!(matches!(
-        catalog_result(Err(CatalogError::OwnerFenced)),
+        catalog_result::<()>(Err(CatalogError::OwnerFenced)),
         Publication::Lost(_)
     ));
     for n in [0, 1, 2, 100, u32::MAX] {
@@ -40,94 +39,6 @@ fn invalid_facts_are_permanent_and_owner_fences_stop_publication() {
     }
 }
 
-struct Counter {
-    inner: Arc<SimTransport>,
-    log: Arc<Mutex<Vec<u8>>>,
-    revoke: Arc<AtomicBool>,
-    permission: Arc<Permission>,
-    round: u64,
-}
-impl TapeTransport for Counter {
-    fn identity(&self) -> &str {
-        self.inner.identity()
-    }
-    fn execute_no_data(&self, cdb: &[u8], timeout: u32) -> Result<ScsiResult> {
-        self.log.lock().unwrap().push(cdb[0]);
-        self.inner.execute_no_data(cdb, timeout)
-    }
-    fn execute_read(&self, cdb: &[u8], buf: &mut [u8], timeout: u32) -> Result<ScsiResult> {
-        self.log.lock().unwrap().push(cdb[0]);
-        let result = self.inner.execute_read(cdb, buf, timeout);
-        if cdb[0] == opcode::READ_ELEMENT_STATUS && self.revoke.swap(false, Ordering::SeqCst) {
-            self.permission.close(self.round);
-        }
-        result
-    }
-    fn execute_write(&self, cdb: &[u8], buf: &[u8], timeout: u32) -> Result<ScsiResult> {
-        self.log.lock().unwrap().push(cdb[0]);
-        self.inner.execute_write(cdb, buf, timeout)
-    }
-}
-struct Provider {
-    serial: String,
-    changer: Arc<SimTransport>,
-    drive: Arc<SimTransport>,
-    log: Arc<Mutex<Vec<u8>>>,
-    revoke: Arc<AtomicBool>,
-    permission: Arc<Permission>,
-    round: u64,
-}
-impl DeviceProvider for Provider {
-    fn open_all(&self) -> Result<Vec<ManagedDevice>> {
-        let wrap = |inner: Arc<SimTransport>| {
-            Box::new(Counter {
-                inner,
-                log: self.log.clone(),
-                revoke: self.revoke.clone(),
-                permission: self.permission.clone(),
-                round: self.round,
-            }) as Box<dyn TapeTransport + Send>
-        };
-        Ok(vec![
-            ManagedDevice {
-                name: "changer".into(),
-                serial: self.serial.clone(),
-                kind: DeviceKind::Changer,
-                dev: wrap(self.changer.clone()),
-            },
-            ManagedDevice {
-                name: "drive".into(),
-                serial: "SIMDRV0000".into(),
-                kind: DeviceKind::Drive,
-                dev: wrap(self.drive.clone()),
-            },
-        ])
-    }
-}
-fn options(node: u8) -> ExecOptions {
-    ExecOptions {
-        node_id: node,
-        interval: Duration::from_secs(1),
-        demo_write: false,
-        salvage: false,
-        block_size: 64 * 1024,
-        read_idle: Duration::from_secs(30),
-    }
-}
-fn make_status(node: u8, round: u64, frozen: u64) -> SharedStatus {
-    Arc::new(Mutex::new(NodeStatus {
-        id: u64::from(node),
-        catalog_frozen_index: Some(frozen),
-        executor: Some(Executor {
-            node: u64::from(node),
-            round,
-            term: 7,
-            fenced: true,
-        }),
-        executor_ready: true,
-        ..Default::default()
-    }))
-}
 fn due(publisher: &mut Publisher) {
     publisher.next = Instant::now();
 }
@@ -378,7 +289,7 @@ fn publisher_preserves_complete_samples_and_owner_boundaries() {
             &runtime,
             catalog.record_library_monitor(&serial, route, round, &captured_at, None)
         ),
-        Publication::Confirmed
+        Publication::Confirmed(())
     ));
     let confirmed_monitor = monitor(&runtime, &control);
     assert!(

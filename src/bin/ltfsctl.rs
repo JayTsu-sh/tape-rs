@@ -133,7 +133,11 @@ enum LibraryCmd {
     /// 查询带库，须给出序列号或--library
     Show { serial: Option<String> },
     /// 显式刷新当前库的设备库存
-    Rescan,
+    Rescan {
+        /// 首次提交前保存原请求；重试须使用相同文件
+        #[arg(long)]
+        request: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -355,12 +359,16 @@ fn main() {
                 args.pool.as_deref(),
             )?,
             Cmd::Library {
-                cmd: LibraryCmd::Rescan,
-            } => print_json(c.admin_request(
-                "POST",
-                "/admin/libraries/current/rescan",
-                serde_json::json!({}),
-            )?),
+                cmd: LibraryCmd::Rescan { request },
+            } => {
+                let library = pool::library(args.library.as_deref(), args.pool.as_deref())?;
+                print_json(pool::submit(
+                    &tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?,
+                    library,
+                    tape_rs::client::fdb::management::ManagementIntent::LibraryRescan,
+                    request,
+                )?);
+            }
             Cmd::Drive { cmd } => match cmd {
                 DriveCmd::List => print_json(c.admin_get("/admin/drives")?),
                 DriveCmd::Show { id } => print_json(c.admin_get(&format!("/admin/drives/{id}"))?),

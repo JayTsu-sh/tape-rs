@@ -1,4 +1,4 @@
-//! Library-scoped pool metadata. Only fixed, durably checkpointed identities are
+//! Library-scoped management requests and pool metadata. Only fixed, durably checkpointed identities are
 //! submitted. The checkpoint is not a task database; FDB owns all task states.
 use super::*;
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,8 @@ use std::path::Path;
 const NS: &str = "x-tapers-catalog-namespace";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
-pub enum PoolIntent {
+pub enum ManagementIntent {
+    LibraryRescan,
     Create {
         name: String,
         file_limit: u64,
@@ -26,11 +27,11 @@ pub enum PoolIntent {
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PoolRequest {
+pub struct ManagementRequestFile {
     version: u8,
     library: String,
     namespace: String,
-    input: PoolIntent,
+    input: ManagementIntent,
     request: Value,
     fingerprint: String,
 }
@@ -112,7 +113,7 @@ pub(super) fn parsed(response: Response, statuses: &[u16]) -> Result<Value> {
     serde_json::from_slice(&response.body)
         .ok()
         .filter(Value::is_object)
-        .ok_or_else(|| ClientError::Verification("池管理响应不是JSON对象".into()))
+        .ok_or_else(|| ClientError::Verification("管理响应不是JSON对象".into()))
 }
 pub(super) fn scope(value: &Value, library: &str, namespace: &str) -> Result<()> {
     if value["library_serial"] != library || value["namespace"] != namespace {
@@ -129,7 +130,7 @@ fn unknown(checkpoint: &Path, error: ClientError) -> ClientError {
         checkpoint.display()
     ))
 }
-impl PoolRequest {
+impl ManagementRequestFile {
     fn digest(&self) -> String {
         format!("{:x}", sha2::Sha256::digest(serde_json::to_vec(&json!({"version":self.version,"library":self.library,"namespace":self.namespace,"input":self.input,"request":self.request})).expect("JSON serializes")))
     }
@@ -137,10 +138,21 @@ impl PoolRequest {
         base(&self.library)?;
         uuid(&self.namespace)?;
         if self.version != 1 || self.fingerprint != self.digest() {
-            return Err(invalid("池请求文件版本或校验不符"));
+            return Err(invalid("管理请求文件版本或校验不符"));
         }
         let expected = match &self.input {
-            PoolIntent::Create {
+            ManagementIntent::LibraryRescan => {
+                uuid(
+                    self.request["operation"]
+                        .as_str()
+                        .ok_or_else(|| invalid("任务UUID缺失"))?,
+                )?;
+                if !self.request["epoch"].as_u64().is_some_and(|n| n > 0) {
+                    return Err(invalid("任务代次无效"));
+                }
+                json!({"version":1,"library":self.library,"namespace":self.namespace,"epoch":self.request["epoch"],"operation":self.request["operation"],"change":{"kind":"library-rescan"}})
+            }
+            ManagementIntent::Create {
                 name: n,
                 file_limit,
             } => {
@@ -160,7 +172,7 @@ impl PoolRequest {
                 }
                 json!({"version":1,"id":self.request["id"],"name":n,"file_limit":file_limit,"created_at_millis":self.request["created_at_millis"],"policy":defaults()})
             }
-            PoolIntent::Set {
+            ManagementIntent::Set {
                 selector,
                 attribute,
                 value,
@@ -170,7 +182,7 @@ impl PoolRequest {
                 }
                 self.management_body(Some(patch(attribute, value)?))?
             }
-            PoolIntent::Delete { selector } => {
+            ManagementIntent::Delete { selector } => {
                 if !name(selector) {
                     return Err(invalid("池选择器无效"));
                 }
@@ -211,7 +223,7 @@ impl PoolRequest {
     pub fn is_library(&self, library: &str) -> bool {
         self.library == library
     }
-    pub fn matches(&self, library: &str, input: &PoolIntent) -> bool {
+    pub fn matches(&self, library: &str, input: &ManagementIntent) -> bool {
         self.library == library && &self.input == input
     }
     /// Never overwrite a checkpoint, including a partial checkpoint after an I/O failure.
@@ -257,7 +269,7 @@ impl PoolRequest {
     }
 }
 impl FdbClient {
-    pub fn pool_context(&self, library: &str) -> Result<Value> {
+    pub fn management_context(&self, library: &str) -> Result<Value> {
         let value = parsed(
             self.retry_request("GET", &format!("{}/context", base(library)?), None, &[])?,
             &[200],
@@ -329,40 +341,48 @@ impl FdbClient {
         check_pool(&value["pool"], library)?;
         Ok(value)
     }
-    pub fn prepare_pool(&self, library: &str, input: PoolIntent) -> Result<PoolRequest> {
+    pub fn prepare_management(
+        &self,
+        library: &str,
+        input: ManagementIntent,
+    ) -> Result<ManagementRequestFile> {
         // Validate command parameters before contacting the server.
         match &input {
-            PoolIntent::Create {
+            ManagementIntent::LibraryRescan => {}
+            ManagementIntent::Create {
                 name: n,
                 file_limit,
             } if name(n) && *file_limit > 0 => {}
-            PoolIntent::Set {
+            ManagementIntent::Set {
                 selector,
                 attribute,
                 value,
             } if name(selector) => {
                 patch(attribute, value)?;
             }
-            PoolIntent::Delete { selector } if name(selector) => {}
-            _ => return Err(invalid("池管理参数无效")),
+            ManagementIntent::Delete { selector } if name(selector) => {}
+            _ => return Err(invalid("管理参数无效")),
         }
-        let context = self.pool_context(library)?;
+        let context = self.management_context(library)?;
         let namespace = context["namespace"]
             .as_str()
             .expect("validated namespace")
             .to_owned();
         let request = match &input {
-            PoolIntent::Create { name, file_limit } => {
+            ManagementIntent::LibraryRescan => {
+                json!({"version":1,"library":library,"namespace":namespace,"epoch":context["window"]["accepting"],"operation":Uuid::new_v4().to_string(),"change":{"kind":"library-rescan"}})
+            }
+            ManagementIntent::Create { name, file_limit } => {
                 let time = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_err(|_| invalid("系统时间无效"))?
                     .as_millis();
                 json!({"version":1,"id":Uuid::new_v4().to_string(),"name":name,"file_limit":file_limit,"created_at_millis":time as u64,"policy":defaults()})
             }
-            PoolIntent::Set { selector, .. } | PoolIntent::Delete { selector } => {
+            ManagementIntent::Set { selector, .. } | ManagementIntent::Delete { selector } => {
                 let pool = self.pool(library, &namespace, selector)?;
                 let mut change = json!({"kind":"pool-delete","id":pool["pool"]["id"],"revision":pool["pool"]["revision"]});
-                if let PoolIntent::Set {
+                if let ManagementIntent::Set {
                     attribute, value, ..
                 } = &input
                 {
@@ -372,7 +392,7 @@ impl FdbClient {
                 json!({"version":1,"library":library,"namespace":namespace,"epoch":context["window"]["accepting"],"operation":Uuid::new_v4().to_string(),"change":change})
             }
         };
-        let mut prepared = PoolRequest {
+        let mut prepared = ManagementRequestFile {
             version: 1,
             library: library.into(),
             namespace,
@@ -385,8 +405,8 @@ impl FdbClient {
         Ok(prepared)
     }
     /// Requires the exact checkpoint saved before the first mutation request.
-    pub fn submit_pool(&self, checkpoint: &Path) -> Result<Value> {
-        let p = PoolRequest::load(checkpoint)?;
+    pub fn submit_management(&self, checkpoint: &Path) -> Result<Value> {
+        let p = ManagementRequestFile::load(checkpoint)?;
         std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(nix::libc::O_NOFOLLOW)
@@ -400,12 +420,17 @@ impl FdbClient {
         )?
         .sync_all()?;
         let (method, route, statuses) = match p.input {
-            PoolIntent::Create { .. } => (
+            ManagementIntent::LibraryRescan => (
+                "POST",
+                format!("{}/library/rescan", base(&p.library)?),
+                vec![202],
+            ),
+            ManagementIntent::Create { .. } => (
                 "POST",
                 format!("{}/pools", base(&p.library)?),
                 vec![200, 201],
             ),
-            PoolIntent::Set { .. } => (
+            ManagementIntent::Set { .. } => (
                 "PATCH",
                 format!(
                     "{}/pools/{}",
@@ -414,7 +439,7 @@ impl FdbClient {
                 ),
                 vec![202],
             ),
-            PoolIntent::Delete { .. } => (
+            ManagementIntent::Delete { .. } => (
                 "DELETE",
                 format!(
                     "{}/pools/{}",
@@ -447,7 +472,7 @@ impl FdbClient {
         }
         let result = (|| {
             let value = parsed(response, &statuses)?;
-            if matches!(p.input, PoolIntent::Create { .. }) {
+            if matches!(p.input, ManagementIntent::Create { .. }) {
                 scope(&value, &p.library, &p.namespace)?;
                 check_pool(&value["pool"], &p.library)?;
                 if value["pool"]["id"] != p.request["id"] {
@@ -461,9 +486,9 @@ impl FdbClient {
         result.map_err(|e| unknown(checkpoint, e))
     }
 
-    pub fn pool_request_status(&self, checkpoint: &Path, cancel: bool) -> Result<Value> {
-        let p = PoolRequest::load(checkpoint)?;
-        if matches!(p.input, PoolIntent::Create { .. }) {
+    pub fn management_request_status(&self, checkpoint: &Path, cancel: bool) -> Result<Value> {
+        let p = ManagementRequestFile::load(checkpoint)?;
+        if matches!(p.input, ManagementIntent::Create { .. }) {
             if cancel {
                 return Err(invalid("池创建是原子事务，没有可取消的异步任务"));
             }
@@ -516,7 +541,7 @@ pub(super) fn check_pool(p: &Value, library: &str) -> Result<()> {
     }
     Ok(())
 }
-fn check_task(task: &Value, p: &PoolRequest) -> Result<()> {
+fn check_task(task: &Value, p: &ManagementRequestFile) -> Result<()> {
     scope(task, &p.library, &p.namespace)?;
     if task["epoch"] != p.request["epoch"]
         || task["operation"] != p.request["operation"]
@@ -536,12 +561,12 @@ fn check_task(task: &Value, p: &PoolRequest) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn prepared() -> PoolRequest {
-        let mut p = PoolRequest {
+    fn prepared() -> ManagementRequestFile {
+        let mut p = ManagementRequestFile {
             version: 1,
             library: "LIB 中文".into(),
             namespace: Uuid::new_v4().to_string(),
-            input: PoolIntent::Create {
+            input: ManagementIntent::Create {
                 name: "归档".into(),
                 file_limit: 100,
             },
@@ -557,13 +582,52 @@ mod tests {
         p
     }
     #[test]
+    fn rescan_reuses_the_durable_management_protocol_and_rejects_bad_receipts() {
+        use super::super::tests::{response, server};
+        let mut p = prepared();
+        p.input = ManagementIntent::LibraryRescan;
+        p.request = json!({"version":1,"library":p.library,"namespace":p.namespace,"epoch":1,"operation":Uuid::new_v4().to_string(),"change":{"kind":"library-rescan"}});
+        p.fingerprint = p.digest();
+        let dir = dir();
+        let path = dir.join("rescan.json");
+        p.save_new(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let receipt = json!({"library_serial":p.library,"namespace":p.namespace,"epoch":1,"operation":p.request["operation"],"request":p.request,"status":"queued"});
+        let (address, worker) = server(response(202, &receipt.to_string()), Duration::ZERO);
+        let task = FdbClient::new([address])
+            .unwrap()
+            .submit_management(&path)
+            .unwrap();
+        assert_eq!(task, receipt);
+        assert!(
+            String::from_utf8(worker.join().unwrap())
+                .unwrap()
+                .starts_with("POST /libraries/LIB%20%E4%B8%AD%E6%96%87/admin/library/rescan ")
+        );
+        for body in ["null".to_owned(), json!({"status":"succeeded"}).to_string()] {
+            let (address, worker) = server(response(202, &body), Duration::ZERO);
+            assert!(matches!(
+                FdbClient::new([address]).unwrap().submit_management(&path),
+                Err(ClientError::Indeterminate(_))
+            ));
+            worker.join().unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        let loaded = ManagementRequestFile::load(&path).unwrap();
+        assert!(loaded.matches(&p.library, &ManagementIntent::LibraryRescan));
+        p.request["change"]["force"] = json!(true);
+        p.fingerprint = p.digest();
+        assert!(p.validate().is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn checkpoint_survives_restart_without_overwrite_or_partial_file_repair() {
         use std::os::unix::fs::PermissionsExt;
         let dir = dir();
         let path = dir.join("request.json");
         let p = prepared();
         p.save_new(&path).unwrap();
-        let loaded = PoolRequest::load(&path).unwrap();
+        let loaded = ManagementRequestFile::load(&path).unwrap();
         assert_eq!(loaded.request, p.request);
         assert!(loaded.matches(&p.library, &p.input));
         assert_eq!(
@@ -572,13 +636,13 @@ mod tests {
         );
         assert!(prepared().save_new(&path).is_err());
         std::fs::write(&path, b"{\"version\":1").unwrap();
-        assert!(PoolRequest::load(&path).is_err());
+        assert!(ManagementRequestFile::load(&path).is_err());
         assert!(p.save_new(&path).is_err());
         std::fs::write(&path, vec![b' '; 16385]).unwrap();
-        assert!(PoolRequest::load(&path).is_err());
+        assert!(ManagementRequestFile::load(&path).is_err());
         std::os::unix::fs::symlink(&path, dir.join("symlink")).unwrap();
-        assert!(PoolRequest::load(&dir.join("symlink")).is_err());
-        assert!(PoolRequest::load(&dir).is_err());
+        assert!(ManagementRequestFile::load(&dir.join("symlink")).is_err());
+        assert!(ManagementRequestFile::load(&dir).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
@@ -628,7 +692,7 @@ mod tests {
         let result = FdbClient::new([a, b])
             .unwrap()
             .with_timeouts(Duration::from_secs(3), Duration::from_secs(1))
-            .submit_pool(&path)
+            .submit_management(&path)
             .unwrap();
         assert_eq!(result["pool"]["id"], p.request["id"]);
         let a = String::from_utf8(ta.join().unwrap()).unwrap();
@@ -639,7 +703,10 @@ mod tests {
         );
         assert!(a.starts_with("POST /libraries/LIB%20%E4%B8%AD%E6%96%87/admin/pools HTTP/1.1"));
         assert!(a.contains(&format!("x-tapers-catalog-namespace: {}", p.namespace)));
-        assert_eq!(PoolRequest::load(&path).unwrap().request, p.request);
+        assert_eq!(
+            ManagementRequestFile::load(&path).unwrap().request,
+            p.request
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
@@ -661,7 +728,7 @@ mod tests {
             let (address, worker) = server(response(status, &body), Duration::ZERO);
             let error = FdbClient::new([address])
                 .unwrap()
-                .submit_pool(&path)
+                .submit_management(&path)
                 .unwrap_err();
             assert!(matches!(error, ClientError::Indeterminate(_)), "{error}");
             let raw = String::from_utf8(worker.join().unwrap()).unwrap();
@@ -674,7 +741,7 @@ mod tests {
     fn cancellation_with_a_lost_or_invalid_receipt_preserves_original_task_identity() {
         use super::super::tests::{response, server};
         let mut p = prepared();
-        p.input = PoolIntent::Set {
+        p.input = ManagementIntent::Set {
             selector: "归档".into(),
             attribute: "file_limit".into(),
             value: "101".into(),
@@ -688,7 +755,7 @@ mod tests {
         let (address, worker) = server(response(200, "null"), Duration::ZERO);
         let result = FdbClient::new([address])
             .unwrap()
-            .pool_request_status(&path, true);
+            .management_request_status(&path, true);
         assert!(matches!(result, Err(ClientError::Indeterminate(_))));
         let raw = String::from_utf8(worker.join().unwrap()).unwrap();
         assert!(raw.starts_with(&format!(
@@ -702,7 +769,7 @@ mod tests {
         let result = FdbClient::new([address])
             .unwrap()
             .with_timeouts(Duration::from_millis(30), Duration::from_millis(20))
-            .pool_request_status(&path, true);
+            .management_request_status(&path, true);
         assert!(matches!(result, Err(ClientError::Indeterminate(_))));
         assert_eq!(std::fs::read(&path).unwrap(), original);
         std::fs::remove_dir_all(dir).unwrap();
@@ -719,9 +786,12 @@ mod tests {
         let result = FdbClient::new([address])
             .unwrap()
             .with_timeouts(Duration::from_millis(30), Duration::from_millis(20))
-            .submit_pool(&path);
+            .submit_management(&path);
         assert!(matches!(result, Err(ClientError::Indeterminate(_))));
-        assert_eq!(PoolRequest::load(&path).unwrap().request, p.request);
+        assert_eq!(
+            ManagementRequestFile::load(&path).unwrap().request,
+            p.request
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

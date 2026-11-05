@@ -316,6 +316,13 @@ mod fdb_loading;
 #[path = "executor_fdb_observations.rs"]
 mod fdb_observations;
 
+#[path = "executor_fdb_rescan.rs"]
+mod fdb_rescan;
+
+#[cfg(test)]
+#[path = "executor_fdb_observations_fixture.rs"]
+mod fdb_observations_fixture;
+
 #[cfg(feature = "fdb")]
 #[path = "executor_fdb_preflight.rs"]
 mod fdb_preflight;
@@ -813,7 +820,7 @@ pub fn run_fdb_owner(
     let mut permission: Option<Arc<Permission>> = None;
     let mut active: Option<Active> = None;
     let mut next_fence_check = Instant::now();
-    let mut observations = fdb_observations::Publisher::default();
+    let mut observations = fdb_rescan::Observer::default();
     loop {
         if Instant::now() >= next_fence_check {
             next_fence_check = Instant::now() + Duration::from_secs(1);

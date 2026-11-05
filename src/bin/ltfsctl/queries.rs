@@ -61,7 +61,7 @@ fn no_pool(pool: Option<&str>) -> Result<()> {
     }
 }
 fn namespace(client: &FdbClient, library: &str) -> Result<String> {
-    Ok(client.pool_context(library)?["namespace"]
+    Ok(client.management_context(library)?["namespace"]
         .as_str()
         .ok_or("管理上下文缺少namespace")?
         .to_owned())

@@ -15,7 +15,7 @@ fn canonical(value: &Value) -> Result<Uuid> {
         .ok_or_else(|| bad("查询响应UUID无效"))
 }
 fn scope(value: &Value, library: &str, namespace: &str) -> Result<()> {
-    pools::scope(value, library, namespace)?;
+    management::scope(value, library, namespace)?;
     if value["version"] != 1 {
         return Err(bad("管理查询响应版本无效"));
     }
@@ -69,7 +69,7 @@ fn barcode(value: &str) -> bool {
             .all(|b| (b'!'..=b'~').contains(&b) && b != b'/')
 }
 fn check_tape(value: &Value, library: &str, namespace: &str, pool: Option<&str>) -> Result<()> {
-    pools::scope(value, library, namespace)?;
+    management::scope(value, library, namespace)?;
     if !value["barcode"].as_str().is_some_and(barcode)
         || !matches!(
             value["presence"].as_str(),
@@ -98,7 +98,7 @@ fn check_tape(value: &Value, library: &str, namespace: &str, pool: Option<&str>)
         if !assignment["volume"].is_null() {
             canonical(&assignment["volume"])?;
         }
-        pools::check_pool(&value["pool"], library)?;
+        management::check_pool(&value["pool"], library)?;
         if value["pool"]["id"] != assignment["pool"] {
             return Err(bad("磁带与池响应标识不符"));
         }
@@ -108,7 +108,7 @@ fn check_tape(value: &Value, library: &str, namespace: &str, pool: Option<&str>)
 impl FdbClient {
     pub fn libraries(&self, filter: Option<&str>) -> Result<Value> {
         if let Some(serial) = filter {
-            pools::base(serial)?;
+            management::base(serial)?;
         }
         let path = format!(
             "/admin/libraries{}",
@@ -116,7 +116,7 @@ impl FdbClient {
                 .map(|s| format!("?library={}", encode_query(s)))
                 .unwrap_or_default()
         );
-        let value = pools::parsed(self.retry_request("GET", &path, None, &[])?, &[200])?;
+        let value = management::parsed(self.retry_request("GET", &path, None, &[])?, &[200])?;
         if value["version"] != 1 {
             return Err(bad("带库清单版本无效"));
         }
@@ -142,11 +142,11 @@ impl FdbClient {
         Ok(value)
     }
     pub fn library(&self, library: &str, namespace: &str) -> Result<Value> {
-        pools::uuid(namespace)?;
-        let value = pools::parsed(
+        management::uuid(namespace)?;
+        let value = management::parsed(
             self.retry_request(
                 "GET",
-                &format!("{}/library", pools::base(library)?),
+                &format!("{}/library", management::base(library)?),
                 None,
                 &[(NS, namespace)],
             )?,
@@ -164,20 +164,20 @@ impl FdbClient {
         pool: Option<&str>,
         after: Option<&str>,
     ) -> Result<Value> {
-        pools::uuid(namespace)?;
+        management::uuid(namespace)?;
         if let Some(pool) = pool {
-            pools::uuid(pool)?;
+            management::uuid(pool)?;
         }
         let path = format!(
             "{}/tapes?limit=100{}{}",
-            pools::base(library)?,
+            management::base(library)?,
             pool.map(|v| format!("&pool={}", encode_query(v)))
                 .unwrap_or_default(),
             after
                 .map(|v| format!("&after={}", encode_query(v)))
                 .unwrap_or_default()
         );
-        let value = pools::parsed(
+        let value = management::parsed(
             self.retry_request("GET", &path, None, &[(NS, namespace)])?,
             &[200],
         )?;
@@ -220,21 +220,21 @@ impl FdbClient {
         pool: Option<&str>,
         barcode_value: &str,
     ) -> Result<Value> {
-        pools::uuid(namespace)?;
+        management::uuid(namespace)?;
         if let Some(pool) = pool {
-            pools::uuid(pool)?;
+            management::uuid(pool)?;
         }
         if !barcode(barcode_value) {
             return Err(invalid("磁带条码无效"));
         }
         let path = format!(
             "{}/tapes/{}{}",
-            pools::base(library)?,
+            management::base(library)?,
             encode_query(barcode_value),
             pool.map(|v| format!("?pool={}", encode_query(v)))
                 .unwrap_or_default()
         );
-        let value = pools::parsed(
+        let value = management::parsed(
             self.retry_request("GET", &path, None, &[(NS, namespace)])?,
             &[200],
         )?;
