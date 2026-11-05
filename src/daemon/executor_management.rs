@@ -596,6 +596,10 @@ pub(super) fn execute(
 }
 
 #[cfg(test)]
+#[path = "executor_management_physical_tests.rs"]
+mod physical_inventory_tests;
+
+#[cfg(test)]
 mod inventory_tests {
     use super::*;
     use crate::scsi::{

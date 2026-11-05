@@ -30,6 +30,8 @@
 
 现有设备执行器的 `observe` 用同一次 `READ ELEMENT STATUS` 返回的元素生成 volumes 和 drives，避免两次读取之间位置变化时拼出混合快照。它仍是带时间的观测，返回后设备可能已变化，不代替执行机械操作前的身份与位置核验；FDB 周期采集与管理入口接线仍待完成。
 
+真实采集验证用例 `real_inventory_observation_uses_one_element_status_reply` 默认忽略，直接调用该生产采集方法并计数实际 CDB。现场协调器须先确认当前 owner、空闲设备队列、原 PR 与目标隔离，再通过 `TAPE_RS_LIBRARY_OBSERVATION_CONFIG` 提供 library、node、round、devices（每项含 path、serial、kind=changer|drive）的 JSON。用例在打开前逐项校验 sysfs 序列号，只允许 INQUIRY、PR IN、MODE SENSE、READ ELEMENT STATUS；验证一次库存响应、卷与驱动投影一致、前后 PR 不变。它不写 FDB，也不代替管理 API、后台巡检和通知链的实带验收。
+
 条码和地址不能在 volumes 内重复，驱动序列号和地址不能在 drives 内重复；列出的驱动装载条码须与同地址的 drive 元素一致。完整 changer 库存可以包含未配置驱动中的介质，不要求所有 drive 元素都在受管 drives 集合中。库存内驱动序列号最多 255 字节，拒绝空白、控制符和 `/`；库序列号沿用当前物理库标识规则。
 
 验证标量形状与边界后才复制输入，最多 4096 个 volumes 和 4096 个 drives，最终完整记录最多 90,000 字节；超限拒绝整次发布，不截断或保存半份库存。当前是有界单记录缓存，大型库存的分片发布尚未实现。数组按元素地址规范排序，读取校验版本、namespace、库、轮次、类型、范围及规范编码，损坏记录不会被查询或后续写入自动修复。
