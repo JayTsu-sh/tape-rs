@@ -374,6 +374,7 @@ impl ProjectionScratch {
             Uuid::nil(),
             &Node {
                 kind: NodeKind::Directory,
+                directory_version: Some(1),
                 parent: Uuid::nil(),
                 name: Vec::new(),
                 attributes: None,
@@ -471,6 +472,7 @@ impl ProjectionScratch {
                 import_inode(self.namespace, pool, "/"),
                 &Node {
                     kind: NodeKind::Directory,
+                    directory_version: Some(1),
                     parent: Uuid::nil(),
                     name: pool.as_hyphenated().to_string().into_bytes(),
                     attributes: None,
@@ -502,6 +504,7 @@ impl ProjectionScratch {
                 id,
                 &Node {
                     kind: NodeKind::Directory,
+                    directory_version: Some(1),
                     parent,
                     name,
                     attributes: Some(entry.current_attributes.clone()),
@@ -521,6 +524,7 @@ impl ProjectionScratch {
             plan.id,
             &Node {
                 kind: NodeKind::File,
+                directory_version: None,
                 parent: plan.parent,
                 name: plan.name,
                 attributes: Some(plan.attributes),
@@ -1083,6 +1087,7 @@ async fn write_projected_file(
     let head_key = head_key(namespace, plan.id);
     let node_value = encode_node(&Node {
         kind: NodeKind::File,
+        directory_version: None,
         parent: plan.parent,
         name: plan.name.clone(),
         attributes: Some(plan.attributes.clone()),

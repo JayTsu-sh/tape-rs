@@ -152,6 +152,7 @@ fn decode(bytes: &[u8]) -> Result<(Uuid, VerifiedNativeBarrier)> {
 fn root_value() -> Vec<u8> {
     encode_node(&Node {
         kind: NodeKind::Directory,
+        directory_version: Some(1),
         parent: Uuid::nil(),
         name: vec![],
         attributes: None,

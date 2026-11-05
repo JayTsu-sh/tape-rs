@@ -5493,6 +5493,7 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
             Uuid::nil(),
             &Node {
                 kind: NodeKind::Directory,
+                directory_version: Some(1),
                 parent: Uuid::nil(),
                 name: Vec::new(),
                 attributes: None,

@@ -317,6 +317,9 @@ pub enum NodeKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Node {
     pub kind: NodeKind,
+    /// Directory attribute revision; files use FileHead.version exclusively.
+    /// Directory contents are separately protected by path/range conflicts.
+    pub directory_version: Option<u64>,
     pub parent: Uuid,
     pub name: Vec<u8>,
     pub attributes: Option<NodeAttributes>,
@@ -478,6 +481,7 @@ impl ManagedCatalog {
         let source_revision_key = source_revision_key(namespace);
         let value = encode_node(&Node {
             kind: NodeKind::Directory,
+            directory_version: Some(1),
             parent: Uuid::nil(),
             name: Vec::new(),
             attributes: None,
@@ -716,6 +720,7 @@ impl ManagedCatalog {
         let root = node_key(namespace, Uuid::nil());
         let value = encode_node(&Node {
             kind: NodeKind::Directory,
+            directory_version: Some(1),
             parent: Uuid::nil(),
             name: Vec::new(),
             attributes: Some(attributes.clone()),
@@ -838,6 +843,7 @@ impl ManagedCatalog {
                     }
                     let value = encode_node(&Node {
                         kind: NodeKind::Directory,
+                        directory_version: Some(1),
                         parent,
                         name,
                         attributes: attributes.clone(),
@@ -890,6 +896,7 @@ impl ManagedCatalog {
             drop(tr);
             return Ok(Some(Node {
                 kind: NodeKind::File,
+                directory_version: None,
                 parent: receipt.parent,
                 name: receipt.name,
                 attributes: Some(self.hydrate_attributes(namespace, attributes).await?),
@@ -1466,6 +1473,7 @@ impl ManagedCatalog {
                     }
                     let file_node_value = encode_node(&Node {
                         kind: NodeKind::File,
+                        directory_version: None,
                         parent: receipt.parent,
                         name: receipt.name.clone(),
                         attributes: attributes.clone(),
@@ -2178,11 +2186,13 @@ fn encode_node(node: &Node) -> Vec<u8> {
     let attribute_len = node.attributes.as_ref().map_or(0, |attributes| {
         attributes.inline_bytes().map_or(38, |bytes| bytes.len())
     });
-    let mut value = Vec::with_capacity(20 + node.name.len() + attribute_len);
+    let mut value = Vec::with_capacity(30 + node.name.len() + attribute_len);
+    value.extend_from_slice(b"N\x01");
     value.push(match node.kind {
         NodeKind::Directory => 0,
         NodeKind::File => 1,
     });
+    value.extend_from_slice(&node.directory_version.unwrap_or(0).to_be_bytes());
     value.extend_from_slice(node.parent.as_bytes());
     value.extend_from_slice(&(node.name.len() as u16).to_be_bytes());
     value.extend_from_slice(&node.name);
@@ -2205,29 +2215,35 @@ fn encode_node(node: &Node) -> Vec<u8> {
 }
 
 fn decode_node(value: &[u8]) -> Result<Node> {
-    if value.len() < 20 {
-        return Err(CatalogError::Corrupt("node 长度"));
+    if value.len() < 30 || &value[..2] != b"N\x01" {
+        return Err(CatalogError::Corrupt("node 版本或长度"));
     }
-    let kind = match value[0] {
+    let kind = match value[2] {
         0 => NodeKind::Directory,
         1 => NodeKind::File,
         _ => return Err(CatalogError::Corrupt("node 类型")),
     };
-    let name_len = u16::from_be_bytes([value[17], value[18]]) as usize;
-    if name_len > MAX_NAME || value.len() < 20 + name_len {
+    let revision = read_u64(&value[3..11]);
+    let directory_version = match (kind, revision) {
+        (NodeKind::Directory, 1..) => Some(revision),
+        (NodeKind::File, 0) => None,
+        _ => return Err(CatalogError::Corrupt("node 目录属性版本与类型不符")),
+    };
+    let name_len = u16::from_be_bytes([value[27], value[28]]) as usize;
+    if name_len > MAX_NAME || value.len() < 30 + name_len {
         return Err(CatalogError::Corrupt("node 名称长度"));
     }
-    let name = value[19..19 + name_len].to_vec();
+    let name = value[29..29 + name_len].to_vec();
     if !name.is_empty() {
         validate_name(&name).map_err(|_| CatalogError::Corrupt("node 名称"))?;
     }
-    let attributes = match value[19 + name_len] {
-        0 if value.len() == 20 + name_len => None,
-        1 if value.len() - 20 - name_len <= INLINE_LIMIT => {
-            Some(NodeAttributes::decode(&value[20 + name_len..])?)
+    let attributes = match value[29 + name_len] {
+        0 if value.len() == 30 + name_len => None,
+        1 if value.len() - 30 - name_len <= INLINE_LIMIT => {
+            Some(NodeAttributes::decode(&value[30 + name_len..])?)
         }
-        3 if value.len() == 20 + name_len + 38 => {
-            let start = 20 + name_len;
+        3 if value.len() == 30 + name_len + 38 => {
+            let start = 30 + name_len;
             Some(NodeAttributes::from_manifest(AttributeManifest {
                 digest: value[start..start + 32].try_into().unwrap(),
                 len: u32::from_be_bytes(value[start + 32..start + 36].try_into().unwrap()),
@@ -2241,7 +2257,8 @@ fn decode_node(value: &[u8]) -> Result<Node> {
     }
     Ok(Node {
         kind,
-        parent: uuid_from(&value[1..17])?,
+        directory_version,
+        parent: uuid_from(&value[11..27])?,
         name,
         attributes,
     })
@@ -2992,6 +3009,7 @@ mod tests {
         for kind in [NodeKind::Directory, NodeKind::File] {
             let node = Node {
                 kind,
+                directory_version: (kind == NodeKind::Directory).then_some(1),
                 parent: Uuid::new_v4(),
                 name: b"subdir".to_vec(),
                 attributes: None,
@@ -2999,6 +3017,58 @@ mod tests {
             assert_eq!(decode_node(&encode_node(&node)).unwrap(), node);
         }
         assert!(decode_node(&[0, 1]).is_err());
+    }
+
+    #[test]
+    fn node_directory_versions_are_mandatory_and_reject_prototype_records() {
+        for (kind, version) in [
+            (NodeKind::Directory, Some(1)),
+            (NodeKind::Directory, Some(u64::MAX)),
+            (NodeKind::File, None),
+        ] {
+            let node = Node {
+                kind,
+                directory_version: version,
+                parent: Uuid::nil(),
+                name: vec![],
+                attributes: None,
+            };
+            let bytes = encode_node(&node);
+            assert_eq!(bytes.len(), 30);
+            assert_eq!(decode_node(&bytes).unwrap(), node);
+            for end in 0..bytes.len() {
+                assert!(decode_node(&bytes[..end]).is_err());
+            }
+            let mut invalid = bytes.clone();
+            invalid[1] = 2;
+            assert!(decode_node(&invalid).is_err());
+            let mut invalid = bytes.clone();
+            invalid[2] = 2;
+            assert!(decode_node(&invalid).is_err());
+            let mut invalid = bytes.clone();
+            invalid[3..11].copy_from_slice(
+                &if kind == NodeKind::Directory {
+                    0_u64
+                } else {
+                    1
+                }
+                .to_be_bytes(),
+            );
+            assert!(decode_node(&invalid).is_err());
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert!(decode_node(&trailing).is_err());
+        }
+        for tag in [0, 1] {
+            let mut old = vec![tag];
+            old.extend_from_slice(Uuid::nil().as_bytes());
+            old.extend_from_slice(&0_u16.to_be_bytes());
+            old.push(0);
+            assert!(
+                decode_node(&old).is_err(),
+                "首版不读取或回填无版本的 prototype node"
+            );
+        }
     }
 
     #[test]
@@ -3196,6 +3266,7 @@ mod tests {
             Uuid::nil(),
             Node {
                 kind: NodeKind::Directory,
+                directory_version: Some(1),
                 parent: Uuid::nil(),
                 name: Vec::new(),
                 attributes: None,
@@ -3211,6 +3282,7 @@ mod tests {
                 receipt.file_id,
                 Node {
                     kind: NodeKind::File,
+                    directory_version: None,
                     parent: receipt.parent,
                     name: receipt.name.clone(),
                     attributes: None,
@@ -3902,6 +3974,7 @@ mod tests {
                 Uuid::nil(),
                 Node {
                     kind: NodeKind::Directory,
+                    directory_version: Some(1),
                     parent: Uuid::nil(),
                     name: Vec::new(),
                     attributes: Some(root_attrs.clone()),
@@ -3912,6 +3985,7 @@ mod tests {
                 directory,
                 Node {
                     kind: NodeKind::Directory,
+                    directory_version: Some(1),
                     parent: Uuid::nil(),
                     name: b"folder".to_vec(),
                     attributes: Some(dir_attrs.clone()),
@@ -3922,6 +3996,7 @@ mod tests {
                 receipt.file_id,
                 Node {
                     kind: NodeKind::File,
+                    directory_version: None,
                     parent: directory,
                     name: b"alias".to_vec(),
                     attributes: Some(changed_attrs.clone()),
@@ -4153,6 +4228,7 @@ mod tests {
             catalog.node(namespace, a.file_id).await.unwrap(),
             Some(Node {
                 kind: NodeKind::File,
+                directory_version: None,
                 parent: Uuid::nil(),
                 name: b"a".to_vec(),
                 attributes: None,
@@ -4561,6 +4637,7 @@ mod tests {
                 imported_dir,
                 Node {
                     kind: NodeKind::Directory,
+                    directory_version: Some(1),
                     parent: Uuid::nil(),
                     name: b"sub".to_vec(),
                     attributes: None,
