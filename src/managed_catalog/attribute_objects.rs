@@ -133,6 +133,20 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
+    async fn small_text(&mut self, len: usize, limit: usize) -> Result<Option<String>> {
+        if len > limit {
+            self.text(len).await?;
+            return Ok(None);
+        }
+        let mut bytes = Vec::with_capacity(len);
+        for _ in 0..len {
+            bytes.push(self.fixed::<1>().await?[0]);
+        }
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| CatalogError::Corrupt("LTFS 属性对象文本编码"))
+    }
+
     fn finish(self) -> Result<()> {
         use sha2::Digest;
         if self.consumed != u64::from(self.manifest.len)
@@ -161,18 +175,46 @@ impl ManagedCatalog {
         {
             return Err(CatalogError::Corrupt("LTFS 属性对象头"));
         }
-        for _ in 0..5 {
+        let mut modified = None;
+        for index in 0..5 {
             let len = u16::from_be_bytes(reader.fixed().await?) as usize;
-            reader.text(len).await?;
+            if index == 2 {
+                modified = reader
+                    // The encoded timestamp length is u16; preserve the full
+                    // parser's accepted precision within that fixed bound.
+                    .small_text(len, u16::MAX as usize)
+                    .await?
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+                    .map(|time| time.timestamp());
+            } else {
+                reader.text(len).await?;
+            }
         }
         let count = u16::from_be_bytes(reader.fixed().await?);
+        let mut saved_headers = None;
         for _ in 0..count {
             let len = u16::from_be_bytes(reader.fixed().await?) as usize;
-            reader.text(len).await?;
+            let is_headers = reader
+                .small_text(len, "tapers.s3.headers".len())
+                .await?
+                .as_deref()
+                == Some("tapers.s3.headers");
             let len = u32::from_be_bytes(reader.fixed().await?) as usize;
-            reader.text(len).await?;
-            if reader.fixed::<1>().await?[0] > 1 {
+            let value = if is_headers {
+                reader.small_text(len, 10924).await?
+            } else {
+                reader.text(len).await?;
+                None
+            };
+            let flag = reader.fixed::<1>().await?[0];
+            if flag > 1 {
                 return Err(CatalogError::Corrupt("LTFS 属性对象 xattr 标志"));
+            }
+            if is_headers {
+                if saved_headers.is_some() || value.is_none() {
+                    return Err(CatalogError::Corrupt("对象 HTTP 属性重复或过长"));
+                }
+                saved_headers = Some((value.expect("checked header"), flag == 1));
             }
         }
         let symlink = match reader.fixed::<1>().await? {
@@ -185,6 +227,20 @@ impl ManagedCatalog {
             _ => return Err(CatalogError::Corrupt("LTFS 属性对象符号链接标志")),
         };
         reader.finish()?;
+        let expected = ObjectMetadata::from_parts(
+            modified,
+            saved_headers
+                .as_ref()
+                .map(|(value, flag)| (value.as_str(), *flag)),
+        )?;
+        let tr = self.db.create_trx()?;
+        if object_metadata::read_at(&tr, namespace, Some(manifest.digest))
+            .await?
+            .as_ref()
+            != Some(&expected)
+        {
+            return Err(CatalogError::Corrupt("对象元数据投影与属性对象不一致"));
+        }
         Ok(VerifiedShape { symlink })
     }
 
@@ -324,6 +380,7 @@ impl ManagedCatalog {
         namespace: Uuid,
         attributes: &NodeAttributes,
     ) -> Result<()> {
+        self.upload_object_metadata(namespace, attributes).await?;
         let Some(manifest) = attributes.manifest() else {
             return Ok(());
         };

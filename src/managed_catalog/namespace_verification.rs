@@ -331,6 +331,15 @@ async fn verify_nodes(
         validate_suffix(NamespacePhase::Nodes, suffix)?;
         let id = uuid_from(suffix)?;
         let node = decode_node(&raw)?;
+        if let Some(attributes) = &node.attributes
+            && attributes.manifest().is_none()
+            && object_metadata::read_at(tr, namespace, Some(attributes.digest()))
+                .await?
+                .as_ref()
+                != Some(&ObjectMetadata::from_attributes(attributes)?)
+        {
+            return Err(CatalogError::Corrupt("对象元数据投影与内联属性不一致"));
+        }
         if let Some(manifest) = node.attributes.as_ref().and_then(NodeAttributes::manifest) {
             super::attribute_objects::require_complete(tr, namespace, manifest).await?;
             let shape = shapes

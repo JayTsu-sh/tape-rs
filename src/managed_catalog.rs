@@ -9,8 +9,10 @@ use uuid::Uuid;
 
 mod attribute_objects;
 mod attributes;
+mod object_metadata;
 pub use attributes::NodeAttributes;
 use attributes::{AttributeManifest, CHUNK_SIZE, INLINE_LIMIT, MAX_REPRESENTABLE};
+pub use object_metadata::ObjectMetadata;
 mod active_volume;
 pub use active_volume::{
     ActiveIndexIdentity, ActiveIndexOutcome, ActiveLoadedVolumeHead, ActiveRecoveryOutcome,
