@@ -641,6 +641,7 @@ pub(super) mod tests {
                     &node_key(namespace, first.file_id),
                     &encode_node(&Node {
                         kind: NodeKind::File,
+                        directory_version: None,
                         parent: Uuid::nil(),
                         name: first.name.clone(),
                         attributes: None,
@@ -714,6 +715,7 @@ pub(super) mod tests {
                             &node_key(namespace, first.file_id),
                             &encode_node(&Node {
                                 kind: NodeKind::Directory,
+                                directory_version: Some(1),
                                 parent: Uuid::nil(),
                                 name: first.name.clone(),
                                 attributes: None,

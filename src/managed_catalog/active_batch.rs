@@ -1520,6 +1520,7 @@ impl ManagedCatalog {
                                 &inode_key,
                                 &encode_node(&Node {
                                     kind: NodeKind::File,
+                                    directory_version: None,
                                     parent: receipt.parent,
                                     name: receipt.name.clone(),
                                     attributes: Some(attributes),

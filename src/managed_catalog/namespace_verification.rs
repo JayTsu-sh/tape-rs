@@ -92,6 +92,12 @@ impl NamespaceDigest {
 }
 
 fn validate_shape(id: Uuid, node: &Node) -> Result<()> {
+    if !matches!(
+        (node.kind, node.directory_version),
+        (NodeKind::Directory, Some(1..)) | (NodeKind::File, None)
+    ) {
+        return Err(CatalogError::Invalid("目录属性版本与 inode 类型不符"));
+    }
     if node.kind == NodeKind::Directory
         && node
             .attributes
@@ -949,6 +955,7 @@ pub(super) mod tests {
     fn root() -> Node {
         Node {
             kind: NodeKind::Directory,
+            directory_version: Some(1),
             parent: Uuid::nil(),
             name: Vec::new(),
             attributes: None,
@@ -957,10 +964,44 @@ pub(super) mod tests {
     fn directory(name: &[u8]) -> Node {
         Node {
             kind: NodeKind::Directory,
+            directory_version: Some(1),
             parent: Uuid::nil(),
             name: name.to_vec(),
             attributes: None,
         }
+    }
+    #[test]
+    fn directory_attribute_versions_are_bound_into_namespace_proofs() {
+        let namespace = Uuid::new_v4();
+        let mut first = NamespaceDigest::new(namespace).unwrap();
+        first.push(Uuid::nil(), &root(), None).unwrap();
+        let mut changed = root();
+        changed.directory_version = Some(2);
+        let mut second = NamespaceDigest::new(namespace).unwrap();
+        second.push(Uuid::nil(), &changed, None).unwrap();
+        assert_ne!(first.summary(), second.summary());
+        for version in [None, Some(0)] {
+            changed.directory_version = version;
+            assert!(
+                NamespaceDigest::new(namespace)
+                    .unwrap()
+                    .push(Uuid::nil(), &changed, None)
+                    .is_err()
+            );
+        }
+        let mut file = directory(b"file");
+        file.kind = NodeKind::File;
+        let head = FileHead {
+            version: 1,
+            size: 0,
+            copy_id: Uuid::new_v4(),
+        };
+        assert!(
+            NamespaceDigest::new(namespace)
+                .unwrap()
+                .push(Uuid::new_v4(), &file, Some(&head))
+                .is_err()
+        );
     }
     fn summary(namespace: Uuid, records: &Records) -> NamespaceSummary {
         let mut digest = NamespaceDigest::new(namespace).unwrap();
@@ -1001,6 +1042,7 @@ pub(super) mod tests {
         (
             Node {
                 kind: NodeKind::File,
+                directory_version: None,
                 parent: receipt.parent,
                 name: receipt.name.clone(),
                 attributes: None,
@@ -1027,6 +1069,7 @@ pub(super) mod tests {
         assert_eq!(digest.summary().nodes, 2);
         let node = Node {
             kind: NodeKind::File,
+            directory_version: None,
             parent: Uuid::nil(),
             name: b"file".to_vec(),
             attributes: None,
