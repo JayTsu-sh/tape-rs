@@ -6,7 +6,7 @@ const MAX_PURGE_PAGE: usize = 100;
 // Copies must go first: they are the bounded reverse lookup for volume rows.
 // The e index is released only by the explicit owner-fenced media check.
 // The managed marker a is cleared after all assignments have been released.
-const NAMESPACE_ROWS: &[u8] = b"RtjsquvwnlkhgfoNCHmMPLZIFABDKEeayYWTUX";
+const NAMESPACE_ROWS: &[u8] = b"RtjsquvwnlkhgfoNCHmMPLZIFABDKEeaWTUX";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PurgeProgress {
@@ -463,10 +463,10 @@ pub(super) mod tests {
         );
         let reopened = ManagedCatalog::open(Some(cluster_file)).unwrap();
         // 103 copy/head/op/file node/child groups, 1001 directories, root,
-        // default node group, and the explicitly inserted proof/progress rows.
+        // request windows and the explicitly inserted proof/progress rows.
         assert_eq!(
             first_page.removed + finish(&reopened, namespace).await,
-            103 * 5 + 1001 * 2 + 4 + 4 + quota_rows
+            103 * 5 + 1001 * 2 + 3 + 4 + quota_rows
         );
         assert_eq!(finish(&reopened, namespace).await, 0);
         assert_eq!(

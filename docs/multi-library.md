@@ -32,7 +32,7 @@
 
 `--expand-libraries-offline` 是同时支持新增库和在旧库追加驱动器的正式参数，`--add-libraries-offline` 保留为同义别名。新增驱动必须使用新的真实 VPD 序列号，旧驱动不能从列表删除或改名；记录同时记下新增驱动集合。原控制快照可继续使用，因为库身份不变。执行前须只读确认新驱动确属该库、DVCID 与预期一致且没有其他服务占用；启动后继续核对 owner 与设备状态。
 
-更换一台旧驱动时，把新配置中该库的旧序列号换成新序列号，然后在全体节点停机后逐节点运行 `ltfsd --replace-drive-offline OLD=NEW --libraries-config <新配置>`，同时带上原有节点和数据目录参数。该命令要求库集合及默认库不变、同一库只更换这一台驱动，并拒绝本地存在未提交的 Raft 日志；不会访问设备。回放旧快照和日志时，旧驱动的 `enabled`、角色、节点组等管理策略迁到新序列号，旧库存观测失效，实际库存须在新 owner 就绪后显式 `library rescan`。操作前须核实旧驱动没有载带、新驱动确属该库且 DVCID/真实 VPD 序列号相符，并确认 EE 或其他进程未占用；三个节点变更前提交索引必须一致。没有替换硬件时不能把此软件路径算作现场验收。
+更换一台旧驱动时，把新配置中该库的旧序列号换成新序列号，然后在全体节点停机后逐节点运行 `ltfsd --replace-drive-offline OLD=NEW --libraries-config <新配置>`，同时带上原有节点和数据目录参数。该命令要求库集合及默认库不变、同一库只更换这一台驱动，并拒绝本地存在未提交的 Raft 日志；不会访问设备。回放旧快照和日志时，旧驱动的 `enabled`、角色等管理策略迁到新序列号，旧库存观测失效，实际库存须在新 owner 就绪后显式 `library rescan`。操作前须核实旧驱动没有载带、新驱动确属该库且 DVCID/真实 VPD 序列号相符，并确认 EE 或其他进程未占用；三个节点变更前提交索引必须一致。没有替换硬件时不能把此软件路径算作现场验收。
 
 退役一台驱动但保留带库时，从新配置中删去该驱动序列号，在全部节点正常停机且日志追齐后逐节点运行 `ltfsd --remove-drive-offline <旧驱动序列号> --libraries-config <新配置>`，并提供原节点、peer 和数据目录参数。每次只移除一台，库内至少保留一台驱动；命令拒绝未提交日志及同时增删其他设备，不访问设备，也不删除磁带目录或文件。旧驱动策略在快照和日志回放时丢弃，指向它的排队/运行管理任务标为 `indeterminate`，含它的库存失效；启动后应显式 `library rescan`。执行前核对驱动已空、无未完成机械任务、实体带仍可由剩余驱动读取，并确认三个节点提交索引一致。移除的序列号不允许在之后的配置变更中复用；若要恢复该实体驱动，需要设计单独的恢复流程。此命令不是带库退役，也不迁移文件或磁带。
 
@@ -96,8 +96,8 @@ FUSE `close` 仍只确认暂存；应用须在关闭文件前调用 `fsync` 确�
 
 序列号唯一身份、两个真实内核 FUSE 挂载及双物理库读写已经完成[本轮现场验收](library-serial-physical-acceptance-20261021.md)。前一份多库报告中的 l8/l9 是历史版本事实，不代表当前接口仍支持别名。
 
-`ltfsctl` 的管理子命令使用同一固定入口和 `--library` 选择库。`library rescan`、`drive up/down/role/assign`、`node assign`、`nodegroup create/delete`、`pool set/delete`、`tape offline/online/blacklist/clear-blacklist/validate/reconcile/objects`、`task cancel/clearhistory --yes` 调用对应 HTTP 管理路由；设备操作返回任务号，须再用 `task show <ID>` 查询终态。`tape reconcile` 从磁带索引更新集群目录，不执行 GPFS HSM 对账；`tape objects` 查询 EE 保存对象，不是普通文件列表。`admin` 子命令仍可显式调用尚未列为具名命令的管理路由。三节点隔离候选已验证 B 库的 rescan、保留驱动 up/down/role、空池属性、上述磁带策略/校验/对账/对象查询与旧文件读回；其余命令和正式服务部署范围见[差距进展](multi-library-gap-progress-20261022.md)。
+`ltfsctl` 的管理子命令使用同一固定入口和 `--library` 选择库。`library rescan`、`drive up/down/role`、`pool set/delete`、`tape offline/online/blacklist/clear-blacklist/validate/objects`、`task cancel/clearhistory --yes` 调用对应 HTTP 管理路由；设备操作返回任务号，须再用 `task show <ID>` 查询终态。`tape objects` 查询 EE 保存对象，不是普通文件列表。`admin` 子命令仍可显式调用尚未列为具名命令的管理路由。三节点隔离候选已验证 B 库的 rescan、保留驱动 up/down/role、空池属性、上述磁带策略/校验/对账/对象查询与旧文件读回；其余命令和正式服务部署范围见[差距进展](multi-library-gap-progress-20261022.md)。
 
-驱动 `up/down/role/assign` 只接受当前 owner 轮次经 `library rescan` 观测到的真实驱动序列号；旧库存和未列出的序列号都会拒绝，避免替换驱动后把策略写给不存在的设备。
+驱动 `up/down/role` 只接受当前 owner 轮次经 `library rescan` 观测到的真实驱动序列号；旧库存和未列出的序列号都会拒绝，避免替换驱动后把策略写给不存在的设备。
 
 `ltfsctl copy` 已在 [同节点 owner 的 A→B 试验](multi-library-cross-copy-physical-20261022.md)与[分散 owner 的 A→B 试验](multi-library-split-owner-copy-physical-20261022.md)中将 A 库的普通文件显式复制到 B 库，并在独立冷挂后从 B 磁带读回。源和目标仍是分库目录中的两个文件；当前没有全局副本集合、自动同步或物理迁池事务。

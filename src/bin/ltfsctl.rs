@@ -77,11 +77,6 @@ enum Cmd {
         #[command(subcommand)]
         cmd: NodeCmd,
     },
-    /// 节点组管理状态
-    Nodegroup {
-        #[command(subcommand)]
-        cmd: NodegroupCmd,
-    },
     /// 集群管理任务
     Task {
         #[command(subcommand)]
@@ -154,22 +149,12 @@ enum DriveCmd {
     Up { id: String },
     Down { id: String },
     Role { id: String, role: String },
-    Assign { id: String, group: String },
 }
 
 #[derive(Subcommand)]
 enum NodeCmd {
     List,
     Show { id: String },
-    Assign { id: String, group: String },
-}
-
-#[derive(Subcommand)]
-enum NodegroupCmd {
-    List,
-    Show { id: String },
-    Create { name: String },
-    Delete { name: String },
 }
 
 #[derive(Subcommand)]
@@ -219,8 +204,6 @@ enum TapeCmd {
         #[arg(long)]
         full_read: bool,
     },
-    /// 以实带 LTFS 索引重新对账集群目录；返回管理任务号
-    Reconcile { barcode: String },
     /// 从实带索引列出 EE 对象；返回管理任务号
     Objects {
         barcode: String,
@@ -467,36 +450,10 @@ fn main() {
                     &format!("/admin/drives/{id}/role"),
                     serde_json::json!({"role":role}),
                 )?),
-                DriveCmd::Assign { id, group } => print_json(c.admin_request(
-                    "POST",
-                    &format!("/admin/drives/{id}/assign"),
-                    serde_json::json!({"group":group}),
-                )?),
             },
             Cmd::Node { cmd } => match cmd {
                 NodeCmd::List => print_json(c.admin_get("/admin/nodes")?),
                 NodeCmd::Show { id } => print_json(c.admin_get(&format!("/admin/nodes/{id}"))?),
-                NodeCmd::Assign { id, group } => print_json(c.admin_request(
-                    "POST",
-                    &format!("/admin/nodes/{id}/assign"),
-                    serde_json::json!({"group":group}),
-                )?),
-            },
-            Cmd::Nodegroup { cmd } => match cmd {
-                NodegroupCmd::List => print_json(c.admin_get("/admin/nodegroups")?),
-                NodegroupCmd::Show { id } => {
-                    print_json(c.admin_get(&format!("/admin/nodegroups/{id}"))?)
-                }
-                NodegroupCmd::Create { name } => print_json(c.admin_request(
-                    "POST",
-                    &format!("/admin/nodegroups/{name}"),
-                    serde_json::json!({}),
-                )?),
-                NodegroupCmd::Delete { name } => print_json(c.admin_request(
-                    "DELETE",
-                    &format!("/admin/nodegroups/{name}"),
-                    serde_json::json!({}),
-                )?),
             },
             Cmd::Task { cmd } => match cmd {
                 TaskCmd::List => print_json(c.admin_get("/admin/tasks")?),
@@ -581,13 +538,6 @@ fn main() {
                 serde_json::json!({"full_read":full_read}),
             )?),
             Cmd::Tape {
-                cmd: TapeCmd::Reconcile { barcode },
-            } => print_json(c.admin_request(
-                "POST",
-                &format!("/admin/tapes/{barcode}/reconcile"),
-                serde_json::json!({}),
-            )?),
-            Cmd::Tape {
                 cmd:
                     TapeCmd::Objects {
                         barcode,
@@ -621,4 +571,28 @@ fn main() {
 
 fn print_json(value: serde_json::Value) {
     println!("{}", serde_json::to_string_pretty(&value).unwrap());
+}
+
+#[cfg(test)]
+mod removed_management_tests {
+    use super::*;
+
+    #[test]
+    fn obsolete_group_and_reconcile_commands_are_rejected() {
+        for command in [
+            vec!["nodegroup", "list"],
+            vec!["node", "assign", "1", "G0"],
+            vec!["drive", "assign", "SERIAL", "G0"],
+            vec!["tape", "reconcile", "AA0014L8"],
+        ] {
+            let mut args = vec!["ltfsctl", "-e", "127.0.0.1:7401"];
+            args.extend(command);
+            assert!(Args::try_parse_from(args).is_err());
+        }
+        for command in [vec!["node", "list"], vec!["drive", "role", "SERIAL", "rg"]] {
+            let mut args = vec!["ltfsctl", "-e", "127.0.0.1:7401"];
+            args.extend(command);
+            assert!(Args::try_parse_from(args).is_ok());
+        }
+    }
 }

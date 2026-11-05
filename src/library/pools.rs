@@ -14,12 +14,11 @@ const MEDIA_RESTRICTIONS: &[&str] = &[
 const POOL_QUERY: &str = "SELECT names.name, p.uuid,
     COALESCE(p.media_restriction, 'none'), COALESCE(p.mount_limit, 0),
     (SELECT COUNT(*) FROM library_volumes v WHERE v.pool=names.name),
-    COALESCE(g.nodegroup, 'G0'), COALESCE(w.low_enabled, 1),
+    COALESCE(w.low_enabled, 1),
     COALESCE(w.low_threshold, 0), COALESCE(w.no_enabled, 1)
     FROM (SELECT DISTINCT pool AS name FROM library_volumes
           UNION SELECT name FROM library_pools) names
     LEFT JOIN library_pools p ON p.name=names.name
-    LEFT JOIN library_pool_groups g ON g.pool=names.name
     LEFT JOIN library_pool_warnings w ON w.pool=names.name";
 
 pub(super) fn initialize(db: &Connection) -> Result<()> {
@@ -29,9 +28,6 @@ pub(super) fn initialize(db: &Connection) -> Result<()> {
             uuid TEXT NOT NULL UNIQUE,
             media_restriction TEXT NOT NULL DEFAULT 'none',
             mount_limit INTEGER NOT NULL DEFAULT 0 CHECK(mount_limit BETWEEN 0 AND 32767)
-        );
-        CREATE TABLE IF NOT EXISTS library_pool_groups (
-            pool TEXT PRIMARY KEY, nodegroup TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS library_pool_warnings (
             pool TEXT PRIMARY KEY, low_enabled INTEGER NOT NULL DEFAULT 1 CHECK(low_enabled IN (0,1)),
@@ -72,7 +68,7 @@ fn exists(db: &Connection, name: &str) -> Result<bool> {
     )?)
 }
 
-fn require_pool(db: &Connection, name: &str) -> Result<()> {
+pub(super) fn require_pool(db: &Connection, name: &str) -> Result<()> {
     if !exists(db, name)? {
         return Err(refuse(format!("池不存在：{name}")));
     }
@@ -88,10 +84,9 @@ fn describe(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "media_restriction": row.get::<_, String>(2)?,
         "mount_limit": row.get::<_, u16>(3)?,
         "num_of_tapes": row.get::<_, u64>(4)?,
-        "nodegroup_name": row.get::<_, String>(5)?,
-        "low_space_warning_enable": row.get::<_, bool>(6)?,
-        "low_space_warning_threshold": row.get::<_, u16>(7)?,
-        "no_space_warning_enable": row.get::<_, bool>(8)?,
+        "low_space_warning_enable": row.get::<_, bool>(5)?,
+        "low_space_warning_threshold": row.get::<_, u16>(6)?,
+        "no_space_warning_enable": row.get::<_, bool>(7)?,
     }))
 }
 
@@ -209,7 +204,6 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
             return Err(refuse(format!("池非空，不能删除：{name}")));
         }
         transaction.execute("DELETE FROM library_pools WHERE name=?1", [name])?;
-        transaction.execute("DELETE FROM library_pool_groups WHERE pool=?1", [name])?;
         transaction.execute("DELETE FROM library_pool_warnings WHERE pool=?1", [name])?;
         transaction.commit()?;
         Ok(())
@@ -231,20 +225,6 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
 
     pub fn pool_list(&self) -> Result<Value> {
         list_from_db(&self.db)
-    }
-
-    /// 本地调度分组。旧隐式池沿用 G0，不推断远端节点归属。
-    pub fn pool_nodegroup(&self, name: &str) -> Result<String> {
-        require_pool(&self.db, name)?;
-        Ok(self
-            .db
-            .query_row(
-                "SELECT nodegroup FROM library_pool_groups WHERE pool=?1",
-                [name],
-                |r| r.get(0),
-            )
-            .optional()?
-            .unwrap_or_else(|| "G0".into()))
     }
 
     /// 保存调用方从两个实际 DP MAM 容量属性得到的完整字节观测。
@@ -313,10 +293,6 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
                         .ok_or_else(|| refuse(format!("{attribute} 必须为 0..32767 的整数")))?,
                 )
             }
-            "nodegroup" => {
-                self.require_nodegroup(value)?;
-                None
-            }
             "lowspacewarningenable" | "nospacewarningenable" => {
                 if !["yes", "no"].contains(&value) {
                     return Err(refuse(format!("{attribute} 必须为 yes 或 no")));
@@ -325,10 +301,6 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
             }
             _ => return Err(refuse(format!("不支持的池属性：{attribute}"))),
         };
-
-        if attribute == "nodegroup" && self.pool_nodegroup(name)? != value {
-            self.check_pool_group_change(name)?;
-        }
 
         let transaction = self.db.unchecked_transaction()?;
         require_pool(&transaction, name)?;
@@ -358,10 +330,6 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
                     params![name, value],
                 )?;
                 transaction.execute(
-                    "UPDATE library_pool_groups SET pool=?2 WHERE pool=?1",
-                    params![name, value],
-                )?;
-                transaction.execute(
                     "UPDATE library_pool_warnings SET pool=?2 WHERE pool=?1",
                     params![name, value],
                 )?;
@@ -376,13 +344,6 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
                 transaction.execute(
                     "UPDATE library_pools SET mount_limit=?2 WHERE name=?1",
                     params![name, limit],
-                )?;
-            }
-            "nodegroup" => {
-                transaction.execute(
-                    "INSERT INTO library_pool_groups(pool,nodegroup) VALUES(?1,?2)
-                     ON CONFLICT(pool) DO UPDATE SET nodegroup=excluded.nodegroup",
-                    params![name, value],
                 )?;
             }
             "lowspacewarningenable" | "lowspacewarningthreshold" | "nospacewarningenable" => {

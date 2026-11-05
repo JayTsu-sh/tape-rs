@@ -63,32 +63,29 @@ HTTP 接入使用 axum / Hyper，保持现有端点、状态码、JSON 字段和
 | 黑名单/清除 | `POST /admin/tapes/{barcode}/blacklist`、`…/clear-blacklist` | blacklist：`{"reason":"inspection"}`；清除：`{}` |
 | 机械搬带 | `POST /admin/tapes/{barcode}/move` | `{"location":"homeslot"}` 或 `{"location":"ieslot"}`；移至 I/E 前必须 offline |
 | 校验 | `POST /admin/tapes/{barcode}/validate` | `{"full_read":true}`；默认只验证索引，完整读取核对已有哈希，无哈希单独计数 |
-| 对账 | `POST /admin/tapes/{barcode}/reconcile` | `{}`；通过已有分片流程更新集群 catalog，不做 GPFS/HSM 对账 |
 | EE 保存对象 | `POST /admin/tapes/{barcode}/objects` | `{"offset":0,"limit":100}`；limit 为 1–500，按 `next_offset` 继续，跨页须核对卷代数 |
 | 恢复 EE 保存对象 | `POST /admin/tapes/{barcode}/restore` | `{"destination":"/absolute/new-directory","confirm":true}`；目的地在执行 owner 本机，只恢复普通文件/目录/链接，不创建 HSM stub |
 | 空间回收 | `POST /admin/tapes/{barcode}/reclaim` | 沿用既有回收协议、两驱动器要求及格式化前核验 |
 | 驱动列表/详情 | `GET /admin/drives`、`GET /admin/drives/{serial}` | 无 |
-| 驱动调度资格 | `POST /admin/drives/{serial}/up`、`…/down`、`…/role`、`…/assign` | up/down：`{}`；role：`{"role":"mrg"}`；assign：`{"group":"G0"}`，`-` 解除分配 |
-| 节点与节点组查询 | `GET /admin/nodes`、`GET /admin/nodes/{id}`、`GET /admin/nodegroups`、`GET /admin/nodegroups/{name}` | 无 |
-| 创建/删除节点组 | `POST /admin/nodegroups/{name}`、`DELETE /admin/nodegroups/{name}` | 无；拒绝删除默认组或仍被使用的组 |
-| 指定节点调度组 | `POST /admin/nodes/{id}/assign` | `{"group":"G0"}`；`-` 停用该节点的设备调度，不改变 Raft 成员资格 |
+| 驱动调度资格 | `POST /admin/drives/{serial}/up`、`…/down`、`…/role` | up/down：`{}`；role：`{"role":"mrg"}` |
+| 节点查询 | `GET /admin/nodes`、`GET /admin/nodes/{id}` | 无；节点是带库的参与者，不分节点组 |
 | 管理任务列表/详情 | `GET /admin/tasks`、`GET /admin/tasks/{id}` | 无；与文件操作的 `/tasks/{id}` 分开 |
 | 请求取消 | `POST /admin/tasks/{id}/cancel` | `{}`；协作取消，不中断在途 CDB，不回滚已完成操作 |
 | 清理终态任务历史 | `POST /admin/tasks/clearhistory` | 必须 `{"confirm":true}`；保留 queued/running，删除的历史不能恢复 |
 
 `ltfsctl tape offline <条码> <说明>`、`tape online <条码>`、`tape blacklist <条码> <原因>`、`tape clear-blacklist <条码>` 对应上述可逆策略接口；`tape validate <条码> [--full-read]` 校验 LTFS 索引，指定选项时还读取文件核对已有哈希。命令返回管理任务号；须用 `ltfsctl task show <任务号>` 核对终态。操作特定带库时加 `--library <真实 changer 序列号>`。
 
-`ltfsctl` 现在可直接查询集群管理资源，例如 `library list`、`library show <序列号>`、`tape list/show`、`drive list/show`、`node list/show`、`nodegroup list/show`、`pool show` 和 `task list/show`。除全局 `library list` 外，`--library <真实序列号>` 始终限定目标库。输出为管理接口的完整 JSON，容量与状态字段不经 CLI 二次计算。文件任务单独用 `file-task <id>` 查询。
+`ltfsctl` 现在可直接查询集群管理资源，例如 `library list`、`library show <序列号>`、`tape list/show`、`drive list/show`、`node list/show`、`pool show` 和 `task list/show`。除全局 `library list` 外，`--library <真实序列号>` 始终限定目标库。输出为管理接口的完整 JSON，容量与状态字段不经 CLI 二次计算。文件任务单独用 `file-task <id>` 查询。
 
 尚未有专用 CLI 语法的管理写入可用 `ltfsctl --library <序列号> admin post|patch|delete /admin/... --body '<JSON>'` 显式调用上述接口。例如 `admin post /admin/libraries/current/rescan --body '{}'`；设备任务返回 `task` 后用 `task show <id>` 查询终态。连接在写请求可能送达后断开时，客户端返回结果未定，不会自动重放请求。
 
-池属性支持 `poolname`、`file_limit`、`mediarestriction`、`mountlimit`、`nodegroup`、`lowspacewarningenable`、`lowspacewarningthreshold`、`nospacewarningenable`。数字及 yes/no 属性沿用字符串值；mountlimit 为 0 时不限制池的写入驱动租约数，容量告警阈值单位为 TiB。容量采用最近一次有效 DP MAM 缓存：未装载时沿用旧值，装载及写入提交后由 owner 刷新并通过 Raft 复制；刷新失败保留同卷旧值并报告失败。未观测或已知卷身份失效时返回 null，不从文件大小推算剩余容量，也不冒充 EE 后台告警事件。m/r/g 分别控制写入、读取和维护；驱动、池及节点分组同时参与设备调度。
+池属性支持 `poolname`、`file_limit`、`mediarestriction`、`mountlimit`、`lowspacewarningenable`、`lowspacewarningthreshold`、`nospacewarningenable`。数字及 yes/no 属性沿用字符串值；mountlimit 为 0 时不限制池的写入驱动租约数，容量告警阈值单位为 TiB。容量采用最近一次有效 DP MAM 缓存：未装载时沿用旧值，装载及写入提交后由 owner 刷新并通过 Raft 复制；刷新失败保留同卷旧值并报告失败。未观测或已知卷身份失效时返回 null，不从文件大小推算剩余容量，也不冒充 EE 后台告警事件。m/r/g 分别控制写入、读取和维护；驱动启用状态、角色、介质兼容性和池挂载上限共同约束设备调度。
 
 所有变更由控制 Leader 受理；访问 Follower 返回 `503 not_leader` 及已知 Leader 地址。查询可访问任意节点，返回 `applied_index` 和 `answered_by`，属于已应用状态视图，不承诺线性一致读取。库存查询读取带时间、owner 和轮次的最近观测；首次使用或要求新鲜库存时显式 rescan。驱动序列号必须与配置设备精确匹配。
 
-需要 owner 核验或操作的请求返回 `202 {"task":123,"status":"queued"}`，表示任务已登记；必须查询 `/admin/tasks/123` 的终态。任务开始先经多数派提交，再在现有隔离和执行许可下操作设备。任务状态为 queued/running/success/failed/cancelled/indeterminate，带执行 owner、round、进度和结果；索引代数及结果不会因换节点丢失。无设备 owner 时可查询、建删空池及管理节点组/取消任务，新的设备任务会拒绝受理。
+需要 owner 核验或操作的请求返回 `202 {"task":123,"status":"queued"}`，表示任务已登记；必须查询 `/admin/tasks/123` 的终态。任务开始先经多数派提交，再在现有隔离和执行许可下操作设备。任务状态为 queued/running/success/failed/cancelled/indeterminate，带执行 owner、round、进度和结果；索引代数及结果不会因换节点丢失。无设备 owner 时可查询、建删空池及取消任务，新的设备任务会拒绝受理。
 
-需要借用磁带的维护以及池属性修改会先暂停新上传、等待已准入上传完成、提交并收束当前写入带、将本实例使用的带归槽；维护结束再按最新策略选带。驱动策略变更要求目标驱动器为空，当前 owner 的节点组变更要求受管驱动器为空。offline 保留 assignment，上线须实际装带验证 LTFS 索引；校验和对账允许检查 offline 带，但不绕过黑名单。搬到 I/E 不等于 EE export，回到 home slot 不等于 HSM import。
+需要借用磁带的维护以及池属性修改会先暂停新上传、等待已准入上传完成、提交并收束当前写入带、将本实例使用的带归槽；维护结束再按最新策略选带。驱动策略变更要求目标驱动器为空。offline 保留 assignment，上线须实际装带验证 LTFS 索引；校验允许检查 offline 带，但不绕过黑名单。搬到 I/E 不等于 EE export，回到 home slot 不等于 HSM import。
 
 分配磁带后，既有调度器可能自动装带，并在首次选择空白带写入时按既有规则格式化；foreign 介质仍拒绝覆盖。恢复操作的文件输出留在任务记载的 owner 本机，不随 HA 自动搬迁。
 
@@ -127,9 +124,9 @@ curl http://127.0.0.1:7401/admin/tasks/123
 | 磁带 `status`、`appendable`、`appendable_reason` | status 是严重程度，state 是业务状态；分级规则见下文。可追加资格综合卷状态、离线/黑名单、池介质限制及文件数上限；no 附中文原因，未分配或状态未确认时 appendable 为 null。它不表示此刻已装载或 owner 正在服务 |
 | `pool_id`、`pool_name`、`offline_msg` | 当前分配池及离线说明；无对应值为 null |
 | `location_type`、`address`、`drive_id` | 最近库存中的 homeslot/ieslot/drive、绝对 SMC element 地址（整数）及驱动序列号；未知为 null，address 不是 CLI 槽位序号 |
-| 池 `id`、`num_of_tapes`、`media_restriction`、`mount_limit`、`nodegroup_name` | UUID、分配带数及有效策略；保留旧 uuid/name/tapes/options 及池列表外层结构 |
+| 池 `id`、`num_of_tapes`、`media_restriction`、`mount_limit` | UUID、分配带数及有效策略；保留旧 uuid/name/tapes/options 及池列表外层结构 |
 | 池 `capacity_complete`、`capacity_known_tapes`、`capacity_unknown_tapes` | 主容量各项是否完整、有效 DP 观测成员数、缺少有效 DP 观测成员数；完整性同时要求可追加状态已知且求和无溢出。partitions 内分别统计 DP/IP 完整性和数量；未知汇总保持 null，不返回部分和冒充总量 |
-| 驱动 `enabled`、`role`、`nodegroup_name` | 平铺有效调度策略，保留 policy；enabled 不代表驱动已经就绪 |
+| 驱动 `enabled`、`role` | 平铺有效调度策略，保留 policy；enabled 不代表驱动已经就绪 |
 
 LE 的 NEED_ASSIGN 对应 state=unassigned，WRITABLE 由本项目 volume_state=appendable 表达；盒带在驱动器里不能直接等同于 LE handling=MOUNTED。容量移出 policy，原始策略对象不再夹带未经校验的历史容量。
 

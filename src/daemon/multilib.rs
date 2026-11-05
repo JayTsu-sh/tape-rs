@@ -2349,15 +2349,15 @@ mod tests {
         assert_eq!(changed.drive_replacements.len(), 1);
         let mut before = ClusterState::new(&old);
         before.controls.get_mut("a").unwrap().management = json!({
-            "pools":{},"tapes":{},"drives":{"da":{"enabled":false,"role":"rg","nodegroup":"G1"}},
-            "nodegroups":["G0","G1"],"nodes":{},"tasks":{},
+            "pools":{},"tapes":{},"drives":{"da":{"enabled":false,"role":"rg"}},
+            "tasks":{},
             "inventory":{"round":7,"drives":[{"serial":"da","barcode":null}]}
         });
         let (mut restored, _, _) =
             ClusterState::restore(&changed, &before.snapshot(1, 42)).unwrap();
         assert_eq!(
             restored.controls["a"].management["drives"]["da2"],
-            json!({"enabled":false,"role":"rg","nodegroup":"G1"})
+            json!({"enabled":false,"role":"rg"})
         );
         assert!(
             restored.controls["a"].management["drives"]
@@ -2476,7 +2476,7 @@ mod tests {
         let mut before = ClusterState::new(&old);
         before.controls.get_mut("a").unwrap().management = json!({
             "pools":{},"tapes":{},"drives":{"da1":{"enabled":false},"da2":{"role":"write"}},
-            "nodegroups":[],"nodes":{},"tasks":{"1":{"id":1,"request":{"resource":"drives","action":"down","target":"da1","params":{}},"state":"queued","cancel_requested":false}},
+            "tasks":{"1":{"id":1,"request":{"resource":"drives","action":"down","target":"da1","params":{}},"state":"queued","cancel_requested":false}},
             "inventory":{"round":7,"drives":[{"serial":"da1"},{"serial":"da2"}]}
         });
         let (mut restored, _, _) =

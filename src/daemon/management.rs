@@ -7,7 +7,7 @@ pub const MAX_STATE: usize = 2 << 20;
 pub const MAX_RESULT: usize = 256 << 10;
 
 pub fn empty() -> Value {
-    json!({"pools":{},"tapes":{},"drives":{},"nodegroups":["G0"],"nodes":{},"tasks":{},"inventory":null})
+    json!({"pools":{},"tapes":{},"drives":{},"tasks":{},"inventory":null})
 }
 
 pub fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -21,16 +21,6 @@ fn name(s: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err("名称须为 1–16 个 ASCII 字母、数字或下划线".into())
-    }
-}
-fn group_exists(m: &Value, group: &str) -> Result<(), String> {
-    if m["nodegroups"]
-        .as_array()
-        .is_some_and(|a| a.iter().any(|g| g == group))
-    {
-        Ok(())
-    } else {
-        Err(format!("节点组不存在：{group}"))
     }
 }
 pub fn request(resource: &str, action: &str, target: &str, params: Value) -> Value {
@@ -79,42 +69,6 @@ fn apply_inner(c: &mut ControlState, index: u64, r: &Value) -> Result<Value, Str
         ("pools", "set") => {
             let mut shadow = c.clone();
             pool_set(&mut shadow, target, p)?;
-        }
-        ("nodegroups", "create") => {
-            name(target)?;
-            if group_exists(&c.management, target).is_ok() {
-                return Err("节点组已存在".into());
-            }
-            c.management["nodegroups"]
-                .as_array_mut()
-                .unwrap()
-                .push(json!(target));
-            return Ok(json!({"name":target}));
-        }
-        ("nodegroups", "delete") => {
-            group_exists(&c.management, target)?;
-            if target == "G0"
-                || active_tasks(&c.management)
-                || ["pools", "drives"].iter().any(|key| {
-                    c.management[*key]
-                        .as_object()
-                        .unwrap()
-                        .values()
-                        .any(|v| v["nodegroup"] == target)
-                })
-                || c.management["nodes"]
-                    .as_object()
-                    .unwrap()
-                    .values()
-                    .any(|v| v == target)
-            {
-                return Err("节点组仍被使用或存在管理任务".into());
-            }
-            c.management["nodegroups"]
-                .as_array_mut()
-                .unwrap()
-                .retain(|g| g != target);
-            return Ok(json!({"deleted":true}));
         }
         ("tasks", "cancel") => {
             let task = c.management["tasks"].get_mut(target).ok_or("任务不存在")?;
@@ -206,9 +160,6 @@ fn pool_set(c: &mut ControlState, target: &str, p: &Value) -> Result<Value, Stri
                 return Err("属性必须为 yes 或 no".into());
             }
         }
-        "nodegroup" => {
-            group_exists(&c.management, value)?;
-        }
         _ => return Err("不支持的池属性".into()),
     }
     if c.management["pools"][&uuid].is_null() {
@@ -226,15 +177,7 @@ fn validate_job(
     p: &Value,
 ) -> Result<(), String> {
     if resource == "tapes"
-        && [
-            "assign",
-            "online",
-            "validate",
-            "reconcile",
-            "objects",
-            "restore",
-        ]
-        .contains(&action)
+        && ["assign", "online", "validate", "objects", "restore"].contains(&action)
     {
         require_data_tape(&c.management, target)?;
     }
@@ -255,7 +198,7 @@ fn validate_job(
         (
             "tapes",
             "unassign" | "offline" | "online" | "blacklist" | "clear-blacklist" | "move"
-            | "validate" | "reconcile" | "objects" | "restore",
+            | "validate" | "objects" | "restore",
         ) => {
             if !c.tapes.contains_key(target) {
                 return Err("磁带尚未分配".into());
@@ -305,7 +248,7 @@ fn validate_job(
                 _ => {}
             }
         }
-        ("drives", "up" | "down" | "role" | "assign") => {
+        ("drives", "up" | "down" | "role") => {
             if target.is_empty() {
                 return Err("驱动器序列号为空".into());
             }
@@ -333,24 +276,6 @@ fn validate_job(
                 if !role.chars().all(|r| "mrg".contains(r) && seen.insert(r)) {
                     return Err("角色必须为无重复的 m/r/g 组合".into());
                 }
-            }
-            if action == "assign" {
-                let group = text(p, "group")?;
-                if group != "-" {
-                    group_exists(&c.management, group)?;
-                }
-            }
-        }
-        ("nodes", "assign") => {
-            let node = target.parse::<u64>().map_err(|_| "节点编号非法")?;
-            if !c.candidates.contains_key(&node)
-                && c.executor.as_ref().is_none_or(|e| e.node != node)
-            {
-                return Err("节点不存在".into());
-            }
-            let group = text(p, "group")?;
-            if group != "-" {
-                group_exists(&c.management, group)?;
             }
         }
         _ => return Err("未知管理操作".into()),
@@ -530,23 +455,9 @@ fn finish_config(c: &mut ControlState, r: &Value, result: &Value) -> Result<(), 
                 "up" => ("enabled", json!(true)),
                 "down" => ("enabled", json!(false)),
                 "role" => ("role", p["role"].clone()),
-                _ => (
-                    "nodegroup",
-                    if p["group"] == "-" {
-                        Value::Null
-                    } else {
-                        p["group"].clone()
-                    },
-                ),
+                _ => return Err("未知驱动器策略操作".into()),
             };
             c.management["drives"][target][key] = value;
-        }
-        ("nodes", "assign") => {
-            c.management["nodes"][target] = if p["group"] == "-" {
-                Value::Null
-            } else {
-                p["group"].clone()
-            };
         }
         _ => {}
     }
@@ -575,23 +486,17 @@ pub fn tape_allowed(m: &Value, barcode: &str) -> bool {
         && m["tapes"][barcode]["offline"].is_null()
         && m["tapes"][barcode]["blacklist"].is_null()
 }
-pub fn drive_allowed(m: &Value, serial: &str, node: u64, pool: &str, role: char) -> bool {
+pub fn drive_allowed(m: &Value, serial: &str, role: char) -> bool {
     let d = &m["drives"][serial];
-    let node_key = node.to_string();
-    let node_group = m["nodes"].get(&node_key).unwrap_or(&Value::Null);
-    let group = m["pools"][pool]["nodegroup"].as_str().unwrap_or("G0");
-    d["enabled"] != false
-        && d["role"].as_str().unwrap_or("mrg").contains(role)
-        && d.get("nodegroup").map_or(Some("G0"), Value::as_str) == Some(group)
-        && (m["nodes"].get(&node_key).is_none() || node_group.as_str() == Some(group))
+    d["enabled"] != false && d["role"].as_str().unwrap_or("mrg").contains(role)
 }
 
 pub fn drive_policy(m: &Value, serial: &str) -> Value {
     let d = &m["drives"][serial];
-    json!({"enabled":d["enabled"]!=false,"role":d["role"].as_str().unwrap_or("mrg"),"nodegroup":d.get("nodegroup").cloned().unwrap_or(json!("G0"))})
+    json!({"enabled":d["enabled"]!=false,"role":d["role"].as_str().unwrap_or("mrg")})
 }
 pub fn pool_options(m: &Value, uuid: &str) -> Value {
-    let mut options = json!({"mediarestriction":"none","mountlimit":"0","nodegroup":"G0","lowspacewarningenable":"yes","lowspacewarningthreshold":"0","nospacewarningenable":"yes"});
+    let mut options = json!({"mediarestriction":"none","mountlimit":"0","lowspacewarningenable":"yes","lowspacewarningthreshold":"0","nospacewarningenable":"yes"});
     if let Some(saved) = m["pools"][uuid].as_object() {
         for (k, v) in saved {
             options[k] = v.clone();
@@ -606,7 +511,7 @@ pub fn policy_view(st: &crate::daemon::node::NodeStatus) -> crate::daemon::node:
         pools: st.pools.clone(),
         tapes: st.tapes.clone(),
         management: std::sync::Arc::new(
-            json!({"pools":st.management["pools"],"tapes":st.management["tapes"],"drives":st.management["drives"],"nodes":st.management["nodes"]}),
+            json!({"pools":st.management["pools"],"tapes":st.management["tapes"],"drives":st.management["drives"]}),
         ),
         ..Default::default()
     }
@@ -1052,7 +957,6 @@ pub fn drive_views(s: &crate::daemon::node::NodeStatus) -> Vec<Value> {
                     let policy = drive_policy(m, d["serial"].as_str().unwrap_or(""));
                     row["enabled"] = policy["enabled"].clone();
                     row["role"] = policy["role"].clone();
-                    row["nodegroup_name"] = policy["nodegroup"].clone();
                     row["policy"] = policy;
                     row["inventory_observation"] = inventory_observation(s);
                     row
@@ -1077,7 +981,6 @@ pub fn pool_view(
         "tapes":pool.tapes,"num_of_tapes":pool.tapes.len(),
         "media_restriction":options["mediarestriction"],
         "mount_limit":options["mountlimit"].as_str().and_then(|v|v.parse::<u64>().ok()),
-        "nodegroup_name":options["nodegroup"],
         "low_space_warning_enable":options["lowspacewarningenable"]!="no",
         "low_space_warning_threshold":options["lowspacewarningthreshold"].as_str().and_then(|v|v.parse::<u64>().ok()),
         "no_space_warning_enable":options["nospacewarningenable"]!="no",
@@ -1187,29 +1090,30 @@ fn pool_partition_observation(
     row
 }
 
-/// 快照可以缺少旧版本没有的管理状态；已有状态必须符合本版本结构。
+/// 管理快照必须符合当前无节点组的资源结构。
 pub fn valid_snapshot(m: &Value) -> bool {
     if m.is_null() {
         return true;
     }
     if m.to_string().len() > MAX_STATE
-        || !["pools", "tapes", "drives", "nodes", "tasks"]
+        || !["pools", "tapes", "drives", "tasks"]
             .iter()
             .all(|k| m[*k].is_object())
-        || !m["nodegroups"]
-            .as_array()
-            .is_some_and(|a| a.iter().all(Value::is_string))
+        || m.get("nodegroups").is_some()
+        || m.get("nodes").is_some()
+        || ["pools", "drives"].iter().any(|resource| {
+            m[*resource].as_object().is_some_and(|items| {
+                items.values().any(|item| {
+                    item.get("nodegroup").is_some() || item.get("nodegroup_name").is_some()
+                })
+            })
+        })
     {
         return false;
     }
     if !["pools", "tapes", "drives"]
         .iter()
         .all(|k| m[*k].as_object().unwrap().values().all(Value::is_object))
-        || !m["nodes"]
-            .as_object()
-            .unwrap()
-            .values()
-            .all(|v| v.is_null() || v.is_string())
         || !(m["inventory"].is_null() || m["inventory"].is_object())
     {
         return false;
@@ -1239,6 +1143,30 @@ pub fn valid_snapshot(m: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn removed_group_operations_do_not_mutate_management_state() {
+        let mut c = state();
+        let before = c.management.clone();
+        for req in [
+            request("nodegroups", "create", "G1", json!({})),
+            request("nodegroups", "delete", "G0", json!({})),
+            request("nodes", "assign", "1", json!({"group":"G0"})),
+            request("drives", "assign", "SERIAL", json!({"group":"G0"})),
+        ] {
+            assert!(apply(&mut c, 99, &req).is_err());
+            assert_eq!(c.management, before);
+        }
+        let mut legacy = empty();
+        legacy["nodegroups"] = json!(["G0"]);
+        assert!(!valid_snapshot(&legacy));
+        for resource in ["pools", "drives"] {
+            let mut legacy = empty();
+            legacy[resource]["obsolete"] = json!({"nodegroup":"G0"});
+            assert!(!valid_snapshot(&legacy));
+        }
+        assert!(valid_snapshot(&empty()));
+    }
+
     use super::*;
     use crate::daemon::state::{Applied, Command, ControlSnapshot, Executor};
     fn state() -> ControlState {
@@ -1990,20 +1918,14 @@ mod tests {
         assert!(c.management["tasks"].as_object().unwrap().is_empty());
     }
     #[test]
-    fn group_role_and_tape_policies_have_real_scheduling_effect() {
+    fn drive_role_and_tape_policies_have_real_scheduling_effect() {
         let mut m = empty();
-        assert!(drive_allowed(&m, "s", 1, "p", 'm'));
+        assert!(drive_allowed(&m, "s", 'm'));
         m["drives"]["s"] = json!({"role":"rg"});
-        assert!(!drive_allowed(&m, "s", 1, "p", 'm'));
-        assert!(drive_allowed(&m, "s", 1, "p", 'r'));
+        assert!(!drive_allowed(&m, "s", 'm'));
+        assert!(drive_allowed(&m, "s", 'r'));
         m["drives"]["s"]["enabled"] = json!(false);
-        assert!(!drive_allowed(&m, "s", 1, "p", 'r'));
-        m["drives"]["s"] = json!({"nodegroup":"G1"});
-        assert!(!drive_allowed(&m, "s", 1, "p", 'r'));
-        m["pools"]["p"] = json!({"nodegroup":"G1"});
-        assert!(drive_allowed(&m, "s", 1, "p", 'r'));
-        m["nodes"]["1"] = Value::Null;
-        assert!(!drive_allowed(&m, "s", 1, "p", 'r'));
+        assert!(!drive_allowed(&m, "s", 'r'));
         m["tapes"]["b"] = json!({"blacklist":"fault"});
         assert!(!tape_allowed(&m, "b"));
     }

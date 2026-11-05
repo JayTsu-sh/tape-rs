@@ -73,13 +73,7 @@ pub(super) async fn unload(
         .ok_or_else(|| lost("没有本轮挂载身份"))?;
     let management = policy(status);
     if !super::super::management::tape_allowed(&management, &mount.barcode)
-        || !super::super::management::drive_allowed(
-            &management,
-            &owner.devices[drive].serial,
-            u64::from(owner.key.node()),
-            &mount.pool.to_string(),
-            'r',
-        )
+        || !super::super::management::drive_allowed(&management, &owner.devices[drive].serial, 'r')
     {
         return Err(ReadError::Busy("只读卸带被磁带或驱动策略禁止".into()));
     }
@@ -167,13 +161,7 @@ pub(super) async fn select(
         return Err(ReadError::Failed("清洗带不能执行 LTFS 读取".into()));
     }
     let allowed = |drive: usize| {
-        super::super::management::drive_allowed(
-            &management,
-            &owner.devices[drive].serial,
-            u64::from(owner.key.node()),
-            &pool,
-            'r',
-        )
+        super::super::management::drive_allowed(&management, &owner.devices[drive].serial, 'r')
     };
     if let Some(slot) = inventory.drives.iter().find(|slot| {
         slot.loaded
@@ -262,8 +250,6 @@ pub(super) async fn select(
                     && super::super::management::drive_allowed(
                         &management,
                         &owner.devices[**drive].serial,
-                        u64::from(owner.key.node()),
-                        &mount.pool.to_string(),
                         'r',
                     )
             })

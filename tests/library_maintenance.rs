@@ -226,21 +226,21 @@ fn owned_drive_returns_normally_to_home_and_no_new_move_when_ie_is_full() {
 }
 
 #[test]
-fn reconcile_replaces_stale_index_only_after_successful_actual_inspection() {
+fn index_cache_refresh_replaces_stale_index_only_after_successful_actual_inspection() {
     let f = Fixture::new();
     let mut lib = f.formatted();
     assert!(lib.tape_index("LIB001L8").unwrap().is_none());
-    let first = lib.tape_reconcile("LIB001L8").unwrap();
+    let first = lib.refresh_tape_index_cache("LIB001L8").unwrap();
     assert_eq!(first["generation"], "1");
     assert!(first["observed_at"].as_str().is_some_and(|s| !s.is_empty()));
     lib.write_from("/pool/LIB001L8/new-file", &mut &b"new contents"[..], true)
         .unwrap();
     assert_eq!(lib.tape_index("LIB001L8").unwrap().unwrap(), first);
     lib.drive_set_enabled("SIMDRV0000", false).unwrap();
-    assert!(lib.tape_reconcile("LIB001L8").is_err());
+    assert!(lib.refresh_tape_index_cache("LIB001L8").is_err());
     assert_eq!(lib.tape_index("LIB001L8").unwrap().unwrap(), first);
     lib.drive_set_enabled("SIMDRV0000", true).unwrap();
-    let updated = lib.tape_reconcile("LIB001L8").unwrap();
+    let updated = lib.refresh_tape_index_cache("LIB001L8").unwrap();
     assert_eq!(updated["generation"], "2");
     let xml = updated["index_xml"].as_str().unwrap();
     let actual = tape_rs::ltfs::index::LtfsIndex::parse(xml.as_bytes()).unwrap();
@@ -330,16 +330,16 @@ fn full_validation_detects_payload_corruption_even_without_a_stored_hash() {
 }
 
 #[test]
-fn validation_and_reconcile_require_maintenance_role_and_do_not_write_media() {
+fn validation_and_index_cache_refresh_require_maintenance_role_and_do_not_write_media() {
     let f = Fixture::new();
     let mut lib = f.formatted();
     lib.drive_set_role("SIMDRV0000", "r").unwrap();
     assert!(lib.tape_validate("LIB001L8", false).is_err());
-    assert!(lib.tape_reconcile("LIB001L8").is_err());
+    assert!(lib.refresh_tape_index_cache("LIB001L8").is_err());
     lib.drive_set_role("SIMDRV0000", "g").unwrap();
     let before = f.drive.command_log().len();
     lib.tape_validate("LIB001L8", true).unwrap();
-    lib.tape_reconcile("LIB001L8").unwrap();
+    lib.refresh_tape_index_cache("LIB001L8").unwrap();
     assert!(
         f.drive.command_log()[before..]
             .iter()
@@ -412,7 +412,7 @@ fn cancelled_move_keeps_not_started_outcome_and_issues_no_mechanics() {
 fn actual_index_read_failure_preserves_previous_cache() {
     let f = Fixture::new();
     let mut lib = f.formatted();
-    let previous = lib.tape_reconcile("LIB001L8").unwrap();
+    let previous = lib.refresh_tape_index_cache("LIB001L8").unwrap();
     lib.close().unwrap();
     f.drive.inject(tape_rs::scsi::sim::Fault {
         opcode: 0x08,
@@ -420,7 +420,7 @@ fn actual_index_read_failure_preserves_previous_cache() {
         after: 0,
         remaining: 1,
     });
-    let error = lib.tape_reconcile("LIB001L8").unwrap_err();
+    let error = lib.refresh_tape_index_cache("LIB001L8").unwrap_err();
     assert!(matches!(error, tape_rs::error::TapeError::ScsiHost(3)));
     assert_eq!(lib.tape_index("LIB001L8").unwrap().unwrap(), previous);
     lib.close().unwrap();
@@ -430,7 +430,7 @@ fn actual_index_read_failure_preserves_previous_cache() {
 fn unsupported_index_xml_cannot_silently_replace_a_complete_cached_snapshot() {
     let f = Fixture::new();
     let mut lib = f.formatted();
-    let previous = lib.tape_reconcile("LIB001L8").unwrap();
+    let previous = lib.refresh_tape_index_cache("LIB001L8").unwrap();
     lib.close().unwrap();
     assert!(f.sim.with_cartridge_mut("LIB001L8", |cart| {
         for partition in &mut cart.partitions {
@@ -449,7 +449,7 @@ fn unsupported_index_xml_cannot_silently_replace_a_complete_cached_snapshot() {
             }
         }
     }));
-    assert!(lib.tape_reconcile("LIB001L8").is_err());
+    assert!(lib.refresh_tape_index_cache("LIB001L8").is_err());
     assert_eq!(lib.tape_index("LIB001L8").unwrap().unwrap(), previous);
     lib.close().unwrap();
 }
@@ -476,7 +476,7 @@ fn cached_generation_preserves_full_unsigned_range_without_fake_zero() {
             }
         }
     });
-    let index = lib.tape_reconcile("LIB001L8").unwrap();
+    let index = lib.refresh_tape_index_cache("LIB001L8").unwrap();
     assert_eq!(index["generation"], "18446744073709551615");
     assert_eq!(
         lib.tape_index("LIB001L8").unwrap().unwrap()["generation"],

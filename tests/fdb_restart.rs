@@ -43,7 +43,6 @@ async fn isolated_fdb_server_restart_recovery() {
         policy: PoolPolicy {
             media_restriction: "L8".into(),
             mount_limit: 9,
-            node_group: "G2".into(),
             low_space_warning_enabled: false,
             low_space_warning_threshold: 17,
             no_space_warning_enabled: true,
@@ -164,7 +163,6 @@ async fn isolated_fdb_server_restart_recovery() {
                 catalog.create_pool(namespace, &pool).await.unwrap(),
                 ControlOutcome::Created
             );
-            assert!(catalog.register_node_group(namespace, "G2").await.unwrap());
             assert_eq!(
                 catalog
                     .update_pool(namespace, &pool, &updated_pool)
@@ -379,6 +377,7 @@ async fn isolated_fdb_server_restart_recovery() {
                     Uuid::nil(),
                     &Node {
                         kind: NodeKind::Directory,
+
                         parent: Uuid::nil(),
                         name: Vec::new(),
                         attributes: None,
@@ -433,14 +432,6 @@ async fn isolated_fdb_server_restart_recovery() {
             assert_eq!(
                 catalog.pool(namespace, pool.id).await.unwrap(),
                 Some(updated_pool)
-            );
-            assert_eq!(
-                catalog
-                    .list_node_groups(namespace, None, 10)
-                    .await
-                    .unwrap()
-                    .items,
-                vec!["G0", "G2"]
             );
             assert_eq!(
                 catalog.volume_placement(volume).await.unwrap(),
@@ -607,14 +598,6 @@ async fn isolated_fdb_server_restart_recovery() {
             assert_eq!(
                 catalog.pool(namespace, pool.id).await.unwrap(),
                 Some(updated_pool)
-            );
-            assert_eq!(
-                catalog
-                    .list_node_groups(namespace, None, 10)
-                    .await
-                    .unwrap()
-                    .items,
-                vec!["G0", "G2"]
             );
             assert_eq!(
                 catalog.volume_placement(volume).await.unwrap(),

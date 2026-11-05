@@ -150,10 +150,7 @@ pub(super) fn drive(
     }
     let r = &task["request"];
     let resource = r["resource"].as_str().unwrap();
-    let needs_volume = matches!(
-        resource,
-        "pools" | "tapes" | "drives" | "nodes" | "nodegroups"
-    );
+    let needs_volume = matches!(resource, "pools" | "tapes" | "drives");
     if needs_volume {
         files.pause_admission();
         for writer in &a.writers {
@@ -280,6 +277,23 @@ pub(super) fn execute(
     let resource = r["resource"].as_str().unwrap();
     let action = r["action"].as_str().unwrap();
     let target = r["target"].as_str().unwrap();
+    if resource == "tapes"
+        && ![
+            "assign",
+            "unassign",
+            "offline",
+            "online",
+            "blacklist",
+            "clear-blacklist",
+            "move",
+            "validate",
+            "objects",
+            "restore",
+        ]
+        .contains(&action)
+    {
+        return Err(error("未知磁带管理操作"));
+    }
     let p = &r["params"];
     let st = status.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let m = &st.management;
@@ -339,15 +353,7 @@ pub(super) fn execute(
         .find(|e| e.full && e.volume_tag.as_deref() == Some(target))
         .ok_or_else(|| error("条码不在实际库存中"))?;
     if entry.is_cleaning()
-        && [
-            "assign",
-            "online",
-            "validate",
-            "reconcile",
-            "objects",
-            "restore",
-        ]
-        .contains(&action)
+        && ["assign", "online", "validate", "objects", "restore"].contains(&action)
     {
         return Err(error("清洗带不能分配到数据池或执行 LTFS 数据操作"));
     }
@@ -409,7 +415,7 @@ pub(super) fn execute(
         move_medium(&a.devices, entry.address, dest.address)?;
         return Ok(json!({"barcode":target,"from":entry.address,"to":dest.address}));
     }
-    if !["online", "validate", "reconcile"].contains(&action) && !model::tape_allowed(m, target) {
+    if !["online", "validate"].contains(&action) && !model::tape_allowed(m, target) {
         return Err(error("磁带 offline 或被列入黑名单"));
     }
     if !m["tapes"][target]["blacklist"].is_null() {
@@ -424,16 +430,7 @@ pub(super) fn execute(
     let d = inv
         .drives
         .iter()
-        .find(|d| {
-            d.loaded.is_none()
-                && model::drive_allowed(
-                    m,
-                    &a.devices[d.dev].serial,
-                    u64::from(opts.node_id),
-                    &pool.uuid,
-                    'g',
-                )
-        })
+        .find(|d| d.loaded.is_none() && model::drive_allowed(m, &a.devices[d.dev].serial, 'g'))
         .ok_or_else(|| error("没有具备维护资格的空闲驱动器"))?;
     if entry.element_type != ElementType::Storage {
         return Err(error("维护前磁带必须位于存储槽位"));
@@ -524,24 +521,6 @@ pub(super) fn execute(
                 result["full_read"] = json!(full);
                 result["verified_hashes"] = json!(verified);
                 result["read_without_hash"] = json!(no_hash);
-            }
-            "reconcile" => {
-                let (records, bytes) = catalog_of(vol.index());
-                let _ = tx.send(ExecEvent::Committed {
-                    round: a.round,
-                    barcode: target.into(),
-                    volume_uuid: vol.label().volume_uuid.to_string(),
-                    generation: vol.index().generation,
-                    files_total: records
-                        .iter()
-                        .filter(|r| !is_directory(&r.metadata))
-                        .count() as u64,
-                    bytes_used: bytes,
-                    bytes_written: bytes_written_on(a.devices[di].dev.as_ref()),
-                    files: records,
-                    full: true,
-                });
-                result["scope"] = json!("cluster_catalog_not_gpfs_hsm");
             }
             "objects" => {
                 let manifest = crate::ltfs::ee::EeManifest::from_index(vol.index())?;
