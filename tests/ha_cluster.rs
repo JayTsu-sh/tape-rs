@@ -20,9 +20,23 @@ struct Net {
     me: u64,
     peers: Arc<HashMap<u64, mpsc::Sender<NodeInput>>>,
     isolated: Arc<Mutex<HashSet<u64>>>,
+    drop_next_vip_acquire: Arc<AtomicBool>,
 }
 impl Network for Net {
     fn send(&self, msg: Message) {
+        if self.drop_next_vip_acquire.load(Ordering::SeqCst)
+            && msg.get_msg_type() == raft::eraftpb::MessageType::MsgPropose
+            && msg.entries.iter().any(|entry| {
+                matches!(
+                    tape_rs::daemon::state::Command::decode(&entry.data),
+                    Some(tape_rs::daemon::state::Command::VipAcquire { .. })
+                )
+            })
+            && self.drop_next_vip_acquire.swap(false, Ordering::SeqCst)
+        {
+            eprintln!("模拟网络明确丢弃首次 VIP Acquire 转发提案");
+            return;
+        }
         let isolated = self.isolated.lock().unwrap();
         if isolated.contains(&self.me) || isolated.contains(&msg.to) {
             return;
@@ -223,6 +237,7 @@ fn scenario(case: u8) {
         .map(|id| (id, Arc::new(AtomicBool::new(false))))
         .collect();
     let isolated = Arc::new(Mutex::new(HashSet::new()));
+    let drop_next_vip_acquire = Arc::new(AtomicBool::new(false));
     let mut statuses: HashMap<u64, SharedStatus> = HashMap::new();
     let mut services = HashMap::new();
     let mut execs = HashMap::new();
@@ -315,6 +330,7 @@ fn scenario(case: u8) {
             me: id,
             peers: peers.clone(),
             isolated: isolated.clone(),
+            drop_next_vip_acquire: drop_next_vip_acquire.clone(),
         });
         let inbox = rxs.remove(&id).unwrap();
         let node_join =
@@ -935,8 +951,12 @@ fn scenario(case: u8) {
         use tape_rs::daemon::state::Command;
         let old = first.as_ref().unwrap();
         let address = "192.0.2.100".parse().unwrap();
-        let wait_vip = |node: u64, round: u64| {
+        // The real VIP loop repeats conditional requests until replicated state
+        // confirms them. A one-shot channel send proves only local delivery,
+        // not proposal acceptance or commitment through a follower.
+        let wait_vip = |node: u64, round: u64, acquire: Option<u64>| {
             let until = Instant::now() + Duration::from_secs(5);
+            let mut next_retry = Instant::now();
             loop {
                 let record = statuses[&3].lock().unwrap().vips.get(&address).cloned();
                 if let Some(record) = record
@@ -947,19 +967,33 @@ fn scenario(case: u8) {
                 {
                     return record.token;
                 }
-                assert!(Instant::now() < until, "VIP 预约必须经过真实 Raft 提交");
+                assert!(
+                    Instant::now() < until,
+                    "VIP 预约必须经过真实 Raft 提交: node={node} round={round} acquire={acquire:?} status={:?}",
+                    statuses[&3].lock().unwrap()
+                );
+                if let Some(expected_token) = acquire
+                    && Instant::now() >= next_retry
+                {
+                    peers[&node]
+                        .send(NodeInput::Vip(Command::VipAcquire {
+                            address,
+                            node,
+                            round,
+                            expected_token,
+                        }))
+                        .unwrap();
+                    next_retry = Instant::now() + Duration::from_millis(200);
+                }
                 std::thread::sleep(Duration::from_millis(20));
             }
         };
-        peers[&old.node]
-            .send(NodeInput::Vip(Command::VipAcquire {
-                address,
-                node: old.node,
-                round: old.round,
-                expected_token: 0,
-            }))
-            .unwrap();
-        let token = wait_vip(old.node, old.round);
+        drop_next_vip_acquire.store(true, Ordering::SeqCst);
+        let token = wait_vip(old.node, old.round, Some(0));
+        assert!(
+            !drop_next_vip_acquire.load(Ordering::SeqCst),
+            "必须实际丢弃首次预约提案"
+        );
         let other = if old.node == 1 { 2 } else { 1 };
         fc[&other].store(true, Ordering::SeqCst);
         isolated.lock().unwrap().insert(old.node);
@@ -995,7 +1029,7 @@ fn scenario(case: u8) {
             .unwrap();
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(
-            wait_vip(old.node, old.round),
+            wait_vip(old.node, old.round, None),
             token,
             "失联/时间/新 owner ready 都不能清除旧占用"
         );
@@ -1025,15 +1059,8 @@ fn scenario(case: u8) {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        peers[&new.node]
-            .send(NodeInput::Vip(Command::VipAcquire {
-                address,
-                node: new.node,
-                round: new.round,
-                expected_token: token,
-            }))
-            .unwrap();
-        let new_token = wait_vip(new.node, new.round);
+        let new_token = wait_vip(new.node, new.round, Some(token));
+        assert!(new_token > token, "新预约必须使用更大的 Raft 提交令牌");
         peers[&old.node]
             .send(NodeInput::Vip(Command::VipRelease {
                 address,
@@ -1044,7 +1071,7 @@ fn scenario(case: u8) {
             .unwrap();
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(
-            wait_vip(new.node, new.round),
+            wait_vip(new.node, new.round, None),
             new_token,
             "迟到释放不能撤销新授权"
         );
