@@ -5,6 +5,8 @@ use tape_rs::client::Client;
 
 #[path = "ltfsctl/notify.rs"]
 mod notify;
+#[path = "ltfsctl/pool.rs"]
+mod pool;
 
 #[derive(Parser)]
 #[command(name = "ltfsctl", about = "ltfsd 客户端")]
@@ -88,7 +90,7 @@ enum Cmd {
     /// 集群管理任务
     Task {
         #[command(subcommand)]
-        cmd: TaskCmd,
+        cmd: pool::TaskCommand,
     },
     /// 查询文件操作任务
     FileTask { id: u64 },
@@ -105,39 +107,13 @@ enum Cmd {
     /// 池管理
     Pool {
         #[command(subcommand)]
-        cmd: PoolCmd,
+        cmd: pool::Command,
     },
     /// 磁带归属
     Tape {
         #[command(subcommand)]
         cmd: TapeCmd,
     },
-}
-
-#[derive(Subcommand)]
-enum PoolCmd {
-    /// 新建池
-    Create {
-        name: String,
-        /// 每盘带的文件数软上限（默认 200000）
-        #[arg(long)]
-        file_limit: Option<u64>,
-    },
-    /// 列出池与各池的磁带。加 --all-nodes 时逐个节点询问，用来核对三个节点是否一致
-    List {
-        #[arg(long)]
-        all_nodes: bool,
-    },
-    /// 查询池详情
-    Show { name: String },
-    /// 修改池属性；服务端执行任务并返回任务号
-    Set {
-        name: String,
-        attribute: String,
-        value: String,
-    },
-    /// 删除空池
-    Delete { name: String },
 }
 
 #[derive(Subcommand)]
@@ -168,22 +144,6 @@ enum DriveCmd {
 enum NodeCmd {
     List,
     Show { id: String },
-}
-
-#[derive(Subcommand)]
-enum TaskCmd {
-    List,
-    Show {
-        id: String,
-    },
-    Cancel {
-        id: String,
-    },
-    /// 只清理终态任务历史，需显式 --yes
-    Clearhistory {
-        #[arg(long)]
-        yes: bool,
-    },
 }
 
 #[derive(Clone, ValueEnum)]
@@ -361,78 +321,12 @@ fn main() {
                     }
                 }
             }
-            Cmd::Pool {
-                cmd: PoolCmd::Create { name, file_limit },
-            } => {
-                println!(
-                    "已创建池 {}  UUID {}",
-                    name,
-                    c.pool_create(&name, file_limit)?
-                );
-            }
-            Cmd::Pool {
-                cmd: PoolCmd::List { all_nodes },
-            } => {
-                let targets: Vec<Option<String>> = if all_nodes {
-                    args.endpoints.iter().cloned().map(Some).collect()
-                } else {
-                    vec![None]
-                };
-                for t in targets {
-                    if let Some(a) = &t {
-                        println!("== {}", a);
-                    }
-                    match c.pools(t.as_deref()) {
-                        Ok(pools) if pools.is_empty() => println!("  (没有池)"),
-                        Ok(pools) => {
-                            for p in pools {
-                                println!(
-                                    "  {}  {}  文件数上限 {}  磁带 [{}]",
-                                    p.name,
-                                    p.uuid,
-                                    p.file_limit,
-                                    p.tapes.join(", ")
-                                );
-                                for t in &p.tape_details {
-                                    println!(
-                                        "    {:<10} {:<14} gen={:<5} 文件 {}/{}  已用 {} MiB  可回收 {} MiB",
-                                        t.barcode,
-                                        t.state,
-                                        t.generation,
-                                        t.live_files,
-                                        t.files,
-                                        t.bytes_used >> 20,
-                                        t.reclaimable >> 20
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => println!("  不可达: {}", e),
-                    }
-                }
-            }
-            Cmd::Pool {
-                cmd: PoolCmd::Show { name },
-            } => print_json(c.admin_get(&format!("/admin/pools/{name}"))?),
-            Cmd::Pool {
-                cmd:
-                    PoolCmd::Set {
-                        name,
-                        attribute,
-                        value,
-                    },
-            } => print_json(c.admin_request(
-                "PATCH",
-                &format!("/admin/pools/{name}"),
-                serde_json::json!({"attribute":attribute,"value":value}),
-            )?),
-            Cmd::Pool {
-                cmd: PoolCmd::Delete { name },
-            } => print_json(c.admin_request(
-                "DELETE",
-                &format!("/admin/pools/{name}"),
-                serde_json::json!({}),
-            )?),
+            Cmd::Pool { cmd } => pool::run(
+                &tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?,
+                args.library.as_deref(),
+                args.pool.as_deref(),
+                cmd,
+            )?,
             Cmd::Library {
                 cmd: LibraryCmd::NativeBarrier { challenge },
             } => print_json(c.native_library_barrier(challenge)?),
@@ -477,25 +371,12 @@ fn main() {
                 NodeCmd::List => print_json(c.admin_get("/admin/nodes")?),
                 NodeCmd::Show { id } => print_json(c.admin_get(&format!("/admin/nodes/{id}"))?),
             },
-            Cmd::Task { cmd } => match cmd {
-                TaskCmd::List => print_json(c.admin_get("/admin/tasks")?),
-                TaskCmd::Show { id } => print_json(c.admin_get(&format!("/admin/tasks/{id}"))?),
-                TaskCmd::Cancel { id } => print_json(c.admin_request(
-                    "POST",
-                    &format!("/admin/tasks/{id}/cancel"),
-                    serde_json::json!({}),
-                )?),
-                TaskCmd::Clearhistory { yes } => {
-                    if !yes {
-                        return Err("清理任务历史须显式 --yes".into());
-                    }
-                    print_json(c.admin_request(
-                        "POST",
-                        "/admin/tasks/clearhistory",
-                        serde_json::json!({"confirm":true}),
-                    )?);
-                }
-            },
+            Cmd::Task { cmd } => pool::task(
+                &tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?,
+                args.library.as_deref(),
+                args.pool.as_deref(),
+                cmd,
+            )?,
             Cmd::FileTask { id } => print_json(c.file_task(id)?),
             Cmd::Admin {
                 method,

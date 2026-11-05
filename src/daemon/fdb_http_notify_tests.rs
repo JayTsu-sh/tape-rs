@@ -107,6 +107,7 @@ async fn isolated_fdb_notify_http_cli_replay_failover_widen_and_backpressure() {
             owner: None,
             notify_streams: Arc::new(Semaphore::new(1)),
             notify_requests: Arc::new(Semaphore::new(2)),
+            admin_requests: Arc::new(Semaphore::new(32)),
         })
     };
     let ctx_a = context();
@@ -569,6 +570,7 @@ async fn isolated_fdb_notify_http_cli_replay_failover_widen_and_backpressure() {
         owner: None,
         notify_streams: Arc::new(Semaphore::new(1)),
         notify_requests: Arc::new(Semaphore::new(1)),
+        admin_requests: Arc::new(Semaphore::new(32)),
     });
     let (unavailable_endpoint, unavailable_server) = serve(unavailable_ctx.clone()).await;
     let unavailable = tokio::time::timeout(

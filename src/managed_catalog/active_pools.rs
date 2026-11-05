@@ -70,6 +70,20 @@ pub(super) async fn require_indexes(
     require_no_file_claims(tr, namespace, pool.id).await
 }
 
+async fn checked_pool(
+    tr: &Transaction,
+    namespace: Uuid,
+    serial: &str,
+    saved: PoolRecord,
+) -> Result<Option<PoolRecord>> {
+    if saved.library_serial != serial {
+        return Ok(None);
+    }
+    require_pool_library(tr, namespace, saved.id, serial).await?;
+    require_indexes(tr, namespace, &saved).await?;
+    Ok(Some(saved))
+}
+
 impl ManagedCatalog {
     pub async fn active_pool_for_route(
         &self,
@@ -87,13 +101,34 @@ impl ManagedCatalog {
         let Some(raw) = tr.get(&pool_key(namespace, id), false).await? else {
             return Ok(None);
         };
-        let saved = decode_pool(id, &raw)?;
-        if saved.library_serial != serial {
+        checked_pool(&tr, namespace, serial, decode_pool(id, &raw)?).await
+    }
+
+    /// Exact name-index lookup; no first-page scan or inferred alias.
+    pub async fn active_pool_named_for_route(
+        &self,
+        serial: &str,
+        route: ActiveLibraryRoute,
+        name: &str,
+    ) -> Result<Option<PoolRecord>> {
+        validate_physical_serial(serial)?;
+        validate_pool_name(name)?;
+        let tr = self.db.create_trx()?;
+        let namespace =
+            routing::require_expected_active_namespace(&tr, serial, Some(route)).await?;
+        let Some(raw) = tr.get(&pool_name_key(namespace, name), false).await? else {
             return Ok(None);
+        };
+        let id = uuid_from(&raw)?;
+        let raw = tr
+            .get(&pool_key(namespace, id), false)
+            .await?
+            .ok_or(CatalogError::Corrupt("池名称索引缺少主记录"))?;
+        let saved = decode_pool(id, &raw)?;
+        if saved.name != name {
+            return Err(CatalogError::Corrupt("池名称索引与主记录不符"));
         }
-        require_pool_library(&tr, namespace, id, serial).await?;
-        require_indexes(&tr, namespace, &saved).await?;
-        Ok(Some(saved))
+        checked_pool(&tr, namespace, serial, saved).await
     }
 
     /// UUID and namespace are supplied by the caller before sending the request.

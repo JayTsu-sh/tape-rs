@@ -1,0 +1,114 @@
+//! Opt-in private-FDB/loopback tests, never real devices.
+use super::*;
+use crate::daemon::{
+    files::FileService,
+    node::NodeStatus,
+    permission::{Permission, Phase},
+    state::Executor,
+};
+use http_body_util::BodyExt;
+use hyper_util::rt::TokioIo;
+use std::sync::{Mutex, mpsc};
+use std::time::{Duration, Instant};
+use uuid::Uuid;
+
+async fn serve(ctx: Arc<Context>) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    (
+        address,
+        tokio::spawn(async move {
+            axum::serve(listener, metadata_router(ctx)).await.unwrap();
+        }),
+    )
+}
+async fn request(
+    address: &str,
+    method: &str,
+    path: &str,
+    ns: Option<&str>,
+    body: &[u8],
+) -> (u16, Value) {
+    let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .unwrap();
+    let connection = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let mut req = hyper::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", address);
+    if let Some(ns) = ns {
+        req = req.header("x-tapers-catalog-namespace", ns);
+    }
+    let response = sender
+        .send_request(
+            req.body(http_body_util::Full::new(bytes::Bytes::copy_from_slice(
+                body,
+            )))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    connection.abort();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+#[test]
+#[ignore = "需要显式隔离FDB_TEST_CLUSTER；原生池HTTP/异步队列，不访问设备"]
+fn native_pool_metadata_routes_read_current_catalog_without_legacy_projection() {
+    let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+    let _network = unsafe { foundationdb::boot() };
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let catalog=Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());let ns=Uuid::new_v4();let serial=format!("POOLAPI-{ns}");let namespace=ns.to_string();let challenge=Uuid::new_v4();
+        let replies=(1..=3).map(|id|json!({"version":1,"library_serial":serial,"challenge":challenge.to_string(),"node_id":id,"term":7,"leader":2,"role":if id==2{"Leader"}else{"Follower"},"members":{"1":"a:1","2":"b:2","3":"c:3"},"quiesce_index":89,"frozen_index":90,"applied_index":92,"executor_absent":true,"catalog_pending":false,"shutting_down":false,"catalog_empty":true})).collect::<Vec<_>>();
+        let proof=crate::managed_catalog::verify_native_barriers(&serial,challenge,&replies).unwrap();let route=catalog.initialize_native_library(ns,&proof).await.unwrap();let epoch=route.initial_owner_epoch;
+        let readonly=Arc::new(Context{catalog:catalog.clone(),routes:BTreeMap::from([(serial.clone(),route)]),owner:None,notify_streams:Arc::new(Semaphore::new(1)),notify_requests:Arc::new(Semaphore::new(1)),admin_requests:Arc::new(Semaphore::new(32))});
+        let(a,ta)=serve(readonly.clone()).await;let root=format!("/libraries/{serial}/admin");
+        let(code,list)=request(&a,"GET",&format!("{root}/pools?limit=100"),Some(&namespace),b"").await;assert_eq!(code,200);assert_eq!(list["items"],json!([]));assert_eq!(list["namespace"],namespace);assert!(list["next"].is_null());
+        assert_eq!(request(&a,"GET",&format!("{root}/pools"),None,b"").await.0,409);
+        assert_eq!(request(&a,"GET",&format!("{root}/pools"),Some(&Uuid::new_v4().to_string()),b"").await.0,409);
+        for query in ["limit=0","limit=101","limit=1&limit=2","after=invalid!"] {assert_eq!(request(&a,"GET",&format!("{root}/pools?{query}"),Some(&namespace),b"").await.0,400);}
+        assert_eq!(request(&a,"GET","/libraries/missing/admin/context",None,b"").await.0,404);
+        assert_eq!(request(&a,"POST",&format!("{root}/pools"),Some(&namespace),b"{}").await.0,405);
+        let spool=std::env::temp_dir().join(format!("tapers-pool-http-{ns}"));let files=FileService::new(spool.clone()).unwrap();let permit=Arc::new(Permission::default());assert!(permit.renew(epoch,Phase::Serving,Instant::now()+Duration::from_secs(120)));files.set_permission(permit.clone());
+        let status=Arc::new(Mutex::new(NodeStatus{id:2,executor:Some(Executor{node:2,round:epoch,term:7,fenced:true}),executor_ready:true,catalog_frozen_index:Some(route.frozen_index),..Default::default()}));
+        let (exec,_)=mpsc::channel();let(node,_)=mpsc::channel();let http=Arc::new(HttpContext{files,status:status.clone(),exec:Mutex::new(exec),node:Mutex::new(node),client_addrs:HashMap::new(),wait_timeout:Duration::from_secs(1)});
+        let owner=Arc::new(Context{owner:Some(OwnerRuntime{libraries:BTreeMap::from([(serial.clone(),http.clone())]),peers:HashMap::new(),requests:Arc::new(Semaphore::new(32))}),..(*readonly).clone()});
+        let(b,tb)=serve(owner.clone()).await;
+        let id=Uuid::new_v4();let body=json!({"version":1,"id":id.to_string(),"name":"归档","file_limit":100,"created_at_millis":1_793_405_000_123u64,"policy":{"media_restriction":"none","mount_limit":0,"low_space_warning_enabled":true,"low_space_warning_threshold":0,"no_space_warning_enabled":true}}).to_string();
+        let result=request(&b,"POST",&format!("{root}/pools"),Some(&namespace),body.as_bytes()).await;assert_eq!(result.0,201,"{result:?}");
+        assert_eq!(request(&b,"POST",&format!("{root}/pools"),Some(&namespace),body.as_bytes()).await.0,200);
+        let poolpath=format!("{root}/pools/{id}");assert_eq!(request(&a,"GET",&poolpath,Some(&namespace),b"").await.1["pool"]["name"],"归档");
+        assert_eq!(request(&a,"GET",&format!("{root}/pools/%E5%BD%92%E6%A1%A3"),Some(&namespace),b"").await.1["pool"]["id"],id.to_string());
+        let mut conflict:Value=serde_json::from_str(&body).unwrap();conflict["id"]=json!(Uuid::new_v4().to_string());assert_eq!(request(&b,"POST",&format!("{root}/pools"),Some(&namespace),conflict.to_string().as_bytes()).await.0,409);
+        let make=|change:Value|json!({"version":1,"library":serial,"namespace":namespace,"epoch":1,"operation":Uuid::new_v4().to_string(),"change":change});
+        let intent=make(json!({"kind":"pool","id":id.to_string(),"revision":1,"patch":{"media_restriction":"L8"}}));
+        // Reject duplicate fields, unsupported kinds, wrong resource and scopes before enqueue.
+        let duplicate=intent.to_string().replace("\"revision\":1","\"revision\":1,\"revision\":2");
+        assert_eq!(request(&b,"PATCH",&poolpath,Some(&namespace),duplicate.as_bytes()).await.0,400);
+        for bad in [make(json!({"kind":"library-rescan"})),make(json!({"kind":"pool","id":Uuid::new_v4().to_string(),"revision":1,"patch":{"name":"wrong"}}))] {assert_eq!(request(&b,"PATCH",&poolpath,Some(&namespace),bad.to_string().as_bytes()).await.0,400);}
+        let mut wrong=intent.clone();wrong["library"]=json!("OTHER");assert_eq!(request(&b,"PATCH",&poolpath,Some(&namespace),wrong.to_string().as_bytes()).await.0,400);
+        let queued=request(&b,"PATCH",&poolpath,Some(&namespace),intent.to_string().as_bytes()).await;assert_eq!(queued.0,202,"{queued:?}");assert_eq!(queued.1["status"],"queued");
+        let taskpath=format!("{root}/tasks/1/{}",intent["operation"].as_str().unwrap());
+        // Revocation leaves original durable intent queued; restoring local readiness does not revive a closed permit.
+        permit.close(epoch);let mut after=None;pools::poll(&owner,&serial,&mut after).await.unwrap();assert_eq!(request(&a,"GET",&taskpath,Some(&namespace),b"").await.1["status"],"queued");
+        assert_eq!(request(&b,"POST",&format!("{root}/pools"),Some(&namespace),body.as_bytes()).await.0,503);
+        let renewed=Arc::new(Permission::default());renewed.renew(epoch,Phase::Serving,Instant::now()+Duration::from_secs(120));http.files.set_permission(renewed.clone());
+        pools::poll(&owner,&serial,&mut after).await.unwrap();assert_eq!(request(&a,"GET",&taskpath,Some(&namespace),b"").await.1["status"],"succeeded");
+        let replay=request(&b,"PATCH",&poolpath,Some(&namespace),intent.to_string().as_bytes()).await;assert_eq!(replay.0,202);assert_eq!(replay.1["status"],"succeeded");
+        assert_eq!(request(&a,"GET",&poolpath,Some(&namespace),b"").await.1["pool"]["revision"],2);
+        let stale=make(json!({"kind":"pool","id":id.to_string(),"revision":1,"patch":{"file_limit":321}}));assert_eq!(request(&b,"PATCH",&poolpath,Some(&namespace),stale.to_string().as_bytes()).await.0,202);pools::poll(&owner,&serial,&mut after).await.unwrap();
+        assert_eq!(catalog.management_task(&serial,route,1,Uuid::parse_str(stale["operation"].as_str().unwrap()).unwrap()).await.unwrap().unwrap()["status"],"failed");
+        let deletion=make(json!({"kind":"pool-delete","id":id.to_string(),"revision":2}));assert_eq!(request(&b,"DELETE",&poolpath,Some(&namespace),deletion.to_string().as_bytes()).await.0,202);let cancelpath=format!("{root}/tasks/1/{}/cancel",deletion["operation"].as_str().unwrap());assert_eq!(request(&b,"POST",&cancelpath,Some(&namespace),b"").await.1["status"],"cancelled");pools::poll(&owner,&serial,&mut after).await.unwrap();assert_eq!(request(&a,"GET",&poolpath,Some(&namespace),b"").await.0,200);
+        // A distinct delete is applied by the actual background worker, without any SCSI receiver.
+        let deletion=make(json!({"kind":"pool-delete","id":id.to_string(),"revision":2}));assert_eq!(request(&b,"DELETE",&poolpath,Some(&namespace),deletion.to_string().as_bytes()).await.0,202);pools::start_worker(&owner).unwrap();
+        tokio::time::timeout(Duration::from_secs(10),async {loop {if request(&a,"GET",&poolpath,Some(&namespace),b"").await.0==404{break;}tokio::time::sleep(Duration::from_millis(20)).await;}}).await.unwrap();
+        // Retired original create cannot resurrect the pool.
+        assert_eq!(request(&b,"POST",&format!("{root}/pools"),Some(&namespace),body.as_bytes()).await.0,409);
+        ta.abort();tb.abort();drop(owner);drop(readonly);drop(http);tokio::time::sleep(Duration::from_millis(350)).await;std::fs::remove_dir_all(spool).unwrap();
+    });
+}

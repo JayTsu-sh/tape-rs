@@ -27,17 +27,21 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 #[path = "fdb_http_notify.rs"]
 mod notify;
 
+#[path = "fdb_http_pools.rs"]
+mod pools;
+
 #[derive(Clone)]
 struct Context {
     catalog: Arc<ManagedCatalog>,
     routes: BTreeMap<String, ActiveLibraryRoute>,
-    owner: Option<OwnerReads>,
+    owner: Option<OwnerRuntime>,
     notify_streams: Arc<Semaphore>,
     notify_requests: Arc<Semaphore>,
+    admin_requests: Arc<Semaphore>,
 }
 
 #[derive(Clone)]
-struct OwnerReads {
+struct OwnerRuntime {
     libraries: BTreeMap<String, Arc<HttpContext>>,
     peers: HashMap<u64, String>,
     requests: Arc<Semaphore>,
@@ -292,6 +296,24 @@ async fn children(
 
 fn metadata_router(ctx: Arc<Context>) -> Router {
     Router::new()
+        .route("/libraries/{serial}/admin/context", get(pools::context))
+        .route(
+            "/libraries/{serial}/admin/pools",
+            get(pools::list).post(pools::create),
+        )
+        .route(
+            "/libraries/{serial}/admin/pools/{selector}",
+            get(pools::show).patch(pools::set).delete(pools::delete),
+        )
+        .route("/libraries/{serial}/admin/tasks", get(pools::tasks))
+        .route(
+            "/libraries/{serial}/admin/tasks/{epoch}/{operation}",
+            get(pools::task),
+        )
+        .route(
+            "/libraries/{serial}/admin/tasks/{epoch}/{operation}/cancel",
+            axum::routing::post(pools::cancel),
+        )
         .route("/readyz", get(ready))
         .route("/v1/fdb/stat/{serial}", get(stat))
         .route("/v1/fdb/children/{serial}", get(children))
@@ -326,33 +348,36 @@ pub fn serve(
             owner: None,
             notify_streams: Arc::new(Semaphore::new(64)),
             notify_requests: Arc::new(Semaphore::new(64)),
+            admin_requests: Arc::new(Semaphore::new(32)),
         })),
     )
 }
 
-/// 阶段性 owner 只读入口；不开放旧 FileService 的目录或写入 API。
+/// 原生 owner 入口：文件内容只读，池元数据通过FDB持久事务管理；不开放旧目录写入API。
 pub fn owner_router(
     catalog: Arc<ManagedCatalog>,
     routes: BTreeMap<String, ActiveLibraryRoute>,
     libraries: BTreeMap<String, Arc<HttpContext>>,
     peers: HashMap<u64, String>,
-) -> Router {
+) -> std::io::Result<Router> {
     let ctx = Arc::new(Context {
         catalog,
         routes,
         notify_streams: Arc::new(Semaphore::new(64)),
         notify_requests: Arc::new(Semaphore::new(64)),
-        owner: Some(OwnerReads {
+        admin_requests: Arc::new(Semaphore::new(32)),
+        owner: Some(OwnerRuntime {
             libraries,
             peers,
             requests: Arc::new(Semaphore::new(32)),
         }),
     });
-    metadata_router(ctx.clone()).merge(
+    pools::start_worker(&ctx)?;
+    Ok(metadata_router(ctx.clone()).merge(
         Router::new()
             .route("/v1/fdb/files/{serial}", get(content))
             .with_state(ctx),
-    )
+    ))
 }
 
 pub fn serve_owner(
@@ -362,7 +387,7 @@ pub fn serve_owner(
     libraries: BTreeMap<String, Arc<HttpContext>>,
     peers: HashMap<u64, String>,
 ) -> std::io::Result<()> {
-    http::serve_router(listen, owner_router(catalog, routes, libraries, peers))
+    http::serve_router(listen, owner_router(catalog, routes, libraries, peers)?)
 }
 
 fn content_scope(request: &Request) -> Result<(String, String, Option<String>), &'static str> {
@@ -690,3 +715,7 @@ mod tests {
 #[cfg(test)]
 #[path = "fdb_http_notify_tests.rs"]
 mod notify_tests;
+
+#[cfg(test)]
+#[path = "fdb_http_pools_tests.rs"]
+mod pools_tests;
