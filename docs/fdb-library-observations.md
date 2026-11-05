@@ -69,6 +69,6 @@ FDB请求有独立5秒预算，每25毫秒检查Serving资格；这不缩短任�
 
 实际停止两个新 FDB server 使其失去多数派，确认原集群读取 1031 超时、管理及就绪接口返回依赖不可用。恢复原 unit/data/cluster 后，完整新采样恢复；原两条已提交事件字节和未确认批次不变。最后仅对本次消费者显式 ACK，三节点均追平，相同 ACK 重放保持幂等。旧 45151 集群在故障期间及恢复后分别通过健康检查；这不代表连续监测。
 
-最终独立核对 FDB、控制状态及三个 B 主域设备 PR 一致：owner node 1 / epoch 142744。验收未装卸、MOVE、格式化或读写介质文件；APP owner 切换属于正常停机，不是崩溃或断电测试。单盘 TapeAlert/MAM 及设备采样错误的实物注入仍未验证，相关失败保留/重试边界由隔离 FDB 与模拟设备测试覆盖。故障窗口观察到重复 PR fencing 尝试，后续需单独核查 FDB 校验与设备 fencing 的调用顺序。
+最终独立核对 FDB、控制状态及三个 B 主域设备 PR 一致：owner node 1 / epoch 142744。验收未装卸、MOVE、格式化或读写介质文件；APP owner 切换属于正常停机，不是崩溃或断电测试。单盘 TapeAlert/MAM 及设备采样错误的实物注入仍未验证，相关失败保留/重试边界由隔离 FDB 与模拟设备测试覆盖。该版本故障窗口观察到重复 PR fencing 尝试；后续已加入并实测接管前置核验，见 [FDB owner 接管前置检查](fdb-owner-takeover.md)。
 
 证据目录：`/work/tmp/tape-native-library-observations-physical-20261106/`，包括 `BASIC-COMPLETE.json`、`SDK-basic.json`、`SSE-COMPLETE.json`、`HA-COMPLETE.json`、`QUORUM-COMPLETE.json`、`SDK-recovery.json`、`ACK-COMPLETE.json` 及 `OWNER-AUDIT-final.json`。软件检查与本次物理验证分别保存；持久消费者、事件和原请求证据均保留。
