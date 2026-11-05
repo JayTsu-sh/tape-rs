@@ -2,6 +2,9 @@
 
 use super::*;
 
+#[path = "management.rs"]
+pub(super) mod management;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolRecord {
     pub id: Uuid,

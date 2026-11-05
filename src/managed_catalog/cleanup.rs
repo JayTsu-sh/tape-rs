@@ -6,7 +6,7 @@ const MAX_PURGE_PAGE: usize = 100;
 // Copies must go first: they are the bounded reverse lookup for volume rows.
 // The e index is released only by the explicit owner-fenced media check.
 // The managed marker a is cleared after all assignments have been released.
-pub(super) const NAMESPACE_ROWS: &[u8] = b"RtjsquvwnlkhgfoNCHmMPLZIFABDKEeaWTUX";
+pub(super) const NAMESPACE_ROWS: &[u8] = b"RtjsquvwnlkhgfoNCHmMPLZIFABDKE@eaWTUX";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PurgeProgress {
