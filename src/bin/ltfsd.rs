@@ -60,7 +60,7 @@ struct Args {
         ]
     )]
     fdb_metadata_readonly: bool,
-    /// FDB Raft/PR owner 只读接任与 HTTP 读取（会按需装卸磁带）；不启用旧目录或写入
+    /// FDB Raft/PR owner 只读文件服务（会按需装卸磁带）及池运维；不启用旧目录或文件写入
     #[cfg(feature = "fdb")]
     #[arg(
         long,

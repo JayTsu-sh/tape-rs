@@ -596,12 +596,15 @@ fn run_fdb_http_loaded_reads(
         client_addrs: HashMap::new(),
         wait_timeout: Duration::from_secs(10),
     });
-    let owner = ReadHttpServer::start(fdb_http::owner_router(
-        catalog.clone(),
-        routes.clone(),
-        BTreeMap::from([(serial.to_owned(), context)]),
-        HashMap::new(),
-    ));
+    let owner = ReadHttpServer::start(
+        fdb_http::owner_router(
+            catalog.clone(),
+            routes.clone(),
+            BTreeMap::from([(serial.to_owned(), context)]),
+            HashMap::new(),
+        )
+        .unwrap(),
+    );
     let mut remote = status.lock().unwrap().clone();
     remote.id = 72;
     let entry_context = Arc::new(HttpContext {
@@ -612,12 +615,15 @@ fn run_fdb_http_loaded_reads(
         client_addrs: HashMap::new(),
         wait_timeout: Duration::from_secs(10),
     });
-    let entry = ReadHttpServer::start(fdb_http::owner_router(
-        catalog,
-        routes,
-        BTreeMap::from([(serial.to_owned(), entry_context.clone())]),
-        HashMap::from([(71, owner.address.clone())]),
-    ));
+    let entry = ReadHttpServer::start(
+        fdb_http::owner_router(
+            catalog,
+            routes,
+            BTreeMap::from([(serial.to_owned(), entry_context.clone())]),
+            HashMap::from([(71, owner.address.clone())]),
+        )
+        .unwrap(),
+    );
     let path = format!("/v1/fdb/files/{serial}?pool={pool}&path=L2FjdHVhbA");
     for server in [&owner, &entry] {
         let (ready, _, ready_body) = server.request("GET", "/readyz", None);

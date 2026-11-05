@@ -1,6 +1,6 @@
 # FDB 持久管理任务账本
 
-本批提供 `admit_management`、`management_task`、`list_management_tasks`、`next_management`、`cancel_management` 和管理请求窗口查询。`apply_pool_management` 可原子执行已排队的池策略修改和空池删除；其他入口只持久排队和查询，不执行磁带策略、库存扫描或设备命令。后台派发、设备 actor、执行中安全取消和管理 CLI/HTTP 接线仍需后续完成；queued 不能解释为命令已成功执行。
+池策略/删除已有 owner 后台执行与 CLI/HTTP 接线，见[原生池管理](fdb-pool-management.md)。创建复用原子创建事务，不伪装为异步任务。其他设备类型仍只有持久排队基础 API，尚未接入的执行器不会通过原生池 HTTP 接收；queued 不能解释为命令已成功执行。
 
 请求须先通过统一 `ManagementRequest::parse`，并固定带库、namespace、epoch、operation、完整 change 及指纹。接纳和取消要求精确活动路由与当前 FDB owner epoch；owner 接管后可用原身份查询、重试，旧 owner 不得继续修改任务。FDB owner 校验不代替 Raft/PR 设备执行许可。
 

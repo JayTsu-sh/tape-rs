@@ -1,10 +1,11 @@
-//! Notification RPCs retry only stable operation UUIDs and conditional consumer
-//! generations. This transport must not be reused for arbitrary control writes.
+//! Retries are restricted to reads, stable notification identities and saved
+//! pool request identities. Never use this transport for arbitrary control writes.
 use super::*;
 use http_body_util::BodyExt;
 use hyper_util::rt::TokioIo;
 use uuid::Uuid;
 mod notifications;
+pub mod pools;
 
 fn invalid(reason: &str) -> ClientError {
     ClientError::Io(std::io::Error::new(
@@ -25,7 +26,7 @@ impl Drop for Connection {
     }
 }
 fn connection_error(error: impl std::fmt::Display) -> ClientError {
-    ClientError::NoLeader(format!("通知连接暂不可用：{error}"))
+    ClientError::NoLeader(format!("FDB 管理连接暂不可用：{error}"))
 }
 fn retry_delay(attempt: u32) -> Duration {
     Duration::from_millis((100_u64 << attempt.min(5)) + u64::from(Uuid::new_v4().as_bytes()[0]))
@@ -62,7 +63,7 @@ impl FdbClient {
         headers: &[(&str, &str)],
     ) -> Result<Response> {
         if body.is_some_and(|v| v.len() > 16 * 1024) {
-            return Err(invalid("通知请求体超过16KiB上限"));
+            return Err(invalid("FDB 管理请求体超过16KiB上限"));
         }
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -132,7 +133,7 @@ async fn rpc_once(
         .body(http_body_util::Full::new(bytes::Bytes::copy_from_slice(
             body.unwrap_or_default(),
         )))
-        .map_err(|_| invalid("通知请求无效"))?;
+        .map_err(|_| invalid("FDB 管理请求无效"))?;
     let response = sender
         .send_request(request)
         .await
@@ -152,14 +153,14 @@ async fn rpc_once(
         .and_then(|v| v.parse::<u64>().ok())
         .is_some_and(|v| v > LIMIT as u64)
     {
-        return Err(ClientError::Verification("通知响应超过2MiB上限".into()));
+        return Err(ClientError::Verification("FDB 管理响应超过2MiB上限".into()));
     }
     let mut incoming = response.into_body();
     let mut bytes = Vec::new();
     while let Some(frame) = incoming.frame().await {
         if let Ok(data) = frame.map_err(connection_error)?.into_data() {
             if data.len() > LIMIT - bytes.len() {
-                return Err(ClientError::Verification("通知响应超过2MiB上限".into()));
+                return Err(ClientError::Verification("FDB 管理响应超过2MiB上限".into()));
             }
             bytes.extend_from_slice(&data);
         }
@@ -182,7 +183,10 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
 
-    fn server(response: Vec<u8>, delay: Duration) -> (String, std::thread::JoinHandle<Vec<u8>>) {
+    pub(super) fn server(
+        response: Vec<u8>,
+        delay: Duration,
+    ) -> (String, std::thread::JoinHandle<Vec<u8>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = listener.local_addr().unwrap().to_string();
         let task = std::thread::spawn(move || {
@@ -213,7 +217,7 @@ mod tests {
         });
         (endpoint, task)
     }
-    fn response(status: u16, body: &str) -> Vec<u8> {
+    pub(super) fn response(status: u16, body: &str) -> Vec<u8> {
         format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).into_bytes()
     }
     #[test]
