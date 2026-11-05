@@ -1,7 +1,10 @@
-//! Durable management intent queue. No method here applies control changes or
-//! performs media work. Running tasks require cancellation by their device actor.
+//! Durable management intents and atomic metadata-only pool application.
+//! Media work and running-task cancellation belong to their device actor.
 use super::*;
 use serde_json::{Value, json};
+
+#[path = "management_pools.rs"]
+mod pools;
 
 const MAX_QUEUED: usize = 100;
 
