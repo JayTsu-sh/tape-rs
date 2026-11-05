@@ -306,6 +306,7 @@ impl Publisher {
                 &context.control.serial,
                 context.control.route,
                 self.round,
+                &attempt.captured_at,
                 attempt.error.as_deref(),
             ),
         );

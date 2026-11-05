@@ -3484,8 +3484,8 @@ fn native_owner_publishes_complete_inventory_without_legacy_catalog() {
         let monitor = runtime
             .block_on(catalog.active_library_monitor(&serial, route))
             .unwrap();
-        if inventory.is_some() && monitor.is_some() {
-            observed = Some((inventory.unwrap(), monitor.unwrap()));
+        if let (Some(inventory), Some(monitor)) = (inventory, monitor) {
+            observed = Some((inventory, monitor));
             break;
         }
         std::thread::sleep(Duration::from_millis(30));
@@ -3508,4 +3508,5 @@ fn native_owner_publishes_complete_inventory_without_legacy_catalog() {
     assert_eq!(monitor["owner_epoch"], round);
     assert!(monitor["error"].is_null());
     assert_eq!(monitor["last_success"], monitor["last_attempt"]);
+    assert_eq!(monitor["last_attempt"], inventory["observed_at"]);
 }

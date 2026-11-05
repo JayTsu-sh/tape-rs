@@ -356,8 +356,56 @@ fn publisher_preserves_complete_samples_and_owner_boundaries() {
     publisher.poll(context(), &runtime).unwrap();
     assert!(log.lock().unwrap().is_empty());
     assert_eq!(inventory(&runtime, &control), pending);
+    assert_eq!(
+        monitor(&runtime, &control)["last_attempt"],
+        pending["observed_at"],
+        "重试旧采样不能刷新巡检时间"
+    );
     assert!(publisher.pending.is_none());
     assert_eq!(head(&runtime, &control), 4);
+    // The SDK transaction really commits; the caller then loses that ACK and
+    // resumes the original monitor stage. Neither timestamps nor events rewind.
+    let captured_at = pending["observed_at"].as_str().unwrap().to_owned();
+    publisher.pending = Some(Attempt {
+        captured_at: captured_at.clone(),
+        inventory: Some(pending.clone()),
+        inventory_confirmed: true,
+        error: None,
+    });
+    assert!(matches!(
+        publish(
+            &context(),
+            &runtime,
+            catalog.record_library_monitor(&serial, route, round, &captured_at, None)
+        ),
+        Publication::Confirmed
+    ));
+    let confirmed_monitor = monitor(&runtime, &control);
+    assert!(
+        !publisher
+            .accept(
+                &context(),
+                "monitor",
+                Publication::Failed {
+                    detail: "测试丢弃真实成功回执".into(),
+                    permanent: false
+                }
+            )
+            .unwrap()
+    );
+    std::thread::sleep(Duration::from_millis(20));
+    log.lock().unwrap().clear();
+    due(&mut publisher);
+    publisher.poll(context(), &runtime).unwrap();
+    assert!(log.lock().unwrap().is_empty());
+    assert_eq!(monitor(&runtime, &control), confirmed_monitor);
+    assert_eq!(head(&runtime, &control), 4);
+    assert!(
+        runtime
+            .block_on(catalog.record_library_monitor(&serial, route, round, "not-a-time", None))
+            .is_err()
+    );
+    assert_eq!(monitor(&runtime, &control), confirmed_monitor);
     due(&mut publisher);
     publisher.poll(context(), &runtime).unwrap();
     assert_eq!(

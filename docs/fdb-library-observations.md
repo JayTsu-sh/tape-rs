@@ -50,7 +50,7 @@ FDB请求有独立5秒预算，每25毫秒检查Serving资格；这不缩短任�
 
 每个库、namespace 保存独立缓存与通知证明。库存的语义投影包含介质/驱动数量及规范化 volumes+drives 的 SHA-256；`library.inventory.changed` 使用这个紧凑投影。条码、位置、装载状态及其他物理字段变化会改变指纹，即使磁带数量不变也产生通知；输入数组顺序、轮询时间或 owner 变化不改变同一物理库存的指纹。每次合法采集仍更新缓存中的时间与来源，不重复追加相同事件。
 
-巡检记录包含 version、namespace、library_serial、owner_epoch、interval_seconds、last_attempt、last_success 和 error。interval_seconds=30 描述预期采集周期，存储方法本身不启动定时任务。成功采集的 last_success 必须与该次 last_attempt 相同；缺失或不一致视为记录损坏，不由下一次心跳补齐。失败保留上次成功时间；同一 error/status 不因心跳、时间或 owner 更新重复通知。成功/故障或诊断内容变化生成 `library.monitor.changed`。错误最多 2048 字节，持久记录上限 16 KiB，JSON 转义后的长度同样受限。
+巡检记录包含 version、namespace、library_serial、owner_epoch、interval_seconds、last_attempt、last_success 和 error。interval_seconds=30 描述预期采集周期，存储方法本身不启动定时任务。调用方在采样结束时固定captured_at并显式交给record_library_monitor，事务和回执重试不重新取当前时间。成功采集的 last_success 必须与该次 last_attempt 和原采样时间相同；缺失或不一致视为记录损坏，不由下一次心跳补齐。失败保留上次成功时间；同一 error/status 不因心跳、时间或 owner 更新重复通知。成功/故障或诊断内容变化生成 `library.monitor.changed`。错误最多 2048 字节，持久记录上限 16 KiB，JSON 转义后的长度同样受限。
 
 这些是带时间的历史事实，不能仅凭 error=null 显示“实时健康”；展示层须结合 last_attempt/last_success 的新鲜度与当前 owner。库存读取与巡检故障独立：失败不会删除上一次完整库存，也不会把未知状态补成空库或健康。
 
