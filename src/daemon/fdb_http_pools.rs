@@ -559,6 +559,14 @@ pub(super) async fn rescan(
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 enum MechanicalChange {
+    #[serde(rename = "media-assign")]
+    Assign {
+        barcode: String,
+        pool: String,
+        volume: String,
+        confirm_format: bool,
+        force_format: bool,
+    },
     #[serde(rename = "media-move")]
     Move {
         barcode: String,
@@ -570,7 +578,7 @@ enum MechanicalChange {
 }
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
-struct MoveEnvelope {
+struct MechanicalEnvelope {
     version: u8,
     library: String,
     namespace: String,
@@ -583,6 +591,22 @@ pub(super) async fn tape_move(
     State(ctx): State<Arc<Context>>,
     Path((serial, barcode)): Path<(String, String)>,
     request: Request,
+) -> Response {
+    tape_mechanical(ctx, serial, barcode, request, "media-move").await
+}
+pub(super) async fn tape_assign(
+    State(ctx): State<Arc<Context>>,
+    Path((serial, barcode)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    tape_mechanical(ctx, serial, barcode, request, "media-assign").await
+}
+async fn tape_mechanical(
+    ctx: Arc<Context>,
+    serial: String,
+    barcode: String,
+    request: Request,
+    kind: &str,
 ) -> Response {
     let _permit = match budget(&ctx) {
         Ok(p) => p,
@@ -599,13 +623,13 @@ pub(super) async fn tape_move(
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let envelope: MoveEnvelope = match body(request).await {
+    let envelope: MechanicalEnvelope = match body(request).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let value = serde_json::to_value(envelope).expect("move envelope serializes");
-    if value["change"]["barcode"] != barcode {
-        return invalid("搬带条码与HTTP路径不符");
+    let value = serde_json::to_value(envelope).expect("mechanical envelope serializes");
+    if value["change"]["barcode"] != barcode || value["change"]["kind"] != kind {
+        return invalid("介质请求条码或种类与HTTP路径不符");
     }
     let intent = match crate::managed_catalog::ManagementRequest::parse(value) {
         Ok(v) => v,
@@ -1005,12 +1029,12 @@ mod backoff_tests {
     #[test]
     fn move_body_requires_explicit_nulls_and_rejects_duplicate_fields() {
         let body = json!({"version":1,"library":"LIB1","namespace":Uuid::new_v4().to_string(),"epoch":1,"operation":Uuid::new_v4().to_string(),"change":{"kind":"media-move","barcode":"TEST01L8","destination":"ieslot","pool":null,"volume":null,"revision":null}});
-        assert!(serde_json::from_value::<MoveEnvelope>(body.clone()).is_ok());
+        assert!(serde_json::from_value::<MechanicalEnvelope>(body.clone()).is_ok());
         for field in ["pool", "volume", "revision", "barcode", "destination"] {
             let mut absent = body.clone();
             absent["change"].as_object_mut().unwrap().remove(field);
             assert!(
-                serde_json::from_value::<MoveEnvelope>(absent).is_err(),
+                serde_json::from_value::<MechanicalEnvelope>(absent).is_err(),
                 "{field}"
             );
         }
@@ -1020,7 +1044,7 @@ mod backoff_tests {
             ("\"version\":", "\"version\":1,\"version\":"),
         ] {
             assert!(
-                serde_json::from_str::<MoveEnvelope>(&body.to_string().replacen(from, to, 1))
+                serde_json::from_str::<MechanicalEnvelope>(&body.to_string().replacen(from, to, 1))
                     .is_err()
             );
         }

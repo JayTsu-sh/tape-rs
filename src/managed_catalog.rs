@@ -57,8 +57,8 @@ pub use control::{
     ActivePoolCreation, ControlOutcome, PoolPolicy, PoolRecord, TapeAssignment, VolumePlacement,
 };
 pub use control::{
-    ManagementRequest, MoveExecution, MoveLocation, MoveLocationKind, MovePhase, MovePlan,
-    NotifyConnectionAction, NotifyFilter,
+    AssignExecution, AssignPhase, AssignPlan, ManagementRequest, MoveExecution, MoveLocation,
+    MoveLocationKind, MovePhase, MovePlan, NotifyConnectionAction, NotifyFilter,
 };
 pub use cutover::{
     FrozenSnapshotIdentity, VerifiedNodeExport, inspect_frozen_snapshot, verify_node_export,

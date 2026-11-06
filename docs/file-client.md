@@ -1,6 +1,6 @@
 # 文件客户端与 FUSE 挂载
 
-当前 FDB 原生 `pool` / `task` 命令以[池管理参考](fdb-pool-management.md)为准，`library list/show` 与 `tape list/show` 见[管理查询](fdb-management-queries.md)，`library rescan --request FILE` 见[异步扫描](fdb-library-rescan.md)，`tape move BARCODE homeslot|ieslot --request FILE` 见[异步搬带](fdb-tape-move.md)。下文旧数字任务命令不能用于原生任务。
+当前 FDB 原生 `pool` / `task` 命令以[池管理参考](fdb-pool-management.md)为准，`library list/show` 与 `tape list/show` 见[管理查询](fdb-management-queries.md)，`library rescan --request FILE` 见[异步扫描](fdb-library-rescan.md)，`tape move BARCODE homeslot|ieslot --request FILE` 见[异步搬带](fdb-tape-move.md)，`tape assign BARCODE POOL --confirm-format --request FILE` 见[原生分配](fdb-tape-assign.md)。下文旧数字任务命令不能用于原生任务。
 
 当前能力与部署状态见 [剩余实施队列](../.scratch/ltfs-ha/remaining-implementation.md) 和 [交接入口](CLAUDE-HANDOFF.md)。本文带日期的实验记录保留当时验证边界；后续记录取代早期状态。
 
@@ -58,7 +58,6 @@ HTTP 接入使用 axum / Hyper，保持现有端点、状态码、JSON 字段和
 | 删除空池 | `DELETE /admin/pools/{pool}` | 无 |
 | 修改池属性 | `PATCH /admin/pools/{pool}` | `{"attribute":"mountlimit","value":"1"}` |
 | 磁带列表/详情 | `GET /admin/tapes`、`GET /admin/tapes/{barcode}` | 无 |
-| 核对库存后分配 | `POST /admin/tapes/{barcode}/assign` | `{"pool":"poolname"}` |
 | 核对归槽后取消分配 | `POST /admin/tapes/{barcode}/unassign` | `{}`；拒绝仍有已知目录内容的磁带 |
 | 离线/上线 | `POST /admin/tapes/{barcode}/offline`、`…/online` | offline：`{"message":"maintenance"}`；online：`{}` |
 | 黑名单/清除 | `POST /admin/tapes/{barcode}/blacklist`、`…/clear-blacklist` | blacklist：`{"reason":"inspection"}`；清除：`{}` |
@@ -88,7 +87,7 @@ HTTP 接入使用 axum / Hyper，保持现有端点、状态码、JSON 字段和
 
 需要借用磁带的维护以及池属性修改会先暂停新上传、等待已准入上传完成、提交并收束当前写入带、将本实例使用的带归槽；维护结束再按最新策略选带。驱动策略变更要求目标驱动器为空。offline 保留 assignment，上线须实际装带验证 LTFS 索引；校验允许检查 offline 带，但不绕过黑名单。搬到 I/E 不等于 EE export，回到 home slot 不等于 HSM import。
 
-分配磁带后，既有调度器可能自动装带，并在首次选择空白带写入时按既有规则格式化；foreign 介质仍拒绝覆盖。恢复操作的文件输出留在任务记载的 owner 本机，不随 HA 自动搬迁。
+原生 FDB 分配必须显式确认格式化，并持久保存原请求；返回202只表示已受理。格式化完成后登记卷身份，文件索引仍需导入，分配不自动启动文件读写。恢复操作的文件输出留在任务记载的 owner 本机，不随 HA 自动搬迁。
 
 连接断开、`504 indeterminate` 或任务换届并不取消设备操作。未开始的 queued 任务可由新 owner 领取；running 任务在执行轮次结束后标为 indeterminate，不自动重放，迟到的旧轮次报告不能覆盖结果。已进入恢复过程的取消请求不能抹去已写入文件或已完成提交；失败也不代表副作用已回滚。响应丢失时先查询任务及资源状态，不能盲目重新提交。
 

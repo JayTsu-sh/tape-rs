@@ -17,6 +17,39 @@ use crate::error::{Result, TapeError};
 const PAGE_SIZE: u64 = 4096;
 const CHUNK: u64 = 16 << 20;
 
+pub(super) fn index_row_error(error: rusqlite::Error) -> TapeError {
+    match error.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::DiskFull) => TapeError::LocalCapacity {
+            reason: format!("索引节点暂存失败: {error}"),
+        },
+        Some(rusqlite::ErrorCode::ConstraintViolation) => {
+            TapeError::Ltfs(format!("索引节点重复: {error}"))
+        }
+        _ => TapeError::CatalogDb(error),
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+    #[test]
+    fn proof_storage_faults_are_not_evidence_of_bad_media() {
+        let error = |code| rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+        assert!(matches!(
+            index_row_error(error(rusqlite::ffi::SQLITE_IOERR)),
+            TapeError::CatalogDb(_)
+        ));
+        assert!(matches!(
+            index_row_error(error(rusqlite::ffi::SQLITE_FULL)),
+            TapeError::LocalCapacity { .. }
+        ));
+        assert!(matches!(
+            index_row_error(error(rusqlite::ffi::SQLITE_CONSTRAINT)),
+            TapeError::Ltfs(_)
+        ));
+    }
+}
+
 /// Node-local limits, independent of tape size and catalog authority. The
 /// ceiling is not allocated up front; reservations grow in 16 MiB chunks.
 #[derive(Debug, Clone)]

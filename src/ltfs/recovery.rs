@@ -34,6 +34,8 @@ use super::volume::P1_DATA_START;
 #[cfg(feature = "fdb")]
 mod streamed;
 #[cfg(feature = "fdb")]
+pub(crate) use streamed::probe_empty_volume;
+#[cfg(feature = "fdb")]
 pub use streamed::{StreamedFullRecovery, capture_full_recovery};
 
 /// 末索引之后区域的分类（协议中的 T0—T4，另加"尚无索引的空数据区"）。
@@ -292,7 +294,7 @@ impl BufRead for ConstructReader<'_, '_> {
                         .checked_add(n)
                         .ok_or_else(|| std::io::Error::other("构造长度溢出"))?;
                     if self.bytes > self.max_bytes {
-                        self.error = Some(TapeError::RecoveryRestricted {
+                        self.error = Some(TapeError::LocalCapacity {
                             reason: format!("构造超过预算 {} 字节", self.max_bytes),
                         });
                         self.done = true;
@@ -613,6 +615,8 @@ pub fn verify_dp_ip_head(
 pub(crate) struct VerifiedDpIpHead {
     pub ip_generation: u64,
     pub predecessors: Vec<super::volume::CommittedIndexConstruct>,
+    /// A property of the verified view, never standalone write permission.
+    pub empty_unlocked: bool,
 }
 
 #[cfg(feature = "fdb")]
@@ -671,6 +675,11 @@ pub(crate) fn verify_dp_ip_head_with_evidence(
     Ok(VerifiedDpIpHead {
         ip_generation: ip.generation,
         predecessors: Vec::new(),
+        empty_unlocked: comparison.empty_dp()?
+            && dp
+                .volume_lock_state
+                .as_deref()
+                .is_none_or(|s| s == "unlocked"),
     })
 }
 
@@ -709,7 +718,7 @@ fn verify_incremental_dp_ip_head(
     let mut predecessors = Vec::new();
     while chain.last().unwrap().incremental {
         if predecessors.len() >= budget.max_chain_len as usize {
-            return Err(TapeError::RecoveryRestricted {
+            return Err(TapeError::LocalCapacity {
                 reason: "增量链重放预算耗尽".into(),
             });
         }
@@ -785,6 +794,11 @@ fn verify_incremental_dp_ip_head(
     Ok(VerifiedDpIpHead {
         ip_generation: ip.generation,
         predecessors,
+        empty_unlocked: replay.empty_dp()?
+            && view
+                .volume_lock_state
+                .as_deref()
+                .is_none_or(|s| s == "unlocked"),
     })
 }
 

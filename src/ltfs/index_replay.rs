@@ -183,6 +183,13 @@ pub(super) struct IndexReplay {
 }
 
 impl IndexReplay {
+    pub(super) fn empty_dp(&self) -> Result<bool> {
+        Ok(!self
+            .db
+            .query_row("SELECT EXISTS(SELECT 1 FROM dp WHERE path!=X'')", [], |r| {
+                r.get::<_, bool>(0)
+            })?)
+    }
     pub(super) fn new(budget: &IndexScratchBudget) -> Result<Self> {
         let db = ScratchDatabase::new(budget)?;
         db.execute_batch(
@@ -216,15 +223,7 @@ impl IndexReplay {
                 entry.symlink,
                 entry.body
             ])
-            .map_err(|error| {
-                if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) {
-                    TapeError::LocalCapacity {
-                        reason: format!("索引磁盘重放路径重复或暂存失败: {error}"),
-                    }
-                } else {
-                    TapeError::Ltfs(format!("索引磁盘重放路径重复或暂存失败: {error}"))
-                }
-            })?;
+            .map_err(super::index_scratch::index_row_error)?;
         Ok(())
     }
 
@@ -238,7 +237,8 @@ impl IndexReplay {
                 entry.kind,
                 entry.uid.to_be_bytes().as_slice(),
                 entry.body
-            ])?;
+            ])
+            .map_err(super::index_scratch::index_row_error)?;
         Ok(())
     }
 

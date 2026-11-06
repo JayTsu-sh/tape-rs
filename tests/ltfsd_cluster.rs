@@ -80,6 +80,7 @@ enum ReclaimCut {
     BeforeLabels,
     PartialLabels,
     AfterMkltfs,
+    BeforeCompletionPublication,
 }
 
 struct FormatPause {
@@ -90,6 +91,8 @@ struct FormatPause {
     entered: Sender<()>,
     resume: Mutex<std::sync::mpsc::Receiver<()>>,
     returned: Sender<bool>,
+    commands: std::sync::atomic::AtomicUsize,
+    formats: std::sync::atomic::AtomicUsize,
 }
 
 impl FormatPause {
@@ -133,6 +136,12 @@ impl tape_rs::scsi::transport::TapeTransport for PausingTransport {
     ) -> Result<tape_rs::scsi::device::ScsiResult> {
         use std::sync::atomic::Ordering;
         let is_format = cdb.first() == Some(&tape_rs::scsi::cdb::opcode::FORMAT_MEDIUM);
+        if let Some(p) = &self.pause {
+            p.commands.fetch_add(1, Ordering::SeqCst);
+            if is_format {
+                p.formats.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         let pause = self.pause.as_ref().filter(|p| {
             p.cut == ReclaimCut::BeforeFormat
                 && is_format
@@ -165,6 +174,9 @@ impl tape_rs::scsi::transport::TapeTransport for PausingTransport {
         timeout: u32,
     ) -> Result<tape_rs::scsi::device::ScsiResult> {
         use std::sync::atomic::Ordering;
+        if let Some(p) = &self.pause {
+            p.commands.fetch_add(1, Ordering::SeqCst);
+        }
         if cdb.first() == Some(&tape_rs::scsi::cdb::opcode::READ_6) {
             self.checkpoint_fault
                 .read_commands
@@ -197,6 +209,9 @@ impl tape_rs::scsi::transport::TapeTransport for PausingTransport {
         timeout: u32,
     ) -> Result<tape_rs::scsi::device::ScsiResult> {
         use std::sync::atomic::Ordering;
+        if let Some(p) = &self.pause {
+            p.commands.fetch_add(1, Ordering::SeqCst);
+        }
         if cdb.first() == Some(&tape_rs::scsi::cdb::opcode::WRITE_6)
             && self
                 .checkpoint_fault
@@ -407,8 +422,23 @@ impl Cluster {
                 executor::run(provider, eopts, exec_rx, ev_tx, files, status_for_exec)
             });
             let inbox_tx = inboxes[&id].clone();
+            let completion_pause = format_pause.clone();
             thread::spawn(move || {
                 for ev in ev_rx {
+                    if let Some(pause) = completion_pause.as_ref().filter(|p| {
+                        p.cut == ReclaimCut::BeforeCompletionPublication
+                            && matches!(ev, executor::ExecEvent::Reclaimed { .. })
+                            && p.initiator
+                                .compare_exchange(
+                                    id as u32,
+                                    0,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                )
+                                .is_ok()
+                    }) {
+                        pause.wait().unwrap();
+                    }
                     if inbox_tx.send(NodeInput::Exec(ev)).is_err() {
                         break;
                     }
@@ -3625,6 +3655,11 @@ fn reclaim_takeover_after_mkltfs_before_completion_preserves_symlinks() {
 }
 
 #[test]
+fn completed_reclaim_waits_for_durable_application_without_another_format() {
+    check_symlink_reclaim(Some(ReclaimCut::BeforeCompletionPublication));
+}
+
+#[test]
 fn reclaim_takeover_after_format_before_labels_preserves_symlinks() {
     check_symlink_reclaim(Some(ReclaimCut::BeforeLabels));
 }
@@ -3696,6 +3731,8 @@ fn check_symlink_reclaim(cut: Option<ReclaimCut>) {
         entered: entered_tx,
         resume: Mutex::new(resume_rx),
         returned: returned_tx,
+        commands: std::sync::atomic::AtomicUsize::new(0),
+        formats: std::sync::atomic::AtomicUsize::new(0),
     });
     if cut.is_some() {
         // Destination creation must not be mistaken for source reclamation.
@@ -3717,6 +3754,7 @@ fn check_symlink_reclaim(cut: Option<ReclaimCut>) {
             Some(ReclaimCut::AfterMkltfs) => "reclaim-symlinks-formatted",
             Some(ReclaimCut::BeforeLabels) => "reclaim-symlinks-blank",
             Some(ReclaimCut::PartialLabels) => "reclaim-symlinks-partial",
+            Some(ReclaimCut::BeforeCompletionPublication) => "reclaim-completion-publication",
         },
         false,
         lib,
@@ -3744,6 +3782,39 @@ fn check_symlink_reclaim(cut: Option<ReclaimCut>) {
             .recv_timeout(Duration::from_secs(20))
             .expect("未到达回收中断屏障");
         assert_eq!(c.st(leader).tapes["PA0001L8"].state, "reformatting");
+        if cut == Some(ReclaimCut::BeforeCompletionPublication) {
+            struct Release(Sender<()>);
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    let _ = self.0.send(());
+                }
+            }
+            let release = Release(resume_tx.clone());
+            let commands = || pause.commands.load(std::sync::atomic::Ordering::SeqCst);
+            let count_formats = || pause.formats.load(std::sync::atomic::Ordering::SeqCst);
+            let before = c.lib.cartridge("PA0001L8").unwrap();
+            let formats = count_formats();
+            let initial_commands = commands();
+            c.wait(
+                "等待回收完成回执时执行线程仍继续运行",
+                || commands() >= initial_commands + 30,
+            );
+            assert_eq!(c.st(leader).tapes["PA0001L8"].state, "reformatting");
+            assert_eq!(
+                count_formats(),
+                formats,
+                "completed FORMAT must not repeat while its Raft completion remains unapplied"
+            );
+            let after = c.lib.cartridge("PA0001L8").unwrap();
+            assert_eq!(before.partitions[0].objects, after.partitions[0].objects);
+            assert_eq!(before.partitions[1].objects, after.partitions[1].objects);
+            drop(release);
+            c.wait("原回收完成记录已应用", || {
+                c.st(leader).tapes["PA0001L8"].state == "appendable"
+            });
+            assert_eq!(count_formats(), formats);
+            return;
+        }
         // Check the actual source medium and the durable destination catalog
         // while completion has not been reported to the replicated state.
         let source = c.lib.cartridge("PA0001L8").unwrap();

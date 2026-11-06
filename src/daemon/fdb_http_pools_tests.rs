@@ -293,6 +293,98 @@ async fn run_pool_api(cluster: &str) {
         (202, cancelled)
     );
 
+    let assignment = json!({"version":1,"library":serial,"namespace":namespace,"epoch":1,"operation":Uuid::new_v4().to_string(),"change":{"kind":"media-assign","pool":Uuid::new_v4().to_string(),"volume":Uuid::new_v4().to_string(),"barcode":"TEST01L8","confirm_format":true,"force_format":false}});
+    let assign_path = format!("{root}/tapes/TEST01L8/assign");
+    assert_eq!(
+        request(
+            &a,
+            "POST",
+            &assign_path,
+            Some(&namespace),
+            assignment.to_string().as_bytes()
+        )
+        .await
+        .0,
+        405
+    );
+    assert_eq!(
+        request(
+            &b,
+            "POST",
+            &assign_path,
+            None,
+            assignment.to_string().as_bytes()
+        )
+        .await
+        .0,
+        409
+    );
+    let (code, admitted) = request(
+        &b,
+        "POST",
+        &assign_path,
+        Some(&namespace),
+        assignment.to_string().as_bytes(),
+    )
+    .await;
+    assert_eq!(code, 202, "{admitted}");
+    assert_eq!(admitted["request"], assignment);
+    assert_eq!(
+        request(
+            &b,
+            "POST",
+            &assign_path,
+            Some(&namespace),
+            assignment.to_string().as_bytes()
+        )
+        .await,
+        (202, admitted)
+    );
+    let mut bad = assignment.clone();
+    bad["change"]["confirm_format"] = json!(false);
+    assert_eq!(
+        request(
+            &b,
+            "POST",
+            &assign_path,
+            Some(&namespace),
+            bad.to_string().as_bytes()
+        )
+        .await
+        .0,
+        400
+    );
+    let mut bad = assignment.clone();
+    bad["change"]["unknown"] = json!(true);
+    assert_eq!(
+        request(
+            &b,
+            "POST",
+            &assign_path,
+            Some(&namespace),
+            bad.to_string().as_bytes()
+        )
+        .await
+        .0,
+        400
+    );
+    let duplicate = assignment.to_string().replace(
+        "\"confirm_format\":true",
+        "\"confirm_format\":true,\"confirm_format\":true",
+    );
+    assert_ne!(duplicate, assignment.to_string());
+    assert_eq!(
+        request(
+            &b,
+            "POST",
+            &assign_path,
+            Some(&namespace),
+            duplicate.as_bytes()
+        )
+        .await
+        .0,
+        400
+    );
     let movement = json!({"version":1,"library":serial,"namespace":namespace,"epoch":1,"operation":Uuid::new_v4().to_string(),"change":{"kind":"media-move","pool":null,"volume":null,"revision":null,"barcode":"TEST01L8","destination":"ieslot"}});
     let move_path = format!("{root}/tapes/TEST01L8/move");
     assert_eq!(

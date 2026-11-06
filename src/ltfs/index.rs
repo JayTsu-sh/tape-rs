@@ -264,7 +264,7 @@ impl LtfsIndex {
 
     /// 从分段输入解析索引，不保留整份 XML；内存只含事件缓冲与文件树。
     pub fn parse_reader<R: std::io::BufRead>(input: R) -> Result<Self> {
-        Self::parse_with(input, false, false, true, |_| Ok(()))
+        Self::parse_with(input, false, Some(false), true, |_| Ok(()))
     }
 
     /// 逐条扫描完整索引，避免把全部文件挂进内存目录树。回调失败立即停止；
@@ -275,7 +275,7 @@ impl LtfsIndex {
         input: R,
         emit: F,
     ) -> Result<Self> {
-        Self::parse_with(input, true, false, true, emit)
+        Self::parse_with(input, true, Some(false), true, emit)
     }
 
     /// Stream a raw incremental construct without materializing the full
@@ -284,7 +284,7 @@ impl LtfsIndex {
         input: R,
         emit: F,
     ) -> Result<Self> {
-        Self::parse_with(input, true, true, true, emit)
+        Self::parse_with(input, true, Some(true), true, emit)
     }
 
     /// The callback must enforce unique paths on disk and keep all output
@@ -298,13 +298,27 @@ impl LtfsIndex {
         input: R,
         emit: F,
     ) -> Result<Self> {
-        Self::parse_with(input, true, true, false, emit)
+        Self::parse_with(input, true, Some(true), false, emit)
+    }
+
+    /// Discovery before an exact source identity is available. The XML root
+    /// selects Full/delta validation; callbacks must remain provisional and
+    /// enforce uniqueness on disk if they retain entries.
+    #[cfg(feature = "fdb")]
+    pub(crate) fn scan_any_reader_to_disk<
+        R: std::io::BufRead,
+        F: FnMut(IndexEntry) -> Result<()>,
+    >(
+        input: R,
+        emit: F,
+    ) -> Result<Self> {
+        Self::parse_with(input, true, None, false, emit)
     }
 
     fn parse_with<R: std::io::BufRead, F: FnMut(IndexEntry) -> Result<()>>(
         input: R,
         streaming: bool,
-        incremental_stream: bool,
+        incremental_stream: Option<bool>,
         check_paths: bool,
         mut emit: F,
     ) -> Result<Self> {
@@ -312,14 +326,19 @@ impl LtfsIndex {
         reader.config_mut().trim_text(false);
         let mut p = IndexParser::new();
         p.streaming = streaming;
-        p.incremental_stream = incremental_stream;
+        p.incremental_stream = incremental_stream.unwrap_or(false);
         let mut seen_paths = BTreeSet::new();
         let mut bufv = Vec::new();
         loop {
             bufv.clear();
             match reader.read_event_into(&mut bufv)? {
                 Event::Eof => break,
-                Event::Start(e) => p.on_start(e)?,
+                Event::Start(e) => {
+                    if incremental_stream.is_none() && p.path.is_empty() {
+                        p.incremental_stream = e.name().as_ref() == b"ltfsincrementalindex";
+                    }
+                    p.on_start(e)?;
+                }
                 Event::Empty(e) => {
                     let end = e.to_end().into_owned();
                     p.on_start(e)?;
@@ -333,7 +352,7 @@ impl LtfsIndex {
                 _ => {}
             }
             if let Some(entry) = p.pending_entry.take() {
-                if incremental_stream {
+                if p.incremental_stream {
                     super::incremental::validate_incremental_entry(&entry)?;
                     let path = match &entry {
                         IndexEntry::File { path, .. } | IndexEntry::Directory { path, .. } => path,
@@ -345,8 +364,9 @@ impl LtfsIndex {
                 emit(entry)?;
             }
         }
+        let expected_incremental = p.incremental_stream;
         let index = p.finish()?;
-        if streaming && index.incremental != incremental_stream {
+        if streaming && index.incremental != expected_incremental {
             return Err(TapeError::Ltfs("逐条扫描的索引类型不匹配".into()));
         }
         index.validate_incremental()?;
@@ -802,7 +822,9 @@ impl IndexParser {
         let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
         self.text.clear();
         if self.path.len() >= 512 {
-            return Err(TapeError::Ltfs("索引 XML 嵌套深度超过预算".into()));
+            return Err(TapeError::LocalCapacity {
+                reason: "索引 XML 嵌套深度超过预算".into(),
+            });
         }
         if matches!(name.as_str(), "name" | "key" | "symlink")
             && e.attributes().flatten().any(|a| {
