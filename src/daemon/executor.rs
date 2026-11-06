@@ -4159,3 +4159,7 @@ mod sg_provider_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "executor_reclaim_physical_tests.rs"]
+mod reclaim_physical_tests;
