@@ -251,11 +251,15 @@ struct ProbeFault {
     detail: String,
     lost: bool,
 }
+fn probe_read_completed(error: &TapeError) -> bool {
+    matches!(error, TapeError::ScsiCommand {status:2,sense_key,asc,ascq,sense}
+        if !matches!(sense_key,2|6|0x0b)
+            && sense.as_deref().and_then(|s| s.current_condition())
+                == Some((*sense_key,*asc,*ascq)))
+}
 impl CommandGuard<'_> {
     fn record_fault(&self, error: &TapeError, guard_failed: bool) {
-        let completed = matches!(error, TapeError::ScsiCommand {status:2,sense_key,..}
-            if !matches!(sense_key,2|6|0x0b));
-        if !guard_failed && completed {
+        if !guard_failed && probe_read_completed(error) {
             return;
         }
         if let Some(cell) = self.probe_fault {

@@ -12,6 +12,57 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use uuid::Uuid;
+
+#[test]
+fn probe_failure_requires_complete_current_sense_before_releasing_unknown_result() {
+    use crate::scsi::sense::SenseInfo;
+    let error = |sense: Option<SenseInfo>, key, asc| TapeError::ScsiCommand {
+        status: 2,
+        sense_key: key,
+        asc,
+        ascq: 0,
+        sense: sense.map(Box::new),
+    };
+    assert!(!probe_read_completed(&error(None, 3, 0x11)));
+    let mut raw = [0; 18];
+    raw[0] = 0x70;
+    raw[2] = 3;
+    raw[7] = 10;
+    raw[12] = 0x11;
+    for length in [0, 7, 13, 14, 17] {
+        assert!(
+            !probe_read_completed(&error(Some(SenseInfo::from_bytes(&raw[..length])), 3, 0x11)),
+            "truncated sense length={length}"
+        );
+    }
+    for response in [0x70, 0x71, 0x72, 0x73] {
+        let mut bytes = raw;
+        bytes[0] = response;
+        if response >= 0x72 {
+            bytes[1] = 3;
+            bytes[2] = 0x11;
+        }
+        assert_eq!(
+            probe_read_completed(&error(Some(SenseInfo::from_bytes(&bytes)), 3, 0x11)),
+            matches!(response, 0x70 | 0x72),
+            "response={response:#x}"
+        );
+    }
+    for (key, asc) in [(5, 0x11), (3, 0x20)] {
+        assert!(
+            !probe_read_completed(&error(Some(SenseInfo::from_bytes(&raw)), key, asc)),
+            "public fields disagree with captured sense"
+        );
+    }
+    for key in [2, 6, 0x0b] {
+        raw[2] = key;
+        assert!(!probe_read_completed(&error(
+            Some(SenseInfo::from_bytes(&raw)),
+            key,
+            0x11
+        )));
+    }
+}
 #[derive(Default)]
 struct Faults {
     successful: Mutex<Vec<Vec<u8>>>,
