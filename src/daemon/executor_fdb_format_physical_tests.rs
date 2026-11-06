@@ -6,8 +6,119 @@ mod physical_format_safety {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    #[tokio::test]
+    #[ignore = "需要隔离FDB；实际任务处理链配合Sim，不访问硬件"]
+    async fn unknown_preformat_probe_keeps_original_fdb_task_and_gate() {
+        struct HostProbe {
+            inner: Box<dyn TapeTransport + Send>,
+            failed: AtomicBool,
+        }
+        impl TapeTransport for HostProbe {
+            fn execute_no_data(
+                &self,
+                cdb: &[u8],
+                timeout: u32,
+            ) -> Result<crate::scsi::device::ScsiResult> {
+                self.inner.execute_no_data(cdb, timeout)
+            }
+            fn execute_read(
+                &self,
+                cdb: &[u8],
+                data: &mut [u8],
+                timeout: u32,
+            ) -> Result<crate::scsi::device::ScsiResult> {
+                if cdb[0] == 0x08 && !self.failed.swap(true, Ordering::SeqCst) {
+                    return Err(TapeError::ScsiHost(3));
+                }
+                self.inner.execute_read(cdb, data, timeout)
+            }
+            fn execute_write(
+                &self,
+                cdb: &[u8],
+                data: &[u8],
+                timeout: u32,
+            ) -> Result<crate::scsi::device::ScsiResult> {
+                self.inner.execute_write(cdb, data, timeout)
+            }
+            fn identity(&self) -> &str {
+                self.inner.identity()
+            }
+            fn session_epoch(&self) -> Option<u64> {
+                self.inner.session_epoch()
+            }
+            fn execution_guard(&self) -> Option<(u64, usize)> {
+                self.inner.execution_guard()
+            }
+        }
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        let (mut f, control, pool, status) = Box::pin(native_fixture(catalog.clone())).await;
+        // Assign starts from a storage element, as on the physical AA47 case.
+        // A cartridge already in a drive has no persisted home in this fixture.
+        TapeDrive::new(f.device()).unload().unwrap();
+        let (_, rows) = elements(&f.owner).unwrap();
+        let source = cartridge(&rows, "LIFE00L8").unwrap().address;
+        let home = rows
+            .iter()
+            .find(|e| e.element_type == ElementType::Storage && !e.full)
+            .unwrap()
+            .address;
+        move_medium(&f.owner.devices, source, home).unwrap();
+        let request=crate::managed_catalog::ManagementRequest::parse(json!({"version":1,"library":control.serial,"namespace":control.route.route.namespace.to_string(),"epoch":1,"operation":uuid::Uuid::new_v4().to_string(),"change":{"kind":"media-assign","pool":pool.id.to_string(),"barcode":"LIFE00L8","volume":uuid::Uuid::new_v4().to_string(),"confirm_format":true,"force_format":false}})).unwrap();
+        catalog
+            .admit_management(&control.serial, control.route, f.owner.round, &request)
+            .await
+            .unwrap();
+        let intake = catalog
+            .start_native_media(
+                &control.serial,
+                control.route,
+                f.owner.round,
+                1,
+                request.operation(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let inner = std::mem::replace(&mut f.owner.devices[0].dev, Box::new(ClosedTransport));
+        f.owner.devices[0].dev = Box::new(HostProbe {
+            inner,
+            failed: AtomicBool::new(false),
+        });
+        let result = Box::pin(fdb_intake::apply(
+            &mut f.owner,
+            &f.permit,
+            &control,
+            &f.opts,
+            &status,
+            1,
+            request.operation(),
+        ))
+        .await;
+        let receipt = catalog
+            .management_task(&control.serial, control.route, 1, request.operation())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(result, Err(ReadError::Lost(_))),
+            "未知检查结果应让actor停止: {result:?}; receipt={receipt}"
+        );
+        assert_eq!(receipt["status"], "running");
+        let state = catalog
+            .native_media_status(&intake, f.owner.round)
+            .await
+            .unwrap();
+        assert_eq!(state["abort"], false, "原任务互锁仍存在，未终态清理");
+        assert_eq!(f.formats(), 0);
+    }
+
     struct Trace {
         root: std::path::PathBuf,
+        operation: String,
+        volume: String,
         formats: AtomicUsize,
         fault_sent: AtomicBool,
         commands: Mutex<Vec<u8>>,
@@ -15,13 +126,20 @@ mod physical_format_safety {
 
     impl Trace {
         fn save(&self, name: &str, value: &Value) {
+            let mut value = value.clone();
+            let object = value.as_object_mut().unwrap();
+            object.insert("acceptance_operation".into(), json!(self.operation));
+            object.insert("accepted_volume".into(), json!(self.volume));
+            let pending = self.root.join(format!(".{name}.pending"));
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(self.root.join(name))
+                .open(&pending)
                 .unwrap();
             file.write_all(value.to_string().as_bytes()).unwrap();
             file.sync_all().unwrap();
+            std::fs::hard_link(&pending, self.root.join(name)).unwrap();
+            std::fs::remove_file(&pending).unwrap();
             std::fs::File::open(&self.root).unwrap().sync_all().unwrap();
         }
         fn wait(&self, name: &str) {
@@ -33,6 +151,12 @@ mod physical_format_safety {
                 );
                 std::thread::sleep(Duration::from_millis(100));
             }
+            let marker: Value =
+                serde_json::from_slice(&std::fs::read(self.root.join(name)).unwrap()).unwrap();
+            assert_eq!(
+                marker["operation"], self.operation,
+                "不能接受其他实验的控制回执"
+            );
         }
         fn command(&self, cdb: &[u8], kind: DeviceKind) {
             if kind == DeviceKind::Drive {
@@ -118,6 +242,15 @@ mod physical_format_safety {
                     crate::scsi::inquiry::read_unit_serial(&device).as_deref(),
                     Some(serial)
                 );
+                let prior = reservation::read_status(&device)?;
+                assert!(
+                    prior.holder.is_none(),
+                    "原owner的PR尚未释放；不注册或抢占: {prior:?}"
+                );
+                self.trace.save(
+                    &format!("PR-BEFORE-{kind:?}.json"),
+                    &json!({"holder":null,"generation":prior.generation,"keys":prior.keys}),
+                );
                 devices.push(ManagedDevice {
                     name: path.into(),
                     serial: serial.into(),
@@ -141,6 +274,7 @@ mod physical_format_safety {
         let plan: Value =
             serde_json::from_slice(&std::fs::read(root.join("PLAN.json")).unwrap()).unwrap();
         assert_eq!(plan["confirm_format"], true);
+        assert_eq!(plan["force_format"], false);
         assert_eq!(plan["barcode"], "8A0047L8");
         assert_eq!(plan["library"], "55L3A78011W9LL01");
         let quiet: Value =
@@ -161,6 +295,8 @@ mod physical_format_safety {
         .await;
         let trace = Arc::new(Trace {
             root,
+            operation: operation.to_string(),
+            volume: volume.to_string(),
             formats: AtomicUsize::new(0),
             fault_sent: AtomicBool::new(false),
             commands: Mutex::new(Vec::new()),
@@ -187,7 +323,7 @@ mod physical_format_safety {
             Instant::now() + Duration::from_secs(3600)
         ));
         f.permit = permit;
-        let request=ManagementRequest::parse(json!({"version":1,"library":control.serial,"namespace":control.route.route.namespace.to_string(),"epoch":1,"operation":operation.to_string(),"change":{"kind":"media-assign","pool":pool.id.to_string(),"barcode":"8A0047L8","volume":volume.to_string(),"confirm_format":true,"force_format":true}})).unwrap();
+        let request=ManagementRequest::parse(json!({"version":1,"library":control.serial,"namespace":control.route.route.namespace.to_string(),"epoch":1,"operation":operation.to_string(),"change":{"kind":"media-assign","pool":pool.id.to_string(),"barcode":"8A0047L8","volume":volume.to_string(),"confirm_format":true,"force_format":false}})).unwrap();
         trace.save("TASK-INTENT.json", request.value());
         catalog
             .admit_management(&control.serial, control.route, f.owner.round, &request)

@@ -29,6 +29,7 @@ impl TapeTransport for Trace {
                 sense_key: 5,
                 asc: 0x24,
                 ascq: 0,
+                sense: None,
             });
         }
         self.inner.execute_no_data(c, t)
@@ -551,6 +552,7 @@ fn unsupported_eod_fails_mount_without_fallback() {
             sense_key: 5,
             asc: 0x24,
             ascq: 0,
+            ..
         })
     ));
     let commands = dev.commands.borrow();

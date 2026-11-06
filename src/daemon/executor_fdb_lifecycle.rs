@@ -1069,11 +1069,9 @@ fn format_allowed(
 ) -> std::result::Result<(), ReadError> {
     let checked = cancel::PreformatRead::new(device, || Ok(false));
     let result = format_allowed_readonly(&checked, spool, budget, force);
-    let proof = checked.verify_proof().map_err(physical);
-    match result {
-        Err(error) => Err(error),
-        Ok(()) => proof,
-    }
+    // Recovery may wrap an I/O error; the proof's unknown state must survive.
+    checked.verify_proof().map_err(physical)?;
+    result
 }
 
 fn format_allowed_readonly(
@@ -4806,6 +4804,93 @@ mod tests {
 mod format_partition_tests {
     use super::*;
     use crate::scsi::sim::{SimCartridge, SimLibrary};
+
+    struct UnknownProbe {
+        inner: crate::scsi::sim::SimTransport,
+        kind: u8,
+        reads: std::cell::Cell<usize>,
+    }
+    impl TapeTransport for UnknownProbe {
+        fn execute_no_data(
+            &self,
+            cdb: &[u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            if self.kind == 0 {
+                return Err(TapeError::ScsiHost(3));
+            }
+            self.inner.execute_no_data(cdb, timeout)
+        }
+        fn execute_read(
+            &self,
+            cdb: &[u8],
+            data: &mut [u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            if cdb[0] == 0x08 {
+                let reads = self.reads.get() + 1;
+                self.reads.set(reads);
+                if reads == 3 {
+                    let mut raw = vec![0; 18];
+                    raw[0] = if self.kind == 1 { 0x71 } else { 0x70 };
+                    raw[2] = 8;
+                    raw[7] = 10;
+                    if self.kind == 2 {
+                        raw.truncate(13);
+                    }
+                    return Err(TapeError::ScsiCommand {
+                        status: 2,
+                        sense_key: 8,
+                        asc: 0,
+                        ascq: 0,
+                        sense: if self.kind == 3 {
+                            None
+                        } else {
+                            Some(Box::new(crate::scsi::sense::SenseInfo::from_bytes(&raw)))
+                        },
+                    });
+                }
+            }
+            self.inner.execute_read(cdb, data, timeout)
+        }
+        fn execute_write(
+            &self,
+            cdb: &[u8],
+            data: &[u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            self.inner.execute_write(cdb, data, timeout)
+        }
+        fn identity(&self) -> &str {
+            self.inner.identity()
+        }
+    }
+
+    #[test]
+    fn preformat_unknown_errors_keep_lost_classification_for_the_actor() {
+        for kind in 0..4 {
+            let lib = SimLibrary::new(1, 2, 1);
+            lib.insert_cartridge(SimCartridge::blank("UNK000L8", 64 << 20), 0)
+                .unwrap();
+            lib.load_into_drive("UNK000L8", 0).unwrap();
+            let dev = lib.drive(0);
+            mkltfs(&dev, &MkltfsOptions::default()).unwrap();
+            lib.with_cartridge_mut("UNK000L8", |c| {
+                c.partitions[0].objects.clear();
+                c.partitions[0].flushed = 0;
+            });
+            let probe = UnknownProbe {
+                inner: dev,
+                kind,
+                reads: std::cell::Cell::new(0),
+            };
+            let result = format_allowed(&probe, &std::env::temp_dir(), Default::default(), false);
+            assert!(
+                matches!(result, Err(ReadError::Lost(_))),
+                "未知预检查不能转Failed清任务: kind={kind}, {result:?}"
+            );
+        }
+    }
 
     #[test]
     fn nonforce_rejects_blank_index_partition_with_data_partition_content() {
