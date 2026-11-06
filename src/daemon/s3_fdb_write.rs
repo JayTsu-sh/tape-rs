@@ -243,7 +243,7 @@ struct UploadHeaders {
     length: u64,
     md5: Option<Vec<u8>>,
     sha: Option<String>,
-    checksum: Option<Vec<u8>>,
+    checksum: UploadChecksum,
     saved: BTreeMap<String, String>,
 }
 impl UploadHeaders {
@@ -266,7 +266,7 @@ impl UploadHeaders {
                 .transpose()
         };
         let md5 = decode("content-md5", 16)?;
-        let checksum = decode("x-amz-checksum-sha256", 32)?;
+        let checksum = UploadChecksum::parse(headers)?;
         let sha = header_text(headers, "x-amz-content-sha256")?
             .filter(|v| *v != "UNSIGNED-PAYLOAD")
             .map(str::to_owned);
@@ -275,17 +275,6 @@ impl UploadHeaders {
             .is_some_and(|v| v.len() != 64 || !v.bytes().all(|b| b.is_ascii_hexdigit()))
         {
             return Err(S3Error::new(400, "InvalidDigest", "SHA-256 无效"));
-        }
-        if headers.keys().any(|name| {
-            name.as_str().starts_with("x-amz-checksum-") && name != "x-amz-checksum-sha256"
-        }) || header_text(headers, "x-amz-sdk-checksum-algorithm")?
-            .is_some_and(|v| v != "SHA256")
-        {
-            return Err(S3Error::new(
-                501,
-                "NotImplemented",
-                "仅支持 SHA256 checksum",
-            ));
         }
         let mut saved = BTreeMap::new();
         for (name, value) in headers {
@@ -330,7 +319,7 @@ async fn put(
     round: u64,
     req: Request,
 ) -> S3Result<Response> {
-    let headers = UploadHeaders::parse(req.headers())?;
+    let mut headers = UploadHeaders::parse(req.headers())?;
     if headers.length > s.storage.download_bytes {
         return Err(S3Error::new(413, "EntityTooLarge", "上传超过本地暂存预算"));
     }
@@ -348,6 +337,7 @@ async fn put(
     let mut length = 0u64;
     let mut sha = Sha256::new();
     let mut md5 = Md5::new();
+    let mut crc32 = crc32fast::Hasher::new();
     let deadline = tokio::time::Instant::now() + s.libraries[serial].wait_timeout;
     while let Some(frame) = tokio::time::timeout_at(deadline, body.frame())
         .await
@@ -365,6 +355,9 @@ async fn put(
         }
         sha.update(&data);
         md5.update(&data);
+        if matches!(headers.checksum, UploadChecksum::Crc32(_)) {
+            crc32.update(&data);
+        }
         file.write_all(&data)
             .await
             .map_err(|err| unavailable(err.to_string()))?;
@@ -387,9 +380,18 @@ async fn put(
                     .collect::<String>(),
             )
         })
-        || headers.checksum.as_deref().is_some_and(|v| v != digest)
+        || !headers.checksum.matches(&digest, crc32.finalize())
     {
         return Err(S3Error::new(400, "BadDigest", "上传正文摘要不匹配"));
+    }
+    headers.checksum.save_crc32(&mut headers.saved, &digest);
+    if headers.saved.len() > 128
+        || serde_json::to_vec(&headers.saved)
+            .expect("string map")
+            .len()
+            > 8192
+    {
+        return Err(S3Error::new(400, "MetadataTooLarge", "对象元数据超过预算"));
     }
     file.flush()
         .await
@@ -482,11 +484,10 @@ async fn put(
             .parse()
             .expect("ETag"),
     );
-    if headers.checksum.is_some() {
-        response.headers_mut().insert(
-            "x-amz-checksum-sha256",
-            STANDARD.encode(digest).parse().expect("digest"),
-        );
+    if let Some((name, value)) = headers.checksum.header() {
+        response
+            .headers_mut()
+            .insert(name, value.parse().expect("digest"));
     }
     Ok(response)
 }
@@ -540,6 +541,17 @@ pub(super) async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sdk_default_crc32_headers_are_accepted() {
+        let request = Request::builder()
+            .header("content-length", "9")
+            .header("x-amz-checksum-crc32", "y/Q5Jg==")
+            .header("x-amz-sdk-checksum-algorithm", "CRC32")
+            .body(Body::empty())
+            .unwrap();
+        assert!(UploadHeaders::parse(request.headers()).is_ok());
+    }
+
     #[test]
     fn unsupported_or_ambiguous_write_parameters_fail_before_spooling() {
         for (name, value) in [

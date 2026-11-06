@@ -30,6 +30,10 @@ const NS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 const HEADERS_XATTR: &str = "tapers.s3.headers";
 const REGION: &str = "us-east-1";
 
+#[path = "s3_checksum.rs"]
+mod checksum;
+use checksum::UploadChecksum;
+
 #[cfg(feature = "fdb")]
 #[path = "s3_fdb.rs"]
 mod fdb;
@@ -600,31 +604,7 @@ fn put(
     if expected_sha.is_some_and(|s| s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit())) {
         return Err(S3Error::new(400, "InvalidDigest", "SHA-256 非法"));
     }
-    let checksum = header_text(headers, "x-amz-checksum-sha256")?
-        .map(|v| {
-            STANDARD
-                .decode(v)
-                .ok()
-                .filter(|b| b.len() == 32)
-                .ok_or_else(|| S3Error::new(400, "InvalidDigest", "SHA-256 checksum 非法"))
-        })
-        .transpose()?;
-    for name in headers.keys().map(|k| k.as_str()) {
-        if name.starts_with("x-amz-checksum-") && name != "x-amz-checksum-sha256" {
-            return Err(S3Error::new(
-                501,
-                "NotImplemented",
-                "暂只支持 SHA-256 checksum，请关闭自动 CRC 校验和",
-            ));
-        }
-    }
-    if header_text(headers, "x-amz-sdk-checksum-algorithm")?.is_some_and(|v| v != "SHA256") {
-        return Err(S3Error::new(
-            501,
-            "NotImplemented",
-            "暂只支持 SHA256 checksum",
-        ));
-    }
+    let checksum = UploadChecksum::parse(headers)?;
     let mut saved = BTreeMap::<String, String>::new();
     for (name, value) in headers {
         if name.as_str().starts_with("x-amz-meta-")
@@ -659,6 +639,7 @@ fn put(
         let mut buf = vec![0u8; 256 * 1024];
         let mut md5 = Md5::new();
         let mut sha = Sha256::new();
+        let mut crc32 = crc32fast::Hasher::new();
         while left > 0 {
             let want = left.min(buf.len() as u64) as usize;
             let n = reader
@@ -675,6 +656,9 @@ fn put(
                 .map_err(|e| S3Error::new(500, "InternalError", e.to_string()))?;
             md5.update(&buf[..n]);
             sha.update(&buf[..n]);
+            if matches!(checksum, UploadChecksum::Crc32(_)) {
+                crc32.update(&buf[..n]);
+            }
             files.ingest(&h, n as u64)?;
             left -= n as u64;
         }
@@ -682,15 +666,23 @@ fn put(
         let sha = sha.finalize();
         if expected_md5.as_deref().is_some_and(|v| v != md5.as_slice())
             || expected_sha.is_some_and(|v| !v.eq_ignore_ascii_case(&format!("{sha:x}")))
-            || checksum.as_deref().is_some_and(|v| v != sha.as_slice())
+            || !checksum.matches(&sha, crc32.finalize())
         {
             return Err(S3Error::new(400, "BadDigest", "正文摘要不匹配，未提交上传"));
         }
         file.sync_all()
             .map_err(|e| S3Error::new(500, "InternalError", e.to_string()))?;
-        Ok((format!("{md5:x}"), sha))
+        checksum.save_crc32(&mut saved, &sha);
+        if serde_json::to_vec(&saved).unwrap().len() > 8192 {
+            return Err(S3Error::new(
+                400,
+                "MetadataTooLarge",
+                "对象元数据超过 8 KiB",
+            ));
+        }
+        Ok(format!("{md5:x}"))
     })();
-    let (md5, sha) = match spooled {
+    let md5 = match spooled {
         Ok(v) => v,
         Err(e) => {
             files.abort(h);
@@ -715,11 +707,8 @@ fn put(
     response
         .headers_mut()
         .insert(header::ETAG, format!("\"{md5}\"").parse().unwrap());
-    if checksum.is_some() {
-        response.headers_mut().insert(
-            "x-amz-checksum-sha256",
-            STANDARD.encode(sha).parse().unwrap(),
-        );
+    if let Some((name, value)) = checksum.header() {
+        response.headers_mut().insert(name, value.parse().unwrap());
     }
     Ok(response)
 }
@@ -905,6 +894,24 @@ fn get(
         );
     }
     headers_for(&st, &mut response);
+    if range.is_none()
+        && header_text(headers, "x-amz-checksum-mode")? == Some("ENABLED")
+        && let Some(saved) = xattr(&st, HEADERS_XATTR)
+            .and_then(|v| v["value"].as_str())
+            .and_then(|v| STANDARD.decode(v).ok())
+            .and_then(|v| serde_json::from_slice::<BTreeMap<String, String>>(&v).ok())
+        && let Some(bound) = saved
+            .get("x-amz-checksum-sha256")
+            .and_then(|v| STANDARD.decode(v).ok())
+        && st
+            .sha256
+            .eq_ignore_ascii_case(&bound.iter().map(|b| format!("{b:02x}")).collect::<String>())
+        && let Some(value) = checksum::stored_crc32(&saved, &bound)
+    {
+        response
+            .headers_mut()
+            .insert("x-amz-checksum-crc32", value.parse().expect("Base64"));
+    }
     Ok(response)
 }
 
@@ -1295,6 +1302,22 @@ mod tests {
             .unwrap();
         assert_eq!(error.code, "IncompleteBody");
         assert_eq!(f.ctx.files.stat_full("/short").unwrap().in_flight, None);
+    }
+
+    #[test]
+    fn bad_crc32_aborts_admission_and_never_enqueues() {
+        let f = Fixture::new(&[]);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", "3".parse().unwrap());
+        headers.insert("x-amz-sdk-checksum-algorithm", "CRC32".parse().unwrap());
+        headers.insert("x-amz-checksum-crc32", "AAAAAA==".parse().unwrap());
+        let error = put(&f.ctx.files, "/bad-crc", &headers, &mut &b"abc"[..], &f.ctx)
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "BadDigest");
+        assert_eq!(f.ctx.files.stat_full("/bad-crc").unwrap().in_flight, None);
+        assert_eq!(f.ctx.files.queued(1), Some((0, 0)));
+        f.ctx.files.abort(f.ctx.files.begin("/bad-crc", 3).unwrap());
     }
     #[test]
     fn delimiter_pagination_does_not_repeat_prefixes_on_next_page() {

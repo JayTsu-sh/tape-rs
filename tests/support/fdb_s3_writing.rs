@@ -65,15 +65,42 @@ fn s3_put_overwrite_metadata_and_delete_use_fdb_and_media_commits() {
         before,
         "bad digest must not even create a directory"
     );
-    let put=entry.request_body("PUT",&path,Some("Content-Length: 3\r\nContent-MD5: kAFQmDzST7DWlj99KOF/cg==\r\nContent-Type: text/plain\r\nCache-Control: max-age=60\r\nx-amz-meta-origin: s3-test\r\nIf-None-Match: *\r\n"),b"abc");
+    let bad_crc = entry.request_body(
+        "PUT", &path,
+        Some("Content-Length: 3\r\nx-amz-sdk-checksum-algorithm: CRC32\r\nx-amz-checksum-crc32: AAAAAA==\r\n"),
+        b"abc",
+    );
+    assert_eq!(bad_crc.0, 400);
+    assert!(String::from_utf8_lossy(&bad_crc.2).contains("BadDigest"));
+    assert_eq!(
+        writes(),
+        before,
+        "CRC32 mismatch must precede parent creation"
+    );
+    let put=entry.request_body("PUT",&path,Some("Content-Length: 3\r\nContent-MD5: kAFQmDzST7DWlj99KOF/cg==\r\nx-amz-sdk-checksum-algorithm: CRC32\r\nx-amz-checksum-crc32: NSRBwg==\r\nContent-Type: text/plain\r\nCache-Control: max-age=60\r\nx-amz-meta-origin: s3-test\r\nIf-None-Match: *\r\n"),b"abc");
     assert_eq!(put.0, 200, "{}", String::from_utf8_lossy(&put.2));
     assert!(writes() > before);
+    assert!(put.1.contains("x-amz-checksum-crc32: nsrbwg=="));
     let head = entry.request("HEAD", &path, None);
     assert_eq!(head.0, 200);
     assert!(head.1.contains("content-length: 3"));
     assert!(head.1.contains("content-type: text/plain"));
     assert!(head.1.contains("x-amz-meta-origin: s3-test"));
     assert!(head.1.contains("cache-control: max-age=60"));
+    assert!(!head.1.contains("x-amz-checksum-"));
+    for method in ["HEAD", "GET"] {
+        let checked = entry.request(method, &path, Some("x-amz-checksum-mode: ENABLED\r\n"));
+        assert_eq!(checked.0, 200);
+        assert!(checked.1.contains("x-amz-checksum-crc32: nsrbwg=="));
+        assert!(!checked.1.contains("x-amz-checksum-sha256:"));
+    }
+    let range = entry.request(
+        "GET",
+        &path,
+        Some("Range: bytes=1-2\r\nx-amz-checksum-mode: ENABLED\r\n"),
+    );
+    assert_eq!(range.2, b"bc");
+    assert!(!range.1.contains("x-amz-checksum-"));
     let etag = head
         .1
         .lines()
@@ -89,7 +116,7 @@ fn s3_put_overwrite_metadata_and_delete_use_fdb_and_media_commits() {
             .request_body(
                 "PUT",
                 &path,
-                Some("Content-Length: 3\r\nIf-None-Match: *\r\n"),
+                Some("Content-Length: 3\r\nIf-None-Match: *\r\nx-amz-sdk-checksum-algorithm: CRC32\r\nx-amz-checksum-crc32: 6466Zw==\r\n"),
                 b"xyz"
             )
             .0,
@@ -118,6 +145,9 @@ fn s3_put_overwrite_metadata_and_delete_use_fdb_and_media_commits() {
     assert!(!head.1.contains("x-amz-meta-origin"));
     assert!(!head.1.contains("cache-control"));
     assert!(head.1.contains("content-type: application/octet-stream"));
+    let replaced_checksum = entry.request("HEAD", &path, Some("x-amz-checksum-mode: ENABLED\r\n"));
+    assert!(!replaced_checksum.1.contains("x-amz-checksum-crc32:"));
+    assert!(replaced_checksum.1.contains("x-amz-checksum-sha256:"));
     let replaced_get = entry.request("GET", &path, None);
     assert_eq!(replaced_get.2, b"xyz");
     assert!(
@@ -162,6 +192,22 @@ fn s3_put_overwrite_metadata_and_delete_use_fdb_and_media_commits() {
         .unwrap()
         .is_some()
     );
+    if let Ok(python) = std::env::var("TAPE_RS_S3_PYTHON") {
+        let output = std::process::Command::new(python)
+            .arg("-c")
+            .arg(include_str!("fdb_s3_crc32.py"))
+            .arg(&entry.address)
+            .arg(&bucket)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+    }
     let readonly = ReadHttpServer::start(s3::fdb_router(
         f.catalog.clone(),
         BTreeMap::from([(f.serial.clone(), f.route)]),

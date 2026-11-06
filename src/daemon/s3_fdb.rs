@@ -831,6 +831,9 @@ async fn get(
         );
         if let Some(metadata) = object_metadata {
             for (name, value) in &metadata.headers {
+                if name.starts_with("x-amz-checksum-") {
+                    continue;
+                }
                 response.headers_mut().insert(
                     axum::http::HeaderName::from_bytes(name.as_bytes())
                         .expect("validated metadata name"),
@@ -843,10 +846,19 @@ async fn get(
             && let ResolvedPath::File { ref copy, .. } = before
             && let ContentDigest::Sha256(bytes) = copy.content_digest
         {
-            response.headers_mut().insert(
-                "x-amz-checksum-sha256",
-                STANDARD.encode(bytes).parse().unwrap(),
-            );
+            if let Some(crc32) = object_metadata
+                .as_ref()
+                .and_then(|metadata| checksum::stored_crc32(&metadata.headers, &bytes))
+            {
+                response
+                    .headers_mut()
+                    .insert("x-amz-checksum-crc32", crc32.parse().expect("Base64"));
+            } else {
+                response.headers_mut().insert(
+                    "x-amz-checksum-sha256",
+                    STANDARD.encode(bytes).parse().unwrap(),
+                );
+            }
         }
     }
     Ok(response)
