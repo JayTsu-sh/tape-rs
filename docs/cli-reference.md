@@ -80,7 +80,8 @@ install -d -m 700 /var/lib/tape-client
 
 | 命令 | 输出方式 |
 |---|---|
-| `library list`、`pool list`、`tape list` | 默认表格；`--no-header` 去表头；`--json` 紧凑 JSON；`--jsonpp` 缩进 JSON |
+| `library list`、`tape list` | 默认表格；`--no-header` 去表头；`--json` 紧凑 JSON；`--jsonpp` 缩进 JSON |
+| `pool list` | 默认表格；`--json` 输出缩进 JSON |
 | `library show`、`tape show` | 默认属性列表；`-a FIELD` 只选顶层属性；支持 `--json`、`--jsonpp` |
 | `pool show` | 直接输出缩进 JSON，不接受 `--json`、`-a` |
 | 设备任务受理、策略变更、FDB 查询 | 直接输出对应 JSON 或命令定义的结果，不统一接受 `--json` |
@@ -249,6 +250,8 @@ ctl tape assign ERASE001L8 -l LIBRARY_SERIAL -p archive --yes --force-format \
 ```
 
 目标须未分池且满足位置、驱动兼容与设备所有权条件。未知格式或读取错误不能当作空带。原请求固定新卷 UUID；格式化开始后的失败可能已经改变介质，必须保留任务诊断并接续原请求。需要保留已有文件时使用 `tape import`。
+
+驱动器开启 append-only 时，显式格式化先核验 BOP0，再发一次 `ALLOW OVERWRITE` 的 Format 授权，随后执行 FORMAT；保留 append-only 模式和原任务、PR、逐命令执行权检查。不用普通 IP 检查点的 Current Position 授权代替 Format 授权。授权或定位结果未知时不继续格式化；FORMAT 结果未知时仍保留原检查点，不能生成新请求盲目重试。协议依据为 [IBM GA32-0928-08 §4.2.3、§5.2.1](https://www.ibm.com/support/pages/system/files/inline-files/LTO%20SCSI%20Reference%20GA32-0928-08%20%28EXTERNAL%29.pdf)。
 
 ### tape unassign
 

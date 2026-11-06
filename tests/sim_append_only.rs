@@ -166,3 +166,160 @@ fn authorization_refuses_wrong_position_and_does_not_retry_reset_ua() {
     ));
     assert!(ao.allows.borrow().is_empty());
 }
+
+/// FORMAT changes both partitions, so Current Position permission cannot
+/// authorize it (IBM GA32-0928-08 §4.2.3, §5.2.1 tables 33/34).
+struct FormatAppendOnly<'a> {
+    inner: &'a SimTransport,
+    permission: Cell<bool>,
+    commands: RefCell<Vec<Vec<u8>>>,
+}
+impl TapeTransport for FormatAppendOnly<'_> {
+    fn identity(&self) -> &str {
+        self.inner.identity()
+    }
+    fn execute_no_data(&self, c: &[u8], timeout: u32) -> Result<ScsiResult> {
+        self.commands.borrow_mut().push(c.to_vec());
+        if c[0] == cdb::opcode::ALLOW_OVERWRITE {
+            assert_eq!(c, &[0x82, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            self.permission.set(true);
+            return self.inner.execute_no_data(&cdb::test_unit_ready(), timeout);
+        }
+        if c[0] == cdb::opcode::FORMAT_MEDIUM && !self.permission.replace(false) {
+            return Err(TapeError::ScsiCommand {
+                sense: None,
+                status: 2,
+                sense_key: 7,
+                asc: 0x5a,
+                ascq: 2,
+            });
+        }
+        self.inner.execute_no_data(c, timeout)
+    }
+    fn execute_read(&self, c: &[u8], b: &mut [u8], timeout: u32) -> Result<ScsiResult> {
+        self.commands.borrow_mut().push(c.to_vec());
+        if c[0] == 0x5a && c[2] == 0x10 && c[3] == 1 {
+            b[..48].fill(0);
+            b[1] = 46;
+            b[7] = 8;
+            b[16] = 0xd0;
+            b[17] = 1;
+            b[19] = 28;
+            b[21] = 0x12;
+            let mut result = self
+                .inner
+                .execute_no_data(&cdb::test_unit_ready(), timeout)?;
+            result.transferred = 48;
+            return Ok(result);
+        }
+        self.inner.execute_read(c, b, timeout)
+    }
+    fn execute_write(&self, c: &[u8], b: &[u8], timeout: u32) -> Result<ScsiResult> {
+        self.commands.borrow_mut().push(c.to_vec());
+        self.inner.execute_write(c, b, timeout)
+    }
+}
+
+#[test]
+fn append_only_format_uses_one_format_permission_then_creates_both_labels() {
+    let (_sim, dev) = setup();
+    let ao = FormatAppendOnly {
+        inner: &dev,
+        permission: Cell::new(false),
+        commands: RefCell::new(Vec::new()),
+    };
+    let expected = uuid::Uuid::new_v4();
+    mkltfs(
+        &ao,
+        &MkltfsOptions {
+            volume_uuid: Some(expected),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mounted = LtfsVolume::mount(&ao).unwrap();
+    assert_eq!(mounted.label().volume_uuid, expected);
+    assert!(mounted.writable());
+    assert!(mounted.index().root.files.is_empty());
+    let commands = ao.commands.borrow();
+    let format = commands
+        .iter()
+        .position(|c| c[0] == cdb::opcode::FORMAT_MEDIUM)
+        .unwrap();
+    assert_eq!(commands[format - 1][0], cdb::opcode::ALLOW_OVERWRITE);
+    assert_eq!(commands[format - 2][0], cdb::opcode::READ_POSITION);
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|c| c[0] == cdb::opcode::ALLOW_OVERWRITE)
+            .count(),
+        1
+    );
+    assert!(!ao.permission.get());
+}
+
+#[test]
+fn append_only_format_refuses_wrong_position_before_grant_or_format() {
+    let (_sim, dev) = setup();
+    TapeDrive::new(&dev).locate(1, 0, true).unwrap();
+    let ao = FormatAppendOnly {
+        inner: &dev,
+        permission: Cell::new(false),
+        commands: RefCell::new(Vec::new()),
+    };
+    assert!(TapeDrive::new(&ao).format(1, false).is_err());
+    assert!(
+        !ao.commands
+            .borrow()
+            .iter()
+            .any(|c| matches!(c[0], 0x04 | 0x82))
+    );
+}
+
+#[test]
+fn append_only_format_does_not_retry_position_reset_or_unknown_format() {
+    use tape_rs::scsi::sim::{Fault, FaultAction};
+    for (opcode, action) in [
+        (
+            cdb::opcode::READ_POSITION,
+            FaultAction::CheckCondition {
+                sense_key: 6,
+                asc: 0x29,
+                ascq: 0,
+            },
+        ),
+        (cdb::opcode::READ_POSITION, FaultAction::HostError(3)),
+        (cdb::opcode::FORMAT_MEDIUM, FaultAction::HostError(3)),
+    ] {
+        let (_sim, dev) = setup();
+        TapeDrive::new(&dev).locate(0, 0, true).unwrap();
+        dev.inject(Fault {
+            opcode,
+            action,
+            after: 0,
+            remaining: 1,
+        });
+        let ao = FormatAppendOnly {
+            inner: &dev,
+            permission: Cell::new(false),
+            commands: RefCell::new(Vec::new()),
+        };
+        assert!(TapeDrive::new(&ao).format(1, false).is_err());
+        let commands = ao.commands.borrow();
+        let expected = usize::from(opcode == cdb::opcode::FORMAT_MEDIUM);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|c| c[0] == cdb::opcode::FORMAT_MEDIUM)
+                .count(),
+            expected
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|c| c[0] == cdb::opcode::ALLOW_OVERWRITE)
+                .count(),
+            expected
+        );
+    }
+}
