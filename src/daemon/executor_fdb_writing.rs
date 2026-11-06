@@ -5,8 +5,8 @@ use crate::daemon::fdb_media::{
     publish_active_media_batch,
 };
 use crate::managed_catalog::{
-    ActiveFileIntent, ActiveFileRequest, ActiveIndexIdentity, ActiveUploadSpec, CatalogError,
-    ContentDigest, PublishOutcome,
+    ActiveFileIntent, ActiveFileRequest, ActiveIndexIdentity, ActiveLoadedVolumeHead,
+    ActiveUploadSpec, CatalogError, ContentDigest, PublishOutcome, VolumePlacement,
 };
 use sha2::{Digest, Sha256};
 use std::io::Read;
@@ -167,6 +167,24 @@ fn verify_spool(
     Ok(())
 }
 
+struct Prepared {
+    intent: ActiveFileIntent,
+    placement: VolumePlacement,
+    head: ActiveLoadedVolumeHead,
+    available: u64,
+    batchable: bool,
+}
+
+enum PreparedWrite {
+    Applied(u64),
+    Ready(Box<Prepared>),
+}
+
+// Files remain owned until every original request has a result. A physically
+// incompatible next upload is resolved again after the preceding group commits.
+type WritePlan = (std::fs::File, Prepared);
+
+#[cfg(test)]
 pub(super) async fn write(
     owner: &mut Active,
     permit: &Permission,
@@ -175,6 +193,106 @@ pub(super) async fn write(
     request: ActiveFileRequest,
     file: std::fs::File,
 ) -> std::result::Result<u64, ReadError> {
+    write_batch(owner, permit, control, status, vec![(request, file)])
+        .await
+        .remove(0)
+}
+
+pub(super) async fn write_batch(
+    owner: &mut Active,
+    permit: &Permission,
+    control: &FdbOwnerControl,
+    status: &SharedStatus,
+    requests: Vec<(ActiveFileRequest, std::fs::File)>,
+) -> Vec<std::result::Result<u64, ReadError>> {
+    let len = requests.len();
+    let _activity = match permit.begin_device_activity(owner.round) {
+        Ok(activity) => activity,
+        Err(error) => return vec![Err(lost(error)); len],
+    };
+    let mut pending: std::collections::VecDeque<_> = requests.into_iter().enumerate().collect();
+    let mut results = vec![Err(lost("原上传批次尚未执行")); len];
+    'requests: while let Some((position, (request, file))) = pending.pop_front() {
+        let first = prepare_write(owner, permit, control, &request, &file).await;
+        let mut group = Vec::new();
+        let mut positions = vec![position];
+        match first {
+            Ok(PreparedWrite::Applied(version)) => {
+                results[position] = Ok(version);
+                continue;
+            }
+            Ok(PreparedWrite::Ready(plan)) => group.push((file, *plan)),
+            Err(error) => {
+                let lost = matches!(error, ReadError::Lost(_));
+                results[position] = Err(error.clone());
+                if lost {
+                    for (position, _) in pending {
+                        results[position] = Err(error.clone());
+                    }
+                    break;
+                }
+                continue;
+            }
+        }
+        while group[0].1.batchable && (group.len() as u64) < group[0].1.available {
+            let Some((_, (request, file))) = pending.front() else {
+                break;
+            };
+            match prepare_write(owner, permit, control, request, file).await {
+                Ok(PreparedWrite::Ready(plan))
+                    if plan.batchable
+                        && plan.intent.volume_id == group[0].1.intent.volume_id
+                        && plan.intent.volume_generation == group[0].1.intent.volume_generation
+                        && plan.intent.volume_scan_id == group[0].1.intent.volume_scan_id
+                        && plan.head == group[0].1.head =>
+                {
+                    let (position, (_, file)) = pending.pop_front().expect("front exists");
+                    positions.push(position);
+                    group.push((file, *plan));
+                }
+                Err(error @ ReadError::Lost(_)) => {
+                    for position in positions {
+                        results[position] = Err(error.clone());
+                    }
+                    for (position, _) in pending {
+                        results[position] = Err(error.clone());
+                    }
+                    break 'requests;
+                }
+                // No intent was admitted yet. Preserve FIFO and re-evaluate
+                // against the freshly committed head on the next pass.
+                _ => break,
+            }
+        }
+        match write_group(owner, permit, control, status, &group).await {
+            Ok(versions) => {
+                for (position, version) in positions.into_iter().zip(versions) {
+                    results[position] = Ok(version);
+                }
+            }
+            Err(error) => {
+                for position in positions {
+                    results[position] = Err(error.clone());
+                }
+                if matches!(error, ReadError::Lost(_)) {
+                    for (position, _) in pending {
+                        results[position] = Err(error.clone());
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    results
+}
+
+async fn prepare_write(
+    owner: &Active,
+    permit: &Permission,
+    control: &FdbOwnerControl,
+    request: &ActiveFileRequest,
+    file: &std::fs::File,
+) -> std::result::Result<PreparedWrite, ReadError> {
     request
         .ltfs_path()
         .map_err(|error| ReadError::Failed(error.to_string()))?;
@@ -184,23 +302,22 @@ pub(super) async fn write(
     {
         return Err(ReadError::Failed("上传不属于当前带库、命名空间或池".into()));
     }
-    verify_spool(&file, &request, control.storage.download_bytes)?;
-    let _activity = permit.begin_device_activity(owner.round).map_err(lost)?;
+    verify_spool(file, request, control.storage.download_bytes)?;
     fdb_loading::guard(owner, permit, control).await?;
     if let Some(result) = control
         .catalog
-        .active_upload_result(&request, control.route)
+        .active_upload_result(request, control.route)
         .await
         .map_err(lost)?
     {
         return match result {
-            PublishOutcome::AlreadyApplied(version) => Ok(version),
+            PublishOutcome::AlreadyApplied(version) => Ok(PreparedWrite::Applied(version)),
             other => Err(ReadError::Failed(format!("上传请求不能重用: {other:?}"))),
         };
     }
     control
         .catalog
-        .check_active_upload_gate(control.route, owner.round, &request)
+        .check_active_upload_gate(control.route, owner.round, request)
         .await
         .map_err(|error| match error {
             CatalogError::PoolImporting => {
@@ -210,9 +327,10 @@ pub(super) async fn write(
             CatalogError::Invalid(reason) => ReadError::Failed(reason.into()),
             error => lost(error),
         })?;
+    let mut batchable = false;
     let mut intent = match control
         .catalog
-        .active_file_attempt(&request, control.route)
+        .active_file_attempt(request, control.route)
         .await
         .map_err(lost)?
     {
@@ -220,7 +338,7 @@ pub(super) async fn write(
         None => {
             if let Some(saved) = control
                 .catalog
-                .reclaim_upload_attempt(control.route, owner.round, &request)
+                .reclaim_upload_attempt(control.route, owner.round, request)
                 .await
                 .map_err(lost)?
             {
@@ -243,11 +361,12 @@ pub(super) async fn write(
                 // logical preflight; only this first physical attempt is selected now.
                 selected.file_id = request.file_id;
                 selected.request_epoch = request.request_epoch;
-                if selected.request() != request {
+                if selected.request() != *request {
                     return Err(ReadError::Failed(
                         "上传原路径、父目录或版本条件已改变".into(),
                     ));
                 }
+                batchable = true;
                 selected
             }
         }
@@ -313,14 +432,31 @@ pub(super) async fn write(
             "目标卷已达到池文件数上限；保留原请求查询结果".into(),
         ));
     }
+    Ok(PreparedWrite::Ready(Box::new(Prepared {
+        intent,
+        placement,
+        head,
+        available: pool.file_limit - count,
+        batchable,
+    })))
+}
+
+async fn write_group(
+    owner: &mut Active,
+    permit: &Permission,
+    control: &FdbOwnerControl,
+    status: &SharedStatus,
+    writes: &[WritePlan],
+) -> std::result::Result<Vec<u64>, ReadError> {
+    let (_, plan) = &writes[0];
+    let (intent, placement, head) = (&plan.intent, &plan.placement, plan.head);
     let drive =
-        fdb_loading::select_write(owner, permit, control, status, &placement, head.index).await?;
+        fdb_loading::select_write(owner, permit, control, status, placement, head.index).await?;
     fdb_monitor::write_allowed(owner, control, &placement.barcode, true).await?;
     fdb_loading::guard(owner, permit, control).await?;
     let round = owner.round;
     let session = owner.write_session.take();
-    let original_intent = intent.clone();
-    let seen_reservation = std::cell::Cell::new(false);
+    let seen_reservations = std::cell::RefCell::new(vec![false; writes.len()]);
     let checked =
         fdb_loading::operation_guard(owner, permit, owner.devices[drive].dev.as_ref(), || {
             futures_executor::block_on(async {
@@ -329,25 +465,28 @@ pub(super) async fn write(
                     .require_active_library_readable(&control.serial, control.route, round)
                     .await
                     .map_err(|e| TapeError::Catalog(e.to_string()))?;
-                control
-                    .catalog
-                    .check_active_upload_gate(control.route, round, &original_intent.request())
-                    .await
-                    .map_err(|e| TapeError::Catalog(e.to_string()))?;
-                let current = control
-                    .catalog
-                    .active_file_attempt(&original_intent.request(), control.route)
-                    .await
-                    .map_err(|e| TapeError::Catalog(e.to_string()))?;
-                if let Some(current) = current {
-                    if current != original_intent {
-                        return Err(TapeError::Catalog("上传原物理尝试已改变".into()));
+                for (n, (_, plan)) in writes.iter().enumerate() {
+                    let original_intent = &plan.intent;
+                    control
+                        .catalog
+                        .check_active_upload_gate(control.route, round, &original_intent.request())
+                        .await
+                        .map_err(|e| TapeError::Catalog(e.to_string()))?;
+                    let current = control
+                        .catalog
+                        .active_file_attempt(&original_intent.request(), control.route)
+                        .await
+                        .map_err(|e| TapeError::Catalog(e.to_string()))?;
+                    if let Some(current) = current {
+                        if current != *original_intent {
+                            return Err(TapeError::Catalog("上传原物理尝试已改变".into()));
+                        }
+                        seen_reservations.borrow_mut()[n] = true;
+                    } else if seen_reservations.borrow()[n] {
+                        return Err(TapeError::Catalog(
+                            "上传原物理尝试已被移除，停止后续命令".into(),
+                        ));
                     }
-                    seen_reservation.set(true);
-                } else if seen_reservation.get() {
-                    return Err(TapeError::Catalog(
-                        "上传原物理尝试已被移除，停止后续命令".into(),
-                    ));
                 }
                 Ok(())
             })
@@ -405,12 +544,18 @@ pub(super) async fn write(
     }
     let ready = ready.map_err(media_error)?;
     let volume = ready.into_volume();
-    if let Some(result) = control
-        .catalog
-        .active_upload_result(&request, control.route)
-        .await
-        .map_err(lost)?
-    {
+    let mut recovered = Vec::with_capacity(writes.len());
+    for (_, plan) in writes {
+        let intent = &plan.intent;
+        recovered.push(
+            control
+                .catalog
+                .active_upload_result(&intent.request(), control.route)
+                .await
+                .map_err(lost)?,
+        );
+    }
+    if recovered.iter().any(Option::is_some) {
         drop(volume);
         owner.fdb_reads.insert(
             drive,
@@ -421,19 +566,30 @@ pub(super) async fn write(
                 last_used: Instant::now(),
             },
         );
-        return match result {
-            PublishOutcome::AlreadyApplied(version) => Ok(version),
-            other => Err(ReadError::Failed(format!("原上传恢复结果拒绝: {other:?}"))),
-        };
+        return recovered
+            .into_iter()
+            .map(|result| match result {
+                Some(PublishOutcome::AlreadyApplied(version)) => Ok(version),
+                result => Err(lost(format!("原上传批次恢复结果拒绝: {result:?}"))),
+            })
+            .collect();
     }
     let batch = uuid::Uuid::new_v4();
-    let upload = ActiveMediaUpload {
-        intent: intent.clone(),
-        spool: format!("/proc/self/fd/{}", file.as_raw_fd()).into(),
-    };
+    let uploads: Vec<_> = writes
+        .iter()
+        .map(|(file, plan)| ActiveMediaUpload {
+            intent: plan.intent.clone(),
+            spool: format!("/proc/self/fd/{}", file.as_raw_fd()).into(),
+        })
+        .collect();
+    log::debug!(
+        "FDB 顺序合批提交: {} files={} previous_gen={}",
+        placement.barcode,
+        writes.len(),
+        head.index.generation
+    );
     let committed =
-        commit_active_media_batch(&control.catalog, volume, batch, &[upload], max_index_bytes)
-            .await;
+        commit_active_media_batch(&control.catalog, volume, batch, &uploads, max_index_bytes).await;
     if committed.is_err() {
         fdb_monitor::io_error(
             owner,
@@ -445,7 +601,10 @@ pub(super) async fn write(
         )
         .await;
     }
-    let committed = committed.map_err(media_error)?;
+    // A later member can lose its gate after an earlier member appended.
+    // Once the batch kernel starts, even PoolBusy/MediaUnavailable cannot
+    // prove that no bytes were written. Freeze this round for recovery.
+    let committed = committed.map_err(lost)?;
     let committed = publish_active_media_batch(&control.catalog, committed)
         .await
         .map_err(lost)?;
@@ -478,25 +637,27 @@ pub(super) async fn write(
     owner.fdb_reads.insert(
         drive,
         fdb_loading::Mount {
-            barcode: placement.barcode,
+            barcode: placement.barcode.clone(),
             volume: intent.volume_id,
             pool: placement.pool_id,
             last_used: Instant::now(),
         },
     );
-    let result = match control
-        .catalog
-        .active_upload_result(&intent.request(), control.route)
-        .await
-        .map_err(lost)?
-    {
-        Some(PublishOutcome::AlreadyApplied(version)) => Ok(version),
-        result => Err(lost(format!("发布后请求结果不一致: {result:?}"))),
-    };
-    if result.is_ok() {
-        owner.write_session = session;
+    let mut versions = Vec::with_capacity(writes.len());
+    for (_, plan) in writes {
+        let intent = &plan.intent;
+        match control
+            .catalog
+            .active_upload_result(&intent.request(), control.route)
+            .await
+            .map_err(lost)?
+        {
+            Some(PublishOutcome::AlreadyApplied(version)) => versions.push(version),
+            result => return Err(lost(format!("发布后请求结果不一致: {result:?}"))),
+        }
     }
-    result
+    owner.write_session = session;
+    Ok(versions)
 }
 
 #[cfg(test)]

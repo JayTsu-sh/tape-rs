@@ -3040,6 +3040,354 @@ mod tests {
         );
     }
 
+    async fn assigned_batch_fixture(
+        catalog: Arc<crate::managed_catalog::ManagedCatalog>,
+    ) -> (
+        Fixture,
+        FdbOwnerControl,
+        crate::managed_catalog::PoolRecord,
+        SharedStatus,
+    ) {
+        use crate::managed_catalog::ManagementRequest;
+        let (mut fixture, control, pool, status) = native_fixture(catalog.clone()).await;
+        let make = |change: Value| {
+            ManagementRequest::parse(json!({"version":1,"library":control.serial,
+            "namespace":control.route.route.namespace.to_string(),"epoch":1,
+            "operation":uuid::Uuid::new_v4().to_string(),"change":change}))
+            .unwrap()
+        };
+        let home = make(json!({"kind":"media-move","pool":null,"barcode":"LIFE00L8",
+            "volume":null,"revision":null,"destination":"homeslot"}));
+        assert_eq!(
+            execute(&mut fixture, &control, &status, &home).await["status"],
+            "succeeded"
+        );
+        let volume = uuid::Uuid::new_v4();
+        let assign = make(json!({"kind":"media-assign","pool":pool.id.to_string(),
+            "barcode":"LIFE00L8","volume":volume.to_string(),"confirm_format":true,"force_format":false}));
+        assert_eq!(
+            execute(&mut fixture, &control, &status, &assign).await["status"],
+            "succeeded"
+        );
+        (fixture, control, pool, status)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；旧 sealed S4 与新邻居按序恢复，不访问实际设备"]
+    async fn native_batch_recovers_original_s4_before_preparing_new_neighbour() {
+        use crate::daemon::fdb_media::{
+            ActiveMediaUpload, commit_active_media_batch, establish_active_media_owner,
+        };
+        use crate::managed_catalog::{
+            ActiveUploadSpec, ContentDigest, ManagedCatalog, PublishOutcome,
+        };
+        use crate::scsi::sim::{Fault, FaultAction, LogicalObject};
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog = Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());
+        let (mut fixture, control, pool, status) = assigned_batch_fixture(catalog.clone()).await;
+        let mut uploads = Vec::new();
+        for n in 0..2 {
+            let bytes = format!("old-s4-and-new-neighbour-{n}").into_bytes();
+            let spool = fixture.root.join(format!("mixed-spool-{n}"));
+            std::fs::write(&spool, &bytes).unwrap();
+            let spec = ActiveUploadSpec {
+                pool_id: pool.id,
+                path: format!("/mixed-{n}").into_bytes(),
+                operation_id: uuid::Uuid::new_v4(),
+                expected_version: None,
+                size: bytes.len() as u64,
+                digest: ContentDigest::Sha256(Sha256::digest(&bytes).into()),
+            };
+            let intent = fdb_writing::prepare(
+                &fixture.owner,
+                &fixture.permit,
+                &control,
+                &spec,
+                Some("LIFE00L8"),
+            )
+            .await
+            .unwrap();
+            uploads.push(ActiveMediaUpload { intent, spool });
+        }
+        let before = catalog
+            .observed_active_volume_index(&control.serial, uploads[0].intent.volume_id)
+            .await
+            .unwrap();
+        // Same PR/permit and original intent: commit the old request's S4 but
+        // lose VCI completion before FDB index observation. No invented rows.
+        let raw = fixture.lib.drive_as(0, 1);
+        raw.inject(Fault {
+            opcode: 0x8d,
+            action: FaultAction::HostError(3),
+            after: 0,
+            remaining: 1,
+        });
+        let device =
+            GuardedTransport::new(Box::new(raw), fixture.permit.clone(), fixture.owner.round);
+        let mounted = LtfsVolume::mount(&device).unwrap();
+        let ready = Box::pin(establish_active_media_owner(
+            &catalog,
+            mounted,
+            &control.serial,
+            fixture.owner.key,
+            &fixture.permit,
+            control.storage.index_bytes as usize,
+        ))
+        .await
+        .unwrap();
+        let committed = Box::pin(commit_active_media_batch(
+            &catalog,
+            ready.into_volume(),
+            uuid::Uuid::new_v4(),
+            &uploads[..1],
+            control.storage.index_bytes as usize,
+        ))
+        .await;
+        assert!(matches!(&committed, Err(TapeError::CommitFailed { stage, .. }) if stage == "vci"));
+        drop(committed);
+        drop(device);
+        assert_eq!(
+            catalog
+                .observed_active_volume_index(&control.serial, before.volume_uuid)
+                .await
+                .unwrap(),
+            before
+        );
+        assert!(
+            catalog
+                .active_file_attempt(&uploads[0].intent.request(), control.route)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            catalog
+                .active_file_attempt(&uploads[1].intent.request(), control.route)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let requests = uploads
+            .iter()
+            .map(|upload| {
+                (
+                    upload.intent.request(),
+                    std::fs::File::open(&upload.spool).unwrap(),
+                )
+            })
+            .collect();
+        let results = Box::pin(fdb_writing::write_batch(
+            &mut fixture.owner,
+            &fixture.permit,
+            &control,
+            &status,
+            requests,
+        ))
+        .await;
+        assert_eq!(results, vec![Ok(1), Ok(1)]);
+        assert_eq!(
+            catalog
+                .observed_active_volume_index(&control.serial, before.volume_uuid)
+                .await
+                .unwrap()
+                .generation,
+            before.generation + 2,
+            "old S4 recovery and new append must have distinct generations"
+        );
+        let cartridge = fixture.lib.cartridge("LIFE00L8").unwrap();
+        for upload in uploads {
+            assert_eq!(
+                catalog
+                    .active_upload_result(&upload.intent.request(), control.route)
+                    .await
+                    .unwrap(),
+                Some(PublishOutcome::AlreadyApplied(1))
+            );
+            let bytes = std::fs::read(upload.spool).unwrap();
+            assert_eq!(
+                cartridge
+                    .partitions
+                    .iter()
+                    .flat_map(|p| &p.objects)
+                    .filter(
+                        |object| matches!(object, LogicalObject::Record(record) if record == &bytes)
+                    )
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；第二次追加注入池屏障错误，SimLibrary，不访问实际设备"]
+    async fn native_batch_partial_append_gate_error_stops_later_requests() {
+        use crate::managed_catalog::{ActiveUploadSpec, ContentDigest, ManagedCatalog};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct GateOnSecondAppend {
+            inner: Box<dyn TapeTransport + Send>,
+            pool: uuid::Uuid,
+            writes: AtomicUsize,
+            failed: AtomicBool,
+            later_commands: Arc<AtomicUsize>,
+        }
+        impl GateOnSecondAppend {
+            fn observe(&self, cdb: &[u8]) {
+                if self.failed.load(Ordering::SeqCst) && cdb[0] != 0x5e {
+                    self.later_commands.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+        impl TapeTransport for GateOnSecondAppend {
+            fn identity(&self) -> &str {
+                self.inner.identity()
+            }
+            fn session_epoch(&self) -> Option<u64> {
+                self.inner.session_epoch()
+            }
+            fn execution_guard(&self) -> Option<(u64, usize)> {
+                self.inner.execution_guard()
+            }
+            fn execute_no_data(
+                &self,
+                cdb: &[u8],
+                timeout: u32,
+            ) -> Result<crate::scsi::device::ScsiResult> {
+                self.observe(cdb);
+                self.inner.execute_no_data(cdb, timeout)
+            }
+            fn execute_read(
+                &self,
+                cdb: &[u8],
+                data: &mut [u8],
+                timeout: u32,
+            ) -> Result<crate::scsi::device::ScsiResult> {
+                self.observe(cdb);
+                self.inner.execute_read(cdb, data, timeout)
+            }
+            fn execute_write(
+                &self,
+                cdb: &[u8],
+                data: &[u8],
+                timeout: u32,
+            ) -> Result<crate::scsi::device::ScsiResult> {
+                self.observe(cdb);
+                if cdb[0] == 0x0a && self.writes.fetch_add(1, Ordering::SeqCst) == 1 {
+                    self.failed.store(true, Ordering::SeqCst);
+                    // Inject the batch kernel's gate error after one actual
+                    // append; this is not a SCSI-reported PoolBusy condition.
+                    return Err(TapeError::PoolBusy {
+                        pool: self.pool.to_string(),
+                    });
+                }
+                self.inner.execute_write(cdb, data, timeout)
+            }
+        }
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog = Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());
+        let (mut fixture, control, pool, status) = assigned_batch_fixture(catalog.clone()).await;
+        let mut requests = Vec::new();
+        for n in 0..2 {
+            let bytes = format!("partial-batch-body-{n}").into_bytes();
+            let path = fixture.root.join(format!("partial-spool-{n}"));
+            std::fs::write(&path, &bytes).unwrap();
+            let spec = ActiveUploadSpec {
+                pool_id: pool.id,
+                path: format!("/partial-{n}").into_bytes(),
+                operation_id: uuid::Uuid::new_v4(),
+                expected_version: None,
+                size: bytes.len() as u64,
+                digest: ContentDigest::Sha256(Sha256::digest(&bytes).into()),
+            };
+            let intent = fdb_writing::prepare(
+                &fixture.owner,
+                &fixture.permit,
+                &control,
+                &spec,
+                Some("LIFE00L8"),
+            )
+            .await
+            .unwrap();
+            requests.push((intent.request(), std::fs::File::open(path).unwrap()));
+        }
+        let mut later = requests[1].0.clone();
+        later.operation_id = uuid::Uuid::new_v4();
+        later.file_id = uuid::Uuid::new_v4();
+        later.name = b"later-unavailable".to_vec();
+        later.barcode = Some("MISSINGL8".into());
+        requests.push((later, requests[1].1.try_clone().unwrap()));
+        let originals: Vec<_> = requests
+            .iter()
+            .map(|(request, _)| request.clone())
+            .collect();
+        let later_commands = Arc::new(AtomicUsize::new(0));
+        let inner = std::mem::replace(
+            &mut fixture.owner.devices[0].dev,
+            Box::new(fixture.lib.drive_as(0, 1)),
+        );
+        fixture.owner.devices[0].dev = Box::new(GateOnSecondAppend {
+            inner,
+            pool: pool.id,
+            writes: AtomicUsize::new(0),
+            failed: AtomicBool::new(false),
+            later_commands: later_commands.clone(),
+        });
+        let results = Box::pin(fdb_writing::write_batch(
+            &mut fixture.owner,
+            &fixture.permit,
+            &control,
+            &status,
+            requests,
+        ))
+        .await;
+        assert!(
+            results
+                .iter()
+                .all(|result| matches!(result, Err(ReadError::Lost(_)))),
+            "{results:?}"
+        );
+        assert_eq!(
+            later_commands.load(Ordering::SeqCst),
+            0,
+            "partial append must not admit later requests"
+        );
+        assert!(fixture.owner.write_session.is_none());
+        for request in &originals {
+            assert!(
+                catalog
+                    .active_upload_result(request, control.route)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        for request in &originals[..2] {
+            assert!(
+                catalog
+                    .active_file_attempt(request, control.route)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert!(
+            catalog
+                .active_file_attempt(&originals[2], control.route)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let cartridge = fixture.lib.cartridge("LIFE00L8").unwrap();
+        for (body, count) in [
+            (b"partial-batch-body-0".as_slice(), 1),
+            (b"partial-batch-body-1".as_slice(), 0),
+        ] {
+            assert_eq!(cartridge.partitions.iter().flat_map(|p| &p.objects).filter(|object|
+                matches!(object, crate::scsi::sim::LogicalObject::Record(record) if record == body)).count(), count);
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "需要隔离 FDB_TEST_CLUSTER；末条 MAM 命令故障，SimLibrary，不访问实际设备"]
     async fn maintenance_last_mam_unknown_keeps_task_loaded_without_publishing_sample() {

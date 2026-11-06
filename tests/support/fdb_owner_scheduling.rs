@@ -5,6 +5,201 @@ use tape_rs::client::fdb::UploadCondition;
 
 const BARCODES: [&str; 4] = ["READA0L8", "READA1L8", "READB0L8", "READA2L9"];
 
+#[test]
+#[ignore = "需要隔离 FDB_TEST_CLUSTER；原生上传排队合批与模拟磁带，不访问真实设备"]
+fn queued_native_uploads_share_one_durable_media_commit() {
+    queued_uploads(UploadScene::Fresh);
+}
+
+#[test]
+#[ignore = "需要隔离 FDB_TEST_CLUSTER；共享 S4 后回执丢失与接管，不访问真实设备"]
+fn queued_native_uploads_recover_original_batch_after_unknown_s4() {
+    queued_uploads(UploadScene::UnknownS4);
+}
+
+enum UploadScene {
+    Fresh,
+    UnknownS4,
+}
+
+fn queued_uploads(scene: UploadScene) {
+    let fail_s4 = matches!(scene, UploadScene::UnknownS4);
+    let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+    let _network = unsafe { foundationdb::boot() };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let f = rt.block_on(fixture(&cluster));
+    let mut owner = Owner::start_mode(&f, 12, json!({}), true);
+    owner.fail_vci.store(fail_s4, Ordering::SeqCst);
+    let before = rt
+        .block_on(
+            f.catalog
+                .active_loaded_volume_head(&f.serial, BARCODES[0], f.route, 12),
+        )
+        .unwrap()
+        .unwrap();
+    let mut pending = Vec::new();
+    for n in 0..8 {
+        let bytes = format!("batch-body-{n}").into_bytes();
+        let path = f.root.join(format!("batch-spool-{n}"));
+        fs::write(&path, &bytes).unwrap();
+        let intent = ActiveFileIntent {
+            barcode_constraint: Some(BARCODES[0].into()),
+            namespace: f.route.route.namespace,
+            parent: f.pool_roots[0],
+            parent_path: b"/".to_vec(),
+            name: format!("batch-file-{n}").into_bytes(),
+            file_id: Uuid::new_v4(),
+            expected_version: None,
+            operation_id: Uuid::new_v4(),
+            request_epoch: 1,
+            library_serial: f.serial.clone(),
+            pool_id: Some(f.pools[0]),
+            owner_epoch: 12,
+            volume_id: before.volume_id,
+            volume_generation: before.index.generation + 1,
+            volume_scan_id: Uuid::new_v4(),
+            expected_size: bytes.len() as u64,
+            expected_digest: ContentDigest::Sha256(Sha256::digest(&bytes).into()),
+        };
+        let (reply, received) = channel();
+        owner
+            .tx
+            .send(ExecRequest::FdbWrite {
+                intent: Box::new(intent.request()),
+                file: fs::File::open(&path).unwrap(),
+                reply,
+            })
+            .unwrap();
+        pending.push((intent.request(), received, bytes, path));
+    }
+    for (_, received, _, _) in &pending {
+        let result = received.recv_timeout(Duration::from_secs(30)).unwrap();
+        if fail_s4 {
+            assert!(matches!(result, Err(ReadError::Lost(_))), "{result:?}");
+        } else {
+            assert_eq!(result, Ok(1));
+        }
+    }
+    if fail_s4 {
+        drop(owner);
+        assert_eq!(
+            rt.block_on(
+                f.catalog
+                    .observed_active_volume_index(&f.serial, before.volume_id)
+            )
+            .unwrap()
+            .generation,
+            before.index.generation
+        );
+        f.library.power_cut();
+        owner = Owner::start_mode(&f, 13, json!({}), true);
+        let mut retries = Vec::new();
+        for (request, _, _, path) in &pending {
+            let (reply, received) = channel();
+            owner
+                .tx
+                .send(ExecRequest::FdbWrite {
+                    intent: Box::new(request.clone()),
+                    file: fs::File::open(path).unwrap(),
+                    reply,
+                })
+                .unwrap();
+            retries.push(received);
+        }
+        // A new neighbour must remain independent of completed original
+        // receipts in the same executor collection window.
+        let bytes = b"new-neighbour-after-recovery".to_vec();
+        let path = f.root.join("new-neighbour-spool");
+        fs::write(&path, &bytes).unwrap();
+        let mut neighbour = pending[0].0.clone();
+        neighbour.name = b"new-neighbour".to_vec();
+        neighbour.file_id = Uuid::new_v4();
+        neighbour.operation_id = Uuid::new_v4();
+        neighbour.expected_size = bytes.len() as u64;
+        neighbour.expected_digest = ContentDigest::Sha256(Sha256::digest(&bytes).into());
+        let (reply, received) = channel();
+        owner
+            .tx
+            .send(ExecRequest::FdbWrite {
+                intent: Box::new(neighbour.clone()),
+                file: fs::File::open(&path).unwrap(),
+                reply,
+            })
+            .unwrap();
+        for received in retries {
+            assert_eq!(
+                received.recv_timeout(Duration::from_secs(30)).unwrap(),
+                Ok(1)
+            );
+        }
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(30)).unwrap(),
+            Ok(1)
+        );
+        pending.push((neighbour, received, bytes, path));
+    }
+    let after = rt
+        .block_on(f.catalog.active_loaded_volume_head(
+            &f.serial,
+            BARCODES[0],
+            f.route,
+            if fail_s4 { 13 } else { 12 },
+        ))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.index.generation,
+        before.index.generation + 1 + u64::from(fail_s4),
+        "already queued uploads must share S4 instead of stopping the tape per object"
+    );
+    for (request, _, bytes, _) in pending {
+        assert_eq!(
+            rt.block_on(f.catalog.active_upload_result(&request, f.route))
+                .unwrap(),
+            Some(PublishOutcome::AlreadyApplied(1))
+        );
+        let mut copies = 0;
+        assert!(f.library.with_cartridge_mut(BARCODES[0], |cartridge| {
+            copies = cartridge
+                .partitions
+                .iter()
+                .flat_map(|p| &p.objects)
+                .filter(
+                    |object| matches!(object, LogicalObject::Record(record) if record == &bytes),
+                )
+                .count();
+        }));
+        assert_eq!(
+            copies, 1,
+            "each original body must have exactly one physical record"
+        );
+        let (reply, received) = channel();
+        owner
+            .tx
+            .send(ExecRequest::Read {
+                path: format!(
+                    "/{}/{}",
+                    f.pools[0],
+                    String::from_utf8(request.name).unwrap()
+                ),
+                reply,
+            })
+            .unwrap();
+        assert_eq!(
+            received
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap()
+                .unwrap(),
+            bytes
+        );
+    }
+    drop(owner);
+    fs::remove_dir_all(f.root).unwrap();
+}
+
 struct Fixture {
     root: std::path::PathBuf,
     library: SimLibrary,

@@ -4,6 +4,83 @@ use std::collections::BTreeMap;
 use tape_rs::daemon::s3;
 
 #[test]
+#[ignore = "需要隔离 FDB_TEST_CLUSTER；并发 S3 TCP 合批与模拟磁带，不访问真实设备"]
+fn concurrent_s3_puts_share_s4_and_preserve_individual_checksums() {
+    use base64::Engine as _;
+    let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+    let _network = unsafe { foundationdb::boot() };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let f = rt.block_on(fixture(&cluster));
+    let owner = Owner::start_mode(&f, 12, json!({}), true);
+    let before = rt
+        .block_on(
+            f.catalog
+                .active_loaded_volume_head(&f.serial, BARCODES[0], f.route, 12),
+        )
+        .unwrap()
+        .unwrap();
+    let context = super::active_pools::context(&owner, 71, 12);
+    let server = ReadHttpServer::start(s3::fdb_router(
+        f.catalog.clone(),
+        BTreeMap::from([(f.serial.clone(), f.route)]),
+        BTreeMap::from([(f.serial.clone(), context.clone())]),
+        context,
+        HashMap::new(),
+        true,
+    ));
+    let bucket = s3::bucket_name(&f.serial, &f.pools[0].to_string());
+    let barrier = std::sync::Barrier::new(4);
+    std::thread::scope(|scope| {
+        for n in 0..4 {
+            let (server, bucket, barrier) = (&server, &bucket, &barrier);
+            scope.spawn(move || {
+                let bytes = vec![65 + n; 43];
+                let crc = base64::engine::general_purpose::STANDARD.encode(crc32fast::hash(&bytes).to_be_bytes());
+                barrier.wait();
+                let response = server.request_body("PUT", &format!("/{bucket}/batch-s3-{n}"),
+                    Some(&format!("Content-Length: 43\r\nIf-None-Match: *\r\nx-amz-sdk-checksum-algorithm: CRC32\r\nx-amz-checksum-crc32: {crc}\r\nx-amz-meta-sample: {n}\r\n")), &bytes);
+                assert_eq!(response.0, 200, "{}", String::from_utf8_lossy(&response.2));
+                assert!(response.1.contains(&format!("x-amz-checksum-crc32: {}", crc.to_ascii_lowercase())));
+            });
+        }
+    });
+    let after = rt
+        .block_on(
+            f.catalog
+                .active_loaded_volume_head(&f.serial, BARCODES[0], f.route, 12),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(
+        (1..4).contains(&(after.index.generation - before.index.generation)),
+        "concurrent public S3 requests must share at least one media generation"
+    );
+    for n in 0..4 {
+        let bytes = vec![65 + n; 43];
+        let crc =
+            base64::engine::general_purpose::STANDARD.encode(crc32fast::hash(&bytes).to_be_bytes());
+        let get = server.request(
+            "GET",
+            &format!("/{bucket}/batch-s3-{n}"),
+            Some("x-amz-checksum-mode: ENABLED\r\n"),
+        );
+        assert_eq!(get.0, 200);
+        assert_eq!(get.2, bytes);
+        assert!(get.1.contains(&format!(
+            "x-amz-checksum-crc32: {}",
+            crc.to_ascii_lowercase()
+        )));
+        assert!(get.1.contains(&format!("x-amz-meta-sample: {n}")));
+    }
+    drop(server);
+    drop(owner);
+    fs::remove_dir_all(f.root).unwrap();
+}
+
+#[test]
 #[ignore = "需要隔离 FDB_TEST_CLUSTER；真实 S3 TCP 与模拟磁带，不访问真实设备"]
 fn consecutive_s3_puts_append_without_recovering_the_same_media_again() {
     let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();

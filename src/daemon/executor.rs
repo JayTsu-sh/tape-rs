@@ -352,6 +352,10 @@ mod fdb_rename;
 mod fdb_writing;
 
 #[cfg(feature = "fdb")]
+#[path = "executor_fdb_write_queue.rs"]
+mod fdb_write_queue;
+
+#[cfg(feature = "fdb")]
 #[path = "executor_fdb_observations.rs"]
 mod fdb_observations;
 
@@ -918,6 +922,7 @@ fn run_fdb_owner_inner(
     let mut node_after = None;
     let mut next_node_check = Instant::now();
     let mut next_statistics_check = Instant::now();
+    let mut deferred_request = None;
     loop {
         if writable
             && !observations.busy()
@@ -1195,7 +1200,11 @@ fn run_fdb_owner_inner(
                 }
             }
         }
-        let request = match rx.recv_timeout(Duration::from_millis(250)) {
+        let request = match deferred_request
+            .take()
+            .map(Ok)
+            .unwrap_or_else(|| rx.recv_timeout(Duration::from_millis(250)))
+        {
             Ok(request) => request,
             Err(RecvTimeoutError::Disconnected) => {
                 if let Some(owner) = &active
@@ -1877,25 +1886,50 @@ fn run_fdb_owner_inner(
                 file,
                 reply,
             } => {
-                let result = if !writable {
-                    Err(ReadError::Failed("FDB owner 只读模式禁止上传".into()))
+                let first = fdb_write_queue::QueuedWrite {
+                    request: *intent,
+                    file,
+                    reply,
+                };
+                let queued = if writable && pool.is_none() {
+                    fdb_write_queue::collect(first, &rx, &mut deferred_request, files.policy())
+                } else {
+                    vec![first]
+                };
+                let count = queued.len();
+                let (requests, replies): (Vec<_>, Vec<_>) = queued
+                    .into_iter()
+                    .map(|queued| ((queued.request, queued.file), queued.reply))
+                    .unzip();
+                let results = if !writable {
+                    vec![Err(ReadError::Failed("FDB owner 只读模式禁止上传".into())); count]
                 } else if pool.as_ref().is_some_and(|pool| {
                     Some(pool.as_str())
-                        != intent.pool_id.as_ref().map(|id| id.to_string()).as_deref()
+                        != requests[0]
+                            .0
+                            .pool_id
+                            .as_ref()
+                            .map(|id| id.to_string())
+                            .as_deref()
                 }) {
-                    Err(ReadError::Failed("上传与池作用域不一致".into()))
+                    vec![Err(ReadError::Failed("上传与池作用域不一致".into())); count]
                 } else {
                     match (
                         active.as_mut().filter(|owner| owner.serving),
                         permission.as_deref(),
                     ) {
-                        (Some(owner), Some(permit)) => runtime.block_on(fdb_writing::write(
-                            owner, permit, &control, &status, *intent, file,
+                        (Some(owner), Some(permit)) => runtime.block_on(fdb_writing::write_batch(
+                            owner, permit, &control, &status, requests,
                         )),
-                        _ => Err(ReadError::Busy("FDB owner 当前不在服务".into())),
+                        _ => {
+                            vec![Err(ReadError::Busy("FDB owner 当前不在服务".into())); count]
+                        }
                     }
                 };
-                if let Err(ReadError::Lost(reason)) = &result {
+                if let Some(reason) = results.iter().find_map(|result| match result {
+                    Err(ReadError::Lost(reason)) => Some(reason),
+                    _ => None,
+                }) {
                     files.close_all(reason);
                     if let Some(owner) = active.take() {
                         if let Some(permit) = permission.as_ref() {
@@ -1907,7 +1941,9 @@ fn run_fdb_owner_inner(
                         });
                     }
                 }
-                let _ = reply.send(result);
+                for (reply, result) in replies.into_iter().zip(results) {
+                    let _ = reply.send(result);
+                }
             }
             ExecRequest::Sync { reply, .. } => {
                 let _ = reply.send(Err("FDB owner 只读控制模式禁止旧文件同步".into()));
