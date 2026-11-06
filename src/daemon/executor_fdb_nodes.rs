@@ -234,6 +234,7 @@ pub(super) async fn advance(
     let Some(task) = page.items.into_iter().next() else {
         return Ok(false);
     };
+    owner.write_session = None;
     // The fair cursor advances for both protocols before dispatch. Rename
     // keeps its original two-path ledger and multi-volume execution boundary.
     if task.kind == NodeMutationTaskKind::Rename {

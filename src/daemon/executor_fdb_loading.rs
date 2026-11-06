@@ -357,6 +357,7 @@ async fn unload_inner(
     maintenance: Option<(&crate::managed_catalog::NativeDeviceTask, u16)>,
     intake: Option<&crate::managed_catalog::NativeMediaImport>,
 ) -> std::result::Result<(), ReadError> {
+    owner.write_session = None;
     if let Some((task, destination)) = maintenance {
         maintenance_unload_guard(owner, control, task, drive, destination).await?;
     }

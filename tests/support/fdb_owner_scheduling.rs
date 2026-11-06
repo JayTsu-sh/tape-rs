@@ -1317,6 +1317,40 @@ fn writable_owner_recovers_unobserved_s4_without_reappending() {
         expected_digest: ContentDigest::Sha256(Sha256::digest(bytes).into()),
     };
     let owner = Owner::start_mode(&f, 12, json!({}), true);
+    // Prime a completed sequential session before losing the next S4's VCI
+    // result. Recovery must discard that cache and use the original ledger.
+    let warm_bytes = b"completed-before-unknown";
+    let warm_spool = f.root.join("before-unobserved-upload");
+    fs::write(&warm_spool, warm_bytes).unwrap();
+    let mut warm = intent.clone();
+    warm.name = b"before-recover-upload".to_vec();
+    warm.file_id = Uuid::new_v4();
+    warm.operation_id = Uuid::new_v4();
+    warm.expected_size = warm_bytes.len() as u64;
+    warm.expected_digest = ContentDigest::Sha256(Sha256::digest(warm_bytes).into());
+    let (reply, received) = channel();
+    owner
+        .tx
+        .send(ExecRequest::FdbWrite {
+            intent: Box::new(warm.request()),
+            file: fs::File::open(&warm_spool).unwrap(),
+            reply,
+        })
+        .unwrap();
+    assert_eq!(
+        received
+            .recv_timeout(Duration::from_secs(15))
+            .unwrap()
+            .unwrap(),
+        1
+    );
+    let previous_generation = rt
+        .block_on(
+            f.catalog
+                .observed_active_volume_index(&f.serial, copy.volume_id),
+        )
+        .unwrap()
+        .generation;
     // sync_batch flushes the DP construct before writing VCI. This failure
     // leaves a complete physical S4 that has not yet been observed in FDB.
     owner.fail_vci.store(true, Ordering::SeqCst);
@@ -1339,7 +1373,7 @@ fn writable_owner_recovers_unobserved_s4_without_reappending() {
         )
         .unwrap()
         .generation,
-        copy.volume_generation
+        previous_generation
     );
     f.library.power_cut();
     let next = Owner::start_mode(&f, 13, json!({}), true);

@@ -5,8 +5,8 @@ use crate::daemon::fdb_media::{
     publish_active_media_batch,
 };
 use crate::managed_catalog::{
-    ActiveFileIntent, ActiveFileRequest, ActiveUploadSpec, CatalogError, ContentDigest,
-    PublishOutcome,
+    ActiveFileIntent, ActiveFileRequest, ActiveIndexIdentity, ActiveUploadSpec, CatalogError,
+    ContentDigest, PublishOutcome,
 };
 use sha2::{Digest, Sha256};
 use std::io::Read;
@@ -318,6 +318,7 @@ pub(super) async fn write(
     fdb_monitor::write_allowed(owner, control, &placement.barcode, true).await?;
     fdb_loading::guard(owner, permit, control).await?;
     let round = owner.round;
+    let session = owner.write_session.take();
     let original_intent = intent.clone();
     let seen_reservation = std::cell::Cell::new(false);
     let checked =
@@ -352,7 +353,23 @@ pub(super) async fn write(
             })
         });
     let tracked = fdb_monitor::Tracked::new(&checked, "write");
-    let mounted = LtfsVolume::mount(&tracked);
+    let mounted = match session.filter(|session| {
+        session.matches_device(&tracked, owner.key)
+            && ActiveIndexIdentity::from(session.committed_index_construct()) == head.index
+    }) {
+        Some(session) => {
+            let resumed = session.resume(&tracked, owner.key);
+            if resumed.is_ok() {
+                log::debug!(
+                    "FDB 复用顺序追加会话: {} gen={}",
+                    placement.barcode,
+                    head.index.generation
+                );
+            }
+            resumed
+        }
+        None => LtfsVolume::mount(&tracked),
+    };
     if mounted.is_err() {
         fdb_monitor::io_error(
             owner,
@@ -432,11 +449,10 @@ pub(super) async fn write(
     let committed = publish_active_media_batch(&control.catalog, committed)
         .await
         .map_err(lost)?;
-    // S4 already flushed and published this exact construct. Unmount may
-    // append a Full checkpoint after an incremental commit, creating a new
-    // generation absent from FDB. End the session without another commit;
-    // explicit drive unload remains in the fenced scheduling path.
-    drop(committed.into_volume());
+    // Keep only this clean S4 session, without a device borrow or another
+    // checkpoint. A later request must recheck its device epoch, PR and the
+    // exact FDB index before reusing its confirmed sequential append head.
+    let session = committed.into_volume().into_session();
     let current = control
         .catalog
         .active_loaded_volume_head(
@@ -468,7 +484,7 @@ pub(super) async fn write(
             last_used: Instant::now(),
         },
     );
-    match control
+    let result = match control
         .catalog
         .active_upload_result(&intent.request(), control.route)
         .await
@@ -476,7 +492,11 @@ pub(super) async fn write(
     {
         Some(PublishOutcome::AlreadyApplied(version)) => Ok(version),
         result => Err(lost(format!("发布后请求结果不一致: {result:?}"))),
+    };
+    if result.is_ok() {
+        owner.write_session = session;
     }
+    result
 }
 
 #[cfg(test)]

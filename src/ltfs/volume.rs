@@ -190,6 +190,22 @@ pub(crate) struct ReadView {
 }
 
 impl VolumeSession {
+    #[cfg(feature = "fdb")]
+    pub(crate) fn matches_device(
+        &self,
+        device: &dyn crate::scsi::transport::TapeTransport,
+        key: crate::scsi::reservation::ReservationKey,
+    ) -> bool {
+        self.identity == device.identity()
+            && self.reservation_guard == Some(key)
+            && device.session_epoch() == Some(self.epoch)
+    }
+
+    #[cfg(feature = "fdb")]
+    pub(crate) fn committed_index_construct(&self) -> CommittedIndexConstruct {
+        self.committed_construct
+    }
+
     pub(crate) fn resume<'a>(
         self,
         device: &'a dyn crate::scsi::transport::TapeTransport,
@@ -2384,6 +2400,43 @@ mod relocation_tests {
         };
         lib.reset_drive(0);
         assert!(session.resume(&dev, key).is_err());
+    }
+
+    #[test]
+    fn session_survives_a_successful_density_capability_query() {
+        use crate::scsi::reservation::{ReservationKey, fence};
+        let lib = SimLibrary::new(1, 2, 1);
+        lib.insert_cartridge(SimCartridge::blank("SESS03L8", 64 << 20), 0)
+            .unwrap();
+        lib.load_into_drive("SESS03L8", 0).unwrap();
+        let dev = lib.drive(0);
+        mkltfs(&dev, &MkltfsOptions::default()).unwrap();
+        let key = ReservationKey::new(1, 1);
+        fence(&dev, key).unwrap();
+        let mut volume = LtfsVolume::mount(&dev).unwrap();
+        volume.set_reservation_guard(Some(key));
+        let session = volume.into_session().unwrap();
+        TapeDrive::new(&dev).report_density_support(false).unwrap();
+        let volume = session.resume(&dev, key).unwrap();
+        let session = volume.into_session().unwrap();
+        dev.inject(crate::scsi::sim::Fault {
+            opcode: 0x44,
+            action: crate::scsi::sim::FaultAction::CheckCondition {
+                sense_key: 6,
+                asc: 0x29,
+                ascq: 0,
+            },
+            after: 0,
+            remaining: 1,
+        });
+        crate::scsi::transport::retry_unit_attention("density", || {
+            TapeDrive::new(&dev).report_density_support(false)
+        })
+        .unwrap();
+        assert!(
+            session.resume(&dev, key).is_err(),
+            "a consumed UA must still invalidate the session"
+        );
     }
 
     #[test]

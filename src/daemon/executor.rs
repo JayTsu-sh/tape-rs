@@ -959,6 +959,7 @@ fn run_fdb_owner_inner(
                         .map_err(|e| ReadError::Lost(e.to_string()))?
                 };
                 if let Some((epoch, id)) = selected {
+                    owner.write_session = None;
                     management_after = Some((epoch, id));
                     let task = control
                         .catalog
@@ -1229,6 +1230,15 @@ fn run_fdb_owner_inner(
             ExecRequest::Scoped { pool, request, .. } => (Some(pool), *request),
             request => (None, request),
         };
+        // One bounded write session per library. Other foreground operations
+        // release its index before mounting or changing any other medium.
+        if !matches!(
+            request,
+            ExecRequest::FdbWrite { .. } | ExecRequest::FdbPrepare { .. } | ExecRequest::Work
+        ) && let Some(owner) = active.as_mut()
+        {
+            owner.write_session = None;
+        }
         match request {
             ExecRequest::AttachPermission {
                 permission: attached,

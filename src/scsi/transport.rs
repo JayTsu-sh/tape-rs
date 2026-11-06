@@ -39,9 +39,11 @@ pub trait TapeTransport {
 }
 
 pub(crate) fn changes_session(cdb: &[u8]) -> bool {
+    // SSC REPORT DENSITY SUPPORT (44h) reports format capabilities without
+    // positioning or changing the medium. Errors/UA still advance the epoch.
     !matches!(
         cdb.first(),
-        Some(0x00 | 0x05 | 0x08 | 0x12 | 0x1a | 0x34 | 0x4d | 0x5a | 0x5e | 0x8c)
+        Some(0x00 | 0x05 | 0x08 | 0x12 | 0x1a | 0x34 | 0x44 | 0x4d | 0x5a | 0x5e | 0x8c)
     )
 }
 

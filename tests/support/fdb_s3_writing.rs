@@ -5,6 +5,82 @@ use tape_rs::daemon::s3;
 
 #[test]
 #[ignore = "需要隔离 FDB_TEST_CLUSTER；真实 S3 TCP 与模拟磁带，不访问真实设备"]
+fn consecutive_s3_puts_append_without_recovering_the_same_media_again() {
+    let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+    let _network = unsafe { foundationdb::boot() };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let f = rt.block_on(fixture(&cluster));
+    let owner = Owner::start_mode(&f, 12, json!({}), true);
+    let context = super::active_pools::context(&owner, 71, 12);
+    let server = ReadHttpServer::start(s3::fdb_router(
+        f.catalog.clone(),
+        BTreeMap::from([(f.serial.clone(), f.route)]),
+        BTreeMap::from([(f.serial.clone(), context.clone())]),
+        context,
+        HashMap::new(),
+        true,
+    ));
+    let bucket = s3::bucket_name(&f.serial, &f.pools[0].to_string());
+    let put = |name: &str, bytes: &[u8]| {
+        let response = server.request_body(
+            "PUT",
+            &format!("/{bucket}/{name}"),
+            Some(&format!(
+                "Content-Length: {}\r\nIf-None-Match: *\r\n",
+                bytes.len()
+            )),
+            bytes,
+        );
+        assert_eq!(response.0, 200, "{}", String::from_utf8_lossy(&response.2));
+    };
+    put("sequential-first", b"first");
+    let before = owner.trace.lock().unwrap().len();
+    put("sequential-second", b"second");
+    let sequential = owner.trace.lock().unwrap()[before..].to_vec();
+    assert!(
+        sequential.iter().all(|cdb| cdb[0] != 0x08),
+        "a completed, unchanged write session must not reread its label and index"
+    );
+    assert!(
+        sequential.iter().all(|cdb| cdb[0] != 0x92),
+        "consecutive writes must retain the confirmed append position"
+    );
+    assert!(sequential.iter().any(|cdb| cdb[0] == 0x0a));
+    assert!(
+        sequential.iter().any(|cdb| cdb[0] == 0x10),
+        "S4 still flushes"
+    );
+    // Interleaved reads leave sequential-write mode; the next write must
+    // recover the real append position instead of trusting a stale cursor.
+    let read = server.request("GET", &format!("/{bucket}/sequential-first"), None);
+    assert_eq!(read.0, 200);
+    assert_eq!(read.2, b"first");
+    let before = owner.trace.lock().unwrap().len();
+    put("sequential-after-read", b"third");
+    assert!(
+        owner.trace.lock().unwrap()[before..]
+            .iter()
+            .any(|cdb| cdb[0] == 0x08)
+    );
+    for (name, expected) in [
+        ("sequential-first", &b"first"[..]),
+        ("sequential-second", &b"second"[..]),
+        ("sequential-after-read", &b"third"[..]),
+    ] {
+        let get = server.request("GET", &format!("/{bucket}/{name}"), None);
+        assert_eq!(get.0, 200);
+        assert_eq!(get.2, expected);
+    }
+    drop(server);
+    drop(owner);
+    fs::remove_dir_all(f.root).unwrap();
+}
+
+#[test]
+#[ignore = "需要隔离 FDB_TEST_CLUSTER；真实 S3 TCP 与模拟磁带，不访问真实设备"]
 fn s3_put_overwrite_metadata_and_delete_use_fdb_and_media_commits() {
     let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
     let _network = unsafe { foundationdb::boot() };
