@@ -1148,7 +1148,11 @@ fn drive_command(
             page[0] = 0x11;
             page[1] = 0x0E;
             page[2] = 3;
-            page[3] = st.drives[idx].pending_partitions.saturating_sub(1) as u8;
+            page[3] = st.drives[idx]
+                .cartridge
+                .as_ref()
+                .and_then(|barcode| st.cartridges.get(barcode))
+                .map_or(0, |cart| cart.partitions.len().saturating_sub(1) as u8);
             page[4] = 0x3C;
             page[5] = 3; // 支持格式及分区识别，不可更改。
             page[6] = 0x19; // 流式分区、GB 单位。

@@ -2,6 +2,8 @@
 use super::*;
 #[path = "executor_fdb_lifecycle_cancel.rs"]
 mod cancel;
+#[path = "executor_fdb_format_guard.rs"]
+mod format_guard;
 use crate::catalog::volume_extents::VolumeExtentCache;
 use crate::changer::element::{ElementAddressMap, ElementStatus};
 use crate::managed_catalog::{CatalogError, NativeDeviceTask};
@@ -1066,7 +1068,21 @@ fn format_allowed(
     force: bool,
 ) -> std::result::Result<(), ReadError> {
     match probe_format(device).map_err(physical)? {
-        FormatProbe::Blank => Ok(()),
+        FormatProbe::Blank => {
+            let drive = TapeDrive::new(device);
+            let mut buffer = vec![0; crate::ltfs::volume::DEFAULT_BLOCK_SIZE as usize];
+            for partition in 0..drive.defined_partitions().map_err(physical)? {
+                drive.locate(partition, 0, true).map_err(physical)?;
+                match drive.read_block(&mut buffer) {
+                    Err(TapeError::ScsiCommand {
+                        sense_key: 0x08, ..
+                    }) => {}
+                    Err(error) => return Err(physical(error)),
+                    Ok(_) => return Err(failed("介质仍有非空分区；销毁须显式 force_format")),
+                }
+            }
+            Ok(())
+        }
         FormatProbe::Foreign(_) | FormatProbe::Ltfs if force => Ok(()),
         FormatProbe::Ltfs => {
             let current = labels(device)?;
@@ -1091,6 +1107,35 @@ fn format_allowed(
             "介质不是空白或空 LTFS：{reason}；不自动格式化"
         ))),
     }
+}
+
+fn format_authority(
+    device: &dyn TapeTransport,
+    permit: &Permission,
+    control: &FdbOwnerControl,
+    task: &NativeDeviceTask,
+    owner: u64,
+    phase: &str,
+) -> crate::error::Result<()> {
+    let permission = || {
+        permit.allows(owner, super::super::permission::Phase::Serving)
+            || permit.allows(owner, super::super::permission::Phase::Execution)
+    };
+    let lost = |detail: String| TapeError::OwnershipLost {
+        device: device.identity().into(),
+        detail,
+    };
+    if !permission() {
+        return Err(lost("格式化执行许可已失效".into()));
+    }
+    control
+        .catalog
+        .native_format_authority_blocking(task, owner, phase)
+        .map_err(|error| lost(error.to_string()))?;
+    if !permission() {
+        return Err(lost("格式化共享状态查询期间执行许可失效".into()));
+    }
+    Ok(())
 }
 
 /// 完成同一已授权格式化意图；unknown 时仅观察，绝不再 FORMAT。
@@ -1259,13 +1304,23 @@ pub(super) async fn prepare_assign(
             ),
         )
         .await?;
-        let result = mkltfs(
+        let result = format_guard::format(
             device,
             &MkltfsOptions {
                 volume_id: intake.barcode().chars().take(6).collect(),
                 block_size: opts.block_size,
                 volume_uuid: Some(volume),
                 ..Default::default()
+            },
+            || {
+                format_authority(
+                    device,
+                    permit,
+                    control,
+                    &task,
+                    owner.round,
+                    "format-started",
+                )
             },
         );
         live(owner, permit, control, &task).await?;
@@ -1288,8 +1343,11 @@ pub(super) async fn prepare_assign(
         format_phase = "format-started";
     }
     // 任何接续都先证明固定 UUID 与完整空索引，再补原 pool 标记，不能重格式化。
+    let proof_device = format_guard::Guard::new(device, || {
+        format_authority(device, permit, control, &task, owner.round, format_phase)
+    });
     let proof = validate_index(
-        device,
+        &proof_device,
         owner.files.spool_dir(),
         control.storage,
         volume,
@@ -1354,7 +1412,17 @@ pub(super) async fn prepare_assign(
         .await?;
     }
     live(owner, permit, control, &task).await?;
-    if let Err(error) = mark_pool(device, owner.key, volume, pool, &target.name) {
+    let marking_device = format_guard::Guard::new(device, || {
+        format_authority(
+            device,
+            permit,
+            control,
+            &task,
+            owner.round,
+            "marking-started",
+        )
+    });
+    if let Err(error) = mark_pool(&marking_device, owner.key, volume, pool, &target.name) {
         if let ReadError::Lost(reason) = error {
             return Err(ReadError::Lost(reason));
         }
@@ -1372,7 +1440,7 @@ pub(super) async fn prepare_assign(
     }
     live(owner, permit, control, &task).await?;
     let validation = match validate_index(
-        device,
+        &marking_device,
         owner.files.spool_dir(),
         control.storage,
         volume,
@@ -2160,10 +2228,24 @@ mod tests {
         crate::managed_catalog::PoolRecord,
         SharedStatus,
     ) {
+        native_fixture_for_serial(catalog, None).await
+    }
+
+    async fn native_fixture_for_serial(
+        catalog: Arc<crate::managed_catalog::ManagedCatalog>,
+        physical_serial: Option<&str>,
+    ) -> (
+        Fixture,
+        FdbOwnerControl,
+        crate::managed_catalog::PoolRecord,
+        SharedStatus,
+    ) {
         use crate::managed_catalog::{PoolPolicy, PoolRecord, verify_native_barriers};
         let mut fixture = Fixture::new();
         let namespace = uuid::Uuid::new_v4();
-        let serial = format!("SIM-LIFECYCLE-{namespace}");
+        let serial = physical_serial
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("SIM-LIFECYCLE-{namespace}"));
         // 此隔离模拟fixture以独立配置身份避免覆盖其他FDB测试域；真实VPD绑定另有测试。
         fixture
             .owner
@@ -4699,5 +4781,55 @@ mod tests {
         );
         assert_eq!(fixture.drive_log(), drive_before_replay);
         assert_eq!(fixture.changer_log(), changer_before_replay);
+    }
+    include!("executor_fdb_format_physical_tests.rs");
+}
+
+#[cfg(test)]
+mod format_partition_tests {
+    use super::*;
+    use crate::scsi::sim::{SimCartridge, SimLibrary};
+
+    #[test]
+    fn nonforce_rejects_blank_index_partition_with_data_partition_content() {
+        let lib = SimLibrary::new(1, 2, 1);
+        lib.insert_cartridge(SimCartridge::blank("REV001L8", 64 << 20), 0)
+            .unwrap();
+        lib.load_into_drive("REV001L8", 0).unwrap();
+        let dev = lib.drive(0);
+        mkltfs(
+            &dev,
+            &MkltfsOptions {
+                volume_id: "REV001".into(),
+                block_size: 64 << 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        {
+            let mut vol = crate::ltfs::volume::LtfsVolume::mount(&dev).unwrap();
+            vol.append_file(
+                "/valuable.txt",
+                &mut std::io::Cursor::new(b"retained P1 data"),
+            )
+            .unwrap();
+            vol.commit().unwrap();
+        }
+        assert!(lib.with_cartridge_mut("REV001L8", |cart| {
+            assert!(cart.partitions[1].objects.len() > 5);
+            cart.partitions[0].objects.clear();
+            cart.partitions[0].flushed = 0;
+        }));
+        assert_eq!(probe_format(&dev).unwrap(), FormatProbe::Blank);
+        let result = format_allowed(
+            &dev,
+            &std::env::temp_dir(),
+            super::super::super::fdb_read::ReadStorageBudget::default(),
+            false,
+        );
+        assert!(
+            result.is_err(),
+            "non-force must reject P0 blank when P1 retains committed file data"
+        );
     }
 }

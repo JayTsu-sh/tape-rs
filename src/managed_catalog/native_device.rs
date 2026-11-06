@@ -834,6 +834,31 @@ impl ManagedCatalog {
         let state = futures_executor::block_on(Box::pin(read_state(&tr, task, owner)))?;
         Ok(state["cancel_requested"] == true)
     }
+
+    /// 阻塞设备线程逐命令读取同一任务及阶段，不依赖 Tokio reactor。
+    /// 格式化已开始后的取消仍按原恢复流程结清，不能伪装成未写介质。
+    pub(crate) fn native_format_authority_blocking(
+        &self,
+        task: &NativeDeviceTask,
+        owner: u64,
+        phase: &str,
+    ) -> Result<()> {
+        if task.kind() != "media-assign"
+            || !matches!(
+                phase,
+                "format-started" | "format-uncertain" | "marking-started"
+            )
+        {
+            return Err(CatalogError::Invalid("格式化命令的原任务或阶段无效"));
+        }
+        let tr = self.db.create_trx()?;
+        tr.set_option(foundationdb::options::TransactionOption::Timeout(2_000))?;
+        let state = futures_executor::block_on(Box::pin(read_state(&tr, task, owner)))?;
+        if state["phase"] != phase {
+            return Err(CatalogError::OwnerFenced);
+        }
+        Ok(())
+    }
     pub async fn checkpoint_native_device_task(
         &self,
         task: &NativeDeviceTask,
@@ -1679,6 +1704,24 @@ mod tests {
             .checkpoint_native_device_task(&format, 100, "planned", "format-started", &p, None)
             .await
             .unwrap();
+        catalog
+            .native_format_authority_blocking(&format, 100, "format-started")
+            .unwrap();
+        assert!(
+            catalog
+                .native_format_authority_blocking(&format, 101, "format-started")
+                .is_err()
+        );
+        assert!(
+            catalog
+                .native_format_authority_blocking(&format, 100, "marking-started")
+                .is_err()
+        );
+        assert!(
+            catalog
+                .native_format_authority_blocking(&format, 100, "ready")
+                .is_err()
+        );
         let mut unknown = observation(&serial, 100, Value::Null);
         unknown["inventory"] = Value::Null;
         unknown["diagnostic"] = json!("SCSI status=2 key=4 ASC=44 ASCQ=00");
