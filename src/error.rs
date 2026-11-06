@@ -6,13 +6,15 @@ pub enum TapeError {
     Io(#[from] std::io::Error),
 
     #[error(
-        "SCSI command failed: status={status:#04x}, sense_key={sense_key:#04x}, asc={asc:#04x}, ascq={ascq:#04x}"
+        "SCSI command failed: status={status:#04x}, sense_key={sense_key:#04x}, asc={asc:#04x}, ascq={ascq:#04x}, sense={sense:?}"
     )]
     ScsiCommand {
         status: u8,
         sense_key: u8,
         asc: u8,
         ascq: u8,
+        /// 未提供原始 sense 时，不能据此授权擦除或归因介质故障。
+        sense: Option<Box<crate::scsi::sense::SenseInfo>>,
     },
 
     /// SCSI status 0x18: 另一个 initiator 持有 Persistent Reservation。
@@ -131,3 +133,14 @@ impl From<std::num::ParseIntError> for TapeError {
 }
 
 pub type Result<T> = std::result::Result<T, TapeError>;
+
+impl TapeError {
+    /// 保留提交阶段包装内的原始 SCSI 诊断；诊断本身不授予重试或写入权限。
+    pub fn sense_info(&self) -> Option<&crate::scsi::sense::SenseInfo> {
+        match self {
+            Self::ScsiCommand { sense, .. } => sense.as_deref(),
+            Self::CommitFailed { source, .. } => source.sense_info(),
+            _ => None,
+        }
+    }
+}

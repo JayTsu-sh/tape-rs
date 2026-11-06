@@ -188,7 +188,7 @@ mod physical_format_safety {
         ));
         f.permit = permit;
         let request=ManagementRequest::parse(json!({"version":1,"library":control.serial,"namespace":control.route.route.namespace.to_string(),"epoch":1,"operation":operation.to_string(),"change":{"kind":"media-assign","pool":pool.id.to_string(),"barcode":"8A0047L8","volume":volume.to_string(),"confirm_format":true,"force_format":true}})).unwrap();
-        trace.save("TASK-INTENT.json", &request.value());
+        trace.save("TASK-INTENT.json", request.value());
         catalog
             .admit_management(&control.serial, control.route, f.owner.round, &request)
             .await

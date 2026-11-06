@@ -40,6 +40,7 @@ impl<'a> Tracked<'a> {
                     sense_key,
                     asc,
                     ascq,
+                    ..
                 } => (Some(*status), Some(*sense_key), Some(*asc), Some(*ascq)),
                 _ => (None, None, None, None),
             };

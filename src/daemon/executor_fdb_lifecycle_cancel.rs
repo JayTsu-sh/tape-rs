@@ -13,6 +13,12 @@ enum State {
     Lost(String),
 }
 
+pub(super) fn current_read_error(error: &TapeError) -> bool {
+    matches!(error, TapeError::ScsiCommand {status:2,sense_key,asc,ascq,sense}
+        if !matches!(sense_key,2|6|0x0b)
+            && sense.as_deref().and_then(|raw|raw.current_condition())==Some((*sense_key,*asc,*ascq)))
+}
+
 pub(super) struct PreformatRead<'a, F> {
     inner: &'a dyn TapeTransport,
     probe: F,
@@ -40,6 +46,27 @@ impl<'a, F: Fn() -> std::result::Result<bool, CatalogError>> PreformatRead<'a, F
     fn cancelled() -> TapeError {
         // Interrupted would let std::io readers silently retry the same read.
         std::io::Error::other("原维护任务已取消，停止只读预检查").into()
+    }
+
+    pub(super) fn verify_proof(&self) -> Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| self.lost("只读证明状态损坏".into()))?;
+        match &*state {
+            State::Active(_) => Ok(()),
+            State::Cancelled => Err(Self::cancelled()),
+            State::Lost(detail) => Err(self.lost(detail.clone())),
+        }
+    }
+
+    fn record_error(&self, error: &TapeError) {
+        if current_read_error(error) {
+            return;
+        }
+        if let Ok(mut state) = self.state.lock() {
+            *state = State::Lost(format!("只读探测未获完整当前执行结果: {error}"));
+        }
     }
 
     fn check(&self, cdb: &[u8]) -> Result<()> {
@@ -80,21 +107,30 @@ impl<'a, F: Fn() -> std::result::Result<bool, CatalogError>> PreformatRead<'a, F
 impl<F: Fn() -> std::result::Result<bool, CatalogError>> TapeTransport for PreformatRead<'_, F> {
     fn execute_no_data(&self, cdb: &[u8], timeout_ms: u32) -> Result<ScsiResult> {
         self.check(cdb)?;
-        let result = self.inner.execute_no_data(cdb, timeout_ms)?;
+        let result = self
+            .inner
+            .execute_no_data(cdb, timeout_ms)
+            .inspect_err(|error| self.record_error(error))?;
         self.check(cdb)?;
         Ok(result)
     }
 
     fn execute_read(&self, cdb: &[u8], data: &mut [u8], timeout_ms: u32) -> Result<ScsiResult> {
         self.check(cdb)?;
-        let result = self.inner.execute_read(cdb, data, timeout_ms)?;
+        let result = self
+            .inner
+            .execute_read(cdb, data, timeout_ms)
+            .inspect_err(|error| self.record_error(error))?;
         self.check(cdb)?;
         Ok(result)
     }
 
     fn execute_write(&self, cdb: &[u8], data: &[u8], timeout_ms: u32) -> Result<ScsiResult> {
         self.check(cdb)?;
-        let result = self.inner.execute_write(cdb, data, timeout_ms)?;
+        let result = self
+            .inner
+            .execute_write(cdb, data, timeout_ms)
+            .inspect_err(|error| self.record_error(error))?;
         self.check(cdb)?;
         Ok(result)
     }
@@ -122,6 +158,7 @@ mod tests {
         cancelled: AtomicBool,
         cancel_during_io: bool,
         fail: bool,
+        failure_sense: Option<Vec<u8>>,
     }
     impl Fake {
         fn result(&self) -> Result<ScsiResult> {
@@ -130,11 +167,13 @@ mod tests {
                 self.cancelled.store(true, Ordering::SeqCst);
             }
             if self.fail {
+                let sense = self.failure_sense.as_deref().map(SenseInfo::from_bytes);
                 return Err(TapeError::ScsiCommand {
                     status: 2,
-                    sense_key: 3,
-                    asc: 0x11,
-                    ascq: 0,
+                    sense_key: sense.as_ref().map_or(3, |v| v.sense_key),
+                    asc: sense.as_ref().map_or(0x11, |v| v.asc),
+                    ascq: sense.as_ref().map_or(0, |v| v.ascq),
+                    sense: sense.map(Box::new),
                 });
             }
             Ok(ScsiResult {
@@ -225,6 +264,43 @@ mod tests {
     }
 
     #[test]
+    fn only_complete_current_blank_can_complete_a_read_only_proof() {
+        let mut current = vec![0; 18];
+        current[0] = 0x70;
+        current[2] = 8;
+        current[7] = 10;
+        let mut deferred = current.clone();
+        deferred[0] = 0x71;
+        let mut deferred_descriptor = vec![0; 8];
+        deferred_descriptor[0] = 0x73;
+        deferred_descriptor[1] = 8;
+        for (sense, known) in [
+            (Some(current.clone()), true),
+            (Some(deferred), false),
+            (Some(current[..13].to_vec()), false),
+            (Some(deferred_descriptor), false),
+            (None, false),
+        ] {
+            let fake = Fake {
+                fail: true,
+                failure_sense: sense,
+                ..Fake::default()
+            };
+            let guard = PreformatRead::new(&fake, || Ok(false));
+            assert!(guard.execute_read(&[0x08], &mut [0; 8], 100).is_err());
+            assert_eq!(guard.verify_proof().is_ok(), known);
+            if !known {
+                assert!(guard.execute_no_data(&[0x92], 100).is_err());
+                assert_eq!(
+                    fake.calls.load(Ordering::SeqCst),
+                    1,
+                    "未知结果后禁止继续探测"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn physical_scsi_failure_keeps_its_original_diagnostics() {
         let fake = Fake {
             cancel_during_io: true,
@@ -238,7 +314,8 @@ mod tests {
                 status: 2,
                 sense_key: 3,
                 asc: 0x11,
-                ascq: 0
+                ascq: 0,
+                ..
             })
         ));
         assert_eq!(fake.calls.load(Ordering::SeqCst), 1);

@@ -1067,6 +1067,21 @@ fn format_allowed(
     budget: super::super::fdb_read::ReadStorageBudget,
     force: bool,
 ) -> std::result::Result<(), ReadError> {
+    let checked = cancel::PreformatRead::new(device, || Ok(false));
+    let result = format_allowed_readonly(&checked, spool, budget, force);
+    let proof = checked.verify_proof().map_err(physical);
+    match result {
+        Err(error) => Err(error),
+        Ok(()) => proof,
+    }
+}
+
+fn format_allowed_readonly(
+    device: &dyn TapeTransport,
+    spool: &std::path::Path,
+    budget: super::super::fdb_read::ReadStorageBudget,
+    force: bool,
+) -> std::result::Result<(), ReadError> {
     match probe_format(device).map_err(physical)? {
         FormatProbe::Blank => {
             let drive = TapeDrive::new(device);
@@ -1074,9 +1089,11 @@ fn format_allowed(
             for partition in 0..drive.defined_partitions().map_err(physical)? {
                 drive.locate(partition, 0, true).map_err(physical)?;
                 match drive.read_block(&mut buffer) {
-                    Err(TapeError::ScsiCommand {
-                        sense_key: 0x08, ..
-                    }) => {}
+                    Err(
+                        error @ TapeError::ScsiCommand {
+                            sense_key: 0x08, ..
+                        },
+                    ) if cancel::current_read_error(&error) => {}
                     Err(error) => return Err(physical(error)),
                     Ok(_) => return Err(failed("介质仍有非空分区；销毁须显式 force_format")),
                 }

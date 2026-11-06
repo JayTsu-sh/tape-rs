@@ -538,6 +538,7 @@ impl TapeTransport for FailVci {
                 sense_key: 3,
                 asc: 0x11,
                 ascq: 0,
+                sense: None,
             });
         }
         self.inner.execute_read(cdb, bytes, timeout)

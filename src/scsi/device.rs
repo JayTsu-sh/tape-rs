@@ -161,7 +161,9 @@ impl ScsiDevice {
                 reason: format!("{} 的 SG_IO 结果未定，需要重新打开并恢复", self.path),
             });
         }
-        let mut sense_buf = [0u8; 64];
+        // IBM LTO may return 96 bytes. Keep the full SG u8 length budget so
+        // sense is not truncated before it can be retained in the error.
+        let mut sense_buf = [0u8; u8::MAX as usize];
         let mut hdr = SgIoHdr::new();
 
         let (cmd_len, dxfer_len) = checked_lengths(cdb.len(), dxfer_len)?;
@@ -377,6 +379,7 @@ pub(crate) fn finish_command(
                 sense_key: sense.sense_key,
                 asc: sense.asc,
                 ascq: sense.ascq,
+                sense: Some(Box::new(sense)),
             });
         }
         SCSI_STATUS_CHECK_CONDITION => {
@@ -417,6 +420,34 @@ pub(crate) fn finish_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_error_preserves_current_versus_deferred_diagnostics() {
+        let error = |response| {
+            let mut raw = [0u8; 18];
+            raw[0] = response;
+            raw[2] = 3;
+            raw[7] = 10;
+            raw[12] = 0x11;
+            finish_command(2, SenseInfo::from_bytes(&raw), 0, 1, "test:drive").unwrap_err()
+        };
+        let current = error(0x70);
+        let deferred = error(0x71);
+        assert_ne!(current.to_string(), deferred.to_string());
+        let original = current.sense_info().unwrap().raw_bytes().to_vec();
+        assert_eq!(original.len(), 18);
+        assert_eq!(original[0], 0x70);
+        assert_eq!(
+            current.sense_info().unwrap().current_condition(),
+            Some((3, 0x11, 0))
+        );
+        assert!(deferred.sense_info().unwrap().current_condition().is_none());
+        let wrapped = TapeError::CommitFailed {
+            stage: "写索引".into(),
+            source: Box::new(current),
+        };
+        assert_eq!(wrapped.sense_info().unwrap().raw_bytes(), original);
+    }
 
     #[test]
     fn interrupted_io_waits_for_completion_without_resubmitting() {
