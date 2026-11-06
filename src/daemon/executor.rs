@@ -368,6 +368,8 @@ struct Active {
 /// 中途换届的话新执行者从状态里看到那盘带仍在回收，重新建一份工作现场接着干。
 struct Reclaim {
     barcode: String,
+    /// Physical completion reported; keep the job until TapeReclaimed is applied.
+    completed: bool,
     /// 源带所在驱动器在 `devices` 里的下标
     drive: usize,
     /// 还没处理的路径，从末尾取
@@ -3346,6 +3348,14 @@ fn drive_reclaim(
     status: &SharedStatus,
     tx: &Sender<ExecEvent>,
 ) -> std::result::Result<bool, String> {
+    if let Some(reclaim) = &a.reclaim
+        && reclaim.completed
+    {
+        if !reformatting(status, &reclaim.barcode) {
+            a.reclaim = None;
+        }
+        return Ok(false);
+    }
     if a.reclaim.is_none() {
         let Some(barcode) = pending_reclaim(status) else {
             a.reclaim_given_up = None;
@@ -3465,6 +3475,7 @@ fn start_reclaim(
     );
     a.reclaim = Some(Reclaim {
         barcode: barcode.to_string(),
+        completed: false,
         drive,
         todo,
         retry: Vec::new(),
@@ -3951,6 +3962,7 @@ fn finish_reclaim(
         management::refresh_capacity(dev, &vol, a.round, &source, tx)?;
         vol.label().volume_uuid.to_string()
     };
+    a.reclaim.as_mut().expect("回收进行中").completed = true;
     let _ = tx.send(ExecEvent::Reclaimed {
         round: a.round,
         barcode: source.clone(),
@@ -3958,7 +3970,6 @@ fn finish_reclaim(
         files: copied,
         bytes,
     });
-    a.reclaim = None;
     // 空出驱动器：这盘带现在是池里一盘干净的可写带，下次需要时再装
     unload_reclaim_drive(a, di, &source);
     Ok(true)
