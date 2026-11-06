@@ -37,6 +37,18 @@ mod streamed;
 pub(crate) use streamed::probe_empty_volume;
 #[cfg(feature = "fdb")]
 pub use streamed::{StreamedFullRecovery, capture_full_recovery};
+#[cfg(feature = "fdb")]
+mod source;
+#[cfg(feature = "fdb")]
+pub(crate) use source::verify_recorded_source_constructs;
+#[cfg(feature = "fdb")]
+pub use source::{
+    CapturedIndexSource, IndexSourceScope, capture_index_source, capture_recorded_index_source,
+};
+#[cfg(feature = "fdb")]
+mod identity;
+#[cfg(feature = "fdb")]
+pub use identity::IndexSourceIdentity;
 
 /// 末索引之后区域的分类（协议中的 T0—T4，另加"尚无索引的空数据区"）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -605,7 +617,7 @@ pub fn verify_dp_ip_head(
     label: &LtfsLabel,
     expected: super::volume::CommittedIndexConstruct,
     budget: &RecoveryBudget,
-) -> Result<u64> {
+) -> Result<Option<u64>> {
     verify_dp_ip_head_with_evidence(drive, label, expected, budget).map(|proof| proof.ip_generation)
 }
 
@@ -613,7 +625,7 @@ pub fn verify_dp_ip_head(
 /// catalog evidence before any content is released.
 #[cfg(feature = "fdb")]
 pub(crate) struct VerifiedDpIpHead {
-    pub ip_generation: u64,
+    pub ip_generation: Option<u64>,
     pub predecessors: Vec<super::volume::CommittedIndexConstruct>,
     /// A property of the verified view, never standalone write permission.
     pub empty_unlocked: bool,
@@ -633,6 +645,7 @@ pub(crate) fn verify_dp_ip_head_with_evidence(
         return verify_incremental_dp_ip_head(drive, label, expected, budget);
     }
     let comparison = super::index_equivalence::FullIndexComparison::new(&budget.index_scratch)?;
+    let mut ip_data = false;
     let dp = with_verified_dp_construct(
         drive,
         label,
@@ -642,6 +655,12 @@ pub(crate) fn verify_dp_ip_head_with_evidence(
         true,
         |reader| {
             LtfsIndex::scan_full_reader(std::io::BufReader::new(reader), |entry| {
+                if let super::index::IndexEntry::File { node, .. } = &entry {
+                    ip_data |= node
+                        .extents
+                        .iter()
+                        .any(|extent| extent.partition == label.index_partition);
+                }
                 comparison.record(false, entry)
             })
         },
@@ -660,11 +679,20 @@ pub(crate) fn verify_dp_ip_head_with_evidence(
     let ip = scan_ip_not_ahead(drive, label, expected.generation, budget, |entry| {
         comparison.record(true, entry)
     })?;
-    comparison.validate_highest_uid(true, ip.highest_file_uid)?;
-    if ip.generation == expected.generation {
+    if ip.is_none() && ip_data {
+        return Err(TapeError::RecoveryRestricted {
+            reason: "DP 仍引用 IP 数据，空 IP 构造不能作为维护债务接纳".into(),
+        });
+    }
+    if let Some(ip) = &ip {
+        comparison.validate_highest_uid(true, ip.highest_file_uid)?;
+    }
+    if let Some(ip) = &ip
+        && ip.generation == expected.generation
+    {
         if ip.previous_location != Some(dp.self_location)
             || ip.previous_incremental_location.is_some()
-            || !same_streamed_logical_header(&dp, &ip)
+            || !same_streamed_logical_header(&dp, ip)
         {
             return Err(TapeError::RecoveryRestricted {
                 reason: "同代 DP/IP Full 索引头或根目录属性不一致".into(),
@@ -673,7 +701,7 @@ pub(crate) fn verify_dp_ip_head_with_evidence(
         comparison.require_equal()?;
     }
     Ok(VerifiedDpIpHead {
-        ip_generation: ip.generation,
+        ip_generation: ip.map(|index| index.generation),
         predecessors: Vec::new(),
         empty_unlocked: comparison.empty_dp()?
             && dp
@@ -690,7 +718,8 @@ fn verify_incremental_dp_ip_head(
     expected: super::volume::CommittedIndexConstruct,
     budget: &RecoveryBudget,
 ) -> Result<VerifiedDpIpHead> {
-    let replay = super::index_replay::IndexReplay::new(&budget.index_scratch)?;
+    let replay =
+        super::index_replay::IndexReplay::new(&budget.index_scratch, label.index_partition)?;
     let head = with_verified_dp_construct(
         drive,
         label,
@@ -714,6 +743,65 @@ fn verify_incremental_dp_ip_head(
     if head.generation != expected.generation || head.self_location != expected.location {
         return Err(TapeError::Ltfs("DP 增量索引身份与 FDB 记录不符".into()));
     }
+    verify_incremental_replay(drive, label, expected, budget, &replay, head).map(|(proof, _)| proof)
+}
+
+#[cfg(feature = "fdb")]
+fn verify_incremental_replay(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    expected: super::volume::CommittedIndexConstruct,
+    budget: &RecoveryBudget,
+    replay: &super::index_replay::IndexReplay,
+    head: LtfsIndex,
+) -> Result<(VerifiedDpIpHead, LtfsIndex)> {
+    let (predecessors, view) = replay_captured_chain(drive, label, budget, replay, head)?;
+    let ip = scan_ip_not_ahead(drive, label, expected.generation, budget, |entry| {
+        replay.record_ip(entry)
+    })?;
+    if ip.is_none() && replay.references_index_partition() {
+        return Err(TapeError::RecoveryRestricted {
+            reason: "DP 重放来源引用 IP 数据，空 IP 构造不能作为维护债务接纳".into(),
+        });
+    }
+    if let Some(ip) = &ip {
+        replay.validate(true, ip.highest_file_uid)?;
+    }
+    if let Some(ip) = &ip
+        && ip.generation == expected.generation
+    {
+        if ip.previous_location != view.previous_location
+            || ip.previous_incremental_location != Some(view.self_location)
+            || !same_streamed_logical_header(&view, ip)
+        {
+            return Err(TapeError::RecoveryRestricted {
+                reason: "同代 DP 增量重放与 IP Full 索引头或根目录不一致".into(),
+            });
+        }
+        replay.require_equal()?;
+    }
+    Ok((
+        VerifiedDpIpHead {
+            ip_generation: ip.map(|index| index.generation),
+            predecessors,
+            empty_unlocked: replay.empty_dp()?
+                && view
+                    .volume_lock_state
+                    .as_deref()
+                    .is_none_or(|s| s == "unlocked"),
+        },
+        view,
+    ))
+}
+
+#[cfg(feature = "fdb")]
+fn replay_captured_chain(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    budget: &RecoveryBudget,
+    replay: &super::index_replay::IndexReplay,
+    head: LtfsIndex,
+) -> Result<(Vec<super::volume::CommittedIndexConstruct>, LtfsIndex)> {
     let mut chain = vec![head];
     let mut predecessors = Vec::new();
     while chain.last().unwrap().incremental {
@@ -776,30 +864,7 @@ fn verify_incremental_dp_ip_head(
         view = view.apply_incremental(&chain[id])?;
         replay.apply_delta(id as u32, view.highest_file_uid)?;
     }
-    let ip = scan_ip_not_ahead(drive, label, expected.generation, budget, |entry| {
-        replay.record_ip(entry)
-    })?;
-    replay.validate(true, ip.highest_file_uid)?;
-    if ip.generation == expected.generation {
-        if ip.previous_location != view.previous_location
-            || ip.previous_incremental_location != Some(view.self_location)
-            || !same_streamed_logical_header(&view, &ip)
-        {
-            return Err(TapeError::RecoveryRestricted {
-                reason: "同代 DP 增量重放与 IP Full 索引头或根目录不一致".into(),
-            });
-        }
-        replay.require_equal()?;
-    }
-    Ok(VerifiedDpIpHead {
-        ip_generation: ip.generation,
-        predecessors,
-        empty_unlocked: replay.empty_dp()?
-            && view
-                .volume_lock_state
-                .as_deref()
-                .is_none_or(|s| s == "unlocked"),
-    })
+    Ok((predecessors, view))
 }
 
 // Physical back pointers have different roles: a DP Full may retain the
@@ -823,14 +888,17 @@ fn same_streamed_logical_header(a: &LtfsIndex, b: &LtfsIndex) -> bool {
 
 /// Check IP generation and construct boundaries only. Content-serving callers
 /// must use `verify_dp_ip_head` for equal-generation logical view validation.
+/// `None` reports only the exact empty IP opening construct. It does not prove
+/// any DP construct or authorize content access by itself.
 #[cfg(feature = "fdb")]
 pub fn verify_ip_not_ahead(
     drive: &TapeDrive<'_>,
     label: &LtfsLabel,
     dp_generation: u64,
     budget: &RecoveryBudget,
-) -> Result<u64> {
-    scan_ip_not_ahead(drive, label, dp_generation, budget, |_| Ok(())).map(|index| index.generation)
+) -> Result<Option<u64>> {
+    scan_ip_not_ahead(drive, label, dp_generation, budget, |_| Ok(()))
+        .map(|index| index.map(|index| index.generation))
 }
 
 #[cfg(feature = "fdb")]
@@ -840,7 +908,7 @@ fn scan_ip_not_ahead(
     dp_generation: u64,
     budget: &RecoveryBudget,
     emit: impl FnMut(super::index::IndexEntry) -> Result<()>,
-) -> Result<LtfsIndex> {
+) -> Result<Option<LtfsIndex>> {
     drive.locate_eod(0)?;
     let eod = drive.read_position()?;
     if eod.partition != 0 {
@@ -857,6 +925,15 @@ fn scan_ip_not_ahead(
     let start = start_mark
         .checked_add(1)
         .ok_or_else(|| TapeError::Ltfs("IP 索引起始块溢出".into()))?;
+    // IP rewrite writes the opening FM before its first XML record. The
+    // exact empty construct has no IP data and no complete newer IP index.
+    // Every other malformed/truncated shape remains an error.
+    if start_mark == P1_DATA_START - 1
+        && end_mark == P1_DATA_START
+        && eod.block_number == P1_DATA_START + 1
+    {
+        return Ok(None);
+    }
     if start >= end_mark {
         return Err(TapeError::RecoveryRestricted {
             reason: "IP 末索引缺少数据记录".into(),
@@ -894,7 +971,7 @@ fn scan_ip_not_ahead(
             ),
         });
     }
-    Ok(index)
+    Ok(Some(index))
 }
 
 /// Stream a catalog-recorded Full DP construct without retaining its XML or
@@ -1246,7 +1323,8 @@ fn classify_tail(
 // ---------- 回指链 ----------
 
 // EE/LE Recovery 会把同一代 Full 追加为新构造，creator/物理位置和回指改变，
-// 逻辑视图不变。只接受完整可解释、所有节点字段完全相同的 Full 副本。
+// EE 还会重写 schema 版本、显式 unlocked 和 xattr 的 XML 编码。
+// 只比较已知 Full schema 的逻辑值；节点内容和所有权不能变化。
 fn same_full_view(a: &LtfsIndex, b: &LtfsIndex) -> bool {
     !a.incremental
         && !b.incremental
@@ -1254,14 +1332,57 @@ fn same_full_view(a: &LtfsIndex, b: &LtfsIndex) -> bool {
         && b.unknown_elements.is_empty()
         && a.volume_uuid == b.volume_uuid
         && a.generation == b.generation
-        && a.version == b.version
+        && (a.version == b.version
+            || (["2.4.0", "2.5.0", "2.5.1"].contains(&a.version.as_str())
+                && ["2.4.0", "2.5.0", "2.5.1"].contains(&b.version.as_str())))
         && a.update_time == b.update_time
         && a.allow_policy_update == b.allow_policy_update
         && a.highest_file_uid == b.highest_file_uid
-        && a.volume_lock_state == b.volume_lock_state
-        && a.previous_incremental_location == b.previous_incremental_location
+        && a.volume_lock_state.as_deref().unwrap_or("unlocked")
+            == b.volume_lock_state.as_deref().unwrap_or("unlocked")
         && a.comment == b.comment
-        && a.root == b.root
+        && same_directory_view(&a.root, &b.root)
+}
+
+fn same_directory_view(a: &super::index::DirectoryNode, b: &super::index::DirectoryNode) -> bool {
+    use super::index::canonical_xattrs;
+    let same_attrs = |a: &[super::index::Xattr], b: &[super::index::Xattr]| match (
+        canonical_xattrs(a),
+        canonical_xattrs(b),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if a.name != b.name
+        || a.meta != b.meta
+        || a.delta_fields != b.delta_fields
+        || !same_attrs(&a.xattrs, &b.xattrs)
+        || a.files.len() != b.files.len()
+        || a.subdirs.len() != b.subdirs.len()
+    {
+        return false;
+    }
+    let mut af: Vec<_> = a.files.iter().collect();
+    let mut bf: Vec<_> = b.files.iter().collect();
+    af.sort_by_key(|f| &f.name);
+    bf.sort_by_key(|f| &f.name);
+    if !af.iter().zip(bf).all(|(a, b)| {
+        a.name == b.name
+            && a.meta == b.meta
+            && a.length == b.length
+            && a.extents == b.extents
+            && a.symlink == b.symlink
+            && a.open_for_write == b.open_for_write
+            && a.delta_fields == b.delta_fields
+            && same_attrs(&a.xattrs, &b.xattrs)
+    }) {
+        return false;
+    }
+    let mut ad: Vec<_> = a.subdirs.iter().collect();
+    let mut bd: Vec<_> = b.subdirs.iter().collect();
+    ad.sort_by_key(|d| &d.name);
+    bd.sort_by_key(|d| &d.name);
+    ad.iter().zip(bd).all(|(a, b)| same_directory_view(a, b))
 }
 
 /// 沿 `previousgenerationlocation` 核验 DP 链。返回 (是否通过, 深度, 是否因预算截断)。

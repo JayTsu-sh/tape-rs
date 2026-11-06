@@ -189,8 +189,8 @@ fn nonforce_single_large_attribute_and_xml_depth_are_resource_limits() {
     );
     let xml = format!(
         "<ltfsindex>{}{}</ltfsindex>",
-        "<directory>".repeat(513),
-        "</directory>".repeat(513)
+        "<directory>".repeat(2059),
+        "</directory>".repeat(2059)
     );
     assert!(matches!(
         LtfsIndex::scan_any_reader_to_disk(xml.as_bytes(), |_| Ok(())),

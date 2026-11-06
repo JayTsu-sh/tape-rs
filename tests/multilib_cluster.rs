@@ -108,6 +108,40 @@ fn exchange(address: &str, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u
     }
 }
 
+fn service_addresses() -> (HashMap<u64, String>, HashMap<u64, TcpListener>) {
+    let mut addresses = HashMap::new();
+    let mut reserved = HashMap::new();
+    for id in 1..=3 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        addresses.insert(id, listener.local_addr().unwrap().to_string());
+        reserved.insert(id, listener);
+    }
+    (addresses, reserved)
+}
+
+#[test]
+fn service_addresses_keep_both_http_and_s3_reservations_until_handoff() {
+    let (http, mut http_reserved) = service_addresses();
+    let (s3, mut s3_reserved) = service_addresses();
+    // Simulate another planned service/process trying to claim a selected port.
+    // With a retained lease it cannot; with the old released probe it can.
+    let competitor = TcpListener::bind(&s3[&1]).ok();
+    drop(s3_reserved.remove(&1));
+    let live =
+        TcpListener::bind(&s3[&1]).expect("service lost its reserved address before startup");
+    assert!(competitor.is_none());
+    for address in http.values().chain(
+        s3.iter()
+            .filter(|(id, _)| **id != 1)
+            .map(|(_, address)| address),
+    ) {
+        assert!(TcpListener::bind(address).is_err());
+    }
+    drop(live);
+    drop(http_reserved.remove(&1));
+    assert!(TcpListener::bind(&http[&1]).is_ok());
+}
+
 #[test]
 fn one_cluster_two_owners_and_fixed_http_entry_preserve_library_isolation() {
     let root = std::env::temp_dir().join(format!("tape-multilib-{}", uuid::Uuid::new_v4()));
@@ -121,11 +155,7 @@ fn one_cluster_two_owners_and_fixed_http_entry_preserve_library_isolation() {
         receivers.insert(id, rx);
     }
     let peers = Arc::new(senders);
-    let mut addresses = HashMap::new();
-    for id in 1..=3 {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        addresses.insert(id, listener.local_addr().unwrap().to_string());
-    }
+    let (addresses, mut http_reserved) = service_addresses();
     let libs: BTreeMap<_, _> = ["55L3A7802K19LL01", "55L3A78011W9LL01"]
         .into_iter()
         .map(|id| {
@@ -136,15 +166,7 @@ fn one_cluster_two_owners_and_fixed_http_entry_preserve_library_isolation() {
             (id, lib)
         })
         .collect();
-    let s3_listeners: Vec<_> = (0..3)
-        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    let s3_addresses: HashMap<_, _> = s3_listeners
-        .iter()
-        .enumerate()
-        .map(|(n, l)| (n as u64 + 1, l.local_addr().unwrap().to_string()))
-        .collect();
-    drop(s3_listeners);
+    let (s3_addresses, mut s3_reserved) = service_addresses();
     let mut statuses = HashMap::<(u64, String), SharedStatus>::new();
     let mut flags = HashMap::new();
     let mut joins = Vec::new();
@@ -247,6 +269,7 @@ fn one_cluster_two_owners_and_fixed_http_entry_preserve_library_isolation() {
             });
         }
         let gateway = contexts.remove(GATEWAY).unwrap();
+        drop(s3_reserved.remove(&id));
         tape_rs::daemon::s3::serve(
             &s3_addresses[&id],
             contexts.clone(),
@@ -254,6 +277,7 @@ fn one_cluster_two_owners_and_fixed_http_entry_preserve_library_isolation() {
             s3_addresses.clone(),
         )
         .unwrap();
+        drop(http_reserved.remove(&id));
         gateway::serve(
             &addresses[&id],
             config.clone(),
@@ -322,8 +346,9 @@ fn one_cluster_two_owners_and_fixed_http_entry_preserve_library_isolation() {
             .map(|e| e.node)
     };
     wait(|| {
-        owner("55L3A7802K19LL01") == Some(3)
-            && owner("55L3A78011W9LL01") == Some(3)
+        owner("55L3A7802K19LL01").is_some()
+            && owner("55L3A78011W9LL01").is_some()
+            && owner("55L3A7802K19LL01") != owner("55L3A78011W9LL01")
             && owner(GATEWAY) == Some(3)
     });
     // ExecutorReady 先于后续 Serving ReadIndex 许可，等待实际可服务状态。
@@ -420,12 +445,59 @@ fn one_cluster_two_owners_and_fixed_http_entry_preserve_library_isolation() {
             });
         }
     }
-    for name in ["55L3A7802K19LL01", "55L3A78011W9LL01"] {
-        flags[&(3, name)].store(false, Ordering::SeqCst);
+    // 故障时允许两库共用唯一健康节点；这必须是真实设备 owner，原提交数据仍可读。
+    for id in [2, 3] {
+        for name in ["55L3A7802K19LL01", "55L3A78011W9LL01"] {
+            flags[&(id, name)].store(false, Ordering::SeqCst);
+        }
+    }
+    wait(|| owner("55L3A7802K19LL01") == Some(1) && owner("55L3A78011W9LL01") == Some(1));
+    for (name, data) in [
+        ("55L3A7802K19LL01", b"library A".as_slice()),
+        ("55L3A78011W9LL01", b"library B".as_slice()),
+    ] {
+        wait(|| {
+            exchange(
+                endpoint,
+                "GET",
+                &format!("/libraries/{name}/files/same"),
+                &[],
+            ) == (200, data.to_vec())
+        });
+    }
+    // B 的第二条健康通路恢复后，经过稳定期重新分散；A 仍只有节点 1 可用。
+    flags[&(2, "55L3A78011W9LL01")].store(true, Ordering::SeqCst);
+    wait(|| owner("55L3A7802K19LL01") == Some(1) && owner("55L3A78011W9LL01") == Some(2));
+    let balanced_rounds: Vec<_> = ["55L3A7802K19LL01", "55L3A78011W9LL01"]
+        .into_iter()
+        .map(|name| {
+            statuses[&(3, name.into())]
+                .lock()
+                .unwrap()
+                .executor
+                .as_ref()
+                .unwrap()
+                .round
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(250));
+    for (name, round) in ["55L3A7802K19LL01", "55L3A78011W9LL01"]
+        .into_iter()
+        .zip(balanced_rounds)
+    {
+        assert_eq!(
+            statuses[&(3, name.into())]
+                .lock()
+                .unwrap()
+                .executor
+                .as_ref()
+                .unwrap()
+                .round,
+            round,
+            "均衡后的健康 owner 不应反复接管"
+        );
     }
     flags[&(1, "55L3A78011W9LL01")].store(false, Ordering::SeqCst);
-    flags[&(2, "55L3A7802K19LL01")].store(false, Ordering::SeqCst);
-    wait(|| owner("55L3A7802K19LL01") == Some(1) && owner("55L3A78011W9LL01") == Some(2));
     // 同名、同 UUID 池投影为不同 bucket；固定节点 3 的 S3 入口分别转发到 owner 1/2。
     let mut s3_buckets = Vec::new();
     for (library, data) in [

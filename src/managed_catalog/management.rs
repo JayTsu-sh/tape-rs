@@ -15,6 +15,73 @@ pub(super) mod moves;
 #[path = "management_assign.rs"]
 pub(super) mod assigns;
 
+#[path = "management_extensions.rs"]
+mod extensions;
+
+pub(super) async fn retained(
+    tr: &Transaction,
+    request: &ManagementRequest,
+) -> Result<RequestWindow> {
+    let window = window(tr, request.namespace()).await?;
+    require_retained(window, request.epoch(), request.operation())?;
+    Ok(window)
+}
+pub(super) async fn task_for_identity(
+    tr: &Transaction,
+    serial: &str,
+    ns: Uuid,
+    epoch: u64,
+    operation: Uuid,
+) -> Result<(ManagementRequest, Value)> {
+    let value = read_task_at(tr, ns, serial, epoch, operation)
+        .await?
+        .ok_or(CatalogError::Invalid("管理请求不存在"))?;
+    let request = ManagementRequest::parse(value["request"].clone())?;
+    Ok((request, value))
+}
+pub(super) async fn read_task(
+    tr: &Transaction,
+    serial: &str,
+    request: &ManagementRequest,
+) -> Result<Value> {
+    let (original, value) = task_for_identity(
+        tr,
+        serial,
+        request.namespace(),
+        request.epoch(),
+        request.operation(),
+    )
+    .await?;
+    if original.value() != request.value() {
+        return Err(CatalogError::Corrupt("介质回执原请求不符"));
+    }
+    Ok(value)
+}
+pub(super) fn clear_queued(tr: &Transaction, request: &ManagementRequest) {
+    let serial = request.value()["library"]
+        .as_str()
+        .expect("validated library");
+    tr.clear(&identity_key(
+        request.namespace(),
+        serial,
+        b'q',
+        request.epoch(),
+        request.operation(),
+    ));
+}
+async fn project_progress(tr: &Transaction, value: &mut Value) -> Result<()> {
+    if matches!(
+        value["request"]["change"]["kind"].as_str(),
+        Some("media-import" | "media-unassign" | "media-validate" | "media-online")
+    ) {
+        let progress = super::native_media::task_progress(tr, value).await?;
+        if !progress.is_null() {
+            value["progress"] = progress;
+        }
+    }
+    Ok(())
+}
+
 const MAX_QUEUED: usize = 100;
 
 pub(crate) fn prefix(namespace: Uuid, kind: u8) -> Vec<u8> {
@@ -43,7 +110,7 @@ pub(crate) fn initialize(tr: &Transaction, namespace: Uuid) {
         }),
     );
 }
-async fn window(tr: &Transaction, namespace: Uuid) -> Result<RequestWindow> {
+pub(super) async fn window(tr: &Transaction, namespace: Uuid) -> Result<RequestWindow> {
     let raw = tr
         .get(&prefix(namespace, b'w'), false)
         .await?
@@ -56,13 +123,13 @@ fn require_retained(window: RequestWindow, epoch: u64, operation: Uuid) -> Resul
     }
     Ok(())
 }
-fn now() -> u64 {
+pub(super) fn now() -> u64 {
     chrono::Utc::now().timestamp_millis() as u64
 }
 fn encode(value: &Value) -> Vec<u8> {
     value.to_string().into_bytes()
 }
-fn device_kind(kind: &str) -> bool {
+pub(super) fn device_kind(kind: &str) -> bool {
     matches!(
         kind,
         "library-rescan"
@@ -179,7 +246,7 @@ async fn require_queue(
     }
     Ok(())
 }
-async fn read_task(
+pub(super) async fn read_task_at(
     tr: &Transaction,
     ns: Uuid,
     serial: &str,
@@ -232,7 +299,7 @@ fn task_event_view(value: &Value) -> Value {
     } else {
         &change["pool"]
     };
-    let mut view = json!({"task_id":format!("{}:{}:{}:{}",value["namespace"].as_str().expect("validated namespace"),value["library_serial"].as_str().expect("validated library"),value["epoch"].as_u64().expect("validated epoch"),value["operation"].as_str().expect("validated operation")),"kind":change["kind"],"pool":pool,"barcode":change["barcode"],"status":value["status"]});
+    let mut view = json!({"task_id":crate::management_task_id::ManagementTaskId::from_receipt(value).expect("validated task identity").to_string(),"kind":change["kind"],"pool":pool,"barcode":change["barcode"],"status":value["status"]});
     if matches!(change["kind"].as_str(), Some("media-move" | "media-assign")) {
         view["execution"] = if value["execution"].is_null() {
             Value::Null
@@ -242,7 +309,11 @@ fn task_event_view(value: &Value) -> Value {
     }
     view
 }
-async fn write_task(tr: &Transaction, request: &ManagementRequest, value: &Value) -> Result<()> {
+pub(super) async fn write_task(
+    tr: &Transaction,
+    request: &ManagementRequest,
+    value: &Value,
+) -> Result<()> {
     let serial = request.value()["library"]
         .as_str()
         .expect("validated library");
@@ -326,7 +397,7 @@ impl ManagedCatalog {
             routing::require_runtime_active_owner(&tr,serial,route,owner).await?;
             let ns=request.namespace();
             let w=window(&tr,ns).await?;
-            if let Some(saved)=read_task(&tr,ns,serial,request.epoch(),request.operation()).await? {
+            if let Some(saved)=read_task_at(&tr,ns,serial,request.epoch(),request.operation()).await? {
                 if saved["fingerprint"]!=request.fingerprint() {return Err(CatalogError::Invalid("管理请求身份已由不同参数使用"));}
                 return Ok(saved);
             }
@@ -358,9 +429,22 @@ impl ManagedCatalog {
                     async {
                         routing::require_runtime_active_owner(&tr, serial, route, owner).await?;
                         let ns = route.route.namespace;
-                        let mut value = read_task(&tr, ns, serial, epoch, operation)
+                        let mut value = read_task_at(&tr, ns, serial, epoch, operation)
                             .await?
                             .ok_or(CatalogError::Invalid("管理请求不存在"))?;
+                        if value["status"] == "running"
+                            && matches!(
+                                value["request"]["change"]["kind"].as_str(),
+                                Some(
+                                    "media-import"
+                                        | "media-unassign"
+                                        | "media-validate"
+                                        | "media-online"
+                                )
+                            )
+                        {
+                            return extensions::cancel_running(&tr, serial, route, &value).await;
+                        }
                         if value["status"] == "running" {
                             return Err(CatalogError::Invalid(
                                 "执行中任务须由对应设备执行器安全取消",
@@ -394,7 +478,11 @@ impl ManagedCatalog {
     ) -> Result<Option<Value>> {
         let tr = self.db.create_trx()?;
         let ns = routing::require_expected_active_namespace(&tr, serial, Some(route)).await?;
-        read_task(&tr, ns, serial, epoch, operation).await
+        let mut value = read_task_at(&tr, ns, serial, epoch, operation).await?;
+        if let Some(value) = value.as_mut() {
+            project_progress(&tr, value).await?;
+        }
+        Ok(value)
     }
     pub async fn list_management_tasks(
         &self,
@@ -423,7 +511,7 @@ impl ManagedCatalog {
             let operation = uuid_from(&key[prefix.len() + 8..])?;
             require_retained(w, epoch, operation)
                 .map_err(|_| CatalogError::Corrupt("管理记录代次无效"))?;
-            let value = task(&raw, serial, ns, epoch, operation)?;
+            let mut value = task(&raw, serial, ns, epoch, operation)?;
             require_queue(&tr, ns, serial, epoch, operation, &value).await?;
             notifications::require_changed_at(
                 &tr,
@@ -434,6 +522,7 @@ impl ManagedCatalog {
                 Some(&task_event_view(&value)),
             )
             .await?;
+            project_progress(&tr, &mut value).await?;
             items.push(value);
         }
         Ok(Page {
@@ -469,7 +558,7 @@ impl ManagedCatalog {
         }
         let epoch = read_u64(&key[prefix.len()..prefix.len() + 8]);
         let operation = uuid_from(&key[prefix.len() + 8..])?;
-        read_task(&tr, ns, serial, epoch, operation)
+        read_task_at(&tr, ns, serial, epoch, operation)
             .await?
             .ok_or(CatalogError::Corrupt("管理队列存在孤立请求"))?;
         Ok(Some((epoch, operation)))

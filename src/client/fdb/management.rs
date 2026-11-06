@@ -11,6 +11,9 @@ const NS: &str = "x-tapers-catalog-namespace";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum ManagementIntent {
+    Native {
+        change: Value,
+    },
     LibraryRescan,
     TapeAssign {
         barcode: String,
@@ -36,7 +39,7 @@ pub enum ManagementIntent {
         selector: String,
     },
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagementRequestFile {
     version: u8,
@@ -110,7 +113,7 @@ fn patch(attribute: &str, value: &str) -> Result<Value> {
     };
     Ok(json!({attribute:value}))
 }
-fn defaults() -> Value {
+pub(super) fn defaults() -> Value {
     json!({"media_restriction":"none","mount_limit":0,"low_space_warning_enabled":true,"low_space_warning_threshold":0,"no_space_warning_enabled":true})
 }
 pub(super) fn parsed(response: Response, statuses: &[u16]) -> Result<Value> {
@@ -152,6 +155,16 @@ impl ManagementRequestFile {
             return Err(invalid("管理请求文件版本或校验不符"));
         }
         let expected = match &self.input {
+            ManagementIntent::Native { change } => {
+                native::PreparedManagement::parse(self.request.clone())?;
+                if &self.request["change"] != change
+                    || self.request["library"] != self.library
+                    || self.request["namespace"] != self.namespace
+                {
+                    return Err(invalid("管理请求作用域或原变更不符"));
+                }
+                self.request.clone()
+            }
             ManagementIntent::TapeAssign {
                 barcode,
                 pool_selector,
@@ -375,7 +388,13 @@ impl FdbClient {
         namespace: &str,
         after: Option<&str>,
     ) -> Result<Value> {
-        self.metadata_page(library, namespace, "tasks", after)
+        let value = self.metadata_page(library, namespace, "tasks", after)?;
+        for record in value["items"].as_array().expect("validated page") {
+            scope(record, library, namespace)?;
+            let request = PreparedManagement::parse(record["request"].clone())?;
+            native::verify_task_for_request(request.value(), record)?;
+        }
+        Ok(value)
     }
     fn metadata_page(
         &self,
@@ -430,6 +449,9 @@ impl FdbClient {
     ) -> Result<ManagementRequestFile> {
         // Validate command parameters before contacting the server.
         match &input {
+            ManagementIntent::Native { .. } => {
+                return Err(invalid("原生变更请使用prepare_control固定请求"));
+            }
             ManagementIntent::LibraryRescan => {}
             ManagementIntent::TapeAssign {
                 barcode,
@@ -464,6 +486,7 @@ impl FdbClient {
             .expect("validated namespace")
             .to_owned();
         let request = match &input {
+            ManagementIntent::Native { .. } => unreachable!("checked before HTTP"),
             ManagementIntent::TapeAssign {
                 barcode,
                 pool_selector,
@@ -547,6 +570,11 @@ impl FdbClient {
         )?
         .sync_all()?;
         let (method, route, statuses) = match &p.input {
+            ManagementIntent::Native { .. } => (
+                "POST",
+                format!("{}/requests", base(&p.library)?),
+                vec![200, 202],
+            ),
             ManagementIntent::TapeAssign { barcode, .. } => (
                 "POST",
                 format!(
@@ -616,8 +644,12 @@ impl FdbClient {
             if matches!(p.input, ManagementIntent::Create { .. }) {
                 scope(&value, &p.library, &p.namespace)?;
                 check_pool(&value["pool"], &p.library)?;
-                if value["pool"]["id"] != p.request["id"] {
-                    return Err(ClientError::Verification("创建回执UUID不符".into()));
+                for field in ["id", "name", "file_limit", "created_at_millis", "policy"] {
+                    if value["pool"][field] != p.request[field] {
+                        return Err(ClientError::Verification(format!(
+                            "池创建回执{field}与原请求不符"
+                        )));
+                    }
                 }
             } else {
                 check_task(&value, &p)?;
@@ -672,31 +704,73 @@ impl FdbClient {
     }
 }
 pub(super) fn check_pool(p: &Value, library: &str) -> Result<()> {
-    uuid(p["id"].as_str().ok_or_else(|| invalid("池回执缺少UUID"))?)?;
-    if p["library_serial"] != library
-        || !p["name"].as_str().is_some_and(name)
-        || !p["revision"].as_u64().is_some_and(|n| n > 0)
-        || !p["file_limit"].as_u64().is_some_and(|n| n > 0)
-    {
-        return Err(ClientError::Verification("池回执身份或修订号无效".into()));
-    }
-    Ok(())
+    super::pools::verify_pool(p, library).map(|_| ())
 }
+
 fn check_task(task: &Value, p: &ManagementRequestFile) -> Result<()> {
-    scope(task, &p.library, &p.namespace)?;
-    if task["epoch"] != p.request["epoch"]
-        || task["operation"] != p.request["operation"]
-        || task["request"] != p.request
-        || !matches!(
-            task["status"].as_str(),
-            Some("queued" | "running" | "succeeded" | "failed" | "cancelled")
-        )
-    {
-        return Err(ClientError::Indeterminate(
-            "任务回执与原请求不符，请保留请求文件".into(),
-        ));
+    native::verify_task_for_request(&p.request, task)
+}
+
+impl FdbClient {
+    pub fn management_task_by_id(
+        &self,
+        id: &crate::management_task_id::ManagementTaskId,
+    ) -> Result<Option<Value>> {
+        self.management_task_id_request(id, false)
     }
-    Ok(())
+    pub fn cancel_management_task_by_id(
+        &self,
+        id: &crate::management_task_id::ManagementTaskId,
+    ) -> Result<Option<Value>> {
+        self.management_task_id_request(id, true)
+    }
+    fn management_task_id_request(
+        &self,
+        id: &crate::management_task_id::ManagementTaskId,
+        cancel: bool,
+    ) -> Result<Option<Value>> {
+        let route = format!(
+            "{}/tasks/{}/{}{}",
+            base(&id.library)?,
+            id.epoch,
+            id.operation,
+            if cancel { "/cancel" } else { "" }
+        );
+        let response = self.retry_request(
+            if cancel { "POST" } else { "GET" },
+            &route,
+            if cancel { Some(b"{}".as_slice()) } else { None },
+            &[(NS, &id.namespace.to_string())],
+        );
+        let response = response.map_err(|error| {
+            if cancel {
+                ClientError::Indeterminate(error.to_string())
+            } else {
+                error
+            }
+        })?;
+        if response.status == 404 {
+            return Ok(None);
+        }
+        let value = parsed(response, &[200])?;
+        let verify = (|| {
+            if crate::management_task_id::ManagementTaskId::from_receipt(&value).map_err(invalid)?
+                != *id
+            {
+                return Err(ClientError::Verification("任务回执与完整任务号不符".into()));
+            }
+            let request = PreparedManagement::parse(value["request"].clone())?;
+            native::verify_task_for_request(request.value(), &value)
+        })();
+        verify.map_err(|error| {
+            if cancel {
+                ClientError::Indeterminate(error.to_string())
+            } else {
+                error
+            }
+        })?;
+        Ok(Some(value))
+    }
 }
 
 #[cfg(test)]
@@ -716,6 +790,17 @@ mod tests {
         };
         p.fingerprint = p.digest();
         p
+    }
+    fn queued(p: &ManagementRequestFile) -> Value {
+        use sha2::{Digest, Sha256};
+        let mut value = json!({"version":1,"library_serial":p.library,"namespace":p.namespace,"epoch":p.request["epoch"],"operation":p.request["operation"],"request":p.request,"fingerprint":format!("{:x}",Sha256::digest(p.request.to_string().as_bytes())),"status":"queued","owner_epoch":0,"created_at_millis":1,"completed_at_millis":null,"result":null});
+        if matches!(
+            p.request["change"]["kind"].as_str(),
+            Some("media-assign" | "media-move")
+        ) {
+            value["execution"] = Value::Null;
+        }
+        value
     }
     fn dir() -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!("tapers-pool-client-{}", Uuid::new_v4()));
@@ -738,7 +823,7 @@ mod tests {
         let path = root.join("assign.json");
         p.save_new(&path).unwrap();
         let bytes = std::fs::read(&path).unwrap();
-        let receipt = json!({"library_serial":p.library,"namespace":p.namespace,"epoch":1,"operation":p.request["operation"],"request":p.request,"status":"queued"});
+        let receipt = queued(&p);
         let (address, worker) = server(response(202, &receipt.to_string()), Duration::ZERO);
         assert_eq!(
             FdbClient::new([address])
@@ -773,7 +858,7 @@ mod tests {
         let path = dir.join("rescan.json");
         p.save_new(&path).unwrap();
         let bytes = std::fs::read(&path).unwrap();
-        let receipt = json!({"library_serial":p.library,"namespace":p.namespace,"epoch":1,"operation":p.request["operation"],"request":p.request,"status":"queued"});
+        let receipt = queued(&p);
         let (address, worker) = server(response(202, &receipt.to_string()), Duration::ZERO);
         let task = FdbClient::new([address])
             .unwrap()
@@ -785,7 +870,20 @@ mod tests {
                 .unwrap()
                 .starts_with("POST /libraries/LIB%20%E4%B8%AD%E6%96%87/admin/library/rescan ")
         );
-        for body in ["null".to_owned(), json!({"status":"succeeded"}).to_string()] {
+        let mut malformed = vec!["null".to_owned(), json!({"status":"succeeded"}).to_string()];
+        for (field, bad) in [
+            ("fingerprint", json!("0".repeat(64))),
+            ("created_at_millis", json!(0)),
+            ("owner_epoch", json!(5)),
+            ("result", json!({})),
+            ("extra", json!(true)),
+            ("execution", json!({"phase":"confirmed"})),
+        ] {
+            let mut value = receipt.clone();
+            value[field] = bad;
+            malformed.push(value.to_string());
+        }
+        for body in malformed {
             let (address, worker) = server(response(202, &body), Duration::ZERO);
             assert!(matches!(
                 FdbClient::new([address]).unwrap().submit_management(&path),
@@ -816,7 +914,7 @@ mod tests {
         let path = dir.join("move.json");
         p.save_new(&path).unwrap();
         let bytes = std::fs::read(&path).unwrap();
-        let receipt = json!({"library_serial":p.library,"namespace":p.namespace,"epoch":1,"operation":p.request["operation"],"request":p.request,"status":"queued","execution":null});
+        let receipt = queued(&p);
         let (address, worker) = server(response(202, &receipt.to_string()), Duration::ZERO);
         assert_eq!(
             FdbClient::new([address])
@@ -918,13 +1016,55 @@ mod tests {
         assert!(patch("nodegroup", "all").is_err());
     }
     #[test]
+    fn create_receipt_must_match_original_fields_and_time_without_changing_checkpoint() {
+        use super::super::tests::{response, server};
+        for field in [
+            "created_at_millis",
+            "created_at",
+            "name",
+            "file_limit",
+            "policy",
+        ] {
+            let p = prepared();
+            let dir = dir();
+            let path = dir.join("request");
+            p.save_new(&path).unwrap();
+            let original = std::fs::read(&path).unwrap();
+            let mut pool = json!({"id":p.request["id"],"name":p.request["name"],"library_serial":p.library,"revision":1,"file_limit":p.request["file_limit"],"created_at_millis":p.request["created_at_millis"],"created_at":chrono::DateTime::from_timestamp_millis(p.request["created_at_millis"].as_i64().unwrap()).unwrap().to_rfc3339_opts(chrono::SecondsFormat::Millis,true),"policy":defaults()});
+            match field {
+                "created_at_millis" => {
+                    pool.as_object_mut().unwrap().remove(field);
+                }
+                "created_at" => pool[field] = json!("2026-01-01T00:00:00.000Z"),
+                "name" => pool[field] = json!("other"),
+                "file_limit" => pool[field] = json!(101),
+                "policy" => pool[field]["mount_limit"] = json!(1),
+                _ => unreachable!(),
+            }
+            let body =
+                json!({"library_serial":p.library,"namespace":p.namespace,"pool":pool}).to_string();
+            let (endpoint, request) = server(response(201, &body), Duration::ZERO);
+            let result = FdbClient::new([endpoint])
+                .unwrap()
+                .with_timeouts(Duration::ZERO, Duration::from_secs(1))
+                .submit_management(&path);
+            assert!(
+                matches!(result, Err(ClientError::Indeterminate(_))),
+                "{field}: {result:?}"
+            );
+            request.join().unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+    #[test]
     fn mutation_retries_keep_saved_identity_and_namespace_across_endpoints() {
         use super::super::tests::{response, server};
         let p = prepared();
         let dir = dir();
         let path = dir.join("request");
         p.save_new(&path).unwrap();
-        let pool = json!({"id":p.request["id"],"name":"归档","library_serial":p.library,"revision":1,"file_limit":100});
+        let pool = json!({"id":p.request["id"],"name":"归档","library_serial":p.library,"revision":1,"file_limit":100,"created_at_millis":p.request["created_at_millis"],"created_at":chrono::DateTime::from_timestamp_millis(p.request["created_at_millis"].as_i64().unwrap()).unwrap().to_rfc3339_opts(chrono::SecondsFormat::Millis,true),"policy":defaults()});
         let body =
             json!({"library_serial":p.library,"namespace":p.namespace,"created":true,"pool":pool})
                 .to_string();
@@ -1036,3 +1176,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[path = "management_native.rs"]
+mod native;
+pub use native::PreparedManagement;

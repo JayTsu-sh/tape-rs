@@ -18,7 +18,7 @@ use super::{
     decode_stored_copy, encode_head, encode_node, encode_physical_copy, encode_ready_volume,
     encode_scan_manifest, head_key, index_evidence, namespace_key, namespace_verification,
     node_key, read_page, ready_volume_key, reconcile_volume_key, requests, scan_key,
-    source_revision, staged_sources, uuid_from, volume_key, volume_prefix, write_attribute_chunks,
+    source_revision, staged_sources, uuid_from, volume_key, volume_prefix,
 };
 
 const INODE_DOMAIN: &[u8] = b"tape-rs/import-inode/1";
@@ -86,7 +86,7 @@ fn tombstone_prefix(namespace: Uuid) -> Vec<u8> {
     key
 }
 
-fn tombstone_key(namespace: Uuid, pool: Uuid, path: &str) -> Vec<u8> {
+pub(super) fn tombstone_key(namespace: Uuid, pool: Uuid, path: &str) -> Vec<u8> {
     let mut key = tombstone_prefix(namespace);
     key.extend_from_slice(pool.as_bytes());
     key.extend_from_slice(&Sha256::digest(path.as_bytes()));
@@ -681,7 +681,7 @@ pub struct ImportTombstone {
     pub logical_file_uid: u64,
 }
 
-fn encode_tombstone(plan: &ImportTombstone) -> Result<Vec<u8>> {
+pub(super) fn encode_tombstone(plan: &ImportTombstone) -> Result<Vec<u8>> {
     let path = plan.path.as_bytes();
     let path_len =
         u32::try_from(path.len()).map_err(|_| CatalogError::Invalid("导入墓碑路径过长"))?;
@@ -698,7 +698,7 @@ fn encode_tombstone(plan: &ImportTombstone) -> Result<Vec<u8>> {
     Ok(value)
 }
 
-fn plan_tombstone(
+pub(super) fn plan_tombstone(
     namespace: Uuid,
     entry: &StagedImportEntry,
     bindings: &[ImportSourceBinding],
@@ -827,10 +827,7 @@ pub(super) fn plan_data_file(
         return Err(CatalogError::Corrupt("导入文件来源数量不符"));
     }
     if matches!(data[entry.path.winner], StagedSourceData::NativeSymlink)
-        && entry
-            .current_attributes
-            .symlink()
-            .is_none_or(|target| target.contains(".LTFSEE_DATA/"))
+        && entry.current_attributes.link_kind()? != super::link_kind::LinkKind::Native
     {
         return Err(CatalogError::Corrupt("原生符号链接属性与来源类型不符"));
     }
@@ -1168,7 +1165,7 @@ async fn write_projected_file(
     if verify_only {
         return Err(CatalogError::Incomplete);
     }
-    write_attribute_chunks(tr, namespace, plan.id, false, Some(&plan.attributes)).await?;
+    super::attribute_objects::require_attributes(tr, namespace, Some(&plan.attributes)).await?;
     tr.set(&child_key, plan.id.as_bytes());
     tr.set(&node_key, &node_value);
     tr.set(&head_key, &head_value);
@@ -2051,14 +2048,13 @@ impl ManagedCatalog {
 
 #[cfg(test)]
 mod tests {
-    use super::super::PoolPolicy;
     use super::*;
     use crate::catalog::volume_extents::ExpectedIndex;
     use crate::ltfs::index::IndexLocation;
     use crate::ltfs::index::NodeMeta;
     use crate::managed_catalog::{
-        ContentDigest, ImportCandidate, NodeAttributes, ReconciledPath, SourceCandidate,
-        VolumePlacement, VolumeScan,
+        ContentDigest, ImportCandidate, NodeAttributes, PoolPolicy, ReconciledPath,
+        SourceCandidate, VolumePlacement, VolumeScan,
     };
 
     #[test]
@@ -2263,6 +2259,18 @@ mod tests {
         assert_eq!(plan.copies.len(), 1);
         assert_eq!(plan.copies[0].copy.ltfs_file_uid, 10);
         assert!(plan.copies[0].copy.media.as_ref().unwrap().native_symlink);
+        entry.current_attributes = NodeAttributes::new(
+            entry.current_attributes.meta().unwrap().clone(),
+            vec![super::super::link_kind::native_marker()],
+            Some(".LTFSEE_DATA/missing".into()),
+        )
+        .unwrap();
+        let marked = plan_data_file(namespace, &entry, &bindings)
+            .unwrap()
+            .unwrap();
+        assert_eq!(marked.attributes.symlink(), Some(".LTFSEE_DATA/missing"));
+        assert!(marked.copies[0].copy.media.as_ref().unwrap().native_symlink);
+        assert_eq!(marked.copies[0].copy.origin, CopyOrigin::Imported);
         entry.path.sources[0].candidate.length = 1;
         assert!(plan_data_file(namespace, &entry, &bindings).is_err());
     }

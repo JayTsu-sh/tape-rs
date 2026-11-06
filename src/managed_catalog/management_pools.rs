@@ -52,8 +52,13 @@ async fn prepare(
     serial: &str,
     change: &Value,
 ) -> Result<PreparedChange> {
-    native_device::require_library_available(tr, ns, serial).await?;
     let id = pool_id(change);
+    if change["kind"] == "pool-delete" {
+        native_device::require_library_available(tr, ns, serial).await?;
+        require_pool_writable_at(tr, ns, id).await?;
+    } else {
+        native_device::require_pool_metadata_available(tr, ns, serial, id).await?;
+    }
     let saved = tr.get(&pool_key(ns, id), false).await?;
     if retired_pool_revision_at(tr, ns, id).await?.is_some() {
         return Err(if saved.is_some() {
@@ -100,9 +105,7 @@ async fn prepare(
             }
             return Err(CatalogError::Invalid("池仍有磁带归属，不能删除"));
         }
-        let mut retirement = vec![1];
-        retirement.extend_from_slice(&revision.to_be_bytes());
-        decode_pool_retirement(&retirement)?;
+        let retirement = encode_pool_retirement(revision)?.to_vec();
         pool.revision = revision;
         return Ok(PreparedChange {
             result: json!({"pool":pool.to_json()?,"deleted":true}),
@@ -167,7 +170,7 @@ impl ManagedCatalog {
                     async {
                         let ns = routing::require_runtime_active_owner(&tr, serial, route, owner)
                             .await?;
-                        let mut task = read_task(&tr, ns, serial, epoch, operation)
+                        let mut task = read_task_at(&tr, ns, serial, epoch, operation)
                             .await?
                             .ok_or(CatalogError::Invalid("管理请求不存在"))?;
                         let request = ManagementRequest::parse(task["request"].clone())?;

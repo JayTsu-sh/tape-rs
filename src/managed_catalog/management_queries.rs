@@ -78,8 +78,19 @@ async fn tape(
         "node":view["inventory"]["owner"],"round":view["inventory"]["round"],"observed_at":view["inventory"]["observed_at"],
         "owner_current":view["inventory"]["round"]==view["owner_epoch"],
     }));
+    let details =
+        match inventory::inventory_entry(tr, serial, route.route.namespace, barcode).await? {
+            Some(details) => details,
+            // A physical, unassigned cartridge has no policy or monitor until an
+            // explicit operation samples it. This is an unknown observation,
+            // whereas a missing assigned record is still corruption.
+            None if assignment.is_none() && location.is_some() => json!({
+                "monitor":null,"task_id":null,"task_progress":null,
+            }),
+            None => return Err(CatalogError::Corrupt("当前磁带库存详情缺失")),
+        };
     Ok(Some(
-        json!({"barcode":barcode,"library_serial":serial,"namespace":route.route.namespace.to_string(),
+        json!({"monitor":details["monitor"],"task_id":details["task_id"],"task_progress":details["task_progress"],"barcode":barcode,"library_serial":serial,"namespace":route.route.namespace.to_string(),
         "presence":if view["inventory"].is_null(){"unknown"}else if location.is_some(){"observed"}else{"not_observed"},
         "location":location,"observation":observation,"assignment":assignment.map(|a|a.to_json()),"pool":pool,
         "health":null,"capacity":null}),

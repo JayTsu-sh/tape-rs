@@ -12,12 +12,11 @@ use fuser::*;
 use nix::libc;
 use tape_rs::client::Client;
 use tape_rs::tapefs::{Attr, Backend, ClientBackend, Res, TapeFs};
+#[cfg(test)]
+use tape_rs::tapefs::{UploadOutcome, UploadState};
 
 #[derive(Parser)]
-#[command(
-    name = "tape-fuse",
-    about = "挂载 ltfsd 文件服务；close 仅暂存，fsync 才确认落带"
-)]
+#[command(name = "tape-fuse", about = "挂载 ltfsd 文件服务；fsync 确认落带")]
 struct Args {
     /// 节点的客户端接口地址，可重复指定
     #[arg(
@@ -33,6 +32,12 @@ struct Args {
     /// 文件命名空间的池名称或 UUID；库内有多个池时必填
     #[arg(long, conflicts_with = "library_changer")]
     pool: Option<String>,
+    /// 固定 FDB 命名空间；须指定 --library 和 UUID 格式的 --pool，默认只读
+    #[arg(long, requires_all = ["library_serial", "pool"], conflicts_with = "library_changer")]
+    fdb_namespace: Option<uuid::Uuid>,
+    /// FDB 持久化请求日志目录（0700）；指定后恢复原操作并启用文件及节点修改
+    #[arg(long, requires = "fdb_namespace", conflicts_with = "library_changer")]
+    fdb_journal_dir: Option<PathBuf>,
     #[command(flatten)]
     library: tape_rs::library_cli::LibraryArgs,
     /// 已存在的挂载目录
@@ -557,6 +562,28 @@ fn main() {
                 .map_err(std::io::Error::other);
             mounted?;
             closed
+        } else if let Some(namespace) = args.fdb_namespace {
+            let serial = args
+                .library_serial
+                .ok_or_else(|| std::io::Error::other("FDB 挂载必须指定 --library"))?;
+            let pool = args
+                .pool
+                .ok_or_else(|| std::io::Error::other("FDB 挂载必须指定 --pool"))?
+                .parse::<uuid::Uuid>()
+                .map_err(|_| std::io::Error::other("FDB 挂载的 pool 必须为 UUID"))?;
+            let client = tape_rs::client::fdb::FdbClient::new(args.endpoints)
+                .map_err(std::io::Error::other)?;
+            let backend = if let Some(directory) = args.fdb_journal_dir {
+                tape_rs::tapefs::FdbBackend::new_writable(
+                    client, serial, namespace, pool, &directory,
+                )
+            } else {
+                config.mount_options.push(MountOption::RO);
+                tape_rs::tapefs::FdbBackend::new(client, serial, namespace, pool)
+            }
+            .map_err(std::io::Error::other)?;
+            let fs = TapeFs::new(backend, args.cache_dir)?;
+            fuser::mount(Adapter::new(fs), args.mountpoint, &config)
         } else {
             let mut client = Client::new(args.endpoints);
             if let Some(serial) = args.library_serial {
@@ -580,6 +607,58 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use tape_rs::tapefs::MemBackend;
+
+    #[test]
+    fn fdb_mount_requires_an_explicit_library_pool_and_namespace() {
+        let namespace = uuid::Uuid::new_v4().to_string();
+        let pool = uuid::Uuid::new_v4().to_string();
+        let arguments = vec![
+            "tape-fuse",
+            "-e",
+            "127.0.0.1:7401",
+            "--fdb-namespace",
+            &namespace,
+            "--library",
+            "SIM",
+            "--pool",
+            &pool,
+            "--cache-dir",
+            "/tmp/cache",
+            "/tmp/mount",
+        ];
+        let parsed = Args::try_parse_from(&arguments).unwrap();
+        assert_eq!(
+            parsed.fdb_namespace,
+            Some(uuid::Uuid::parse_str(&namespace).unwrap())
+        );
+        assert_eq!(parsed.pool.as_deref(), Some(pool.as_str()));
+        assert!(parsed.fdb_journal_dir.is_none());
+        let mut writable = arguments.clone();
+        writable.extend(["--fdb-journal-dir", "/tmp/fdb-journals"]);
+        let parsed = Args::try_parse_from(&writable).unwrap();
+        assert_eq!(
+            parsed.fdb_journal_dir,
+            Some(PathBuf::from("/tmp/fdb-journals"))
+        );
+        let index = writable
+            .iter()
+            .position(|argument| *argument == "--fdb-namespace")
+            .unwrap();
+        writable.drain(index..index + 2);
+        assert!(Args::try_parse_from(writable).is_err());
+        for flag in ["--library", "--pool"] {
+            let mut missing = arguments.clone();
+            let index = missing
+                .iter()
+                .position(|argument| *argument == flag)
+                .unwrap();
+            missing.drain(index..index + 2);
+            assert!(Args::try_parse_from(missing).is_err());
+        }
+        let mut local = arguments;
+        local.extend(["--library-changer", "/dev/sg0"]);
+        assert!(Args::try_parse_from(local).is_err());
+    }
 
     #[test]
     fn remote_mount_selects_serial_and_cannot_mix_local_device_mode() {
@@ -695,13 +774,13 @@ mod tests {
         fn stat(&self, p: &str) -> Res<Option<tape_rs::client::PathStat>> {
             self.inner.stat(p)
         }
-        fn list_dir(&self, p: &str) -> Res<Option<Vec<tape_rs::client::DirItem>>> {
+        fn list_dir(&self, p: &str) -> Res<Option<tape_rs::tapefs::DirectoryListing>> {
             self.inner.list_dir(p)
         }
         fn fetch(&self, p: &str, f: &mut std::fs::File) -> Res<u64> {
             self.inner.fetch(p, f)
         }
-        fn upload(&self, p: &str, f: &Path, c: bool, w: bool) -> Res<bool> {
+        fn upload(&self, p: &str, f: &Path, c: &mut UploadState, w: bool) -> Res<UploadOutcome> {
             if self.reject_upload.load(Ordering::Relaxed) {
                 return Err(libc::ENOSPC);
             }
@@ -805,13 +884,19 @@ mod tests {
                 }
                 Ok(old)
             }
-            fn list_dir(&self, p: &str) -> Res<Option<Vec<tape_rs::client::DirItem>>> {
+            fn list_dir(&self, p: &str) -> Res<Option<tape_rs::tapefs::DirectoryListing>> {
                 self.inner.list_dir(p)
             }
             fn fetch(&self, p: &str, f: &mut std::fs::File) -> Res<u64> {
                 self.inner.fetch(p, f)
             }
-            fn upload(&self, p: &str, f: &Path, c: bool, w: bool) -> Res<bool> {
+            fn upload(
+                &self,
+                p: &str,
+                f: &Path,
+                c: &mut UploadState,
+                w: bool,
+            ) -> Res<UploadOutcome> {
                 self.inner.upload(p, f, c, w)
             }
             fn delete(&self, p: &str) -> Res<()> {
@@ -1056,13 +1141,29 @@ os.unlink(p)
                 }
                 Ok(s)
             }
-            fn list_dir(&self, p: &str) -> Res<Option<Vec<tape_rs::client::DirItem>>> {
-                self.inner.list_dir(p)
+            fn list_dir(&self, p: &str) -> Res<Option<tape_rs::tapefs::DirectoryListing>> {
+                let Some(mut items) = self.inner.list_dir(p)? else {
+                    return Ok(None);
+                };
+                let records = self.records.lock().unwrap();
+                for item in items.entries.iter_mut().filter(|item| !item.is_dir) {
+                    let path = tape_rs::tapefs::join(p, &item.name);
+                    if let Some(record) = records.iter().find(|record| record.path == path) {
+                        item.is_symlink = Some(record.metadata["kind"] == "symlink");
+                    }
+                }
+                Ok(Some(items))
             }
             fn fetch(&self, p: &str, f: &mut std::fs::File) -> Res<u64> {
                 self.inner.fetch(p, f)
             }
-            fn upload(&self, _: &str, _: &Path, _: bool, _: bool) -> Res<bool> {
+            fn upload(
+                &self,
+                _: &str,
+                _: &Path,
+                _: &mut UploadState,
+                _: bool,
+            ) -> Res<UploadOutcome> {
                 Err(libc::EROFS)
             }
             fn symlink(&self, target: &str, p: &str) -> Res<()> {

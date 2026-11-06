@@ -87,6 +87,21 @@ pub enum Command {
         expected_round: Option<u64>,
         group: String,
     },
+    /// 健康迁移只能消费当前实例已提交的空闲证明；与开始设备任务同序仲裁。
+    RebalanceExecutor {
+        node: u64,
+        instance: u64,
+        term: u64,
+        expected_round: u64,
+        expected_instance: u64,
+        idle_sequence: u64,
+        group: String,
+    },
+    /// 仅由当前实例的 ExecutorReport 携带，直接提交不改变状态。
+    DeviceActivity {
+        sequence: u64,
+        busy: bool,
+    },
     /// 新 Leader 声明接管。它被提交时的日志索引就是该执行者的轮次。
     Takeover {
         node: u64,
@@ -272,6 +287,20 @@ impl Command {
             } => {
                 json!({"op":"assign_executor", "node":node, "instance":instance, "term":term, "expected_round":expected_round, "group":group})
             }
+            Command::RebalanceExecutor {
+                node,
+                instance,
+                term,
+                expected_round,
+                expected_instance,
+                idle_sequence,
+                group,
+            } => {
+                json!({"op":"rebalance_executor","node":node,"instance":instance,"term":term,"expected_round":expected_round,"expected_instance":expected_instance,"idle_sequence":idle_sequence,"group":group})
+            }
+            Command::DeviceActivity { sequence, busy } => {
+                json!({"op":"device_activity","sequence":sequence,"busy":busy})
+            }
             Command::Takeover { node, term } => {
                 json!({"op": "takeover", "node": node, "term": term})
             }
@@ -398,7 +427,8 @@ impl Command {
                 // 不递归接收任意嵌套，避免网络输入耗尽栈；报告不能伪装成管理命令。
                 if !matches!(
                     inner.get("op")?.as_str()?,
-                    "fenced"
+                    "device_activity"
+                        | "fenced"
                         | "abandoned"
                         | "executor_ready"
                         | "tape_state"
@@ -433,6 +463,23 @@ impl Command {
                     group: text("group")?,
                     drives: usize::try_from(v.get("drives")?.as_u64()?).ok()?,
                     eligible: v.get("eligible")?.as_bool()?,
+                });
+            }
+            "device_activity" => {
+                return Some(Command::DeviceActivity {
+                    sequence: v.get("sequence")?.as_u64()?,
+                    busy: v.get("busy")?.as_bool()?,
+                });
+            }
+            "rebalance_executor" => {
+                return Some(Command::RebalanceExecutor {
+                    node: v.get("node")?.as_u64()?,
+                    instance: v.get("instance")?.as_u64()?,
+                    term: v.get("term")?.as_u64()?,
+                    expected_round: v.get("expected_round")?.as_u64()?,
+                    expected_instance: v.get("expected_instance")?.as_u64()?,
+                    idle_sequence: v.get("idle_sequence")?.as_u64()?,
+                    group: text("group")?,
                 });
             }
             "assign_executor" => {
@@ -569,6 +616,7 @@ impl ControlSnapshot {
             "executor_instance": c.executor_instance,
             "executor_report_sequence": c.executor_report_sequence,
             "executor_ready": c.executor_ready,
+            "device_activity": c.device_activity.as_ref().map(|a| json!({"node":a.node,"instance":a.instance,"round":a.round,"sequence":a.sequence,"busy":a.busy})),
             "catalog_quiesce_index": c.catalog_quiesce_index,
             "catalog_frozen_index": c.catalog_frozen_index,
             "vips": c.vips.iter().map(|(a,r)| json!([a.to_string(),r.token,r.holder.as_ref().map(|h|json!([h.node,h.round]))])).collect::<Vec<_>>(),
@@ -613,6 +661,21 @@ impl ControlSnapshot {
                 .get("executor_ready")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            device_activity: match v.get("device_activity")? {
+                Value::Null => None,
+                a => {
+                    if a.as_object()?.len() != 5 {
+                        return None;
+                    }
+                    Some(super::permission::DeviceActivityState {
+                        node: a.get("node")?.as_u64()?,
+                        instance: a.get("instance")?.as_u64()?,
+                        round: a.get("round")?.as_u64()?,
+                        sequence: a.get("sequence")?.as_u64()?,
+                        busy: a.get("busy")?.as_bool()?,
+                    })
+                }
+            },
             catalog_quiesce_index: optional_index("catalog_quiesce_index")?,
             catalog_frozen_index: optional_index("catalog_frozen_index")?,
             ..Default::default()
@@ -672,6 +735,19 @@ impl ControlSnapshot {
                 round: n(e.get(2))?,
                 fenced: e.get(3)?.as_bool()?,
             });
+        }
+        if let Some(a) = &c.device_activity
+            && (a.node == 0
+                || a.instance == 0
+                || a.round == 0
+                || a.sequence == 0
+                || c.executor_instance != a.instance
+                || !c.executor_ready
+                || c.executor
+                    .as_ref()
+                    .is_none_or(|e| !e.fenced || e.node != a.node || e.round != a.round))
+        {
+            return None;
         }
         for r in rows("history")? {
             c.history.push((n(r.get(0))?, n(r.get(1))?));
@@ -820,6 +896,7 @@ pub struct ControlState {
     pub executor_instance: u64,
     pub executor_report_sequence: u64,
     pub executor_ready: bool,
+    pub device_activity: Option<super::permission::DeviceActivityState>,
     pub candidates: std::collections::BTreeMap<u64, Candidate>,
     pub applied_index: u64,
     /// 历次接管的简要记录：(轮次, 节点)，只留最近 `HISTORY_KEPT` 条
@@ -863,6 +940,7 @@ impl ControlState {
                 Command::CatalogFreeze { .. }
                     | Command::Candidate { .. }
                     | Command::VipRelease { .. }
+                    | Command::RebalanceExecutor { .. }
                     | Command::AssignExecutor { .. }
                     | Command::Takeover { .. }
                     | Command::ExecutorReport { .. }
@@ -881,6 +959,7 @@ impl ControlState {
                     | Command::TapeAssign { .. }
                     | Command::TapeUnassign { .. }
                     | Command::TapeReclaim { .. }
+                    | Command::RebalanceExecutor { .. }
                     | Command::AssignExecutor { .. }
                     | Command::Takeover { .. }
             )
@@ -1005,7 +1084,8 @@ impl ControlState {
                 if self.catalog_frozen_index.is_some()
                     && !matches!(
                         command.as_ref(),
-                        Command::Fenced { .. }
+                        Command::DeviceActivity { .. }
+                            | Command::Fenced { .. }
                             | Command::ExecutorReady { .. }
                             | Command::Abandoned { .. }
                     )
@@ -1036,6 +1116,15 @@ impl ControlState {
                     Command::ExecutorReady { node: n, round: r } => {
                         e.fenced && n == node && r == round
                     }
+                    Command::DeviceActivity { sequence, .. } => {
+                        e.fenced
+                            && self.executor_ready
+                            && self
+                                .device_activity
+                                .as_ref()
+                                .map_or(Some(1), |a| a.sequence.checked_add(1))
+                                == Some(*sequence)
+                    }
                     Command::TapeState { .. }
                     | Command::FileTask { .. }
                     | Command::ManagementReport { .. }
@@ -1049,6 +1138,16 @@ impl ControlState {
                     return Applied::Nothing;
                 }
                 self.executor_report_sequence = *sequence;
+                if let Command::DeviceActivity { sequence, busy } = command.as_ref() {
+                    self.device_activity = Some(super::permission::DeviceActivityState {
+                        node: *node,
+                        instance: *instance,
+                        round: *round,
+                        sequence: *sequence,
+                        busy: *busy,
+                    });
+                    return Applied::Reported(Box::new(Applied::Nothing));
+                }
                 Applied::Reported(Box::new(self.apply(index, command)))
             }
             Command::ExecutorReady { node, round } => {
@@ -1092,6 +1191,43 @@ impl ControlState {
                 );
                 Applied::Nothing
             }
+            Command::DeviceActivity { .. } => Applied::Nothing,
+            Command::RebalanceExecutor {
+                node,
+                instance,
+                term,
+                expected_round,
+                expected_instance,
+                idle_sequence,
+                group,
+            } => {
+                if !self.executor_ready
+                    || self.executor_instance != *expected_instance
+                    || self
+                        .executor
+                        .as_ref()
+                        .is_none_or(|e| !e.fenced || e.round != *expected_round)
+                    || self.device_activity.as_ref().is_none_or(|a| {
+                        a.busy
+                            || a.round != *expected_round
+                            || a.instance != *expected_instance
+                            || a.sequence != *idle_sequence
+                            || self.executor.as_ref().is_none_or(|e| e.node != a.node)
+                    })
+                {
+                    return Applied::Nothing;
+                }
+                self.apply(
+                    index,
+                    &Command::AssignExecutor {
+                        node: *node,
+                        instance: *instance,
+                        term: *term,
+                        expected_round: Some(*expected_round),
+                        group: group.clone(),
+                    },
+                )
+            }
             Command::AssignExecutor {
                 node,
                 instance,
@@ -1122,6 +1258,7 @@ impl ControlState {
                 self.executor_instance = 0;
                 self.executor_report_sequence = 0;
                 self.executor_ready = false;
+                self.device_activity = None;
                 let e = Executor {
                     node: *node,
                     term: *term,
@@ -1151,6 +1288,7 @@ impl ControlState {
                     super::management::interrupt(self);
                     self.executor = None;
                     self.executor_ready = false;
+                    self.device_activity = None;
                     Applied::ExecutorGone {
                         node: *node,
                         round: *round,
@@ -2190,3 +2328,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "state_activity_tests.rs"]
+mod activity_tests;

@@ -1152,11 +1152,23 @@ fn drive_command(
             let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as usize;
             let mut v = vec![0u8; 8];
             v[0..2].copy_from_slice(&(6u16 + 16).to_be_bytes());
+            if st.drives[idx]
+                .cartridge
+                .as_ref()
+                .and_then(|b| st.cartridges.get(b))
+                .is_some_and(|c| c.write_protected)
+            {
+                v[3] |= 0x80;
+            }
             let mut page = [0u8; 16];
             page[0] = 0x11;
             page[1] = 0x0E;
             page[2] = 3;
-            page[3] = st.drives[idx].pending_partitions.saturating_sub(1) as u8;
+            page[3] = st.drives[idx]
+                .cartridge
+                .as_ref()
+                .and_then(|barcode| st.cartridges.get(barcode))
+                .map_or(0, |cart| cart.partitions.len().saturating_sub(1) as u8);
             page[4] = 0x3C;
             page[5] = 3; // 支持格式及分区识别，不可更改。
             page[6] = 0x19; // 流式分区、GB 单位。

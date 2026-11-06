@@ -170,6 +170,7 @@ mod tests {
                 sense_key: 6,
                 asc: 0x2a,
                 ascq: 5,
+                sense: None,
             })
         }
         fn execute_read(&self, cdb: &[u8], buf: &mut [u8], timeout: u32) -> Result<ScsiResult> {

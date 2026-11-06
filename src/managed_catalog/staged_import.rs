@@ -10,8 +10,8 @@ use uuid::Uuid;
 
 use super::{
     CatalogError, ContentDigest, DirectoryAudit, ImportCandidate, ImportOrigin, ImportReconciler,
-    ImportSourceBinding, ImportVolume, ManagedCatalog, NamespaceState, NodeAttributes, NodeKind,
-    ReconciledPath, Result, SourceCandidate, control, import_spool, key, namespace_key,
+    ImportSourceBinding, ImportSpool, ImportVolume, ManagedCatalog, NamespaceState, NodeAttributes,
+    NodeKind, ReconciledPath, Result, SourceCandidate, control, import_spool, key, namespace_key,
 };
 
 const ROW_DOMAIN: &[u8] = b"tape-rs/staged-import-rows/1";
@@ -124,28 +124,33 @@ fn winner_data_matches(
     data: &StagedSourceData,
     require_ee_path: bool,
 ) -> bool {
-    match (attributes.symlink(), data) {
+    use super::link_kind::LinkKind;
+    let Ok(kind) = attributes.link_kind() else {
+        return false;
+    };
+    match (kind, data) {
         (
-            None,
+            LinkKind::None,
             StagedSourceData::Data {
                 ee_alias: false, ..
             },
         ) => !candidate.deleted && candidate.kind == NodeKind::File,
         (
-            Some(target),
+            LinkKind::EeAlias,
             StagedSourceData::Data {
                 ee_alias: true,
                 data_path,
                 ..
             },
-        ) if target.contains(".LTFSEE_DATA/") => {
+        ) => {
+            let target = attributes.symlink().expect("classified EE alias");
             !require_ee_path
                 || import_spool::resolve_ee_alias_target(&candidate.physical_path, target)
                     .ok()
                     .as_ref()
                     == data_path.as_ref()
         }
-        (Some(target), StagedSourceData::NativeSymlink) => !target.contains(".LTFSEE_DATA/"),
+        (LinkKind::Native, StagedSourceData::NativeSymlink) => true,
         (_, StagedSourceData::NoCopy) => candidate.deleted || candidate.kind == NodeKind::Directory,
         _ => false,
     }
@@ -214,6 +219,68 @@ fn encode_source_data(data: &StagedSourceData) -> Result<Vec<u8>> {
             out
         }
     })
+}
+
+/// Reconstruct one candidate's full logical and data identities from the
+/// verified source, including EE aliases and native links.
+pub(super) fn source_evidence(
+    source: &ImportSpool,
+    candidate: &ImportCandidate,
+) -> Result<(NodeAttributes, u64, StagedSourceData)> {
+    let node = source
+        .node_by_path(&candidate.physical_path)
+        .map_err(|e| CatalogError::Cache(e.to_string()))?
+        .ok_or(CatalogError::Corrupt("暂存候选缺少物理节点"))?;
+    let reconstructed =
+        import_spool::import_candidate(&node.path, node.kind, node.length, &node.attributes)
+            .map_err(|e| CatalogError::Cache(e.to_string()))?;
+    if reconstructed.as_ref() != Some(candidate) {
+        return Err(CatalogError::Corrupt("暂存候选与完整 LTFS 属性不一致"));
+    }
+    let data = if candidate.deleted || candidate.kind == NodeKind::Directory {
+        StagedSourceData::NoCopy
+    } else if node.attributes.symlink().is_some() {
+        if node.attributes.link_kind()? == super::link_kind::LinkKind::EeAlias {
+            let data = source
+                .resolve_file_data(&node.path)
+                .map_err(|e| CatalogError::Cache(e.to_string()))?
+                .ok_or(CatalogError::Corrupt("暂存 EE 别名数据文件缺失"))?;
+            StagedSourceData::Data {
+                file_uid: data.data_file_uid,
+                length: data.length,
+                content_digest: data.content_digest,
+                ee_alias: true,
+                data_path: Some(data.data_path),
+            }
+        } else {
+            StagedSourceData::NativeSymlink
+        }
+    } else {
+        StagedSourceData::Data {
+            file_uid: node
+                .attributes
+                .meta()
+                .ok_or(CatalogError::Corrupt("暂存来源缺少 fileuid"))?
+                .file_uid,
+            length: node
+                .length
+                .ok_or(CatalogError::Corrupt("暂存文件长度缺失"))?,
+            content_digest: node
+                .content_digest
+                .ok_or(CatalogError::Corrupt("暂存文件摘要状态缺失"))?,
+            ee_alias: false,
+            data_path: None,
+        }
+    };
+    let uid = node
+        .attributes
+        .meta()
+        .ok_or(CatalogError::Corrupt("暂存来源缺少 fileuid"))?
+        .file_uid;
+    if !source_data_matches(candidate, uid, &data, true) {
+        return Err(CatalogError::Corrupt("暂存来源数据对象与候选不一致"));
+    }
+    Ok((node.attributes, uid, data))
 }
 
 fn path_sources_match(path: &ReconciledPath, sources: &HashMap<String, (Uuid, Uuid, u64)>) -> bool {
@@ -844,69 +911,12 @@ impl ManagedCatalog {
                 let source = source_by_barcode
                     .get(candidate.barcode.as_str())
                     .ok_or(CatalogError::Corrupt("暂存候选缺少来源卷"))?;
-                let node = source
-                    .node_by_path(&candidate.candidate.physical_path)
-                    .map_err(|error| CatalogError::Cache(error.to_string()))?
-                    .ok_or(CatalogError::Corrupt("暂存候选缺少物理节点"))?;
-                let reconstructed = import_spool::import_candidate(
-                    &node.path,
-                    node.kind,
-                    node.length,
-                    &node.attributes,
-                )
-                .map_err(|error| CatalogError::Cache(error.to_string()))?;
-                if reconstructed.as_ref() != Some(&candidate.candidate) {
-                    return Err(CatalogError::Corrupt("暂存候选与完整 LTFS 属性不一致"));
-                }
-                let data_source = if candidate.candidate.deleted
-                    || candidate.candidate.kind == NodeKind::Directory
-                {
-                    StagedSourceData::NoCopy
-                } else if let Some(target) = node.attributes.symlink() {
-                    if target.contains(".LTFSEE_DATA/") {
-                        let data = source
-                            .resolve_file_data(&node.path)
-                            .map_err(|error| CatalogError::Cache(error.to_string()))?
-                            .ok_or(CatalogError::Corrupt("暂存 EE 别名数据文件缺失"))?;
-                        StagedSourceData::Data {
-                            file_uid: data.data_file_uid,
-                            length: data.length,
-                            content_digest: data.content_digest,
-                            ee_alias: true,
-                            data_path: Some(data.data_path),
-                        }
-                    } else {
-                        StagedSourceData::NativeSymlink
-                    }
-                } else {
-                    StagedSourceData::Data {
-                        file_uid: node
-                            .attributes
-                            .meta()
-                            .ok_or(CatalogError::Corrupt("暂存来源缺少 LTFS fileuid"))?
-                            .file_uid,
-                        length: node
-                            .length
-                            .ok_or(CatalogError::Corrupt("暂存文件长度缺失"))?,
-                        content_digest: node
-                            .content_digest
-                            .ok_or(CatalogError::Corrupt("暂存文件摘要状态缺失"))?,
-                        ee_alias: false,
-                        data_path: None,
-                    }
-                };
-                let logical_uid = node
-                    .attributes
-                    .meta()
-                    .ok_or(CatalogError::Corrupt("暂存来源缺少 LTFS fileuid"))?
-                    .file_uid;
-                if !source_data_matches(&candidate.candidate, logical_uid, &data_source, true) {
-                    return Err(CatalogError::Corrupt("暂存来源数据对象与候选不一致"));
-                }
+                let (attributes, logical_uid, data_source) =
+                    source_evidence(source, &candidate.candidate)?;
                 source_file_uids.push(logical_uid);
                 source_data.push(data_source);
                 if index == path.winner {
-                    winner_attributes = Some(node.attributes);
+                    winner_attributes = Some(attributes);
                 }
             }
             let winner_attributes =
@@ -1957,11 +1967,11 @@ mod tests {
                 .create_pool(
                     namespace,
                     &PoolRecord {
+                        created_at_millis: 1_793_405_000_123,
                         id: pool,
                         library_serial: "STAGED_TEST".into(),
                         name: "import-test".into(),
                         file_limit: 100,
-                        created_at_millis: 1_793_405_000_123,
                         policy: PoolPolicy::default(),
                         revision: 1,
                     },

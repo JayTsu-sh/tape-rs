@@ -18,7 +18,7 @@ use tape_rs::managed_catalog::{
     NodeAttributes, NodeKind, PoolPolicy, PoolRecord, PrepareRouteOutcome, PreparedLibraryRoute,
     PublishOutcome, ScanDigest, SourceOutcome, StagedSourceData, VerificationOutcome,
     VolumeOutcome, VolumePlacement, VolumeScan, WindowOutcome, derive_copy_id,
-    inspect_frozen_snapshot, verify_node_export,
+    inspect_frozen_snapshot, pool_catalog_path, verify_node_export,
 };
 use uuid::Uuid;
 
@@ -43,6 +43,84 @@ fn fdb_http_probe(port: u16, method: &str, path: &str) -> String {
     let mut output = String::new();
     conn.read_to_string(&mut output).unwrap();
     output
+}
+
+/// Actual B-library EE index, processed using only private local files. Saved
+/// GPFS paths are index data; resolving them must use the tape's data UID.
+/// This does not read payloads from the physical tape or contact an FDB server.
+#[test]
+fn real_b_ee_index_builds_streaming_sources_without_gpfs() {
+    use tape_rs::ltfs::ee::EeManifest;
+
+    let xml = include_bytes!("fixtures/ee-b-aa0000-import-gen5.xml");
+    let index = LtfsIndex::parse(xml).unwrap();
+    let manifest = EeManifest::from_index(&index).unwrap();
+    let expected = ExpectedIndex {
+        volume_uuid: index.volume_uuid,
+        generation: index.generation,
+        location: index.self_location,
+        sha256: Sha256::digest(xml).into(),
+    };
+    let root = std::env::temp_dir().join(format!("tape-rs-ee-source-{}", Uuid::new_v4()));
+    fs::create_dir(&root).unwrap();
+    let path = root.join("import.db");
+    let cache_path = root.join("extents.db");
+    ImportSpool::build(xml.as_slice(), &path, expected).unwrap();
+    VolumeExtentCache::build(xml.as_slice(), &cache_path, expected).unwrap();
+    let spool = ImportSpool::open(&path, expected).unwrap();
+    let cache = VolumeExtentCache::open(&cache_path, expected).unwrap();
+    spool.verify_all().unwrap();
+    spool.verify_extent_cache(&cache).unwrap();
+
+    let mut after = None;
+    let mut saved_paths = std::collections::BTreeSet::new();
+    let mut directories = 0;
+    loop {
+        let page = spool.candidate_page(after.as_deref(), 1).unwrap();
+        for candidate in page.candidates {
+            if candidate.kind == NodeKind::Directory {
+                assert_eq!(
+                    spool
+                        .node_by_path(&candidate.physical_path)
+                        .unwrap()
+                        .unwrap()
+                        .kind,
+                    NodeKind::Directory
+                );
+                directories += 1;
+                continue;
+            }
+            let object = manifest
+                .objects()
+                .iter()
+                .find(|object| object.saved_path == candidate.logical_path)
+                .expect("导入候选必须映射到真实 EE 保存路径");
+            let data = spool
+                .resolve_file_data(&candidate.physical_path)
+                .unwrap()
+                .unwrap();
+            assert_eq!(data.data_path, object.object_path);
+            assert_eq!(data.length, object.length);
+            assert_ne!(data.logical_file_uid, data.data_file_uid);
+            assert_eq!(
+                index.find_file(&data.data_path).unwrap().meta.file_uid,
+                data.data_file_uid
+            );
+            assert!(saved_paths.insert(candidate.logical_path));
+        }
+        after = page.next;
+        if after.is_none() {
+            break;
+        }
+    }
+    assert_eq!(directories, 8);
+    assert_eq!(saved_paths.len(), 3);
+    assert_eq!(saved_paths.len(), manifest.objects().len());
+    assert_eq!(index.volume_uuid, expected.volume_uuid);
+    assert_eq!(index.generation, 5);
+    drop(cache);
+    drop(spool);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -346,11 +424,11 @@ async fn external_media_import_is_bound_sealed_and_requires_empty_node_exports()
             .create_pool(
                 namespace,
                 &PoolRecord {
+                    created_at_millis: 1_793_405_000_123,
                     library_serial: serial.clone(),
                     id: pool,
                     name: "external".into(),
                     file_limit: 1000,
-                    created_at_millis: 1_793_405_000_123,
                     policy: PoolPolicy::default(),
                     revision: 1
                 }
@@ -667,31 +745,35 @@ async fn external_media_import_is_bound_sealed_and_requires_empty_node_exports()
     fs::remove_dir_all(root).unwrap();
 }
 
-#[tokio::test]
+#[test]
 #[ignore = "需要 FDB_TEST_CLUSTER 指向隔离 FDB；只使用合成索引与临时目录快照"]
-async fn audited_candidates_stage_in_fdb_without_becoming_visible() {
-    staged_import_synthetic(false, false).await;
+fn audited_candidates_stage_in_fdb_without_becoming_visible() {
+    run_staged_import_synthetic(false, false);
 }
 
-#[tokio::test]
+#[test]
 #[ignore = "需要 FDB_TEST_CLUSTER 指向隔离 FDB；仅物化合成 Building 文件"]
-async fn confirmed_data_file_materializes_with_all_copies_and_replays() {
-    staged_import_synthetic(true, false).await;
+fn confirmed_data_file_materializes_with_all_copies_and_replays() {
+    run_staged_import_synthetic(true, false);
 }
 
 #[test]
 #[ignore = "需要 FDB_TEST_CLUSTER 指向隔离 FDB；发布随机合成的无墓碑目录"]
 fn verified_data_import_seals_and_reclaims_staging() {
+    run_staged_import_synthetic(true, true);
+}
+
+fn run_staged_import_synthetic(project_file: bool, seal: bool) {
     // This end-to-end async fixture contains many independent checkpoints.
     // Keep its generated future off the test harness's small default stack.
     std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
-        .spawn(|| {
+        .spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(staged_import_synthetic(true, true));
+                .block_on(staged_import_synthetic(project_file, seal));
         })
         .unwrap()
         .join()
@@ -811,11 +893,11 @@ async fn confirmed_tombstone_is_private_and_verified_with_full_scan() {
             .create_pool(
                 namespace,
                 &PoolRecord {
+                    created_at_millis: 1_793_405_000_123,
                     library_serial: serial.clone(),
                     id: pool,
                     name: "tomb".into(),
                     file_limit: 1_000_000,
-                    created_at_millis: 1_793_405_000_123,
                     policy: PoolPolicy::default(),
                     revision: 1,
                 },
@@ -1207,11 +1289,11 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
             .create_pool(
                 namespace,
                 &PoolRecord {
+                    created_at_millis: 1_793_405_000_123,
                     library_serial: serial.clone(),
                     id: pool,
                     name: "stage".into(),
                     file_limit: 1_000_000,
-                    created_at_millis: 1_793_405_000_123,
                     policy: PoolPolicy::default(),
                     revision: 1,
                 },
@@ -1706,11 +1788,11 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                     .create_pool(
                         namespace,
                         &PoolRecord {
+                            created_at_millis: 1_793_405_000_123,
                             library_serial: serial.clone(),
                             id: Uuid::new_v4(),
                             name: "late".into(),
                             file_limit: 1,
-                            created_at_millis: 1_793_405_000_123,
                             policy: PoolPolicy::default(),
                             revision: 1,
                         }
@@ -1890,7 +1972,7 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
             assert!(catalog.discard_import(namespace).await.is_err());
             let mut active_request = CommitReceipt {
                 namespace,
-                parent: Uuid::nil(),
+                parent: plan.parent,
                 name: b"active-admission-only".to_vec(),
                 file_id: Uuid::new_v4(),
                 expected_version: None,
@@ -1910,6 +1992,7 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
             };
             active_request.copy_id = derive_copy_id(&active_request);
             let reservation = ActiveFileIntent {
+                barcode_constraint: None,
                 namespace,
                 parent: active_request.parent,
                 parent_path: b"/".to_vec(),
@@ -2301,6 +2384,7 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
             committed_request.metadata_digest = Some(committed_attributes.digest());
             committed_request.copy_id = derive_copy_id(&committed_request);
             let committed_reservation = ActiveFileIntent {
+                barcode_constraint: None,
                 namespace,
                 parent: committed_request.parent,
                 parent_path: b"/".to_vec(),
@@ -2408,6 +2492,9 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
             tr.commit().await.unwrap();
             let baseline_source = bindings[0].source;
             let baseline_index = ActiveIndexIdentity::from(baseline_source);
+            let mut baseline_file_count = 0_u64;
+            index.walk_files(|_, _| baseline_file_count += 1);
+
             let volume_id = bindings[0].placement.volume_id;
             let mut duplicate_path = committed_request.clone();
             duplicate_path.operation_id = Uuid::new_v4();
@@ -2728,7 +2815,8 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                         ActiveIndexIdentity {
                             generation: baseline_index.generation + 1,
                             ..baseline_index
-                        }
+                        },
+                        baseline_file_count + 1,
                     )
                     .await
                     .unwrap(),
@@ -2860,6 +2948,7 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                         batch_id,
                         baseline_index,
                         observed_index,
+                        baseline_file_count + 1,
                     )
                     .await
                     .unwrap(),
@@ -2874,6 +2963,7 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                         Uuid::new_v4(),
                         baseline_index,
                         observed_index,
+                        baseline_file_count + 1,
                     )
                     .await
                     .unwrap(),
@@ -2888,6 +2978,7 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                         batch_id,
                         baseline_index,
                         observed_index,
+                        baseline_file_count + 1,
                     )
                     .await
                     .unwrap(),
@@ -2972,7 +3063,8 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                     .unwrap(),
                 Some(committed_attributes.clone())
             );
-            // Prepared attributes are stored in the immutable namespace object.
+            // Large attributes live in the namespace's immutable attribute
+            // object, rather than the inline prepared-file record.
             let mut prepared_chunk = b"tape-rs/catalog/22/M/".to_vec();
             prepared_chunk.extend_from_slice(namespace.as_bytes());
             prepared_chunk.extend_from_slice(&committed_attributes.digest());
@@ -3057,7 +3149,11 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                     .unwrap(),
                 ActivePreparationOutcome::AlreadyPrepared
             );
-            let committed_path = [b"/".as_slice(), committed_request.name.as_slice()].concat();
+            let committed_path = pool_catalog_path(
+                pool,
+                &[b"/".as_slice(), committed_request.name.as_slice()].concat(),
+            )
+            .unwrap();
             assert_eq!(
                 reopened
                     .resolve_active_path(&serial, &committed_path)
@@ -3067,7 +3163,7 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
             );
             assert!(
                 !reopened
-                    .list_children(namespace, Uuid::nil(), None, 100)
+                    .list_children(namespace, committed_request.parent, None, 100)
                     .await
                     .unwrap()
                     .items
@@ -3311,7 +3407,7 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
             }
             assert!(
                 reopened
-                    .list_children(namespace, Uuid::nil(), None, 100)
+                    .list_children(namespace, committed_request.parent, None, 100)
                     .await
                     .unwrap()
                     .items
@@ -3321,7 +3417,7 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
             );
             assert_eq!(
                 reopened
-                    .resolve_child(namespace, Uuid::nil(), &committed_request.name)
+                    .resolve_child(namespace, committed_request.parent, &committed_request.name)
                     .await
                     .unwrap(),
                 Some(committed_request.file_id)
@@ -3400,7 +3496,7 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
             );
             assert!(
                 reopened
-                    .list_children(namespace, Uuid::nil(), None, 100)
+                    .list_children(namespace, committed_request.parent, None, 100)
                     .await
                     .is_err()
             );
@@ -3432,7 +3528,7 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
             );
             assert!(
                 reopened
-                    .list_children(namespace, Uuid::nil(), None, 100)
+                    .list_children(namespace, committed_request.parent, None, 100)
                     .await
                     .is_err()
             );
@@ -3448,7 +3544,7 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
             );
             assert!(
                 !reopened
-                    .list_children(namespace, Uuid::nil(), None, 100)
+                    .list_children(namespace, committed_request.parent, None, 100)
                     .await
                     .unwrap()
                     .items
@@ -3584,6 +3680,7 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                         batch_id,
                         baseline_index,
                         observed_index,
+                        baseline_file_count + 1,
                     )
                     .await
                     .unwrap(),
@@ -3597,7 +3694,8 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                         volume_id,
                         Uuid::new_v4(),
                         baseline_index,
-                        observed_index
+                        observed_index,
+                        baseline_file_count + 1,
                     )
                     .await
                     .unwrap(),
@@ -3678,6 +3776,7 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                         next_batch_id,
                         incorrect_previous,
                         next_index,
+                        baseline_file_count + 130,
                     )
                     .await
                     .unwrap(),
@@ -3691,7 +3790,8 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                         volume_id,
                         next_batch_id,
                         baseline_index,
-                        next_index
+                        next_index,
+                        baseline_file_count + 130,
                     )
                     .await
                     .is_err()
@@ -3705,6 +3805,7 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                         next_batch_id,
                         observed_index,
                         next_index,
+                        baseline_file_count + 130,
                     )
                     .await
                     .unwrap(),
@@ -3853,7 +3954,7 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                 let mut found = std::collections::HashSet::new();
                 loop {
                     let page = reopened
-                        .list_children(namespace, Uuid::nil(), cursor.as_deref(), 23)
+                        .list_children(namespace, committed_request.parent, cursor.as_deref(), 23)
                         .await
                         .unwrap();
                     for child in page.items {
@@ -4076,6 +4177,7 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                         batch_id,
                         baseline_index,
                         observed_index,
+                        baseline_file_count + 1,
                     )
                     .await
                     .unwrap(),
@@ -4270,7 +4372,7 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                     .is_empty()
             );
             let materialized = catalog
-                .resolve_active_path(&serial, b"/active-admission-only")
+                .resolve_active_path(&serial, &committed_path)
                 .await
                 .unwrap()
                 .unwrap();
@@ -4461,29 +4563,17 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                 .unwrap()
                 .unwrap()
                 .to_vec();
-            assert_eq!(source_before.len(), 42);
+            assert_eq!(source_before.len(), 77);
+            assert_eq!(source_before[76], 0); // Full baseline has no predecessors.
             let mut imported_ready = ready_before.clone();
             imported_ready[..8].copy_from_slice(&observed_index.generation.to_be_bytes());
             let mut imported_source = source_before.clone();
-            imported_source[1..42].copy_from_slice(&imported_history[25..66]);
+            imported_source[26..76].copy_from_slice(&imported_history[17..67]);
+            imported_source[76] = 1;
+            imported_source.extend_from_slice(&source_before[10..76]);
             tr.set(&ready_key, &imported_ready);
             tr.set(&source_key, &imported_source);
             tr.clear(&cursor_key);
-            tr.commit().await.unwrap();
-            // This branch imports Full indexes only. An incremental historical
-            // head cannot prove a Full baseline, even with identical SHA.
-            assert!(
-                reopened
-                    .active_batch_status(&serial, volume_id, observed_index.generation)
-                    .await
-                    .is_err()
-            );
-            // Construct the matching synthetic Full completed index, retaining
-            // its exact generation, position, SHA and original batch identity.
-            let mut full_history = imported_history.clone();
-            full_history[66] = 0;
-            let tr = direct.create_trx().unwrap();
-            tr.set(&imported_history_key, &full_history);
             tr.commit().await.unwrap();
             let imported_status = reopened
                 .active_batch_status(&serial, volume_id, observed_index.generation)
@@ -4494,7 +4584,7 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
             assert_eq!(imported_status.batch_id, batch_id);
             // Same generation alone is not sufficient: reject a different head.
             let mut mismatched_source = imported_source;
-            mismatched_source[10] ^= 1;
+            mismatched_source[43] ^= 1;
             let tr = direct.create_trx().unwrap();
             tr.set(&source_key, &mismatched_source);
             tr.commit().await.unwrap();
@@ -4508,7 +4598,6 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
             tr.set(&ready_key, &ready_before);
             tr.set(&source_key, &source_before);
             tr.set(&cursor_key, &cursor_before);
-            tr.set(&imported_history_key, &imported_history);
             tr.commit().await.unwrap();
             assert!(
                 reopened
@@ -4699,11 +4788,11 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                     .create_pool(
                         namespace,
                         &PoolRecord {
+                            created_at_millis: 1_793_405_000_123,
                             library_serial: serial.clone(),
                             id: Uuid::new_v4(),
                             name: "lateactive".into(),
                             file_limit: 1,
-                            created_at_millis: 1_793_405_000_123,
                             policy: PoolPolicy::default(),
                             revision: 1,
                         }
@@ -4834,56 +4923,78 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
             }
             let ready = fdb_http_probe(port, "GET", "/readyz");
             assert!(ready.starts_with("HTTP/1.1 200"), "{ready}");
-            let encoded =
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(active_path.as_bytes());
+            let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(staged_entry.path.logical_path.as_bytes());
             let stat = fdb_http_probe(
                 port,
                 "GET",
-                &format!("/v1/fdb/stat/{serial}?path={encoded}"),
+                &format!("/v1/fdb/stat/{serial}?pool={pool}&path={encoded}"),
             );
             assert!(stat.starts_with("HTTP/1.1 200"), "{stat}");
             assert!(stat.contains("\"kind\":\"file\""), "{stat}");
             let mut cursor = None;
-            let mut found_pool = false;
-            for _ in 0..100 {
+            let mut found_import_file = false;
+            for _ in 0..(next_requests.len() + 3) {
                 let suffix = cursor
                     .as_ref()
                     .map_or(String::new(), |value: &String| format!("&after={value}"));
                 let root = fdb_http_probe(
                     port,
                     "GET",
-                    &format!("/v1/fdb/children/{serial}?path=Lw&limit=1{suffix}"),
+                    &format!("/v1/fdb/children/{serial}?pool={pool}&path=Lw&limit=1{suffix}"),
                 );
                 assert!(root.starts_with("HTTP/1.1 200"), "{root}");
                 let body: serde_json::Value =
                     serde_json::from_str(root.split_once("\r\n\r\n").unwrap().1).unwrap();
                 let items = body["items"].as_array().unwrap();
                 assert!(items.len() <= 1);
-                found_pool |= items.iter().any(|item| item["name"] == pool.to_string());
+                found_import_file |= items.iter().any(|item| item["id"] == plan.id.to_string());
                 let next = body["next"].as_str().map(str::to_owned);
                 if next.is_some() {
                     assert_ne!(next, cursor, "目录分页游标未前进：{body}");
                 }
                 cursor = next;
-                if cursor.is_none() || found_pool {
+                if cursor.is_none() || found_import_file {
                     break;
                 }
             }
-            assert!(found_pool, "根目录分页未列出已知池 {pool}");
-            let parent = active_path.rsplit_once('/').unwrap().0;
+            assert!(found_import_file, "池根目录分页未列出已导入文件 {pool}");
+            let parent = staged_entry.path.logical_path.rsplit_once('/').unwrap().0;
             let parent = if parent.is_empty() { "/" } else { parent };
             let parent = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(parent.as_bytes());
-            let children = fdb_http_probe(
-                port,
-                "GET",
-                &format!("/v1/fdb/children/{serial}?path={parent}&limit=100"),
-            );
-            assert!(children.starts_with("HTTP/1.1 200"), "{children}");
-            assert!(children.contains(&plan.id.to_string()), "{children}");
+            let mut cursor = None;
+            let mut found_import_file = false;
+            for _ in 0..(next_requests.len() + 3) {
+                let suffix = cursor
+                    .as_ref()
+                    .map_or(String::new(), |value: &String| format!("&after={value}"));
+                let children = fdb_http_probe(
+                    port,
+                    "GET",
+                    &format!(
+                        "/v1/fdb/children/{serial}?pool={pool}&path={parent}&limit=100{suffix}"
+                    ),
+                );
+                assert!(children.starts_with("HTTP/1.1 200"), "{children}");
+                let body: serde_json::Value =
+                    serde_json::from_str(children.split_once("\r\n\r\n").unwrap().1).unwrap();
+                let items = body["items"].as_array().unwrap();
+                assert!(items.len() <= 100);
+                found_import_file |= items.iter().any(|item| item["id"] == plan.id.to_string());
+                let next = body["next"].as_str().map(str::to_owned);
+                if next.is_some() {
+                    assert_ne!(next, cursor, "目录分页游标未前进：{body}");
+                }
+                cursor = next;
+                if cursor.is_none() || found_import_file {
+                    break;
+                }
+            }
+            assert!(found_import_file, "目录分页未列出导入文件 {}", plan.id);
             let invalid_cursor = fdb_http_probe(
                 port,
                 "GET",
-                &format!("/v1/fdb/children/{serial}?path=Lw&after=AA&limit=1"),
+                &format!("/v1/fdb/children/{serial}?pool={pool}&path=Lw&after=AA&limit=1"),
             );
             assert!(
                 invalid_cursor.starts_with("HTTP/1.1 400"),
@@ -4945,7 +5056,8 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
                         volume_id,
                         next_batch_id,
                         next_index,
-                        invalid_index
+                        invalid_index,
+                        baseline_file_count + 131,
                     )
                     .await
                     .is_err()
@@ -5111,7 +5223,7 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
             // above before exercising the old import-only discard path.
             let mut child = b"tape-rs/catalog/22/C/".to_vec();
             child.extend_from_slice(namespace.as_bytes());
-            child.extend_from_slice(Uuid::nil().as_bytes());
+            child.extend_from_slice(committed_request.parent.as_bytes());
             child.extend_from_slice(&committed_request.name);
             child.extend_from_slice(&[0, 0]);
             tr.clear(&child);
@@ -5558,20 +5670,8 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
             .await
             .is_err()
     );
-    assert!(catalog.discard_import(namespace).await.unwrap());
-    assert_eq!(
-        catalog
-            .retire_discarded_volume_scan(
-                namespace,
-                &serial,
-                10,
-                bindings[0].placement.volume_id,
-                bindings[0].scan,
-            )
-            .await
-            .unwrap(),
-        VolumeOutcome::ScanConflict
-    );
+    // Cancel the in-flight scan while the candidate still permits scan changes.
+    // Discarded namespaces only permit their explicit retirement operations.
     assert_eq!(
         catalog
             .cancel_volume_reconcile(
@@ -5583,6 +5683,31 @@ async fn staged_import_synthetic(project_file: bool, seal: bool) {
             .await
             .unwrap(),
         VolumeOutcome::Cancelled
+    );
+    assert!(catalog.discard_import(namespace).await.unwrap());
+    assert!(
+        catalog
+            .cancel_volume_reconcile(
+                &serial,
+                10,
+                bindings[0].placement.volume_id,
+                replacement_scan,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        catalog
+            .retire_discarded_volume_scan(
+                namespace,
+                &serial,
+                10,
+                bindings[0].placement.volume_id,
+                replacement_scan,
+            )
+            .await
+            .unwrap(),
+        VolumeOutcome::ScanConflict
     );
     for binding in &bindings {
         assert_eq!(

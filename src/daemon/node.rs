@@ -208,6 +208,7 @@ pub fn run_with_catalog(
     let mut next_tick = Instant::now() + cfg.tick;
     let mut last_status = String::new();
     let mut shutdown: Option<(Instant, Receiver<()>)> = None;
+    let mut shutdown_vips = super::vip::ShutdownVips::default();
     let mut coordinator = cfg
         .coordination
         .clone()
@@ -217,11 +218,16 @@ pub fn run_with_catalog(
     loop {
         if let Some((deadline, done)) = &shutdown {
             let finished = matches!(done.try_recv(), Ok(()) | Err(TryRecvError::Disconnected));
-            let vip_held = ctl
-                .vips
-                .values()
-                .any(|r| r.holder.as_ref().is_some_and(|h| h.node == cfg.id));
+            let vip_held = shutdown_vips.pending(cfg.id, node.raft.leader_id, &ctl.vips);
             if finished && !vip_held {
+                if ctl.vips.values().any(|record| {
+                    record
+                        .holder
+                        .as_ref()
+                        .is_some_and(|holder| holder.node == cfg.id)
+                }) {
+                    info!("本机 VIP 已确认撤址；当前无 Leader，保留未提交的占用记录后退出");
+                }
                 info!("节点 {} 停机", cfg.id);
                 return Ok(());
             }
@@ -272,6 +278,9 @@ pub fn run_with_catalog(
                     Command::VipRelease { node, .. } => *node == cfg.id,
                     _ => false,
                 };
+                if valid {
+                    shutdown_vips.observe(cfg.id, &ctl.vips, &cmd);
+                }
                 if valid && coordinator.is_some() {
                     propose(&mut node, &cmd);
                 }
@@ -655,29 +664,31 @@ pub fn run_with_catalog(
             }
         }
         for entry in committed {
-            applied = applied.max(entry.index);
             if entry.get_entry_type() != EntryType::EntryNormal || entry.data.is_empty() {
+                applied = applied.max(entry.index);
                 continue;
             }
             let Some(cmd) = Command::decode(&entry.data) else {
                 warn!("日志索引 {} 无法解码，跳过", entry.index);
+                applied = applied.max(entry.index);
                 continue;
             };
             let is_leader = node.raft.state == StateRole::Leader;
             let term = node.raft.term;
-            let applied = ctl.apply(entry.index, &cmd);
+            let outcome = ctl.apply(entry.index, &cmd);
             if let Some(files) = catalog_files.as_ref() {
                 files.set_catalog_quiesced(ctl.catalog_quiesce_index.is_some());
             }
             // 等目录库拉回来期间不写本地库：它马上要被整份替换，写进去的会一起丢掉
             if let Some(d) = directory.as_mut().filter(|_| directory_pending.is_none()) {
-                d.apply(entry.index, &cmd, &applied)?;
+                d.apply(entry.index, &cmd, &outcome)?;
             }
+            applied = applied.max(entry.index);
             let waiter = <[u8; 8]>::try_from(entry.context.as_ref())
                 .ok()
                 .and_then(|b| pending_admin.remove(&u64::from_be_bytes(b)));
             if let Some(tx) = waiter {
-                let _ = tx.send(match &applied {
+                let _ = tx.send(match &outcome {
                     Applied::Admin(Ok(s)) => AdminReply::Ok(s.clone()),
                     Applied::Admin(Err(e)) => AdminReply::Rejected(e.clone()),
                     Applied::CatalogRejected => {
@@ -690,7 +701,7 @@ pub fn run_with_catalog(
                 c.observe(&ctl, directory_pending.is_none());
                 continue;
             }
-            match applied {
+            match outcome {
                 Applied::NewExecutor(e) if e.node == cfg.id && is_leader && e.term == term => {
                     info!("本节点成为执行者，轮次 {}（任期 {}）", e.round, e.term);
                     claimed_term = Some(term);
@@ -729,7 +740,8 @@ pub fn run_with_catalog(
                 _ => {}
             }
         }
-        // Confirm control application only after the snapshot and entries are applied.
+        // Ready/LightReady 只交付提交；控制快照恢复及命令实际应用后才确认。
+        // 目录快照异步拉取有独立 pending 屏障，不能以控制 applied 冒充目录已就绪。
         node.advance_apply_to(applied);
         if let Some(c) = coordinator.as_mut() {
             c.confirm(reads, &node, &ctl, applied, directory_pending.is_none());
@@ -873,7 +885,8 @@ fn yield_leadership(node: &mut RawNode<ControlStorage>, cfg: &NodeConfig) {
 }
 
 /// raft-rs 的 Ready 处理。先持久化、再发送需要持久化之后才能发的消息。
-/// 返回 (本轮装入的快照, 已提交的条目)。
+/// 返回 (本轮持久化的快照, 已提交的条目, ReadState)。调用方实际恢复/应用后再
+/// `advance_apply_to`；这里仅通过 `advance_append` 确认持久化。
 pub(super) fn on_ready(
     node: &mut RawNode<ControlStorage>,
     store: &mut RaftStore,

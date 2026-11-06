@@ -1277,6 +1277,26 @@ fn scenario(case: u8) {
                     == vec![0x5a; 700_000];
             }
         } else if case >= 6 {
+            // Pool setup and the file commit may complete a normal takeover.
+            // Fault injection and PR assertions must use the serving round now.
+            let until = Instant::now() + Duration::from_secs(4);
+            let shutdown_owner = loop {
+                let state = statuses[&old.node].lock().unwrap().clone();
+                if let Some(owner) = state.executor.as_ref().filter(|owner| {
+                    state.executor_ready
+                        && owner.node == old.node
+                        && owner.fenced
+                        && services[&owner.node].serving_round() == Some(owner.round)
+                }) {
+                    break owner.clone();
+                }
+                assert!(
+                    Instant::now() < until,
+                    "停机注入前 owner 未恢复就绪: {state:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            let old = &shutdown_owner;
             slow_checkpoint.store(true, Ordering::SeqCst);
             peers[&old.node].send(NodeInput::Shutdown).unwrap();
             if case == 7 {

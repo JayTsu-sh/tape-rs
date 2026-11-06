@@ -152,7 +152,10 @@ impl ManagedCatalog {
                             routing::require_runtime_active_owner(&tr, serial, route, epoch)
                                 .await?;
                         let record = pool_key(namespace, pool.id);
-                        native_device::require_library_available(&tr, namespace, serial).await?;
+                        native_device::require_pool_metadata_available(
+                            &tr, namespace, serial, pool.id,
+                        )
+                        .await?;
                         let named = pool_name_key(namespace, &pool.name);
                         if retired_pool_revision_at(&tr, namespace, pool.id)
                             .await?

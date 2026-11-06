@@ -6,7 +6,9 @@ const MAX_PURGE_PAGE: usize = 100;
 // Copies must go first: they are the bounded reverse lookup for volume rows.
 // The e index is released only by the explicit owner-fenced media check.
 // The managed marker a is cleared after all assignments have been released.
-pub(super) const NAMESPACE_ROWS: &[u8] = b"RtjsquvwnlkhgfoNCHmMPLZIFABDKE@eaWTUX";
+// Forward reservations are namespace-owned too; has_namespace_holds prevents
+// purging them while live. Their volume/target reverse rows use other scopes.
+pub(super) const NAMESPACE_ROWS: &[u8] = b"RtjsquvwnlkhgfoNCHmMPLZ0IFABDKE@eaWTUX";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PurgeProgress {
@@ -450,6 +452,32 @@ pub(super) mod tests {
         .unwrap()
         .items
         .len();
+        let mut observed_rows = 0;
+        for kind in NAMESPACE_ROWS {
+            let prefix = namespace_prefix(*kind, namespace);
+            let mut after = None;
+            loop {
+                let page = read_page(
+                    &catalog.db.create_trx().unwrap(),
+                    &prefix,
+                    after.as_deref(),
+                    100,
+                    true,
+                )
+                .await
+                .unwrap();
+                observed_rows += page.items.len();
+                after = page.next;
+                if after.is_none() {
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            observed_rows,
+            103 * 5 + 1001 * 2 + 6 + 2 + quota_rows,
+            "清理前实际持久行数与夹具预期不符"
+        );
         let first_page = catalog
             .purge_discarded_namespace(namespace, 97)
             .await

@@ -1,0 +1,235 @@
+//! Data relocation is distinct from metadata coverage and final erase proof.
+use super::super::{children, retirement, walk};
+use super::*;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReclaimDataProgress {
+    version: u8,
+    parent: String,
+    inventory: [u8; 32],
+    files: u64,
+    bytes: u64,
+    total_files: u64,
+    total_bytes: u64,
+}
+impl ReclaimDataProgress {
+    pub fn files(&self) -> u64 {
+        self.files
+    }
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+    pub fn total_files(&self) -> u64 {
+        self.total_files
+    }
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+}
+
+fn body_key(reservation: &ReclaimReservation, uid: u64) -> Vec<u8> {
+    let mut key = ledger::own_key(reservation, b'b');
+    key.extend_from_slice(&uid.to_be_bytes());
+    key
+}
+fn destination_key(reservation: &ReclaimReservation, uid: u64, operation: Uuid) -> Vec<u8> {
+    let mut key = ledger::own_key(reservation, b'd');
+    key.extend_from_slice(&uid.to_be_bytes());
+    key.extend_from_slice(operation.as_bytes());
+    key
+}
+pub(in super::super) async fn require_no_data_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+) -> Result<()> {
+    for kind in *b"bdg" {
+        if requests::prefix_has_rows(tr, &ledger::own_key(reservation, kind)).await? {
+            return Err(CatalogError::Corrupt(
+                "回收数据迁移账本在预期空状态下仍有记录",
+            ));
+        }
+    }
+    Ok(())
+}
+async fn progress_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    manifest: &ReclaimSourceProgress,
+) -> Result<ReclaimDataProgress> {
+    let raw = tr.get(&ledger::own_key(reservation, b'g'), false).await?;
+    let Some(raw) = raw else {
+        require_no_data_at(tr, reservation).await?;
+        return Ok(ReclaimDataProgress {
+            version: 1,
+            parent: reservation.fingerprint(),
+            inventory: manifest.summary.digest,
+            files: 0,
+            bytes: 0,
+            total_files: manifest.summary.counts.files,
+            total_bytes: manifest.summary.counts.data_bytes,
+        });
+    };
+    let progress: ReclaimDataProgress = serde_json::from_slice(&raw).map_err(cache)?;
+    if serde_json::to_vec(&progress).map_err(cache)?.as_slice() != raw.as_ref()
+        || progress.version != 1
+        || progress.parent != reservation.fingerprint()
+        || progress.inventory != manifest.summary.digest
+        || progress.total_files != manifest.summary.counts.files
+        || progress.total_bytes != manifest.summary.counts.data_bytes
+        || progress.files > progress.total_files
+        || progress.bytes > progress.total_bytes
+        || progress.files == 0 && progress.bytes != 0
+    {
+        return Err(CatalogError::Corrupt("回收数据迁移进度与原清单不一致"));
+    }
+    Ok(progress)
+}
+
+impl ManagedCatalog {
+    /// Seal source read, destination readback and exact retirement atomically.
+    /// Resolve a lost reply with the same parent/child, without another tape I/O.
+    /// Shared EE data UIDs count once; alias metadata remains separate work.
+    pub async fn seal_reclaim_data_relocation(
+        &self,
+        reservation: &ReclaimReservation,
+        owner: u64,
+        file: &ReclaimFile,
+        request: &ActiveFileRequest,
+    ) -> Result<ReclaimDataProgress> {
+        request.validate()?;
+        self.db
+            .run(|tr, _| {
+                Box::pin(async move {
+                    requests::retry_result(
+                        async {
+                            Box::pin(seal_data_at(&tr, reservation, owner, file, request)).await
+                        }
+                        .await,
+                    )
+                })
+            })
+            .await?
+    }
+}
+
+/// All ledger validation finishes before the shared retirement's first write.
+pub(super) async fn seal_data_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    owner: u64,
+    file: &ReclaimFile,
+    request: &ActiveFileRequest,
+) -> Result<ReclaimDataProgress> {
+    let parent = record_at(tr, reservation, owner).await?;
+    if parent["owner_epoch"] != owner {
+        return Err(CatalogError::OwnerFenced);
+    }
+    let manifest = ledger::require_complete_at(tr, reservation).await?;
+    let (_, index) = source_state_at(tr, reservation).await?;
+    let mut index_bytes = Vec::new();
+    active_volume::encode_index(&mut index_bytes, index);
+    if index_bytes != manifest.summary.head {
+        return Err(CatalogError::Invalid("回收数据迁移的原卷头已改变"));
+    }
+    let (intent, _) = children::child_at(
+        tr,
+        reservation.namespace(),
+        reservation.spec().pool,
+        request.request_epoch,
+        request.operation_id,
+        owner,
+    )
+    .await?
+    .ok_or(CatalogError::Incomplete)?;
+    if intent.request() != *request {
+        return Err(CatalogError::Invalid("数据迁移必须复用封存的原子请求"));
+    }
+    let raw = tr
+        .get(
+            &children::child_key(
+                reservation.namespace(),
+                &reservation.token(),
+                request.operation_id,
+            )?,
+            false,
+        )
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+    let child = decode(&raw)?;
+    let source_raw: Vec<u8> =
+        serde_json::from_value(child["source_copy"].clone()).map_err(cache)?;
+    let source = copy_records::decode_copy(&source_raw)?;
+    let head = decode_head(
+        &serde_json::from_value::<Vec<u8>>(child["source_head"].clone()).map_err(cache)?,
+    )?;
+    let evidence = ReclaimSourceRead::require_source(
+        &child["source_read"],
+        &reservation.fingerprint(),
+        &head,
+        &source,
+        &intent,
+    )?;
+    let object = evidence.object();
+    let object_raw = object.encode()?;
+    if evidence.inventory() != manifest.summary.digest
+        || evidence.index() != manifest.summary.head
+        || object.kind != Kind::File
+        || tr
+            .get(&ledger::object_key(reservation, object.uid), false)
+            .await?
+            .as_deref()
+            != Some(object_raw.as_slice())
+    {
+        return Err(CatalogError::Corrupt("回收数据实读与完整源对象清单不一致"));
+    }
+    let target_raw = tr
+        .get(&walk::verification_key(reservation, file), false)
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+    let receipt =
+        retirement::retirement_receipt(reservation, file, request, &source_raw, &target_raw);
+    let body = json!({"version":1,"parent":reservation.fingerprint(),"inventory":manifest.summary.digest,
+                "uid":object.uid,"object_sha256":Sha256::digest(&object_raw).to_vec(),"sha256":evidence.sha256(),"length":object.length});
+    let body_raw = body.to_string().into_bytes();
+    let destination = json!({"version":1,"parent":reservation.fingerprint(),"uid":object.uid,
+                "request":request.fingerprint(),"body_sha256":Sha256::digest(&body_raw).to_vec(),
+                "target_proof_sha256":Sha256::digest(&target_raw).to_vec(),"retirement":receipt});
+    let destination_raw = destination.to_string().into_bytes();
+    let body_key = body_key(reservation, object.uid);
+    let destination_key = destination_key(reservation, object.uid, request.operation_id);
+    let mut progress = progress_at(tr, reservation, &manifest).await?;
+    let previous_body = tr.get(&body_key, false).await?;
+    if let Some(previous) = &previous_body {
+        if previous.as_ref() != body_raw {
+            return Err(CatalogError::Corrupt("同一数据 UID 的原正文证明改变"));
+        }
+    } else {
+        progress.files = progress
+            .files
+            .checked_add(1)
+            .ok_or(CatalogError::Corrupt("迁移数据计数溢出"))?;
+        progress.bytes = progress
+            .bytes
+            .checked_add(object.length.ok_or(CatalogError::Incomplete)?)
+            .ok_or(CatalogError::Corrupt("迁移数据字节数溢出"))?;
+        if progress.files > progress.total_files || progress.bytes > progress.total_bytes {
+            return Err(CatalogError::Corrupt("迁移数据超出原源清单"));
+        }
+    }
+    if let Some(previous) = tr.get(&destination_key, false).await?
+        && (previous.as_ref() != destination_raw || previous_body.is_none())
+    {
+        return Err(CatalogError::Corrupt(
+            "原数据迁移目的回执冲突或缺少正文证明",
+        ));
+    }
+    let progress_raw = serde_json::to_vec(&progress).map_err(cache)?;
+    // Finish every fallible ledger proof before retirement mutates X1/V.
+    // No read, validation or encoding may follow that shared helper.
+    Box::pin(retirement::retire_at(tr, reservation, owner, file, request)).await?;
+    tr.set(&body_key, &body_raw);
+    tr.set(&destination_key, &destination_raw);
+    tr.set(&ledger::own_key(reservation, b'g'), &progress_raw);
+    Ok(progress)
+}

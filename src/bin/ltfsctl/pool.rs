@@ -1,10 +1,12 @@
 use clap::Subcommand;
 use serde_json::{Value, json};
 use std::path::PathBuf;
+use tape_rs::client::Client;
 use tape_rs::client::fdb::{
     FdbClient,
     management::{ManagementIntent, ManagementRequestFile},
 };
+use uuid::Uuid;
 
 #[derive(Subcommand)]
 pub enum Command {
@@ -15,7 +17,7 @@ pub enum Command {
         file_limit: u64,
         /// 首次调用前保存请求身份；重试须用相同文件和参数
         #[arg(long)]
-        request: PathBuf,
+        request: Option<PathBuf>,
     },
     /// 列出当前带库的全部FDB池
     List {
@@ -31,29 +33,16 @@ pub enum Command {
         attribute: String,
         value: String,
         #[arg(long)]
-        request: PathBuf,
+        request: Option<PathBuf>,
     },
     /// 提交删除空池任务；目录或磁带归属非空时失败
     Delete {
         selector: String,
         #[arg(long)]
-        request: PathBuf,
+        request: Option<PathBuf>,
     },
 }
-#[derive(Subcommand)]
-pub enum TaskCommand {
-    List,
-    /// 根据保存的原始请求查询FDB任务；创建请求查询池UUID
-    Show {
-        #[arg(long)]
-        request: PathBuf,
-    },
-    /// 仅取消尚未执行的FDB任务
-    Cancel {
-        #[arg(long)]
-        request: PathBuf,
-    },
-}
+
 pub(super) fn library<'a>(
     library: Option<&'a str>,
     pool: Option<&str>,
@@ -80,7 +69,10 @@ pub(super) fn submit(
         }
         Err(e) => return Err(e.into()),
     }
-    Ok(client.submit_management(&path)?)
+    eprintln!("原管理请求已保存至 {}", path.display());
+    let mut result = client.submit_management(&path)?;
+    result["request_file"] = json!(path);
+    Ok(result)
 }
 fn items(
     client: &FdbClient,
@@ -141,7 +133,7 @@ pub fn run(
             client,
             library,
             ManagementIntent::Create { name, file_limit },
-            request,
+            request_path(request)?,
         )?,
         Command::Set {
             selector,
@@ -156,13 +148,13 @@ pub fn run(
                 attribute,
                 value,
             },
-            request,
+            request_path(request)?,
         )?,
         Command::Delete { selector, request } => submit(
             client,
             library,
             ManagementIntent::Delete { selector },
-            request,
+            request_path(request)?,
         )?,
         Command::Show { selector } => {
             let context = client.management_context(library)?;
@@ -196,25 +188,53 @@ pub fn run(
     };
     print(result)
 }
-pub fn task(
-    client: &FdbClient,
-    serial: Option<&str>,
-    pool: Option<&str>,
-    command: TaskCommand,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let library = library(serial, pool)?;
-    let cancel = matches!(command, TaskCommand::Cancel { .. });
-    match command {
-        TaskCommand::List => print(items(client, library, true)?),
-        TaskCommand::Show { request } | TaskCommand::Cancel { request } => {
-            let saved = ManagementRequestFile::load(&request)?;
-            if !saved.is_library(library) {
-                return Err("请求文件不属于指定带库".into());
-            }
-            print(client.management_request_status(&request, cancel)?)
-        }
+
+pub(super) fn request_path(path: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Some(path) = path {
+        return Ok(path);
     }
+    use std::os::unix::fs::DirBuilderExt;
+    let root = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|v| PathBuf::from(v).join(".local/state")))
+        .ok_or("无法确定本机状态目录，请指定 --request")?
+        .join("tape-rs/management");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&root)?;
+    Ok(root.join(format!("{}.json", Uuid::new_v4())))
 }
+
+pub(super) fn library_from_client(
+    control: &mut Client,
+    serial: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(serial) = serial {
+        return Ok(serial.into());
+    }
+    let value = control.libraries()?;
+    let libraries = value["items"].as_array().ok_or("带库清单无效")?;
+    if libraries.len() != 1 {
+        return Err("多个带库时必须指定 --library".into());
+    }
+    Ok(libraries[0]["library_serial"]
+        .as_str()
+        .ok_or("带库序列号缺失")?
+        .into())
+}
+
+pub(super) fn selected(
+    client: &FdbClient,
+    serial: &str,
+    selector: &str,
+) -> Result<(uuid::Uuid, Value), Box<dyn std::error::Error>> {
+    let context = client.management_context(serial)?;
+    let ns = context["namespace"].as_str().ok_or("namespace缺失")?;
+    let value = client.pool(serial, ns, selector)?;
+    Ok((ns.parse()?, value["pool"].clone()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

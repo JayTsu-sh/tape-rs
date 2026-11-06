@@ -22,7 +22,7 @@ async fn original_task(
     serial: &str,
     request: &ManagementRequest,
 ) -> Result<Value> {
-    let task = read_task(
+    let task = read_task_at(
         tr,
         request.namespace(),
         serial,

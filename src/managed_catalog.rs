@@ -8,6 +8,8 @@ use foundationdb::{Database, FdbBindingError, KeySelector, RangeOption, Transact
 use uuid::Uuid;
 
 mod attribute_objects;
+mod upload_receipts;
+pub use upload_receipts::{ActiveUploadReceipt, UploadReceiptOutcome};
 mod attributes;
 mod object_metadata;
 pub use attributes::NodeAttributes;
@@ -26,39 +28,82 @@ pub use active_batch::{
 mod verification;
 pub use verification::{ScanDigest, ScanSummary, VerificationOutcome};
 mod cleanup;
-mod control;
 mod copy_records;
-mod cutover;
-mod history;
 pub use copy_records::CopyOrigin;
 use copy_records::{
     StoredCopy, decode_copy, decode_stored_copy, encode_physical_copy, encode_reclaimed_copy,
 };
+mod control;
+pub use control::notifications::tape_inventory_state;
+use control::tape_monitor;
+pub use tape_monitor::{
+    TapeCapacity, TapeMediaFault, TapeMonitorError, TapeMonitorRecord, TapeMonitorSample,
+};
+mod cutover;
+mod ee_internal;
+mod history;
 mod import_materialize;
 mod import_reconcile;
 mod import_spool;
 mod index_evidence;
+mod link_kind;
 mod lookup;
+mod objects;
+pub use objects::{ObjectEntry, ObjectListRequest};
 mod maintenance;
 mod namespace_verification;
+mod namespace_visibility;
+mod node_mutation;
+mod node_plan_objects;
+pub use node_plan_objects::{NodePlanObject, NodePlanUpload};
+mod file_request;
+pub use file_request::ActiveFileRequest;
 mod physical;
+pub use node_mutation::{
+    NodeMutation, NodeMutationAbsenceEvidence, NodeMutationAbsenceKind,
+    NodeMutationAncestorEvidence, NodeMutationContext, NodeMutationEvidence, NodeMutationPlan,
+    XattrMode,
+};
 pub use physical::{
     ActiveFileIntent, PreparedActiveFile, prepare_active_file, prepare_committed_active_file,
 };
 mod native_init;
 mod requests;
 mod reservation;
-pub use native_init::{VerifiedNativeBarrier, verify_native_barriers};
+mod retired_nodes;
+mod upload;
+pub use upload::ActiveUploadSpec;
 mod routing;
+mod s3_rename;
+mod s3_upload;
+pub use native_init::{VerifiedNativeBarrier, verify_native_barriers};
+pub use s3_rename::S3RenameInput;
 mod staged_import;
 mod staged_sources;
 pub use cleanup::PurgeProgress;
 pub use control::{
-    ActivePoolCreation, ControlOutcome, PoolPolicy, PoolRecord, TapeAssignment, VolumePlacement,
-};
-pub use control::{
-    AssignExecution, AssignPhase, AssignPlan, ManagementRequest, MoveExecution, MoveLocation,
-    MoveLocationKind, MovePhase, MovePlan, NotifyConnectionAction, NotifyFilter,
+    ActivePoolCreation, AssignExecution, AssignPhase, AssignPlan, ControlOutcome,
+    ManagementRequest, MoveExecution, MoveLocation, MoveLocationKind, MovePhase, MovePlan,
+    NativeDeviceTask, NativeMediaImport, NativeMediaSource, NodeMutationAncestor,
+    NodeMutationAttempt, NodeMutationAttemptClosure, NodeMutationBaseline, NodeMutationDeletion,
+    NodeMutationObservation, NodeMutationParent, NodeMutationPublication, NodeMutationRequest,
+    NodeMutationRequestContext, NodeMutationSpec, NodeMutationTask, NodeMutationTaskKind,
+    NodeMutationTaskOutcome, NodeMutationTaskState, NodeMutationTaskStatus,
+    NodeRenameAbsenceEvidence, NodeRenameAbsenceKind, NodeRenameAttempt, NodeRenameAttemptPhase,
+    NodeRenameBaseline, NodeRenameDataReferences, NodeRenameGlobalPlan, NodeRenameIntentClosure,
+    NodeRenameLiveFile, NodeRenameManifest, NodeRenameManifestCapture, NodeRenameManifestReader,
+    NodeRenameMediaPlan, NodeRenameObservation, NodeRenameParticipant,
+    NodeRenameParticipantsCapture, NodeRenameParticipantsSummary, NodeRenamePhysicalSource,
+    NodeRenamePhysicalSourceStats, NodeRenameProjectionSpool, NodeRenameProjectionStats,
+    NodeRenameProjectionVolume, NodeRenamePublication, NodeRenameReferenceRole, NodeRenameRequest,
+    NodeRenameRevision, NodeRenameS4Evidence, NodeRenameSpec, NodeRenameSubtreeCapture,
+    NodeRenameSubtreeEntry, NodeRenameSubtreePage, NodeRenameSubtreeSummary, NodeRenameVolumeGuard,
+    NodeRenameVolumeGuardStats, NodeRenameVolumeIntent, NodeRenameVolumePlan,
+    NodeRenameVolumeProjection, NodeRenameVolumeProjectionStats, NotifyConnectionAction,
+    NotifyFilter, PoolPolicy, PoolRecord, PreparedNodeMutationInputs, PreparedNodeRenameInputs,
+    ReclaimDataProgress, ReclaimFile, ReclaimFileMetadata, ReclaimMetadataProgress,
+    ReclaimReservation, ReclaimSourceInventory, ReclaimSourceProgress, ReclaimSourceRead,
+    ReclaimSpec, ReclaimWalk, TapeAssignment, VolumePlacement,
 };
 pub use cutover::{
     FrozenSnapshotIdentity, VerifiedNodeExport, inspect_frozen_snapshot, verify_node_export,
@@ -94,11 +139,14 @@ pub use staged_sources::StagedSourceSummary;
 const PREFIX: &[u8] = b"tape-rs/catalog/22/";
 const MAX_PAGE: usize = 1000;
 const MAX_NAME: usize = 255;
-const MAX_DEPTH: u16 = 1024;
 const MAX_POOL_PATH_BYTES: usize = 2048;
+pub(crate) const NODE_RENAME_MARKER: &str = "tapers.fdb.nodeRename";
+const MAX_DEPTH: u16 = 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
+    #[error("同一 S3 client token 的原请求参数不一致")]
+    IdempotencyMismatch,
     #[error("FDB 目录操作失败: {0}")]
     Fdb(#[from] FdbBindingError),
     #[error("FDB 客户端初始化失败: {0}")]
@@ -109,12 +157,22 @@ pub enum CatalogError {
     Corrupt(&'static str),
     #[error("卷索引缓存校验失败: {0}")]
     Cache(String),
+    #[error("节点计划 {phase} 失败: {source}")]
+    NodePlanIo {
+        phase: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("目录索引未完成，暂不能判定文件是否存在")]
     Incomplete,
     #[error("池或带库正在执行互斥操作")]
     PoolBusy,
     #[error("管理任务队列已满，请稍后重试")]
     ManagementQueueFull,
+    #[error("池正在接入介质，目录暂不可用")]
+    PoolImporting,
+    #[error("磁带离线或在黑名单中，暂不能执行数据读写")]
+    MediaUnavailable,
     #[error("目录维护任务已被新的执行者接管")]
     MaintenanceFenced,
     #[error("带库 owner 已由新的执行轮次接管")]
@@ -137,7 +195,8 @@ impl CatalogError {
 
 pub type Result<T> = std::result::Result<T, CatalogError>;
 
-/// Resolve a public pool-relative path without writing pool UUIDs into tape paths.
+/// Public paths are relative to a pool's virtual root. Pool IDs are never
+/// written as physical LTFS directory components.
 pub fn pool_catalog_path(pool: Uuid, path: &[u8]) -> Result<Vec<u8>> {
     if pool.is_nil()
         || path.len() > MAX_POOL_PATH_BYTES
@@ -403,6 +462,7 @@ pub struct FileHead {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PhysicalCopy {
     pub version: u64,
+    /// The original content source; metadata management preserves it.
     pub origin: CopyOrigin,
     pub volume_id: Uuid,
     pub volume_generation: u64,
@@ -410,8 +470,8 @@ pub struct PhysicalCopy {
     pub ltfs_file_uid: u64,
     pub size: u64,
     pub content_digest: ContentDigest,
-    /// Exact on-medium identity required by whole-volume imports. Single-file
-    /// receipts still require verified managed placement when serving reads.
+    /// Exact on-medium identity for imported files and native links. Active
+    /// uploads use their canonical pool-relative path without this extension.
     pub media: Option<MediaProvenance>,
 }
 
@@ -573,6 +633,18 @@ impl ManagedCatalog {
                                     "非受管命名空间存在扫描修订号",
                                 )));
                             }
+                            let management_window = tr
+                                .get(&control::management::prefix(namespace, b'w'), false)
+                                .await?;
+                            if management_window
+                                .as_deref()
+                                .map(requests::decode_window)
+                                .transpose()
+                                .is_err()
+                                || management_window.is_none()
+                            {
+                                return Ok(Err(CatalogError::Corrupt("管理请求窗口缺失或损坏")));
+                            }
                             let window = tr.get(&requests::window_key(namespace), false).await?;
                             if window
                                 .as_deref()
@@ -592,7 +664,8 @@ impl ManagedCatalog {
                             {
                                 return Ok(Err(CatalogError::Corrupt("受管命名空间缺少根记录")));
                             }
-                            // Never bless orphan rows by adding a new namespace header.
+                            // Do not bless orphan records as current-layout
+                            // data merely by creating a new namespace header.
                             for &kind in cleanup::NAMESPACE_ROWS {
                                 let mut prefix = key(kind);
                                 prefix.extend_from_slice(namespace.as_bytes());
@@ -604,16 +677,16 @@ impl ManagedCatalog {
                                 };
                                 if !tr.get_range(&range, 1, false).await?.is_empty() {
                                     return Ok(Err(CatalogError::Corrupt(
-                                        "命名空间存在无根的目录记录",
+                                        "namespace 存在孤立记录",
                                     )));
                                 }
                             }
                             tr.set(&root, &value);
                             tr.set(&state_key, &[state as u8]);
+                            control::management::initialize(&tr, namespace);
                             if managed {
                                 tr.set(&managed_key, b"");
                                 control::initialize_managed_layout(&tr, namespace);
-                                control::management::initialize(&tr, namespace);
                                 tr.set(&source_revision_key, &0u64.to_be_bytes());
                             }
                             tr.set(
@@ -786,14 +859,9 @@ impl ManagedCatalog {
                     if decoded.attributes.is_some() {
                         return Ok(Err(CatalogError::Invalid("根目录 LTFS 属性与已有导入冲突")));
                     }
-                    if let Err(error) = write_attribute_chunks(
-                        &tr,
-                        namespace,
-                        Uuid::nil(),
-                        false,
-                        Some(&attributes),
-                    )
-                    .await
+                    if let Err(error) =
+                        attribute_objects::require_attributes(&tr, namespace, Some(&attributes))
+                            .await
                     {
                         return Ok(Err(error));
                     }
@@ -905,7 +973,8 @@ impl ManagedCatalog {
                         return Ok(Ok(DirectoryOutcome::IdConflict));
                     }
                     if let Err(error) =
-                        write_attribute_chunks(&tr, namespace, id, false, attributes.as_ref()).await
+                        attribute_objects::require_attributes(&tr, namespace, attributes.as_ref())
+                            .await
                     {
                         return Ok(Err(error));
                     }
@@ -920,11 +989,25 @@ impl ManagedCatalog {
     pub async fn node(&self, namespace: Uuid, id: Uuid) -> Result<Option<Node>> {
         let tr = self.db.create_trx()?;
         require_namespace_readable(&tr, namespace).await?;
-        if tr.get(&namespace_key(namespace), true).await?.as_deref()
-            == Some(&[NamespaceState::Active as u8][..])
-            && let Some((locator, receipt, _)) =
-                lookup::published_file_receipt_at(&tr, namespace, id).await?
+        let active = tr.get(&namespace_key(namespace), true).await?.as_deref()
+            == Some(&[NamespaceState::Active as u8][..]);
+        let published = if active {
+            lookup::published_file_receipt_at(&tr, namespace, id).await?
+        } else {
+            None
+        };
+        let raw = tr.get(&node_key(namespace, id), true).await?;
+        if let Some(bytes) = raw.as_deref()
+            && retired_nodes::from_node_record(namespace, id, bytes)?.is_some()
         {
+            if !active || published.is_some() {
+                return Err(CatalogError::Corrupt(
+                    "已删除 inode 与命名空间或活动发布不一致",
+                ));
+            }
+            return Ok(None);
+        }
+        if let Some((locator, receipt, _)) = published {
             let attributes = active_batch::prepared_attributes_at(&tr, locator.batch_id, &receipt)
                 .await?
                 .ok_or(CatalogError::Corrupt("已发布活动 inode 缺少属性"))?;
@@ -937,7 +1020,7 @@ impl ManagedCatalog {
                 attributes: Some(self.hydrate_attributes(namespace, attributes).await?),
             }));
         }
-        let Some(bytes) = tr.get(&node_key(namespace, id), true).await? else {
+        let Some(bytes) = raw else {
             return Ok(None);
         };
         let mut node = decode_node(&bytes)?;
@@ -1513,7 +1596,6 @@ impl ManagedCatalog {
                         name: receipt.name.clone(),
                         attributes: attributes.clone(),
                     });
-                    let mut old_external = false;
                     if let Some(node) = tr.get(&file_node, false).await? {
                         let old = match decode_node(&node) {
                             Ok(node) => node,
@@ -1528,10 +1610,6 @@ impl ManagedCatalog {
                         if old.attributes.is_some() && attributes.is_none() {
                             return Ok(Ok(PublishOutcome::OperationConflict));
                         }
-                        old_external = old
-                            .attributes
-                            .as_ref()
-                            .is_some_and(NodeAttributes::is_external);
                     }
                     let previous = tr.get(&head, false).await?;
                     if let Some(bytes) = &previous
@@ -1562,11 +1640,9 @@ impl ManagedCatalog {
                         Err(CatalogError::Client(error)) => return Err(error.into()),
                         Err(error) => return Ok(Err(error)),
                     };
-                    if let Err(error) = write_attribute_chunks(
+                    if let Err(error) = attribute_objects::require_attributes(
                         &tr,
                         receipt.namespace,
-                        receipt.file_id,
-                        old_external,
                         attributes.as_ref(),
                     )
                     .await
@@ -1618,11 +1694,24 @@ impl ManagedCatalog {
     pub async fn file_head(&self, namespace: Uuid, file_id: Uuid) -> Result<Option<FileHead>> {
         let tr = self.db.create_trx()?;
         require_namespace_readable(&tr, namespace).await?;
-        if tr.get(&namespace_key(namespace), true).await?.as_deref()
-            == Some(&[NamespaceState::Active as u8][..])
-            && let Some((_, receipt, _)) =
-                lookup::published_file_receipt_at(&tr, namespace, file_id).await?
+        let active = tr.get(&namespace_key(namespace), true).await?.as_deref()
+            == Some(&[NamespaceState::Active as u8][..]);
+        let published = if active {
+            lookup::published_file_receipt_at(&tr, namespace, file_id).await?
+        } else {
+            None
+        };
+        if let Some(bytes) = tr.get(&node_key(namespace, file_id), true).await?
+            && retired_nodes::from_node_record(namespace, file_id, &bytes)?.is_some()
         {
+            if !active || published.is_some() {
+                return Err(CatalogError::Corrupt(
+                    "已删除 inode 与命名空间或活动发布不一致",
+                ));
+            }
+            return Ok(None);
+        }
+        if let Some((_, receipt, _)) = published {
             return lookup::candidate_head(&receipt).map(Some);
         }
         let value = tr.get(&head_key(namespace, file_id), true).await?;
@@ -2145,32 +2234,6 @@ fn node_key(ns: Uuid, id: Uuid) -> Vec<u8> {
     k
 }
 
-fn attribute_chunk_prefix(ns: Uuid, id: Uuid) -> Vec<u8> {
-    let mut k = key(b'm');
-    k.extend_from_slice(ns.as_bytes());
-    k.extend_from_slice(id.as_bytes());
-    k
-}
-
-async fn write_attribute_chunks(
-    tr: &Transaction,
-    ns: Uuid,
-    id: Uuid,
-    old_external: bool,
-    attributes: Option<&NodeAttributes>,
-) -> Result<()> {
-    // Only retire old per-inode storage. Immutable M objects are retained;
-    // the reference switch must never delete a version still held by a reader.
-    if old_external {
-        let prefix = attribute_chunk_prefix(ns, id);
-        tr.clear_range(&prefix, &prefix_end(&prefix));
-    }
-    if let Some(manifest) = attributes.and_then(NodeAttributes::manifest) {
-        attribute_objects::require_complete(tr, ns, manifest).await?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 async fn hydrate_node(
     tr: &Transaction,
@@ -2465,6 +2528,9 @@ fn validate_receipt(receipt: &CommitReceipt) -> Result<()> {
             "owner、请求代次、卷代数和 LTFS fileuid 必须大于零",
         ));
     }
+    if receipt.expected_version == Some(0) {
+        return Err(CatalogError::Invalid("覆盖版本必须大于零"));
+    }
     receipt
         .expected_version
         .unwrap_or(0)
@@ -2539,7 +2605,7 @@ async fn test_publish_imported(
     catalog.publish_imported(receipt).await
 }
 
-// Legacy storage fixtures intentionally have no managed placement. Inspect their
+// Unplaced storage fixtures intentionally have no managed placement. Inspect their
 // scan-qualified records for GC/recovery assertions, while also proving that the
 // public serving API rejects them. Never use this helper in managed/owner tests.
 #[cfg(test)]
@@ -3184,7 +3250,12 @@ mod tests {
             records.push((*id, node.clone(), None));
         }
         for receipt in receipts {
-            assert!(receipt.parent.is_nil(), "fixture helper expects root files");
+            assert!(
+                records
+                    .iter()
+                    .any(|(id, node, _)| *id == receipt.parent && node.kind == NodeKind::Directory),
+                "fixture parent must be a declared directory"
+            );
             records.push((
                 receipt.file_id,
                 Node {
@@ -4002,6 +4073,24 @@ mod tests {
         }
         let tr = reopened.db.create_trx().unwrap();
         assert!(tr.get(&key, false).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；仅验证独立命名空间清理"]
+    async fn isolated_fdb_namespace_cleanup() {
+        let cluster_file = std::env::var("FDB_TEST_CLUSTER").expect("FDB_TEST_CLUSTER");
+        let _network = unsafe { foundationdb::boot() };
+        let catalog = ManagedCatalog::open(Some(&cluster_file)).unwrap();
+        cleanup::tests::exercise(&catalog, &cluster_file).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；仅测试请求登记、取消和分页"]
+    async fn isolated_fdb_request_cancellation_and_paging() {
+        let cluster_file = std::env::var("FDB_TEST_CLUSTER").expect("FDB_TEST_CLUSTER");
+        let _network = unsafe { foundationdb::boot() };
+        let catalog = ManagedCatalog::open(Some(&cluster_file)).unwrap();
+        requests::tests::exercise(&catalog, &cluster_file).await;
     }
 
     #[tokio::test]

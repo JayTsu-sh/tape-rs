@@ -92,7 +92,7 @@ pub(crate) fn probe_empty_volume(
         incremental: head.incremental,
     };
     let proof = verify_dp_ip_head_with_evidence(drive, label, expected, &budget)?;
-    if proof.ip_generation != expected.generation || !proof.empty_unlocked {
+    if proof.ip_generation != Some(expected.generation) || !proof.empty_unlocked {
         return Ok(false);
     }
     // The index proof uses P0's identity. Both physical labels must agree
@@ -125,7 +125,7 @@ pub struct StreamedFullRecovery {
     pub construct: CommittedIndexConstruct,
     pub source_bytes: u64,
     pub dp_eod: u64,
-    pub ip_generation: u64,
+    pub ip_generation: Option<u64>,
     pub history_depth: u32,
     /// Same bounded historical audit semantics as `verify_chain`. This is not
     /// a claim that every generation was audited, nor permission to write.
@@ -197,23 +197,7 @@ fn full_at(
     })
 }
 
-/// Capture the exact latest clean Full DP XML while scanning child-free nodes
-/// into disposable SQLite, then verify its bounded Full history and DP/IP view.
-/// Memory depends on one node/XML event, directory depth, and fixed DB buffers,
-/// rather than the number of files. Large individual attributes still matter.
-///
-/// Caller must serialize device use and enforce current owner/PR before and
-/// after every command. Output is provisional until success: never publish a
-/// partial file. This returns read evidence, not writable recovery, a general
-/// T1/T2 repair verdict, or an incremental-chain bootstrap. An incremental head
-/// or predecessor is explicitly rejected; the FDB reader has a separate exact
-/// recorded-source replay path. No on-tape state is changed here.
-pub fn capture_full_recovery(
-    drive: &TapeDrive<'_>,
-    label: &LtfsLabel,
-    budget: &RecoveryBudget,
-    output: &mut dyn Write,
-) -> Result<StreamedFullRecovery> {
+pub(super) fn clean_dp_head_position(drive: &TapeDrive<'_>) -> Result<(u64, u64, u64)> {
     drive.locate_eod(1)?;
     let eod = drive.read_position()?;
     if eod.partition != 1 {
@@ -235,6 +219,27 @@ pub fn capture_full_recovery(
             reason: "DP 末构造位置无效".into(),
         });
     }
+    Ok((start, closing, eod.block_number))
+}
+
+/// Capture the exact latest clean Full DP XML while scanning child-free nodes
+/// into disposable SQLite, then verify its bounded Full history and DP/IP view.
+/// Memory depends on one node/XML event, directory depth, and fixed DB buffers,
+/// rather than the number of files. Large individual attributes still matter.
+///
+/// Caller must serialize device use and enforce current owner/PR before and
+/// after every command. Output is provisional until success: never publish a
+/// partial file. This returns read evidence, not writable recovery, a general
+/// T1/T2 repair verdict, or an incremental-chain bootstrap. An incremental head
+/// or predecessor is explicitly rejected; the FDB reader has a separate exact
+/// recorded-source replay path. No on-tape state is changed here.
+pub fn capture_full_recovery(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    budget: &RecoveryBudget,
+    output: &mut dyn Write,
+) -> Result<StreamedFullRecovery> {
+    let (start, closing, eod) = clean_dp_head_position(drive)?;
     let comparison = FullIndexComparison::new(&budget.index_scratch)?;
     let mut head = full_at(
         drive,
@@ -244,7 +249,7 @@ pub fn capture_full_recovery(
         |entry| comparison.record(false, entry),
         Some(output),
     )?;
-    if head.next.checked_sub(1) != Some(closing) || head.next != eod.block_number {
+    if head.next.checked_sub(1) != Some(closing) || head.next != eod {
         return Err(TapeError::RecoveryRestricted {
             reason: "DP Full 构造未紧邻数据分区 EOD".into(),
         });
@@ -304,7 +309,7 @@ pub fn capture_full_recovery(
     Ok(StreamedFullRecovery {
         construct,
         source_bytes,
-        dp_eod: eod.block_number,
+        dp_eod: eod,
         ip_generation,
         history_depth: depth,
         history_truncated: truncated,

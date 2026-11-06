@@ -16,7 +16,7 @@ use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use slog::Drain;
 
-use super::coordinator::Coordinator;
+use super::coordinator::{Coordinator, placement};
 use super::directory::Directory;
 use super::executor::{DeviceProvider, ExecEvent, ExecRequest};
 use super::files::FileService;
@@ -1211,6 +1211,7 @@ pub fn run(
     let mut waiters: HashMap<u64, Sender<AdminReply>> = HashMap::new();
     let mut request_id = 0u64;
     let mut shutdown: Option<(Instant, Vec<Receiver<()>>)> = None;
+    let mut shutdown_vips = super::vip::ShutdownVips::default();
     let mut snapshot_job: Option<SnapshotJob> = None;
     let mut deferred_directory = None;
     loop {
@@ -1236,13 +1237,24 @@ pub fn run(
             let done = receivers
                 .iter()
                 .all(|r| !matches!(r.try_recv(), Err(mpsc::TryRecvError::Empty)));
-            let held = state.controls[GATEWAY]
-                .vips
-                .values()
-                .any(|v| v.holder.as_ref().is_some_and(|h| h.node == cfg.id));
-            if (done && !held && running.values().all(directory_idle))
-                || Instant::now() >= *deadline
-            {
+            let held =
+                shutdown_vips.pending(cfg.id, node.raft.leader_id, &state.controls[GATEWAY].vips);
+            if done && !held && running.values().all(directory_idle) {
+                if state.controls[GATEWAY].vips.values().any(|record| {
+                    record
+                        .holder
+                        .as_ref()
+                        .is_some_and(|holder| holder.node == cfg.id)
+                }) {
+                    log::info!("本机 VIP 已确认撤址；当前无 Leader，保留未提交的占用记录后退出");
+                }
+                return Ok(());
+            }
+            if Instant::now() >= *deadline {
+                log::warn!(
+                    "等待设备、目录任务或 VIP 撤址确认超过 {:?}，保留未确认状态后退出",
+                    cfg.shutdown_grace
+                );
                 return Ok(());
             }
         }
@@ -1301,6 +1313,7 @@ pub fn run(
                     _ => false,
                 };
                 if scope == GATEWAY && valid {
+                    shutdown_vips.observe(cfg.id, &state.controls[GATEWAY].vips, &command);
                     let _ = node.propose(vec![], encode_command(GATEWAY, &command));
                 }
             }
@@ -1395,7 +1408,25 @@ pub fn run(
         if node.raft.state != StateRole::Leader {
             waiters.clear();
         }
+        let plan = placement::spread(
+            &running
+                .iter()
+                .filter(|(id, _)| id.as_str() != GATEWAY)
+                .map(|(id, r)| {
+                    (
+                        id.clone(),
+                        r.coordinator.placement_input(&state.controls[id]),
+                    )
+                })
+                .collect(),
+        );
         for (id, r) in &mut running {
+            if id != GATEWAY {
+                r.coordinator.set_placement(
+                    plan.get(id)
+                        .map(|node| (*node, state.controls[id].candidates[node].instance)),
+                );
+            }
             // `tick` may send Recover immediately. Publish the frozen source
             // index it used before the executor can consume that request.
             r.runtime
@@ -1443,8 +1474,8 @@ pub fn run(
             }
         }
         for entry in entries {
-            applied = applied.max(entry.index);
             if entry.get_entry_type() != EntryType::EntryNormal || entry.data.is_empty() {
+                applied = applied.max(entry.index);
                 continue;
             }
             let outcome = apply_entry(
@@ -1454,6 +1485,7 @@ pub fn run(
                 &entry.data,
                 pending.is_none(),
             )?;
+            applied = applied.max(entry.index);
             if let Ok(bytes) = <[u8; 8]>::try_from(entry.context.as_ref())
                 && let Some(reply) = waiters.remove(&u64::from_be_bytes(bytes))
             {
@@ -1471,7 +1503,8 @@ pub fn run(
         if pending.is_none() {
             advance_directories(&mut running, applied)?;
         }
-        // Directory jobs/fetches retain their own readiness barriers.
+        // 确认已恢复/应用的全局控制位置；异步目录 job/queue/fetch 仍由独立屏障控制，
+        // 不将控制 applied 当作各目录已完成的水位。
         node.advance_apply_to(applied);
         for (id, r) in &mut running {
             let idle = directory_idle(r);
@@ -2662,6 +2695,227 @@ mod tests {
         .unwrap();
         assert!(state.controls[GATEWAY].vips[&address].holder.is_none());
     }
+    #[test]
+    fn local_vip_withdrawal_without_quorum_finishes_single_node_shutdown() {
+        shutdown_without_quorum(false);
+    }
+
+    #[test]
+    fn local_vip_withdrawal_without_quorum_finishes_multilib_shutdown() {
+        shutdown_without_quorum(true);
+    }
+
+    fn shutdown_without_quorum(multiple: bool) {
+        struct Offline;
+        impl Network for Offline {
+            fn send(&self, _: raft::eraftpb::Message) {}
+        }
+        let root = std::env::temp_dir().join(format!("shutdown-vip-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let libraries = config();
+        let address = "192.0.2.100".parse().unwrap();
+        let mut control = ControlState::default();
+        control.apply(9, &Command::Takeover { node: 1, term: 1 });
+        control.apply(
+            10,
+            &Command::VipAcquire {
+                address,
+                node: 1,
+                round: 9,
+                expected_token: 0,
+            },
+        );
+        let data = if multiple {
+            let mut state = ClusterState::new(&libraries);
+            for value in state.controls.values_mut() {
+                *value = control.clone();
+            }
+            state.snapshot(1, 0)
+        } else {
+            ControlSnapshot {
+                control,
+                source: 1,
+                directory_index: 0,
+            }
+            .encode()
+        };
+        let path = root.join("raft.db");
+        let mut store = RaftStore::open(&path, &[1, 2, 3]).unwrap();
+        let mut snapshot = raft::eraftpb::Snapshot::default();
+        snapshot.set_data(data.into());
+        snapshot.mut_metadata().set_index(10);
+        snapshot.mut_metadata().set_term(1);
+        snapshot
+            .mut_metadata()
+            .set_conf_state(raft::eraftpb::ConfState::from((vec![1, 2, 3], vec![])));
+        store.install_snapshot(&snapshot).unwrap();
+        store
+            .set_hardstate(&raft::eraftpb::HardState {
+                term: 1,
+                commit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        drop(store);
+        let store = RaftStore::open(&path, &[1, 2, 3]).unwrap();
+        let cfg = NodeConfig {
+            id: 1,
+            peers: vec![1, 2, 3],
+            tick: Duration::from_millis(10),
+            election_ticks: 10,
+            heartbeat_ticks: 3,
+            status_file: None,
+            directory_file: None,
+            cooldown: Duration::from_secs(1),
+            snapshot: SnapshotPolicy::default(),
+            shutdown_grace: Duration::from_secs(2),
+            drives: 1,
+            coordination: Some(CoordinationConfig {
+                group: "test".into(),
+                validity: Duration::from_secs(6),
+            }),
+        };
+        let (tx, rx) = mpsc::channel();
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let mut finish_rx = Some(finish_rx);
+        let mut workers = Vec::new();
+        let mut runtimes = Vec::new();
+        let names = if multiple {
+            libraries
+                .libraries
+                .iter()
+                .map(|l| l.changer_serial.clone())
+                .chain(std::iter::once(GATEWAY.to_owned()))
+                .collect::<Vec<_>>()
+        } else {
+            vec!["a".to_owned()]
+        };
+        let count = names.len();
+        for name in names {
+            let (exec, requests) = mpsc::channel();
+            let seen = seen_tx.clone();
+            let finish = finish_rx.take();
+            workers.push(std::thread::spawn(move || {
+                while let Ok(request) = requests.recv() {
+                    if let ExecRequest::Shutdown { done } = request {
+                        seen.send(()).unwrap();
+                        if let Some(finish) = finish {
+                            finish.recv().unwrap();
+                        }
+                        done.unwrap().send(()).unwrap();
+                        return;
+                    }
+                }
+            }));
+            runtimes.push(LibraryRuntime {
+                id: name.clone(),
+                group: name.clone(),
+                drives: 1,
+                directory_file: None,
+                exec,
+                status: Arc::new(Mutex::new(NodeStatus::default())),
+                files: FileService::new(root.join(format!("spool-{name}"))).unwrap(),
+            });
+        }
+        let (completed, result) = mpsc::channel();
+        let sender = tx.clone();
+        let node = std::thread::spawn(move || {
+            let outcome = if multiple {
+                run(
+                    cfg,
+                    libraries,
+                    store,
+                    Box::new(Offline),
+                    None,
+                    sender,
+                    rx,
+                    runtimes,
+                )
+            } else {
+                let runtime = runtimes.remove(0);
+                super::super::node::run(
+                    cfg,
+                    store,
+                    Box::new(Offline),
+                    rx,
+                    runtime.exec,
+                    runtime.status,
+                )
+            };
+            completed.send(outcome).unwrap();
+        });
+        tx.send(NodeInput::Shutdown).unwrap();
+        for _ in 0..count {
+            seen_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        let proof = |node, round, token| {
+            NodeInput::Vip(Command::VipRelease {
+                address,
+                node,
+                round,
+                token,
+            })
+        };
+        if multiple {
+            tx.send(proof(1, 9, 10)).unwrap();
+        } else {
+            for invalid in [proof(2, 9, 10), proof(1, 8, 10), proof(1, 9, 9)] {
+                tx.send(invalid).unwrap();
+            }
+        }
+        std::thread::sleep(Duration::from_millis(60));
+        let waited_for_worker = !node.is_finished();
+        finish_tx.send(()).unwrap();
+        let mut waited_for_proof = true;
+        if !multiple {
+            std::thread::sleep(Duration::from_millis(80));
+            waited_for_proof = !node.is_finished();
+            let _ = tx.send(proof(1, 9, 10));
+        }
+        let early = match result.recv_timeout(Duration::from_millis(800)) {
+            Ok(outcome) => {
+                outcome.unwrap();
+                true
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                result
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap()
+                    .unwrap();
+                false
+            }
+            Err(error) => panic!("节点结果通道异常: {error}"),
+        };
+        node.join().unwrap();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        // 本机退出不能伪造 Raft 提交，磁盘上的旧占用仍须保留。
+        let store = RaftStore::open(&path, &[1, 2, 3]).unwrap();
+        assert_eq!(store.snapshot_index(), 10);
+        let bytes = store.loaded_snapshot().unwrap().get_data();
+        let held = if multiple {
+            ClusterState::restore(&config(), bytes).unwrap().0.controls[GATEWAY].vips[&address]
+                .clone()
+        } else {
+            ControlSnapshot::decode(bytes).unwrap().control.vips[&address].clone()
+        };
+        assert_eq!(held.token, 10);
+        assert_eq!(held.holder.unwrap().node, 1);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(waited_for_worker, "设备执行线程未结束时禁止提前退出");
+        assert!(
+            waited_for_proof,
+            "其他节点、旧轮次或旧 token 的撤址确认无效"
+        );
+        assert!(
+            early,
+            "设备已结束且本机确认撤址后，不应因失去多数派等满停机宽限"
+        );
+    }
+
     fn running(root: &Path, id: &str) -> Running {
         std::fs::create_dir_all(root).unwrap();
         let (exec, _rx) = mpsc::channel();

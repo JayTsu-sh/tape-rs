@@ -1,3 +1,21 @@
+## 2026-11-04 — 真实磁带状态构造及识别时效验证完成
+
+生产版本仍为监控e29，源码未改。真实策略offline/blacklisted/恢复、AA18 unknown→appendable、AA17 importing与原生外部Full引起的import_required均已验证；延迟与机械/导入耗时分别报告，不把不可现场构造的写保护、满带、永久坏带声称为已测。后台实带采样间隔约30.22/30.18秒。
+
+最终AA17/AA18归原槽、策略flags还原、三节点/FDB healthy、EELE全停，owner为B node1/A node2。原始证据及本轮状态/未验证项见 [状态构造实带报告](../.scratch/ltfs-ha/reports/tape-monitor-states-physical-20261104.md)；接续以交接文件最新记录为准。
+
+## 2026-11-04 — 磁带原生监控实带验收完成
+
+207–209 实际已部署磁带监控版本，两个 Library owner 分散在 node1/node3，AA0017L8 已归槽。约30秒库存刷新、装载卷 TapeAlert/WP/MAM 采集、FDB 故障锁存、CLI/HTTP 共用记录，以及实际S3读写/跨节点接管均已验证。永久坏带故障注入仅在隔离 FDB+Sim 中验证，未损坏真实介质。
+
+监控直接使用 tape-rs 自身的 SCSI/SG_IO，不调用 EE/LE CLI、HTTP/REST、私有接口或缓存；EE 全程停止。规范见 [管理模型](management-model.md)，部署 SHA、25项软件检查、物理证据与边界见 [监控实带报告](../.scratch/ltfs-ha/reports/tape-monitor-physical-20261104.md)。接续以 `.scratch/ltfs-ha/handoff-to-codex.md` 最新记录为准；下方较早报告保留作历史。
+
+## 2026-11-04 — 已装载外部 Full 启动与管理队列实带验收完成
+
+当前实际部署为 207–209 三节点项目/FDB 集群，两个 Library 的 active_node 分散；AA0017L8 已正常归槽，EE 全停。外部 Full 留驱动器时保留管理入口、显式原卷异步刷新和池忙时队列/取消已在真实 TS4300 验证；FUSE/S3 冷读及属性共41项通过。实测 LE 正常 unmount 会归槽，本轮在全部控制器释放后显式装回 AA17 构造加载启动条件，没有重写 EE 文件。
+
+部署 SHA、原始证据与环境告警见[本轮报告](../.scratch/ltfs-ha/reports/loaded-media-refresh-physical-20261104.md)；接续始终先核对 [AGENTS.md](../AGENTS.md) 和 `.scratch/ltfs-ha/handoff-to-codex.md` 最新条目。下方旧日期的硬件状态及待办为历史，不自动执行。
+
 ## 2026-10-19 — HTTP VIP 交付与主分支接续
 
 当前直接使用 `/work/jay/tape-rs` 的 `main`；原开发 worktree 已迁移。接续以 `AGENTS.md` 和 `.scratch/ltfs-ha/handoff-to-codex.md` 最新条目为准；下方旧日期的待办、运行进程和硬件状态只作为历史记录，不自动触发重跑。

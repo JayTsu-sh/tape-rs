@@ -35,7 +35,7 @@ fn require_request(
     Ok(())
 }
 async fn original(tr: &Transaction, serial: &str, request: &ManagementRequest) -> Result<Value> {
-    let task = read_task(
+    let task = read_task_at(
         tr,
         request.namespace(),
         serial,
@@ -49,7 +49,11 @@ async fn original(tr: &Transaction, serial: &str, request: &ManagementRequest) -
     }
     Ok(task)
 }
-pub(super) async fn pending_at(tr: &Transaction, ns: Uuid, serial: &str) -> Result<Option<Value>> {
+pub(in crate::managed_catalog::control) async fn pending_at(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+) -> Result<Option<Value>> {
     let Some(raw) = tr
         .get(&native_device::library_gate(ns, serial), false)
         .await?
@@ -84,17 +88,30 @@ pub(super) async fn pending_at(tr: &Transaction, ns: Uuid, serial: &str) -> Resu
                 .filter(|id| !id.is_nil() && id.to_string() == s)
         })
         .ok_or(CatalogError::Corrupt("机械任务gate UUID无效"))?;
-    let task = read_task(tr, ns, serial, epoch, operation)
+    let task = read_task_at(tr, ns, serial, epoch, operation)
         .await?
         .ok_or(CatalogError::Corrupt("机械任务gate缺少原任务"))?;
     if task["status"] != "running"
         || !matches!(
             task["request"]["change"]["kind"].as_str(),
-            Some("media-move" | "media-assign")
+            Some(
+                "media-move"
+                    | "media-assign"
+                    | "media-import"
+                    | "media-unassign"
+                    | "media-validate"
+                    | "media-online"
+            )
         )
         || task["fingerprint"] != gate["fingerprint"]
     {
         return Err(CatalogError::Corrupt("机械任务gate与原执行检查点不符"));
+    }
+    if !matches!(
+        task["request"]["change"]["kind"].as_str(),
+        Some("media-move" | "media-assign")
+    ) {
+        native_media::task_progress(tr, &task).await?;
     }
     Ok(Some(task))
 }
@@ -158,7 +175,7 @@ async fn home_at(
                 .filter(|id| !id.is_nil() && id.to_string() == s)
         })
         .ok_or(CatalogError::Corrupt("home来源任务 UUID无效"))?;
-    let task = read_task(tr, ns, serial, epoch, operation)
+    let task = read_task_at(tr, ns, serial, epoch, operation)
         .await?
         .ok_or(CatalogError::Corrupt("home缺少原任务证明"))?;
     let request = ManagementRequest::parse(task["request"].clone())

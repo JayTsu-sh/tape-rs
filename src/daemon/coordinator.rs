@@ -100,6 +100,16 @@ pub(super) struct Coordinator {
     next_check: Instant,
     next_report: Instant,
     next_assign: Instant,
+    placement: Option<Preference>,
+}
+
+#[path = "placement.rs"]
+pub(crate) mod placement;
+
+struct Preference {
+    target: Option<(u64, u64)>,
+    since: Instant,
+    owner: Option<(u64, u64, u64)>,
 }
 
 impl Drop for Coordinator {
@@ -125,6 +135,7 @@ impl Coordinator {
             ));
         }
         let permission = Arc::new(Permission::default());
+        permission.enable_activity(id, instance);
         exec.send(ExecRequest::AttachPermission {
             permission: permission.clone(),
         })
@@ -155,11 +166,42 @@ impl Coordinator {
             next_check: now,
             next_report: now,
             next_assign: now,
+            placement: None,
         })
     }
 
     pub(super) fn set_scope(&mut self, scope: String) {
         self.scope = Some(scope);
+    }
+
+    pub(super) fn placement_input(&self, ctl: &ControlState) -> placement::Library {
+        let now = Instant::now();
+        placement::Library {
+            candidates: ctl
+                .candidates
+                .keys()
+                .copied()
+                .filter(|id| self.fresh(ctl, *id, now))
+                .collect(),
+            owner: ctl
+                .executor
+                .as_ref()
+                .filter(|e| {
+                    self.fresh(ctl, e.node, now)
+                        && ctl.candidates[&e.node].instance == ctl.executor_instance
+                })
+                .map(|e| e.node),
+        }
+    }
+
+    pub(super) fn set_placement(&mut self, target: Option<(u64, u64)>) {
+        if self.placement.as_ref().is_none_or(|p| p.target != target) {
+            self.placement = Some(Preference {
+                target,
+                since: Instant::now(),
+                owner: None,
+            });
+        }
     }
 
     fn propose(&self, node: &mut RawNode<ControlStorage>, cmd: &Command) -> bool {
@@ -397,6 +439,8 @@ impl Coordinator {
     }
 
     pub(super) fn observe(&mut self, ctl: &ControlState, directory_idle: bool) {
+        self.permission
+            .observe_activity(ctl.device_activity.as_ref());
         let now = Instant::now();
         for (&id, c) in &ctl.candidates {
             if self
@@ -462,6 +506,17 @@ impl Coordinator {
             self.next_check = now;
         }
         if let Some(round) = own {
+            while let Some(update) = self.permission.next_activity() {
+                if update.round == round {
+                    self.report(
+                        round,
+                        Command::DeviceActivity {
+                            sequence: update.sequence,
+                            busy: update.busy,
+                        },
+                    );
+                }
+            }
             let e = ctl.executor.as_ref().unwrap();
             let phase = if ctl.executor_ready {
                 Phase::Serving
@@ -553,9 +608,41 @@ impl Coordinator {
                         .get(&e.node)
                         .is_some_and(|c| c.instance == ctl.executor_instance)
             });
-            // Leader 具备本设备组的有效资格时兼任 owner；无资格时保留健康 owner。
-            let leader_should_own = self.fresh(ctl, self.id, now)
-                && ctl.executor.as_ref().is_none_or(|e| e.node != self.id);
+            let (chosen, replace) = if let Some(preference) = self.placement.as_mut() {
+                let owner = ctl
+                    .executor
+                    .as_ref()
+                    .map(|e| (e.node, ctl.executor_instance, e.round));
+                if preference.owner != owner {
+                    preference.owner = owner;
+                    preference.since = now;
+                }
+                // 失效 owner 可立即替换；健康迁移须等当前轮次恢复完成、目标稳定。
+                // 短目录任务只阻止当下迁移，不清空稳定期，避免周期快照饿死再均衡。
+                if !ctl.executor_ready {
+                    preference.since = now;
+                }
+                let stable = now.duration_since(preference.since) >= self.cfg.validity * 2
+                    && self.catalog_ready
+                    && directory_ready;
+                let target = preference.target;
+                let chosen = target
+                    .filter(|(id, instance)| {
+                        self.fresh(ctl, *id, now) && ctl.candidates[id].instance == *instance
+                    })
+                    .map(|(id, _)| id);
+                let differs =
+                    chosen.is_some_and(|id| ctl.executor.as_ref().is_none_or(|e| e.node != id));
+                (chosen, !healthy_owner || (differs && stable))
+            } else {
+                // 单库与 gateway 保留 Leader 优先；设备库由多库主循环统一分散。
+                let leader_should_own = self.fresh(ctl, self.id, now)
+                    && ctl.executor.as_ref().is_none_or(|e| e.node != self.id);
+                let chosen = std::iter::once(self.id)
+                    .chain(ctl.candidates.keys().copied().filter(|id| *id != self.id))
+                    .find(|id| self.fresh(ctl, *id, now));
+                (chosen, leader_should_own || !healthy_owner)
+            };
             if ctl.catalog_quiesce_index.is_some() && ctl.catalog_frozen_index.is_none() {
                 // 暂停期间 AssignExecutor 会被状态机拒绝。重启/失联的旧实例
                 // 不能再提交自己的退出报告，须经多数派撤销后才能完成冻结。
@@ -569,22 +656,41 @@ impl Coordinator {
                         },
                     );
                 }
-            } else if leader_should_own || !healthy_owner {
-                let chosen = std::iter::once(self.id)
-                    .chain(ctl.candidates.keys().copied().filter(|id| *id != self.id))
-                    .find(|id| self.fresh(ctl, *id, now));
+            } else if replace {
                 if let Some(id) = chosen {
                     let instance = ctl.candidates[&id].instance;
-                    self.propose(
-                        node,
-                        &Command::AssignExecutor {
+                    let command = if healthy_owner {
+                        ctl.device_activity
+                            .as_ref()
+                            .filter(|a| {
+                                !a.busy
+                                    && ctl.executor_ready
+                                    && a.instance == ctl.executor_instance
+                                    && ctl.executor.as_ref().is_some_and(|e| {
+                                        e.fenced && e.node == a.node && e.round == a.round
+                                    })
+                            })
+                            .map(|a| Command::RebalanceExecutor {
+                                node: id,
+                                instance,
+                                term: node.raft.term,
+                                expected_round: a.round,
+                                expected_instance: a.instance,
+                                idle_sequence: a.sequence,
+                                group: self.cfg.group.clone(),
+                            })
+                    } else {
+                        Some(Command::AssignExecutor {
                             node: id,
                             instance,
                             term: node.raft.term,
                             expected_round: ctl.executor.as_ref().map(|e| e.round),
                             group: self.cfg.group.clone(),
-                        },
-                    );
+                        })
+                    };
+                    if let Some(command) = command {
+                        self.propose(node, &command);
+                    }
                 } else if self.scope.is_some()
                     && let Some(owner) = ctl.executor.as_ref()
                 {
@@ -641,6 +747,292 @@ impl Coordinator {
 }
 
 #[cfg(test)]
+mod placement_tests {
+    use super::super::state::Candidate;
+    use super::super::store::RaftStore;
+    use super::*;
+    use std::sync::mpsc;
+
+    struct Case {
+        root: std::path::PathBuf,
+        coordinator: Coordinator,
+        node: RawNode<ControlStorage>,
+        control: ControlState,
+        exec: Sender<ExecRequest>,
+        requests: mpsc::Receiver<ExecRequest>,
+        _store: RaftStore,
+    }
+    impl Case {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("placement-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            let store = RaftStore::open(&root.join("raft.db"), &[2]).unwrap();
+            let mut node = RawNode::new(
+                &raft::Config {
+                    id: 2,
+                    ..Default::default()
+                },
+                store.raft_storage(),
+                &slog::Logger::root(slog::Discard, slog::o!()),
+            )
+            .unwrap();
+            node.campaign().unwrap();
+            let (exec, requests) = mpsc::channel();
+            let mut coordinator = Coordinator::new(
+                2,
+                1,
+                CoordinationConfig {
+                    group: "lib".into(),
+                    validity: Duration::from_secs(6),
+                },
+                Duration::ZERO,
+                &exec,
+            )
+            .unwrap();
+            let mut control = ControlState::default();
+            control.apply(42, &Command::Takeover { node: 1, term: 1 });
+            control.executor_instance = 1;
+            control.executor.as_mut().unwrap().fenced = true;
+            control.executor_ready = true;
+            control.device_activity = Some(super::super::permission::DeviceActivityState {
+                node: 1,
+                instance: 1,
+                round: 42,
+                sequence: 1,
+                busy: false,
+            });
+            for id in 1..=3 {
+                control.candidates.insert(
+                    id,
+                    Candidate {
+                        instance: 1,
+                        sequence: 1,
+                        group: "lib".into(),
+                        drives: 1,
+                        eligible: true,
+                    },
+                );
+            }
+            coordinator.observe(&control, true);
+            Self {
+                root,
+                coordinator,
+                node,
+                control,
+                exec,
+                requests,
+                _store: store,
+            }
+        }
+        fn tick(&mut self) {
+            self.coordinator.next_assign = Instant::now();
+            self.coordinator.tick(
+                &mut self.node,
+                &self.control,
+                true,
+                &self.exec,
+                &mut String::new(),
+            );
+        }
+        fn stable(&mut self) {
+            let preference = self.coordinator.placement.as_mut().unwrap();
+            preference.owner = Some((1, 1, 42));
+            preference.since =
+                Instant::now() - self.coordinator.cfg.validity * 2 - Duration::from_millis(1);
+        }
+        fn last_command(&mut self) -> Command {
+            Command::decode(&self.node.ready().entries().last().unwrap().data).unwrap()
+        }
+    }
+    impl Drop for Case {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn placement_keeps_a_balanced_follower_owner_instead_of_preferring_the_leader() {
+        let mut case = Case::new();
+        case.coordinator.set_placement(Some((1, 1)));
+        let before = case.node.raft.raft_log.last_index();
+        case.tick();
+        assert_eq!(case.node.raft.raft_log.last_index(), before);
+    }
+
+    #[test]
+    fn placement_rebalances_only_after_stability_then_uses_the_normal_raft_command() {
+        let mut case = Case::new();
+        case.coordinator.set_placement(Some((3, 1)));
+        let before = case.node.raft.raft_log.last_index();
+        case.tick();
+        assert_eq!(
+            case.node.raft.raft_log.last_index(),
+            before,
+            "健康 owner 不得立即迁移"
+        );
+        case.stable();
+        case.tick();
+        assert!(matches!(
+            case.last_command(),
+            Command::RebalanceExecutor {
+                node: 3,
+                instance: 1,
+                expected_round: 42,
+                ..
+            }
+        ));
+        assert!(
+            case.requests.try_iter().all(|request| !matches!(
+                request,
+                ExecRequest::Takeover { .. } | ExecRequest::Recover { .. }
+            )),
+            "placement 只提案，不能绕过多数派和 fencing 发设备请求"
+        );
+        assert_eq!(
+            case.control.executor.as_ref().unwrap().node,
+            1,
+            "未提交前不改变实际 owner"
+        );
+    }
+
+    #[test]
+    fn placement_failed_owner_moves_immediately_to_the_selected_healthy_candidate() {
+        let mut case = Case::new();
+        case.control.candidates.get_mut(&1).unwrap().eligible = false;
+        case.coordinator.set_placement(Some((3, 1)));
+        case.tick();
+        assert!(matches!(
+            case.last_command(),
+            Command::AssignExecutor {
+                node: 3,
+                expected_round: Some(42),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn placement_target_flapping_restarts_the_stability_window() {
+        let mut case = Case::new();
+        case.coordinator.set_placement(Some((3, 1)));
+        case.stable();
+        case.coordinator.set_placement(Some((2, 1)));
+        case.coordinator.set_placement(Some((3, 1)));
+        let before = case.node.raft.raft_log.last_index();
+        case.tick();
+        assert_eq!(case.node.raft.raft_log.last_index(), before);
+    }
+
+    #[test]
+    fn placement_catalog_and_recovering_owner_delay_a_healthy_move() {
+        for ready in [true, false] {
+            let mut case = Case::new();
+            case.control.executor_ready = ready;
+            case.coordinator.set_catalog_ready(!ready);
+            case.coordinator.set_placement(Some((3, 1)));
+            case.stable();
+            let before = case.node.raft.raft_log.last_index();
+            case.tick();
+            assert_eq!(case.node.raft.raft_log.last_index(), before);
+        }
+    }
+
+    #[test]
+    fn placement_a_short_catalog_job_does_not_starve_a_stable_rebalance() {
+        let mut case = Case::new();
+        case.coordinator.set_placement(Some((3, 1)));
+        case.stable();
+        case.coordinator.set_catalog_ready(false);
+        let before = case.node.raft.raft_log.last_index();
+        case.tick();
+        assert_eq!(case.node.raft.raft_log.last_index(), before);
+        case.coordinator.set_catalog_ready(true);
+        case.tick();
+        assert_eq!(
+            case.node.raft.raft_log.last_index(),
+            before + 1,
+            "短目录任务不得清空已稳定的迁移目标"
+        );
+        assert!(matches!(
+            case.last_command(),
+            Command::RebalanceExecutor {
+                node: 3,
+                expected_round: 42,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn placement_busy_or_unobserved_device_activity_defers_healthy_moves_only() {
+        for proof in [
+            None,
+            Some(super::super::permission::DeviceActivityState {
+                node: 1,
+                instance: 1,
+                round: 42,
+                sequence: 2,
+                busy: true,
+            }),
+        ] {
+            let mut case = Case::new();
+            case.control.device_activity = proof;
+            case.coordinator.set_placement(Some((3, 1)));
+            case.stable();
+            let before = case.node.raft.raft_log.last_index();
+            case.tick();
+            assert_eq!(case.node.raft.raft_log.last_index(), before);
+            case.control.candidates.get_mut(&1).unwrap().eligible = false;
+            case.tick();
+            assert!(matches!(
+                case.last_command(),
+                Command::AssignExecutor { node: 3, .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn placement_does_not_use_a_stale_target_instance() {
+        let mut case = Case::new();
+        case.control.candidates.get_mut(&1).unwrap().eligible = false;
+        case.coordinator.set_placement(Some((3, 2)));
+        let before = case.node.raft.raft_log.last_index();
+        case.tick();
+        assert_eq!(case.node.raft.raft_log.last_index(), before);
+    }
+
+    #[test]
+    fn placement_input_excludes_expired_paths_wrong_groups_and_restarted_instances() {
+        let mut case = Case::new();
+        assert_eq!(
+            case.coordinator
+                .placement_input(&case.control)
+                .candidates
+                .len(),
+            3
+        );
+        case.control.candidates.get_mut(&1).unwrap().group = "other".into();
+        case.control.candidates.get_mut(&2).unwrap().instance = 2;
+        case.coordinator.capabilities.get_mut(&3).unwrap().2 =
+            Instant::now() - case.coordinator.cfg.validity * 2 - Duration::from_millis(1);
+        let input = case.coordinator.placement_input(&case.control);
+        assert!(input.candidates.is_empty());
+        assert!(input.owner.is_none());
+        case.control.candidates.get_mut(&3).unwrap().sequence += 1;
+        case.coordinator.observe(&case.control, true);
+        assert_eq!(
+            case.coordinator.placement_input(&case.control).candidates,
+            [2, 3].into()
+        );
+        case.control.candidates.get_mut(&3).unwrap().eligible = false;
+        assert_eq!(
+            case.coordinator.placement_input(&case.control).candidates,
+            [2].into()
+        );
+    }
+}
+
+#[cfg(test)]
 mod catalog_latency_tests {
     use super::super::{
         state::{Candidate, FileRec},
@@ -684,7 +1076,11 @@ mod catalog_latency_tests {
                 ctl.candidates.insert(
                     id,
                     Candidate {
-                        instance: if id == 2 && !healthy { 2 } else { 1 },
+                        instance: if id == 2 && (!healthy || frozen) {
+                            2
+                        } else {
+                            1
+                        },
                         sequence: 1,
                         group: "test".into(),
                         drives: 1,

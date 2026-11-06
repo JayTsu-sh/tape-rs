@@ -172,7 +172,7 @@ async fn media_assign_journal_pins_format_intent_and_atomic_membership() {
             .is_err()
     );
     let at = crate::ltfs::label::ltfs_time_now();
-    let inv = json!({"library_serial":serial,"owner":2,"round":next,"observed_at":at,"volumes":[{"barcode":"TEST01L8","address":1,"element_type":4,"medium_type":1,"source_address":1001,"home_slot":null}],"drives":[{"serial":"SIMDRV0000","address":1,"barcode":"TEST01L8"}]});
+    let inv = json!({"num_of_slots":8,"num_of_ieslots":1,"scsi_vendor_id":"SIM","scsi_product_id":"SIM-CHANGER","scsi_firmware_revision":"0001","library_serial":serial,"owner":2,"round":next,"observed_at":at,"volumes":[{"barcode":"TEST01L8","address":1,"element_type":4,"medium_type":1,"source_address":1001,"home_slot":null}],"drives":[{"serial":"SIMDRV0000","address":1,"barcode":"TEST01L8"}]});
     c.record_active_library_inventory(&serial, route, next, &inv)
         .await
         .unwrap();
@@ -189,12 +189,27 @@ async fn media_assign_journal_pins_format_intent_and_atomic_membership() {
         sha256: [7; 32],
         incremental: false,
     };
+    let source = NativeMediaSource {
+        identity: crate::ltfs::recovery::IndexSourceIdentity::new(
+            crate::ltfs::volume::CommittedIndexConstruct {
+                volume_uuid: index.volume_uuid,
+                generation: index.generation,
+                location: index.location,
+                sha256: index.sha256,
+                incremental: false,
+            },
+            Vec::new(),
+        )
+        .unwrap(),
+        files: 0,
+        paths: 0,
+    };
     let done = c
-        .complete_media_assign(&serial, route, next, &r, index, &at)
+        .complete_media_assign(&serial, route, next, &r, &source, &at)
         .await
         .unwrap();
     assert_eq!(done["status"], "succeeded");
-    assert_eq!(done["result"]["index_imported"], false);
+    assert_eq!(done["result"]["index_imported"], true);
     let assignment = c
         .tape_assignment(&serial, "TEST01L8")
         .await
@@ -213,11 +228,11 @@ async fn media_assign_journal_pins_format_intent_and_atomic_membership() {
         c.active_loaded_volume_head(&serial, "TEST01L8", route, next)
             .await
             .unwrap()
-            .is_none(),
-        "assignment cannot fabricate imported index readiness"
+            .is_some(),
+        "assignment publishes the verified empty source with readiness atomically"
     );
     assert_eq!(
-        c.complete_media_assign(&serial, route, next, &r, index, &at)
+        c.complete_media_assign(&serial, route, next, &r, &source, &at)
             .await
             .unwrap(),
         done

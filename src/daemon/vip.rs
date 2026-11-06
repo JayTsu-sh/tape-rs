@@ -138,6 +138,55 @@ struct VipSession {
     token: Option<u64>,
 }
 
+/// 只记录本机网络线程已完成的撤址，不替代或修改 Raft 的占用记录。
+#[derive(Default)]
+pub(super) struct ShutdownVips {
+    withdrawn: std::collections::BTreeMap<Ipv4Addr, (u64, u64, u64)>,
+}
+
+impl ShutdownVips {
+    pub(super) fn observe(
+        &mut self,
+        local_node: u64,
+        records: &std::collections::BTreeMap<Ipv4Addr, super::state::VipRecord>,
+        command: &Command,
+    ) {
+        if let Command::VipRelease {
+            address,
+            node,
+            round,
+            token,
+        } = command
+            && *node == local_node
+            && records.get(address).is_some_and(|record| {
+                record.token == *token
+                    && record
+                        .holder
+                        .as_ref()
+                        .is_some_and(|holder| holder.node == *node && holder.round == *round)
+            })
+        {
+            self.withdrawn.insert(*address, (*node, *round, *token));
+        }
+    }
+
+    pub(super) fn pending(
+        &self,
+        local_node: u64,
+        leader: u64,
+        records: &std::collections::BTreeMap<Ipv4Addr, super::state::VipRecord>,
+    ) -> bool {
+        records.iter().any(|(address, record)| {
+            record.holder.as_ref().is_some_and(|holder| {
+                holder.node == local_node
+                    && (leader != 0
+                        || self.withdrawn.get(address)
+                            != Some(&(holder.node, holder.round, record.token)))
+            })
+        })
+    }
+}
+
 impl VipSession {
     fn step(
         &mut self,

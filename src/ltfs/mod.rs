@@ -22,5 +22,14 @@ pub mod label;
 pub mod mam;
 pub mod mkltfs;
 mod namespace;
+
+/// XML 1.0 text must be representable before a new LTFS name is admitted.
+/// Escaping markup does not make forbidden code points valid XML.
+pub(crate) fn xml_text_valid(text: &str) -> bool {
+    text.chars().all(|c| {
+        matches!(c, '\u{9}' | '\u{a}' | '\u{d}' | '\u{20}'..='\u{d7ff}'
+        | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')
+    })
+}
 pub mod recovery;
 pub mod volume;

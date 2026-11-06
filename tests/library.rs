@@ -103,15 +103,25 @@ fn multi_volume_backend_reads_writes_metadata_and_switches() {
     let lib = f.formatted();
     let shared = std::sync::Arc::new(std::sync::Mutex::new(lib));
     let backend = LibraryBackend(shared.clone());
-    assert_eq!(backend.list_dir("/").unwrap().unwrap()[0].name, "pool");
-    assert_eq!(backend.list_dir("/pool").unwrap().unwrap().len(), 2);
+    assert_eq!(
+        backend.list_dir("/").unwrap().unwrap().entries[0].name,
+        "pool"
+    );
+    assert_eq!(backend.list_dir("/pool").unwrap().unwrap().entries.len(), 2);
     let local = f.path.with_extension("input");
     std::fs::write(&local, b"payload").unwrap();
     for b in ["LIB001L8", "LIB002L8"] {
         let p = format!("/pool/{b}/dir");
         backend.mkdir(&p).unwrap();
         backend
-            .upload(&format!("{p}/f"), &local, true, true)
+            .upload(
+                &format!("{p}/f"),
+                &local,
+                &mut tape_rs::tapefs::UploadState::new(tape_rs::tapefs::UploadTarget::Native {
+                    create_only: true,
+                }),
+                true,
+            )
             .unwrap();
         backend
             .change_xattr(&format!("{p}/f"), "user.binary", Some(&[0, 255]), 0)
@@ -137,6 +147,7 @@ fn multi_volume_backend_reads_writes_metadata_and_switches() {
                 .list_dir(&format!("/pool/{b}/dir"))
                 .unwrap()
                 .unwrap()
+                .entries
                 .len(),
             2
         );

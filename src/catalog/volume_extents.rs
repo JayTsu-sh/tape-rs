@@ -268,6 +268,87 @@ impl VolumeExtentCache {
         disposable: bool,
         admit: &mut dyn FnMut(&Connection, &Path, usize) -> Result<()>,
     ) -> Result<CacheStats> {
+        Self::build_entries(
+            path,
+            expected,
+            incremental,
+            disposable,
+            None,
+            admit,
+            |save_entry| {
+                let mut hash_input = HashingRead {
+                    inner: input,
+                    sha: Sha256::new(),
+                };
+                let index = if incremental {
+                    #[cfg(feature = "fdb")]
+                    {
+                        if disposable {
+                            LtfsIndex::scan_incremental_reader_to_disk(
+                                BufReader::new(&mut hash_input),
+                                save_entry,
+                            )?
+                        } else {
+                            LtfsIndex::scan_incremental_reader(
+                                BufReader::new(&mut hash_input),
+                                save_entry,
+                            )?
+                        }
+                    }
+                    #[cfg(not(feature = "fdb"))]
+                    LtfsIndex::scan_incremental_reader(BufReader::new(&mut hash_input), save_entry)?
+                } else {
+                    LtfsIndex::scan_full_reader(BufReader::new(&mut hash_input), save_entry)?
+                };
+                Ok((index, hash_input.sha.finalize().into()))
+            },
+        )
+    }
+
+    #[cfg(feature = "fdb")]
+    pub(crate) fn build_captured(
+        source: &crate::ltfs::recovery::CapturedIndexSource,
+        path: &Path,
+        storage: &mut crate::local_read_storage::CacheBuild,
+    ) -> Result<CacheStats> {
+        let head = source.construct();
+        let expected = ExpectedIndex {
+            volume_uuid: head.volume_uuid,
+            generation: head.generation,
+            location: head.location,
+            sha256: head.sha256,
+        };
+        let identity = if head.incremental {
+            Some(source.identity()?.to_bytes())
+        } else {
+            None
+        };
+        let stats = Self::build_entries(
+            path,
+            expected,
+            head.incremental,
+            true,
+            identity.as_deref(),
+            &mut |conn, path, cost| storage.admit(conn, path, cost),
+            |save| {
+                source.for_each_entry(save)?;
+                Ok((source.header().clone(), head.sha256))
+            },
+        )?;
+        storage.finish()?;
+        Ok(stats)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_entries(
+        path: &Path,
+        expected: ExpectedIndex,
+        incremental: bool,
+        disposable: bool,
+        source_identity: Option<&[u8]>,
+        admit: &mut dyn FnMut(&Connection, &Path, usize) -> Result<()>,
+        produce: impl FnOnce(&mut dyn FnMut(IndexEntry) -> Result<()>) -> Result<(LtfsIndex, [u8; 32])>,
+    ) -> Result<CacheStats> {
         if path.exists() {
             return Err(TapeError::Catalog(format!(
                 "卷 extent 缓存已存在: {}",
@@ -304,7 +385,7 @@ impl VolumeExtentCache {
                id INTEGER PRIMARY KEY CHECK (id=1),
                volume_uuid TEXT NOT NULL, generation TEXT NOT NULL,
                partition TEXT NOT NULL, start_block TEXT NOT NULL,
-               sha256 BLOB NOT NULL, files TEXT NOT NULL, extents TEXT NOT NULL
+               sha256 BLOB NOT NULL, files TEXT NOT NULL, extents TEXT NOT NULL, source_identity BLOB
              );
              CREATE TABLE files (
                uid TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE,
@@ -318,7 +399,7 @@ impl VolumeExtentCache {
                PRIMARY KEY (uid,seq)
              );
              BEGIN IMMEDIATE;",
-            if incremental { 2 } else { 1 }
+            if source_identity.is_some() {3} else if incremental {2} else {1}
         ))?;
 
         if disposable && incremental {
@@ -327,10 +408,6 @@ impl VolumeExtentCache {
         let mut stats = CacheStats {
             files: 0,
             extents: 0,
-        };
-        let mut hash_input = HashingRead {
-            inner: input,
-            sha: Sha256::new(),
         };
         let mut save_entry = |entry: IndexEntry| {
             if disposable && incremental {
@@ -402,27 +479,7 @@ impl VolumeExtentCache {
             }
             Ok(())
         };
-        let index = if incremental {
-            #[cfg(feature = "fdb")]
-            {
-                if disposable {
-                    LtfsIndex::scan_incremental_reader_to_disk(
-                        BufReader::new(&mut hash_input),
-                        &mut save_entry,
-                    )?
-                } else {
-                    LtfsIndex::scan_incremental_reader(
-                        BufReader::new(&mut hash_input),
-                        &mut save_entry,
-                    )?
-                }
-            }
-            #[cfg(not(feature = "fdb"))]
-            LtfsIndex::scan_incremental_reader(BufReader::new(&mut hash_input), &mut save_entry)?
-        } else {
-            LtfsIndex::scan_full_reader(BufReader::new(&mut hash_input), &mut save_entry)?
-        };
-        let digest: [u8; 32] = hash_input.sha.finalize().into();
+        let (index, digest) = produce(&mut save_entry)?;
         if index.volume_uuid != expected.volume_uuid
             || index.generation != expected.generation
             || index.self_location != expected.location
@@ -436,8 +493,8 @@ impl VolumeExtentCache {
         }
         admit(&conn, &temp, 512)?;
         conn.execute(
-            "INSERT INTO manifest(id,volume_uuid,generation,partition,start_block,sha256,files,extents)
-             VALUES (1,?1,?2,?3,?4,?5,?6,?7)",
+            "INSERT INTO manifest(id,volume_uuid,generation,partition,start_block,sha256,files,extents,source_identity)
+             VALUES (1,?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
                 expected.volume_uuid.to_string(),
                 expected.generation.to_string(),
@@ -446,6 +503,7 @@ impl VolumeExtentCache {
                 &expected.sha256[..],
                 stats.files.to_string(),
                 stats.extents.to_string(),
+                source_identity,
             ],
         )?;
         conn.execute_batch("COMMIT;")?;
@@ -459,17 +517,30 @@ impl VolumeExtentCache {
 
     /// 打开时再次核对卷身份；不能将上一代或另一盘的物理位置当成当前索引。
     pub fn open(path: &Path, expected: ExpectedIndex) -> Result<Self> {
-        Self::open_with_mode(path, expected, false)
+        Self::open_with_mode(path, expected, false, None)
     }
 
     pub fn open_incremental(path: &Path, expected: ExpectedIndex) -> Result<Self> {
-        Self::open_with_mode(path, expected, true)
+        Self::open_with_mode(path, expected, true, None)
     }
 
-    fn open_with_mode(path: &Path, expected: ExpectedIndex, incremental: bool) -> Result<Self> {
+    fn open_with_mode(
+        path: &Path,
+        expected: ExpectedIndex,
+        incremental: bool,
+        source_identity: Option<&[u8]>,
+    ) -> Result<Self> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version != if incremental { 2 } else { 1 } {
+        if version
+            != if source_identity.is_some() {
+                3
+            } else if incremental {
+                2
+            } else {
+                1
+            }
+        {
             return Err(TapeError::Catalog(format!(
                 "卷 extent 缓存版本 {version} 不受支持"
             )));
@@ -492,7 +563,63 @@ impl VolumeExtentCache {
         {
             return Err(TapeError::Catalog("卷 extent 缓存身份不匹配".into()));
         }
+        let stored: Option<Vec<u8>> =
+            conn.query_row("SELECT source_identity FROM manifest WHERE id=1", [], |r| {
+                r.get(0)
+            })?;
+        if stored.as_deref() != source_identity {
+            return Err(TapeError::Catalog("缓存完整重放来源不符".into()));
+        }
         Ok(Self { conn })
+    }
+
+    #[cfg(feature = "fdb")]
+    pub fn open_captured(
+        path: &Path,
+        identity: &crate::ltfs::recovery::IndexSourceIdentity,
+    ) -> Result<Self> {
+        let head = identity.head();
+        let expected = ExpectedIndex {
+            volume_uuid: head.volume_uuid,
+            generation: head.generation,
+            location: head.location,
+            sha256: head.sha256,
+        };
+        if head.incremental {
+            Self::open_with_mode(path, expected, true, Some(&identity.to_bytes()))
+        } else {
+            Self::open(path, expected)
+        }
+    }
+
+    #[cfg(feature = "fdb")]
+    pub(crate) fn verify_source(
+        &self,
+        identity: &crate::ltfs::recovery::IndexSourceIdentity,
+    ) -> Result<()> {
+        let version: u32 = self
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))?;
+        let head = identity.head();
+        let row:(String,String,String,String,Vec<u8>,Option<Vec<u8>>)=self.conn.query_row("SELECT volume_uuid,generation,partition,start_block,sha256,source_identity FROM manifest WHERE id=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
+        if row.0 != head.volume_uuid.to_string()
+            || row.1 != head.generation.to_string()
+            || row.2 != head.location.partition.to_string()
+            || row.3 != head.location.start_block.to_string()
+            || row.4 != head.sha256
+            || version != if head.incremental { 3 } else { 1 }
+            || row.5
+                != if head.incremental {
+                    Some(identity.to_bytes())
+                } else {
+                    None
+                }
+        {
+            return Err(TapeError::Catalog(
+                "清单与缓存的完整来源身份或种类不符".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn file_by_uid(&self, uid: u64) -> Result<Option<CachedFile>> {
@@ -888,7 +1015,8 @@ mod tests {
             )
             .unwrap();
             storage.finish().unwrap();
-            let cache = VolumeExtentCache::open_with_mode(&path, expected, incremental).unwrap();
+            let cache =
+                VolumeExtentCache::open_with_mode(&path, expected, incremental, None).unwrap();
             assert!(cache.required_file_by_uid(u64::MAX).is_ok());
             let seen: bool = cache
                 .conn
@@ -1435,7 +1563,7 @@ mod tests {
         let stats =
             VolumeExtentCache::build(File::open(&xml_path).unwrap(), &db_path, expected).unwrap();
         assert_eq!(stats.files, COUNT);
-        let cache = VolumeExtentCache::open_with_mode(&db_path, expected, managed).unwrap();
+        let cache = VolumeExtentCache::open_with_mode(&db_path, expected, managed, None).unwrap();
         assert_eq!(
             cache.required_file_by_uid(COUNT + 1).unwrap().path,
             format!("f{}", COUNT - 1)

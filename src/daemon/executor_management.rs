@@ -246,13 +246,18 @@ pub(super) fn elements(
     let rows = mc.read_all_status()?;
     Ok((map, rows))
 }
-fn observe(a: &Active, opts: &ExecOptions) -> Result<Value> {
+pub(super) fn observe(a: &Active, opts: &ExecOptions) -> Result<Value> {
     observe_devices(&a.devices, opts.node_id, a.round)
 }
 
 pub(super) fn observe_devices(devices: &[ManagedDevice], node: u8, round: u64) -> Result<Value> {
     let (map, rows) = elements(devices)?;
-    observation_from_elements(devices, node, round, &map, &rows)
+    let changer = devices
+        .iter()
+        .find(|d| d.kind == DeviceKind::Changer)
+        .ok_or_else(|| error("没有换带器"))?;
+    let descriptor = crate::scsi::inquiry::standard_inquiry(changer.dev.as_ref())?;
+    observation_from_elements(devices, node, round, &map, &rows, &descriptor)
 }
 
 pub(super) fn observation_from_elements(
@@ -261,13 +266,22 @@ pub(super) fn observation_from_elements(
     round: u64,
     map: &crate::changer::element::ElementAddressMap,
     rows: &[crate::changer::element::ElementStatus],
+    descriptor: &crate::scsi::inquiry::InquiryStandard,
 ) -> Result<Value> {
+    if descriptor.peripheral_type != 8
+        || descriptor.vendor.is_empty()
+        || descriptor.product.is_empty()
+    {
+        return Err(error("库观测必须来自有效换带器 INQUIRY"));
+    }
     let volumes:Vec<Value>=rows.iter().filter(|e|e.full && e.volume_tag.is_some()).map(|e|json!({"barcode":e.volume_tag,"address":e.address,"element_type":e.element_type as u8,"medium_type":e.medium_type,"source_address":e.source_address,"home_slot":e.address.checked_sub(map.storage_start).filter(|s|*s<map.storage_count).map(|s|u32::from(s)+1)})).collect();
     // Keep both projections tied to the same READ ELEMENT STATUS reply.
     let inv = inventory_elements(devices, rows, true)?;
     let drives:Vec<Value>=inv.drives.iter().map(|d|json!({"serial":devices[d.dev].serial,"address":d.addr,"barcode":d.loaded.as_ref().map(|l|&l.0)})).collect();
     Ok(
-        json!({"library_serial":devices.iter().find(|d|d.kind==DeviceKind::Changer).map(|d|&d.serial),"owner":node,"round":round,"observed_at":crate::ltfs::label::ltfs_time_now(),"volumes":volumes,"drives":drives}),
+        json!({"library_serial":devices.iter().find(|d|d.kind==DeviceKind::Changer).map(|d|&d.serial),"owner":node,"round":round,"observed_at":crate::ltfs::label::ltfs_time_now(),"volumes":volumes,"drives":drives,
+            "num_of_slots":map.storage_count,"num_of_ieslots":map.ie_count,
+            "scsi_vendor_id":descriptor.vendor,"scsi_product_id":descriptor.product,"scsi_firmware_revision":descriptor.revision}),
     )
 }
 

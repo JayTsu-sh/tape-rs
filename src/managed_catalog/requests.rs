@@ -189,19 +189,42 @@ pub(super) async fn window(tr: &Transaction, namespace: Uuid) -> Result<RequestW
 }
 
 pub(super) fn terminal_result(bytes: &[u8], fingerprint: &[u8]) -> Result<PublishOutcome> {
-    if bytes.len() != 41
+    if !matches!(bytes.len(), 41 | 73)
         || bytes[0] > 1
-        || (bytes[0] == 0 && read_u64(&bytes[33..]) == 0)
-        || (bytes[0] == 1 && read_u64(&bytes[33..]) != 0)
+        || (bytes[0] == 0 && read_u64(&bytes[33..41]) == 0)
+        || (bytes[0] == 1 && (bytes.len() != 41 || read_u64(&bytes[33..41]) != 0))
     {
         return Err(CatalogError::Corrupt("请求终态标记"));
     }
     Ok(if &bytes[1..33] != fingerprint {
         PublishOutcome::OperationConflict
     } else if bytes[0] == 0 {
-        PublishOutcome::AlreadyApplied(read_u64(&bytes[33..]))
+        PublishOutcome::AlreadyApplied(read_u64(&bytes[33..41]))
     } else {
         PublishOutcome::RequestCancelled
+    })
+}
+
+// A finalized upload retains both the physical receipt fingerprint and its
+// pre-append identity. The latter recognizes retries after attributes and
+// in-flight claims have been compacted, including after a later overwrite.
+pub(super) fn reservation_terminal_result(
+    bytes: &[u8],
+    fingerprint: &[u8; 32],
+) -> Result<PublishOutcome> {
+    let result = terminal_result(bytes, bytes.get(1..33).unwrap_or_default())?;
+    if bytes[0] == 0 && bytes.len() != 73 {
+        return Err(CatalogError::Corrupt("上传终态缺少原请求指纹"));
+    }
+    let saved = if bytes.len() == 73 {
+        &bytes[41..]
+    } else {
+        &bytes[1..33]
+    };
+    Ok(if saved != fingerprint {
+        PublishOutcome::OperationConflict
+    } else {
+        result
     })
 }
 
@@ -219,8 +242,10 @@ pub(super) async fn prefix_has_rows(tr: &Transaction, prefix: &[u8]) -> Result<b
         .is_empty())
 }
 
-pub(super) async fn has_namespace_holds(tr: &Transaction, namespace: Uuid) -> Result<bool> {
-    for kind in *b"IF" {
+pub(super) async fn has_file_holds(tr: &Transaction, namespace: Uuid) -> Result<bool> {
+    // A 0 reservation already owns a write-before-data target, even before
+    // the first append produces an I receipt or an F batch claim.
+    for kind in *b"0IF" {
         let mut prefix = key(kind);
         prefix.extend_from_slice(namespace.as_bytes());
         if prefix_has_rows(tr, &prefix).await? {
@@ -228,6 +253,13 @@ pub(super) async fn has_namespace_holds(tr: &Transaction, namespace: Uuid) -> Re
         }
     }
     Ok(false)
+}
+
+pub(super) async fn has_namespace_holds(tr: &Transaction, namespace: Uuid) -> Result<bool> {
+    if has_file_holds(tr, namespace).await? {
+        return Ok(true);
+    }
+    prefix_has_rows(tr, &control::node_hold_prefix(namespace)).await
 }
 
 pub(super) async fn older_rows(
@@ -409,6 +441,9 @@ impl ManagedCatalog {
                             {
                                 return terminal_result(&old, &fingerprint);
                             }
+                            if active {
+                                control::reclaim::require_receipt_at(&tr, &r).await?;
+                            }
                             if !control::receipt_placement_matches(&tr, &r).await? {
                                 return Ok(PublishOutcome::PlacementMismatch);
                             }
@@ -474,6 +509,9 @@ impl ManagedCatalog {
                                 } else {
                                     PublishOutcome::OperationConflict
                                 });
+                            }
+                            if active {
+                                control::reclaim::require_receipt_at(&tr, &r).await?;
                             }
                             if active && reservation::claim_conflicts(&tr, &r).await? {
                                 return Ok(PublishOutcome::BatchClaimed);
@@ -820,6 +858,39 @@ pub(super) async fn purge_expired_page(
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    #[test]
+    fn upload_terminal_retains_preappend_identity_after_compaction() {
+        let receipt = [3; 32];
+        let upload = [4; 32];
+        let mut terminal = terminal_value(&receipt, Some(7));
+        assert!(
+            reservation_terminal_result(&terminal, &upload).is_err(),
+            "上传成功终态不能缺少原请求指纹"
+        );
+        terminal.extend_from_slice(&upload);
+        assert_eq!(
+            terminal_result(&terminal, &receipt).unwrap(),
+            PublishOutcome::AlreadyApplied(7)
+        );
+        assert_eq!(
+            reservation_terminal_result(&terminal, &upload).unwrap(),
+            PublishOutcome::AlreadyApplied(7)
+        );
+        assert_eq!(
+            reservation_terminal_result(&terminal, &[5; 32]).unwrap(),
+            PublishOutcome::OperationConflict
+        );
+        assert_eq!(
+            reservation_terminal_result(&terminal_value(&upload, None), &upload).unwrap(),
+            PublishOutcome::RequestCancelled
+        );
+        for len in [0, 1, 40, 42, 72, 74] {
+            assert!(reservation_terminal_result(&vec![0; len], &upload).is_err());
+        }
+        terminal[0] = 1;
+        assert!(reservation_terminal_result(&terminal, &upload).is_err());
+    }
 
     #[test]
     fn window_terminal_and_durable_intent_validation() {

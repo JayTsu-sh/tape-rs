@@ -394,3 +394,53 @@ fn incomplete_or_corrupt_ee_metadata_is_not_silently_skipped() {
         );
     }
 }
+
+// Real B oracle: EE6 task1017 succeeded, actual EE1.3.4/LE2.4.6 cached Full Gen5.
+// XML SHA256: 940167f068c4373fea0c1152f084b4df14854fbc8d6ab9add44dcb6552b93e12. Only metadata interpretation is tested here;
+// EE GPFS recall1019 failed errno13, so this is not a physical payload-read claim.
+#[test]
+fn real_b_ee_index_maps_saved_objects_without_gpfs_runtime() {
+    let raw = include_bytes!("fixtures/ee-b-aa0000-import-gen5.xml");
+    let index = LtfsIndex::parse(raw).unwrap();
+    assert_eq!(
+        index.volume_uuid.to_string(),
+        "6f948f4d-5c26-4dda-a4b9-da56adb5a48e"
+    );
+    assert_eq!(index.generation, 5);
+    let before = index.to_xml().unwrap();
+    let manifest = EeManifest::from_index(&index).unwrap();
+    assert_eq!(manifest.objects().len(), 3);
+    let prefix = "/ee-gpfs/tape-eeadm-b-v2-20261106/ee6-imported/AA0000L8/ee-gpfs/tape-eeadm-b-v2-20261106/ee6-files/";
+    for (name, length) in [("docs/a.txt", 49), ("docs/b.txt", 51), ("binary.bin", 1024)] {
+        let expected = format!("{prefix}{name}");
+        let objects: Vec<_> = manifest
+            .objects()
+            .iter()
+            .filter(|o| o.saved_path == expected)
+            .collect();
+        assert_eq!(
+            objects.len(),
+            1,
+            "each original path must bind one saved data object"
+        );
+        let object = objects[0];
+        assert_eq!(object.kind, EeObjectKind::RegularFile);
+        assert_eq!(object.length, length);
+        assert!(object.object_path.starts_with(".LTFSEE_DATA/"));
+        assert_eq!(
+            object.aliases,
+            [expected.trim_start_matches('/').to_owned()]
+        );
+        let physical = index.find_file(&object.object_path).unwrap();
+        assert!(!physical.extents.is_empty());
+        assert_eq!(
+            physical.extents.iter().map(|e| e.byte_count).sum::<u64>(),
+            length
+        );
+    }
+    assert_eq!(
+        index.to_xml().unwrap(),
+        before,
+        "metadata inspection must not rewrite the source index"
+    );
+}

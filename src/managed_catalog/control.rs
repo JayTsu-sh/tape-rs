@@ -1,4 +1,4 @@
-//! Small, shared placement metadata. The production control plane has not switched to this store.
+//! Pool and placement metadata. Active writes require the exact route and owner.
 
 use super::*;
 
@@ -18,8 +18,19 @@ mod library_observations;
 mod management_queries;
 
 #[path = "notifications.rs"]
-mod notifications;
+pub(super) mod notifications;
 pub use notifications::{NotifyConnectionAction, NotifyFilter};
+#[path = "inventory.rs"]
+mod inventory;
+#[path = "tape_capacity.rs"]
+pub(super) mod tape_capacity;
+#[path = "tape_monitor.rs"]
+pub(super) mod tape_monitor;
+#[path = "tape_policy.rs"]
+pub(super) mod tape_policy;
+#[path = "tape_stats.rs"]
+mod tape_stats;
+pub use native_device::NativeDeviceTask;
 
 #[path = "active_pools.rs"]
 mod active_pools;
@@ -29,6 +40,58 @@ mod pool_roots;
 pub(super) use pool_roots::{initial_pool_root, reject_generic_pool_root_at};
 #[path = "native_device.rs"]
 pub(super) mod native_device;
+#[path = "reclaim.rs"]
+pub(super) mod reclaim;
+pub use reclaim::{
+    ReclaimDataProgress, ReclaimFile, ReclaimFileMetadata, ReclaimMetadataProgress,
+    ReclaimReservation, ReclaimSourceInventory, ReclaimSourceProgress, ReclaimSourceRead,
+    ReclaimSpec, ReclaimWalk,
+};
+#[path = "node_baseline.rs"]
+mod node_baseline;
+pub use node_baseline::{NodeMutationBaseline, NodeMutationParent, NodeMutationSpec};
+#[path = "node_inputs.rs"]
+mod node_inputs;
+pub use node_inputs::{NodeMutationAncestor, PreparedNodeMutationInputs};
+#[path = "node_request.rs"]
+mod node_request;
+pub use node_request::{NodeMutationRequest, NodeMutationRequestContext};
+#[path = "node_rename.rs"]
+mod node_rename;
+pub use node_rename::{
+    NodeRenameAbsenceEvidence, NodeRenameAbsenceKind, NodeRenameAttempt, NodeRenameAttemptPhase,
+    NodeRenameBaseline, NodeRenameDataReferences, NodeRenameGlobalPlan, NodeRenameIntentClosure,
+    NodeRenameLiveFile, NodeRenameManifest, NodeRenameManifestCapture, NodeRenameManifestReader,
+    NodeRenameMediaPlan, NodeRenameObservation, NodeRenameParticipant,
+    NodeRenameParticipantsCapture, NodeRenameParticipantsSummary, NodeRenamePhysicalSource,
+    NodeRenamePhysicalSourceStats, NodeRenameProjectionSpool, NodeRenameProjectionStats,
+    NodeRenameProjectionVolume, NodeRenamePublication, NodeRenameReferenceRole, NodeRenameRequest,
+    NodeRenameRevision, NodeRenameS4Evidence, NodeRenameSpec, NodeRenameSubtreeCapture,
+    NodeRenameSubtreeEntry, NodeRenameSubtreePage, NodeRenameSubtreeSummary, NodeRenameVolumeGuard,
+    NodeRenameVolumeGuardStats, NodeRenameVolumeIntent, NodeRenameVolumePlan,
+    NodeRenameVolumeProjection, NodeRenameVolumeProjectionStats, PreparedNodeRenameInputs,
+};
+pub(super) use node_rename::{require_rename_discard_at, require_rename_observation_at};
+#[path = "node_tasks.rs"]
+mod node_tasks;
+pub use node_tasks::{
+    NodeMutationTask, NodeMutationTaskKind, NodeMutationTaskOutcome, NodeMutationTaskState,
+    NodeMutationTaskStatus,
+};
+pub(super) use node_tasks::{
+    node_hold_prefix, require_pool_without_reclaim_at, require_pool_writable_at,
+};
+#[path = "node_attempts.rs"]
+pub(super) mod node_attempts;
+#[path = "node_claims.rs"]
+mod node_claims;
+pub use node_attempts::{
+    NodeMutationAttempt, NodeMutationAttemptClosure, NodeMutationDeletion, NodeMutationObservation,
+    NodeMutationPublication,
+};
+#[path = "native_media.rs"]
+pub(super) mod native_media;
+pub use native_media::{NativeMediaImport, NativeMediaSource};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolRecord {
@@ -575,7 +638,7 @@ fn pool_prefix(namespace: Uuid) -> Vec<u8> {
     k
 }
 
-fn pool_key(namespace: Uuid, id: Uuid) -> Vec<u8> {
+pub(super) fn pool_key(namespace: Uuid, id: Uuid) -> Vec<u8> {
     let mut k = pool_prefix(namespace);
     k.extend_from_slice(id.as_bytes());
     k
@@ -585,6 +648,15 @@ pub(super) fn retired_pool_key(namespace: Uuid, pool: Uuid) -> Vec<u8> {
     let mut k = management::prefix(namespace, b'r');
     k.extend_from_slice(pool.as_bytes());
     k
+}
+
+pub(super) fn encode_pool_retirement(revision: u64) -> Result<[u8; 9]> {
+    if revision < 2 {
+        return Err(CatalogError::Invalid("池退役修订号无效"));
+    }
+    let mut value = [1; 9];
+    value[1..].copy_from_slice(&revision.to_be_bytes());
+    Ok(value)
 }
 
 pub(super) async fn retired_pool_revision_at(
@@ -676,7 +748,7 @@ fn encode_pool(pool: &PoolRecord) -> Vec<u8> {
     value
 }
 
-fn decode_pool(id: Uuid, value: &[u8]) -> Result<PoolRecord> {
+pub(super) fn decode_pool(id: Uuid, value: &[u8]) -> Result<PoolRecord> {
     if value.first() != Some(&4) {
         return Err(CatalogError::Corrupt("pool 记录版本无效"));
     }
@@ -760,7 +832,7 @@ async fn require_managed_pool_library(
     require_pool_library(tr, namespace, pool_id, serial).await
 }
 
-async fn require_pool_library(
+pub(super) async fn require_pool_library(
     tr: &Transaction,
     namespace: Uuid,
     pool_id: Uuid,
@@ -771,10 +843,21 @@ async fn require_pool_library(
         .await?
         .ok_or(CatalogError::Invalid("pool 不存在"))?;
     let pool = decode_pool(pool_id, &pool)?;
+    if retired_pool_revision_at(tr, namespace, pool_id)
+        .await?
+        .is_some()
+    {
+        return Err(CatalogError::Corrupt("退役池仍存在主记录"));
+    }
     if pool.library_serial != serial {
         return Err(CatalogError::Invalid(
             "pool 不属于目标物理带库，跨库操作必须使用另一个池",
         ));
+    }
+    match tr.get(&managed_key(namespace), false).await?.as_deref() {
+        Some([]) => require_managed_layout(tr, namespace).await?,
+        Some(_) => return Err(CatalogError::Corrupt("受管命名空间标记")),
+        None => {}
     }
     let library = tr
         .get(&library_key(namespace, serial), false)
@@ -787,19 +870,6 @@ async fn require_pool_library(
 }
 
 impl ManagedCatalog {
-    pub(super) async fn import_pool_exists(&self, namespace: Uuid, id: Uuid) -> Result<bool> {
-        if id.is_nil() {
-            return Err(CatalogError::Invalid("pool ID 不能为 nil"));
-        }
-        let tr = self.db.create_trx()?;
-        require_control_building_or_ready(&tr, namespace).await?;
-        tr.get(&pool_key(namespace, id), false)
-            .await?
-            .map(|value| decode_pool(id, &value).map(|_| true))
-            .transpose()
-            .map(|value| value.unwrap_or(false))
-    }
-
     pub(super) async fn import_pools(
         &self,
         namespace: Uuid,
@@ -823,6 +893,7 @@ impl ManagedCatalog {
         })
     }
 
+    /// Bounded pool reads through the exact Active route and verified roots.
     pub async fn list_active_pools_for_route(
         &self,
         serial: &str,
@@ -856,6 +927,19 @@ impl ManagedCatalog {
             items,
             next: page.next,
         })
+    }
+
+    pub(super) async fn import_pool_exists(&self, namespace: Uuid, id: Uuid) -> Result<bool> {
+        if id.is_nil() {
+            return Err(CatalogError::Invalid("pool ID 不能为 nil"));
+        }
+        let tr = self.db.create_trx()?;
+        require_control_building_or_ready(&tr, namespace).await?;
+        tr.get(&pool_key(namespace, id), false)
+            .await?
+            .map(|value| decode_pool(id, &value).map(|_| true))
+            .transpose()
+            .map(|value| value.unwrap_or(false))
     }
 
     /// Declare a physical changer by its real serial within one logical namespace.
@@ -916,6 +1000,15 @@ impl ManagedCatalog {
                             }
 
                             let old = tr.get(&record, false).await?;
+                            if retired_pool_revision_at(&tr, namespace, pool.id)
+                                .await?
+                                .is_some()
+                            {
+                                if old.is_some() {
+                                    return Err(CatalogError::Corrupt("退役池仍存在主记录"));
+                                }
+                                return Err(CatalogError::Invalid("池 UUID 已退役，不能复用"));
+                            }
                             let named = tr.get(&name, false).await?;
                             if let Some(ref bytes) = old {
                                 decode_pool(pool.id, bytes)?;
@@ -1111,6 +1204,10 @@ impl ManagedCatalog {
                             }
                             tr.set(&record, &value);
                             tr.set(&index, &index_value);
+                            notifications::tape_changed_at(
+                                &tr, namespace, &serial, &barcode, "assigned",
+                            )
+                            .await?;
                             Ok(ControlOutcome::Created)
                         }
                         .await,
@@ -1173,6 +1270,14 @@ impl ManagedCatalog {
                             }
                             tr.clear(&record);
                             tr.clear(&index);
+                            notifications::tape_changed_at(
+                                &tr,
+                                namespace,
+                                &serial,
+                                &barcode,
+                                "unassigned",
+                            )
+                            .await?;
                             Ok(ControlOutcome::Unassigned)
                         }
                         .await,
@@ -1462,6 +1567,14 @@ impl ManagedCatalog {
                             }
                             tr.clear(&record);
                             tr.clear(&index);
+                            notifications::tape_changed_at(
+                                &tr,
+                                namespace,
+                                &serial,
+                                &barcode,
+                                "discarded_assignment_released",
+                            )
+                            .await?;
                             Ok(ControlOutcome::Unassigned)
                         }
                         .await,
@@ -1567,6 +1680,13 @@ impl ManagedCatalog {
                             require_assignment_index(&tr, &assigned).await?;
                             if assigned.volume_id.is_some_and(|id| id != p.volume_id) {
                                 return Ok(ControlOutcome::BarcodeConflict);
+                            }
+                            if tr
+                                .get(&native_media::volume_claim_key(p.volume_id), false)
+                                .await?
+                                .is_some()
+                            {
+                                return Ok(ControlOutcome::VolumeConflict);
                             }
                             let old = tr.get(&record, false).await?;
                             let named = tr.get(&reverse, false).await?;
@@ -2109,14 +2229,220 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn pool_retirement_codec_is_strict_and_cannot_mark_revision_one() {
+        for revision in [2, u64::MAX] {
+            let bytes = encode_pool_retirement(revision).unwrap();
+            assert_eq!(decode_pool_retirement(&bytes).unwrap(), revision);
+            for end in 0..bytes.len() {
+                assert!(decode_pool_retirement(&bytes[..end]).is_err());
+            }
+            let mut extra = bytes.to_vec();
+            extra.push(0);
+            assert!(decode_pool_retirement(&extra).is_err());
+            for version in [0, 2] {
+                let mut wrong = bytes;
+                wrong[0] = version;
+                assert!(decode_pool_retirement(&wrong).is_err());
+            }
+        }
+        for revision in [0u64, 1] {
+            assert!(encode_pool_retirement(revision).is_err());
+            let mut bytes = [1; 9];
+            bytes[1..].copy_from_slice(&revision.to_be_bytes());
+            assert!(decode_pool_retirement(&bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn unversioned_assignment_reverse_keys_are_not_the_current_layout() {
+        let ns = Uuid::new_v4();
+        let mut prototype = key(b'e');
+        prototype.extend_from_slice(ns.as_bytes());
+        append_component(&mut prototype, b"SERIAL_A");
+        append_component(&mut prototype, b"AA0001L8");
+        assert!(
+            decode_namespace_assignment(
+                ns,
+                &prototype,
+                &encode_namespace_assignment("SERIAL_A", "AA0001L8")
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；验证布局版本拒绝与不回填，不操作设备"]
+    async fn managed_layout_is_required_before_active_use_and_is_never_backfilled() {
+        use serde_json::json;
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog = ManagedCatalog::open(Some(&cluster)).unwrap();
+        let ns = Uuid::new_v4();
+        let serial = format!("SIM-LAYOUT-{ns}");
+        let challenge = Uuid::new_v4();
+        let replies=(1..=3).map(|node|json!({"version":1,"library_serial":serial,"challenge":challenge.to_string(),"node_id":node,"term":7,"leader":2,"role":if node==2 {"Leader"}else{"Follower"},"members":{"1":"a:1","2":"b:2","3":"c:3"},"quiesce_index":89,"frozen_index":90,"applied_index":92,"executor_absent":true,"catalog_pending":false,"shutting_down":false,"catalog_empty":true})).collect::<Vec<_>>();
+        let proof = verify_native_barriers(&serial, challenge, &replies).unwrap();
+        let route = catalog.initialize_native_library(ns, &proof).await.unwrap();
+        catalog
+            .claim_active_owner_epoch(&serial, 100)
+            .await
+            .unwrap();
+        let layout = |ns| {
+            let mut k = managed_key(ns);
+            k.extend_from_slice(b"/layout");
+            k
+        };
+        let layout_key = layout(ns);
+        let tr = catalog.db.create_trx().unwrap();
+        tr.clear(&layout_key);
+        tr.commit().await.unwrap();
+        assert!(matches!(
+            catalog.native_initialization_status(&serial, ns).await,
+            Err(CatalogError::Corrupt(_))
+        ));
+        assert!(matches!(
+            catalog.initialize_native_library(ns, &proof).await,
+            Err(CatalogError::Corrupt(_))
+        ));
+        assert!(matches!(
+            catalog.claim_active_owner_epoch(&serial, 101).await,
+            Err(CatalogError::Corrupt(_))
+        ));
+        assert!(matches!(
+            catalog
+                .check_active_pool_gate(&serial, route, 100, Uuid::new_v4())
+                .await,
+            Err(CatalogError::Corrupt(_))
+        ));
+        let tr = catalog.db.create_trx().unwrap();
+        assert!(tr.get(&layout_key, false).await.unwrap().is_none());
+        assert_eq!(
+            tr.get(&owner_key(&serial), false).await.unwrap().as_deref(),
+            Some(100u64.to_be_bytes().as_slice())
+        );
+        drop(tr);
+        for unsupported in [1, MANAGED_LAYOUT_VERSION + 1] {
+            let tr = catalog.db.create_trx().unwrap();
+            tr.set(&layout_key, &[unsupported]);
+            tr.commit().await.unwrap();
+            assert!(matches!(
+                catalog.native_initialization_status(&serial, ns).await,
+                Err(CatalogError::Corrupt(_))
+            ));
+            assert!(matches!(
+                catalog.claim_active_owner_epoch(&serial, 101).await,
+                Err(CatalogError::Corrupt(_))
+            ));
+            let tr = catalog.db.create_trx().unwrap();
+            assert_eq!(
+                tr.get(&layout_key, false).await.unwrap().as_deref(),
+                Some([unsupported].as_slice())
+            );
+        }
+        let tr = catalog.db.create_trx().unwrap();
+        tr.set(&layout_key, &[MANAGED_LAYOUT_VERSION]);
+        tr.commit().await.unwrap();
+        assert_eq!(
+            catalog
+                .native_initialization_status(&serial, ns)
+                .await
+                .unwrap(),
+            Some(route)
+        );
+        let candidate = Uuid::new_v4();
+        assert!(catalog.begin_managed_import(candidate).await.unwrap());
+        let tr = catalog.db.create_trx().unwrap();
+        tr.clear(&layout(candidate));
+        tr.commit().await.unwrap();
+        assert!(matches!(
+            catalog.begin_managed_import(candidate).await,
+            Err(CatalogError::Corrupt(_))
+        ));
+        let tr = catalog.db.create_trx().unwrap();
+        assert!(tr.get(&layout(candidate), false).await.unwrap().is_none());
+        tr.set(&layout(candidate), &[MANAGED_LAYOUT_VERSION]);
+        tr.commit().await.unwrap();
+        assert!(!catalog.begin_managed_import(candidate).await.unwrap());
+        let orphan = Uuid::new_v4();
+        let tr = catalog.db.create_trx().unwrap();
+        tr.set(&layout(orphan), &[1]);
+        tr.commit().await.unwrap();
+        assert!(matches!(
+            catalog.begin_managed_import(orphan).await,
+            Err(CatalogError::Corrupt(_))
+        ));
+        assert!(
+            catalog
+                .db
+                .create_trx()
+                .unwrap()
+                .get(&namespace_key(orphan), false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；旧孤立索引不能获得新布局标记，不操作设备"]
+    async fn orphan_namespace_rows_are_not_relabelled_as_current_data() {
+        use serde_json::json;
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog = ManagedCatalog::open(Some(&cluster)).unwrap();
+        for kind in *b"e0" {
+            let ns = Uuid::new_v4();
+            let mut row = key(kind);
+            row.extend_from_slice(ns.as_bytes());
+            if kind == b'e' {
+                append_component(&mut row, b"SERIAL_A");
+                append_component(&mut row, b"OLD000L8");
+            } else {
+                row.extend_from_slice(&1u64.to_be_bytes());
+                row.extend_from_slice(Uuid::new_v4().as_bytes());
+            }
+            let tr = catalog.db.create_trx().unwrap();
+            tr.set(&row, &encode_namespace_assignment("SERIAL_A", "OLD000L8"));
+            tr.commit().await.unwrap();
+            assert!(matches!(
+                catalog.begin_managed_import(ns).await,
+                Err(CatalogError::Corrupt(_))
+            ));
+            let serial = format!("SIM-ORPHAN-{ns}");
+            let challenge = Uuid::new_v4();
+            let replies=(1..=3).map(|node|json!({"version":1,"library_serial":serial,"challenge":challenge.to_string(),"node_id":node,"term":7,"leader":2,"role":if node==2 {"Leader"}else{"Follower"},"members":{"1":"a:1","2":"b:2","3":"c:3"},"quiesce_index":89,"frozen_index":90,"applied_index":92,"executor_absent":true,"catalog_pending":false,"shutting_down":false,"catalog_empty":true})).collect::<Vec<_>>();
+            let proof = verify_native_barriers(&serial, challenge, &replies).unwrap();
+            assert!(matches!(
+                catalog.initialize_native_library(ns, &proof).await,
+                Err(CatalogError::Invalid(_))
+            ));
+            assert!(
+                catalog
+                    .active_library_route(&serial)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let tr = catalog.db.create_trx().unwrap();
+            assert!(
+                tr.get(&managed_layout_key(ns), false)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(tr.get(&namespace_key(ns), false).await.unwrap().is_none());
+        }
+    }
+
+    #[test]
     fn pool_codec_rejects_bad_lengths_and_values() {
         let id = Uuid::new_v4();
         let record = PoolRecord {
+            created_at_millis: 1_793_405_000_123,
             id,
             library_serial: "SERIAL_A".into(),
             name: "归档".into(),
             file_limit: 200_000,
-            created_at_millis: 1_793_405_000_123,
             policy: PoolPolicy {
                 media_restriction: "L9".into(),
                 mount_limit: 7,
@@ -2180,6 +2506,11 @@ pub(super) mod tests {
         broken = encoded.clone();
         broken[24] = 255;
         assert!(decode_pool(id, &broken).is_err());
+        for time in [0, u64::MAX, 253_402_300_800_000] {
+            broken = encoded.clone();
+            broken[26..34].copy_from_slice(&time.to_be_bytes());
+            assert!(decode_pool(id, &broken).is_err());
+        }
         assert!(
             validate_pool(&PoolRecord {
                 policy: PoolPolicy {
@@ -2300,6 +2631,8 @@ pub(super) mod tests {
         );
         let index = namespace_assignment_key(namespace, pool, "SERIAL_A", "AA0001L8");
         let value = encode_namespace_assignment("SERIAL_A", "AA0001L8");
+        assert!(index.starts_with(&pool_assignment_prefix(namespace, pool)));
+        assert!(!index.starts_with(&pool_assignment_prefix(namespace, Uuid::new_v4())));
         assert_eq!(
             decode_namespace_assignment(namespace, &index, &value).unwrap(),
             (pool, "SERIAL_A".into(), "AA0001L8".into())
@@ -2307,6 +2640,14 @@ pub(super) mod tests {
         for end in 0..value.len() {
             assert!(decode_namespace_assignment(namespace, &index, &value[..end]).is_err());
         }
+        for end in 0..index.len() {
+            assert!(decode_namespace_assignment(namespace, &index[..end], &value).is_err());
+        }
+        let mut unknown_version = index.clone();
+        unknown_version[key(b'e').len() + 16] = MANAGED_LAYOUT_VERSION + 1;
+        assert!(decode_namespace_assignment(namespace, &unknown_version, &value).is_err());
+        let nil_pool = namespace_assignment_key(namespace, Uuid::nil(), "SERIAL_A", "AA0001L8");
+        assert!(decode_namespace_assignment(namespace, &nil_pool, &value).is_err());
         assert!(decode_namespace_assignment(Uuid::new_v4(), &index, &value).is_err());
         let mut unknown = index.clone();
         unknown[key(b'e').len() + 16] = MANAGED_LAYOUT_VERSION + 1;
@@ -2352,11 +2693,11 @@ pub(super) mod tests {
                 .unwrap()
         );
         let pool = PoolRecord {
+            created_at_millis: 1_793_405_000_123,
             id: Uuid::new_v4(),
             library_serial: serial.clone(),
             name: "单库归档".into(),
             file_limit: 200_000,
-            created_at_millis: 1_793_405_000_123,
             policy: PoolPolicy::default(),
             revision: 1,
         };
@@ -2395,12 +2736,30 @@ pub(super) mod tests {
                 .unwrap(),
             ControlOutcome::Created
         );
+        let pending_index = namespace_assignment_key(namespace, pool.id, &serial, "PENDINGL8");
+        let tr = catalog.db.create_trx().unwrap();
+        assert!(tr.get(&pending_index, false).await.unwrap().is_some());
+        assert!(
+            !requests::prefix_has_rows(&tr, &pool_assignment_prefix(namespace, Uuid::new_v4()))
+                .await
+                .unwrap()
+        );
         assert_eq!(
             catalog
                 .unassign_tape(namespace, pool.id, &serial, "PENDINGL8")
                 .await
                 .unwrap(),
             ControlOutcome::Unassigned
+        );
+        assert!(
+            catalog
+                .db
+                .create_trx()
+                .unwrap()
+                .get(&pending_index, false)
+                .await
+                .unwrap()
+                .is_none()
         );
         assert!(
             catalog
@@ -2890,11 +3249,11 @@ pub(super) mod tests {
         let namespace = Uuid::new_v4();
         let serial = format!("IMPORT-{}", Uuid::new_v4());
         let pool = PoolRecord {
+            created_at_millis: 1_793_405_000_123,
             id: Uuid::new_v4(),
             library_serial: serial.clone(),
             name: "受管导入池".into(),
             file_limit: 200_000,
-            created_at_millis: 1_793_405_000_123,
             policy: PoolPolicy::default(),
             revision: 1,
         };
@@ -2910,9 +3269,10 @@ pub(super) mod tests {
             library_serial: serial.clone(),
             barcode: "IMPORTL8".into(),
         };
+        let pool_root = import_materialize::import_inode(namespace, pool.id, "/");
         let receipt = test_receipt(CommitReceipt {
             namespace,
-            parent: Uuid::nil(),
+            parent: pool_root,
             name: b"uid-1".to_vec(),
             file_id: Uuid::new_v4(),
             expected_version: None,
@@ -2944,6 +3304,7 @@ pub(super) mod tests {
             catalog.create_pool(namespace, &pool).await.unwrap(),
             ControlOutcome::Created
         );
+        catalog.create_pool_root(namespace, pool.id).await.unwrap();
         assert_eq!(
             catalog
                 .assign_tape(namespace, pool.id, &serial, &placement.barcode)
@@ -2976,12 +3337,13 @@ pub(super) mod tests {
         );
         assert!(matches!(
             catalog
-                .resolve_child(namespace, Uuid::nil(), &receipt.name)
+                .resolve_child(namespace, pool_root, &receipt.name)
                 .await,
             Err(CatalogError::Incomplete)
         ));
         let mut path = vec![b'/'];
         path.extend_from_slice(&receipt.name);
+        let path = pool_catalog_path(pool.id, &path).unwrap();
         assert!(matches!(
             catalog.resolve_path(namespace, &path).await,
             Err(CatalogError::Incomplete)
@@ -3025,7 +3387,7 @@ pub(super) mod tests {
             catalog,
             namespace,
             std::slice::from_ref(&receipt),
-            &[],
+            &[(pool_root, initial_pool_root(&pool).unwrap())],
         )
         .await;
         assert!(catalog.seal_import(namespace).await.unwrap());
@@ -3041,7 +3403,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             catalog
-                .resolve_child(namespace, Uuid::nil(), &receipt.name)
+                .resolve_child(namespace, pool_root, &receipt.name)
                 .await
                 .unwrap(),
             Some(receipt.file_id)
@@ -3184,11 +3546,11 @@ pub(super) mod tests {
         let abandoned = Uuid::new_v4();
         let abandoned_serial = format!("IMPORT-{}", Uuid::new_v4());
         let abandoned_pool = PoolRecord {
+            created_at_millis: 1_793_405_000_123,
             id: Uuid::new_v4(),
             library_serial: abandoned_serial.clone(),
             name: "废弃候选池".into(),
             file_limit: 100,
-            created_at_millis: 1_793_405_000_123,
             policy: PoolPolicy::default(),
             revision: 1,
         };
@@ -3204,6 +3566,11 @@ pub(super) mod tests {
             .unwrap();
         catalog
             .create_pool(abandoned, &abandoned_pool)
+            .await
+            .unwrap();
+        let abandoned_root = import_materialize::import_inode(abandoned, abandoned_pool.id, "/");
+        catalog
+            .create_pool_root(abandoned, abandoned_pool.id)
             .await
             .unwrap();
         catalog
@@ -3231,7 +3598,7 @@ pub(super) mod tests {
             .unwrap();
         let abandoned_file = test_receipt(CommitReceipt {
             namespace: abandoned,
-            parent: Uuid::nil(),
+            parent: abandoned_root,
             name: b"discarded-file".to_vec(),
             file_id: Uuid::new_v4(),
             expected_version: None,
@@ -3415,14 +3782,29 @@ pub(super) mod tests {
         );
 
         let p = PoolRecord {
+            created_at_millis: 1_793_405_000_123,
             id: Uuid::new_v4(),
             library_serial: "SERIAL_A".into(),
             name: "Archive".into(),
             file_limit: 200_000,
-            created_at_millis: 1_793_405_000_123,
             policy: PoolPolicy::default(),
             revision: 1,
         };
+        assert!(
+            catalog
+                .create_pool(
+                    ns,
+                    &PoolRecord {
+                        policy: PoolPolicy {
+                            media_restriction: "L99".into(),
+                            ..p.policy.clone()
+                        },
+                        ..p.clone()
+                    }
+                )
+                .await
+                .is_err()
+        );
         assert!(
             catalog
                 .create_pool(
@@ -3483,11 +3865,11 @@ pub(super) mod tests {
         let mut generated = Vec::new();
         for n in 0..103 {
             let item = PoolRecord {
+                created_at_millis: 1_793_405_000_123,
                 id: Uuid::new_v4(),
                 library_serial: "SERIAL_A".into(),
                 name: format!("P-{n}"),
                 file_limit: 1,
-                created_at_millis: 1_793_405_000_123,
                 policy: PoolPolicy::default(),
                 revision: 1,
             };

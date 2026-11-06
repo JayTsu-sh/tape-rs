@@ -11,6 +11,7 @@ mod local_read_storage;
 pub mod ltfs;
 #[cfg(feature = "fdb")]
 pub mod managed_catalog;
+pub mod management_task_id;
 pub mod scsi;
 pub mod tape;
 pub mod tapefs;

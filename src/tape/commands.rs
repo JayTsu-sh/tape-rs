@@ -823,7 +823,7 @@ mod monitor_parser_tests {
 
 #[cfg(test)]
 mod partition_count_tests {
-    use super::*;
+    use super::defined_partition_count;
     #[test]
     fn defined_partition_count_checks_header_page_and_descriptors() {
         let mut v = vec![

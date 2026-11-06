@@ -92,6 +92,7 @@ async fn run_pool_api(cluster: &str) {
         catalog: catalog.clone(),
         routes: BTreeMap::from([(serial.clone(), route)]),
         owner: None,
+        upload_budget: None,
         notify_streams: Arc::new(Semaphore::new(1)),
         notify_requests: Arc::new(Semaphore::new(1)),
         admin_requests: Arc::new(Semaphore::new(32)),
@@ -537,7 +538,7 @@ async fn run_pool_api(cluster: &str) {
         200
     );
     let at = crate::ltfs::label::ltfs_time_now();
-    let observed = json!({"library_serial":serial,"owner":2,"round":epoch,"observed_at":at,"volumes":[{"barcode":"TEST01L8","address":101,"element_type":3,"medium_type":1,"source_address":1001,"home_slot":null}],"drives":[{"serial":"SIMDRV0000","address":1,"barcode":null}]});
+    let observed = json!({"num_of_slots":8,"num_of_ieslots":1,"scsi_vendor_id":"SIM","scsi_product_id":"SIM-CHANGER","scsi_firmware_revision":"0001","library_serial":serial,"owner":2,"round":epoch,"observed_at":at,"volumes":[{"barcode":"TEST01L8","address":101,"element_type":3,"medium_type":1,"source_address":1001,"home_slot":null}],"drives":[{"serial":"SIMDRV0000","address":1,"barcode":null}]});
     catalog
         .record_active_library_inventory(&serial, route, epoch, &observed)
         .await

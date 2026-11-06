@@ -20,17 +20,20 @@ use crate::error::{Result, TapeError};
 use crate::ltfs::index::{DirectoryNode, IndexEntry, LtfsIndex};
 use crate::ltfs::recovery::TailKind;
 use crate::ltfs::volume::{
-    CommittedIndexConstruct, LtfsVolume, TailPolicy, XATTR_EMPTY_RECOVERY, empty_recovery_marker,
+    CommittedIndexConstruct, FileMetadata, LtfsVolume, TailPolicy, XATTR_EMPTY_RECOVERY,
+    empty_recovery_marker,
 };
 use crate::managed_catalog::{
     ActiveBatchOutcome, ActiveBatchPhase, ActiveCompactionOutcome, ActiveFileIntent,
-    ActiveFinalizationOutcome, ActiveIndexIdentity, ActiveIndexOutcome,
+    ActiveFinalizationOutcome, ActiveIndexIdentity, ActiveIndexOutcome, ActiveLibraryRoute,
     ActiveMaterializationOutcome, ActiveOwnerOutcome, ActivePreparationOutcome,
     ActivePublicationOutcome, ActiveRecoveryOutcome, CommitReceipt, ManagedCatalog,
-    PreparedActiveFile, PublishOutcome, prepare_active_file, prepare_committed_active_file,
+    PreparedActiveFile, PublishOutcome, ResolvedPath, pool_catalog_path, prepare_active_file,
+    prepare_committed_active_file,
 };
 use crate::scsi::reservation::ReservationKey;
 
+#[derive(Debug)]
 pub struct ActiveMediaUpload {
     pub intent: ActiveFileIntent,
     pub spool: PathBuf,
@@ -42,6 +45,9 @@ pub struct ActiveMediaRecovered<'a> {
 }
 
 impl<'a> ActiveMediaRecovered<'a> {
+    pub fn into_volume(self) -> LtfsVolume<'a> {
+        self.volume
+    }
     pub fn volume(&self) -> &LtfsVolume<'a> {
         &self.volume
     }
@@ -91,6 +97,14 @@ pub async fn recover_active_media_tail<'a>(
         return Err(TapeError::Catalog(
             "FDB 恢复时介质与已观察索引不符或存在未知 S4".into(),
         ));
+    }
+    if !already_closed && matches!(tail, TailKind::UnindexedData | TailKind::TruncatedIndex) {
+        let route = catalog
+            .active_library_route(serial)
+            .await
+            .map_err(|error| catalog_error("修尾前查询活动路由", error))?
+            .ok_or_else(|| TapeError::NotReady("活动带库不存在".into()))?;
+        require_media_io(catalog, serial, route, owner_epoch, mounted.volume_uuid).await?;
     }
     expect_outcome(
         "冻结卷预约",
@@ -259,6 +273,35 @@ pub async fn reconcile_active_media_on_takeover<'a>(
         .observed_active_volume_index(serial, current.volume_uuid)
         .await
         .map_err(|error| catalog_error("接任核对已观察索引", error))?;
+    // An explicit import must remain possible when an external clean Full
+    // replaced the observed head. Do not cancel or bypass any owned work.
+    let expected_empty_close = observed.generation.checked_add(1) == Some(current.generation)
+        && volume.root_xattr(XATTR_EMPTY_RECOVERY)
+            == Some(
+                empty_recovery_marker(crate::ltfs::volume::CommittedIndexConstruct {
+                    volume_uuid: observed.volume_uuid,
+                    generation: observed.generation,
+                    location: observed.location,
+                    sha256: observed.sha256,
+                    incremental: observed.incremental,
+                })
+                .as_str(),
+            );
+    if current != observed
+        && !current.incremental
+        && volume.recovery().dp.tail == TailKind::Complete
+        && !expected_empty_close
+        && catalog
+            .may_defer_unobserved_media(serial, owner_epoch, observed, current)
+            .await
+            .map_err(|error| catalog_error("核对待导入介质占用", error))?
+    {
+        return Err(TapeError::MediaImportRequired {
+            volume: current.volume_uuid,
+            observed_generation: observed.generation,
+            media_generation: current.generation,
+        });
+    }
     let status = catalog
         .active_batch_status(serial, current.volume_uuid, current.generation)
         .await
@@ -302,12 +345,15 @@ pub async fn reconcile_active_media_on_takeover<'a>(
 /// Enter FDB's Active authority only after the Raft execution permit and the
 /// same mounted drive's PR holder have both been verified. A failed recovery
 /// leaves the advanced epoch as a fence; the same round may safely retry.
+/// Node attempts resume before generic file recovery. `node_budget` bounds
+/// loading their original request/plan and reconstructing canonical inputs.
 pub async fn establish_active_media_owner<'a>(
     catalog: &ManagedCatalog,
     mut volume: LtfsVolume<'a>,
     serial: &str,
     key: ReservationKey,
     permission: &Permission,
+    node_budget: usize,
 ) -> Result<ActiveMediaRecovered<'a>> {
     let round = key.round();
     if !key.is_ours()
@@ -338,6 +384,45 @@ pub async fn establish_active_media_owner<'a>(
     if !(permission.allows(round, Phase::Execution) || permission.allows(round, Phase::Serving)) {
         return Err(TapeError::NotReady(
             "FDB 接任期间多数派执行许可已失效".into(),
+        ));
+    }
+    let source = volume.verified_recovery_index_construct()?;
+    let (route, current_owner) = catalog
+        .active_library_owner(serial)
+        .await
+        .map_err(|error| catalog_error("接任核对当前路由", error))?
+        .ok_or_else(|| TapeError::Catalog("接任带库活动路由缺失".into()))?;
+    if current_owner != round {
+        return Err(TapeError::OwnershipLost {
+            device: serial.into(),
+            detail: "节点恢复前 FDB owner 已改变".into(),
+        });
+    }
+    if let Some(attempt) = catalog
+        .pending_node_mutation_attempt(serial, route, round, source.volume_uuid)
+        .await
+        .map_err(|error| catalog_error("接任发现原节点尝试", error))?
+    {
+        let (epoch, operation) = attempt.request_identity();
+        let task = catalog
+            .node_mutation_task(serial, route, epoch, operation)
+            .await
+            .map_err(|error| catalog_error("接任加载原节点任务", error))?
+            .ok_or_else(|| TapeError::Catalog("待恢复节点尝试缺少原任务".into()))?;
+        volume = Box::pin(super::fdb_node_media::execute_node_mutation(
+            catalog,
+            volume,
+            route,
+            key,
+            &task,
+            node_budget,
+        ))
+        .await?
+        .into_volume();
+    }
+    if !(permission.allows(round, Phase::Execution) || permission.allows(round, Phase::Serving)) {
+        return Err(TapeError::NotReady(
+            "FDB 节点恢复期间多数派执行许可已失效".into(),
         ));
     }
     volume.verified_recovery_index_construct()?;
@@ -480,6 +565,7 @@ pub async fn recover_sealed_active_media_batch<'a>(
                 batch.batch_id,
                 previous,
                 current,
+                index_file_count(volume.index()),
             )
             .await
             .map_err(|error| catalog_error("接任登记已提交索引", error))?,
@@ -989,6 +1075,9 @@ pub struct ActiveMediaCommit<'a> {
 }
 
 impl<'a> ActiveMediaCommit<'a> {
+    pub fn into_volume(self) -> LtfsVolume<'a> {
+        self.volume
+    }
     /// Read-only access for the current owner. Dropping the result leaves the
     /// committed DP index intact; callers cannot trigger an unrecorded IP
     /// checkpoint through `LtfsVolume::unmount`.
@@ -1009,8 +1098,58 @@ impl<'a> ActiveMediaCommit<'a> {
     }
 }
 
+fn index_file_count(index: &LtfsIndex) -> u64 {
+    fn count(dir: &crate::ltfs::index::DirectoryNode) -> u64 {
+        dir.files.len() as u64 + dir.subdirs.iter().map(count).sum::<u64>()
+    }
+    count(&index.root)
+}
+
 fn catalog_error(stage: &str, error: impl std::fmt::Display) -> TapeError {
     TapeError::Catalog(format!("FDB 活动写入 {stage} 失败：{error}"))
+}
+
+fn pool_gate_error(
+    stage: &str,
+    pool: Uuid,
+    error: crate::managed_catalog::CatalogError,
+) -> TapeError {
+    match error {
+        crate::managed_catalog::CatalogError::PoolImporting
+        | crate::managed_catalog::CatalogError::PoolBusy => TapeError::PoolBusy {
+            pool: pool.to_string(),
+        },
+        error => catalog_error(stage, error),
+    }
+}
+
+async fn require_media_io(
+    catalog: &ManagedCatalog,
+    serial: &str,
+    route: ActiveLibraryRoute,
+    owner: u64,
+    volume: Uuid,
+) -> Result<()> {
+    let placement = catalog
+        .volume_placement(volume)
+        .await
+        .map_err(|error| catalog_error("查询介质归属", error))?
+        .filter(|placement| {
+            placement.library_serial == serial && placement.namespace == route.route.namespace
+        })
+        .ok_or_else(|| TapeError::Catalog("介质不属于当前活动带库".into()))?;
+    let head = catalog
+        .active_loaded_volume_head(serial, &placement.barcode, route, owner)
+        .await
+        .map_err(|error| catalog_error("查询介质策略", error))?
+        .filter(|head| head.volume_id == volume && head.pool_id == placement.pool_id)
+        .ok_or_else(|| TapeError::Catalog("介质归属或卷身份已改变".into()))?;
+    if !head.online || head.blacklisted {
+        return Err(TapeError::MediaUnavailable {
+            barcode: placement.barcode,
+        });
+    }
+    Ok(())
 }
 
 fn expect_outcome<T: std::fmt::Debug + PartialEq>(
@@ -1050,6 +1189,7 @@ fn paths_for_batch(
             .map_err(|error| catalog_error("批次路径预检", error))?;
         if intent.namespace != first.namespace
             || intent.library_serial != first.library_serial
+            || intent.pool_id != first.pool_id
             || intent.owner_epoch != first.owner_epoch
             || intent.volume_id != volume
             || Some(intent.volume_generation) != previous_generation.checked_add(1)
@@ -1059,7 +1199,7 @@ fn paths_for_batch(
             || !file_ids.insert(intent.file_id)
         {
             return Err(TapeError::Catalog(
-                "FDB 活动批次存在跨卷、跨 owner 或重复文件身份".into(),
+                "FDB 活动批次存在跨卷、跨池、跨 owner 或重复文件身份".into(),
             ));
         }
         physical.push(path);
@@ -1067,16 +1207,95 @@ fn paths_for_batch(
     Ok(physical)
 }
 
+async fn capture_replacement_metadata(
+    catalog: &ManagedCatalog,
+    route: ActiveLibraryRoute,
+    uploads: &[ActiveMediaUpload],
+    max_bytes: usize,
+) -> Result<Vec<Option<FileMetadata>>> {
+    let mut remaining = max_bytes;
+    let mut replacements = Vec::with_capacity(uploads.len());
+    for upload in uploads {
+        let intent = &upload.intent;
+        if let Some(metadata) = catalog
+            .s3_upload_metadata(route, &intent.request())
+            .await
+            .map_err(|error| catalog_error("读取原 S3 上传属性", error))?
+        {
+            let bytes = serde_json::to_vec(&(&metadata.meta, &metadata.xattrs))
+                .map_err(|error| catalog_error("核对 S3 属性预算", error))?
+                .len();
+            remaining = remaining
+                .checked_sub(bytes)
+                .ok_or_else(|| TapeError::Catalog("S3 属性超过批次字节预算".into()))?;
+            replacements.push(Some(metadata));
+            continue;
+        }
+        let Some(expected) = intent.expected_version else {
+            replacements.push(None);
+            continue;
+        };
+        if intent.namespace != route.route.namespace {
+            return Err(TapeError::Catalog("覆盖请求与活动命名空间不符".into()));
+        }
+        let pool = intent
+            .pool_id
+            .ok_or_else(|| TapeError::Catalog("覆盖请求缺少池身份".into()))?;
+        let path = intent
+            .ltfs_path()
+            .and_then(|path| pool_catalog_path(pool, path.as_bytes()))
+            .map_err(|error| catalog_error("覆盖属性路径", error))?;
+        let resolved = catalog
+            .resolve_active_attributes_for_route(&intent.library_serial, &path, route, remaining)
+            .await
+            .map_err(|error| catalog_error("读取原版本覆盖属性", error))?;
+        let Some(ResolvedPath::File {
+            id,
+            head,
+            attributes: Some(attributes),
+            ..
+        }) = resolved
+        else {
+            return Err(TapeError::Catalog("原文件或属性缺失，拒绝有损覆盖".into()));
+        };
+        if id != intent.file_id || head.version != expected {
+            return Err(TapeError::Catalog("覆盖属性与原文件身份或版本不符".into()));
+        }
+        let relocation = catalog
+            .reclaim_upload_attempt(route, intent.owner_epoch, &intent.request())
+            .await
+            .map_err(|error| catalog_error("核对回收属性用途", error))?
+            .is_some();
+        let (metadata, bytes) = if relocation {
+            attributes.data_relocation()
+        } else {
+            attributes.content_replacement()
+        }
+        .map_err(|error| catalog_error("构建覆盖或迁移属性", error))?;
+        remaining = remaining
+            .checked_sub(bytes)
+            .ok_or_else(|| TapeError::Catalog("覆盖属性超过批次字节预算".into()))?;
+        replacements.push(Some(metadata));
+    }
+    Ok(replacements)
+}
+
 /// Append an already spooled batch and record the exact committed index in FDB.
 /// The caller must hold the drive PR and set the volume reservation guard.
 /// This method intentionally stops at index observation: visibility, request
 /// finalization, and compaction are resumed from the durable sealed batch.
+/// Replacement attributes share one encoded-byte budget and are captured
+/// before appending; each reservation rechecks the original inode/version.
 pub async fn commit_active_media_batch<'a>(
     catalog: &ManagedCatalog,
     mut volume: LtfsVolume<'a>,
     batch_id: Uuid,
     uploads: &[ActiveMediaUpload],
+    max_attributes_bytes: usize,
 ) -> Result<ActiveMediaCommit<'a>> {
+    if max_attributes_bytes == 0 {
+        return Err(TapeError::Catalog("覆盖属性字节预算必须大于零".into()));
+    }
     let previous = ActiveIndexIdentity::from(volume.verified_committed_index_construct()?);
     let volume_id = previous.volume_uuid;
     let physical_paths = paths_for_batch(volume_id, previous.generation, batch_id, uploads)?;
@@ -1091,18 +1310,69 @@ pub async fn commit_active_media_batch<'a>(
         ));
     }
 
+    // The actor executes policy tasks between complete media requests. Check
+    // the same authoritative pool before reserving or appending any bytes.
+    let route = catalog
+        .active_library_route(serial)
+        .await
+        .map_err(|error| catalog_error("写前查询活动路由", error))?
+        .ok_or_else(|| TapeError::NotReady("活动带库不存在".into()))?;
+    let pool_id = uploads[0]
+        .intent
+        .pool_id
+        .ok_or_else(|| TapeError::Catalog("写入缺少池身份".into()))?;
+    for upload in uploads {
+        catalog
+            .check_active_upload_gate(route, upload.intent.owner_epoch, &upload.intent.request())
+            .await
+            .map_err(|error| pool_gate_error("写前池屏障", pool_id, error))?;
+    }
+    require_media_io(
+        catalog,
+        serial,
+        route,
+        uploads[0].intent.owner_epoch,
+        volume_id,
+    )
+    .await?;
+    let pool = catalog
+        .active_pool_for_route(serial, route, pool_id)
+        .await
+        .map_err(|error| catalog_error("写前查询池策略", error))?
+        .ok_or_else(|| TapeError::Catalog("写入池不存在".into()))?;
+    let count = catalog
+        .active_volume_file_count(serial, route, uploads[0].intent.owner_epoch, volume_id)
+        .await
+        .map_err(|error| catalog_error("写前核对卷文件数", error))?;
+    if count != index_file_count(volume.index()) {
+        return Err(TapeError::Catalog("卷文件数与核验后的介质索引不符".into()));
+    }
+    let added = physical_paths
+        .iter()
+        .filter(|path| volume.index().find_file(path).is_none())
+        .count() as u64;
+    if count >= pool.file_limit || count.checked_add(added).is_none_or(|n| n > pool.file_limit) {
+        return Err(TapeError::NotReady("目标卷已达到池文件数上限".into()));
+    }
+
+    let replacements =
+        capture_replacement_metadata(catalog, route, uploads, max_attributes_bytes).await?;
     let mut files = Vec::with_capacity(uploads.len());
-    for (upload, path) in uploads.iter().zip(&physical_paths) {
+    for ((upload, path), metadata) in uploads.iter().zip(&physical_paths).zip(replacements) {
         expect_outcome(
             "写前预约",
             catalog
                 .reserve_active_file(&upload.intent)
                 .await
-                .map_err(|error| catalog_error("写前预约", error))?,
+                .map_err(|error| pool_gate_error("写前预约", pool_id, error))?,
             &[PublishOutcome::Registered],
         )?;
         let mut spool = BufReader::new(File::open(&upload.spool)?);
-        volume.append_file(path, &mut spool)?;
+        if let Some(metadata) = metadata {
+            volume.append_replacement_file(path, &mut spool, &metadata)?;
+        } else {
+            volume.append_file(path, &mut spool)?;
+        }
         let prepared = prepare_active_file(&volume, path, &upload.intent)
             .map_err(|error| catalog_error("核对物理收据", error))?;
         expect_outcome(
@@ -1140,6 +1410,7 @@ pub async fn commit_active_media_batch<'a>(
                 batch_id,
                 previous,
                 current,
+                index_file_count(volume.index()),
             )
             .await
             .map_err(|error| catalog_error("登记已提交索引", error))?,
@@ -1373,6 +1644,53 @@ pub async fn publish_active_media_batch<'a>(
 mod sealed_full_audit_tests {
     use super::*;
     use crate::ltfs::index::{DirectoryNode, FileNode};
+
+    #[test]
+    fn batch_preflight_rejects_cross_pool_before_any_reservation() {
+        let intent = ActiveFileIntent {
+            barcode_constraint: None,
+            namespace: Uuid::new_v4(),
+            parent: Uuid::new_v4(),
+            parent_path: b"/".to_vec(),
+            name: b"a".to_vec(),
+            file_id: Uuid::new_v4(),
+            expected_version: None,
+            operation_id: Uuid::new_v4(),
+            request_epoch: 1,
+            library_serial: "SIM".into(),
+            pool_id: Some(Uuid::new_v4()),
+            owner_epoch: 100,
+            volume_id: Uuid::new_v4(),
+            volume_generation: 2,
+            volume_scan_id: Uuid::new_v4(),
+            expected_size: 3,
+            expected_digest: crate::managed_catalog::ContentDigest::Sha256(
+                Sha256::digest(b"one").into(),
+            ),
+        };
+        let mut other = intent.clone();
+        other.pool_id = Some(Uuid::new_v4());
+        other.name = b"b".to_vec();
+        other.file_id = Uuid::new_v4();
+        other.operation_id = Uuid::new_v4();
+        let mut uploads = [
+            ActiveMediaUpload {
+                intent: intent.clone(),
+                spool: PathBuf::new(),
+            },
+            ActiveMediaUpload {
+                intent: other,
+                spool: PathBuf::new(),
+            },
+        ];
+        let batch = Uuid::new_v4();
+        assert!(paths_for_batch(intent.volume_id, 1, batch, &uploads).is_err());
+        uploads[1].intent.pool_id = intent.pool_id;
+        assert_eq!(
+            paths_for_batch(intent.volume_id, 1, batch, &uploads).unwrap(),
+            ["/a", "/b"]
+        );
+    }
 
     fn file(path: &str, uid: u64, length: u64) -> IndexEntry {
         IndexEntry::File {

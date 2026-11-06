@@ -9,8 +9,6 @@
 //! 替换上传可用服务端记录的内容哈希核对结果；只创建上传丢失响应时，同内容文件
 //! 不足以证明归属，必须返回结果未定。
 
-pub mod fdb;
-
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
@@ -18,6 +16,9 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use serde_json::Value;
 use sha2::Digest as _;
+
+/// FDB 文件服务客户端；不要求调用方链接 FDB SDK。
+pub mod fdb;
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -64,20 +65,100 @@ impl From<std::io::Error> for ClientError {
 
 pub type Result<T> = std::result::Result<T, ClientError>;
 
+/// A backend's real identity domain. FDB inode revisions are not Raft pairs,
+/// and native LTFS file UIDs are not execution rounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FileVersion {
+    Raft {
+        round: u64,
+        sequence: u64,
+    },
+    Ltfs {
+        volume: uuid::Uuid,
+        file_uid: u64,
+        generation: u64,
+    },
+    Fdb {
+        namespace: uuid::Uuid,
+        inode: uuid::Uuid,
+        version: u64,
+    },
+}
+
+impl std::fmt::Display for FileVersion {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Raft { round, sequence } => write!(output, "{round}.{sequence}"),
+            Self::Ltfs {
+                volume,
+                file_uid,
+                generation,
+            } => write!(output, "ltfs:{volume}/{file_uid}@{generation}"),
+            Self::Fdb {
+                namespace,
+                inode,
+                version,
+            } => write!(output, "fdb:{namespace}/{inode}@{version}"),
+        }
+    }
+}
+
+impl PartialOrd for FileVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (*self, *other) {
+            (
+                Self::Raft {
+                    round: a,
+                    sequence: b,
+                },
+                Self::Raft {
+                    round: c,
+                    sequence: d,
+                },
+            ) => Some((a, b).cmp(&(c, d))),
+            (
+                Self::Ltfs {
+                    volume: a,
+                    file_uid: b,
+                    generation: c,
+                },
+                Self::Ltfs {
+                    volume: d,
+                    file_uid: e,
+                    generation: f,
+                },
+            ) if a == d && b == e => Some(c.cmp(&f)),
+            (
+                Self::Fdb {
+                    namespace: a,
+                    inode: b,
+                    version: c,
+                },
+                Self::Fdb {
+                    namespace: d,
+                    inode: e,
+                    version: f,
+                },
+            ) if a == d && b == e => Some(c.cmp(&f)),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileStat {
     pub length: u64,
-    /// 包含该文件的索引代数
-    pub generation: u64,
-    /// 回答这次查询的执行轮次
-    pub round: u64,
+    /// 原内容来源的索引代数；纯逻辑目录没有物理卷代数。
+    pub generation: Option<u64>,
+    /// 回答这次查询的执行轮次；纯元数据或原生 LTFS 查询没有执行轮次。
+    pub round: Option<u64>,
     /// 所在磁带的条码
     pub barcode: String,
     /// 服务端写带时算出的内容 sha256（十六进制小写）
     pub sha256: String,
-    /// 文件的内容版本（轮次、序号），不是当前回答查询的执行轮次。
-    pub version: (u64, u64),
-    /// 索引 modify_time/xattrs；旧服务端或旧缓存没有该字段时为 null。
+    /// 后端版本身份，与回答查询的执行轮次分别记录。
+    pub version: FileVersion,
+    /// 索引 modify_time/xattrs；未登记的属性为 null。
     pub metadata: Value,
 }
 
@@ -101,9 +182,11 @@ pub struct PathStat {
 /// 目录的一个直接子项（`list_dir`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirItem {
+    /// 本次列举捕获的节点身份与版本；列表未提供时为 None。
+    pub version: Option<FileVersion>,
     pub name: String,
     pub is_dir: bool,
-    /// 旧服务端没有类型字段时为 None，调用方可回退到 stat。
+    /// 尚未确定链接类型时为 None，调用方可点查确认。
     pub is_symlink: Option<bool>,
     /// 文件：`committed`、`uploading` 或 `staged`；目录为空串
     pub state: String,
@@ -111,19 +194,38 @@ pub struct DirItem {
     pub staged_length: Option<u64>,
 }
 
-fn file_stat(j: &Value) -> FileStat {
-    FileStat {
+fn file_stat(j: &Value) -> Result<FileStat> {
+    let version = j["version"]
+        .as_array()
+        .filter(|v| v.len() == 2)
+        .ok_or_else(|| ClientError::Verification("Raft 文件版本必须是两个整数".into()))?;
+    let round = version[0]
+        .as_u64()
+        .ok_or_else(|| ClientError::Verification("Raft 文件版本轮次无效".into()))?;
+    let sequence = version[1]
+        .as_u64()
+        .ok_or_else(|| ClientError::Verification("Raft 文件版本序号无效".into()))?;
+    let observed_round = match j.get("round") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .ok_or_else(|| ClientError::Verification("查询执行轮次字段无效".into()))?,
+        ),
+    };
+    Ok(FileStat {
         length: j["length"].as_u64().unwrap_or(0),
-        generation: j["generation"].as_u64().unwrap_or(0),
-        round: j["round"].as_u64().unwrap_or(0),
+        generation: Some(
+            j["generation"]
+                .as_u64()
+                .ok_or_else(|| ClientError::Verification("Raft 文件缺少真实索引代数".into()))?,
+        ),
+        round: observed_round,
         barcode: j["barcode"].as_str().unwrap_or("").to_string(),
         sha256: j["sha256"].as_str().unwrap_or("").to_string(),
-        version: (
-            j["version"][0].as_u64().unwrap_or(0),
-            j["version"][1].as_u64().unwrap_or(0),
-        ),
+        version: FileVersion::Raft { round, sequence },
         metadata: j.get("metadata").cloned().unwrap_or(Value::Null),
-    }
+    })
 }
 
 fn portable_xattrs(metadata: &Value) -> Vec<(String, String, bool)> {
@@ -189,34 +291,38 @@ pub struct PutOutcome {
 enum Body<'a> {
     Mem(&'a [u8]),
     File(&'a std::path::Path, u64),
+    OpenedFile(&'a std::fs::File, u64),
 }
 
 impl Body<'_> {
     fn len(&self) -> u64 {
         match self {
             Body::Mem(b) => b.len() as u64,
-            Body::File(_, n) => *n,
+            Body::File(_, n) | Body::OpenedFile(_, n) => *n,
         }
     }
 
     fn send(&self, conn: &mut TcpStream) -> std::io::Result<()> {
-        match self {
-            Body::Mem(b) => conn.write_all(b),
-            Body::File(p, n) => {
-                let f = std::fs::File::open(p)?;
-                let copied = std::io::copy(
-                    &mut std::io::BufReader::with_capacity(1 << 20, f).take(*n),
-                    conn,
-                )?;
-                if copied != *n {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "本地文件在上传途中变短了",
-                    ));
-                }
-                Ok(())
+        let (file, length) = match self {
+            Body::Mem(bytes) => return conn.write_all(bytes),
+            Body::File(path, length) => (std::fs::File::open(path)?, *length),
+            Body::OpenedFile(file, length) => {
+                let mut copy = file.try_clone()?;
+                std::io::Seek::rewind(&mut copy)?;
+                (copy, *length)
             }
+        };
+        let copied = std::io::copy(
+            &mut std::io::BufReader::with_capacity(1 << 20, file).take(length),
+            conn,
+        )?;
+        if copied != length {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "本地文件在上传途中变短了",
+            ));
         }
+        Ok(())
     }
 }
 
@@ -557,11 +663,18 @@ impl Client {
         match r.status {
             200 => {
                 let j = r.json();
-                let state = j["state"].as_str().unwrap_or("committed").to_string();
+                let state = j["state"]
+                    .as_str()
+                    .filter(|state| matches!(*state, "committed" | "uploading" | "staged"))
+                    .ok_or_else(|| ClientError::Verification("路径状态字段无效".into()))?
+                    .to_string();
                 let current = if state == "committed" {
-                    Some(file_stat(&j))
+                    Some(file_stat(&j)?)
                 } else {
-                    j.get("current").map(file_stat)
+                    j.get("current")
+                        .filter(|value| !value.is_null())
+                        .map(file_stat)
+                        .transpose()?
                 };
                 Ok(Some(PathStat {
                     length: j["length"].as_u64().unwrap_or(0),
@@ -878,12 +991,14 @@ impl Client {
                         // 相同内容不能证明这次只创建请求写下了该版本；它可能
                         // 早已存在，或由另一个客户端在连接中断后创建。
                         return Err(ClientError::Indeterminate(format!(
-                            "只创建上传 {} 的响应丢失；目标已有相同内容，无法确认归属（版本 {}.{})",
-                            path, cur.version.0, cur.version.1
+                            "只创建上传 {} 的响应丢失；目标已有相同内容，无法确认归属（版本 {}）",
+                            path, cur.version
                         )));
                     }
                     return Ok(PutOutcome {
-                        generation: cur.generation,
+                        generation: cur.generation.ok_or_else(|| {
+                            ClientError::Verification("提交结果缺少真实索引代数".into())
+                        })?,
                         attempts,
                         resolved_by_query: true,
                         committed: true,
@@ -932,9 +1047,14 @@ impl Client {
     }
 
     /// 仅当源路径仍是已核验版本时写入墓碑；用于复制后安全地决定是否可删除源。
-    pub fn delete_if_version(&mut self, path: &str, version: (u64, u64)) -> Result<()> {
+    pub fn delete_if_version(&mut self, path: &str, version: FileVersion) -> Result<()> {
+        let FileVersion::Raft { round, sequence } = version else {
+            return Err(ClientError::Verification(
+                "条件删除要求同一 Raft 文件版本域".into(),
+            ));
+        };
         let route = format!("/files/{}?wait=1", path.trim_start_matches('/'));
-        let etag = format!("\"{}.{}\"", version.0, version.1);
+        let etag = format!("\"{round}.{sequence}\"");
         let r = self
             .request_leader_with("DELETE", &route, None, &[("If-Match", &etag)], None)
             .map_err(|e| match e {
@@ -947,8 +1067,8 @@ impl Client {
             200 if r.json()["status"] == "committed" => Ok(()),
             404 => Err(ClientError::NotFound),
             412 => Err(ClientError::Verification(format!(
-                "{} 已不是版本 {}.{}",
-                path, version.0, version.1
+                "{} 已不是版本 {}",
+                path, version
             ))),
             202 | 504 => Err(ClientError::Indeterminate(format!(
                 "条件删除 {} 尚未取得落带确认: {}",
@@ -1179,6 +1299,7 @@ impl Client {
                 .map(|a| {
                     a.iter()
                         .map(|e| DirItem {
+                            version: None,
                             name: e["name"].as_str().unwrap_or("").to_string(),
                             is_dir: e["type"] == "dir",
                             is_symlink: e["is_symlink"].as_bool(),
@@ -1490,6 +1611,155 @@ fn encode_path(path: &str) -> String {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn file_versions_keep_backend_domains_and_fdb_inode_scope_distinct() {
+        let namespace = uuid::Uuid::new_v4();
+        let inode = uuid::Uuid::new_v4();
+        let raft = FileVersion::Raft {
+            round: 7,
+            sequence: 12,
+        };
+        let ltfs = FileVersion::Ltfs {
+            volume: namespace,
+            file_uid: 7,
+            generation: 12,
+        };
+        let fdb = FileVersion::Fdb {
+            namespace,
+            inode,
+            version: 12,
+        };
+        assert_ne!(raft, ltfs);
+        assert_ne!(raft, fdb);
+        assert_ne!(ltfs, fdb);
+        assert_ne!(
+            fdb,
+            FileVersion::Fdb {
+                namespace: uuid::Uuid::new_v4(),
+                inode,
+                version: 12
+            }
+        );
+        assert_ne!(
+            fdb,
+            FileVersion::Fdb {
+                namespace,
+                inode: uuid::Uuid::new_v4(),
+                version: 12
+            }
+        );
+        assert_eq!(raft.to_string(), "7.12");
+        assert_eq!(ltfs.to_string(), format!("ltfs:{namespace}/7@12"));
+        assert_eq!(fdb.to_string(), format!("fdb:{namespace}/{inode}@12"));
+        assert_eq!(raft.partial_cmp(&ltfs), None);
+        assert!(
+            FileVersion::Raft {
+                round: 8,
+                sequence: 1
+            } > raft
+        );
+        assert!(
+            FileVersion::Fdb {
+                namespace,
+                inode,
+                version: 13
+            } > fdb
+        );
+        assert_eq!(
+            fdb.partial_cmp(&FileVersion::Fdb {
+                namespace: uuid::Uuid::new_v4(),
+                inode,
+                version: 13
+            }),
+            None
+        );
+        assert_eq!(
+            ltfs.partial_cmp(&FileVersion::Ltfs {
+                volume: namespace,
+                file_uid: 8,
+                generation: 13
+            }),
+            None
+        );
+        assert_eq!(
+            ltfs.partial_cmp(&FileVersion::Ltfs {
+                volume: uuid::Uuid::new_v4(),
+                file_uid: 7,
+                generation: 13
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn conditional_delete_rejects_other_identity_domains_before_network_io() {
+        let mut client = Client::new(Vec::<String>::new());
+        client.retry_for = Duration::ZERO;
+        for version in [
+            FileVersion::Ltfs {
+                volume: uuid::Uuid::new_v4(),
+                file_uid: 7,
+                generation: 12,
+            },
+            FileVersion::Fdb {
+                namespace: uuid::Uuid::new_v4(),
+                inode: uuid::Uuid::new_v4(),
+                version: 12,
+            },
+        ] {
+            assert!(matches!(
+                client.delete_if_version("/file", version),
+                Err(ClientError::Verification(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn file_identity_decoding_requires_real_version_fields_and_preserves_unknown_round() {
+        let mut value = serde_json::json!({"length":3,"generation":4,"barcode":"SIM","sha256":"x","version":[7,12],"metadata":null});
+        let stat = file_stat(&value).unwrap();
+        assert_eq!(
+            stat.version,
+            FileVersion::Raft {
+                round: 7,
+                sequence: 12
+            }
+        );
+        assert_eq!(stat.round, None);
+        value["round"] = serde_json::json!(100);
+        assert_eq!(file_stat(&value).unwrap().round, Some(100));
+        value["round"] = Value::Null;
+        assert_eq!(file_stat(&value).unwrap().round, None);
+        value["round"] = serde_json::json!("100");
+        assert!(file_stat(&value).is_err());
+        value["round"] = Value::Null;
+        for version in [
+            Value::Null,
+            serde_json::json!([]),
+            serde_json::json!([7]),
+            serde_json::json!([7, 12, 13]),
+            serde_json::json!([7, "12"]),
+            serde_json::json!([7, -1]),
+            serde_json::json!([7, 1.5]),
+            serde_json::json!({"namespace":uuid::Uuid::new_v4().to_string(),"inode":uuid::Uuid::new_v4().to_string(),"version":12}),
+        ] {
+            value["version"] = version;
+            assert!(file_stat(&value).is_err());
+        }
+        value.as_object_mut().unwrap().remove("version");
+        assert!(file_stat(&value).is_err());
+        value["version"] = serde_json::json!([0, 0]);
+        assert!(
+            file_stat(&value).is_ok(),
+            "explicit wire values must not be confused with a missing version"
+        );
+        value.as_object_mut().unwrap().remove("generation");
+        assert!(
+            file_stat(&value).is_err(),
+            "unknown generation must not become a fabricated zero"
+        );
+    }
 
     #[test]
     fn create_only_does_not_claim_preexisting_same_content_after_lost_reply() {
@@ -2012,7 +2282,7 @@ mod tests {
                 ("PUT", serde_json::json!({"status": "staged", "task": 1})),
                 (
                     "GET",
-                    serde_json::json!({"state": "committed", "length": 3, "generation": 2, "sha256": format!("{:x}", Sha256::digest(b"abc"))}),
+                    serde_json::json!({"state": "committed", "length": 3, "generation": 2, "version":[1,1],"sha256": format!("{:x}", Sha256::digest(b"abc"))}),
                 ),
             ] {
                 let (stream, _) = listener.accept().unwrap();

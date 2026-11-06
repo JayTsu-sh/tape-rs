@@ -30,11 +30,11 @@ async fn isolated_fdb_server_restart_recovery() {
     let namespace = id(1);
     let serial = format!("RECOVERY_{}", run.simple());
     let pool = PoolRecord {
+        created_at_millis: 1_793_405_000_123,
         id: id(2),
         library_serial: serial.clone(),
         name: "恢复验收池".into(),
         file_limit: 100,
-        created_at_millis: 1_793_405_000_123,
         policy: PoolPolicy::default(),
         revision: 1,
     };
@@ -54,11 +54,11 @@ async fn isolated_fdb_server_restart_recovery() {
     let candidate = id(8);
     let candidate_serial = format!("IMPORT_{}", run.simple());
     let candidate_pool = PoolRecord {
+        created_at_millis: 1_793_405_000_123,
         id: id(9),
         library_serial: candidate_serial.clone(),
         name: "故障恢复导入池".into(),
         file_limit: 200_000,
-        created_at_millis: 1_793_405_000_123,
         policy: PoolPolicy::default(),
         revision: 1,
     };
