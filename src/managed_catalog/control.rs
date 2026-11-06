@@ -1,6 +1,84 @@
-//! Small, shared placement metadata. The production control plane has not switched to this store.
+//! Pool and placement metadata. Active writes require the exact route and owner.
 
 use super::*;
+
+#[path = "inventory.rs"]
+mod inventory;
+#[path = "native_device.rs"]
+pub(super) mod native_device;
+#[path = "notifications.rs"]
+pub(super) mod notifications;
+#[path = "tape_capacity.rs"]
+pub(super) mod tape_capacity;
+#[path = "tape_monitor.rs"]
+pub(super) mod tape_monitor;
+#[path = "tape_policy.rs"]
+pub(super) mod tape_policy;
+#[path = "tape_stats.rs"]
+mod tape_stats;
+pub use native_device::NativeDeviceTask;
+
+#[path = "active_pools.rs"]
+mod active_pools;
+pub use active_pools::ActivePoolCreation;
+#[path = "management.rs"]
+pub(super) mod management;
+pub use management::ManagementRequest;
+#[path = "reclaim.rs"]
+pub(super) mod reclaim;
+pub use reclaim::{
+    ReclaimDataProgress, ReclaimFile, ReclaimFileMetadata, ReclaimMetadataProgress,
+    ReclaimReservation, ReclaimSourceInventory, ReclaimSourceProgress, ReclaimSourceRead,
+    ReclaimSpec, ReclaimWalk,
+};
+#[path = "node_baseline.rs"]
+mod node_baseline;
+pub use node_baseline::{NodeMutationBaseline, NodeMutationParent, NodeMutationSpec};
+#[path = "node_inputs.rs"]
+mod node_inputs;
+pub use node_inputs::{NodeMutationAncestor, PreparedNodeMutationInputs};
+#[path = "node_request.rs"]
+mod node_request;
+pub use node_request::{NodeMutationRequest, NodeMutationRequestContext};
+#[path = "node_rename.rs"]
+mod node_rename;
+pub use node_rename::{
+    NodeRenameAbsenceEvidence, NodeRenameAbsenceKind, NodeRenameAttempt, NodeRenameAttemptPhase,
+    NodeRenameBaseline, NodeRenameDataReferences, NodeRenameGlobalPlan, NodeRenameIntentClosure,
+    NodeRenameLiveFile, NodeRenameManifest, NodeRenameManifestCapture, NodeRenameManifestReader,
+    NodeRenameMediaPlan, NodeRenameObservation, NodeRenameParticipant,
+    NodeRenameParticipantsCapture, NodeRenameParticipantsSummary, NodeRenamePhysicalSource,
+    NodeRenamePhysicalSourceStats, NodeRenameProjectionSpool, NodeRenameProjectionStats,
+    NodeRenameProjectionVolume, NodeRenamePublication, NodeRenameReferenceRole, NodeRenameRequest,
+    NodeRenameRevision, NodeRenameS4Evidence, NodeRenameSpec, NodeRenameSubtreeCapture,
+    NodeRenameSubtreeEntry, NodeRenameSubtreePage, NodeRenameSubtreeSummary, NodeRenameVolumeGuard,
+    NodeRenameVolumeGuardStats, NodeRenameVolumeIntent, NodeRenameVolumePlan,
+    NodeRenameVolumeProjection, NodeRenameVolumeProjectionStats, PreparedNodeRenameInputs,
+};
+pub(super) use node_rename::{require_rename_discard_at, require_rename_observation_at};
+#[path = "node_tasks.rs"]
+mod node_tasks;
+pub use node_tasks::{
+    NodeMutationTask, NodeMutationTaskKind, NodeMutationTaskOutcome, NodeMutationTaskState,
+    NodeMutationTaskStatus,
+};
+pub(super) use node_tasks::{
+    node_hold_prefix, require_pool_without_reclaim_at, require_pool_writable_at,
+};
+#[path = "node_attempts.rs"]
+pub(super) mod node_attempts;
+#[path = "node_claims.rs"]
+mod node_claims;
+pub use node_attempts::{
+    NodeMutationAttempt, NodeMutationAttemptClosure, NodeMutationDeletion, NodeMutationObservation,
+    NodeMutationPublication,
+};
+#[path = "pool_roots.rs"]
+mod pool_roots;
+pub(super) use pool_roots::{initial_pool_root, reject_generic_pool_root_at};
+#[path = "native_media.rs"]
+pub(super) mod native_media;
+pub use native_media::{NativeMediaImport, NativeMediaSource};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolRecord {
@@ -9,9 +87,22 @@ pub struct PoolRecord {
     pub library_serial: String,
     pub name: String,
     pub file_limit: u64,
+    /// Time this pool was created in FDB, in UTC milliseconds; immutable.
+    pub created_at_millis: u64,
     pub policy: PoolPolicy,
     /// Monotonic CAS token; starts at one and advances on every update.
     pub revision: u64,
+}
+
+impl PoolRecord {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({"id":self.id.to_string(),"library_serial":self.library_serial,"name":self.name,
+            "file_limit":self.file_limit,"revision":self.revision,"created_at_millis":self.created_at_millis,
+            "created_at":chrono::DateTime::from_timestamp_millis(self.created_at_millis as i64).expect("validated pool time").to_rfc3339_opts(chrono::SecondsFormat::Millis,true),
+            "policy":{"media_restriction":self.policy.media_restriction,"mount_limit":self.policy.mount_limit,
+                "low_space_warning_enabled":self.policy.low_space_warning_enabled,"low_space_warning_threshold":self.policy.low_space_warning_threshold,
+                "no_space_warning_enabled":self.policy.no_space_warning_enabled}})
+    }
 }
 
 /// Pool placement and warning policy shared by every owner of a logical library.
@@ -19,7 +110,6 @@ pub struct PoolRecord {
 pub struct PoolPolicy {
     pub media_restriction: String,
     pub mount_limit: u16,
-    pub node_group: String,
     pub low_space_warning_enabled: bool,
     pub low_space_warning_threshold: u16,
     pub no_space_warning_enabled: bool,
@@ -30,7 +120,6 @@ impl Default for PoolPolicy {
         Self {
             media_restriction: "none".into(),
             mount_limit: 0,
-            node_group: "G0".into(),
             low_space_warning_enabled: true,
             low_space_warning_threshold: 0,
             no_space_warning_enabled: true,
@@ -70,12 +159,59 @@ pub struct TapeAssignment {
     pub barcode: String,
     /// None until the owner has read and verified the LTFS volume identity.
     pub volume_id: Option<Uuid>,
+    pub revision: u64,
+    pub online: bool,
+    pub blacklisted: bool,
+}
+
+impl TapeAssignment {
+    pub fn allows_io(&self) -> bool {
+        self.online && !self.blacklisted
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "library":self.library_serial,"namespace":self.namespace.to_string(),
+            "pool":self.pool_id.to_string(),"barcode":self.barcode,
+            "volume":self.volume_id.map(|id| id.to_string()),
+            "revision":self.revision,"online":self.online,"blacklisted":self.blacklisted,
+        })
+    }
 }
 
 pub(super) fn managed_key(namespace: Uuid) -> Vec<u8> {
     let mut k = key(b'a');
     k.extend_from_slice(namespace.as_bytes());
     k
+}
+
+pub(super) const MANAGED_LAYOUT_VERSION: u8 = 2;
+
+pub(super) fn managed_layout_key(namespace: Uuid) -> Vec<u8> {
+    // Keep the layout assertion with the managed marker: namespace cleanup
+    // releases all assignment rows before clearing either of these records.
+    let mut k = managed_key(namespace);
+    k.extend_from_slice(b"/layout");
+    k
+}
+
+pub(super) fn validate_managed_layout(value: Option<&[u8]>) -> Result<()> {
+    if value != Some(&[MANAGED_LAYOUT_VERSION]) {
+        return Err(CatalogError::Corrupt("受管目录布局缺失或不支持"));
+    }
+    Ok(())
+}
+
+pub(super) fn initialize_managed_layout(tr: &Transaction, namespace: Uuid) {
+    tr.set(&managed_layout_key(namespace), &[MANAGED_LAYOUT_VERSION]);
+}
+
+pub(super) async fn require_managed_layout(tr: &Transaction, namespace: Uuid) -> Result<()> {
+    validate_managed_layout(
+        tr.get(&managed_layout_key(namespace), false)
+            .await?
+            .as_deref(),
+    )
 }
 
 fn placement_key(volume: Uuid) -> Vec<u8> {
@@ -98,9 +234,21 @@ fn assignment_key(serial: &str, barcode: &str) -> Vec<u8> {
     k
 }
 
-pub(super) fn namespace_assignment_key(namespace: Uuid, serial: &str, barcode: &str) -> Vec<u8> {
+pub(super) fn pool_assignment_prefix(namespace: Uuid, pool: Uuid) -> Vec<u8> {
     let mut k = key(b'e');
     k.extend_from_slice(namespace.as_bytes());
+    k.push(MANAGED_LAYOUT_VERSION);
+    k.extend_from_slice(pool.as_bytes());
+    k
+}
+
+pub(super) fn namespace_assignment_key(
+    namespace: Uuid,
+    pool: Uuid,
+    serial: &str,
+    barcode: &str,
+) -> Vec<u8> {
+    let mut k = pool_assignment_prefix(namespace, pool);
     append_component(&mut k, serial.as_bytes());
     append_component(&mut k, barcode.as_bytes());
     k
@@ -117,9 +265,19 @@ fn encode_namespace_assignment(serial: &str, barcode: &str) -> Vec<u8> {
 
 pub(super) fn decode_namespace_assignment(
     namespace: Uuid,
-    key: &[u8],
+    row_key: &[u8],
     bytes: &[u8],
-) -> Result<(String, String)> {
+) -> Result<(Uuid, String, String)> {
+    let mut prefix = key(b'e');
+    prefix.extend_from_slice(namespace.as_bytes());
+    prefix.push(MANAGED_LAYOUT_VERSION);
+    if namespace.is_nil() || !row_key.starts_with(&prefix) || row_key.len() < prefix.len() + 16 {
+        return Err(CatalogError::Corrupt("磁带归属索引布局或作用域"));
+    }
+    let pool = uuid_from(&row_key[prefix.len()..prefix.len() + 16])?;
+    if pool.is_nil() {
+        return Err(CatalogError::Corrupt("磁带归属索引池身份"));
+    }
     let serial_len = *bytes
         .first()
         .ok_or(CatalogError::Corrupt("磁带归属索引长度"))? as usize;
@@ -136,42 +294,65 @@ pub(super) fn decode_namespace_assignment(
         .map_err(|_| CatalogError::Corrupt("磁带归属索引条码"))?;
     validate_physical_serial(serial).map_err(|_| CatalogError::Corrupt("磁带归属索引序列号"))?;
     validate_barcode(barcode).map_err(|_| CatalogError::Corrupt("磁带归属索引条码"))?;
-    if namespace_assignment_key(namespace, serial, barcode) != key {
+    if namespace_assignment_key(namespace, pool, serial, barcode) != row_key {
         return Err(CatalogError::Corrupt("磁带归属索引键值不一致"));
     }
-    Ok((serial.to_owned(), barcode.to_owned()))
+    Ok((pool, serial.to_owned(), barcode.to_owned()))
 }
 
 fn encode_assignment(namespace: Uuid, pool: Uuid, volume: Option<Uuid>) -> Vec<u8> {
-    let mut value = vec![0; if volume.is_some() { 49 } else { 33 }];
-    value[0] = if volume.is_some() { 2 } else { 1 };
-    value[1..17].copy_from_slice(namespace.as_bytes());
-    value[17..33].copy_from_slice(pool.as_bytes());
+    encode_assignment_state(namespace, pool, volume, 1, true, false)
+}
+
+fn encode_assignment_state(
+    namespace: Uuid,
+    pool: Uuid,
+    volume: Option<Uuid>,
+    revision: u64,
+    online: bool,
+    blacklisted: bool,
+) -> Vec<u8> {
+    let mut value = vec![0; if volume.is_some() { 60 } else { 44 }];
+    value[0] = 1;
+    value[1] = u8::from(volume.is_some());
+    value[2..18].copy_from_slice(namespace.as_bytes());
+    value[18..34].copy_from_slice(pool.as_bytes());
+    value[34..42].copy_from_slice(&revision.to_be_bytes());
+    value[42] = u8::from(online);
+    value[43] = u8::from(blacklisted);
     if let Some(volume) = volume {
-        value[33..49].copy_from_slice(volume.as_bytes());
+        value[44..60].copy_from_slice(volume.as_bytes());
     }
     value
 }
 
 fn decode_assignment(serial: &str, barcode: &str, bytes: &[u8]) -> Result<TapeAssignment> {
     if !matches!(
-        (bytes.first().copied(), bytes.len()),
-        (Some(1), 33) | (Some(2), 49)
-    ) {
+        (bytes.first().copied(), bytes.get(1).copied(), bytes.len()),
+        (Some(1), Some(0), 44) | (Some(1), Some(1), 60)
+    ) || bytes[42] > 1
+        || bytes[43] > 1
+    {
         return Err(CatalogError::Corrupt("磁带分配记录版本或长度"));
     }
     let assignment = TapeAssignment {
-        namespace: uuid_from(&bytes[1..17])?,
-        pool_id: uuid_from(&bytes[17..33])?,
+        namespace: uuid_from(&bytes[2..18])?,
+        pool_id: uuid_from(&bytes[18..34])?,
         library_serial: serial.to_owned(),
         barcode: barcode.to_owned(),
-        volume_id: (bytes.len() == 49)
-            .then(|| uuid_from(&bytes[33..49]))
+        volume_id: (bytes[1] == 1)
+            .then(|| uuid_from(&bytes[44..60]))
             .transpose()?,
+        revision: read_u64(&bytes[34..42]),
+        online: bytes[42] == 1,
+        blacklisted: bytes[43] == 1,
     };
     if assignment.namespace.is_nil()
         || assignment.pool_id.is_nil()
         || assignment.volume_id.is_some_and(|id| id.is_nil())
+        || assignment.revision == 0
+        || (assignment.volume_id.is_none()
+            && (assignment.revision != 1 || !assignment.online || assignment.blacklisted))
     {
         return Err(CatalogError::Corrupt("磁带分配记录标识"));
     }
@@ -179,8 +360,10 @@ fn decode_assignment(serial: &str, barcode: &str, bytes: &[u8]) -> Result<TapeAs
 }
 
 async fn require_assignment_index(tr: &Transaction, assignment: &TapeAssignment) -> Result<()> {
+    require_managed_layout(tr, assignment.namespace).await?;
     let key = namespace_assignment_key(
         assignment.namespace,
+        assignment.pool_id,
         &assignment.library_serial,
         &assignment.barcode,
     );
@@ -433,10 +616,43 @@ fn pool_prefix(namespace: Uuid) -> Vec<u8> {
     k
 }
 
-fn pool_key(namespace: Uuid, id: Uuid) -> Vec<u8> {
+pub(super) fn pool_key(namespace: Uuid, id: Uuid) -> Vec<u8> {
     let mut k = pool_prefix(namespace);
     k.extend_from_slice(id.as_bytes());
     k
+}
+
+pub(super) fn retired_pool_key(namespace: Uuid, pool: Uuid) -> Vec<u8> {
+    let mut k = management::prefix(namespace, b'r');
+    k.extend_from_slice(pool.as_bytes());
+    k
+}
+
+pub(super) fn encode_pool_retirement(revision: u64) -> Result<[u8; 9]> {
+    if revision < 2 {
+        return Err(CatalogError::Invalid("池退役修订号无效"));
+    }
+    let mut value = [1; 9];
+    value[1..].copy_from_slice(&revision.to_be_bytes());
+    Ok(value)
+}
+
+pub(super) async fn retired_pool_revision_at(
+    tr: &Transaction,
+    namespace: Uuid,
+    pool: Uuid,
+) -> Result<Option<u64>> {
+    tr.get(&retired_pool_key(namespace, pool), false)
+        .await?
+        .map(|value| decode_pool_retirement(&value))
+        .transpose()
+}
+
+fn decode_pool_retirement(value: &[u8]) -> Result<u64> {
+    if value.len() != 9 || value[0] != 1 || read_u64(&value[1..]) < 2 {
+        return Err(CatalogError::Corrupt("池退役记录格式或修订号"));
+    }
+    Ok(read_u64(&value[1..]))
 }
 
 fn pool_name_key(namespace: Uuid, name: &str) -> Vec<u8> {
@@ -446,66 +662,23 @@ fn pool_name_key(namespace: Uuid, name: &str) -> Vec<u8> {
     k
 }
 
-fn node_group_prefix(namespace: Uuid) -> Vec<u8> {
-    let mut k = key(b'Y');
-    k.extend_from_slice(namespace.as_bytes());
-    k
+fn valid_media_restriction(value: &str) -> bool {
+    [
+        "none", "L5", "L6", "L7", "L8", "L9", "M8", "JB", "JC", "JD", "JE", "JY", "JZ", "JV", "JK",
+        "JL", "JM", "JF",
+    ]
+    .contains(&value)
 }
 
-pub(super) fn node_group_key(namespace: Uuid, name: &str) -> Vec<u8> {
-    let mut k = node_group_prefix(namespace);
-    append_component(&mut k, name.as_bytes());
-    k
-}
-
-fn group_pool_prefix(namespace: Uuid, name: &str) -> Vec<u8> {
-    let mut k = key(b'y');
-    k.extend_from_slice(namespace.as_bytes());
-    append_component(&mut k, name.as_bytes());
-    k
-}
-
-fn group_pool_key(namespace: Uuid, name: &str, pool: Uuid) -> Vec<u8> {
-    let mut k = group_pool_prefix(namespace, name);
-    k.extend_from_slice(pool.as_bytes());
-    k
-}
-
-fn validate_node_group(name: &str) -> Result<()> {
+fn validate_pool_name(name: &str) -> Result<()> {
     if name.is_empty()
-        || name.len() > 16
-        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        || name.len() > MAX_NAME
+        || name.as_bytes().contains(&0)
+        || name.as_bytes().contains(&b'/')
     {
-        return Err(CatalogError::Invalid(
-            "节点组名称须为 1–16 个 ASCII 字母、数字或下划线",
-        ));
+        return Err(CatalogError::Invalid("pool 名称为空、过长或含非法字符"));
     }
     Ok(())
-}
-
-async fn require_node_group(tr: &Transaction, namespace: Uuid, name: &str) -> Result<()> {
-    match tr.get(&node_group_key(namespace, name), false).await? {
-        Some(value) if value.is_empty() => Ok(()),
-        Some(_) => Err(CatalogError::Corrupt("节点组记录损坏")),
-        None => Err(CatalogError::Invalid("pool 节点组不存在")),
-    }
-}
-
-async fn require_group_pool_index(
-    tr: &Transaction,
-    namespace: Uuid,
-    pool: &PoolRecord,
-) -> Result<()> {
-    match tr
-        .get(
-            &group_pool_key(namespace, &pool.policy.node_group, pool.id),
-            false,
-        )
-        .await?
-    {
-        Some(value) if value.is_empty() => Ok(()),
-        _ => Err(CatalogError::Corrupt("pool 节点组引用索引缺失或损坏")),
-    }
 }
 
 fn validate_pool(pool: &PoolRecord) -> Result<()> {
@@ -515,36 +688,24 @@ fn validate_pool(pool: &PoolRecord) -> Result<()> {
             "pool ID、revision 和文件数上限必须有效",
         ));
     }
-    if pool.name.is_empty()
-        || pool.name.len() > MAX_NAME
-        || pool.name.as_bytes().contains(&0)
-        || pool.name.as_bytes().contains(&b'/')
-    {
-        return Err(CatalogError::Invalid("pool 名称为空、过长或含非法字符"));
+    if !(1..=253_402_300_799_999).contains(&pool.created_at_millis) {
+        return Err(CatalogError::Invalid("pool 创建时间超出有效 UTC 毫秒范围"));
     }
+    validate_pool_name(&pool.name)?;
     let policy = &pool.policy;
-    if ![
-        "none", "L5", "L6", "L7", "L8", "L9", "M8", "JB", "JC", "JD", "JE", "JY", "JZ", "JV", "JK",
-        "JL", "JM", "JF",
-    ]
-    .contains(&policy.media_restriction.as_str())
-    {
+    if !valid_media_restriction(&policy.media_restriction) {
         return Err(CatalogError::Invalid("pool 介质限制非法"));
     }
     if policy.mount_limit > 32767 || policy.low_space_warning_threshold > 32767 {
         return Err(CatalogError::Invalid("pool 挂载或低空间阈值超出范围"));
     }
-    validate_node_group(&policy.node_group)?;
     Ok(())
 }
 
 fn encode_pool(pool: &PoolRecord) -> Vec<u8> {
     let policy = &pool.policy;
     let mut value = Vec::with_capacity(
-        27 + pool.name.len()
-            + policy.media_restriction.len()
-            + policy.node_group.len()
-            + pool.library_serial.len(),
+        34 + pool.name.len() + policy.media_restriction.len() + pool.library_serial.len(),
     );
     value.push(2);
     value.extend_from_slice(&pool.revision.to_be_bytes());
@@ -557,43 +718,34 @@ fn encode_pool(pool: &PoolRecord) -> Vec<u8> {
     );
     value.extend_from_slice(&(pool.name.len() as u16).to_be_bytes());
     value.push(policy.media_restriction.len() as u8);
-    value.push(policy.node_group.len() as u8);
     value.push(pool.library_serial.len() as u8);
+    value.extend_from_slice(&pool.created_at_millis.to_be_bytes());
     value.extend_from_slice(pool.name.as_bytes());
     value.extend_from_slice(policy.media_restriction.as_bytes());
-    value.extend_from_slice(policy.node_group.as_bytes());
     value.extend_from_slice(pool.library_serial.as_bytes());
     value
 }
 
-fn decode_pool(id: Uuid, value: &[u8]) -> Result<PoolRecord> {
+pub(super) fn decode_pool(id: Uuid, value: &[u8]) -> Result<PoolRecord> {
     if value.first() != Some(&2) {
-        return Err(CatalogError::Corrupt(
-            "pool 记录版本不支持；旧候选需重新导入明确的带库归属",
-        ));
+        return Err(CatalogError::Corrupt("pool 记录版本无效"));
     }
-    if value.len() < 27 || value[21] & !0b11 != 0 {
+    if value.len() < 34 || value[21] & !0b11 != 0 {
         return Err(CatalogError::Corrupt("pool 记录长度"));
     }
     let name_len = u16::from_be_bytes([value[22], value[23]]) as usize;
     let media_len = value[24] as usize;
-    let group_len = value[25] as usize;
-    let serial_len = value[26] as usize;
-    if value.len() != 27 + name_len + media_len + group_len + serial_len {
+    let serial_len = value[25] as usize;
+    if value.len() != 34 + name_len + media_len + serial_len {
         return Err(CatalogError::Corrupt("pool 可变字段长度"));
     }
-    let name = std::str::from_utf8(&value[27..27 + name_len])
+    let name = std::str::from_utf8(&value[34..34 + name_len])
         .map_err(|_| CatalogError::Corrupt("pool 名称编码"))?
         .to_owned();
-    let media = std::str::from_utf8(&value[27 + name_len..27 + name_len + media_len])
+    let media = std::str::from_utf8(&value[34 + name_len..34 + name_len + media_len])
         .map_err(|_| CatalogError::Corrupt("pool 介质限制编码"))?
         .to_owned();
-    let group = std::str::from_utf8(
-        &value[27 + name_len + media_len..27 + name_len + media_len + group_len],
-    )
-    .map_err(|_| CatalogError::Corrupt("pool 节点组编码"))?
-    .to_owned();
-    let library_serial = std::str::from_utf8(&value[27 + name_len + media_len + group_len..])
+    let library_serial = std::str::from_utf8(&value[34 + name_len + media_len..])
         .map_err(|_| CatalogError::Corrupt("pool 带库序列号编码"))?
         .to_owned();
     let pool = PoolRecord {
@@ -601,10 +753,10 @@ fn decode_pool(id: Uuid, value: &[u8]) -> Result<PoolRecord> {
         library_serial,
         name,
         file_limit: read_u64(&value[9..17]),
+        created_at_millis: read_u64(&value[26..34]),
         policy: PoolPolicy {
             media_restriction: media,
             mount_limit: u16::from_be_bytes([value[17], value[18]]),
-            node_group: group,
             low_space_warning_enabled: value[21] & 1 != 0,
             low_space_warning_threshold: u16::from_be_bytes([value[19], value[20]]),
             no_space_warning_enabled: value[21] & 2 != 0,
@@ -646,7 +798,7 @@ async fn require_managed_pool_library(
     require_pool_library(tr, namespace, pool_id, serial).await
 }
 
-async fn require_pool_library(
+pub(super) async fn require_pool_library(
     tr: &Transaction,
     namespace: Uuid,
     pool_id: Uuid,
@@ -657,13 +809,22 @@ async fn require_pool_library(
         .await?
         .ok_or(CatalogError::Invalid("pool 不存在"))?;
     let pool = decode_pool(pool_id, &pool)?;
+    if retired_pool_revision_at(tr, namespace, pool_id)
+        .await?
+        .is_some()
+    {
+        return Err(CatalogError::Corrupt("退役池仍存在主记录"));
+    }
     if pool.library_serial != serial {
         return Err(CatalogError::Invalid(
             "pool 不属于目标物理带库，跨库操作必须使用另一个池",
         ));
     }
-    require_node_group(tr, namespace, &pool.policy.node_group).await?;
-    require_group_pool_index(tr, namespace, &pool).await?;
+    match tr.get(&managed_key(namespace), false).await?.as_deref() {
+        Some([]) => require_managed_layout(tr, namespace).await?,
+        Some(_) => return Err(CatalogError::Corrupt("受管命名空间标记")),
+        None => {}
+    }
     let library = tr
         .get(&library_key(namespace, serial), false)
         .await?
@@ -675,6 +836,65 @@ async fn require_pool_library(
 }
 
 impl ManagedCatalog {
+    pub(super) async fn import_pools(
+        &self,
+        namespace: Uuid,
+        after: Option<&[u8]>,
+    ) -> Result<Page<PoolRecord>> {
+        let prefix = pool_prefix(namespace);
+        let tr = self.db.create_trx()?;
+        if tr.get(&namespace_key(namespace), true).await?.as_deref()
+            != Some(&[NamespaceState::Building as u8][..])
+        {
+            return Err(CatalogError::Incomplete);
+        }
+        let page = read_page(&tr, &prefix, after, 100, true).await?;
+        Ok(Page {
+            items: page
+                .items
+                .into_iter()
+                .map(|(key, value)| decode_pool(uuid_from(&key[prefix.len()..])?, &value))
+                .collect::<Result<Vec<_>>>()?,
+            next: page.next,
+        })
+    }
+
+    /// Bounded pool reads through the exact Active route and verified roots.
+    pub async fn list_active_pools_for_route(
+        &self,
+        serial: &str,
+        route: ActiveLibraryRoute,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Page<PoolRecord>> {
+        validate_physical_serial(serial)?;
+        if !(1..=100).contains(&limit) {
+            return Err(CatalogError::Invalid("池分页大小必须在 1..=100"));
+        }
+        let prefix = pool_prefix(route.route.namespace);
+        if after
+            .is_some_and(|cursor| !cursor.starts_with(&prefix) || cursor.len() != prefix.len() + 16)
+        {
+            return Err(CatalogError::Invalid("池分页游标无效"));
+        }
+        let tr = self.db.create_trx()?;
+        routing::require_expected_active_namespace(&tr, serial, Some(route)).await?;
+        let page = read_page(&tr, &prefix, after, limit, true).await?;
+        let mut items = Vec::new();
+        for (key, value) in page.items {
+            let pool = decode_pool(uuid_from(&key[prefix.len()..])?, &value)?;
+            if pool.library_serial == serial {
+                require_pool_library(&tr, route.route.namespace, pool.id, serial).await?;
+                active_pools::require_indexes(&tr, route.route.namespace, &pool).await?;
+                items.push(pool);
+            }
+        }
+        Ok(Page {
+            items,
+            next: page.next,
+        })
+    }
+
     pub(super) async fn import_pool_exists(&self, namespace: Uuid, id: Uuid) -> Result<bool> {
         if id.is_nil() {
             return Err(CatalogError::Invalid("pool ID 不能为 nil"));
@@ -686,110 +906,6 @@ impl ManagedCatalog {
             .map(|value| decode_pool(id, &value).map(|_| true))
             .transpose()
             .map(|value| value.unwrap_or(false))
-    }
-
-    /// Node groups are namespace-scoped. G0 is created with the namespace.
-    pub async fn register_node_group(&self, namespace: Uuid, name: &str) -> Result<bool> {
-        validate_node_group(name)?;
-        let record = node_group_key(namespace, name);
-        self.db
-            .run(|tr, _| {
-                let record = record.clone();
-                async move {
-                    requests::retry_result(
-                        async {
-                            require_control_building_or_ready(&tr, namespace).await?;
-                            match tr.get(&record, false).await? {
-                                Some(value) if value.is_empty() => Ok(false),
-                                Some(_) => Err(CatalogError::Corrupt("节点组记录损坏")),
-                                None => {
-                                    tr.set(&record, b"");
-                                    Ok(true)
-                                }
-                            }
-                        }
-                        .await,
-                    )
-                }
-            })
-            .await?
-    }
-
-    /// Reject deleting a group while any pool still references it.
-    pub async fn remove_node_group(&self, namespace: Uuid, name: &str) -> Result<bool> {
-        validate_node_group(name)?;
-        if name == "G0" {
-            return Err(CatalogError::Invalid("默认节点组 G0 不能删除"));
-        }
-        let record = node_group_key(namespace, name);
-        let prefix = group_pool_prefix(namespace, name);
-        self.db
-            .run(|tr, _| {
-                let record = record.clone();
-                let prefix = prefix.clone();
-                async move {
-                    requests::retry_result(
-                        async {
-                            require_control_namespace(&tr, namespace).await?;
-                            let Some(value) = tr.get(&record, false).await? else {
-                                return Ok(false);
-                            };
-                            if !value.is_empty() {
-                                return Err(CatalogError::Corrupt("节点组记录损坏"));
-                            }
-                            let range = RangeOption {
-                                begin: KeySelector::first_greater_or_equal(prefix.clone()),
-                                end: KeySelector::first_greater_or_equal(prefix_end(&prefix)),
-                                limit: Some(1),
-                                ..RangeOption::default()
-                            };
-                            if !tr.get_range(&range, 1, false).await?.is_empty() {
-                                return Err(CatalogError::Invalid("节点组仍被 pool 引用"));
-                            }
-                            tr.clear(&record);
-                            Ok(true)
-                        }
-                        .await,
-                    )
-                }
-            })
-            .await?
-    }
-
-    pub async fn list_node_groups(
-        &self,
-        namespace: Uuid,
-        after: Option<&[u8]>,
-        limit: usize,
-    ) -> Result<Page<String>> {
-        let prefix = node_group_prefix(namespace);
-        if after.is_some_and(|cursor| {
-            !cursor.starts_with(&prefix)
-                || cursor.len() > prefix.len() + 18
-                || decode_name(&cursor[prefix.len()..]).is_err()
-        }) {
-            return Err(CatalogError::Invalid("节点组分页游标无效"));
-        }
-        let rows = self
-            .page_range(&prefix, after, limit, Some(namespace), None)
-            .await?;
-        let items = rows
-            .items
-            .into_iter()
-            .map(|(k, v)| {
-                if !v.is_empty() {
-                    return Err(CatalogError::Corrupt("节点组记录损坏"));
-                }
-                let name = String::from_utf8(decode_name(&k[prefix.len()..])?)
-                    .map_err(|_| CatalogError::Corrupt("节点组名称编码"))?;
-                validate_node_group(&name).map_err(|_| CatalogError::Corrupt("节点组名称非法"))?;
-                Ok(name)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Page {
-            items,
-            next: rows.next,
-        })
     }
 
     /// Declare a physical changer by its real serial within one logical namespace.
@@ -828,16 +944,10 @@ impl ManagedCatalog {
         }
         let record = pool_key(namespace, pool.id);
         let name = pool_name_key(namespace, &pool.name);
-        let group_index = group_pool_key(namespace, &pool.policy.node_group, pool.id);
         let value = encode_pool(pool);
         self.db
             .run(|tr, _| {
-                let (record, name, group_index, value) = (
-                    record.clone(),
-                    name.clone(),
-                    group_index.clone(),
-                    value.clone(),
-                );
+                let (record, name, value) = (record.clone(), name.clone(), value.clone());
                 async move {
                     requests::retry_result(
                         async {
@@ -854,12 +964,19 @@ impl ManagedCatalog {
                                     ));
                                 }
                             }
-                            require_node_group(&tr, namespace, &pool.policy.node_group).await?;
                             let old = tr.get(&record, false).await?;
+                            if retired_pool_revision_at(&tr, namespace, pool.id)
+                                .await?
+                                .is_some()
+                            {
+                                if old.is_some() {
+                                    return Err(CatalogError::Corrupt("退役池仍存在主记录"));
+                                }
+                                return Err(CatalogError::Invalid("池 UUID 已退役，不能复用"));
+                            }
                             let named = tr.get(&name, false).await?;
                             if let Some(ref bytes) = old {
-                                let saved = decode_pool(pool.id, bytes)?;
-                                require_group_pool_index(&tr, namespace, &saved).await?;
+                                decode_pool(pool.id, bytes)?;
                             }
                             if let Some(ref bytes) = named {
                                 uuid_from(bytes)?;
@@ -879,12 +996,8 @@ impl ManagedCatalog {
                                 (Some(_), _) => Ok(ControlOutcome::IdConflict),
                                 (_, Some(_)) => Ok(ControlOutcome::NameConflict),
                                 (None, None) => {
-                                    if tr.get(&group_index, false).await?.is_some() {
-                                        return Err(CatalogError::Corrupt("pool 节点组索引孤儿"));
-                                    }
                                     tr.set(&record, &value);
                                     tr.set(&name, pool.id.as_bytes());
-                                    tr.set(&group_index, b"");
                                     Ok(ControlOutcome::Created)
                                 }
                             }
@@ -912,23 +1025,22 @@ impl ManagedCatalog {
         if expected.id != replacement.id {
             return Err(CatalogError::Invalid("不能改变 pool ID"));
         }
+        if expected.created_at_millis != replacement.created_at_millis {
+            return Err(CatalogError::Invalid("不能改变 pool 创建时间"));
+        }
         if expected.revision.checked_add(1) != Some(replacement.revision) {
             return Err(CatalogError::Invalid("pool revision 必须递增 1"));
         }
         let record = pool_key(namespace, expected.id);
         let old_name = pool_name_key(namespace, &expected.name);
         let new_name = pool_name_key(namespace, &replacement.name);
-        let old_group = group_pool_key(namespace, &expected.policy.node_group, expected.id);
-        let new_group = group_pool_key(namespace, &replacement.policy.node_group, replacement.id);
         let replacement_value = encode_pool(replacement);
         self.db
             .run(|tr, _| {
-                let (record, old_name, new_name, old_group, new_group, replacement_value) = (
+                let (record, old_name, new_name, replacement_value) = (
                     record.clone(),
                     old_name.clone(),
                     new_name.clone(),
-                    old_group.clone(),
-                    new_group.clone(),
                     replacement_value.clone(),
                 );
                 async move {
@@ -939,8 +1051,6 @@ impl ManagedCatalog {
                                 return Ok(ControlOutcome::IdConflict);
                             };
                             let current = decode_pool(expected.id, &current)?;
-                            require_node_group(&tr, namespace, &current.policy.node_group).await?;
-                            require_group_pool_index(&tr, namespace, &current).await?;
                             let actual_name = pool_name_key(namespace, &current.name);
                             match tr.get(&actual_name, false).await? {
                                 Some(id) if id.as_ref() == current.id.as_bytes() => {}
@@ -952,8 +1062,6 @@ impl ManagedCatalog {
                             if current != *expected {
                                 return Ok(ControlOutcome::StaleVersion);
                             }
-                            require_node_group(&tr, namespace, &replacement.policy.node_group)
-                                .await?;
                             if old_name != new_name {
                                 if let Some(id) = tr.get(&new_name, false).await? {
                                     if uuid_from(&id)? == expected.id {
@@ -963,13 +1071,6 @@ impl ManagedCatalog {
                                 }
                                 tr.clear(&old_name);
                                 tr.set(&new_name, expected.id.as_bytes());
-                            }
-                            if old_group != new_group {
-                                if tr.get(&new_group, false).await?.is_some() {
-                                    return Err(CatalogError::Corrupt("pool 目标节点组索引孤儿"));
-                                }
-                                tr.clear(&old_group);
-                                tr.set(&new_group, b"");
                             }
                             tr.set(&record, &replacement_value);
                             Ok(ControlOutcome::Updated)
@@ -998,7 +1099,7 @@ impl ManagedCatalog {
         let barcode = barcode.to_owned();
         let record = assignment_key(&serial, &barcode);
         let reverse = barcode_key(&serial, &barcode);
-        let index = namespace_assignment_key(namespace, &serial, &barcode);
+        let index = namespace_assignment_key(namespace, pool_id, &serial, &barcode);
         let value = encode_assignment(namespace, pool_id, None);
         let index_value = encode_namespace_assignment(&serial, &barcode);
         self.db
@@ -1062,6 +1163,10 @@ impl ManagedCatalog {
                             }
                             tr.set(&record, &value);
                             tr.set(&index, &index_value);
+                            notifications::tape_changed_at(
+                                &tr, namespace, &serial, &barcode, "assigned",
+                            )
+                            .await?;
                             Ok(ControlOutcome::Created)
                         }
                         .await,
@@ -1089,7 +1194,7 @@ impl ManagedCatalog {
         let barcode = barcode.to_owned();
         let record = assignment_key(&serial, &barcode);
         let reverse = barcode_key(&serial, &barcode);
-        let index = namespace_assignment_key(namespace, &serial, &barcode);
+        let index = namespace_assignment_key(namespace, pool_id, &serial, &barcode);
         self.db
             .run(|tr, _| {
                 let (serial, barcode, record, reverse, index) = (
@@ -1124,6 +1229,14 @@ impl ManagedCatalog {
                             }
                             tr.clear(&record);
                             tr.clear(&index);
+                            notifications::tape_changed_at(
+                                &tr,
+                                namespace,
+                                &serial,
+                                &barcode,
+                                "unassigned",
+                            )
+                            .await?;
                             Ok(ControlOutcome::Unassigned)
                         }
                         .await,
@@ -1297,7 +1410,8 @@ impl ManagedCatalog {
                                 None => return Ok(ControlOutcome::StaleOwner),
                             }
                             let record = assignment_key(&serial, &barcode);
-                            let index = namespace_assignment_key(namespace, &serial, &barcode);
+                            let index =
+                                namespace_assignment_key(namespace, pool_id, &serial, &barcode);
                             let reverse = barcode_key(&serial, &barcode);
                             let assigned = tr.get(&record, false).await?;
                             let indexed = tr.get(&index, false).await?;
@@ -1412,6 +1526,14 @@ impl ManagedCatalog {
                             }
                             tr.clear(&record);
                             tr.clear(&index);
+                            notifications::tape_changed_at(
+                                &tr,
+                                namespace,
+                                &serial,
+                                &barcode,
+                                "discarded_assignment_released",
+                            )
+                            .await?;
                             Ok(ControlOutcome::Unassigned)
                         }
                         .await,
@@ -1517,6 +1639,13 @@ impl ManagedCatalog {
                             require_assignment_index(&tr, &assigned).await?;
                             if assigned.volume_id.is_some_and(|id| id != p.volume_id) {
                                 return Ok(ControlOutcome::BarcodeConflict);
+                            }
+                            if tr
+                                .get(&native_media::volume_claim_key(p.volume_id), false)
+                                .await?
+                                .is_some()
+                            {
+                                return Ok(ControlOutcome::VolumeConflict);
                             }
                             let old = tr.get(&record, false).await?;
                             let named = tr.get(&reverse, false).await?;
@@ -1676,9 +1805,216 @@ pub(super) mod tests {
     use super::*;
 
     #[test]
+    fn pool_retirement_codec_is_strict_and_cannot_mark_revision_one() {
+        for revision in [2, u64::MAX] {
+            let bytes = encode_pool_retirement(revision).unwrap();
+            assert_eq!(decode_pool_retirement(&bytes).unwrap(), revision);
+            for end in 0..bytes.len() {
+                assert!(decode_pool_retirement(&bytes[..end]).is_err());
+            }
+            let mut extra = bytes.to_vec();
+            extra.push(0);
+            assert!(decode_pool_retirement(&extra).is_err());
+            for version in [0, 2] {
+                let mut wrong = bytes;
+                wrong[0] = version;
+                assert!(decode_pool_retirement(&wrong).is_err());
+            }
+        }
+        for revision in [0u64, 1] {
+            assert!(encode_pool_retirement(revision).is_err());
+            let mut bytes = [1; 9];
+            bytes[1..].copy_from_slice(&revision.to_be_bytes());
+            assert!(decode_pool_retirement(&bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn unversioned_assignment_reverse_keys_are_not_the_current_layout() {
+        let ns = Uuid::new_v4();
+        let mut prototype = key(b'e');
+        prototype.extend_from_slice(ns.as_bytes());
+        append_component(&mut prototype, b"SERIAL_A");
+        append_component(&mut prototype, b"AA0001L8");
+        assert!(
+            decode_namespace_assignment(
+                ns,
+                &prototype,
+                &encode_namespace_assignment("SERIAL_A", "AA0001L8")
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；验证布局版本拒绝与不回填，不操作设备"]
+    async fn managed_layout_is_required_before_active_use_and_is_never_backfilled() {
+        use serde_json::json;
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog = ManagedCatalog::open(Some(&cluster)).unwrap();
+        let ns = Uuid::new_v4();
+        let serial = format!("SIM-LAYOUT-{ns}");
+        let challenge = Uuid::new_v4();
+        let replies=(1..=3).map(|node|json!({"version":1,"challenge":challenge.to_string(),"node_id":node,"term":7,"leader":2,"role":if node==2 {"Leader"}else{"Follower"},"members":{"1":"a:1","2":"b:2","3":"c:3"},"quiesce_index":89,"frozen_index":90,"applied_index":92,"executor_absent":true,"catalog_pending":false,"shutting_down":false,"catalog_empty":true})).collect::<Vec<_>>();
+        let proof = verify_native_barriers(&serial, challenge, &replies).unwrap();
+        let route = catalog.initialize_native_library(ns, &proof).await.unwrap();
+        catalog
+            .claim_active_owner_epoch(&serial, 100)
+            .await
+            .unwrap();
+        let layout = |ns| {
+            let mut k = managed_key(ns);
+            k.extend_from_slice(b"/layout");
+            k
+        };
+        let layout_key = layout(ns);
+        let tr = catalog.db.create_trx().unwrap();
+        tr.clear(&layout_key);
+        tr.commit().await.unwrap();
+        assert!(matches!(
+            catalog.native_initialization_status(&serial, ns).await,
+            Err(CatalogError::Corrupt(_))
+        ));
+        assert!(matches!(
+            catalog.initialize_native_library(ns, &proof).await,
+            Err(CatalogError::Corrupt(_))
+        ));
+        assert!(matches!(
+            catalog.claim_active_owner_epoch(&serial, 101).await,
+            Err(CatalogError::Corrupt(_))
+        ));
+        assert!(matches!(
+            catalog
+                .check_active_pool_gate(&serial, route, 100, Uuid::new_v4())
+                .await,
+            Err(CatalogError::Corrupt(_))
+        ));
+        let tr = catalog.db.create_trx().unwrap();
+        assert!(tr.get(&layout_key, false).await.unwrap().is_none());
+        assert_eq!(
+            tr.get(&owner_key(&serial), false).await.unwrap().as_deref(),
+            Some(100u64.to_be_bytes().as_slice())
+        );
+        drop(tr);
+        for unsupported in [1, MANAGED_LAYOUT_VERSION + 1] {
+            let tr = catalog.db.create_trx().unwrap();
+            tr.set(&layout_key, &[unsupported]);
+            tr.commit().await.unwrap();
+            assert!(matches!(
+                catalog.native_initialization_status(&serial, ns).await,
+                Err(CatalogError::Corrupt(_))
+            ));
+            assert!(matches!(
+                catalog.claim_active_owner_epoch(&serial, 101).await,
+                Err(CatalogError::Corrupt(_))
+            ));
+            let tr = catalog.db.create_trx().unwrap();
+            assert_eq!(
+                tr.get(&layout_key, false).await.unwrap().as_deref(),
+                Some([unsupported].as_slice())
+            );
+        }
+        let tr = catalog.db.create_trx().unwrap();
+        tr.set(&layout_key, &[MANAGED_LAYOUT_VERSION]);
+        tr.commit().await.unwrap();
+        assert_eq!(
+            catalog
+                .native_initialization_status(&serial, ns)
+                .await
+                .unwrap(),
+            Some(route)
+        );
+        let candidate = Uuid::new_v4();
+        assert!(catalog.begin_managed_import(candidate).await.unwrap());
+        let tr = catalog.db.create_trx().unwrap();
+        tr.clear(&layout(candidate));
+        tr.commit().await.unwrap();
+        assert!(matches!(
+            catalog.begin_managed_import(candidate).await,
+            Err(CatalogError::Corrupt(_))
+        ));
+        let tr = catalog.db.create_trx().unwrap();
+        assert!(tr.get(&layout(candidate), false).await.unwrap().is_none());
+        tr.set(&layout(candidate), &[MANAGED_LAYOUT_VERSION]);
+        tr.commit().await.unwrap();
+        assert!(!catalog.begin_managed_import(candidate).await.unwrap());
+        let orphan = Uuid::new_v4();
+        let tr = catalog.db.create_trx().unwrap();
+        tr.set(&layout(orphan), &[1]);
+        tr.commit().await.unwrap();
+        assert!(matches!(
+            catalog.begin_managed_import(orphan).await,
+            Err(CatalogError::Corrupt(_))
+        ));
+        assert!(
+            catalog
+                .db
+                .create_trx()
+                .unwrap()
+                .get(&namespace_key(orphan), false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；旧孤立索引不能获得新布局标记，不操作设备"]
+    async fn orphan_namespace_rows_are_not_relabelled_as_current_data() {
+        use serde_json::json;
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog = ManagedCatalog::open(Some(&cluster)).unwrap();
+        for kind in *b"e0" {
+            let ns = Uuid::new_v4();
+            let mut row = key(kind);
+            row.extend_from_slice(ns.as_bytes());
+            if kind == b'e' {
+                append_component(&mut row, b"SERIAL_A");
+                append_component(&mut row, b"OLD000L8");
+            } else {
+                row.extend_from_slice(&1u64.to_be_bytes());
+                row.extend_from_slice(Uuid::new_v4().as_bytes());
+            }
+            let tr = catalog.db.create_trx().unwrap();
+            tr.set(&row, &encode_namespace_assignment("SERIAL_A", "OLD000L8"));
+            tr.commit().await.unwrap();
+            assert!(matches!(
+                catalog.begin_managed_import(ns).await,
+                Err(CatalogError::Corrupt(_))
+            ));
+            let serial = format!("SIM-ORPHAN-{ns}");
+            let challenge = Uuid::new_v4();
+            let replies=(1..=3).map(|node|json!({"version":1,"challenge":challenge.to_string(),"node_id":node,"term":7,"leader":2,"role":if node==2 {"Leader"}else{"Follower"},"members":{"1":"a:1","2":"b:2","3":"c:3"},"quiesce_index":89,"frozen_index":90,"applied_index":92,"executor_absent":true,"catalog_pending":false,"shutting_down":false,"catalog_empty":true})).collect::<Vec<_>>();
+            let proof = verify_native_barriers(&serial, challenge, &replies).unwrap();
+            assert!(matches!(
+                catalog.initialize_native_library(ns, &proof).await,
+                Err(CatalogError::Invalid(_))
+            ));
+            assert!(
+                catalog
+                    .active_library_route(&serial)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let tr = catalog.db.create_trx().unwrap();
+            assert!(
+                tr.get(&managed_layout_key(ns), false)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(tr.get(&namespace_key(ns), false).await.unwrap().is_none());
+        }
+    }
+
+    #[test]
     fn pool_codec_rejects_bad_lengths_and_values() {
         let id = Uuid::new_v4();
         let record = PoolRecord {
+            created_at_millis: 1_793_405_000_123,
             id,
             library_serial: "SERIAL_A".into(),
             name: "归档".into(),
@@ -1686,7 +2022,7 @@ pub(super) mod tests {
             policy: PoolPolicy {
                 media_restriction: "L9".into(),
                 mount_limit: 7,
-                node_group: "G2".into(),
+
                 low_space_warning_enabled: false,
                 low_space_warning_threshold: 32767,
                 no_space_warning_enabled: true,
@@ -1698,7 +2034,7 @@ pub(super) mod tests {
         legacy[0] = 1;
         assert!(
             decode_pool(id, &legacy).is_err(),
-            "没有明确带库归属的旧池记录不得被默认为可读"
+            "旧版本池记录必须拒绝，不解释已删除的节点组字段"
         );
         for serial in ["", "wrong/serial"] {
             assert!(
@@ -1722,6 +2058,11 @@ pub(super) mod tests {
         broken = encoded.clone();
         broken[24] = 255;
         assert!(decode_pool(id, &broken).is_err());
+        for time in [0, u64::MAX, 253_402_300_800_000] {
+            broken = encoded.clone();
+            broken[26..34].copy_from_slice(&time.to_be_bytes());
+            assert!(decode_pool(id, &broken).is_err());
+        }
         assert!(
             validate_pool(&PoolRecord {
                 policy: PoolPolicy {
@@ -1784,6 +2125,9 @@ pub(super) mod tests {
             assert_eq!(assignment.namespace, namespace);
             assert_eq!(assignment.pool_id, pool);
             assert_eq!(assignment.volume_id, expected);
+            assert_eq!(assignment.revision, 1);
+            assert!(assignment.online && !assignment.blacklisted && assignment.allows_io());
+            assert_eq!(encoded.len(), if expected.is_some() { 60 } else { 44 });
             for end in 0..encoded.len() {
                 assert!(decode_assignment("SERIAL_A", "AA0001L8", &encoded[..end]).is_err());
             }
@@ -1792,17 +2136,70 @@ pub(super) mod tests {
             assert!(decode_assignment("SERIAL_A", "AA0001L8", &invalid).is_err());
         }
         let mut nil_volume = encode_assignment(namespace, pool, Some(volume));
-        nil_volume[33..49].fill(0);
+        nil_volume[44..60].fill(0);
         assert!(decode_assignment("SERIAL_A", "AA0001L8", &nil_volume).is_err());
-        let index = namespace_assignment_key(namespace, "SERIAL_A", "AA0001L8");
+        for length in [33, 49] {
+            assert!(decode_assignment("SERIAL_A", "AA0001L8", &vec![1; length]).is_err());
+        }
+        for volume_id in [None, Some(volume)] {
+            for offset in [1, 42, 43] {
+                let mut invalid = encode_assignment(namespace, pool, volume_id);
+                invalid[offset] = 2;
+                assert!(decode_assignment("SERIAL_A", "AA0001L8", &invalid).is_err());
+            }
+            let mut invalid = encode_assignment(namespace, pool, volume_id);
+            invalid[34..42].fill(0);
+            assert!(decode_assignment("SERIAL_A", "AA0001L8", &invalid).is_err());
+        }
+        for (online, blacklisted) in [(false, false), (true, false), (false, true), (true, true)] {
+            let encoded = encode_assignment_state(
+                namespace,
+                pool,
+                Some(volume),
+                u64::MAX,
+                online,
+                blacklisted,
+            );
+            let decoded = decode_assignment("SERIAL_A", "AA0001L8", &encoded).unwrap();
+            assert_eq!(decoded.revision, u64::MAX);
+            assert_eq!(decoded.allows_io(), online && !blacklisted);
+            assert_eq!(decoded.to_json()["volume"], volume.to_string());
+        }
+        assert!(
+            decode_assignment(
+                "SERIAL_A",
+                "AA0001L8",
+                &encode_assignment_state(namespace, pool, None, 2, true, false)
+            )
+            .is_err()
+        );
+        assert!(
+            decode_assignment(
+                "SERIAL_A",
+                "AA0001L8",
+                &encode_assignment_state(namespace, pool, None, 1, false, false)
+            )
+            .is_err()
+        );
+        let index = namespace_assignment_key(namespace, pool, "SERIAL_A", "AA0001L8");
         let value = encode_namespace_assignment("SERIAL_A", "AA0001L8");
+        assert!(index.starts_with(&pool_assignment_prefix(namespace, pool)));
+        assert!(!index.starts_with(&pool_assignment_prefix(namespace, Uuid::new_v4())));
         assert_eq!(
             decode_namespace_assignment(namespace, &index, &value).unwrap(),
-            ("SERIAL_A".into(), "AA0001L8".into())
+            (pool, "SERIAL_A".into(), "AA0001L8".into())
         );
         for end in 0..value.len() {
             assert!(decode_namespace_assignment(namespace, &index, &value[..end]).is_err());
         }
+        for end in 0..index.len() {
+            assert!(decode_namespace_assignment(namespace, &index[..end], &value).is_err());
+        }
+        let mut unknown_version = index.clone();
+        unknown_version[key(b'e').len() + 16] = MANAGED_LAYOUT_VERSION + 1;
+        assert!(decode_namespace_assignment(namespace, &unknown_version, &value).is_err());
+        let nil_pool = namespace_assignment_key(namespace, Uuid::nil(), "SERIAL_A", "AA0001L8");
+        assert!(decode_namespace_assignment(namespace, &nil_pool, &value).is_err());
         assert!(decode_namespace_assignment(Uuid::new_v4(), &index, &value).is_err());
         let mut wrong = value;
         *wrong.last_mut().unwrap() = b'9';
@@ -1838,6 +2235,7 @@ pub(super) mod tests {
                 .unwrap()
         );
         let pool = PoolRecord {
+            created_at_millis: 1_793_405_000_123,
             id: Uuid::new_v4(),
             library_serial: serial.clone(),
             name: "单库归档".into(),
@@ -1880,12 +2278,30 @@ pub(super) mod tests {
                 .unwrap(),
             ControlOutcome::Created
         );
+        let pending_index = namespace_assignment_key(namespace, pool.id, &serial, "PENDINGL8");
+        let tr = catalog.db.create_trx().unwrap();
+        assert!(tr.get(&pending_index, false).await.unwrap().is_some());
+        assert!(
+            !requests::prefix_has_rows(&tr, &pool_assignment_prefix(namespace, Uuid::new_v4()))
+                .await
+                .unwrap()
+        );
         assert_eq!(
             catalog
                 .unassign_tape(namespace, pool.id, &serial, "PENDINGL8")
                 .await
                 .unwrap(),
             ControlOutcome::Unassigned
+        );
+        assert!(
+            catalog
+                .db
+                .create_trx()
+                .unwrap()
+                .get(&pending_index, false)
+                .await
+                .unwrap()
+                .is_none()
         );
         assert!(
             catalog
@@ -2375,6 +2791,7 @@ pub(super) mod tests {
         let namespace = Uuid::new_v4();
         let serial = format!("IMPORT-{}", Uuid::new_v4());
         let pool = PoolRecord {
+            created_at_millis: 1_793_405_000_123,
             id: Uuid::new_v4(),
             library_serial: serial.clone(),
             name: "受管导入池".into(),
@@ -2394,9 +2811,10 @@ pub(super) mod tests {
             library_serial: serial.clone(),
             barcode: "IMPORTL8".into(),
         };
+        let pool_root = import_materialize::import_inode(namespace, pool.id, "/");
         let receipt = test_receipt(CommitReceipt {
             namespace,
-            parent: Uuid::nil(),
+            parent: pool_root,
             name: b"uid-1".to_vec(),
             file_id: Uuid::new_v4(),
             expected_version: None,
@@ -2428,6 +2846,7 @@ pub(super) mod tests {
             catalog.create_pool(namespace, &pool).await.unwrap(),
             ControlOutcome::Created
         );
+        catalog.create_pool_root(namespace, pool.id).await.unwrap();
         assert_eq!(
             catalog
                 .assign_tape(namespace, pool.id, &serial, &placement.barcode)
@@ -2460,12 +2879,13 @@ pub(super) mod tests {
         );
         assert!(matches!(
             catalog
-                .resolve_child(namespace, Uuid::nil(), &receipt.name)
+                .resolve_child(namespace, pool_root, &receipt.name)
                 .await,
             Err(CatalogError::Incomplete)
         ));
         let mut path = vec![b'/'];
         path.extend_from_slice(&receipt.name);
+        let path = pool_catalog_path(pool.id, &path).unwrap();
         assert!(matches!(
             catalog.resolve_path(namespace, &path).await,
             Err(CatalogError::Incomplete)
@@ -2509,7 +2929,7 @@ pub(super) mod tests {
             catalog,
             namespace,
             std::slice::from_ref(&receipt),
-            &[],
+            &[(pool_root, initial_pool_root(&pool).unwrap())],
         )
         .await;
         assert!(catalog.seal_import(namespace).await.unwrap());
@@ -2525,7 +2945,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             catalog
-                .resolve_child(namespace, Uuid::nil(), &receipt.name)
+                .resolve_child(namespace, pool_root, &receipt.name)
                 .await
                 .unwrap(),
             Some(receipt.file_id)
@@ -2575,6 +2995,7 @@ pub(super) mod tests {
             catalog.resolve_path(namespace, b"/").await.unwrap(),
             Some(ResolvedPath::Directory {
                 id: Uuid::nil(),
+                version: 1,
                 attributes: None
             })
         );
@@ -2667,6 +3088,7 @@ pub(super) mod tests {
         let abandoned = Uuid::new_v4();
         let abandoned_serial = format!("IMPORT-{}", Uuid::new_v4());
         let abandoned_pool = PoolRecord {
+            created_at_millis: 1_793_405_000_123,
             id: Uuid::new_v4(),
             library_serial: abandoned_serial.clone(),
             name: "废弃候选池".into(),
@@ -2686,6 +3108,11 @@ pub(super) mod tests {
             .unwrap();
         catalog
             .create_pool(abandoned, &abandoned_pool)
+            .await
+            .unwrap();
+        let abandoned_root = import_materialize::import_inode(abandoned, abandoned_pool.id, "/");
+        catalog
+            .create_pool_root(abandoned, abandoned_pool.id)
             .await
             .unwrap();
         catalog
@@ -2713,7 +3140,7 @@ pub(super) mod tests {
             .unwrap();
         let abandoned_file = test_receipt(CommitReceipt {
             namespace: abandoned,
-            parent: Uuid::nil(),
+            parent: abandoned_root,
             name: b"discarded-file".to_vec(),
             file_id: Uuid::new_v4(),
             expected_version: None,
@@ -2834,34 +3261,6 @@ pub(super) mod tests {
         assert!(catalog.create_namespace(ns).await.unwrap());
         assert!(catalog.create_namespace(other).await.unwrap());
         assert_eq!(
-            catalog.list_node_groups(ns, None, 1).await.unwrap().items,
-            vec!["G0"]
-        );
-        assert!(!catalog.register_node_group(ns, "G0").await.unwrap());
-        assert!(catalog.register_node_group(ns, "G1").await.unwrap());
-        assert!(catalog.register_node_group(ns, "G2").await.unwrap());
-        assert!(!catalog.register_node_group(ns, "G2").await.unwrap());
-        assert!(catalog.register_node_group(ns, "bad/group").await.is_err());
-        assert!(catalog.remove_node_group(ns, "G0").await.is_err());
-        let groups = catalog.list_node_groups(ns, None, 2).await.unwrap();
-        assert_eq!(groups.items, vec!["G0", "G1"]);
-        assert_eq!(
-            catalog
-                .list_node_groups(ns, groups.next.as_deref(), 2)
-                .await
-                .unwrap()
-                .items,
-            vec!["G2"]
-        );
-        assert!(
-            catalog
-                .list_node_groups(other, groups.next.as_deref(), 1)
-                .await
-                .is_err()
-        );
-        assert!(catalog.remove_node_group(ns, "G1").await.unwrap());
-        assert!(!catalog.remove_node_group(ns, "G1").await.unwrap());
-        assert_eq!(
             catalog
                 .register_physical_library(ns, "SERIAL_A")
                 .await
@@ -2910,6 +3309,7 @@ pub(super) mod tests {
         );
 
         let p = PoolRecord {
+            created_at_millis: 1_793_405_000_123,
             id: Uuid::new_v4(),
             library_serial: "SERIAL_A".into(),
             name: "Archive".into(),
@@ -2923,7 +3323,7 @@ pub(super) mod tests {
                     ns,
                     &PoolRecord {
                         policy: PoolPolicy {
-                            node_group: "G3".into(),
+                            media_restriction: "L99".into(),
                             ..p.policy.clone()
                         },
                         ..p.clone()
@@ -2992,6 +3392,7 @@ pub(super) mod tests {
         let mut generated = Vec::new();
         for n in 0..103 {
             let item = PoolRecord {
+                created_at_millis: 1_793_405_000_123,
                 id: Uuid::new_v4(),
                 library_serial: "SERIAL_A".into(),
                 name: format!("P-{n}"),
@@ -3027,7 +3428,7 @@ pub(super) mod tests {
             policy: PoolPolicy {
                 media_restriction: "L8".into(),
                 mount_limit: 10,
-                node_group: "G2".into(),
+
                 low_space_warning_threshold: 12,
                 ..PoolPolicy::default()
             },
@@ -3076,7 +3477,6 @@ pub(super) mod tests {
             reopened.pool(ns, p.id).await.unwrap(),
             Some(changed.clone())
         );
-        assert!(catalog.remove_node_group(ns, "G2").await.is_err());
         assert_eq!(
             catalog
                 .create_pool(

@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{Result, TapeError};
 
-use super::index::IndexEntry;
+use super::index::{IndexEntry, canonical_xattrs};
 use super::index_scratch::{IndexScratchBudget, ScratchDatabase};
 
 pub(super) struct FullIndexComparison {
@@ -28,11 +28,13 @@ impl FullIndexComparison {
 
     pub(super) fn record(&self, ip: bool, entry: IndexEntry) -> Result<()> {
         let (path, kind, name, uid, digest) = match entry {
-            IndexEntry::File { path, node } => {
+            IndexEntry::File { path, mut node } => {
+                node.xattrs = comparison_xattrs(&node.xattrs)?;
                 let digest: [u8; 32] = Sha256::digest(format!("{node:?}").as_bytes()).into();
                 (path, 1, node.name, node.meta.file_uid, digest)
             }
-            IndexEntry::Directory { path, node } => {
+            IndexEntry::Directory { path, mut node } => {
+                node.xattrs = comparison_xattrs(&node.xattrs)?;
                 let digest: [u8; 32] = Sha256::digest(format!("{node:?}").as_bytes()).into();
                 (path, 0, node.name, node.meta.file_uid, digest)
             }
@@ -126,6 +128,18 @@ impl FullIndexComparison {
         )?;
         Ok(())
     }
+}
+
+fn comparison_xattrs(xattrs: &[super::index::Xattr]) -> Result<Vec<super::index::Xattr>> {
+    use base64::Engine;
+    Ok(canonical_xattrs(xattrs)?
+        .into_iter()
+        .map(|(key, value)| super::index::Xattr {
+            key,
+            value: base64::engine::general_purpose::STANDARD.encode(value),
+            base64: true,
+        })
+        .collect())
 }
 
 #[cfg(test)]

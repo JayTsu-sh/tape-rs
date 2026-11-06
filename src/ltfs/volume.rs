@@ -722,6 +722,145 @@ impl<'a> LtfsVolume<'a> {
         self.verified_recovery_index_construct()
     }
 
+    /// Stage one deterministic node change after the caller has durably admitted
+    /// its intent. This only changes working state; it neither commits nor
+    /// publishes an FDB inode. The surrounding device actor must check policy.
+    #[cfg(feature = "fdb")]
+    pub fn stage_node_mutation(
+        &mut self,
+        plan: &crate::managed_catalog::NodeMutationPlan,
+    ) -> Result<()> {
+        let previous = self.verified_committed_index_construct()?;
+        if crate::managed_catalog::ActiveIndexIdentity::from(previous) != plan.context().previous {
+            return Err(TapeError::Catalog("节点变更来源与已提交构造不符".into()));
+        }
+        plan.stage(&mut self.working)
+            .map_err(|error| TapeError::Catalog(error.to_string()))?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Stage a retained rename projection after durable admission by the
+    /// device actor. No media write or logical namespace publication occurs.
+    #[cfg(feature = "fdb")]
+    pub fn stage_node_rename(
+        &mut self,
+        plan: &crate::managed_catalog::NodeRenameMediaPlan,
+        view: &crate::managed_catalog::NodeRenameVolumeProjection,
+        max_database_bytes: u64,
+    ) -> Result<()> {
+        let current = self.verified_committed_index_construct()?;
+        if crate::managed_catalog::ActiveIndexIdentity::from(current)
+            != plan.recipe().source_index()
+        {
+            return Err(TapeError::Catalog("rename 来源与已提交构造不符".into()));
+        }
+        plan.require_projection(view)
+            .and_then(|()| plan.require_source(&self.index, max_database_bytes))
+            .map_err(|error| TapeError::Catalog(error.to_string()))?;
+        let name = std::mem::take(&mut self.working.root.name);
+        self.working.root = crate::ltfs::index::DirectoryNode {
+            name,
+            ..Default::default()
+        };
+        // The old working tree has been dropped; do not retain a third tree.
+        if let Err(error) = plan.stage_tree(&mut self.working, view) {
+            self.writable = false;
+            self.restricted_reason = Some(format!("rename 工作索引重建失败: {error}"));
+            return Err(TapeError::Catalog(error.to_string()));
+        }
+        self.incremental_depth = self.incremental_limit;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Only a clean, owner-fenced, confirmed media construct can produce S4.
+    /// The global original participant ledger must separately accept it.
+    #[cfg(feature = "fdb")]
+    pub fn node_rename_evidence(
+        &mut self,
+        plan: &crate::managed_catalog::NodeRenameMediaPlan,
+        max_database_bytes: u64,
+    ) -> Result<crate::managed_catalog::NodeRenameS4Evidence> {
+        let current = self.verified_committed_index_construct()?;
+        plan.evidence(&self.index, current.into(), max_database_bytes)
+            .map_err(|error| TapeError::Catalog(error.to_string()))
+    }
+
+    /// A media proof only: the request's durable FDB ledger must still compare
+    /// owner, route and intent before atomically publishing the logical change.
+    #[cfg(feature = "fdb")]
+    pub fn node_mutation_evidence(
+        &mut self,
+        plan: &crate::managed_catalog::NodeMutationPlan,
+    ) -> Result<crate::managed_catalog::NodeMutationEvidence> {
+        let current = self.verified_committed_index_construct()?;
+        plan.evidence(&self.index, current.into())
+            .map_err(|error| TapeError::Catalog(error.to_string()))
+    }
+
+    /// Prove the original rename was not committed; no replay or FDB closure.
+    #[cfg(feature = "fdb")]
+    pub fn node_rename_absence_evidence(
+        &mut self,
+        plan: &crate::managed_catalog::NodeRenameMediaPlan,
+        budget: u64,
+    ) -> Result<crate::managed_catalog::NodeRenameAbsenceEvidence> {
+        let current = self.verified_committed_index_construct()?;
+        plan.absence_evidence(&self.index, current.into(), budget)
+            .map_err(|error| TapeError::Catalog(error.to_string()))
+    }
+    /// Explicit original-rename T1/T2 Discard; current FDB authority is separate.
+    #[cfg(feature = "fdb")]
+    pub fn discard_node_rename_tail(
+        &mut self,
+        plan: &crate::managed_catalog::NodeRenameMediaPlan,
+        budget: u64,
+    ) -> Result<crate::managed_catalog::NodeRenameAbsenceEvidence> {
+        if self.dirty {
+            return Err(TapeError::Catalog(
+                "rename 修尾要求重新挂载的确定恢复视图".into(),
+            ));
+        }
+        let current = self.verified_recovery_index_construct()?;
+        plan.require_discard_source(&self.index, current.into(), budget)
+            .map_err(|error| TapeError::Catalog(error.to_string()))?;
+        self.close_tail(TailPolicy::Discard)?;
+        self.node_rename_absence_evidence(plan, budget)
+    }
+
+    /// Prove an unchanged source or an already completed Discard under PR.
+    /// No writes, persistent attempt closure, or automatic replay occur here.
+    #[cfg(feature = "fdb")]
+    pub fn node_mutation_absence_evidence(
+        &mut self,
+        plan: &crate::managed_catalog::NodeMutationPlan,
+    ) -> Result<crate::managed_catalog::NodeMutationAbsenceEvidence> {
+        let current = self.verified_committed_index_construct()?;
+        plan.absence_evidence(&self.index, current.into())
+            .map_err(|error| TapeError::Catalog(error.to_string()))
+    }
+
+    /// Explicitly append a Discard index for this original node attempt's T1/T2
+    /// tail. The original committed source is checked before any tail write.
+    /// The caller still enforces current FDB ownership, policy and execution.
+    #[cfg(feature = "fdb")]
+    pub fn discard_node_mutation_tail(
+        &mut self,
+        plan: &crate::managed_catalog::NodeMutationPlan,
+    ) -> Result<crate::managed_catalog::NodeMutationAbsenceEvidence> {
+        if self.dirty {
+            return Err(TapeError::Catalog(
+                "节点修尾要求重新挂载的确定恢复视图".into(),
+            ));
+        }
+        let current = self.verified_recovery_index_construct()?;
+        plan.require_absence_source(&self.index, current.into())
+            .map_err(|error| TapeError::Catalog(error.to_string()))?;
+        self.close_tail(TailPolicy::Discard)?;
+        self.node_mutation_absence_evidence(plan)
+    }
+
     /// Verify the PR and committed view even when T1/T2 makes the volume
     /// read-only. A recovery caller must separately classify that tail.
     pub fn verified_recovery_index_construct(&mut self) -> Result<CommittedIndexConstruct> {
@@ -1373,6 +1512,16 @@ impl<'a> LtfsVolume<'a> {
         xattrs: &[(&str, &str)],
     ) -> Result<u64> {
         self.append_file_inner(path, r, xattrs, None)
+    }
+
+    #[cfg(feature = "fdb")]
+    pub(crate) fn append_replacement_file<R: Read>(
+        &mut self,
+        path: &str,
+        r: &mut R,
+        metadata: &FileMetadata,
+    ) -> Result<u64> {
+        self.append_file_inner(path, r, &[], Some(metadata))
     }
 
     pub(crate) fn append_relocated_file<R: Read>(

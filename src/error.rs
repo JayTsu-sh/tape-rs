@@ -54,6 +54,11 @@ pub enum TapeError {
 
     #[error("Device not ready: {0}")]
     NotReady(String),
+    #[error("磁带 {barcode} 离线或在黑名单中，暂不能执行数据读写")]
+    MediaUnavailable { barcode: String },
+
+    #[error("池 {pool} 正在接入介质，暂不能开始新写入")]
+    PoolBusy { pool: String },
 
     #[error("Move failed: {reason}")]
     MoveFailed { reason: String },
@@ -95,6 +100,17 @@ pub enum TapeError {
 
     #[error("Catalog error: {0}")]
     Catalog(String),
+
+    /// A clean, same-UUID medium changed outside the catalog, without owned
+    /// work that could explain it. Keep management reachable; do not adopt it.
+    #[error(
+        "卷 {volume} 的带内索引尚未导入（FDB代数 {observed_generation}，带内代数 {media_generation}）；请执行 tape import"
+    )]
+    MediaImportRequired {
+        volume: uuid::Uuid,
+        observed_generation: u64,
+        media_generation: u64,
+    },
 
     /// SQLite 返回的原始错误（保留 source 链）。
     /// `?` 从 `rusqlite::Error` 自动归到这里。

@@ -186,12 +186,7 @@ fn check_cached_copy(cache: &VolumeExtentCache, copy: &PhysicalCopy) -> Result<(
         && (indexed.path != media.physical_path
             || media.native_symlink != indexed.symlink.is_some()
             || (media.native_symlink
-                && (copy.size != 0 || copy.content_digest != super::ContentDigest::Unknown))
-            || (media.native_symlink
-                && indexed
-                    .symlink
-                    .as_ref()
-                    .is_some_and(|target| target.contains(".LTFSEE_DATA/"))))
+                && (copy.size != 0 || copy.content_digest != super::ContentDigest::Unknown)))
     {
         return Err(CatalogError::Corrupt("扫描文件路径与物理副本来源不一致"));
     }
@@ -509,7 +504,7 @@ pub(super) mod tests {
         let cache = VolumeExtentCache::open(&path, source).unwrap();
         let mut copy = PhysicalCopy {
             version: 1,
-            request_epoch: 1,
+            origin: CopyOrigin::FileRequest { request_epoch: 1 },
             volume_id: volume,
             volume_generation: index.generation,
             volume_scan_id: Uuid::new_v4(),

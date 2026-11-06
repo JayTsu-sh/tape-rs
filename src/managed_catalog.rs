@@ -8,9 +8,13 @@ use foundationdb::{Database, FdbBindingError, KeySelector, RangeOption, Transact
 use uuid::Uuid;
 
 mod attribute_objects;
+mod upload_receipts;
+pub use upload_receipts::{ActiveUploadReceipt, UploadReceiptOutcome};
 mod attributes;
+mod object_metadata;
 pub use attributes::NodeAttributes;
 use attributes::{AttributeManifest, CHUNK_SIZE, INLINE_LIMIT, MAX_REPRESENTABLE};
+pub use object_metadata::ObjectMetadata;
 mod active_volume;
 pub use active_volume::{
     ActiveIndexIdentity, ActiveIndexOutcome, ActiveLoadedVolumeHead, ActiveRecoveryOutcome,
@@ -24,27 +28,81 @@ pub use active_batch::{
 mod verification;
 pub use verification::{ScanDigest, ScanSummary, VerificationOutcome};
 mod cleanup;
+mod copy_records;
+pub use copy_records::CopyOrigin;
+use copy_records::{
+    StoredCopy, decode_copy, decode_stored_copy, encode_physical_copy, encode_reclaimed_copy,
+};
 mod control;
+pub use control::notifications::{NotifyConnectionAction, NotifyFilter, tape_inventory_state};
+use control::tape_monitor;
+pub use tape_monitor::{
+    TapeCapacity, TapeMediaFault, TapeMonitorError, TapeMonitorRecord, TapeMonitorSample,
+};
 mod cutover;
+mod ee_internal;
 mod history;
 mod import_materialize;
 mod import_reconcile;
 mod import_spool;
 mod index_evidence;
+mod link_kind;
 mod lookup;
+mod objects;
+pub use objects::{ObjectEntry, ObjectListRequest};
 mod maintenance;
 mod namespace_verification;
+mod namespace_visibility;
+mod node_mutation;
+mod node_plan_objects;
+pub use node_plan_objects::{NodePlanObject, NodePlanUpload};
+mod file_request;
+pub use file_request::ActiveFileRequest;
 mod physical;
+pub use node_mutation::{
+    NodeMutation, NodeMutationAbsenceEvidence, NodeMutationAbsenceKind,
+    NodeMutationAncestorEvidence, NodeMutationContext, NodeMutationEvidence, NodeMutationPlan,
+    XattrMode,
+};
 pub use physical::{
     ActiveFileIntent, PreparedActiveFile, prepare_active_file, prepare_committed_active_file,
 };
 mod requests;
 mod reservation;
+mod retired_nodes;
+mod upload;
+pub use upload::ActiveUploadSpec;
+mod native_init;
 mod routing;
+mod s3_rename;
+mod s3_upload;
+pub use native_init::{VerifiedNativeBarrier, verify_native_barriers};
+pub use s3_rename::S3RenameInput;
 mod staged_import;
 mod staged_sources;
 pub use cleanup::PurgeProgress;
-pub use control::{ControlOutcome, PoolPolicy, PoolRecord, TapeAssignment, VolumePlacement};
+pub use control::{
+    ActivePoolCreation, ControlOutcome, ManagementRequest, NativeDeviceTask, NativeMediaImport,
+    NativeMediaSource, NodeMutationAncestor, NodeMutationAttempt, NodeMutationAttemptClosure,
+    NodeMutationBaseline, NodeMutationDeletion, NodeMutationObservation, NodeMutationParent,
+    NodeMutationPublication, NodeMutationRequest, NodeMutationRequestContext, NodeMutationSpec,
+    NodeMutationTask, NodeMutationTaskKind, NodeMutationTaskOutcome, NodeMutationTaskState,
+    NodeMutationTaskStatus, NodeRenameAbsenceEvidence, NodeRenameAbsenceKind, NodeRenameAttempt,
+    NodeRenameAttemptPhase, NodeRenameBaseline, NodeRenameDataReferences, NodeRenameGlobalPlan,
+    NodeRenameIntentClosure, NodeRenameLiveFile, NodeRenameManifest, NodeRenameManifestCapture,
+    NodeRenameManifestReader, NodeRenameMediaPlan, NodeRenameObservation, NodeRenameParticipant,
+    NodeRenameParticipantsCapture, NodeRenameParticipantsSummary, NodeRenamePhysicalSource,
+    NodeRenamePhysicalSourceStats, NodeRenameProjectionSpool, NodeRenameProjectionStats,
+    NodeRenameProjectionVolume, NodeRenamePublication, NodeRenameReferenceRole, NodeRenameRequest,
+    NodeRenameRevision, NodeRenameS4Evidence, NodeRenameSpec, NodeRenameSubtreeCapture,
+    NodeRenameSubtreeEntry, NodeRenameSubtreePage, NodeRenameSubtreeSummary, NodeRenameVolumeGuard,
+    NodeRenameVolumeGuardStats, NodeRenameVolumeIntent, NodeRenameVolumePlan,
+    NodeRenameVolumeProjection, NodeRenameVolumeProjectionStats, PoolPolicy, PoolRecord,
+    PreparedNodeMutationInputs, PreparedNodeRenameInputs, ReclaimDataProgress, ReclaimFile,
+    ReclaimFileMetadata, ReclaimMetadataProgress, ReclaimReservation, ReclaimSourceInventory,
+    ReclaimSourceProgress, ReclaimSourceRead, ReclaimSpec, ReclaimWalk, TapeAssignment,
+    VolumePlacement,
+};
 pub use cutover::{
     FrozenSnapshotIdentity, VerifiedNodeExport, inspect_frozen_snapshot, verify_node_export,
 };
@@ -79,10 +137,14 @@ pub use staged_sources::StagedSourceSummary;
 const PREFIX: &[u8] = b"tape-rs/catalog/22/";
 const MAX_PAGE: usize = 1000;
 const MAX_NAME: usize = 255;
+const MAX_POOL_PATH_BYTES: usize = 2048;
+pub(crate) const NODE_RENAME_MARKER: &str = "tapers.fdb.nodeRename";
 const MAX_DEPTH: u16 = 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
+    #[error("同一 S3 client token 的原请求参数不一致")]
+    IdempotencyMismatch,
     #[error("FDB 目录操作失败: {0}")]
     Fdb(#[from] FdbBindingError),
     #[error("FDB 客户端初始化失败: {0}")]
@@ -93,8 +155,20 @@ pub enum CatalogError {
     Corrupt(&'static str),
     #[error("卷索引缓存校验失败: {0}")]
     Cache(String),
+    #[error("节点计划 {phase} 失败: {source}")]
+    NodePlanIo {
+        phase: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("目录索引未完成，暂不能判定文件是否存在")]
     Incomplete,
+    #[error("池正在接入介质，目录暂不可用")]
+    PoolImporting,
+    #[error("池存在已准备的节点修改，暂不能开始其他写入")]
+    PoolBusy,
+    #[error("磁带离线或在黑名单中，暂不能执行数据读写")]
+    MediaUnavailable,
     #[error("目录维护任务已被新的执行者接管")]
     MaintenanceFenced,
     #[error("带库 owner 已由新的执行轮次接管")]
@@ -102,6 +176,22 @@ pub enum CatalogError {
 }
 
 pub type Result<T> = std::result::Result<T, CatalogError>;
+
+/// Public paths are relative to a pool's virtual root. Pool IDs are never
+/// written as physical LTFS directory components.
+pub fn pool_catalog_path(pool: Uuid, path: &[u8]) -> Result<Vec<u8>> {
+    if pool.is_nil()
+        || path.len() > MAX_POOL_PATH_BYTES
+        || lookup::path_components(path)?.len() >= usize::from(MAX_DEPTH)
+    {
+        return Err(CatalogError::Invalid("池或池内路径无效"));
+    }
+    let mut full = format!("/{pool}").into_bytes();
+    if path != b"/" {
+        full.extend_from_slice(path);
+    }
+    Ok(full)
+}
 
 /// Preferred checksum carried by the LTFS index. `Unknown` does not prove
 /// that the file's content has been verified.
@@ -315,6 +405,9 @@ pub enum NodeKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Node {
     pub kind: NodeKind,
+    /// Directory attribute revision; files use FileHead.version exclusively.
+    /// Directory contents are separately protected by path/range conflicts.
+    pub directory_version: Option<u64>,
     pub parent: Uuid,
     pub name: Vec<u8>,
     pub attributes: Option<NodeAttributes>,
@@ -351,15 +444,16 @@ pub struct FileHead {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PhysicalCopy {
     pub version: u64,
-    pub request_epoch: u64,
+    /// The original content source; metadata management preserves it.
+    pub origin: CopyOrigin,
     pub volume_id: Uuid,
     pub volume_generation: u64,
     pub volume_scan_id: Uuid,
     pub ltfs_file_uid: u64,
     pub size: u64,
     pub content_digest: ContentDigest,
-    /// Exact on-medium identity for imported files. Legacy storage records may
-    /// lack provenance; serving reads still require verified managed placement.
+    /// Exact on-medium identity for imported files and native links. Active
+    /// uploads use their canonical pool-relative path without this extension.
     pub media: Option<MediaProvenance>,
 }
 
@@ -373,27 +467,6 @@ pub struct MediaProvenance {
     pub ee_alias: bool,
     /// A zero-data LTFS link, retained as metadata and never read as payload.
     pub native_symlink: bool,
-}
-
-enum StoredCopy {
-    Present(PhysicalCopy),
-    Reclaimed { version: u64, request_epoch: u64 },
-}
-
-impl StoredCopy {
-    fn version(&self) -> u64 {
-        match self {
-            Self::Present(copy) => copy.version,
-            Self::Reclaimed { version, .. } => *version,
-        }
-    }
-
-    fn request_epoch(&self) -> u64 {
-        match self {
-            Self::Present(copy) => copy.request_epoch,
-            Self::Reclaimed { request_epoch, .. } => *request_epoch,
-        }
-    }
 }
 
 /// Stable across retries and owner takeover; a fresh ID isolates each scan,
@@ -474,9 +547,9 @@ impl ManagedCatalog {
         let state_key = namespace_key(namespace);
         let managed_key = control::managed_key(namespace);
         let source_revision_key = source_revision_key(namespace);
-        let default_group = control::node_group_key(namespace, "G0");
         let value = encode_node(&Node {
             kind: NodeKind::Directory,
+            directory_version: Some(1),
             parent: Uuid::nil(),
             name: Vec::new(),
             attributes: None,
@@ -487,14 +560,15 @@ impl ManagedCatalog {
                 let state_key = state_key.clone();
                 let managed_key = managed_key.clone();
                 let source_revision_key = source_revision_key.clone();
-                let default_group = default_group.clone();
                 let value = value.clone();
                 async move {
                     let old_root = tr.get(&root, false).await?;
                     let old_state = tr.get(&state_key, false).await?;
                     let old_managed = tr.get(&managed_key, false).await?;
+                    let old_layout = tr
+                        .get(&control::managed_layout_key(namespace), false)
+                        .await?;
                     let old_source_revision = tr.get(&source_revision_key, false).await?;
-                    let old_group = tr.get(&default_group, false).await?;
                     if old_state.as_deref() == Some(&[NamespaceState::Discarded as u8]) {
                         return Ok(Err(CatalogError::Invalid("废弃的 namespace ID 不能复用")));
                     }
@@ -516,6 +590,17 @@ impl ManagedCatalog {
                                     "namespace 管理模式不能更改",
                                 )));
                             }
+                            if managed {
+                                if let Err(error) =
+                                    control::validate_managed_layout(old_layout.as_deref())
+                                {
+                                    return Ok(Err(error));
+                                }
+                            } else if old_layout.is_some() {
+                                return Ok(Err(CatalogError::Corrupt(
+                                    "非受管命名空间存在受管布局记录",
+                                )));
+                            }
                             if managed
                                 && old_source_revision
                                     .as_deref()
@@ -530,8 +615,17 @@ impl ManagedCatalog {
                                     "非受管命名空间存在扫描修订号",
                                 )));
                             }
-                            if old_group.as_deref() != Some(&[][..]) {
-                                return Ok(Err(CatalogError::Corrupt("默认节点组缺失或损坏")));
+                            let management_window = tr
+                                .get(&control::management::prefix(namespace, b'w'), false)
+                                .await?;
+                            if management_window
+                                .as_deref()
+                                .map(requests::decode_window)
+                                .transpose()
+                                .is_err()
+                                || management_window.is_none()
+                            {
+                                return Ok(Err(CatalogError::Corrupt("管理请求窗口缺失或损坏")));
                             }
                             let window = tr.get(&requests::window_key(namespace), false).await?;
                             if window
@@ -547,16 +641,34 @@ impl ManagedCatalog {
                         }
                         (None, None) => {
                             if old_managed.is_some()
-                                || old_group.is_some()
+                                || old_layout.is_some()
                                 || old_source_revision.is_some()
                             {
                                 return Ok(Err(CatalogError::Corrupt("受管命名空间缺少根记录")));
                             }
+                            // Do not bless orphan records as current-layout
+                            // data merely by creating a new namespace header.
+                            for &kind in cleanup::NAMESPACE_ROWS {
+                                let mut prefix = key(kind);
+                                prefix.extend_from_slice(namespace.as_bytes());
+                                let range = RangeOption {
+                                    begin: KeySelector::first_greater_or_equal(prefix.clone()),
+                                    end: KeySelector::first_greater_or_equal(prefix_end(&prefix)),
+                                    limit: Some(1),
+                                    ..RangeOption::default()
+                                };
+                                if !tr.get_range(&range, 1, false).await?.is_empty() {
+                                    return Ok(Err(CatalogError::Corrupt(
+                                        "namespace 存在孤立记录",
+                                    )));
+                                }
+                            }
                             tr.set(&root, &value);
                             tr.set(&state_key, &[state as u8]);
-                            tr.set(&default_group, b"");
+                            control::management::initialize(&tr, namespace);
                             if managed {
                                 tr.set(&managed_key, b"");
+                                control::initialize_managed_layout(&tr, namespace);
                                 tr.set(&source_revision_key, &0u64.to_be_bytes());
                             }
                             tr.set(
@@ -689,6 +801,7 @@ impl ManagedCatalog {
         let root = node_key(namespace, Uuid::nil());
         let value = encode_node(&Node {
             kind: NodeKind::Directory,
+            directory_version: Some(1),
             parent: Uuid::nil(),
             name: Vec::new(),
             attributes: Some(attributes.clone()),
@@ -728,14 +841,9 @@ impl ManagedCatalog {
                     if decoded.attributes.is_some() {
                         return Ok(Err(CatalogError::Invalid("根目录 LTFS 属性与已有导入冲突")));
                     }
-                    if let Err(error) = write_attribute_chunks(
-                        &tr,
-                        namespace,
-                        Uuid::nil(),
-                        false,
-                        Some(&attributes),
-                    )
-                    .await
+                    if let Err(error) =
+                        attribute_objects::require_attributes(&tr, namespace, Some(&attributes))
+                            .await
                     {
                         return Ok(Err(error));
                     }
@@ -761,6 +869,10 @@ impl ManagedCatalog {
         }
         if namespace.is_nil() || id.is_nil() {
             return Err(CatalogError::Invalid("namespace 和目录 inode 不能为 nil"));
+        }
+        if parent.is_nil() {
+            control::reject_generic_pool_root_at(&self.db.create_trx()?, namespace, parent, name)
+                .await?;
         }
         if let Some(attributes) = attributes {
             self.upload_attributes(namespace, attributes).await?;
@@ -799,6 +911,11 @@ impl ManagedCatalog {
                         Ok(None) => return Ok(Err(CatalogError::Incomplete)),
                         Err(error) => return Ok(Err(error)),
                     }
+                    if let Err(error) =
+                        control::reject_generic_pool_root_at(&tr, namespace, parent, &name).await
+                    {
+                        return requests::retry_result(Err(error));
+                    }
                     let Some(parent_bytes) = tr.get(&parent_key, false).await? else {
                         return Ok(Ok(DirectoryOutcome::MissingParent));
                     };
@@ -811,6 +928,7 @@ impl ManagedCatalog {
                     }
                     let value = encode_node(&Node {
                         kind: NodeKind::Directory,
+                        directory_version: Some(1),
                         parent,
                         name,
                         attributes: attributes.clone(),
@@ -837,7 +955,8 @@ impl ManagedCatalog {
                         return Ok(Ok(DirectoryOutcome::IdConflict));
                     }
                     if let Err(error) =
-                        write_attribute_chunks(&tr, namespace, id, false, attributes.as_ref()).await
+                        attribute_objects::require_attributes(&tr, namespace, attributes.as_ref())
+                            .await
                     {
                         return Ok(Err(error));
                     }
@@ -852,23 +971,38 @@ impl ManagedCatalog {
     pub async fn node(&self, namespace: Uuid, id: Uuid) -> Result<Option<Node>> {
         let tr = self.db.create_trx()?;
         require_namespace_readable(&tr, namespace).await?;
-        if tr.get(&namespace_key(namespace), true).await?.as_deref()
-            == Some(&[NamespaceState::Active as u8][..])
-            && let Some((locator, receipt, _)) =
-                lookup::published_file_receipt_at(&tr, namespace, id).await?
+        let active = tr.get(&namespace_key(namespace), true).await?.as_deref()
+            == Some(&[NamespaceState::Active as u8][..]);
+        let published = if active {
+            lookup::published_file_receipt_at(&tr, namespace, id).await?
+        } else {
+            None
+        };
+        let raw = tr.get(&node_key(namespace, id), true).await?;
+        if let Some(bytes) = raw.as_deref()
+            && retired_nodes::from_node_record(namespace, id, bytes)?.is_some()
         {
+            if !active || published.is_some() {
+                return Err(CatalogError::Corrupt(
+                    "已删除 inode 与命名空间或活动发布不一致",
+                ));
+            }
+            return Ok(None);
+        }
+        if let Some((locator, receipt, _)) = published {
             let attributes = active_batch::prepared_attributes_at(&tr, locator.batch_id, &receipt)
                 .await?
                 .ok_or(CatalogError::Corrupt("已发布活动 inode 缺少属性"))?;
             drop(tr);
             return Ok(Some(Node {
                 kind: NodeKind::File,
+                directory_version: None,
                 parent: receipt.parent,
                 name: receipt.name,
                 attributes: Some(self.hydrate_attributes(namespace, attributes).await?),
             }));
         }
-        let Some(bytes) = tr.get(&node_key(namespace, id), true).await? else {
+        let Some(bytes) = raw else {
             return Ok(None);
         };
         let mut node = decode_node(&bytes)?;
@@ -1439,11 +1573,11 @@ impl ManagedCatalog {
                     }
                     let file_node_value = encode_node(&Node {
                         kind: NodeKind::File,
+                        directory_version: None,
                         parent: receipt.parent,
                         name: receipt.name.clone(),
                         attributes: attributes.clone(),
                     });
-                    let mut old_external = false;
                     if let Some(node) = tr.get(&file_node, false).await? {
                         let old = match decode_node(&node) {
                             Ok(node) => node,
@@ -1458,10 +1592,6 @@ impl ManagedCatalog {
                         if old.attributes.is_some() && attributes.is_none() {
                             return Ok(Ok(PublishOutcome::OperationConflict));
                         }
-                        old_external = old
-                            .attributes
-                            .as_ref()
-                            .is_some_and(NodeAttributes::is_external);
                     }
                     let previous = tr.get(&head, false).await?;
                     if let Some(bytes) = &previous
@@ -1492,11 +1622,9 @@ impl ManagedCatalog {
                         Err(CatalogError::Client(error)) => return Err(error.into()),
                         Err(error) => return Ok(Err(error)),
                     };
-                    if let Err(error) = write_attribute_chunks(
+                    if let Err(error) = attribute_objects::require_attributes(
                         &tr,
                         receipt.namespace,
-                        receipt.file_id,
-                        old_external,
                         attributes.as_ref(),
                     )
                     .await
@@ -1548,11 +1676,24 @@ impl ManagedCatalog {
     pub async fn file_head(&self, namespace: Uuid, file_id: Uuid) -> Result<Option<FileHead>> {
         let tr = self.db.create_trx()?;
         require_namespace_readable(&tr, namespace).await?;
-        if tr.get(&namespace_key(namespace), true).await?.as_deref()
-            == Some(&[NamespaceState::Active as u8][..])
-            && let Some((_, receipt, _)) =
-                lookup::published_file_receipt_at(&tr, namespace, file_id).await?
+        let active = tr.get(&namespace_key(namespace), true).await?.as_deref()
+            == Some(&[NamespaceState::Active as u8][..]);
+        let published = if active {
+            lookup::published_file_receipt_at(&tr, namespace, file_id).await?
+        } else {
+            None
+        };
+        if let Some(bytes) = tr.get(&node_key(namespace, file_id), true).await?
+            && retired_nodes::from_node_record(namespace, file_id, &bytes)?.is_some()
         {
+            if !active || published.is_some() {
+                return Err(CatalogError::Corrupt(
+                    "已删除 inode 与命名空间或活动发布不一致",
+                ));
+            }
+            return Ok(None);
+        }
+        if let Some((_, receipt, _)) = published {
             return lookup::candidate_head(&receipt).map(Some);
         }
         let value = tr.get(&head_key(namespace, file_id), true).await?;
@@ -2075,32 +2216,6 @@ fn node_key(ns: Uuid, id: Uuid) -> Vec<u8> {
     k
 }
 
-fn attribute_chunk_prefix(ns: Uuid, id: Uuid) -> Vec<u8> {
-    let mut k = key(b'm');
-    k.extend_from_slice(ns.as_bytes());
-    k.extend_from_slice(id.as_bytes());
-    k
-}
-
-async fn write_attribute_chunks(
-    tr: &Transaction,
-    ns: Uuid,
-    id: Uuid,
-    old_external: bool,
-    attributes: Option<&NodeAttributes>,
-) -> Result<()> {
-    // Only retire old per-inode storage. Immutable M objects are retained;
-    // the reference switch must never delete a version still held by a reader.
-    if old_external {
-        let prefix = attribute_chunk_prefix(ns, id);
-        tr.clear_range(&prefix, &prefix_end(&prefix));
-    }
-    if let Some(manifest) = attributes.and_then(NodeAttributes::manifest) {
-        attribute_objects::require_complete(tr, ns, manifest).await?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 async fn hydrate_node(
     tr: &Transaction,
@@ -2151,11 +2266,13 @@ fn encode_node(node: &Node) -> Vec<u8> {
     let attribute_len = node.attributes.as_ref().map_or(0, |attributes| {
         attributes.inline_bytes().map_or(38, |bytes| bytes.len())
     });
-    let mut value = Vec::with_capacity(20 + node.name.len() + attribute_len);
+    let mut value = Vec::with_capacity(30 + node.name.len() + attribute_len);
+    value.extend_from_slice(b"N\x01");
     value.push(match node.kind {
         NodeKind::Directory => 0,
         NodeKind::File => 1,
     });
+    value.extend_from_slice(&node.directory_version.unwrap_or(0).to_be_bytes());
     value.extend_from_slice(node.parent.as_bytes());
     value.extend_from_slice(&(node.name.len() as u16).to_be_bytes());
     value.extend_from_slice(&node.name);
@@ -2178,29 +2295,35 @@ fn encode_node(node: &Node) -> Vec<u8> {
 }
 
 fn decode_node(value: &[u8]) -> Result<Node> {
-    if value.len() < 20 {
-        return Err(CatalogError::Corrupt("node 长度"));
+    if value.len() < 30 || &value[..2] != b"N\x01" {
+        return Err(CatalogError::Corrupt("node 版本或长度"));
     }
-    let kind = match value[0] {
+    let kind = match value[2] {
         0 => NodeKind::Directory,
         1 => NodeKind::File,
         _ => return Err(CatalogError::Corrupt("node 类型")),
     };
-    let name_len = u16::from_be_bytes([value[17], value[18]]) as usize;
-    if name_len > MAX_NAME || value.len() < 20 + name_len {
+    let revision = read_u64(&value[3..11]);
+    let directory_version = match (kind, revision) {
+        (NodeKind::Directory, 1..) => Some(revision),
+        (NodeKind::File, 0) => None,
+        _ => return Err(CatalogError::Corrupt("node 目录属性版本与类型不符")),
+    };
+    let name_len = u16::from_be_bytes([value[27], value[28]]) as usize;
+    if name_len > MAX_NAME || value.len() < 30 + name_len {
         return Err(CatalogError::Corrupt("node 名称长度"));
     }
-    let name = value[19..19 + name_len].to_vec();
+    let name = value[29..29 + name_len].to_vec();
     if !name.is_empty() {
         validate_name(&name).map_err(|_| CatalogError::Corrupt("node 名称"))?;
     }
-    let attributes = match value[19 + name_len] {
-        0 if value.len() == 20 + name_len => None,
-        1 if value.len() - 20 - name_len <= INLINE_LIMIT => {
-            Some(NodeAttributes::decode(&value[20 + name_len..])?)
+    let attributes = match value[29 + name_len] {
+        0 if value.len() == 30 + name_len => None,
+        1 if value.len() - 30 - name_len <= INLINE_LIMIT => {
+            Some(NodeAttributes::decode(&value[30 + name_len..])?)
         }
-        3 if value.len() == 20 + name_len + 38 => {
-            let start = 20 + name_len;
+        3 if value.len() == 30 + name_len + 38 => {
+            let start = 30 + name_len;
             Some(NodeAttributes::from_manifest(AttributeManifest {
                 digest: value[start..start + 32].try_into().unwrap(),
                 len: u32::from_be_bytes(value[start + 32..start + 36].try_into().unwrap()),
@@ -2214,7 +2337,8 @@ fn decode_node(value: &[u8]) -> Result<Node> {
     }
     Ok(Node {
         kind,
-        parent: uuid_from(&value[1..17])?,
+        directory_version,
+        parent: uuid_from(&value[11..27])?,
         name,
         attributes,
     })
@@ -2243,65 +2367,6 @@ fn decode_head(bytes: &[u8]) -> Result<FileHead> {
     })
 }
 
-fn decode_copy(bytes: &[u8]) -> Result<PhysicalCopy> {
-    let digest_tag = *bytes
-        .get(48)
-        .ok_or(CatalogError::Corrupt("物理副本摘要算法"))?;
-    let extended = digest_tag & 0x80 != 0;
-    let digest_len = match digest_tag & 0x7f {
-        0 => 0,
-        1 => 32,
-        2 => 16,
-        _ => return Err(CatalogError::Corrupt("物理副本摘要算法")),
-    };
-    let epoch_offset = 49 + digest_len;
-    let uid_offset = epoch_offset + 8;
-    let size_offset = uid_offset + 8;
-    let base_end = size_offset + 8;
-    if bytes.len() < base_end
-        || read_u64(bytes) == 0
-        || read_u64(&bytes[epoch_offset..]) == 0
-        || read_u64(&bytes[uid_offset..]) == 0
-    {
-        return Err(CatalogError::Corrupt("物理副本长度或版本"));
-    }
-    let volume_id = uuid_from(&bytes[8..24])?;
-    let volume_generation = read_u64(&bytes[24..32]);
-    let volume_scan_id = uuid_from(&bytes[32..48])?;
-    validate_scan(
-        volume_id,
-        VolumeScan {
-            generation: volume_generation,
-            id: volume_scan_id,
-        },
-    )
-    .map_err(|_| CatalogError::Corrupt("物理副本卷或扫描 ID"))?;
-    let ltfs_file_uid = read_u64(&bytes[uid_offset..]);
-    let media = if extended {
-        Some(decode_media(&bytes[base_end..], ltfs_file_uid)?)
-    } else if bytes.len() == base_end {
-        None
-    } else {
-        return Err(CatalogError::Corrupt("旧物理副本含多余尾部"));
-    };
-    if media.as_ref().is_some_and(|media| media.native_symlink)
-        && (read_u64(&bytes[size_offset..]) != 0 || digest_tag & 0x7f != 0)
-    {
-        return Err(CatalogError::Corrupt("原生符号链接不能包含数据副本"));
-    }
-    Ok(PhysicalCopy {
-        version: read_u64(bytes),
-        request_epoch: read_u64(&bytes[epoch_offset..]),
-        volume_id,
-        volume_generation,
-        volume_scan_id,
-        ltfs_file_uid,
-        size: read_u64(&bytes[size_offset..]),
-        content_digest: ContentDigest::decode_compact(digest_tag & 0x7f, &bytes[49..epoch_offset])?,
-        media,
-    })
-}
-
 fn validate_media(media: &MediaProvenance, data_uid: u64) -> Result<()> {
     if media.logical_file_uid == 0
         || media.physical_path.len() > u16::MAX as usize
@@ -2315,48 +2380,6 @@ fn validate_media(media: &MediaProvenance, data_uid: u64) -> Result<()> {
         return Err(CatalogError::Invalid("物理副本介质来源无效"));
     }
     Ok(())
-}
-
-fn decode_media(bytes: &[u8], data_uid: u64) -> Result<MediaProvenance> {
-    if bytes.len() < 28 || !matches!((bytes[0], bytes[1]), (1, 0 | 1) | (2, 2)) {
-        return Err(CatalogError::Corrupt("物理副本介质来源版本或长度"));
-    }
-    let length = u16::from_be_bytes(bytes[26..28].try_into().unwrap()) as usize;
-    if bytes.len() != 28 + length {
-        return Err(CatalogError::Corrupt("物理副本介质路径长度"));
-    }
-    let media = MediaProvenance {
-        version: (read_u64(&bytes[2..10]), read_u64(&bytes[10..18])),
-        logical_file_uid: read_u64(&bytes[18..26]),
-        physical_path: std::str::from_utf8(&bytes[28..])
-            .map_err(|_| CatalogError::Corrupt("物理副本介质路径 UTF-8"))?
-            .to_owned(),
-        ee_alias: bytes[1] == 1,
-        native_symlink: bytes[1] == 2,
-    };
-    validate_media(&media, data_uid).map_err(|_| CatalogError::Corrupt("物理副本介质来源字段"))?;
-    Ok(media)
-}
-
-fn encode_reclaimed_copy(version: u64, request_epoch: u64) -> Vec<u8> {
-    let mut value = vec![0xff];
-    value.extend_from_slice(&version.to_be_bytes());
-    value.extend_from_slice(&request_epoch.to_be_bytes());
-    value
-}
-
-fn decode_stored_copy(bytes: &[u8]) -> Result<StoredCopy> {
-    if bytes.len() == 17
-        && bytes[0] == 0xff
-        && read_u64(&bytes[1..]) != 0
-        && read_u64(&bytes[9..]) != 0
-    {
-        return Ok(StoredCopy::Reclaimed {
-            version: read_u64(&bytes[1..]),
-            request_epoch: read_u64(&bytes[9..]),
-        });
-    }
-    decode_copy(bytes).map(StoredCopy::Present)
 }
 
 fn copy_prefix(ns: Uuid) -> Vec<u8> {
@@ -2429,7 +2452,9 @@ fn decode_name(bytes: &[u8]) -> Result<Vec<u8>> {
 fn encode_copy(receipt: &CommitReceipt, version: u64) -> Vec<u8> {
     encode_physical_copy(&PhysicalCopy {
         version,
-        request_epoch: receipt.request_epoch,
+        origin: CopyOrigin::FileRequest {
+            request_epoch: receipt.request_epoch,
+        },
         volume_id: receipt.volume_id,
         volume_generation: receipt.volume_generation,
         volume_scan_id: receipt.volume_scan_id,
@@ -2438,60 +2463,7 @@ fn encode_copy(receipt: &CommitReceipt, version: u64) -> Vec<u8> {
         content_digest: receipt.content_digest,
         media: None,
     })
-    .expect("legacy media commit has no variable-length provenance")
-}
-
-fn encode_physical_copy(copy: &PhysicalCopy) -> Result<Vec<u8>> {
-    if copy.media.is_some()
-        && (copy.version == 0
-            || copy.request_epoch == 0
-            || copy.ltfs_file_uid == 0
-            || validate_scan(
-                copy.volume_id,
-                VolumeScan {
-                    generation: copy.volume_generation,
-                    id: copy.volume_scan_id,
-                },
-            )
-            .is_err())
-    {
-        return Err(CatalogError::Invalid("导入物理副本基础身份无效"));
-    }
-    let mut value = Vec::with_capacity(
-        73 + copy.content_digest.compact_len()
-            + copy
-                .media
-                .as_ref()
-                .map_or(0, |media| 28 + media.physical_path.len()),
-    );
-    value.extend_from_slice(&copy.version.to_be_bytes());
-    value.extend_from_slice(copy.volume_id.as_bytes());
-    value.extend_from_slice(&copy.volume_generation.to_be_bytes());
-    value.extend_from_slice(copy.volume_scan_id.as_bytes());
-    value.push(copy.content_digest.tag() | if copy.media.is_some() { 0x80 } else { 0 });
-    value.extend_from_slice(&copy.content_digest.payload()[..copy.content_digest.compact_len()]);
-    value.extend_from_slice(&copy.request_epoch.to_be_bytes());
-    value.extend_from_slice(&copy.ltfs_file_uid.to_be_bytes());
-    value.extend_from_slice(&copy.size.to_be_bytes());
-    if let Some(media) = &copy.media {
-        validate_media(media, copy.ltfs_file_uid)?;
-        if media.native_symlink && (copy.size != 0 || copy.content_digest != ContentDigest::Unknown)
-        {
-            return Err(CatalogError::Invalid("原生符号链接不能包含数据副本"));
-        }
-        value.push(if media.native_symlink { 2 } else { 1 });
-        value.push(if media.native_symlink {
-            2
-        } else {
-            u8::from(media.ee_alias)
-        });
-        value.extend_from_slice(&media.version.0.to_be_bytes());
-        value.extend_from_slice(&media.version.1.to_be_bytes());
-        value.extend_from_slice(&media.logical_file_uid.to_be_bytes());
-        value.extend_from_slice(&(media.physical_path.len() as u16).to_be_bytes());
-        value.extend_from_slice(media.physical_path.as_bytes());
-    }
-    Ok(value)
+    .expect("validated file receipt encodes a physical description")
 }
 
 /// Stable copy identity. A fresh epoch/operation/file version cannot reuse an
@@ -2537,6 +2509,9 @@ fn validate_receipt(receipt: &CommitReceipt) -> Result<()> {
         return Err(CatalogError::Invalid(
             "owner、请求代次、卷代数和 LTFS fileuid 必须大于零",
         ));
+    }
+    if receipt.expected_version == Some(0) {
+        return Err(CatalogError::Invalid("覆盖版本必须大于零"));
     }
     receipt
         .expected_version
@@ -2612,12 +2587,12 @@ async fn test_publish_imported(
     catalog.publish_imported(receipt).await
 }
 
-// Legacy storage fixtures intentionally have no managed placement. Inspect their
+// Unplaced storage fixtures intentionally have no managed placement. Inspect their
 // scan-qualified records for GC/recovery assertions, while also proving that the
 // public serving API rejects them. Never use this helper in managed/owner tests.
 #[cfg(test)]
 impl ManagedCatalog {
-    async fn legacy_copy_record_for_test(
+    async fn unplaced_copy_record_for_test(
         &self,
         namespace: Uuid,
         file_id: Uuid,
@@ -2661,6 +2636,29 @@ impl ManagedCatalog {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pool_paths_are_canonical_and_isolated() {
+        let pool = uuid::Uuid::new_v4();
+        assert_eq!(
+            super::pool_catalog_path(pool, b"/").unwrap(),
+            format!("/{pool}").as_bytes()
+        );
+        assert_eq!(
+            super::pool_catalog_path(pool, b"/a/b").unwrap(),
+            format!("/{pool}/a/b").as_bytes()
+        );
+        for path in [
+            b"".as_slice(),
+            b"relative",
+            b"/a/",
+            b"//a",
+            b"/../a",
+            b"/a\0b",
+        ] {
+            assert!(super::pool_catalog_path(pool, path).is_err());
+        }
+        assert!(super::pool_catalog_path(uuid::Uuid::nil(), b"/").is_err());
+    }
     use super::*;
 
     #[test]
@@ -2762,7 +2760,7 @@ mod tests {
         assert_eq!(decode_copy(&bytes).unwrap().size, u64::MAX - 1);
         assert!(decode_copy(&bytes[..bytes.len() - 1]).is_err());
         let mut missing = bytes;
-        missing[89..97].fill(0);
+        missing[50..58].fill(0);
         assert!(decode_copy(&missing).is_err());
         let mut invalid = receipt;
         invalid.ltfs_file_uid = 0;
@@ -2792,7 +2790,7 @@ mod tests {
             metadata_digest: None,
         });
         let unknown_fingerprint = receipt_fingerprint(&receipt);
-        assert_eq!(encode_copy(&receipt, 1).len(), 73);
+        assert_eq!(encode_copy(&receipt, 1).len(), 77);
         assert_eq!(
             decode_copy(&encode_copy(&receipt, 1))
                 .unwrap()
@@ -2802,7 +2800,7 @@ mod tests {
         receipt.content_digest = ContentDigest::Md5([7; 16]);
         assert_ne!(receipt_fingerprint(&receipt), unknown_fingerprint);
         let md5 = encode_copy(&receipt, 1);
-        assert_eq!(md5.len(), 89);
+        assert_eq!(md5.len(), 93);
         assert_eq!(
             decode_copy(&md5).unwrap().content_digest,
             receipt.content_digest
@@ -2811,10 +2809,10 @@ mod tests {
         invalid.push(1);
         assert!(decode_copy(&invalid).is_err());
         invalid = md5;
-        invalid[48] = 3;
+        invalid[66] = 3;
         assert!(decode_copy(&invalid).is_err());
         receipt.content_digest = ContentDigest::Sha256([0; 32]);
-        assert_eq!(encode_copy(&receipt, 1).len(), 105);
+        assert_eq!(encode_copy(&receipt, 1).len(), 109);
         assert_eq!(
             decode_copy(&encode_copy(&receipt, 1))
                 .unwrap()
@@ -2828,7 +2826,7 @@ mod tests {
     fn native_symlink_copy_codec_never_accepts_payload_or_alias_flags() {
         let mut copy = PhysicalCopy {
             version: 1,
-            request_epoch: 1,
+            origin: CopyOrigin::Imported,
             volume_id: Uuid::new_v4(),
             volume_generation: 1,
             volume_scan_id: Uuid::new_v4(),
@@ -2846,10 +2844,10 @@ mod tests {
         let bytes = encode_physical_copy(&copy).unwrap();
         assert_eq!(decode_copy(&bytes).unwrap(), copy);
         let mut corrupt = bytes.clone();
-        corrupt[72] = 1;
+        corrupt[65] = 1; // R1 size must remain zero for a native link.
         assert!(decode_copy(&corrupt).is_err());
         corrupt = bytes;
-        corrupt[73] = 1; // Version 1 cannot encode a native link.
+        corrupt[68] = 2; // EE aliases cannot reuse their data UID.
         assert!(decode_copy(&corrupt).is_err());
         copy.size = 1;
         assert!(encode_physical_copy(&copy).is_err());
@@ -2883,9 +2881,10 @@ mod tests {
             content_digest: ContentDigest::Sha256([7; 32]),
             metadata_digest: None,
         });
-        let legacy = encode_copy(&receipt, 1);
-        assert!(decode_copy(&legacy).unwrap().media.is_none());
-        let mut copy = decode_copy(&legacy).unwrap();
+        let receipt_copy = encode_copy(&receipt, 1);
+        assert!(decode_copy(&receipt_copy).unwrap().media.is_none());
+        let mut copy = decode_copy(&receipt_copy).unwrap();
+        copy.origin = CopyOrigin::Imported;
         copy.media = Some(MediaProvenance {
             version: (u64::MAX, u64::MAX),
             logical_file_uid: 33,
@@ -2895,18 +2894,18 @@ mod tests {
         });
         let encoded = encode_physical_copy(&copy).unwrap();
         assert_eq!(decode_copy(&encoded).unwrap(), copy);
-        for end in legacy.len()..encoded.len() {
+        for end in 0..encoded.len() {
             assert!(decode_copy(&encoded[..end]).is_err());
         }
         let mut bad = encoded.clone();
-        bad[legacy.len()] = 2;
+        bad[100] = 4; // Unknown media kind after the Imported origin.
         assert!(decode_copy(&bad).is_err());
         bad = encoded.clone();
-        bad[legacy.len() + 1] = 2;
+        bad[117..125].copy_from_slice(&copy.ltfs_file_uid.to_be_bytes());
         assert!(decode_copy(&bad).is_err());
         bad = encoded;
-        bad[legacy.len() + 26] = 0;
-        bad[legacy.len() + 27] = 1;
+        bad[125] = 0;
+        bad[126] = 1;
         assert!(decode_copy(&bad).is_err());
 
         let mut invalid = copy;
@@ -2965,6 +2964,7 @@ mod tests {
         for kind in [NodeKind::Directory, NodeKind::File] {
             let node = Node {
                 kind,
+                directory_version: (kind == NodeKind::Directory).then_some(1),
                 parent: Uuid::new_v4(),
                 name: b"subdir".to_vec(),
                 attributes: None,
@@ -2972,6 +2972,58 @@ mod tests {
             assert_eq!(decode_node(&encode_node(&node)).unwrap(), node);
         }
         assert!(decode_node(&[0, 1]).is_err());
+    }
+
+    #[test]
+    fn node_directory_versions_are_mandatory_and_reject_prototype_records() {
+        for (kind, version) in [
+            (NodeKind::Directory, Some(1)),
+            (NodeKind::Directory, Some(u64::MAX)),
+            (NodeKind::File, None),
+        ] {
+            let node = Node {
+                kind,
+                directory_version: version,
+                parent: Uuid::nil(),
+                name: vec![],
+                attributes: None,
+            };
+            let bytes = encode_node(&node);
+            assert_eq!(bytes.len(), 30);
+            assert_eq!(decode_node(&bytes).unwrap(), node);
+            for end in 0..bytes.len() {
+                assert!(decode_node(&bytes[..end]).is_err());
+            }
+            let mut invalid = bytes.clone();
+            invalid[1] = 2;
+            assert!(decode_node(&invalid).is_err());
+            let mut invalid = bytes.clone();
+            invalid[2] = 2;
+            assert!(decode_node(&invalid).is_err());
+            let mut invalid = bytes.clone();
+            invalid[3..11].copy_from_slice(
+                &if kind == NodeKind::Directory {
+                    0_u64
+                } else {
+                    1
+                }
+                .to_be_bytes(),
+            );
+            assert!(decode_node(&invalid).is_err());
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert!(decode_node(&trailing).is_err());
+        }
+        for tag in [0, 1] {
+            let mut old = vec![tag];
+            old.extend_from_slice(Uuid::nil().as_bytes());
+            old.extend_from_slice(&0_u16.to_be_bytes());
+            old.push(0);
+            assert!(
+                decode_node(&old).is_err(),
+                "首版不读取或回填无版本的 prototype node"
+            );
+        }
     }
 
     #[test]
@@ -3169,6 +3221,7 @@ mod tests {
             Uuid::nil(),
             Node {
                 kind: NodeKind::Directory,
+                directory_version: Some(1),
                 parent: Uuid::nil(),
                 name: Vec::new(),
                 attributes: None,
@@ -3179,11 +3232,17 @@ mod tests {
             records.push((*id, node.clone(), None));
         }
         for receipt in receipts {
-            assert!(receipt.parent.is_nil(), "fixture helper expects root files");
+            assert!(
+                records
+                    .iter()
+                    .any(|(id, node, _)| *id == receipt.parent && node.kind == NodeKind::Directory),
+                "fixture parent must be a declared directory"
+            );
             records.push((
                 receipt.file_id,
                 Node {
                     kind: NodeKind::File,
+                    directory_version: None,
                     parent: receipt.parent,
                     name: receipt.name.clone(),
                     attributes: None,
@@ -3393,7 +3452,7 @@ mod tests {
         );
         assert!(matches!(
             catalog
-                .legacy_copy_record_for_test(
+                .unplaced_copy_record_for_test(
                     old_receipt.namespace,
                     old_receipt.file_id,
                     old_receipt.copy_id
@@ -3402,7 +3461,7 @@ mod tests {
             Err(CatalogError::Incomplete)
         ));
         let current = catalog
-            .legacy_copy_record_for_test(receipt.namespace, receipt.file_id, receipt.copy_id)
+            .unplaced_copy_record_for_test(receipt.namespace, receipt.file_id, receipt.copy_id)
             .await
             .unwrap()
             .unwrap();
@@ -3566,7 +3625,7 @@ mod tests {
         ));
         assert!(matches!(
             catalog
-                .legacy_copy_record_for_test(receipt.namespace, receipt.file_id, receipt.copy_id)
+                .unplaced_copy_record_for_test(receipt.namespace, receipt.file_id, receipt.copy_id)
                 .await,
             Err(CatalogError::Incomplete)
         ));
@@ -3639,7 +3698,7 @@ mod tests {
         assert_eq!(copies.items[0].copy_id, receipt.copy_id);
         assert!(
             catalog
-                .legacy_copy_record_for_test(receipt.namespace, receipt.file_id, receipt.copy_id)
+                .unplaced_copy_record_for_test(receipt.namespace, receipt.file_id, receipt.copy_id)
                 .await
                 .unwrap()
                 .is_some()
@@ -3875,6 +3934,7 @@ mod tests {
                 Uuid::nil(),
                 Node {
                     kind: NodeKind::Directory,
+                    directory_version: Some(1),
                     parent: Uuid::nil(),
                     name: Vec::new(),
                     attributes: Some(root_attrs.clone()),
@@ -3885,6 +3945,7 @@ mod tests {
                 directory,
                 Node {
                     kind: NodeKind::Directory,
+                    directory_version: Some(1),
                     parent: Uuid::nil(),
                     name: b"folder".to_vec(),
                     attributes: Some(dir_attrs.clone()),
@@ -3895,6 +3956,7 @@ mod tests {
                 receipt.file_id,
                 Node {
                     kind: NodeKind::File,
+                    directory_version: None,
                     parent: directory,
                     name: b"alias".to_vec(),
                     attributes: Some(changed_attrs.clone()),
@@ -3953,7 +4015,7 @@ mod tests {
         let id = Uuid::new_v4();
         let copy = PhysicalCopy {
             version: 1,
-            request_epoch: 1,
+            origin: CopyOrigin::FileRequest { request_epoch: 1 },
             volume_id: Uuid::new_v4(),
             volume_generation: 7,
             volume_scan_id: Uuid::new_v4(),
@@ -3993,6 +4055,24 @@ mod tests {
         }
         let tr = reopened.db.create_trx().unwrap();
         assert!(tr.get(&key, false).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；仅验证独立命名空间清理"]
+    async fn isolated_fdb_namespace_cleanup() {
+        let cluster_file = std::env::var("FDB_TEST_CLUSTER").expect("FDB_TEST_CLUSTER");
+        let _network = unsafe { foundationdb::boot() };
+        let catalog = ManagedCatalog::open(Some(&cluster_file)).unwrap();
+        cleanup::tests::exercise(&catalog, &cluster_file).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；仅测试请求登记、取消和分页"]
+    async fn isolated_fdb_request_cancellation_and_paging() {
+        let cluster_file = std::env::var("FDB_TEST_CLUSTER").expect("FDB_TEST_CLUSTER");
+        let _network = unsafe { foundationdb::boot() };
+        let catalog = ManagedCatalog::open(Some(&cluster_file)).unwrap();
+        requests::tests::exercise(&catalog, &cluster_file).await;
     }
 
     #[tokio::test]
@@ -4126,6 +4206,7 @@ mod tests {
             catalog.node(namespace, a.file_id).await.unwrap(),
             Some(Node {
                 kind: NodeKind::File,
+                directory_version: None,
                 parent: Uuid::nil(),
                 name: b"a".to_vec(),
                 attributes: None,
@@ -4167,11 +4248,11 @@ mod tests {
         );
         assert_eq!(
             catalog
-                .legacy_copy_record_for_test(namespace, a.file_id, a.copy_id)
+                .unplaced_copy_record_for_test(namespace, a.file_id, a.copy_id)
                 .await
                 .unwrap(),
             Some(PhysicalCopy {
-                request_epoch: 1,
+                origin: CopyOrigin::FileRequest { request_epoch: 1 },
                 version: 1,
                 volume_id,
                 volume_generation: 1,
@@ -4323,7 +4404,7 @@ mod tests {
         ));
         assert!(matches!(
             catalog
-                .legacy_copy_record_for_test(namespace, a.file_id, a.copy_id)
+                .unplaced_copy_record_for_test(namespace, a.file_id, a.copy_id)
                 .await,
             Err(CatalogError::Incomplete)
         ));
@@ -4369,7 +4450,7 @@ mod tests {
         assert_eq!(current.items[0].file_id, replacement.file_id);
         assert_eq!(
             catalog
-                .legacy_copy_record_for_test(
+                .unplaced_copy_record_for_test(
                     replacement_ns,
                     replacement.file_id,
                     replacement.copy_id
@@ -4415,13 +4496,13 @@ mod tests {
         );
         assert!(matches!(
             catalog
-                .legacy_copy_record_for_test(namespace, a.file_id, a.copy_id)
+                .unplaced_copy_record_for_test(namespace, a.file_id, a.copy_id)
                 .await,
             Err(CatalogError::Incomplete)
         ));
         assert!(
             catalog
-                .legacy_copy_record_for_test(
+                .unplaced_copy_record_for_test(
                     replacement_ns,
                     replacement.file_id,
                     replacement.copy_id
@@ -4534,6 +4615,7 @@ mod tests {
                 imported_dir,
                 Node {
                     kind: NodeKind::Directory,
+                    directory_version: Some(1),
                     parent: Uuid::nil(),
                     name: b"sub".to_vec(),
                     attributes: None,
@@ -4556,7 +4638,7 @@ mod tests {
         );
         assert!(matches!(
             catalog
-                .legacy_copy_record_for_test(import_ns, imported.file_id, imported.copy_id)
+                .unplaced_copy_record_for_test(import_ns, imported.file_id, imported.copy_id)
                 .await,
             Err(CatalogError::Incomplete)
         ));

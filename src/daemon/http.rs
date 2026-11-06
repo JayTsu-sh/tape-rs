@@ -1640,6 +1640,104 @@ mod tests {
     }
 
     #[test]
+    fn native_barrier_requires_an_applied_empty_frozen_catalog() {
+        let mut ctx = test_context();
+        Arc::get_mut(&mut ctx).unwrap().client_addrs = HashMap::from([
+            (1, "127.0.0.1:8001/libraries/L".into()),
+            (2, "127.0.0.1:8002/libraries/L".into()),
+            (3, "127.0.0.1:8003".into()),
+        ]);
+        let frozen = NodeStatus {
+            id: 1,
+            role: "Follower".into(),
+            term: 7,
+            leader: 2,
+            catalog_quiesce_index: Some(89),
+            catalog_frozen_index: Some(90),
+            applied_index: 92,
+            ..Default::default()
+        };
+        let call = |challenge: &str| {
+            let mut response = Response::new(Body::empty());
+            assert!(
+                management::handle(
+                    "GET",
+                    &format!("/admin/catalog/barrier/{challenge}"),
+                    None,
+                    &mut std::io::Cursor::new(&[]),
+                    &mut response,
+                    &ctx
+                )
+                .unwrap()
+            );
+            response
+        };
+        *ctx.status.lock().unwrap() = frozen.clone();
+        let challenge = uuid::Uuid::new_v4();
+        let response = call(&challenge.to_string());
+        assert_eq!(response.status(), StatusCode::OK);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let bytes = runtime
+            .block_on(axum::body::to_bytes(response.into_body(), 16_384))
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["node_id"], 1);
+        assert_eq!(value["challenge"], challenge.to_string());
+        assert_eq!(value["catalog_empty"], true);
+        assert_eq!(
+            value["members"],
+            json!({"1":"127.0.0.1:8001","2":"127.0.0.1:8002","3":"127.0.0.1:8003"})
+        );
+        #[cfg(feature = "fdb")]
+        {
+            let replies: Vec<_> = (1..=3)
+                .map(|id| {
+                    let mut reply = value.clone();
+                    reply["node_id"] = json!(id);
+                    reply["role"] = json!(if id == 2 { "Leader" } else { "Follower" });
+                    reply
+                })
+                .collect();
+            crate::managed_catalog::verify_native_barriers("L", challenge, &replies).unwrap();
+        }
+        assert_eq!(call("invalid").status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            call(&uuid::Uuid::nil().to_string()).status(),
+            StatusCode::BAD_REQUEST
+        );
+        for variant in 0..7 {
+            let mut status = frozen.clone();
+            match variant {
+                0 => status.catalog_pending = true,
+                1 => status.shutting_down = true,
+                2 => status.applied_index = 89,
+                3 => status.catalog_frozen_index = None,
+                4 => status.catalog_quiesce_index = Some(91),
+                5 => {
+                    status.executor = Some(super::super::state::Executor {
+                        node: 1,
+                        round: 80,
+                        term: 7,
+                        fenced: true,
+                    })
+                }
+                _ => {
+                    status.tapes.insert("EXISTING".into(), Default::default());
+                }
+            }
+            *ctx.status.lock().unwrap() = status;
+            assert_eq!(
+                call(&challenge.to_string()).status(),
+                StatusCode::CONFLICT,
+                "variant {variant}"
+            );
+        }
+    }
+
+    #[test]
     fn catalog_audit_without_local_directory_fails_closed() {
         let ctx = test_context();
         let mut response = Response::new(Body::empty());

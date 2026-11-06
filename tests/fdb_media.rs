@@ -51,6 +51,7 @@ use uuid::Uuid;
 
 struct FdbOwnerSimProvider {
     library: SimLibrary,
+    serial: String,
     node: u8,
     enabled: Arc<AtomicBool>,
 }
@@ -112,7 +113,7 @@ impl DeviceProvider for FdbOwnerSimProvider {
             },
             ManagedDevice {
                 name: "模拟换带器".into(),
-                serial: "SIMLIB0000000001".into(),
+                serial: self.serial.clone(),
                 kind: DeviceKind::Changer,
                 dev: Box::new(self.library.changer_as(self.node as u32)),
             },
@@ -158,9 +159,11 @@ async fn run_fdb_owner_raft_failover(
     let (legacy_events, legacy_event_rx) = mpsc::channel();
     let legacy = std::thread::spawn({
         let library = library.clone();
+        let serial = serial.to_owned();
         move || {
             executor::run(
                 Box::new(FdbOwnerSimProvider {
+                    serial: serial.to_owned(),
                     library,
                     node: 79,
                     enabled: Arc::new(AtomicBool::new(true)),
@@ -275,6 +278,7 @@ async fn run_fdb_owner_raft_failover(
         let (events, event_rx) = mpsc::channel();
         files.set_executor(exec.clone());
         let provider = Box::new(FdbOwnerSimProvider {
+            serial: serial.to_owned(),
             library: library.clone(),
             node: id as u8,
             enabled,
@@ -492,6 +496,10 @@ struct ReadHttpServer {
 impl ReadHttpServer {
     fn start(router: axum::Router) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        Self::start_on(listener, router)
+    }
+
+    fn start_on(listener: std::net::TcpListener, router: axum::Router) -> Self {
         let address = listener.local_addr().unwrap().to_string();
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
@@ -515,7 +523,13 @@ impl ReadHttpServer {
                                     hyper_util::service::TowerToHyperService::new(router),
                                 )
                                 .await
-                                .unwrap();
+                                .unwrap_or_else(|error| {
+                                    // SSE consumers may intentionally disconnect mid-response.
+                                    assert!(
+                                        error.is_incomplete_message() || error.is_closed(),
+                                        "{error}"
+                                    );
+                                });
                         });
                     }
                 }
@@ -529,6 +543,15 @@ impl ReadHttpServer {
     }
 
     fn request(&self, method: &str, path: &str, extra: Option<&str>) -> (u16, String, Vec<u8>) {
+        self.request_body(method, path, extra, &[])
+    }
+    fn request_body(
+        &self,
+        method: &str,
+        path: &str,
+        extra: Option<&str>,
+        body: &[u8],
+    ) -> (u16, String, Vec<u8>) {
         let mut stream = std::net::TcpStream::connect(&self.address).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(15)))
@@ -539,6 +562,7 @@ impl ReadHttpServer {
             extra.unwrap_or("")
         )
         .unwrap();
+        stream.write_all(body).unwrap();
         let mut bytes = Vec::new();
         stream.read_to_end(&mut bytes).unwrap();
         let split = bytes
@@ -669,7 +693,7 @@ fn run_fdb_http_loaded_reads(
                     None
                 )
                 .0,
-            404
+            400
         );
         assert_eq!(
             server
@@ -860,7 +884,12 @@ async fn run_fdb_owner_loaded_reads(
     )
     .unwrap();
     let barcode = catalog
-        .resolve_active_read_source_for_owner(serial, b"/actual", route, 11)
+        .resolve_active_read_source_for_owner(
+            serial,
+            format!("/{pool}/actual").as_bytes(),
+            route,
+            11,
+        )
         .await
         .unwrap()
         .unwrap()
@@ -891,6 +920,7 @@ async fn run_fdb_owner_loaded_reads(
             tape_rs::daemon::executor::run_fdb_owner(
                 Box::new(ScheduleProvider {
                     base: FdbOwnerSimProvider {
+                        serial: serial.to_owned(),
                         library,
                         node: 71,
                         enabled: Arc::new(AtomicBool::new(true)),
@@ -942,7 +972,7 @@ async fn run_fdb_owner_loaded_reads(
     );
     let (read_tx, read_rx) = channel();
     tx.send(ExecRequest::ReadTo {
-        path: "/actual".into(),
+        path: format!("/{pool}/actual"),
         file: files.read_spool().unwrap(),
         reply: read_tx,
     })
@@ -973,7 +1003,7 @@ async fn run_fdb_owner_loaded_reads(
         pool: Uuid::new_v4().to_string(),
         lane: 0,
         request: Box::new(ExecRequest::Read {
-            path: "/actual".into(),
+            path: format!("/{pool}/actual"),
             reply: wrong_pool_tx,
         }),
     })
@@ -991,7 +1021,7 @@ async fn run_fdb_owner_loaded_reads(
     let read = || {
         let (reply, received) = channel();
         tx.send(ExecRequest::Read {
-            path: "/actual".into(),
+            path: format!("/{pool}/actual"),
             reply,
         })
         .unwrap();
@@ -1037,7 +1067,7 @@ async fn run_fdb_owner_loaded_reads(
         nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock).unwrap();
     let (busy_tx, busy_rx) = channel();
     tx.send(ExecRequest::ReadTo {
-        path: "/actual".into(),
+        path: format!("/{pool}/actual"),
         file: files.read_spool().unwrap(),
         reply: busy_tx,
     })
@@ -1052,7 +1082,7 @@ async fn run_fdb_owner_loaded_reads(
         pool: pool.to_string(),
         lane: 0,
         request: Box::new(ExecRequest::ReadTo {
-            path: "/actual".into(),
+            path: format!("/{pool}/actual"),
             file: files.read_spool().unwrap(),
             reply: read_tx,
         }),
@@ -1067,7 +1097,7 @@ async fn run_fdb_owner_loaded_reads(
     assert_eq!(bytes, expected);
     let (missing_tx, missing_rx) = channel();
     tx.send(ExecRequest::Read {
-        path: "/missing".into(),
+        path: format!("/{pool}/missing"),
         reply: missing_tx,
     })
     .unwrap();
@@ -1077,7 +1107,7 @@ async fn run_fdb_owner_loaded_reads(
     ));
     let (invalid_tx, invalid_rx) = channel();
     tx.send(ExecRequest::Read {
-        path: "/".into(),
+        path: format!("/{pool}"),
         reply: invalid_tx,
     })
     .unwrap();
@@ -1087,7 +1117,7 @@ async fn run_fdb_owner_loaded_reads(
     ));
     let (read_tx, read_rx) = channel();
     tx.send(ExecRequest::Read {
-        path: "/actual".into(),
+        path: format!("/{pool}/actual"),
         reply: read_tx,
     })
     .unwrap();
@@ -1108,7 +1138,7 @@ async fn run_fdb_owner_loaded_reads(
             pool: target_pool.clone(),
             lane: 0,
             request: Box::new(ExecRequest::ReadTo {
-                path: "/actual".into(),
+                path: format!("/{pool}/actual"),
                 file: files.read_spool().unwrap(),
                 reply: read_tx,
             }),
@@ -1127,7 +1157,7 @@ async fn run_fdb_owner_loaded_reads(
             pool: target_pool.clone(),
             lane: 0,
             request: Box::new(ExecRequest::Read {
-                path: "/actual".into(),
+                path: format!("/{pool}/actual"),
                 reply: read_tx,
             }),
         })
@@ -1145,7 +1175,7 @@ async fn run_fdb_owner_loaded_reads(
         pool: pool.to_string(),
         lane: 0,
         request: Box::new(ExecRequest::Read {
-            path: "/actual".into(),
+            path: format!("/{pool}/actual"),
             reply: read_tx,
         }),
     })
@@ -1222,7 +1252,7 @@ async fn run_fdb_owner_loaded_reads(
     }
     let (read_tx, read_rx) = channel();
     tx.send(ExecRequest::ReadTo {
-        path: "/actual".into(),
+        path: format!("/{pool}/actual"),
         file: files.read_spool().unwrap(),
         reply: read_tx,
     })
@@ -1404,6 +1434,7 @@ async fn simulated_media_commit() {
             .create_pool(
                 namespace,
                 &PoolRecord {
+                    created_at_millis: 1_793_405_000_123,
                     library_serial: serial.clone(),
                     id: pool,
                     name: "sim-media".into(),
@@ -1650,6 +1681,7 @@ async fn simulated_media_commit() {
         std::thread::spawn(move || {
             tape_rs::daemon::executor::run_fdb_owner(
                 Box::new(FdbOwnerSimProvider {
+                    serial: serial.to_owned(),
                     library,
                     node: 71,
                     enabled: Arc::new(AtomicBool::new(true)),
@@ -1782,13 +1814,13 @@ async fn simulated_media_commit() {
     ));
     let unguarded = LtfsVolume::mount(&drive).unwrap();
     assert!(
-        establish_active_media_owner(&catalog, unguarded, &serial, key, &permission)
+        establish_active_media_owner(&catalog, unguarded, &serial, key, &permission, 4 << 20)
             .await
             .is_err()
     );
     let guarded_drive = GuardedTransport::new(Box::new(library.drive(0)), permission.clone(), 11);
     let volume = LtfsVolume::mount(&guarded_drive).unwrap();
-    let ready = establish_active_media_owner(&catalog, volume, &serial, key, &permission)
+    let ready = establish_active_media_owner(&catalog, volume, &serial, key, &permission, 4 << 20)
         .await
         .unwrap();
     assert_eq!(ready.index(), baseline);
@@ -1806,8 +1838,17 @@ async fn simulated_media_commit() {
     file.sync_all().unwrap();
     drop(file);
     let intent = ActiveFileIntent {
+        barcode_constraint: None,
         namespace,
-        parent: Uuid::nil(),
+        parent: match catalog
+            .resolve_active_path(&serial, format!("/{pool}").as_bytes())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            ResolvedPath::Directory { id, .. } => id,
+            _ => panic!("pool root must be a directory"),
+        },
         parent_path: b"/".to_vec(),
         name: b"actual".to_vec(),
         file_id: Uuid::new_v4(),
@@ -1832,6 +1873,7 @@ async fn simulated_media_commit() {
             intent: intent.clone(),
             spool: data_path.clone(),
         }],
+        64 << 20,
     )
     .await
     .unwrap();
@@ -1858,7 +1900,7 @@ async fn simulated_media_commit() {
         .await
         .unwrap();
     assert!(matches!(
-        catalog.resolve_active_path(&serial, b"/actual").await.unwrap(),
+        catalog.resolve_active_path(&serial, format!("/{pool}/actual").as_bytes()).await.unwrap(),
         Some(ResolvedPath::File { copy, .. }) if copy.ltfs_file_uid == expected_uid
     ));
     assert!(
@@ -1889,7 +1931,12 @@ async fn simulated_media_commit() {
     let committed_digest: [u8; 32] = Sha256::digest(&committed_xml).into();
     assert_eq!(committed_digest, current.sha256);
     let source_lookup = catalog
-        .resolve_active_read_source_for_owner(&serial, b"/actual", active, 11)
+        .resolve_active_read_source_for_owner(
+            &serial,
+            format!("/{pool}/actual").as_bytes(),
+            active,
+            11,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -1914,7 +1961,11 @@ async fn simulated_media_commit() {
         VolumeExtentCache::build(&committed_xml[..], &current_cache, expected_current).unwrap();
     }
     let read = catalog
-        .resolve_active_read(&serial, b"/actual", &current_cache)
+        .resolve_active_read(
+            &serial,
+            format!("/{pool}/actual").as_bytes(),
+            &current_cache,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -1938,13 +1989,19 @@ async fn simulated_media_commit() {
     )
     .unwrap();
     let media_read = catalog
-        .resolve_active_read(&serial, b"/actual", &media_cache)
+        .resolve_active_read(&serial, format!("/{pool}/actual").as_bytes(), &media_cache)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(media_read, read);
     let owner_read = catalog
-        .resolve_active_read_for_owner(&serial, b"/actual", &media_cache, active, 11)
+        .resolve_active_read_for_owner(
+            &serial,
+            format!("/{pool}/actual").as_bytes(),
+            &media_cache,
+            active,
+            11,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -1962,9 +2019,20 @@ async fn simulated_media_commit() {
         permission: &permission,
         storage: Default::default(),
     };
+    // Pool scope is mandatory even for absent files. No namespace-root fallback.
     assert!(
         reader
             .read(b"/missing", &media_cache, &read_spool)
+            .await
+            .is_err()
+    );
+    assert!(
+        reader
+            .read(
+                format!("/{pool}/missing").as_bytes(),
+                &media_cache,
+                &read_spool
+            )
             .await
             .unwrap()
             .is_none()
@@ -1983,7 +2051,13 @@ async fn simulated_media_commit() {
         .filter(|op| **op == tape_rs::scsi::cdb::opcode::READ_6)
         .count();
     assert!(matches!(
-        denied.read(b"/actual", &media_cache, &read_spool).await,
+        denied
+            .read(
+                format!("/{pool}/actual").as_bytes(),
+                &media_cache,
+                &read_spool
+            )
+            .await,
         Err(tape_rs::error::TapeError::LocalCapacity { .. })
     ));
     let reads_after = library
@@ -1998,7 +2072,11 @@ async fn simulated_media_commit() {
     );
     assert_eq!(fs::read_dir(&read_spool).unwrap().count(), 0);
     let mut verified_read = reader
-        .read(b"/actual", &media_cache, &read_spool)
+        .read(
+            format!("/{pool}/actual").as_bytes(),
+            &media_cache,
+            &read_spool,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -2011,14 +2089,22 @@ async fn simulated_media_commit() {
     let automatic_cache = root.join("automatic-extents");
     assert!(
         reader
-            .read_with_cache(b"/missing", &automatic_cache, &read_spool)
+            .read_with_cache(
+                format!("/{pool}/missing").as_bytes(),
+                &automatic_cache,
+                &read_spool
+            )
             .await
             .unwrap()
             .is_none()
     );
     assert!(!automatic_cache.exists());
     let mut cold_read = reader
-        .read_with_cache(b"/actual", &automatic_cache, &read_spool)
+        .read_with_cache(
+            format!("/{pool}/actual").as_bytes(),
+            &automatic_cache,
+            &read_spool,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -2038,7 +2124,11 @@ async fn simulated_media_commit() {
     let cached_inode = fs::metadata(cached_path).unwrap().ino();
     assert!(
         reader
-            .read_with_cache(b"/actual", &automatic_cache, &read_spool)
+            .read_with_cache(
+                format!("/{pool}/actual").as_bytes(),
+                &automatic_cache,
+                &read_spool
+            )
             .await
             .unwrap()
             .is_some()
@@ -2068,7 +2158,11 @@ async fn simulated_media_commit() {
     fs::write(cached_path, b"invalid cached SQLite").unwrap();
     assert!(
         reader
-            .read_with_cache(b"/actual", &automatic_cache, &read_spool)
+            .read_with_cache(
+                format!("/{pool}/actual").as_bytes(),
+                &automatic_cache,
+                &read_spool
+            )
             .await
             .is_err()
     );
@@ -2076,7 +2170,11 @@ async fn simulated_media_commit() {
     fs::remove_file(cached_path).unwrap();
     assert!(
         reader
-            .read_with_cache(b"/actual", &automatic_cache, &read_spool)
+            .read_with_cache(
+                format!("/{pool}/actual").as_bytes(),
+                &automatic_cache,
+                &read_spool
+            )
             .await
             .unwrap()
             .is_some()
@@ -2086,7 +2184,11 @@ async fn simulated_media_commit() {
             device: &drive,
             ..reader
         }
-        .read(b"/actual", &media_cache, &read_spool)
+        .read(
+            format!("/{pool}/actual").as_bytes(),
+            &media_cache,
+            &read_spool
+        )
         .await
         .is_err()
     );
@@ -2099,7 +2201,11 @@ async fn simulated_media_commit() {
         record[0] ^= 1;
     }));
     let digest_error = reader
-        .read(b"/actual", &media_cache, &read_spool)
+        .read(
+            format!("/{pool}/actual").as_bytes(),
+            &media_cache,
+            &read_spool,
+        )
         .await
         .err()
         .unwrap();
@@ -2135,14 +2241,22 @@ async fn simulated_media_commit() {
             permission: &revoked_permission,
             ..reader
         }
-        .read(b"/actual", &media_cache, &read_spool)
+        .read(
+            format!("/{pool}/actual").as_bytes(),
+            &media_cache,
+            &read_spool
+        )
         .await
         .is_err()
     );
     fence(&library.drive_as(0, 72), ReservationKey::new(72, 11)).unwrap();
     assert!(
         reader
-            .read(b"/actual", &media_cache, &read_spool)
+            .read(
+                format!("/{pool}/actual").as_bytes(),
+                &media_cache,
+                &read_spool
+            )
             .await
             .is_err()
     );
@@ -2150,7 +2264,13 @@ async fn simulated_media_commit() {
     assert_eq!(fs::read_dir(&read_spool).unwrap().count(), 0);
     assert!(matches!(
         catalog
-            .resolve_active_read_for_owner(&serial, b"/actual", &media_cache, active, 10)
+            .resolve_active_read_for_owner(
+                &serial,
+                format!("/{pool}/actual").as_bytes(),
+                &media_cache,
+                active,
+                10
+            )
             .await,
         Err(CatalogError::OwnerFenced)
     ));
@@ -2158,7 +2278,7 @@ async fn simulated_media_commit() {
         catalog
             .resolve_active_read_for_owner(
                 &serial,
-                b"/actual",
+                format!("/{pool}/actual").as_bytes(),
                 &media_cache,
                 ActiveLibraryRoute {
                     frozen_index: active.frozen_index + 1,
@@ -2201,7 +2321,7 @@ async fn simulated_media_commit() {
             spool: data_path.clone(),
         })
         .collect();
-    let padded = commit_active_media_batch(&catalog, volume, Uuid::new_v4(), &padding)
+    let padded = commit_active_media_batch(&catalog, volume, Uuid::new_v4(), &padding, 64 << 20)
         .await
         .unwrap();
     current = padded.current_index();
@@ -2331,7 +2451,7 @@ async fn simulated_media_commit() {
     assert!(!recovered_status.published);
     assert!(matches!(
         catalog
-            .resolve_active_path(&serial, b"/pad-255")
+            .resolve_active_path(&serial, format!("/{pool}/pad-255").as_bytes())
             .await
             .unwrap(),
         Some(ResolvedPath::File { .. })
@@ -2434,7 +2554,7 @@ async fn simulated_media_commit() {
     );
     assert!(matches!(
         catalog
-            .resolve_active_path(&serial, b"/sealed-recovery")
+            .resolve_active_path(&serial, format!("/{pool}/sealed-recovery").as_bytes())
             .await
             .unwrap(),
         Some(ResolvedPath::File { .. })
@@ -2457,7 +2577,11 @@ async fn simulated_media_commit() {
     .unwrap();
     assert_eq!(
         catalog
-            .resolve_active_read(&serial, b"/sealed-recovery", &incremental_cache)
+            .resolve_active_read(
+                &serial,
+                format!("/{pool}/sealed-recovery").as_bytes(),
+                &incremental_cache
+            )
             .await
             .unwrap()
             .unwrap()
@@ -2503,7 +2627,11 @@ async fn simulated_media_commit() {
         Err(CatalogError::OwnerFenced)
     ));
     let mut delta_read = reader
-        .read_with_cache(b"/sealed-recovery", &automatic_cache, &read_spool)
+        .read_with_cache(
+            format!("/{pool}/sealed-recovery").as_bytes(),
+            &automatic_cache,
+            &read_spool,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -2527,7 +2655,11 @@ async fn simulated_media_commit() {
             .into_bytes();
     }));
     let error = reader
-        .read_with_cache(b"/sealed-recovery", &automatic_cache, &read_spool)
+        .read_with_cache(
+            format!("/{pool}/sealed-recovery").as_bytes(),
+            &automatic_cache,
+            &read_spool,
+        )
         .await
         .err()
         .expect("前驱变化不得返回内容句柄");
@@ -2592,14 +2724,22 @@ async fn simulated_media_commit() {
     let unknown_head_cache = root.join("unknown-head-cache");
     assert!(
         reader
-            .read_with_cache(b"/actual", &unknown_head_cache, &read_spool)
+            .read_with_cache(
+                format!("/{pool}/actual").as_bytes(),
+                &unknown_head_cache,
+                &read_spool
+            )
             .await
             .is_err()
     );
     assert!(!unknown_head_cache.exists());
     assert!(
         reader
-            .read(b"/actual", &media_cache, &read_spool)
+            .read(
+                format!("/{pool}/actual").as_bytes(),
+                &media_cache,
+                &read_spool
+            )
             .await
             .is_err(),
         "介质已有 FDB 未观察 S4 时不能返回文件内容"
@@ -2629,7 +2769,11 @@ async fn simulated_media_commit() {
     drop(reconciled);
     assert_eq!(
         catalog
-            .resolve_active_read(&serial, b"/sealed-recovery", &historical_cache)
+            .resolve_active_read(
+                &serial,
+                format!("/{pool}/sealed-recovery").as_bytes(),
+                &historical_cache
+            )
             .await
             .unwrap()
             .unwrap()
@@ -2638,13 +2782,23 @@ async fn simulated_media_commit() {
         bytes.len() as u64
     );
     let historical_read = catalog
-        .resolve_active_read_for_owner(&serial, b"/sealed-recovery", &historical_cache, active, 11)
+        .resolve_active_read_for_owner(
+            &serial,
+            format!("/{pool}/sealed-recovery").as_bytes(),
+            &historical_cache,
+            active,
+            11,
+        )
         .await
         .unwrap()
         .unwrap();
     assert_eq!(historical_read.source, historical_source);
     let mut historical_content = reader
-        .read(b"/sealed-recovery", &historical_cache, &read_spool)
+        .read(
+            format!("/{pool}/sealed-recovery").as_bytes(),
+            &historical_cache,
+            &read_spool,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -2655,14 +2809,23 @@ async fn simulated_media_commit() {
         .unwrap();
     assert_eq!(historical_bytes, bytes);
     let historical_source_lookup = catalog
-        .resolve_active_read_source_for_owner(&serial, b"/sealed-recovery", active, 11)
+        .resolve_active_read_source_for_owner(
+            &serial,
+            format!("/{pool}/sealed-recovery").as_bytes(),
+            active,
+            11,
+        )
         .await
         .unwrap()
         .unwrap();
     assert_eq!(historical_source_lookup.source, historical_source);
     assert!(historical_source.incremental);
     let mut cold_history = reader
-        .read_with_cache(b"/sealed-recovery", &automatic_cache, &read_spool)
+        .read_with_cache(
+            format!("/{pool}/sealed-recovery").as_bytes(),
+            &automatic_cache,
+            &read_spool,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -2686,7 +2849,7 @@ async fn simulated_media_commit() {
     );
     assert!(matches!(
         catalog
-            .resolve_active_path(&serial, b"/orchestrated")
+            .resolve_active_path(&serial, format!("/{pool}/orchestrated").as_bytes())
             .await
             .unwrap(),
         Some(ResolvedPath::File { .. })
@@ -2713,6 +2876,7 @@ async fn simulated_media_commit() {
             intent: failed_intent.clone(),
             spool: data_path,
         }],
+        64 << 20,
     )
     .await;
     assert!(failure.is_err());
@@ -2741,9 +2905,16 @@ async fn simulated_media_commit() {
         current
     );
     assert!(
-        establish_active_media_owner(&catalog, recovered, &serial, takeover_key, &permission)
-            .await
-            .is_err()
+        establish_active_media_owner(
+            &catalog,
+            recovered,
+            &serial,
+            takeover_key,
+            &permission,
+            4 << 20
+        )
+        .await
+        .is_err()
     );
     assert_eq!(
         catalog.claim_active_owner_epoch(&serial, 11).await.unwrap(),
@@ -2756,9 +2927,16 @@ async fn simulated_media_commit() {
     ));
     let unguarded = LtfsVolume::mount(&drive).unwrap();
     assert!(
-        establish_active_media_owner(&catalog, unguarded, &serial, takeover_key, &permission)
-            .await
-            .is_err()
+        establish_active_media_owner(
+            &catalog,
+            unguarded,
+            &serial,
+            takeover_key,
+            &permission,
+            4 << 20
+        )
+        .await
+        .is_err()
     );
     assert_eq!(
         catalog.claim_active_owner_epoch(&serial, 11).await.unwrap(),
@@ -2774,9 +2952,16 @@ async fn simulated_media_commit() {
     ));
     let wrong_permission = LtfsVolume::mount(&guarded_drive_12).unwrap();
     assert!(
-        establish_active_media_owner(&catalog, wrong_permission, &serial, takeover_key, &detached,)
-            .await
-            .is_err()
+        establish_active_media_owner(
+            &catalog,
+            wrong_permission,
+            &serial,
+            takeover_key,
+            &detached,
+            4 << 20
+        )
+        .await
+        .is_err()
     );
     assert_eq!(
         catalog.claim_active_owner_epoch(&serial, 11).await.unwrap(),
@@ -2790,6 +2975,7 @@ async fn simulated_media_commit() {
             &serial,
             ReservationKey::new(99, 12),
             &permission,
+            4 << 20
         )
         .await
         .is_err()
@@ -2799,10 +2985,16 @@ async fn simulated_media_commit() {
         ActiveOwnerOutcome::AlreadyCurrent
     );
     let recovered = LtfsVolume::mount(&guarded_drive_12).unwrap();
-    let recovered =
-        establish_active_media_owner(&catalog, recovered, &serial, takeover_key, &permission)
-            .await
-            .unwrap();
+    let recovered = establish_active_media_owner(
+        &catalog,
+        recovered,
+        &serial,
+        takeover_key,
+        &permission,
+        4 << 20,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         catalog
             .cancel_active_file_reservation(&failed_intent)
@@ -2844,6 +3036,7 @@ async fn simulated_media_commit() {
                 intent: persistent_intent.clone(),
                 spool: root.join("upload.bin"),
             }],
+            64 << 20,
         )
         .await
         .is_err()
@@ -2867,9 +3060,10 @@ async fn simulated_media_commit() {
         volume.recovery().dp.tail,
         TailKind::UnindexedData | TailKind::TruncatedIndex
     ));
-    let recovered = establish_active_media_owner(&catalog, volume, &serial, final_key, &permission)
-        .await
-        .unwrap();
+    let recovered =
+        establish_active_media_owner(&catalog, volume, &serial, final_key, &permission, 4 << 20)
+            .await
+            .unwrap();
     assert_eq!(recovered.index().generation, current.generation + 1);
     assert_eq!(
         catalog
@@ -2894,7 +3088,7 @@ async fn simulated_media_commit() {
     );
     assert!(
         catalog
-            .resolve_active_path(&serial, b"/persistent-tail")
+            .resolve_active_path(&serial, format!("/{pool}/persistent-tail").as_bytes())
             .await
             .unwrap()
             .is_none()
@@ -2988,7 +3182,7 @@ async fn simulated_media_commit() {
     );
     assert!(
         catalog
-            .resolve_active_path(&serial, b"/upgraded-tail")
+            .resolve_active_path(&serial, format!("/{pool}/upgraded-tail").as_bytes())
             .await
             .unwrap()
             .is_none()
@@ -3178,7 +3372,7 @@ async fn simulated_media_commit() {
         .unwrap();
     assert!(matches!(
         catalog
-            .resolve_active_path(&serial, b"/full-recovery")
+            .resolve_active_path(&serial, format!("/{pool}/full-recovery").as_bytes())
             .await
             .unwrap(),
         Some(ResolvedPath::File { .. })
@@ -3269,6 +3463,7 @@ async fn simulated_media_commit() {
         move || {
             tape_rs::daemon::executor::run_fdb_owner(
                 Box::new(FdbOwnerSimProvider {
+                    serial: serial.to_owned(),
                     library,
                     node: 75,
                     enabled: Arc::new(AtomicBool::new(true)),

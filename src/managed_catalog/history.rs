@@ -90,7 +90,12 @@ pub(super) async fn compact_page(
                 .as_deref()
                 .ok_or(CatalogError::Corrupt("当前副本缺失，禁止回收历史"))?,
         )?;
-        if primary.version != head.version || primary.request_epoch > window.accepting {
+        if primary.version != head.version
+            || primary
+                .origin
+                .receipt_epoch()
+                .is_some_and(|epoch| epoch > window.accepting)
+        {
             return Err(CatalogError::Corrupt("当前副本与 head 版本不一致"));
         }
         heads.insert(file, head);
@@ -105,24 +110,31 @@ pub(super) async fn compact_page(
             return Err(CatalogError::Corrupt("历史副本与当前 head 不一致"));
         }
         let copy = match stored {
-            StoredCopy::Reclaimed {
-                version,
-                request_epoch,
-            } => {
+            StoredCopy::Reclaimed { version, origin } => {
                 if version >= head.version || id == head.copy_id {
                     return Err(CatalogError::Corrupt("当前副本或版本被错误回收"));
                 }
-                if request_epoch > window.accepting {
+                if origin
+                    .receipt_epoch()
+                    .is_some_and(|epoch| epoch > window.accepting)
+                {
                     return Err(CatalogError::Corrupt("副本请求代次未开放"));
                 }
-                if request_epoch < window.first_retained {
+                if origin
+                    .receipt_epoch()
+                    .is_some_and(|epoch| epoch < window.first_retained)
+                {
                     forget.push(key);
                 }
                 continue;
             }
             StoredCopy::Present(copy) => copy,
         };
-        if copy.request_epoch > window.accepting {
+        if copy
+            .origin
+            .receipt_epoch()
+            .is_some_and(|epoch| epoch > window.accepting)
+        {
             return Err(CatalogError::Corrupt("副本请求代次未开放"));
         }
         if version == head.version {
@@ -168,10 +180,14 @@ pub(super) async fn compact_page(
         }
         mutations.push((
             key,
-            if copy.request_epoch < window.first_retained {
+            if copy
+                .origin
+                .receipt_epoch()
+                .is_some_and(|epoch| epoch < window.first_retained)
+            {
                 None
             } else {
-                Some(encode_reclaimed_copy(copy.version, copy.request_epoch))
+                Some(encode_reclaimed_copy(copy.version, copy.origin))
             },
             volume_key(copy.volume_id, scan.id, namespace, file, id),
         ));
@@ -202,7 +218,8 @@ pub(super) async fn compact_page(
 
 impl ManagedCatalog {
     /// Compact older-version descriptions only on retired scans in a serving
-    /// namespace. Retain tombstones until the request window fences their epoch.
+    /// namespace. File receipt tombstones follow their request window; other
+    /// origins retain their identity until namespace cleanup.
     /// Neither current-version replicas nor media contents are reclaimed.
     pub async fn compact_superseded_copies(
         &self,
@@ -242,18 +259,25 @@ pub(super) mod tests {
     #[test]
     fn reclaimed_copy_codec_and_cursor_boundaries() {
         for version in [1, u64::MAX] {
-            let encoded = encode_reclaimed_copy(version, 1);
-            assert_eq!(encoded.len(), 17);
+            let encoded =
+                encode_reclaimed_copy(version, CopyOrigin::FileRequest { request_epoch: 1 });
+            assert_eq!(encoded.len(), 19);
             assert!(
-                matches!(decode_stored_copy(&encoded).unwrap(), StoredCopy::Reclaimed { version: v, request_epoch: 1 } if v == version)
+                matches!(decode_stored_copy(&encoded).unwrap(), StoredCopy::Reclaimed { version: v, origin: CopyOrigin::FileRequest { request_epoch: 1 } } if v == version)
             );
             assert!(decode_copy(&encoded).is_err());
             for length in 0..encoded.len() {
                 assert!(decode_stored_copy(&encoded[..length]).is_err());
             }
         }
-        assert!(decode_stored_copy(&encode_reclaimed_copy(0, 1)).is_err());
-        let mut unknown = encode_reclaimed_copy(1, 1);
+        assert!(
+            decode_stored_copy(&encode_reclaimed_copy(
+                0,
+                CopyOrigin::FileRequest { request_epoch: 1 }
+            ))
+            .is_err()
+        );
+        let mut unknown = encode_reclaimed_copy(1, CopyOrigin::FileRequest { request_epoch: 1 });
         unknown[0] = 0xfe;
         assert!(decode_stored_copy(&unknown).is_err());
         unknown.push(0);
@@ -324,6 +348,142 @@ pub(super) mod tests {
             content_digest: ContentDigest::Sha256([3; 32]),
             metadata_digest: None,
         })
+    }
+
+    #[tokio::test]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；仅合成未放置记录验证导入来源回收，不证明介质提交"]
+    async fn imported_history_does_not_borrow_the_file_request_window() {
+        use sha2::Digest;
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog = ManagedCatalog::open(Some(&cluster)).unwrap();
+        let namespace = Uuid::new_v4();
+        catalog.create_namespace(namespace).await.unwrap();
+        let serial = format!("origin-history-{}", Uuid::new_v4());
+        catalog.advance_owner_epoch(&serial, 10).await.unwrap();
+        let volume = Uuid::new_v4();
+        let old_scan = VolumeScan {
+            generation: 1,
+            id: Uuid::new_v4(),
+        };
+        ready(&catalog, &serial, volume, old_scan).await;
+        let mut originals = Vec::new();
+        for file in [1, 2] {
+            let mut record = receipt(namespace, &serial, volume, old_scan, file, 1);
+            record.ltfs_file_uid = file as u64;
+            record.copy_id = derive_copy_id(&record);
+            assert_eq!(
+                test_publish(&catalog, &record).await.unwrap(),
+                PublishOutcome::Applied(1)
+            );
+            originals.push(record);
+        }
+        let imported = &originals[0];
+        let imported_key = copy_key(namespace, imported.file_id, imported.copy_id);
+        let tr = catalog.db.create_trx().unwrap();
+        let mut copy = decode_copy(&tr.get(&imported_key, false).await.unwrap().unwrap()).unwrap();
+        // This synthetic storage fixture has no managed placement or device
+        // proof. Install a valid whole-media origin shape to test only GC.
+        copy.origin = CopyOrigin::Imported;
+        copy.media = Some(MediaProvenance {
+            version: (0, 0),
+            logical_file_uid: copy.ltfs_file_uid,
+            physical_path: String::from_utf8(imported.name.clone()).unwrap(),
+            ee_alias: false,
+            native_symlink: false,
+        });
+        let bytes = encode_physical_copy(&copy).unwrap();
+        let mut reverse = 1_u64.to_be_bytes().to_vec();
+        reverse.extend_from_slice(&sha2::Sha256::digest(&bytes));
+        tr.set(&imported_key, &bytes);
+        tr.set(
+            &volume_key(
+                volume,
+                old_scan.id,
+                namespace,
+                imported.file_id,
+                imported.copy_id,
+            ),
+            &reverse,
+        );
+        tr.commit().await.unwrap();
+        let current_scan = VolumeScan {
+            generation: 2,
+            id: Uuid::new_v4(),
+        };
+        ready(&catalog, &serial, volume, current_scan).await;
+        let mut current = Vec::new();
+        for file in [1, 2] {
+            let mut record = receipt(namespace, &serial, volume, current_scan, file, 2);
+            record.ltfs_file_uid = file as u64;
+            record.copy_id = derive_copy_id(&record);
+            assert_eq!(
+                test_publish(&catalog, &record).await.unwrap(),
+                PublishOutcome::Applied(2)
+            );
+            current.push(record);
+        }
+        let first = catalog
+            .compact_superseded_copies(namespace, None, 100)
+            .await
+            .unwrap();
+        assert_eq!((first.compacted, first.forgotten), (2, 0));
+        assert_eq!(
+            raw(&catalog, &imported_key).await.unwrap(),
+            encode_reclaimed_copy(1, CopyOrigin::Imported)
+        );
+        catalog.rotate_request_epoch(namespace, 1).await.unwrap();
+        catalog
+            .advance_request_floor(namespace, 1, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog.request_window(namespace).await.unwrap(),
+            RequestWindow {
+                first_retained: 2,
+                accepting: 2
+            }
+        );
+        let next = catalog
+            .compact_superseded_copies(namespace, None, 100)
+            .await
+            .unwrap();
+        assert_eq!((next.compacted, next.forgotten), (0, 1));
+        assert_eq!(
+            raw(&catalog, &imported_key).await.unwrap(),
+            encode_reclaimed_copy(1, CopyOrigin::Imported)
+        );
+        assert!(
+            raw(
+                &catalog,
+                &copy_key(namespace, originals[1].file_id, originals[1].copy_id)
+            )
+            .await
+            .is_none()
+        );
+        for record in &current {
+            assert!(matches!(
+                decode_stored_copy(
+                    &raw(
+                        &catalog,
+                        &copy_key(namespace, record.file_id, record.copy_id)
+                    )
+                    .await
+                    .unwrap()
+                )
+                .unwrap(),
+                StoredCopy::Present(_)
+            ));
+            assert_eq!(
+                catalog
+                    .file_head(namespace, record.file_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .version,
+                2
+            );
+        }
     }
 
     pub(crate) async fn exercise(catalog: &ManagedCatalog, cluster_file: &str) {
@@ -414,7 +574,7 @@ pub(super) mod tests {
             "head 更新必须使在途回收冲突"
         );
         let first_key = copy_key(namespace, first.file_id, first.copy_id);
-        assert_eq!(raw(catalog, &first_key).await.unwrap().len(), 105);
+        assert_eq!(raw(catalog, &first_key).await.unwrap().len(), 109);
         let in_flight = catalog.db.create_trx().unwrap();
         compact_page(&in_flight, namespace, None, 5).await.unwrap();
         let tr = catalog.db.create_trx().unwrap();
@@ -476,14 +636,14 @@ pub(super) mod tests {
         }
         assert!(
             catalog
-                .legacy_copy_record_for_test(namespace, first.file_id, first.copy_id)
+                .unplaced_copy_record_for_test(namespace, first.file_id, first.copy_id)
                 .await
                 .unwrap()
                 .is_none()
         );
         assert!(
             catalog
-                .legacy_copy_record_for_test(namespace, current.file_id, current.copy_id)
+                .unplaced_copy_record_for_test(namespace, current.file_id, current.copy_id)
                 .await
                 .unwrap()
                 .is_some()
@@ -506,7 +666,7 @@ pub(super) mod tests {
         );
         assert!(matches!(
             catalog
-                .legacy_copy_record_for_test(namespace, offline.file_id, offline.copy_id)
+                .unplaced_copy_record_for_test(namespace, offline.file_id, offline.copy_id)
                 .await,
             Err(CatalogError::Incomplete)
         ));
@@ -523,7 +683,7 @@ pub(super) mod tests {
                     .await
                     .unwrap()
                     .len(),
-                105
+                109
             );
         }
         assert_eq!(
@@ -534,14 +694,17 @@ pub(super) mod tests {
             .await
             .unwrap()
             .len(),
-            105
+            109
         );
         for r in &history {
             assert_eq!(
                 raw(catalog, &copy_key(namespace, r.file_id, r.copy_id))
                     .await
                     .unwrap(),
-                encode_reclaimed_copy(r.expected_version.unwrap_or(0) + 1, 1)
+                encode_reclaimed_copy(
+                    r.expected_version.unwrap_or(0) + 1,
+                    CopyOrigin::FileRequest { request_epoch: 1 }
+                )
             );
             assert!(
                 raw(
@@ -641,6 +804,7 @@ pub(super) mod tests {
                     &node_key(namespace, first.file_id),
                     &encode_node(&Node {
                         kind: NodeKind::File,
+                        directory_version: None,
                         parent: Uuid::nil(),
                         name: first.name.clone(),
                         attributes: None,
@@ -685,7 +849,10 @@ pub(super) mod tests {
                         0 => tr.clear(&head_key(namespace, first.file_id)),
                         1 => tr.clear(&node_key(namespace, first.file_id)),
                         2 => tr.clear(&primary_key),
-                        3 => tr.set(&primary_key, &encode_reclaimed_copy(2, 1)),
+                        3 => tr.set(
+                            &primary_key,
+                            &encode_reclaimed_copy(2, CopyOrigin::FileRequest { request_epoch: 1 }),
+                        ),
                         4 => tr.set(&primary_key, &encode_copy(&latest, 3)),
                         5 => tr.set(&old_key, &encode_copy(&first, 3)),
                         6 => tr.set(&old_key, &[0]),
@@ -709,11 +876,15 @@ pub(super) mod tests {
                                 1,
                             ),
                         ),
-                        9 => tr.set(&old_key, &encode_reclaimed_copy(2, 1)),
+                        9 => tr.set(
+                            &old_key,
+                            &encode_reclaimed_copy(2, CopyOrigin::FileRequest { request_epoch: 1 }),
+                        ),
                         10 => tr.set(
                             &node_key(namespace, first.file_id),
                             &encode_node(&Node {
                                 kind: NodeKind::Directory,
+                                directory_version: Some(1),
                                 parent: Uuid::nil(),
                                 name: first.name.clone(),
                                 attributes: None,
@@ -736,7 +907,7 @@ pub(super) mod tests {
             let first_key = copy_key(namespace, Uuid::from_u128(1), old.copy_id);
             assert_eq!(
                 raw(catalog, &first_key).await.unwrap().len(),
-                105,
+                109,
                 "错误页不得提交前项回收 {case}"
             );
             assert!(
@@ -765,7 +936,7 @@ pub(super) mod tests {
             if case == 3 {
                 assert!(matches!(
                     catalog
-                        .legacy_copy_record_for_test(
+                        .unplaced_copy_record_for_test(
                             namespace,
                             Uuid::from_u128(2),
                             Uuid::from_u128(9999)

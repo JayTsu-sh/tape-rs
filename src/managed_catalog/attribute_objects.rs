@@ -133,6 +133,20 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
+    async fn small_text(&mut self, len: usize, limit: usize) -> Result<Option<String>> {
+        if len > limit {
+            self.text(len).await?;
+            return Ok(None);
+        }
+        let mut bytes = Vec::with_capacity(len);
+        for _ in 0..len {
+            bytes.push(self.fixed::<1>().await?[0]);
+        }
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| CatalogError::Corrupt("LTFS 属性对象文本编码"))
+    }
+
     fn finish(self) -> Result<()> {
         use sha2::Digest;
         if self.consumed != u64::from(self.manifest.len)
@@ -161,18 +175,44 @@ impl ManagedCatalog {
         {
             return Err(CatalogError::Corrupt("LTFS 属性对象头"));
         }
-        for _ in 0..5 {
+        let mut modified = None;
+        for index in 0..5 {
             let len = u16::from_be_bytes(reader.fixed().await?) as usize;
-            reader.text(len).await?;
+            if index == 2 {
+                modified = reader
+                    .small_text(len, 128)
+                    .await?
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+                    .map(|time| time.timestamp());
+            } else {
+                reader.text(len).await?;
+            }
         }
         let count = u16::from_be_bytes(reader.fixed().await?);
+        let mut saved_headers = None;
         for _ in 0..count {
             let len = u16::from_be_bytes(reader.fixed().await?) as usize;
-            reader.text(len).await?;
+            let is_headers = reader
+                .small_text(len, "tapers.s3.headers".len())
+                .await?
+                .as_deref()
+                == Some("tapers.s3.headers");
             let len = u32::from_be_bytes(reader.fixed().await?) as usize;
-            reader.text(len).await?;
-            if reader.fixed::<1>().await?[0] > 1 {
+            let value = if is_headers {
+                reader.small_text(len, 10924).await?
+            } else {
+                reader.text(len).await?;
+                None
+            };
+            let flag = reader.fixed::<1>().await?[0];
+            if flag > 1 {
                 return Err(CatalogError::Corrupt("LTFS 属性对象 xattr 标志"));
+            }
+            if is_headers {
+                if saved_headers.is_some() || value.is_none() {
+                    return Err(CatalogError::Corrupt("对象 HTTP 属性重复或过长"));
+                }
+                saved_headers = Some((value.expect("checked header"), flag == 1));
             }
         }
         let symlink = match reader.fixed::<1>().await? {
@@ -185,6 +225,20 @@ impl ManagedCatalog {
             _ => return Err(CatalogError::Corrupt("LTFS 属性对象符号链接标志")),
         };
         reader.finish()?;
+        let expected = ObjectMetadata::from_parts(
+            modified,
+            saved_headers
+                .as_ref()
+                .map(|(value, flag)| (value.as_str(), *flag)),
+        )?;
+        let tr = self.db.create_trx()?;
+        if object_metadata::read_at(&tr, namespace, Some(manifest.digest))
+            .await?
+            .as_ref()
+            != Some(&expected)
+        {
+            return Err(CatalogError::Corrupt("对象元数据投影与属性对象不一致"));
+        }
         Ok(VerifiedShape { symlink })
     }
 
@@ -239,12 +293,24 @@ impl ManagedCatalog {
     ) -> Result<bool> {
         let tr = self.db.create_trx()?;
         require_namespace_readable(&tr, namespace).await?;
-        let attributes = if let Some((locator, receipt, _)) =
-            lookup::published_file_receipt_at(&tr, namespace, id).await?
+        let published = lookup::published_file_receipt_at(&tr, namespace, id).await?;
+        let raw = tr.get(&node_key(namespace, id), true).await?;
+        if let Some(bytes) = raw.as_deref()
+            && retired_nodes::from_node_record(namespace, id, bytes)?.is_some()
         {
+            let active = tr.get(&namespace_key(namespace), true).await?.as_deref()
+                == Some(&[NamespaceState::Active as u8][..]);
+            if !active || published.is_some() {
+                return Err(CatalogError::Corrupt(
+                    "已删除 inode 与命名空间或活动发布不一致",
+                ));
+            }
+            return Ok(false);
+        }
+        let attributes = if let Some((locator, receipt, _)) = published {
             active_batch::prepared_attributes_at(&tr, locator.batch_id, &receipt).await?
         } else {
-            let Some(raw) = tr.get(&node_key(namespace, id), true).await? else {
+            let Some(raw) = raw else {
                 return Ok(false);
             };
             decode_node(&raw)?.attributes
@@ -314,6 +380,19 @@ pub(super) async fn require_complete(
     Ok(())
 }
 
+/// Validate immutable attribute references before the caller starts mutating
+/// catalog rows. Inline values have no independently stored object to check.
+pub(super) async fn require_attributes(
+    tr: &Transaction,
+    namespace: Uuid,
+    attributes: Option<&NodeAttributes>,
+) -> Result<()> {
+    if let Some(manifest) = attributes.and_then(NodeAttributes::manifest) {
+        require_complete(tr, namespace, manifest).await?;
+    }
+    Ok(())
+}
+
 impl ManagedCatalog {
     /// Stage an immutable object in transactions containing at most four
     /// 64,000-byte chunks, plus keys and a tiny progress record. A crash leaves
@@ -324,6 +403,7 @@ impl ManagedCatalog {
         namespace: Uuid,
         attributes: &NodeAttributes,
     ) -> Result<()> {
+        self.upload_object_metadata(namespace, attributes).await?;
         let Some(manifest) = attributes.manifest() else {
             return Ok(());
         };
@@ -443,7 +523,7 @@ mod tests {
         // Publication refuses absent and partially uploaded objects.
         let tr = catalog.db.create_trx().unwrap();
         assert!(
-            write_attribute_chunks(&tr, ns, Uuid::nil(), false, Some(&attributes))
+            require_attributes(&tr, ns, Some(&attributes))
                 .await
                 .is_err()
         );
@@ -500,6 +580,30 @@ mod tests {
                 .unwrap()
                 .symlink
         );
+        // Publication reads the immutable object's completion marker with
+        // conflict detection before adding any visible catalog mutations.
+        let validation = catalog.db.create_trx().unwrap();
+        require_attributes(&validation, ns, Some(&attributes))
+            .await
+            .unwrap();
+        let marker = progress_key(ns, manifest);
+        let mut probe = marker.clone();
+        probe.push(0xff);
+        let concurrent = catalog.db.create_trx().unwrap();
+        let original = concurrent
+            .get(&marker, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .to_vec();
+        concurrent.clear(&marker);
+        concurrent.commit().await.unwrap();
+        validation.set(&probe, b"must-not-publish");
+        assert_eq!(validation.commit().await.unwrap_err().code(), 1020);
+        let restore = catalog.db.create_trx().unwrap();
+        assert!(restore.get(&probe, false).await.unwrap().is_none());
+        restore.set(&marker, &original);
+        restore.commit().await.unwrap();
         struct SlowHash {
             hash: sha2::Sha256,
             first: bool,
@@ -640,6 +744,7 @@ mod tests {
                 Uuid::nil(),
                 &Node {
                     kind: NodeKind::Directory,
+                    directory_version: Some(1),
                     parent: Uuid::nil(),
                     name: Vec::new(),
                     attributes: Some(attributes.clone()),

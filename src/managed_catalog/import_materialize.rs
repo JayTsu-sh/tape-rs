@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use super::{
-    CatalogError, DirectoryOutcome, FileHead, ImportSourceBinding, MAX_DEPTH, ManagedCatalog,
-    MediaProvenance, NodeAttributes, NodeKind, PhysicalCopy, Result, StagedImportEntry,
-    StagedSourceData, staged_import, validate_media, validate_name,
+    CatalogError, CopyOrigin, DirectoryOutcome, FileHead, ImportSourceBinding, MAX_DEPTH,
+    ManagedCatalog, MediaProvenance, NodeAttributes, NodeKind, PhysicalCopy, PoolRecord, Result,
+    StagedImportEntry, StagedSourceData, staged_import, validate_media, validate_name,
 };
 use super::{
     NamespaceDigest, NamespaceState, NamespaceSummary, Node, ScanState, StagedImportSummary,
@@ -18,7 +18,7 @@ use super::{
     decode_stored_copy, encode_head, encode_node, encode_physical_copy, encode_ready_volume,
     encode_scan_manifest, head_key, index_evidence, namespace_key, namespace_verification,
     node_key, read_page, ready_volume_key, reconcile_volume_key, requests, scan_key,
-    source_revision, staged_sources, uuid_from, volume_key, volume_prefix, write_attribute_chunks,
+    source_revision, staged_sources, uuid_from, volume_key, volume_prefix,
 };
 
 const INODE_DOMAIN: &[u8] = b"tape-rs/import-inode/1";
@@ -86,7 +86,7 @@ fn tombstone_prefix(namespace: Uuid) -> Vec<u8> {
     key
 }
 
-fn tombstone_key(namespace: Uuid, pool: Uuid, path: &str) -> Vec<u8> {
+pub(super) fn tombstone_key(namespace: Uuid, pool: Uuid, path: &str) -> Vec<u8> {
     let mut key = tombstone_prefix(namespace);
     key.extend_from_slice(pool.as_bytes());
     key.extend_from_slice(&Sha256::digest(path.as_bytes()));
@@ -374,6 +374,7 @@ impl ProjectionScratch {
             Uuid::nil(),
             &Node {
                 kind: NodeKind::Directory,
+                directory_version: Some(1),
                 parent: Uuid::nil(),
                 name: Vec::new(),
                 attributes: None,
@@ -454,6 +455,13 @@ impl ProjectionScratch {
         Ok(())
     }
 
+    pub(super) fn add_pool(&mut self, pool: &PoolRecord) -> Result<()> {
+        let node = control::initial_pool_root(pool)?;
+        self.insert(import_inode(self.namespace, pool.id, "/"), &node, None)?;
+        self.pools.insert(pool.id);
+        Ok(())
+    }
+
     pub(super) fn add_entry(
         &mut self,
         entry: &StagedImportEntry,
@@ -466,17 +474,8 @@ impl ProjectionScratch {
         if pool.is_nil() {
             return Err(CatalogError::Corrupt("导入池身份无效"));
         }
-        if self.pools.insert(pool) {
-            self.insert(
-                import_inode(self.namespace, pool, "/"),
-                &Node {
-                    kind: NodeKind::Directory,
-                    parent: Uuid::nil(),
-                    name: pool.as_hyphenated().to_string().into_bytes(),
-                    attributes: None,
-                },
-                None,
-            )?;
+        if !self.pools.contains(&pool) {
+            return Err(CatalogError::Corrupt("导入期望投影缺少已登记的池元数据"));
         }
         let current = entry
             .path
@@ -502,6 +501,7 @@ impl ProjectionScratch {
                 id,
                 &Node {
                     kind: NodeKind::Directory,
+                    directory_version: Some(1),
                     parent,
                     name,
                     attributes: Some(entry.current_attributes.clone()),
@@ -521,6 +521,7 @@ impl ProjectionScratch {
             plan.id,
             &Node {
                 kind: NodeKind::File,
+                directory_version: None,
                 parent: plan.parent,
                 name: plan.name,
                 attributes: Some(plan.attributes),
@@ -680,7 +681,7 @@ pub struct ImportTombstone {
     pub logical_file_uid: u64,
 }
 
-fn encode_tombstone(plan: &ImportTombstone) -> Result<Vec<u8>> {
+pub(super) fn encode_tombstone(plan: &ImportTombstone) -> Result<Vec<u8>> {
     let path = plan.path.as_bytes();
     let path_len =
         u32::try_from(path.len()).map_err(|_| CatalogError::Invalid("导入墓碑路径过长"))?;
@@ -697,7 +698,7 @@ fn encode_tombstone(plan: &ImportTombstone) -> Result<Vec<u8>> {
     Ok(value)
 }
 
-fn plan_tombstone(
+pub(super) fn plan_tombstone(
     namespace: Uuid,
     entry: &StagedImportEntry,
     bindings: &[ImportSourceBinding],
@@ -742,7 +743,7 @@ fn plan_tombstone(
     })
 }
 
-fn import_inode(namespace: Uuid, pool: Uuid, path: &str) -> Uuid {
+pub(super) fn import_inode(namespace: Uuid, pool: Uuid, path: &str) -> Uuid {
     let mut hash = Sha256::new();
     hash.update(INODE_DOMAIN);
     hash.update(namespace.as_bytes());
@@ -826,10 +827,7 @@ pub(super) fn plan_data_file(
         return Err(CatalogError::Corrupt("导入文件来源数量不符"));
     }
     if matches!(data[entry.path.winner], StagedSourceData::NativeSymlink)
-        && entry
-            .current_attributes
-            .symlink()
-            .is_none_or(|target| target.contains(".LTFSEE_DATA/"))
+        && entry.current_attributes.link_kind()? != super::link_kind::LinkKind::Native
     {
         return Err(CatalogError::Corrupt("原生符号链接属性与来源类型不符"));
     }
@@ -924,7 +922,7 @@ pub(super) fn plan_data_file(
             binding: (*binding).clone(),
             copy: PhysicalCopy {
                 version: rank,
-                request_epoch: 1,
+                origin: CopyOrigin::Imported,
                 volume_id: source.volume_id,
                 volume_generation: binding.scan.generation,
                 volume_scan_id: binding.scan.id,
@@ -1083,6 +1081,7 @@ async fn write_projected_file(
     let head_key = head_key(namespace, plan.id);
     let node_value = encode_node(&Node {
         kind: NodeKind::File,
+        directory_version: None,
         parent: plan.parent,
         name: plan.name.clone(),
         attributes: Some(plan.attributes.clone()),
@@ -1166,7 +1165,7 @@ async fn write_projected_file(
     if verify_only {
         return Err(CatalogError::Incomplete);
     }
-    write_attribute_chunks(tr, namespace, plan.id, false, Some(&plan.attributes)).await?;
+    super::attribute_objects::require_attributes(tr, namespace, Some(&plan.attributes)).await?;
     tr.set(&child_key, plan.id.as_bytes());
     tr.set(&node_key, &node_value);
     tr.set(&head_key, &head_value);
@@ -1254,16 +1253,7 @@ impl ManagedCatalog {
             return Ok(None);
         };
         let summary = self.confirmed_staged_import(namespace).await?;
-        let root = import_inode(namespace, plan.pool_id, "/");
-        require_directory_outcome(
-            self.create_import_directory(
-                namespace,
-                Uuid::nil(),
-                plan.pool_id.as_hyphenated().to_string().as_bytes(),
-                root,
-            )
-            .await?,
-        )?;
+        require_directory_outcome(self.create_pool_root(namespace, plan.pool_id).await?)?;
         self.db
             .run(|tr, _| {
                 let plan = plan.clone();
@@ -1738,6 +1728,19 @@ impl ManagedCatalog {
                 total: staged.paths,
             });
         }
+        if start == 0 {
+            let mut after = None;
+            loop {
+                let page = self.import_pools(namespace, after.as_deref()).await?;
+                for pool in page.items {
+                    require_directory_outcome(self.create_pool_root(namespace, pool.id).await?)?;
+                }
+                after = page.next;
+                if after.is_none() {
+                    break;
+                }
+            }
+        }
         let end = start.saturating_add(limit as u64).min(staged.paths);
         for ordinal in start..end {
             let entry = self
@@ -1926,16 +1929,7 @@ impl ManagedCatalog {
             self.verify_attribute_object(namespace, manifest).await?;
         }
         let summary = self.confirmed_staged_import(namespace).await?;
-        let root = import_inode(namespace, plan.pool_id, "/");
-        require_directory_outcome(
-            self.create_import_directory(
-                namespace,
-                Uuid::nil(),
-                plan.pool_id.as_hyphenated().to_string().as_bytes(),
-                root,
-            )
-            .await?,
-        )?;
+        require_directory_outcome(self.create_pool_root(namespace, plan.pool_id).await?)?;
         self.db
             .run(|tr, _| {
                 let plan = plan.clone();
@@ -2037,16 +2031,7 @@ impl ManagedCatalog {
         if !self.import_pool_exists(namespace, pool).await? {
             return Err(CatalogError::Incomplete);
         }
-        let root = import_inode(namespace, pool, "/");
-        require_directory_outcome(
-            self.create_import_directory(
-                namespace,
-                Uuid::nil(),
-                pool.as_hyphenated().to_string().as_bytes(),
-                root,
-            )
-            .await?,
-        )?;
+        require_directory_outcome(self.create_pool_root(namespace, pool).await?)?;
         require_directory_outcome(
             self.create_import_directory_with_attributes(
                 namespace,
@@ -2068,8 +2053,8 @@ mod tests {
     use crate::ltfs::index::IndexLocation;
     use crate::ltfs::index::NodeMeta;
     use crate::managed_catalog::{
-        ContentDigest, ImportCandidate, NodeAttributes, ReconciledPath, SourceCandidate,
-        VolumePlacement, VolumeScan,
+        ContentDigest, ImportCandidate, NodeAttributes, PoolPolicy, ReconciledPath,
+        SourceCandidate, VolumePlacement, VolumeScan,
     };
 
     #[test]
@@ -2268,6 +2253,18 @@ mod tests {
         assert_eq!(plan.copies.len(), 1);
         assert_eq!(plan.copies[0].copy.ltfs_file_uid, 10);
         assert!(plan.copies[0].copy.media.as_ref().unwrap().native_symlink);
+        entry.current_attributes = NodeAttributes::new(
+            entry.current_attributes.meta().unwrap().clone(),
+            vec![super::super::link_kind::native_marker()],
+            Some(".LTFSEE_DATA/missing".into()),
+        )
+        .unwrap();
+        let marked = plan_data_file(namespace, &entry, &bindings)
+            .unwrap()
+            .unwrap();
+        assert_eq!(marked.attributes.symlink(), Some(".LTFSEE_DATA/missing"));
+        assert!(marked.copies[0].copy.media.as_ref().unwrap().native_symlink);
+        assert_eq!(marked.copies[0].copy.origin, CopyOrigin::Imported);
         entry.path.sources[0].candidate.length = 1;
         assert!(plan_data_file(namespace, &entry, &bindings).is_err());
     }
@@ -2339,6 +2336,9 @@ mod tests {
         let directory = std::env::temp_dir();
         let mut ascending = ProjectionScratch::new(namespace, &directory).unwrap();
         let mut descending = ProjectionScratch::new(namespace, &directory).unwrap();
+        let pool = projection_pool(entry.path.pool_id, &bindings[0].placement.library_serial);
+        ascending.add_pool(&pool).unwrap();
+        descending.add_pool(&pool).unwrap();
         let mut paths = Vec::new();
         for n in 0..1_000 {
             let mut entry = entry.clone();
@@ -2385,6 +2385,12 @@ mod tests {
             tombstone_key(namespace, Uuid::from_u128(3), &plan.path)
         );
         let mut scratch = ProjectionScratch::new(namespace, &std::env::temp_dir()).unwrap();
+        scratch
+            .add_pool(&projection_pool(
+                entry.path.pool_id,
+                &bindings[0].placement.library_serial,
+            ))
+            .unwrap();
         scratch.add_entry(&entry, &bindings).unwrap();
         let expected = scratch.summary().unwrap().unwrap();
         assert_eq!((expected.namespace.files, expected.copies.copies), (0, 0));
@@ -2393,6 +2399,43 @@ mod tests {
             .candidate
             .physical_path = "wrong".into();
         assert!(plan_tombstone(namespace, &entry, &bindings).is_err());
+    }
+
+    fn projection_pool(id: Uuid, serial: &str) -> PoolRecord {
+        PoolRecord {
+            id,
+            library_serial: serial.into(),
+            name: "projection".into(),
+            file_limit: 200_000,
+            created_at_millis: 1_798_000_000_123,
+            policy: PoolPolicy::default(),
+            revision: 1,
+        }
+    }
+
+    #[test]
+    fn projection_scratch_requires_explicit_pool_creation_metadata() {
+        let (namespace, entry, bindings) = data_entry();
+        let mut scratch = ProjectionScratch::new(namespace, &std::env::temp_dir()).unwrap();
+        assert!(matches!(
+            scratch.add_entry(&entry, &bindings),
+            Err(CatalogError::Corrupt(_))
+        ));
+        let pool = projection_pool(entry.path.pool_id, &bindings[0].placement.library_serial);
+        let mut invalid = pool.clone();
+        invalid.created_at_millis = 0;
+        assert!(scratch.add_pool(&invalid).is_err());
+        assert!(!scratch.pools.contains(&pool.id));
+        scratch.add_pool(&pool).unwrap();
+        scratch.add_entry(&entry, &bindings).unwrap();
+        let original = scratch.summary().unwrap();
+        let mut changed = pool.clone();
+        changed.created_at_millis += 1;
+        assert!(matches!(
+            scratch.add_pool(&changed),
+            Err(CatalogError::Corrupt(_))
+        ));
+        assert_eq!(scratch.summary().unwrap(), original);
     }
 
     #[test]

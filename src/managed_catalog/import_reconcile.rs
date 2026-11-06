@@ -63,7 +63,8 @@ pub(super) fn snapshot_sha256(path: &Path) -> Result<[u8; 32]> {
     let mut file = std::fs::File::open(path)
         .map_err(|error| CatalogError::Cache(format!("目录快照文件读取失败: {error}")))?;
     let mut digest = Sha256::new();
-    let mut buffer = [0u8; 1024 * 1024];
+    // Keep the existing streaming chunk off bounded worker-thread stacks.
+    let mut buffer = vec![0u8; 1024 * 1024].into_boxed_slice();
     loop {
         let bytes = file
             .read(&mut buffer)
@@ -666,6 +667,7 @@ mod tests {
         let snapshot = root.join("empty.snap.db");
         directory.write_snapshot(&snapshot).unwrap();
         let mut index = LtfsIndex::empty(Uuid::new_v4(), "external".into(), 'b');
+        index.self_location.start_block = 5;
         index.root.files.push(file("external-file", 2, "1.1"));
         index.highest_file_uid = 2;
         let (path, spool) = spool(&index);
@@ -1112,5 +1114,34 @@ mod tests {
         drop(spool);
         std::fs::remove_file(spool_path).unwrap();
         std::fs::remove_file(snapshot).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod stack_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_hash_uses_bounded_stack_and_preserves_the_known_digest() {
+        let path =
+            std::env::temp_dir().join(format!("tape-rs-fdb-snapshot-stack-{}", Uuid::new_v4()));
+        std::fs::write(&path, b"abc").unwrap();
+        eprintln!("fdb_snapshot_stack_fixture={}", path.display());
+        let input = path.clone();
+        let digest = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || snapshot_sha256(&input).unwrap())
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(
+            digest,
+            [
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+                0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+                0xf2, 0x00, 0x15, 0xad
+            ]
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }

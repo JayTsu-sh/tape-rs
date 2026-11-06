@@ -507,7 +507,7 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
             .map(|i| self.drive_eligible_in(i, &pool, role, &map, &inv))
             .collect::<Result<Vec<_>>>()?;
         if !enabled.iter().any(|enabled| *enabled) {
-            return Err(refuse(format!("没有符合角色 {role} 和节点组约束的驱动器")));
+            return Err(refuse(format!("没有已启用且符合角色 {role} 的驱动器")));
         }
         self.check_task(8, "挂载限额调整前检查")?;
         self.task_outcome(
@@ -855,15 +855,19 @@ fn file_stat(
         length,
         current: Some(crate::client::FileStat {
             length,
-            generation: index.generation,
-            round: 0,
+            generation: Some(index.generation),
+            round: None,
             barcode: barcode.into(),
             sha256: xattrs
                 .iter()
                 .find(|x| x.key == crate::ltfs::index::XATTR_SHA256 && !x.base64)
                 .map(|x| x.value.clone())
                 .unwrap_or_default(),
-            version: (meta.file_uid, index.generation),
+            version: crate::client::FileVersion::Ltfs {
+                volume: index.volume_uuid,
+                file_uid: meta.file_uid,
+                generation: index.generation,
+            },
             metadata: json!({"kind":kind,"symlink":symlink,"modify_time":meta.modify_time,"node":{
             "readonly":meta.readonly,"creation_time":meta.creation_time,"change_time":meta.change_time,"access_time":meta.access_time},
             "xattrs":xattrs.iter().map(|x|json!({"key":x.key,"value":x.value,"base64":x.base64})).collect::<Vec<_>>()}),
@@ -904,58 +908,65 @@ impl<C: TapeTransport + Send, D: TapeTransport + Send> crate::tapefs::Backend
         })
         .map_err(errno)
     }
-    fn list_dir(&self, path: &str) -> crate::tapefs::Res<Option<Vec<crate::client::DirItem>>> {
-        let mut lib = self.0.lock().map_err(|_| nix::libc::EIO)?;
-        let p = path.trim_matches('/');
-        let item =
-            |name: String, is_dir: bool, is_symlink: bool, len: u64| crate::client::DirItem {
-                name,
-                is_dir,
-                is_symlink: Some(is_symlink),
-                state: if is_dir {
-                    String::new()
-                } else {
-                    "committed".into()
-                },
-                committed_length: Some(len),
-                staged_length: None,
-            };
-        if p.is_empty() {
-            return Ok(Some(
-                lib.pools()
-                    .map_err(errno)?
-                    .into_iter()
-                    .map(|n| item(n, true, false, 0))
-                    .collect(),
-            ));
-        }
-        if !p.contains('/') {
-            return Ok(if lib.pools().map_err(errno)?.iter().any(|v| v == p) {
-                Some(
-                    lib.volumes(p)
+    fn list_dir(&self, path: &str) -> crate::tapefs::Res<Option<crate::tapefs::DirectoryListing>> {
+        let entries = (|| -> crate::tapefs::Res<Option<Vec<crate::client::DirItem>>> {
+            let mut lib = self.0.lock().map_err(|_| nix::libc::EIO)?;
+            let p = path.trim_matches('/');
+            let item =
+                |name: String, is_dir: bool, is_symlink: bool, len: u64| crate::client::DirItem {
+                    version: None,
+                    name,
+                    is_dir,
+                    is_symlink: Some(is_symlink),
+                    state: if is_dir {
+                        String::new()
+                    } else {
+                        "committed".into()
+                    },
+                    committed_length: Some(len),
+                    staged_length: None,
+                };
+            if p.is_empty() {
+                return Ok(Some(
+                    lib.pools()
                         .map_err(errno)?
                         .into_iter()
                         .map(|n| item(n, true, false, 0))
                         .collect(),
-                )
-            } else {
-                None
-            });
-        }
-        lib.inspect_volume(path, |v, p| {
-            Ok(v.index().find_directory(p).map(|d| {
-                d.subdirs
-                    .iter()
-                    .map(|s| item(s.name.clone(), true, false, 0))
-                    .chain(
-                        d.files
-                            .iter()
-                            .map(|f| item(f.name.clone(), false, f.symlink.is_some(), f.length)),
+                ));
+            }
+            if !p.contains('/') {
+                return Ok(if lib.pools().map_err(errno)?.iter().any(|v| v == p) {
+                    Some(
+                        lib.volumes(p)
+                            .map_err(errno)?
+                            .into_iter()
+                            .map(|n| item(n, true, false, 0))
+                            .collect(),
                     )
-                    .collect()
-            }))
-        })
-        .map_err(errno)
+                } else {
+                    None
+                });
+            }
+            lib.inspect_volume(path, |v, p| {
+                Ok(v.index().find_directory(p).map(|d| {
+                    d.subdirs
+                        .iter()
+                        .map(|s| item(s.name.clone(), true, false, 0))
+                        .chain(
+                            d.files.iter().map(|f| {
+                                item(f.name.clone(), false, f.symlink.is_some(), f.length)
+                            }),
+                        )
+                        .collect()
+                }))
+            })
+            .map_err(errno)
+        })()?;
+        Ok(entries.map(|entries| crate::tapefs::DirectoryListing {
+            version: None,
+            entries,
+        }))
     }
     fn fetch(&self, path: &str, out: &mut std::fs::File) -> crate::tapefs::Res<u64> {
         self.0
@@ -968,16 +979,17 @@ impl<C: TapeTransport + Send, D: TapeTransport + Send> crate::tapefs::Backend
         &self,
         path: &str,
         local: &Path,
-        create_only: bool,
+        state: &mut crate::tapefs::UploadState,
         _wait: bool,
-    ) -> crate::tapefs::Res<bool> {
+    ) -> crate::tapefs::Res<crate::tapefs::UploadOutcome> {
+        let create_only = state.target().native_create_only()?;
         let mut input = std::fs::File::open(local).map_err(|_| nix::libc::EIO)?;
         self.0
             .lock()
             .map_err(|_| nix::libc::EIO)?
             .write_from(path, &mut input, create_only)
             .map_err(errno)?;
-        Ok(true)
+        Ok(crate::tapefs::UploadOutcome::Native { committed: true })
     }
     fn delete(&self, path: &str) -> crate::tapefs::Res<()> {
         self.0

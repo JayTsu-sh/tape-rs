@@ -549,7 +549,7 @@ fn scenario(case: u8) {
         );
         // 非 Leader 不接受管理变更，也不会误报成功。
         assert_eq!(
-            request(&addresses[&1], "POST", "/admin/nodegroups/G1", json!({})).0,
+            request(&addresses[&1], "POST", "/admin/pools/nonleader", json!({})).0,
             503
         );
         task(
@@ -733,14 +733,6 @@ fn scenario(case: u8) {
             "/admin/tapes/HATESTL8/move",
             json!({"location":"homeslot"}),
         );
-        assert_eq!(
-            request(&addresses[&3], "POST", "/admin/nodegroups/G1", json!({})).0,
-            200
-        );
-        assert_eq!(
-            request(&addresses[&3], "DELETE", "/admin/nodegroups/G1", json!({})).0,
-            200
-        );
         // A fresh owner round invalidates the previous inventory even when
         // the same node takes over again. Drive commands need a new rescan.
         let previous_round = statuses[&3]
@@ -817,7 +809,16 @@ fn scenario(case: u8) {
             "/admin/tapes/HATESTL8/validate",
             json!({"full_read":true}),
         );
-        task("POST", "/admin/tapes/HATESTL8/reconcile", json!({}));
+        assert_eq!(
+            request(
+                &addresses[&3],
+                "POST",
+                "/admin/tapes/HATESTL8/reconcile",
+                json!({})
+            )
+            .0,
+            404
+        );
         task(
             "POST",
             "/admin/drives/SIMDRV0000/role",
@@ -1249,6 +1250,26 @@ fn scenario(case: u8) {
                     == vec![0x5a; 700_000];
             }
         } else if case >= 6 {
+            // Pool setup and the file commit may complete a normal takeover.
+            // Fault injection and PR assertions must use the serving round now.
+            let until = Instant::now() + Duration::from_secs(4);
+            let shutdown_owner = loop {
+                let state = statuses[&old.node].lock().unwrap().clone();
+                if let Some(owner) = state.executor.as_ref().filter(|owner| {
+                    state.executor_ready
+                        && owner.node == old.node
+                        && owner.fenced
+                        && services[&owner.node].serving_round() == Some(owner.round)
+                }) {
+                    break owner.clone();
+                }
+                assert!(
+                    Instant::now() < until,
+                    "停机注入前 owner 未恢复就绪: {state:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            let old = &shutdown_owner;
             slow_checkpoint.store(true, Ordering::SeqCst);
             peers[&old.node].send(NodeInput::Shutdown).unwrap();
             if case == 7 {

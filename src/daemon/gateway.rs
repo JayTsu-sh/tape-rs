@@ -36,14 +36,40 @@ pub fn serve(
     gateway: Arc<HttpContext>,
     peers: HashMap<u64, String>,
 ) -> std::io::Result<()> {
-    let app = Router::new().fallback(dispatch).with_state(Gateway {
+    http::serve_router(listen, router(config, libraries, gateway, peers))
+}
+
+pub fn router(
+    config: LibrariesConfig,
+    libraries: BTreeMap<String, Arc<HttpContext>>,
+    gateway: Arc<HttpContext>,
+    peers: HashMap<u64, String>,
+) -> Router {
+    Router::new().fallback(dispatch).with_state(Gateway {
         config,
         libraries,
         gateway,
         peers,
         requests: Arc::new(Semaphore::new(32)),
-    });
-    http::serve_router(listen, app)
+    })
+}
+
+/// FDB 模式只共享只读控制发现，不开放旧目录和文件写入路由。
+pub fn control_router(
+    config: LibrariesConfig,
+    libraries: BTreeMap<String, Arc<HttpContext>>,
+    gateway: Arc<HttpContext>,
+    peers: HashMap<u64, String>,
+) -> Router {
+    Router::new()
+        .route("/cluster", axum::routing::get(dispatch))
+        .with_state(Gateway {
+            config,
+            libraries,
+            gateway,
+            peers,
+            requests: Arc::new(Semaphore::new(32)),
+        })
 }
 
 fn response(code: u16, value: serde_json::Value) -> Response {
@@ -108,10 +134,19 @@ async fn dispatch(State(g): State<Gateway>, mut req: Request) -> Response {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let libraries: Vec<_> = g.config.libraries.iter().map(|l| {
-            let s = g.libraries[&l.changer_serial].status.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            json!({"id":l.changer_serial,"changer_serial":l.changer_serial,"drive_serials":l.drive_serials,"executor":s.executor.as_ref().map(|e|json!({"node":e.node,"round":e.round,"fenced":e.fenced})),"executor_ready":s.executor_ready,"applied_index":s.applied_index})
-        }).collect();
+        let libraries: Vec<_> = g
+            .config
+            .libraries
+            .iter()
+            .map(|l| {
+                let s = g.libraries[&l.changer_serial]
+                    .status
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                super::management::library_inventory_view(&l.changer_serial, &l.drive_serials, &s)
+            })
+            .collect();
         return response(
             200,
             json!({"id":status.id,"role":status.role,"leader":status.leader,"term":status.term,"applied_index":status.applied_index,"default_library":g.config.default_library,"gateway":{"executor":status.executor.as_ref().map(|e|json!({"node":e.node,"round":e.round,"fenced":e.fenced})),"executor_ready":status.executor_ready},"vips":status.vips.iter().map(|(a,r)|json!({"address":a.to_string(),"token":r.token,"holder":r.holder.as_ref().map(|h|json!({"node":h.node,"round":h.round}))})).collect::<Vec<_>>(),"libraries":libraries}),
@@ -304,6 +339,91 @@ impl hyper::body::Body for ProxyBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fdb_control_discovery_exposes_only_local_read_only_routes() {
+        use super::super::{files::FileService, node::NodeStatus};
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::sync::{Mutex, mpsc};
+        let root = std::env::temp_dir().join(format!("fdb-control-{}", uuid::Uuid::new_v4()));
+        let (exec, received_exec) = mpsc::channel();
+        let (node, received_node) = mpsc::channel();
+        let context = Arc::new(HttpContext {
+            files: FileService::new(root.clone()).unwrap(),
+            status: Arc::new(Mutex::new(NodeStatus {
+                id: 2,
+                leader: 1,
+                ..Default::default()
+            })),
+            exec: Mutex::new(exec),
+            node: Mutex::new(node),
+            client_addrs: HashMap::new(),
+            wait_timeout: Duration::from_secs(1),
+        });
+        let config = LibrariesConfig::parse(&json!({"default_library":"L", "libraries":[{"changer_serial":"L","drive_serials":["D"]}]})).unwrap();
+        let router = control_router(
+            config,
+            BTreeMap::from([("L".into(), context.clone())]),
+            context,
+            HashMap::new(),
+        );
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = runtime.spawn(async move { axum::serve(listener, router).await.unwrap() });
+        for (method, path, expected) in [
+            ("GET", "/cluster", 200),
+            ("GET", "/admin/libraries", 404),
+            ("POST", "/cluster", 405),
+            ("PUT", "/files/test", 404),
+            ("POST", "/admin/pools", 404),
+            ("GET", "/admin/status", 404),
+        ] {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            write!(stream,"{method} {path} HTTP/1.1\r\nHost: local\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).unwrap();
+            let at = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            let header = String::from_utf8_lossy(&bytes[..at]);
+            assert_eq!(
+                header
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .parse::<u16>()
+                    .unwrap(),
+                expected,
+                "{method} {path}"
+            );
+            if expected == 200 {
+                let value: serde_json::Value = serde_json::from_slice(&bytes[at + 4..]).unwrap();
+                assert_eq!(value["id"], 2);
+                assert_eq!(value["libraries"][0]["changer_serial"], "L");
+            }
+        }
+        assert!(matches!(
+            received_exec.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            received_node.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        server.abort();
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn frozen_catalog_export_is_local_even_when_another_node_is_leader() {
         use super::super::{

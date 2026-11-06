@@ -92,6 +92,12 @@ impl NamespaceDigest {
 }
 
 fn validate_shape(id: Uuid, node: &Node) -> Result<()> {
+    if !matches!(
+        (node.kind, node.directory_version),
+        (NodeKind::Directory, Some(1..)) | (NodeKind::File, None)
+    ) {
+        return Err(CatalogError::Invalid("目录属性版本与 inode 类型不符"));
+    }
     if node.kind == NodeKind::Directory
         && node
             .attributes
@@ -325,6 +331,15 @@ async fn verify_nodes(
         validate_suffix(NamespacePhase::Nodes, suffix)?;
         let id = uuid_from(suffix)?;
         let node = decode_node(&raw)?;
+        if let Some(attributes) = &node.attributes
+            && attributes.manifest().is_none()
+            && object_metadata::read_at(tr, namespace, Some(attributes.digest()))
+                .await?
+                .as_ref()
+                != Some(&ObjectMetadata::from_attributes(attributes)?)
+        {
+            return Err(CatalogError::Corrupt("对象元数据投影与内联属性不一致"));
+        }
         if let Some(manifest) = node.attributes.as_ref().and_then(NodeAttributes::manifest) {
             super::attribute_objects::require_complete(tr, namespace, manifest).await?;
             let shape = shapes
@@ -469,7 +484,11 @@ async fn verify_indexes(
                     return Err(CatalogError::Corrupt("副本 ID 不能为 nil"));
                 }
                 let stored = decode_stored_copy(&value)?;
-                if accepting.is_some_and(|epoch| stored.request_epoch() > epoch) {
+                if accepting.is_some_and(|epoch| {
+                    stored
+                        .receipt_epoch()
+                        .is_some_and(|request| request > epoch)
+                }) {
                     return Err(CatalogError::Corrupt("副本请求代次未开放"));
                 }
                 let head = decode_head(
@@ -908,7 +927,7 @@ pub(super) mod tests {
         };
         let mut copy = PhysicalCopy {
             version: 2,
-            request_epoch: 1,
+            origin: CopyOrigin::FileRequest { request_epoch: 1 },
             volume_id: Uuid::new_v4(),
             volume_generation: 1,
             volume_scan_id: Uuid::new_v4(),
@@ -949,6 +968,7 @@ pub(super) mod tests {
     fn root() -> Node {
         Node {
             kind: NodeKind::Directory,
+            directory_version: Some(1),
             parent: Uuid::nil(),
             name: Vec::new(),
             attributes: None,
@@ -957,10 +977,44 @@ pub(super) mod tests {
     fn directory(name: &[u8]) -> Node {
         Node {
             kind: NodeKind::Directory,
+            directory_version: Some(1),
             parent: Uuid::nil(),
             name: name.to_vec(),
             attributes: None,
         }
+    }
+    #[test]
+    fn directory_attribute_versions_are_bound_into_namespace_proofs() {
+        let namespace = Uuid::new_v4();
+        let mut first = NamespaceDigest::new(namespace).unwrap();
+        first.push(Uuid::nil(), &root(), None).unwrap();
+        let mut changed = root();
+        changed.directory_version = Some(2);
+        let mut second = NamespaceDigest::new(namespace).unwrap();
+        second.push(Uuid::nil(), &changed, None).unwrap();
+        assert_ne!(first.summary(), second.summary());
+        for version in [None, Some(0)] {
+            changed.directory_version = version;
+            assert!(
+                NamespaceDigest::new(namespace)
+                    .unwrap()
+                    .push(Uuid::nil(), &changed, None)
+                    .is_err()
+            );
+        }
+        let mut file = directory(b"file");
+        file.kind = NodeKind::File;
+        let head = FileHead {
+            version: 1,
+            size: 0,
+            copy_id: Uuid::new_v4(),
+        };
+        assert!(
+            NamespaceDigest::new(namespace)
+                .unwrap()
+                .push(Uuid::new_v4(), &file, Some(&head))
+                .is_err()
+        );
     }
     fn summary(namespace: Uuid, records: &Records) -> NamespaceSummary {
         let mut digest = NamespaceDigest::new(namespace).unwrap();
@@ -1001,6 +1055,7 @@ pub(super) mod tests {
         (
             Node {
                 kind: NodeKind::File,
+                directory_version: None,
                 parent: receipt.parent,
                 name: receipt.name.clone(),
                 attributes: None,
@@ -1027,6 +1082,7 @@ pub(super) mod tests {
         assert_eq!(digest.summary().nodes, 2);
         let node = Node {
             kind: NodeKind::File,
+            directory_version: None,
             parent: Uuid::nil(),
             name: b"file".to_vec(),
             attributes: None,

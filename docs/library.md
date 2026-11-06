@@ -33,7 +33,7 @@ FUSE 路径为 `/池名/条码/卷内路径`。根目录列池，池目录列显
 
 上述查询在新版本FUSE持锁时复用只读缓存入口；库存可能过时，池/离线/资格从同一SQLite事务读取。rescan要求取得资源锁，不在活跃FUSE旁路查询设备。查询输出标明source与observed_at。
 
-这是本项目的直接管理入口，不等于完整 EE。下面的后续扩展补充了角色、节点组、任务日志和本地维护；需要操作 GPFS stub/副本引用的 EE import/export/datamigrate/replace 仍不在此非 HSM 管理器的实现范围。底层机械命令不能直接当成这些事务。离线/上线只实现本项目卷访问资格，不生成 IBM EE 的 GPFS/HSM 元数据。
+这是本项目的直接管理入口，不等于完整 EE。下面的后续扩展补充了角色、任务日志和本地维护；需要操作 GPFS stub/副本引用的 EE import/export/datamigrate/replace 仍不在此非 HSM 管理器的实现范围。底层机械命令不能直接当成这些事务。离线/上线只实现本项目卷访问资格，不生成 IBM EE 的 GPFS/HSM 元数据。
 
 LTFS 2.5.1 实现与 EE 互通必须分开验收：普通 LTFS 字节/索引互读、未修改 EE 对象保真、新建 EE 对象的语义恢复是三个层次。当前普通写入不维护 EE 对象 ID/objgen/GPFS 映射；不能把通用 xattr 保真或 LE 能读取普通文件当成完整 EE 对象写入已支持。`write_from` 和 `LibraryBackend` 的删除、改名、元数据/xattr 等普通入口拒绝改变 EE 对象、别名以及包含它们的目录；新建 `ibm.ltfsee.*` 属性也被拒绝。显式 `with_volume` 和原始 `LtfsVolume` 仍是低层接口，调用方必须负责协议语义，不应用于普通 EE 对象改写。
 
@@ -55,21 +55,16 @@ tape-library --library-state /isolated/library.sqlite task clearhistory --yes
 | 命令 | 行为与边界 |
 |---|---|
 | `drive role SERIAL mrg` | 设置 m 写、r 读、g 维护；真实候选筛选执行约束，缺合适驱动时在搬带前拒绝 |
-| `nodegroup create/list/show/delete` | 管理本地分组，默认 G0；删除被驱动、池或本地成员引用的组会拒绝 |
-| `nodegroup local NAME` | 指定本地控制器所属组；`-` 停用本地组调度，不创建远端 EE 节点 |
-| `drive assign SERIAL GROUP` | 分配本地驱动；`-` 解除分配；池、驱动、本地成员三者的组必须匹配才可调度 |
-| `pool set NAME nodegroup GROUP` | 约束这个池可用的本地驱动组；池改名保留组关系 |
 | `pool set NAME lowspacewarningenable yes/no` / `nospacewarningenable yes/no` | 控制基于已观测 DP 剩余字节的本地告警条件；不是 EE 后台告警服务 |
 | `pool set NAME lowspacewarningthreshold N` | 0..32767 TiB，0 禁用低空间阈值；所有卷都有有效容量快照才计算，否则返回 null |
 | `tape move BARCODE homeslot/ieslot` | 基于当前 element map 和条码核验搬带；到 I/E 必须先 offline；保留 assignment，不等于 EE export |
 | `tape validate BARCODE [--full-read]` | g 角色装带检查；full-read 读取所有普通文件，有哈希则比对，无哈希明确报告未验证 checksum |
-| `tape reconcile BARCODE` | 从实际磁带刷新本地完整索引快照；失败不替换旧缓存，含未知 XML 拒绝有损保存；不做 GPFS 对账或写带修正 |
 | `tape objects BARCODE` | 解释 `.LTFSEE_DATA` 的 `gpfs.objtype/path/target` 为原来的文件、目录、符号链接，保留对象 ID/objgen 不变 |
 | `tape restore BARCODE DESTINATION` | 把 EE 保存对象流式恢复为普通文件/目录/原文链接；目标必须是空目录或全新目录，祖先不能为符号链接，拒绝穿越/覆盖/路径冲突 |
 
 恢复不执行保存的链接目标，不读取它们指向的宿主路径。它保留原始保存路径层级和链接文本，不承诺还原权限、时间、GPFS inode、私有 xattr、stub 或 HSM 副本登记。中途磁带/磁盘失败可能留下部分恢复文件，保留作诊断，重试应选择新的空目录。原始语义、别名和 xattr 可由 `ltfs::ee::EeManifest` 查询，原始索引不会因此修改。
 
-新增持久表与原表增量共存，包括 `library_tasks`、角色/节点组关系和 `library_volume_indexes`。缓存是带读取结果，不是修改带的授权；重新分配或换介质后必须重新对账。不能把本地节点组当成跨主机分配、服务接管或 HA 成果。
+新增持久表与原表增量共存，包括 `library_tasks`、角色配置和 `library_volume_indexes`。缓存是带读取结果，不是修改带的授权；重新分配或换介质后必须重新刷新索引缓存。本地控制器不承担跨主机接管；多节点管理使用 ltfsd 的 [管理模型](management-model.md)。
 
 容量在实际挂载和完整写提交后采样 DP MAM 0x0000/0x0001，必须两个属性都存在且数值有效；缺失、读失败或算术溢出不伪造零。查询标明 `capacity_source=observed_dp_mam` 和观测时间，并不是每次查询都装带。失败访问/下次恢复前使旧观测失效；没有全池观测时，容量和告警条件都明确 unknown/null。它不估算 EE 的 reclaimable/non-appendable 空间，不能代替现场容量规划。
 

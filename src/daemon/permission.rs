@@ -16,9 +16,15 @@ pub enum Phase {
     Serving,
 }
 
+#[path = "permission_activity.rs"]
+mod activity;
+pub(super) use activity::ActivityUpdate;
+pub use activity::{DeviceActivityGuard, DeviceActivityState};
+
 #[derive(Debug, Default)]
 pub struct Permission {
     state: Mutex<Option<Grant>>,
+    activity: activity::ActivityRegistry,
 }
 
 #[derive(Debug)]
@@ -30,6 +36,32 @@ struct Grant {
 }
 
 impl Permission {
+    /// Wait for the exact busy claim before starting Serving-phase device I/O.
+    pub fn begin_device_activity(&self, round: u64) -> Result<DeviceActivityGuard<'_>> {
+        // Recovery is never eligible for a healthy rebalance. Its existing
+        // Execution lease and per-CDB checks remain the device authority.
+        if self.allows(round, Phase::Execution) {
+            return Ok(self.activity.recovering(round));
+        }
+        let deadline =
+            self.deadline(round, Phase::Serving)
+                .ok_or_else(|| TapeError::OwnershipLost {
+                    device: "library".into(),
+                    detail: "当前设备执行许可不可用".into(),
+                })?;
+        self.activity
+            .begin(round, deadline, || self.allows(round, Phase::Serving))
+    }
+    pub(super) fn enable_activity(&self, node: u64, instance: u64) {
+        self.activity.enable(node, instance);
+    }
+    pub(super) fn next_activity(&self) -> Option<ActivityUpdate> {
+        self.activity.next()
+    }
+    pub(super) fn observe_activity(&self, proof: Option<&DeviceActivityState>) {
+        self.activity.observe(proof);
+    }
+
     pub fn renew(&self, round: u64, phase: Phase, deadline: Instant) -> bool {
         let now = Instant::now();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -52,6 +84,10 @@ impl Permission {
             deadline,
             closed: false,
         });
+        drop(state);
+        if phase == Phase::Serving {
+            self.activity.serving(round);
+        }
         true
     }
 
@@ -83,6 +119,8 @@ impl Permission {
         } else if let Some(g) = state.as_mut().filter(|g| g.round == round) {
             g.closed = true;
         }
+        drop(state);
+        self.activity.close(round);
     }
 }
 

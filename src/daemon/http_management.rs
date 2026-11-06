@@ -31,6 +31,60 @@ pub(super) fn handle(
             return Ok(false);
         }
         let s = ctx.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if resource == "catalog" && target == "barrier" {
+            let challenge = uuid::Uuid::parse_str(action).ok().filter(|id| !id.is_nil());
+            let Some(challenge) = challenge else {
+                respond_json(conn, 400, "", json!({"error":"invalid_barrier_challenge"}))?;
+                return Ok(true);
+            };
+            if s.shutting_down
+                || s.catalog_pending
+                || s.executor.is_some()
+                || s.catalog_frozen_index
+                    .is_none_or(|frozen| frozen == 0 || frozen > s.applied_index)
+                || s.catalog_quiesce_index
+                    .is_none_or(|quiesce| quiesce == 0 || Some(quiesce) > s.catalog_frozen_index)
+            {
+                respond_json(
+                    conn,
+                    409,
+                    "",
+                    json!({"error":"library_not_frozen","detail":"初始化需要已应用冻结屏障且无设备 owner 的节点"}),
+                )?;
+            } else if !s.pools.is_empty() || !s.tapes.is_empty() {
+                respond_json(
+                    conn,
+                    409,
+                    "",
+                    json!({"error":"catalog_not_empty","detail":"原生初始化要求无池、无磁带目录的新带库"}),
+                )?;
+            } else if ctx.client_addrs.len() != 3 {
+                respond_json(conn, 503, "", json!({"error":"client_members_unavailable"}))?;
+            } else {
+                // 多库 HTTP 提示带库路径；冻结证明的成员身份只使用物理节点地址。
+                let members: std::collections::BTreeMap<_, _> = ctx
+                    .client_addrs
+                    .iter()
+                    .map(|(id, address)| {
+                        let physical = address
+                            .split_once("/libraries/")
+                            .filter(|(_, serial)| !serial.is_empty() && !serial.contains('/'))
+                            .map_or(address.as_str(), |(physical, _)| physical);
+                        (*id, physical)
+                    })
+                    .collect();
+                respond_json(
+                    conn,
+                    200,
+                    "",
+                    json!({"version":1,"challenge":challenge.to_string(),
+                    "node_id":s.id,"term":s.term,"leader":s.leader,"role":s.role,"members":members,
+                    "quiesce_index":s.catalog_quiesce_index,"frozen_index":s.catalog_frozen_index,
+                    "applied_index":s.applied_index,"executor_absent":true,"catalog_pending":false,"shutting_down":false,"catalog_empty":true}),
+                )?;
+            }
+            return Ok(true);
+        }
         if resource == "catalog" && target == "current" && action == "audit" {
             match ctx.files.catalog_cutover_audit() {
                 Ok(audit) => respond_json(
@@ -75,7 +129,7 @@ pub(super) fn handle(
                     .map(|b| (b.clone(), model::tape_policy(&m, b)))
                     .collect();
                 Some(
-                    json!({"inventory":m["inventory"],"inventory_observation":model::inventory_observation(&s),"pools":s.pools.iter().map(|p|model::pool_view(&s,p)).collect::<Vec<_>>(),"tapes":model::tape_views(&s),"drives":model::drive_views(&s),"tape_policies":policies,"drive_policies":m["drives"],"nodegroups":m["nodegroups"],"nodes":m["nodes"]}),
+                    json!({"inventory":m["inventory"],"inventory_observation":model::inventory_observation(&s),"pools":s.pools.iter().map(|p|model::pool_view(&s,p)).collect::<Vec<_>>(),"tapes":model::tape_views(&s),"drives":model::drive_views(&s),"tape_policies":policies,"drive_policies":m["drives"]}),
                 )
             }
             "tasks" if action.is_empty() => {
@@ -90,20 +144,8 @@ pub(super) fn handle(
             "libraries" if action.is_empty() && (target.is_empty() || target == "current") => Some(
                 json!({"scope":"cluster_device_group","inventory":m["inventory"],"inventory_observation":model::inventory_observation(&s),"executor":s.executor.as_ref().map(|e|json!({"node":e.node,"round":e.round})),"executor_ready":s.executor_ready,"catalog_quiesce_index":s.catalog_quiesce_index,"catalog_frozen_index":s.catalog_frozen_index}),
             ),
-            "nodegroups" if action.is_empty() => {
-                if target.is_empty() {
-                    Some(m["nodegroups"].clone())
-                } else {
-                    m["nodegroups"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .find(|g| *g == target)
-                        .map(|_| json!({"name":target,"nodes":m["nodes"],"drives":m["drives"]}))
-                }
-            }
             "nodes" if action.is_empty() => {
-                let rows: Vec<Value> = s.candidates.iter().map(|(id,c)|json!({"id":id,"instance":c.instance,"device_group":c.group,"drives":c.drives,"eligible":c.eligible,"nodegroup":m["nodes"].get(id.to_string()).cloned().unwrap_or(json!("G0"))})).collect();
+                let rows: Vec<Value> = s.candidates.iter().map(|(id,c)|json!({"id":id,"instance":c.instance,"device_group":c.group,"drives":c.drives,"eligible":c.eligible})).collect();
                 if target.is_empty() {
                     Some(json!(rows))
                 } else {
@@ -202,8 +244,6 @@ pub(super) fn handle(
         ("POST", "catalog", "quiesce" | "resume" | "freeze") if target == "current" => Some(action),
         ("PATCH", "pools", "") if !target.is_empty() => Some("set"),
         ("DELETE", "pools", "") if !target.is_empty() => Some("delete"),
-        ("POST", "nodegroups", "") if !target.is_empty() => Some("create"),
-        ("DELETE", "nodegroups", "") if !target.is_empty() => Some("delete"),
         ("POST", "tasks", "") if target == "clearhistory" => Some("clearhistory"),
         ("POST", "tasks", "cancel") => Some("cancel"),
         ("POST", "libraries", "rescan") if target == "current" => Some("rescan"),
@@ -211,10 +251,9 @@ pub(super) fn handle(
             "POST",
             "tapes",
             "assign" | "unassign" | "offline" | "online" | "blacklist" | "clear-blacklist" | "move"
-            | "validate" | "reconcile" | "objects" | "restore",
+            | "validate" | "objects" | "restore",
         ) => Some(action),
-        ("POST", "drives", "up" | "down" | "role" | "assign") => Some(action),
-        ("POST", "nodes", "assign") => Some("assign"),
+        ("POST", "drives", "up" | "down" | "role") => Some(action),
         _ => None,
     };
     if let Some(op) = op {

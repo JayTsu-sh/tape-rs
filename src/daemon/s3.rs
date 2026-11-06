@@ -30,6 +30,12 @@ const NS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 const HEADERS_XATTR: &str = "tapers.s3.headers";
 const REGION: &str = "us-east-1";
 
+#[cfg(feature = "fdb")]
+#[path = "s3_fdb.rs"]
+mod fdb;
+#[cfg(feature = "fdb")]
+pub use fdb::{router as fdb_router, serve as serve_fdb};
+
 #[derive(Clone)]
 struct S3 {
     libraries: BTreeMap<String, Arc<HttpContext>>,
@@ -287,8 +293,17 @@ fn query(value: &str) -> Result<BTreeMap<String, String>, S3Error> {
     Ok(out)
 }
 fn supported_request(headers: &HeaderMap, query: &BTreeMap<String, String>) -> Result<(), S3Error> {
-    if headers.contains_key(header::IF_MODIFIED_SINCE)
-        || headers.contains_key(header::IF_UNMODIFIED_SINCE)
+    supported_request_with_time(headers, query, false)
+}
+
+fn supported_request_with_time(
+    headers: &HeaderMap,
+    query: &BTreeMap<String, String>,
+    time_conditions: bool,
+) -> Result<(), S3Error> {
+    if (!time_conditions
+        && (headers.contains_key(header::IF_MODIFIED_SINCE)
+            || headers.contains_key(header::IF_UNMODIFIED_SINCE)))
         || headers.contains_key(header::IF_RANGE)
         || headers
             .keys()
@@ -338,7 +353,9 @@ fn supported_request(headers: &HeaderMap, query: &BTreeMap<String, String>) -> R
         ));
     }
     if headers.keys().any(|k| {
-        k.as_str().starts_with("x-amz-server-side-encryption")
+        k.as_str().starts_with("x-amz-rename-")
+            || k.as_str() == "x-amz-client-token"
+            || k.as_str().starts_with("x-amz-server-side-encryption")
             || k.as_str().starts_with("x-amz-grant-")
             || matches!(
                 k.as_str(),
@@ -374,6 +391,9 @@ fn supported_request(headers: &HeaderMap, query: &BTreeMap<String, String>) -> R
 }
 fn object_path(key: &str) -> Result<String, S3Error> {
     let key = decode(key)?;
+    decoded_object_path(&key)
+}
+fn decoded_object_path(key: &str) -> Result<String, S3Error> {
     if key.is_empty()
         || key.chars().any(|c| c.is_control() || !xml_character(c))
         || key

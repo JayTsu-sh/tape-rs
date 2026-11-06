@@ -1,5 +1,7 @@
 # 文件客户端与 FUSE 挂载
 
+命令语法、选项、异步任务与常用流程见[命令行参考手册](cli-reference.md)。
+
 当前能力与部署状态见 [剩余实施队列](../.scratch/ltfs-ha/remaining-implementation.md) 和 [交接入口](CLAUDE-HANDOFF.md)。本文带日期的实验记录保留当时验证边界；后续记录取代早期状态。
 
 `ltfsctl` 与 `tape-fuse` 都通过 ltfsd 客户端接口寻找 Leader；节点地址可以重复指定。它们不直接打开磁带设备。
@@ -24,9 +26,11 @@ Rust 客户端使用 `Client::new(endpoints).with_library(serial)?.with_pool(poo
 
 并发上传按需申请额外写驱动。一台驱动的批次到期时，也启动其他驱动已收齐的队列；普通工作每台只提交一批，随后返回 owner 循环处理控制请求。`mountlimit` 限制同池的写入驱动租约，包含准备写入的装带阶段；只读装载、维护源带和闲置但没有写入租约的介质不占该配额。资源不足时，读请求或其他池可以借用已排空的写驱动；借用前先关闭新准入、再次核对空闲状态并生成卸载检查点。整库维护与计划停机要等待所有驱动写入作业归还句柄，才会移动介质或释放 PR。
 
-选带先检查池限制、介质状态、节点组和 m/r/g 角色，再核对驱动的 REPORT DENSITY SUPPORT / WRTOK。优先复用已装载的合格介质，其余按最近有效 MAM 的物理已用比例从高到低排列，最后按条码确定顺序；这项次序是本项目的确定性策略，不声称复现 IBM 未公开的全部调度算法。装载后还会核对当前介质格式。无法确认兼容性的驱动或介质不会获得写入资格。
+当前 FDB 数据链路优先复用已装载的合格磁带，其次按槽位中条码的字典序选择第一盘合格磁带。候选必须属于指定 Library/Pool，卷 UUID 已绑定且索引已核验、在线、不在黑名单、不是清洗带，符合池介质限制和物理文件条目上限，并有启用的 m 角色兼容驱动可调度；驱动兼容性来自 REPORT DENSITY SUPPORT / WRTOK。待显式导入的磁带会被跳过；预约、恢复和节点修改占用仍须通过各自闸门。
 
-写入预算必须来自本次有效的 DP/IP MAM 读数，并保留索引收尾空间；不再用虚构的大容量替代缺失读数。容量刷新失败时，已确认的提交仍成功，已有文件可读，新写入暂停并等待有界重试；不会仅因容量未知将磁带标成 FULL 或 CHECK。显示仍保留同卷最近有效容量，并注明刷新失败；这个缓存不能代替新的写入准入证据。索引分区剩余空间不足也会停止新写入。
+这个 FDB 策略没有按 MAM 剩余容量或已用比例排序，也没有轮询均衡。驱动调度先复用目标带所在驱动，再找兼容空驱动，最后按挂载上限和 LRU 选择已核验、可卸载的读取挂载。导入目录和原文件所在磁带都不绑定之后的写入目标：同名覆盖可落在同池另一盘带上，公开路径以 FDB 最新已提交 head 为准。
+
+上传尝试一旦绑定卷 UUID、代数和原请求，重试保留这些身份。实际写入重新核验索引和占用；发生介质错误或提交结果未定时先恢复并查询原请求，不把同一正文自动换带重发。当前 FDB 路径不承诺基于物理剩余空间的提前换带，也不承诺写满后透明切到下一盘。
 
 大目录的原子发布在后台执行，该库的数据入口暂时返回 `503 catalog_pending`；目录发布完成后可重试。控制查询和多数派许可继续工作。目录快照固定同一日志索引，制作快照本身不暂停数据请求。
 
@@ -43,136 +47,48 @@ HTTP 接入使用 axum / Hyper，保持现有端点、状态码、JSON 字段和
 
 ## 集群 HTTP 管理接口
 
-管理命令直接接入 `ltfsd`，通过 Raft 复制配置及任务状态，由当前设备 owner 执行设备操作。无需另启 `tape-library` 控制器，也不导入或复用其独立 `--library-state` 数据库。同一逻辑库仍只允许一个有效设备 owner；节点组是这个设备组内的调度策略，不增加 Raft 成员或并行设备 owner。
+当前集群管理以 FDB 为权威，关系为 Library → Pool → Tape；每库有参与 nodes 和唯一就绪 active_node。完整命令、HTTP 层级及介质安全边界见 [管理模型](management-model.md)，FDB 配置、持久请求与数据接口见 [FoundationDB](foundationdb.md)。不再提供节点分组、G0 或旧的非池作用域管理写入入口。
 
-本次扩展控制日志和快照字段；旧快照可由新版读取，但所有集群节点必须统一升级，不能混跑旧版或在新增管理状态后回退。独立 `tape-library` 的单机模式保留。
-
-| 能力 | 方法及路径 | JSON 请求体 |
-| --- | --- | --- |
-| 管理状态 | `GET /admin/status` | 无 |
-| 带库查询 | `GET /admin/libraries`、`GET /admin/libraries/current` | 无 |
-| 重新读取库存 | `POST /admin/libraries/current/rescan` | `{}`；不执行 INITIALIZE，不装带或搬带 |
-| 池列表/详情 | `GET /admin/pools`、`GET /admin/pools/{pool}` | 无；pool 可用名称或 UUID |
-| 建池 | `POST /admin/pools/{name}` | 无；沿用 `?file_limit=200000` |
-| 删除空池 | `DELETE /admin/pools/{pool}` | 无 |
-| 修改池属性 | `PATCH /admin/pools/{pool}` | `{"attribute":"mountlimit","value":"1"}` |
-| 磁带列表/详情 | `GET /admin/tapes`、`GET /admin/tapes/{barcode}` | 无 |
-| 核对库存后分配 | `POST /admin/tapes/{barcode}/assign` | `{"pool":"poolname"}` |
-| 核对归槽后取消分配 | `POST /admin/tapes/{barcode}/unassign` | `{}`；拒绝仍有已知目录内容的磁带 |
-| 离线/上线 | `POST /admin/tapes/{barcode}/offline`、`…/online` | offline：`{"message":"maintenance"}`；online：`{}` |
-| 黑名单/清除 | `POST /admin/tapes/{barcode}/blacklist`、`…/clear-blacklist` | blacklist：`{"reason":"inspection"}`；清除：`{}` |
-| 机械搬带 | `POST /admin/tapes/{barcode}/move` | `{"location":"homeslot"}` 或 `{"location":"ieslot"}`；移至 I/E 前必须 offline |
-| 校验 | `POST /admin/tapes/{barcode}/validate` | `{"full_read":true}`；默认只验证索引，完整读取核对已有哈希，无哈希单独计数 |
-| 对账 | `POST /admin/tapes/{barcode}/reconcile` | `{}`；通过已有分片流程更新集群 catalog，不做 GPFS/HSM 对账 |
-| EE 保存对象 | `POST /admin/tapes/{barcode}/objects` | `{"offset":0,"limit":100}`；limit 为 1–500，按 `next_offset` 继续，跨页须核对卷代数 |
-| 恢复 EE 保存对象 | `POST /admin/tapes/{barcode}/restore` | `{"destination":"/absolute/new-directory","confirm":true}`；目的地在执行 owner 本机，只恢复普通文件/目录/链接，不创建 HSM stub |
-| 空间回收 | `POST /admin/tapes/{barcode}/reclaim` | 沿用既有回收协议、两驱动器要求及格式化前核验 |
-| 驱动列表/详情 | `GET /admin/drives`、`GET /admin/drives/{serial}` | 无 |
-| 驱动调度资格 | `POST /admin/drives/{serial}/up`、`…/down`、`…/role`、`…/assign` | up/down：`{}`；role：`{"role":"mrg"}`；assign：`{"group":"G0"}`，`-` 解除分配 |
-| 节点与节点组查询 | `GET /admin/nodes`、`GET /admin/nodes/{id}`、`GET /admin/nodegroups`、`GET /admin/nodegroups/{name}` | 无 |
-| 创建/删除节点组 | `POST /admin/nodegroups/{name}`、`DELETE /admin/nodegroups/{name}` | 无；拒绝删除默认组或仍被使用的组 |
-| 指定节点调度组 | `POST /admin/nodes/{id}/assign` | `{"group":"G0"}`；`-` 停用该节点的设备调度，不改变 Raft 成员资格 |
-| 管理任务列表/详情 | `GET /admin/tasks`、`GET /admin/tasks/{id}` | 无；与文件操作的 `/tasks/{id}` 分开 |
-| 请求取消 | `POST /admin/tasks/{id}/cancel` | `{}`；协作取消，不中断在途 CDB，不回滚已完成操作 |
-| 清理终态任务历史 | `POST /admin/tasks/clearhistory` | 必须 `{"confirm":true}`；保留 queued/running，删除的历史不能恢复 |
-
-`ltfsctl tape offline <条码> <说明>`、`tape online <条码>`、`tape blacklist <条码> <原因>`、`tape clear-blacklist <条码>` 对应上述可逆策略接口；`tape validate <条码> [--full-read]` 校验 LTFS 索引，指定选项时还读取文件核对已有哈希。命令返回管理任务号；须用 `ltfsctl task show <任务号>` 核对终态。操作特定带库时加 `--library <真实 changer 序列号>`。
-
-`ltfsctl` 现在可直接查询集群管理资源，例如 `library list`、`library show <序列号>`、`tape list/show`、`drive list/show`、`node list/show`、`nodegroup list/show`、`pool show` 和 `task list/show`。除全局 `library list` 外，`--library <真实序列号>` 始终限定目标库。输出为管理接口的完整 JSON，容量与状态字段不经 CLI 二次计算。文件任务单独用 `file-task <id>` 查询。
-
-尚未有专用 CLI 语法的管理写入可用 `ltfsctl --library <序列号> admin post|patch|delete /admin/... --body '<JSON>'` 显式调用上述接口。例如 `admin post /admin/libraries/current/rescan --body '{}'`；设备任务返回 `task` 后用 `task show <id>` 查询终态。连接在写请求可能送达后断开时，客户端返回结果未定，不会自动重放请求。
-
-池属性支持 `poolname`、`file_limit`、`mediarestriction`、`mountlimit`、`nodegroup`、`lowspacewarningenable`、`lowspacewarningthreshold`、`nospacewarningenable`。数字及 yes/no 属性沿用字符串值；mountlimit 为 0 时不限制池的写入驱动租约数，容量告警阈值单位为 TiB。容量采用最近一次有效 DP MAM 缓存：未装载时沿用旧值，装载及写入提交后由 owner 刷新并通过 Raft 复制；刷新失败保留同卷旧值并报告失败。未观测或已知卷身份失效时返回 null，不从文件大小推算剩余容量，也不冒充 EE 后台告警事件。m/r/g 分别控制写入、读取和维护；驱动、池及节点分组同时参与设备调度。
-
-所有变更由控制 Leader 受理；访问 Follower 返回 `503 not_leader` 及已知 Leader 地址。查询可访问任意节点，返回 `applied_index` 和 `answered_by`，属于已应用状态视图，不承诺线性一致读取。库存查询读取带时间、owner 和轮次的最近观测；首次使用或要求新鲜库存时显式 rescan。驱动序列号必须与配置设备精确匹配。
-
-需要 owner 核验或操作的请求返回 `202 {"task":123,"status":"queued"}`，表示任务已登记；必须查询 `/admin/tasks/123` 的终态。任务开始先经多数派提交，再在现有隔离和执行许可下操作设备。任务状态为 queued/running/success/failed/cancelled/indeterminate，带执行 owner、round、进度和结果；索引代数及结果不会因换节点丢失。无设备 owner 时可查询、建删空池及管理节点组/取消任务，新的设备任务会拒绝受理。
-
-需要借用磁带的维护以及池属性修改会先暂停新上传、等待已准入上传完成、提交并收束当前写入带、将本实例使用的带归槽；维护结束再按最新策略选带。驱动策略变更要求目标驱动器为空，当前 owner 的节点组变更要求受管驱动器为空。offline 保留 assignment，上线须实际装带验证 LTFS 索引；校验和对账允许检查 offline 带，但不绕过黑名单。搬到 I/E 不等于 EE export，回到 home slot 不等于 HSM import。
-
-分配磁带后，既有调度器可能自动装带，并在首次选择空白带写入时按既有规则格式化；foreign 介质仍拒绝覆盖。恢复操作的文件输出留在任务记载的 owner 本机，不随 HA 自动搬迁。
-
-连接断开、`504 indeterminate` 或任务换届并不取消设备操作。未开始的 queued 任务可由新 owner 领取；running 任务在执行轮次结束后标为 indeterminate，不自动重放，迟到的旧轮次报告不能覆盖结果。已进入恢复过程的取消请求不能抹去已写入文件或已完成提交；失败也不代表副作用已回滚。响应丢失时先查询任务及资源状态，不能盲目重新提交。
-
-管理请求体上限 16 KiB，单任务结果上限 256 KiB，任务历史最多 1024 条且管理状态总量上限 2 MiB；新设备任务会预留结果空间。达到上限后显式清理终态历史。大型索引通过原有 catalog 分片复制，不放进管理结果或额外复制整份 XML。同一设备组一次只受理一个管理任务，既有 reclaim 期间拒绝其他设备任务。
-
-例如，在控制 Leader 的客户端端口提交校验，再查询结果：
-
-```bash
-curl -X POST http://127.0.0.1:7401/admin/tapes/TEST01L8/validate \
-  -H 'Content-Type: application/json' -d '{"full_read":true}'
-curl http://127.0.0.1:7401/admin/tasks/123
+```sh
+ltfsctl -e HOST:7401 library list --json
+ltfsctl -e HOST:7401 library show -l SERIAL --json
+ltfsctl -e HOST:7401 library rescan -l SERIAL --request rescan.json
+ltfsctl -e HOST:7401 pool create archive -l SERIAL --request pool.json
+ltfsctl -e HOST:7401 pool list -l SERIAL --json
+ltfsctl -e HOST:7401 pool show archive -l SERIAL
+ltfsctl -e HOST:7401 tape list -l SERIAL -p archive --json
+ltfsctl -e HOST:7401 tape import BARCODE -l SERIAL -p archive --request import.json
+ltfsctl -e HOST:7401 task show NAMESPACE:EPOCH:OPERATION -l SERIAL
 ```
 
-这组接口已有模拟器和三节点 Raft 回归验证。容量/状态、装载与实写刷新、离线缓存、重新上线和 owner 切换已完成物理带库专项验收，见[现场报告](../.scratch/ltfs-ha/reports/admin-capacity-physical-20261020.html)。本轮使用隔离候选和 RC0018L9，其他管理操作以各自验证记录为准。
+`library rescan` 和介质命令异步返回持久任务号；列表/详情读取缓存观测，不逐卷读取索引。所有设备任务先保存规范原请求，再提交到相应 Library/Pool/Tape 的 HTTP 路径；不能用空正文或临时 `{location:...}` 代替完整请求。重试保留原 namespace、epoch、operation 和操作参数。任务状态、进度及终态在 FDB，SQLite 只承担本地缓存；owner 切换接续原任务。
 
-### 容量与状态输出对标
+`tape assign` 可能初始化介质，必须 `--yes`，覆盖有文件的带还须 `--force-format`。`tape import` 保留介质内容、恢复 FDB 文件索引。`tape move -L homeslot|ieslot` 核验库存和持久 home 证明；已分配介质到 I/E 前须离线。`tape unassign` 要求无引用和在途依赖，不擦除介质。`tape validate` 核验标签/完整索引链，报告 `payload_verified=false`；不提供 `--full-read`，不隐式修复或导入。
 
-容量主字段采用 EE 的空间划分：`capacity = used_space + free_space + non_appendable_space`（各项已知时），统一使用整数字节。对已入池带，`capacity` 是格式化后数据分区的容量观测，`used_space` 是已占用空间；可追加时余量计入 `free_space`，已知不可追加时 free_space 为 0，余量计入 non_appendable_space。未入池带的上述四项按 EE 列表口径均为 0，表示尚未纳入池管理，不能推断为空带或物理容量为零。物理读数保留在 partitions.data/index 和 volume_capacity 技术详情，不使用两分区合计冒充用户数据容量。参照 [IBM EE REST 定义](https://www.ibm.com/docs/en/storage-archive-ee/1.3.4?topic=information-rest-api-tape) 和 [eeadm tape list 的 Usable/Used/Available 说明](https://www.ibm.com/docs/en/storage-archive-ee/1.3.5?topic=tape-eeadm-list)。
-
-命名同时参考本地保存的 EE 1.3.4 REST 与 LE tape show 现场输出。EE 返回字节；LE total_dp/remaining_dp 为 MiB，例如 LE total_dp=16736984 对应 EE capacity=17549999734784 字节。本次更改新 HTTP 管理接口顶层 free_space 的语义：它不再等同物理余量；原始值须读取 partitions.data.free_space。没有更改容量采样、介质格式、目录持久化或设备操作策略。
-
-磁带列表、详情及 `/admin/status` 的 tapes 使用同一套字段；池列表、详情及汇总也使用同一容量计算：
-
-| EE 参照字段 | 本接口含义 |
-| --- | --- |
-| `capacity`、`used_space`、`free_space` | 格式化后数据容量、已占用、允许追加的剩余空间；capacity/used 由有效 DP MAM 最大及最大减物理余量得到，free 按可追加状态划分；`capacity_unit=bytes`、`capacity_partition=DP` |
-| `non_appendable_space`、`non_appendable` | 已知不可追加时的未用空间，两个名字同值（现场 EE JSON 使用前者，部分版本文档使用后者）；可追加时为 0，未知为 null |
-| `partitions.data`、`partitions.index` | DP/IP 各自的总量、已用、剩余及物理 partition_number、成功观测时间、代数、刷新结果；两分区独立保存缓存 |
-| `volume_capacity` | IP+DP 物理容量合计，标明 capacity_partition=IP+DP；任一分区未知或合计溢出则三项均为 null。它不是用户文件可写空间 |
-| `capacity_source`、`capacity_observed_at`、`capacity_cached` | 本项目扩展：来源 observed_dp_mam/unknown、成功观测时间，以及是否为缓存值；GET 始终读缓存，未知时 cached 为 null。未入池主容量 source=unassigned、cached=false、时间/代数/刷新结果为 null；历史观测在 partitions 中。空池 source=empty_pool |
-| `capacity_generation`、`capacity_generation_matches`、`capacity_refresh` | 磁带容量观测代数、是否与目录代数一致，以及最近刷新结果（status/time/error/owner/round）；同 UUID 的跨代观测可保留。容量报告与目录摘要分别提交，观测也可能短暂领先目录，matches=false 不等同于采样失败；无可比较目录代数时为 null |
-| `active_space`、`reclaimable_space`、`reclaimable_percent` | 尚未实现 EE 活跃/失效对象空间计量，空间及可回收比例明确为 null（界面显示“—”）；不使用物理占用减文件字节数伪造可回收空间，也不补成 0% |
-| 磁带 `state`、`volume_state` | state 优先报告 blacklisted/offline，再报告 unassigned 或已知介质状态；volume_state 保留底层 appendable/data_full/full/check 等状态 |
-| 磁带 `status`、`appendable`、`appendable_reason` | status 是严重程度，state 是业务状态；分级规则见下文。可追加资格综合卷状态、离线/黑名单、池介质限制及文件数上限；no 附中文原因，未分配或状态未确认时 appendable 为 null。它不表示此刻已装载或 owner 正在服务 |
-| `pool_id`、`pool_name`、`offline_msg` | 当前分配池及离线说明；无对应值为 null |
-| `location_type`、`address`、`drive_id` | 最近库存中的 homeslot/ieslot/drive、绝对 SMC element 地址（整数）及驱动序列号；未知为 null，address 不是 CLI 槽位序号 |
-| 池 `id`、`num_of_tapes`、`media_restriction`、`mount_limit`、`nodegroup_name` | UUID、分配带数及有效策略；保留旧 uuid/name/tapes/options 及池列表外层结构 |
-| 池 `capacity_complete`、`capacity_known_tapes`、`capacity_unknown_tapes` | 主容量各项是否完整、有效 DP 观测成员数、缺少有效 DP 观测成员数；完整性同时要求可追加状态已知且求和无溢出。partitions 内分别统计 DP/IP 完整性和数量；未知汇总保持 null，不返回部分和冒充总量 |
-| 驱动 `enabled`、`role`、`nodegroup_name` | 平铺有效调度策略，保留 policy；enabled 不代表驱动已经就绪 |
-
-LE 的 NEED_ASSIGN 对应 state=unassigned，WRITABLE 由本项目 volume_state=appendable 表达；盒带在驱动器里不能直接等同于 LE handling=MOUNTED。容量移出 policy，原始策略对象不再夹带未经校验的历史容量。
-
-严重程度以 [IBM EE 1.3.5 状态表](https://www.ibm.com/docs/en/storage-archive-ee/1.3.5?topic=list-tape-status-state-information)为基准：appendable、append_fenced、data_full、exported、offline、recall_only、unassigned、write_protected 为 ok；full、need_replace 为 info；require_replace 为 degraded；check_tape_library 为 warning；require_validate、check_key_server、check_hba、inaccessible、non_supported、duplicated、missing、disconnected、unformatted、label_mismatch、need_unlock 为 error。本项目扩展 check=error、blacklisted=warning、reclaiming/reformatting=info；未识别状态为 unknown。展示状态与底层 volume_state 取较高严重程度，避免离线或未入池掩盖已知介质错误。data_full 表示不能再写文件内容但仍可更新元数据，full 表示所有更新均被拒绝；两者都不允许新增文件。现场旧 EE 清洗带曾返回 info/non_supported，与 1.3.5 文档有差异；本接口采用上述明确规则，不按条码猜测介质健康或复制特定旧版本分级。
-
-分级映射只作用于已知状态，不代表已实现全部 EE 状态的自动检测。清洗带例外按现场 EE 输出展示为 state=non_supported、status=info；已知健康错误或黑名单告警仍保留较高分级。库存增加 medium_type（设备原始介质类型，2=cleaning，0=未指定，缺失为 null）、cleaning 和 cleaning_source（element_status/barcode/null）。优先使用 READ ELEMENT STATUS 的类型；标准 CLN 六位卷标及其 L1 后缀作为旧缓存/设备的保守兜底，不单凭 L1 后缀识别清洗带。数据池分配及 LTFS 数据操作会拒绝清洗带，执行装载前另查实际库存，保护历史错误分配。清洗带主容量/已用/可用/不可追加为业务零，capacity_source=cleaning、cached=false、appendable=no；DP/IP 和整卷物理容量为 null，不读取或沿用数据带容量，也不伪造可回收百分比。不会为识别而装载或启动清洗。Rust 和 EE 的池分配分别维护，不能直接将两个系统的分配状态当成同一目录比较。
-
-未装载磁带不因查询而搬带，继续返回上次容量与观测时间；未入池时仅分区详情保留历史读数。普通写入带装载、读带装载、写入提交及卸载检查点后读取 DP 与 IP MAM，按已挂载卷的恢复报告选择实际分区号；维护装带和回收同样采样。每个分区的最大/剩余属性必须同时有效，缺失、长度异常、超出范围或换算溢出均记为该分区刷新失败。失败保留同 UUID 的该分区最近成功值，不阻止另一个分区更新；格式化前或确认 UUID 变化时两分区旧缓存失效；分配关系变化不抹掉该条码最近一次成功容量观测，重新入池可沿用有效缓存。无成功观测的物理容量为 null。旧快照若缺少容量 UUID，仅兼容同代观测；未保存 IP 的旧快照将其报告为未知，等待下一次装带补齐。
-
-池主容量按每盘分配带的 EE 空间划分相加，包括未装载带的有效缓存；free_space 不包含离线、黑名单、已满、须检查、正在维护、达到文件数上限或不满足介质限制的带的余量。这些余量归 non_appendable_space。时间取最早成功观测；任一带 DP 未知则池主容量和告警条件为 null，已知容量但可追加状态未知时 available/non_appendable 和告警未知。空池没有分配空间，返回总/已用/可用/不可追加均 0、capacity_source=empty_pool，而非未知。IP 未知仅使池 IP 和整卷物理汇总未知，不抹掉已知 DP。
-
-capacity_complete 不代表实时或无刷新错误：它仅说明汇总所需值已知且可安全相加。历史观测是否适用、最近是否刷新失败，须结合每盘容量代数、时间及 capacity_refresh 查看；在 drive 中也仍是最近成功观测。池汇总可能 capacity_known_tapes 等于成员总数，但因追加资格未知或求和溢出而 capacity_complete=false；空池 complete=true、已知/未知成员数均为 0。
-
-池低空间/无空间条件按 EE free_space 判断，warning_scope=available_space；“无可追加空间”不等于所有介质物理已满。物理分区合计始终保留在 partitions，不受离线策略影响。旧池列表 tape_details 中的 bytes_used/live_bytes/reclaimable_bytes 继续沿用索引及目录统计口径，不等同于 EE used_space/active_space/reclaimable_space。
-
-用户主视图采用 EE 的数据容量、已用、可用、可追加状态；DP/IP 明细与整卷物理合计用于高级详情。当前 capacity/used 的基础仍为设备 DP MAM，不等于当前文件大小，也未复现 IBM 私有活跃/可回收计量或预留区算法。DP 还容纳索引和历史数据；free_space 不是承诺还能写入同样多的逻辑文件字节，不代表待提交队列已预留的预算。IP 检查点在固定位置覆盖重写，IP 剩余量不能直接判断新的完整索引能否容纳；需要 IP 检查点时若写入失败仍会冻结写入并报告错误。容量展示不改变设备准入或磁带写入策略。
-
-例如，同一盘已观测总量 1000、已占用 600、物理余量 400 的磁带，在线且可追加时返回 `free_space=400, non_appendable_space=0, appendable=yes`；离线后返回 `free_space=0, non_appendable_space=400, appendable=no`，而 `partitions.data.free_space` 仍为 400。解除分配后主容量四项均为 0，source=unassigned，分区详情仍保留 1000/600/400；重新入池后恢复使用这份有效观测。已入池但未观测过容量时容量为 null，不借用 0 表示未知。
-
-本接口提供 JSON，没有容量文本渲染层。客户端主列表建议按 EE 顺序展示 Usable、Used、Available、Reclaimable%、Status、State；默认十进制 GB/TB（1 GB=10^9 bytes），切换二进制单位时必须标为 GiB/TiB。保留原始整数字节，不把 GB 舍入值用于汇总或反算；小于 1 GB 的非零值显示“<1 GB”或更小单位，避免显示 0 使用户误认为空带。分区与 IP+DP 仅在详情展示。
-
-每盘磁带、每台驱动的列表和详情均返回 `inventory_observation={source,observed_at,owner,round,owner_matches_current}`。source 为 cached_inventory 或 unknown；owner_matches_current 仅比较执行轮次，不保证库存尚未变化。归槽后的库存观测可能早于服务恢复重新装带，跨 owner 也保留历史观测。外层 applied_index 是 Raft 应用进度，不是设备观测时间。要求新鲜库存时显式 rescan；rescan 不读取槽内磁带容量，GET 不查询设备。当前容量刷新由装载和提交触发，不以 HTTP 请求或空闲定时轮询触发。
+查询的设备路径属于 `host_device_node`，不作为其他节点的设备路径。缺失或不可信的容量、可回收比例返回 null，不使用型号或文件字节数推算。历史物理容量验证见 [现场报告](../.scratch/ltfs-ha/reports/admin-capacity-physical-20261020.html)；该报告不代替当前 FDB 管理模型的现场验收。
 
 ## 文件客户端使用
 
 ```bash
-cargo build --bin ltfsctl --bin tape-fuse --features fuse
-ltfsctl -e 127.0.0.1:7401 put ./archive.bin /archive.bin
-ltfsctl -e 127.0.0.1:7401 get /archive.bin ./download.bin
-ltfsctl -e 127.0.0.1:7401 delete /archive.bin
-mkdir -p /tmp/tape-mount /tmp/tape-cache
-tape-fuse -e 127.0.0.1:7401 --cache-dir /tmp/tape-cache /tmp/tape-mount
+cargo build --bin tape-fuse --features fuse
+mkdir -p /tmp/tape-mount /tmp/tape-cache /var/lib/tape-client
+tape-fuse -e NODE1:7401 -e NODE2:7401 -e NODE3:7401 \
+  --library SERIAL --pool POOL_UUID --fdb-namespace NAMESPACE_UUID \
+  --fdb-journal-dir /var/lib/tape-client/fdb-journals \
+  --cache-dir /tmp/tape-cache /tmp/tape-mount
 ```
+
+当前FDB集群使用上述显式namespace与池UUID；替换示例中的节点地址和标识。省略`--fdb-journal-dir`时为内核只读；日志根由程序创建为0700，父目录须存在。完整文件CLI及原操作恢复见[FoundationDB手册](foundationdb.md#fdb-挂载)。
 
 挂载进程在前台运行，需要 Linux FUSE 与挂载权限。另一个终端执行 `fusermount3 -u /tmp/tape-mount` 卸载。默认只向挂载用户开放，属主权限由内核检查。
 
 ## 完成语义
 
 - `ltfsctl put` 等待文件落带；`delete` 等待删除墓碑落带，不立即回收介质空间。
-- FUSE `close` 仅确认上传到服务端暂存区。需要归档确认的应用必须在关闭前调用 `fsync`；`fsync` 成功才表示该内容已落带。
+- FDB挂载的`flush`/`close`和`fsync`同步确认S4及原回执；未确认时保留原日志并报告错误。普通文件接口模式的`close`确认服务端暂存，归档确认使用`fsync`。
 - 删除响应丢失会返回结果未定，不自动按路径重发，避免删除随后创建的新版本。
 - 写入支持 `O_RDWR`、非截断打开、任意偏移覆盖、`O_APPEND` 和任意长度截断；多个写句柄共享内容及上传状态。非截断写首次需要完整下载旧内容。`O_EXCL` 提供只创建保护。
-- 服务端读取只选择已提交文件；只有服务端在途版本且没有本地文件时返回 `EBUSY`。首次读打开下载整个已提交文件，因此可能等待磁带读取。同一 inode 的本地句柄共享内容，本挂载写入在 fsync/close 前可读；覆盖和截断对旧句柄及映射可见。删除后已有句柄继续引用旧文件，同名重建使用新 inode。
+- 服务端读取只选择已提交文件；只有服务端在途版本且没有本地文件时返回 `EBUSY`。首次读打开下载整个已提交文件，因此可能等待磁带读取。 FDB 模式读取 EE 等外部文件时允许带内未记录正文摘要；此时私有缓存仍核对完整长度和读取前后的命名空间、inode、版本及介质位置，不能声称已按带内摘要验证正文。有 SHA-256 或 MD5 时严格校验，错误或部分正文不发布缓存。显式校验导出 `ltfsctl fdb get` 仍要求已登记的摘要。同一 inode 的本地句柄共享内容，本挂载写入在 fsync/close 前可读；覆盖和截断对旧句柄及映射可见。删除后已有句柄继续引用旧文件，同名重建使用新 inode。
 - `mkdir`/`rmdir` 等待 LTFS 索引提交；空目录跨挂载和节点接管保留。`mkdir` 要求父目录存在，`rmdir` 拒绝非空目录及在途子路径。目录流在打开时取快照。
 - `rename` 支持当前写入卷内的文件和目录原子改名、同类型目标替换，以及 `RENAME_NOREPLACE`；目录替换要求目标为空。保留源 inode、UID、extent、mtime 和 xattr。跨带源/目标或不在当前写入卷的源仍返回 `EXDEV`；复制加删除回退不具备原子性。权限/时间修改的原生映射见下文；符号链接支持创建及读取，已有符号链接可通过 FUSE 的 lstat/readlink 和内核路径解析读取，读取链接目标时仍校验目标文件版本。可写扩展属性的范围见下文。
 
@@ -192,14 +108,20 @@ cargo test --features fuse --bin tape-fuse -- --ignored
 
 2026-10-20 已在物理节点显式运行四项默认忽略用例：内核 VIP 地址生命周期、VIP 进程暂停/恢复/退出/强杀、增量 XML 导出及官方 XSD 校验、百万文件索引解析，均通过。VIP 使用隔离网络中的真实内核、HTTP 和 ARP，控制日志提交按用例模拟；本轮不访问磁带。结果、资源测量、清理核验及复用步骤见[验收摘要](../.scratch/ltfs-ha/reports/ignored-four-physical-20261020-summary.html)。默认测试的环境门控保持不变。
 
-Holo 端到端实测已覆盖 fsync、覆盖、删除、旧句柄读取、mv、Range 和计划接管；EE 删除/覆盖现场对照与物理带库验证仍未完成。详见[现场记录](../.scratch/ltfs-ha/holo-file-client-20260924.md)。
+2026-11-04 已在209的真实内核FUSE和A库AA0017L8上验证显式FDB模式的创建、读写、fsync、随机写/追加/截断、多句柄、目录与文件改名、二进制xattr、链接、删除/同名重建及全新缓存重挂；独立S3读回的长度和摘要一致。首轮发现并修复了删除历史head导致后续rename误判的问题，原任务接续与剩余检查通过。见[FUSE物理验收报告](../.scratch/ltfs-ha/reports/fuse-fdb-physical-20261104.md)。写入中故障迁移和断电未在本轮测试。此前Holo范围作为[历史记录](../.scratch/ltfs-ha/holo-file-client-20260924.md)保留。
 
 
-## 元数据兼容性
+## 元数据与文件身份
 
-目录日志条目增加可选 metadata 字段，SQLite 的 files/staging 表按需增加同名 TEXT 列。新版本可以解码旧日志、迁移旧库，已有版本号保留；原来未缓存的修改时间和 xattr 保持未知，直到从磁带索引重新形成目录记录。迁移不会主动装带、改写磁带或强制刷新全部旧记录。
+传输与缓存保留原索引属性；未登记的属性保持未知，不能当作空属性。回收复制保留源文件的时间、只读标记和原始自定义 xattr（包括 Base64 标记）；新副本分配新的卷内 UID 和版本号，重新计算内容哈希。普通上传替换生成新时间，并从当前目录版本继承原 xattr；跨带覆盖同样适用。目录不可读或缺少必要属性时拒绝覆盖，需先从磁带重新对账。不能通过客户端注入回收元数据。
 
-建议整组节点统一升级后使用这些字段，不承诺新旧二进制混跑或回退时的元数据完整性。Rust 的 FileStat/FileRec 增加字段，直接构造这些结构的调用方需要更新。传输与缓存保留原索引属性；回收复制已保留源文件的时间、只读标记和原始自定义 xattr（包括 Base64 标记）；新副本分配新的卷内 UID 和版本号，重新计算内容哈希。普通上传替换仍生成新时间，并从当前目录版本继承原 xattr（包括二进制属性），内容哈希和版本号重新生成；跨带覆盖同样适用。目录不可读或旧记录缺少 xattr 元数据时拒绝覆盖，需先从磁带重新对账，不能把未知属性当成空属性。不能通过客户端注入回收元数据。
+Rust `FileStat.version` 使用 `FileVersion` 区分真实身份域：Raft 的轮次/序号、原生 LTFS 的卷 UUID/fileuid/索引代数，以及 FDB 的 namespace/inode/逻辑版本。不同身份域不排序；LTFS 只在同卷同 fileuid、FDB 只在同 namespace 同 inode 内排序。版本显示分别为 `round.sequence`、`ltfs:VOLUME/UID@GENERATION` 和 `fdb:NAMESPACE/INODE@VERSION`。`FileStat.round` 为可选的查询执行轮次；纯元数据与原生 LTFS 查询不填写执行轮次。`FileStat.generation` 同样可选：只有真实物理来源才填写代数，逻辑目录不补0。
+
+FDB 文件缓存即使 SHA-256 相同，也核对 namespace、inode 和逻辑版本。已有读句柄及映射保留原内容、版本、哈希和扩展属性。同一 FDB inode 的版本变化时，新 open 返回 ESTALE，最后一个旧引用关闭后可重新下载；同名重建为不同 FDB inode 时分配独立的本地 inode，新文件可在旧句柄仍打开时读取。文件重建为目录或链接也按各自身份报告类型。首次下载期间身份变化返回 EAGAIN，并丢弃私有临时缓存。
+
+`Backend::list_dir` 返回 `DirectoryListing`，携带本次捕获的目录版本和子项；`DirItem.version` 携带后端提供的子项版本。FDB 列举保留真实父子身份，目录项与 lookup 使用相同的本地 inode；原目录被同名重建后，旧 inode 的列举与子项查询返回 ESTALE；子项查询前后均核对 FDB 父目录身份，同一父 inode 仅版本变化仍可查询。Raft 和原生 LTFS 当前列举没有提供这些版本，明确保留 None。所有调用方直接使用当前接口。
+
+Raft 路径查询要求已知状态、真实的双整数版本字段及真实索引代数，缺失或错误编码返回 Verification。条件删除接收类型化文件版本，先拒绝其他身份域，再发送 Raft If-Match；FDB 操作继续使用保存的原请求。上传结果可通过只读入口查询，不依赖当前 owner；未确认请求的写入仍须连接受当前许可保护的 writer。首版直接更新所有 Rust 调用方，不提供旧 tuple 转换接口。FDB 已提供[显式挂载入口](foundationdb.md#fdb-挂载)，固定 namespace 与池，保留原属性并按登记算法核验下载。默认内核只读；指定专用 `--fdb-journal-dir` 后持久保存原操作并支持普通文件创建、覆盖和原操作恢复。FDB 的 flush 同步确认原 S4 与完整回执，未知结果冻结原正文，根 `user.ltfs.sync` 继续原上传；不追加原生后端的完整检查点。FDB 已支持目录、链接、删除、属性和 xattr 修改。Rust SDK、[rename CLI](foundationdb.md#rename-cli) 和 FUSE 均使用双路径改名及持久原日志。FUSE 改名前提交源文件及子树的脏数据，成功后保留源 inode 并更新打开 writer 的完整版本条件；结果未定时冻结路径操作和写入，根 `user.ltfs.sync` 继续同一原请求。
 
 
 ## 工具兼容性早期实验（后续页缓存版本已取代）
@@ -232,7 +154,7 @@ LE 后续能力实测及实现进度见 [LE/Holo 能力矩阵](../.scratch/ltfs-
 
 服务端上传和删除批次使用标准 DP 增量索引（XML 格式版本 2.5.0）。连续最多 5 份增量后，下一次有变更的提交生成 DP/IP 全量检查点；更小的恢复链预算会进一步缩短此间隔。正常停机和换出写入带前也生成全量检查点。全量只重写索引，不复制文件数据。
 
-提交成功仍要求磁带持久化屏障及 VCI 更新完成；202 仍仅表示节点暂存。恢复从 Full 顺序应用依赖增量，缺链不得当作最新完整视图。旧版 LTFS 工具对异常增量尾部的恢复不在兼容性保证内；清洁 Full 与现场 LE 的互操作仍需独立验证。
+提交成功仍要求磁带持久化屏障及 VCI 更新完成；202 仍仅表示节点暂存。恢复从 Full 顺序应用依赖增量，缺链不得当作最新完整视图。现场 EE 1.3.4 / LE 2.4.6 使用 LTFS 2.4 Full，不能把本项目的增量恢复能力当作 EE 能力。交接给 EE 前必须正常完成 Full 检查点及卸载，并确认最新有效索引为 Full；异常中断留下的增量末索引须先由本项目恢复，不能交给旧版 EE 修复。Full 同代重写按已理解字段的逻辑值核验，保留原始 XML 摘要和物理来源身份。真实互通结果与边界见[本轮报告](../.scratch/ltfs-ha/reports/fuse-s3-ee-physical-20261104.md)。
 
 
 ## 持久化目录接口

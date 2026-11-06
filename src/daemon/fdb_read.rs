@@ -3,7 +3,7 @@
 //! after the medium, file digest and final ownership checks succeed.
 
 use std::fs::File;
-use std::io::{Seek, Write};
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 
 use md5::Md5;
@@ -13,11 +13,15 @@ use uuid::Uuid;
 use crate::catalog::volume_extents::{ExpectedIndex, VolumeExtentCache};
 use crate::error::{Result, TapeError};
 use crate::ltfs::label::LtfsLabel;
-use crate::ltfs::recovery::{RecoveryBudget, verify_dp_ip_head_with_evidence};
+use crate::ltfs::recovery::{
+    RecoveryBudget, capture_index_source, capture_recorded_index_source,
+    verify_dp_ip_head_with_evidence,
+};
 use crate::ltfs::volume::{CommittedIndexConstruct, read_cached_file_to_writer, read_label_only};
 use crate::managed_catalog::{
-    ActiveIndexIdentity, ActiveLibraryRoute, ActiveLoadedVolumeHead, ContentDigest, ManagedCatalog,
-    ResolvedRead,
+    ActiveFileRequest, ActiveIndexIdentity, ActiveLibraryRoute, ActiveLoadedVolumeHead,
+    ActiveReadSource, ContentDigest, ManagedCatalog, ReclaimFile, ReclaimFileMetadata,
+    ReclaimReservation, ReclaimSourceInventory, ReclaimSourceRead, ResolvedRead,
 };
 use crate::scsi::reservation::{ReservationKey, verify_holder};
 use crate::scsi::transport::TapeTransport;
@@ -31,6 +35,9 @@ use crate::local_read_storage::{
 
 pub struct ActiveMediaRead {
     pub metadata: ResolvedRead,
+    /// Exact current medium head proved by this read. The file's historical
+    /// source may predate it and must not be substituted as a health proof.
+    pub verified_head: crate::managed_catalog::ActiveIndexIdentity,
     pub file: File,
 }
 
@@ -46,7 +53,182 @@ pub struct ActiveMediaReader<'a> {
     pub storage: ReadStorageBudget,
 }
 
+#[derive(Clone, Copy)]
+enum ReadTarget<'a> {
+    Published(&'a [u8]),
+    Reclaim(&'a ReclaimReservation, &'a ActiveFileRequest),
+}
+impl ReadTarget<'_> {
+    async fn resolve(self, reader: &ActiveMediaReader<'_>) -> Result<Option<ActiveReadSource>> {
+        let result = match self {
+            Self::Published(path) => {
+                reader
+                    .catalog
+                    .resolve_active_read_source_for_owner(
+                        reader.serial,
+                        path,
+                        reader.route,
+                        reader.key.round(),
+                    )
+                    .await
+            }
+            Self::Reclaim(reservation, request) => reader
+                .catalog
+                .reclaim_read_source(reservation, reader.key.round(), request)
+                .await
+                .map(Some),
+        };
+        result.map_err(|error| TapeError::Catalog(error.to_string()))
+    }
+}
+
 impl ActiveMediaReader<'_> {
+    /// Read the current source before sealing its copy request. In particular,
+    /// an EE file without a recorded digest must acquire its SHA from bytes.
+    pub async fn read_reclaim_file_with_cache(
+        &self,
+        reservation: &ReclaimReservation,
+        file: &ReclaimFile,
+        inventory: &ReclaimSourceInventory<'_>,
+        cache_dir: &Path,
+        spool_dir: &Path,
+    ) -> Result<(ActiveMediaRead, ReclaimSourceRead)> {
+        if reservation.intent()["library"] != self.serial
+            || reservation.intent()["namespace"] != self.route.route.namespace.to_string()
+        {
+            return Err(TapeError::Catalog("源读取不属于当前带库或命名空间".into()));
+        }
+        self.catalog
+            .reserved_reclaim_status(reservation, self.key.round())
+            .await
+            .map_err(|e| TapeError::Catalog(e.to_string()))?;
+        let spec = reservation.spec();
+        let path = format!("/{}{}", spec.pool(), file.path());
+        let mut read = self
+            .read_with_cache_scoped(path.as_bytes(), Some(spec.pool()), cache_dir, spool_dir)
+            .await?
+            .ok_or_else(|| TapeError::Catalog("回收源文件不存在".into()))?;
+        // Hash the exact anonymous spool returned by the checked reader, never
+        // a caller-supplied pathname. Rewind before returning it to the writer.
+        read.file.rewind()?;
+        let mut sha = Sha256::new();
+        let mut buffer = vec![0; 1024 * 1024];
+        let mut remaining = read.metadata.copy.size;
+        loop {
+            let count = read.file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            remaining = remaining
+                .checked_sub(count as u64)
+                .ok_or_else(|| TapeError::Catalog("源暂存正文超过已核验长度".into()))?;
+            sha.update(&buffer[..count]);
+        }
+        if remaining != 0 {
+            return Err(TapeError::Catalog("源暂存正文短于已核验长度".into()));
+        }
+        read.file.rewind()?;
+        self.check_device_owner()?;
+        self.catalog
+            .reserved_reclaim_status(reservation, self.key.round())
+            .await
+            .map_err(|e| TapeError::Catalog(e.to_string()))?;
+        let evidence = inventory
+            .bind_verified_read(
+                reservation,
+                file,
+                &read.metadata,
+                read.verified_head,
+                sha.finalize().into(),
+            )
+            .map_err(|e| TapeError::Catalog(e.to_string()))?;
+        Ok((read, evidence))
+    }
+
+    /// Read the destination bytes and its current raw metadata under the same
+    /// serialized drive lease. Failed capture/ownership checks yield no proof.
+    pub async fn read_reclaim_metadata_with_cache(
+        &self,
+        reservation: &ReclaimReservation,
+        request: &ActiveFileRequest,
+        inventory: &ReclaimSourceInventory<'_>,
+        cache_dir: &Path,
+        spool_dir: &Path,
+    ) -> Result<(ActiveMediaRead, ReclaimFileMetadata)> {
+        if request.library_serial != self.serial
+            || request.namespace != self.route.route.namespace
+            || reservation.intent()["library"] != self.serial
+            || reservation.intent()["namespace"] != request.namespace.to_string()
+        {
+            return Err(TapeError::Catalog(
+                "元数据读取不属于当前带库或命名空间".into(),
+            ));
+        }
+        let source = self
+            .catalog
+            .reclaim_read_source(reservation, self.key.round(), request)
+            .await
+            .map_err(|e| TapeError::Catalog(e.to_string()))?;
+        let pool = request
+            .pool_id
+            .ok_or_else(|| TapeError::Catalog("回收元数据缺少原池".into()))?;
+        let path = crate::managed_catalog::pool_catalog_path(
+            pool,
+            request
+                .ltfs_path()
+                .map_err(|e| TapeError::Catalog(e.to_string()))?
+                .as_bytes(),
+        )
+        .map_err(|e| TapeError::Catalog(e.to_string()))?;
+        let read = self
+            .read_with_cache_scoped(&path, Some(pool), cache_dir, spool_dir)
+            .await?
+            .ok_or_else(|| TapeError::Catalog("回收目的文件不存在".into()))?;
+        self.check_device_owner()?;
+        let label = read_label_only(self.device)?;
+        let mut budget = RecoveryBudget::default();
+        budget.max_index_bytes = budget
+            .max_index_bytes
+            .min(usize::try_from(self.storage.index_bytes).unwrap_or(usize::MAX));
+        budget.index_scratch.directory = spool_dir.to_path_buf();
+        budget.index_scratch.max_bytes = self.storage.index_bytes;
+        budget.index_scratch.headroom_bytes = self.storage.headroom_bytes;
+        let captured = retry_after_space_reclaim(
+            || capture_index_source(&TapeDrive::new(self.device), &label, &budget),
+            || reclaim_cache_space(cache_dir, self.storage),
+        )?;
+        let (_, head) = self
+            .verify_media_head(
+                &read.metadata.placement.barcode,
+                read.metadata.copy.volume_id,
+                spool_dir,
+                || reclaim_cache_space(cache_dir, self.storage),
+            )
+            .await?;
+        if head.index != read.verified_head {
+            return Err(TapeError::Catalog("目的索引在元数据读取期间改变".into()));
+        }
+        let final_source = self
+            .catalog
+            .reclaim_read_source(reservation, self.key.round(), request)
+            .await
+            .map_err(|e| TapeError::Catalog(e.to_string()))?;
+        if final_source != source {
+            return Err(TapeError::Catalog("原回收来源在元数据读取期间改变".into()));
+        }
+        self.check_device_owner()?;
+        let evidence = inventory
+            .bind_verified_metadata(
+                reservation,
+                request,
+                source.copy(),
+                (&read.metadata, read.verified_head),
+                &captured,
+            )
+            .map_err(|e| TapeError::Catalog(e.to_string()))?;
+        Ok((read, evidence))
+    }
+
     fn check_device_owner(&self) -> Result<()> {
         let round = self.key.round();
         if !self.key.is_ours()
@@ -76,6 +258,11 @@ impl ActiveMediaReader<'_> {
             .map_err(|error| TapeError::Catalog(error.to_string()))?
             .ok_or_else(|| TapeError::Catalog("FDB 读取卷未绑定当前带库".into()))?;
         self.check_device_owner()?;
+        if !head.online || head.blacklisted {
+            return Err(TapeError::MediaUnavailable {
+                barcode: barcode.into(),
+            });
+        }
         let label = read_label_only(self.device)?;
         if label.volume_uuid != head.volume_id || label.volume_uuid != volume {
             return Err(TapeError::Catalog(
@@ -142,17 +329,40 @@ impl ActiveMediaReader<'_> {
         cache_dir: &Path,
         spool_dir: &Path,
     ) -> Result<Option<ActiveMediaRead>> {
-        self.check_device_owner()?;
-        let source = self
-            .catalog
-            .resolve_active_read_source_for_owner(self.serial, path, self.route, self.key.round())
+        self.read_target_with_cache(ReadTarget::Published(path), pool, cache_dir, spool_dir)
             .await
-            .map_err(|error| TapeError::Catalog(error.to_string()))?;
+    }
+
+    pub async fn read_reclaim_with_cache(
+        &self,
+        reservation: &ReclaimReservation,
+        request: &ActiveFileRequest,
+        cache_dir: &Path,
+        spool_dir: &Path,
+    ) -> Result<Option<ActiveMediaRead>> {
+        self.read_target_with_cache(
+            ReadTarget::Reclaim(reservation, request),
+            request.pool_id,
+            cache_dir,
+            spool_dir,
+        )
+        .await
+    }
+
+    async fn read_target_with_cache(
+        &self,
+        target: ReadTarget<'_>,
+        pool: Option<Uuid>,
+        cache_dir: &Path,
+        spool_dir: &Path,
+    ) -> Result<Option<ActiveMediaRead>> {
+        self.check_device_owner()?;
+        let source = target.resolve(self).await?;
         let Some(source) = source else {
             return Ok(None);
         };
         require_pool(pool, source.placement().pool_id)?;
-        let cache_path = cache_dir.join(cache_name(source.source));
+        let cache_path = cache_dir.join(cache_name(source.source, source.baseline.as_ref()));
         let _cache_pin = match CachePin::open(&cache_path) {
             Ok(pin) => pin,
             Err(TapeError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -165,33 +375,42 @@ impl ActiveMediaReader<'_> {
                     )
                     .await?;
                 let mut storage = CacheBuild::new(cache_dir, self.storage)?;
-                VolumeExtentCache::build_managed_from_media(
-                    &TapeDrive::new(self.device),
-                    &label,
-                    &RecoveryBudget::default(),
-                    &cache_path,
-                    ExpectedIndex {
-                        volume_uuid: source.source.volume_uuid,
-                        generation: source.source.generation,
-                        location: source.source.location,
-                        sha256: source.source.sha256,
-                    },
-                    source.source.incremental,
-                    &mut storage,
-                )?;
+                if let Some(identity) = source
+                    .baseline
+                    .as_ref()
+                    .filter(|identity| identity.head().incremental)
+                {
+                    let mut budget = RecoveryBudget::default();
+                    budget.index_scratch.directory = spool_dir.to_path_buf();
+                    budget.index_scratch.max_bytes = self.storage.index_bytes;
+                    budget.index_scratch.headroom_bytes = self.storage.headroom_bytes;
+                    let captured = capture_recorded_index_source(
+                        &TapeDrive::new(self.device),
+                        &label,
+                        identity,
+                        &budget,
+                    )?;
+                    VolumeExtentCache::build_captured(&captured, &cache_path, &mut storage)?;
+                } else {
+                    VolumeExtentCache::build_managed_from_media(
+                        &TapeDrive::new(self.device),
+                        &label,
+                        &RecoveryBudget::default(),
+                        &cache_path,
+                        ExpectedIndex {
+                            volume_uuid: source.source.volume_uuid,
+                            generation: source.source.generation,
+                            location: source.source.location,
+                            sha256: source.source.sha256,
+                        },
+                        source.source.incremental,
+                        &mut storage,
+                    )?;
+                }
                 storage.finish()?;
                 let pin = CachePin::open(&cache_path)?;
                 self.check_device_owner()?;
-                let final_source = self
-                    .catalog
-                    .resolve_active_read_source_for_owner(
-                        self.serial,
-                        path,
-                        self.route,
-                        self.key.round(),
-                    )
-                    .await
-                    .map_err(|error| TapeError::Catalog(error.to_string()))?;
+                let final_source = target.resolve(self).await?;
                 let final_head = self
                     .catalog
                     .active_loaded_volume_head(
@@ -212,7 +431,7 @@ impl ActiveMediaReader<'_> {
             }
             Err(error) => return Err(error),
         };
-        self.read_scoped(path, pool, &cache_path, spool_dir, Some(cache_dir))
+        self.read_scoped(target, pool, &cache_path, spool_dir, Some(cache_dir))
             .await
     }
 
@@ -225,13 +444,19 @@ impl ActiveMediaReader<'_> {
         cache_path: &Path,
         spool_dir: &Path,
     ) -> Result<Option<ActiveMediaRead>> {
-        self.read_scoped(path, None, cache_path, spool_dir, None)
-            .await
+        self.read_scoped(
+            ReadTarget::Published(path),
+            None,
+            cache_path,
+            spool_dir,
+            None,
+        )
+        .await
     }
 
     async fn read_scoped(
         &self,
-        path: &[u8],
+        target: ReadTarget<'_>,
         pool: Option<Uuid>,
         cache_path: &Path,
         spool_dir: &Path,
@@ -239,16 +464,11 @@ impl ActiveMediaReader<'_> {
     ) -> Result<Option<ActiveMediaRead>> {
         self.check_device_owner()?;
         let _cache_pin = CachePin::open(cache_path)?;
-        let plan = self
-            .catalog
-            .resolve_active_read_for_owner(
-                self.serial,
-                path,
-                cache_path,
-                self.route,
-                self.key.round(),
-            )
-            .await
+        let plan = target
+            .resolve(self)
+            .await?
+            .map(|source| source.plan_read(cache_path))
+            .transpose()
             .map_err(|error| TapeError::Catalog(error.to_string()))?;
         let Some(plan) = plan else {
             return Ok(None);
@@ -270,6 +490,20 @@ impl ActiveMediaReader<'_> {
                 reclaim,
             )
             .await?;
+
+        if let Some(identity) = plan
+            .baseline
+            .as_ref()
+            .filter(|identity| identity.head().incremental)
+        {
+            crate::ltfs::recovery::verify_recorded_source_constructs(
+                &TapeDrive::new(self.device),
+                &label,
+                identity,
+                &RecoveryBudget::default(),
+            )?;
+            self.check_device_owner()?;
+        }
 
         let mut writer = DigestingFile {
             file,
@@ -293,16 +527,11 @@ impl ActiveMediaReader<'_> {
             return Err(TapeError::Catalog("FDB 文件读取摘要不符".into()));
         }
         self.check_device_owner()?;
-        let final_plan = self
-            .catalog
-            .resolve_active_read_for_owner(
-                self.serial,
-                path,
-                cache_path,
-                self.route,
-                self.key.round(),
-            )
-            .await
+        let final_plan = target
+            .resolve(self)
+            .await?
+            .map(|source| source.plan_read(cache_path))
+            .transpose()
             .map_err(|error| TapeError::Catalog(error.to_string()))?;
         let final_head = self
             .catalog
@@ -321,6 +550,7 @@ impl ActiveMediaReader<'_> {
         writer.file.rewind()?;
         Ok(Some(ActiveMediaRead {
             metadata: plan.read,
+            verified_head: head.index,
             file: writer.file,
         }))
     }
@@ -335,8 +565,15 @@ fn require_pool(expected: Option<Uuid>, actual: Uuid) -> Result<()> {
     Ok(())
 }
 
-fn cache_name(source: ActiveIndexIdentity) -> String {
+fn cache_name(
+    source: ActiveIndexIdentity,
+    baseline: Option<&crate::ltfs::recovery::IndexSourceIdentity>,
+) -> String {
     let mut hash = Sha256::new();
+    if let Some(identity) = baseline.filter(|identity| identity.head().incremental) {
+        hash.update(b"tape-rs/complete-replay-cache/1");
+        hash.update(identity.fingerprint());
+    }
     hash.update(source.volume_uuid.as_bytes());
     hash.update(source.generation.to_be_bytes());
     hash.update((source.location.partition as u32).to_be_bytes());

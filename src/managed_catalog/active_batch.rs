@@ -1079,6 +1079,7 @@ impl ManagedCatalog {
                                 });
                             }
                             tr.set(&key, &expected);
+                            namespace_visibility::publish(&tr, namespace);
                             Ok(ActivePublicationOutcome::Published)
                         }
                         .await,
@@ -1256,7 +1257,15 @@ impl ManagedCatalog {
                                     .get(&prepared_key(volume, generation, epoch, operation), false)
                                     .await?
                                     .ok_or(CatalogError::Corrupt("活动终结文件准备缺失"))?;
-                                let (saved_batch, fingerprint, _) = decode_prepared(&prepared)?;
+                                let (saved_batch, fingerprint, attributes) =
+                                    decode_prepared(&prepared)?;
+                                upload_receipts::require_at(
+                                    &tr,
+                                    &receipt,
+                                    &placement.barcode,
+                                    attributes,
+                                )
+                                .await?;
                                 if saved_batch != batch_id || fingerprint != entry[24..] {
                                     return Err(CatalogError::Corrupt("活动终结文件准备不一致"));
                                 }
@@ -1267,13 +1276,29 @@ impl ManagedCatalog {
                                 if tr.get(&op, false).await?.is_some() {
                                     return Err(CatalogError::Corrupt("活动终结前已有请求结果"));
                                 }
-                                terminals.push((
-                                    op,
-                                    requests::terminal_value(
-                                        &receipt_fingerprint(&receipt),
-                                        Some(receipt.expected_version.unwrap_or(0) + 1),
-                                    ),
-                                ));
+                                let mut terminal = requests::terminal_value(
+                                    &receipt_fingerprint(&receipt),
+                                    Some(receipt.expected_version.unwrap_or(0) + 1),
+                                );
+                                if let Some(raw) = tr
+                                    .get(&reservation::upgraded_key_for(&receipt), false)
+                                    .await?
+                                {
+                                    let (upload, saved_permit) =
+                                        reservation::decode(&raw, namespace, epoch, operation)?;
+                                    if saved_permit != permit {
+                                        return Err(CatalogError::Corrupt(
+                                            "活动终结写前许可不一致",
+                                        ));
+                                    }
+                                    // Independently bind the retained upload to this exact receipt.
+                                    reservation::intent_for_upgraded_at(&tr, &receipt, permit)
+                                        .await?;
+                                    terminal.extend_from_slice(
+                                        &reservation::cancellation_fingerprint(&upload),
+                                    );
+                                }
+                                terminals.push((op, terminal));
                             }
                             let mut releases = Vec::with_capacity(permits.len());
                             for (permit, count) in permits {
@@ -1496,19 +1521,9 @@ impl ManagedCatalog {
                                 return Err(CatalogError::Corrupt("活动归并属性摘要不一致"));
                             }
                             let inode_key = node_key(namespace, receipt.file_id);
-                            let old_external = tr
-                                .get(&inode_key, false)
-                                .await?
-                                .as_deref()
-                                .map(decode_node)
-                                .transpose()?
-                                .and_then(|node| node.attributes)
-                                .is_some_and(|attrs| attrs.is_external());
-                            write_attribute_chunks(
+                            attribute_objects::require_attributes(
                                 &tr,
                                 namespace,
-                                receipt.file_id,
-                                old_external,
                                 Some(&attributes),
                             )
                             .await?;
@@ -1520,6 +1535,7 @@ impl ManagedCatalog {
                                 &inode_key,
                                 &encode_node(&Node {
                                     kind: NodeKind::File,
+                                    directory_version: None,
                                     parent: receipt.parent,
                                     name: receipt.name.clone(),
                                     attributes: Some(attributes),
@@ -2164,12 +2180,32 @@ impl ManagedCatalog {
                             }
                             if let Some(existing) = tr.get(&item_key, false).await? {
                                 decode_prepared(&existing)?;
-                                return Ok(if existing.as_ref() == prepared.as_slice() {
-                                    ActivePreparationOutcome::AlreadyPrepared
-                                } else {
-                                    ActivePreparationOutcome::BatchConflict
-                                });
+                                if existing.as_ref() != prepared.as_slice() {
+                                    return Ok(ActivePreparationOutcome::BatchConflict);
+                                }
+                                upload_receipts::prepare_at(
+                                    &tr,
+                                    &receipt,
+                                    requests::matching_permit(&intent, &receipt)?
+                                        .expect("checked permit"),
+                                    &placement.barcode,
+                                    attributes,
+                                    true,
+                                )
+                                .await?;
+                                return Ok(ActivePreparationOutcome::AlreadyPrepared);
                             }
+                            let original = upload_receipts::prepare_at(
+                                &tr,
+                                &receipt,
+                                requests::matching_permit(&intent, &receipt)?
+                                    .expect("checked permit"),
+                                &placement.barcode,
+                                attributes,
+                                false,
+                            )
+                            .await?
+                            .expect("new preparation");
                             if let Some(manifest) = manifest {
                                 attribute_objects::require_complete(
                                     &tr,
@@ -2190,6 +2226,7 @@ impl ManagedCatalog {
                                 }
                                 tr.set(&key, &inline);
                             }
+                            original.apply(&tr);
                             tr.set(&item_key, &prepared);
                             Ok(ActivePreparationOutcome::Prepared)
                         }
@@ -2688,6 +2725,7 @@ impl ManagedCatalog {
                             if !next_generation(current, generation) {
                                 return Ok(ActiveBatchOutcome::GenerationConflict);
                             }
+                            control::node_attempts::require_no_pending_at(&tr, volume).await?;
                             if active_volume::recovery_active(&tr, volume).await? {
                                 return Ok(ActiveBatchOutcome::GenerationConflict);
                             }
@@ -2707,6 +2745,7 @@ impl ManagedCatalog {
                                     }
                                 });
                             }
+                            control::reclaim::require_receipt_at(&tr, &representative).await?;
                             tr.set(&header_key, &header.encode());
                             Ok(ActiveBatchOutcome::Staged)
                         }
@@ -2750,6 +2789,7 @@ impl ManagedCatalog {
                                 {
                                     return Ok(ActiveBatchOutcome::StaleOwner);
                                 }
+                                control::node_attempts::require_no_pending_at(&tr, volume).await?;
                                 if active_volume::recovery_active(&tr, volume).await? {
                                     return Ok(ActiveBatchOutcome::GenerationConflict);
                                 }
@@ -2903,6 +2943,7 @@ impl ManagedCatalog {
                             {
                                 return Ok(ActiveBatchOutcome::StaleOwner);
                             }
+                            control::node_attempts::require_no_pending_at(&tr, volume).await?;
                             if active_volume::recovery_active(&tr, volume).await? {
                                 return Ok(ActiveBatchOutcome::GenerationConflict);
                             }
@@ -3261,7 +3302,7 @@ impl ManagedCatalog {
         let publication = tr.get(&publication_key(volume, generation), false).await?;
         if completed {
             let Some((observed_batch, _)) =
-                active_volume::observed_batch_at(&tr, serial, volume, generation).await?
+                active_volume::observed_completed_batch_at(&tr, serial, volume, generation).await?
             else {
                 return Err(CatalogError::Corrupt("已完成批次缺少物理索引观察"));
             };

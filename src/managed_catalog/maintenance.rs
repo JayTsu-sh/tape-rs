@@ -1672,7 +1672,7 @@ pub(super) mod tests {
         for r in receipts {
             assert!(c.file_head(ns, r.file_id).await.unwrap().is_some());
             assert!(
-                c.legacy_copy_record_for_test(ns, r.file_id, r.copy_id)
+                c.unplaced_copy_record_for_test(ns, r.file_id, r.copy_id)
                     .await
                     .unwrap()
                     .is_some()

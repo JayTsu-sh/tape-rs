@@ -10,6 +10,7 @@ use crate::catalog::volume_extents::{CachedFile, ExpectedIndex, VolumeExtentCach
 pub enum ResolvedPath {
     Directory {
         id: Uuid,
+        version: u64,
         attributes: Option<NodeAttributes>,
     },
     File {
@@ -18,6 +19,7 @@ pub enum ResolvedPath {
         copy: Box<PhysicalCopy>,
         placement: VolumePlacement,
         attributes: Option<NodeAttributes>,
+        object_metadata: Option<ObjectMetadata>,
     },
 }
 
@@ -37,6 +39,7 @@ pub struct ResolvedRead {
 pub struct ResolvedActiveRead {
     pub read: ResolvedRead,
     pub source: ActiveIndexIdentity,
+    pub baseline: Option<crate::ltfs::recovery::IndexSourceIdentity>,
 }
 
 /// A cache-independent file lookup. The path and published metadata remain
@@ -46,9 +49,17 @@ pub struct ActiveReadSource {
     resolved: ResolvedPath,
     path: Vec<u8>,
     pub source: ActiveIndexIdentity,
+    pub baseline: Option<crate::ltfs::recovery::IndexSourceIdentity>,
 }
 
 impl ActiveReadSource {
+    pub(crate) fn copy(&self) -> &PhysicalCopy {
+        match &self.resolved {
+            ResolvedPath::File { copy, .. } => copy,
+            ResolvedPath::Directory { .. } => unreachable!("source lookup accepts files only"),
+        }
+    }
+
     pub fn placement(&self) -> &VolumePlacement {
         match &self.resolved {
             ResolvedPath::File { placement, .. } => placement,
@@ -63,7 +74,9 @@ impl ActiveReadSource {
             location: self.source.location,
             sha256: self.source.sha256,
         };
-        let cache = if self.source.incremental {
+        let cache = if let Some(identity) = &self.baseline {
+            VolumeExtentCache::open_captured(cache_path, identity)
+        } else if self.source.incremental {
             VolumeExtentCache::open_incremental(cache_path, expected)
         } else {
             VolumeExtentCache::open(cache_path, expected)
@@ -72,6 +85,7 @@ impl ActiveReadSource {
         Ok(ResolvedActiveRead {
             read: plan_read(self.resolved, &self.path, &cache)?,
             source: self.source,
+            baseline: self.baseline,
         })
     }
 }
@@ -91,6 +105,26 @@ pub(super) fn path_components(path: &[u8]) -> Result<Vec<&[u8]>> {
         validate_name(component)?;
     }
     Ok(components)
+}
+
+async fn require_pool_path_at(
+    tr: &Transaction,
+    namespace: Uuid,
+    serial: &str,
+    components: &[&[u8]],
+) -> Result<Uuid> {
+    let pool = components
+        .first()
+        .and_then(|name| std::str::from_utf8(name).ok())
+        .and_then(|name| Uuid::parse_str(name).ok())
+        .filter(|pool| !pool.is_nil())
+        .ok_or(CatalogError::Invalid("活动目录路径必须以池 UUID 开始"))?;
+    if pool.to_string().as_bytes() != components[0] {
+        return Err(CatalogError::Invalid("池 UUID 路径格式不规范"));
+    }
+    control::require_pool_library(tr, namespace, pool, serial).await?;
+    control::native_media::require_pool_readable(tr, namespace, pool).await?;
+    Ok(pool)
 }
 
 pub(super) async fn require_serving_copy_at(
@@ -122,10 +156,14 @@ pub(super) async fn require_serving_copy_at(
         {
             return Err(CatalogError::Corrupt("活动副本与扫描或带库路由不一致"));
         }
-        let (_, index) =
-            active_volume::observed_batch_at(tr, &serial, copy.volume_id, copy.volume_generation)
-                .await?
-                .ok_or(CatalogError::Incomplete)?;
+        let index = active_volume::observed_copy_index_at(
+            tr,
+            &serial,
+            copy.volume_id,
+            copy.volume_generation,
+        )
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
         if index.volume_uuid != copy.volume_id || index.generation != copy.volume_generation {
             return Err(CatalogError::Corrupt("活动副本与已观察索引不一致"));
         }
@@ -260,6 +298,7 @@ impl ManagedCatalog {
         } else {
             routing::require_active_namespace(&tr, serial).await?
         };
+        require_pool_path_at(&tr, namespace, serial, &components).await?;
         let Some(resolved) = resolve_active_path_at(&tr, namespace, components).await? else {
             return Ok(None);
         };
@@ -281,51 +320,13 @@ impl ManagedCatalog {
         if placement.library_serial != serial {
             return Err(CatalogError::Corrupt("活动文件副本与带库路由不一致"));
         }
-        let baseline = require_volume_ready(&tr, copy.volume_id, None).await?;
-        if copy.volume_scan_id != baseline.id || copy.volume_generation < baseline.generation {
-            return Err(CatalogError::Corrupt("活动文件副本与导入基线不一致"));
-        }
-        let (expected, incremental) = if copy.volume_generation == baseline.generation {
-            (
-                index_evidence::require_source(&tr, copy.volume_id, baseline).await?,
-                false,
-            )
-        } else {
-            let (_, index) = active_volume::observed_batch_at(
-                &tr,
-                serial,
-                copy.volume_id,
-                copy.volume_generation,
-            )
-            .await?
-            .ok_or(CatalogError::Corrupt("活动文件副本缺少已观察索引"))?;
-            (
-                ExpectedIndex {
-                    volume_uuid: index.volume_uuid,
-                    generation: index.generation,
-                    location: index.location,
-                    sha256: index.sha256,
-                },
-                index.incremental,
-            )
-        };
-        let source = ActiveIndexIdentity {
-            volume_uuid: expected.volume_uuid,
-            generation: expected.generation,
-            location: expected.location,
-            sha256: expected.sha256,
-            incremental,
-        };
+        let source = read_source_at(&tr, serial, path, resolved).await?;
         drop(tr);
         let resolved = self
-            .hydrate_resolved(namespace, Some(resolved))
+            .hydrate_resolved(namespace, Some(source.resolved))
             .await?
             .expect("resolved path");
-        Ok(Some(ActiveReadSource {
-            resolved,
-            path: path.to_vec(),
-            source,
-        }))
+        Ok(Some(ActiveReadSource { resolved, ..source }))
     }
 
     /// A readable managed namespace can answer `None` only after its import
@@ -381,7 +382,56 @@ impl ManagedCatalog {
         let tr = self.db.create_trx()?;
         let namespace =
             routing::require_expected_active_namespace(&tr, serial, Some(expected)).await?;
-        resolve_active_path_at_mode(&tr, namespace, components, false).await
+        let pool = require_pool_path_at(&tr, namespace, serial, &components).await?;
+        let resolved = resolve_active_path_at_mode(&tr, namespace, components, false).await?;
+        if let Some(ResolvedPath::File { placement, .. }) = &resolved
+            && (placement.pool_id != pool || placement.library_serial != serial)
+        {
+            return Err(CatalogError::Corrupt("文件副本与池路径或带库归属不一致"));
+        }
+        Ok(resolved)
+    }
+
+    /// Capture the node/version and its exact immutable attribute reference in
+    /// one read version, then hydrate only that reference within the RAM budget.
+    pub async fn resolve_active_attributes_for_route(
+        &self,
+        serial: &str,
+        path: &[u8],
+        expected: ActiveLibraryRoute,
+        max_bytes: usize,
+    ) -> Result<Option<ResolvedPath>> {
+        if max_bytes == 0 {
+            return Err(CatalogError::Invalid("节点属性读取预算必须大于零"));
+        }
+        control::validate_physical_serial(serial)?;
+        let components = path_components(path)?;
+        let tr = self.db.create_trx()?;
+        let namespace =
+            routing::require_expected_active_namespace(&tr, serial, Some(expected)).await?;
+        let pool = require_pool_path_at(&tr, namespace, serial, &components).await?;
+        let resolved = resolve_active_path_at(&tr, namespace, components).await?;
+        if let Some(ResolvedPath::File { placement, .. }) = &resolved
+            && (placement.pool_id != pool || placement.library_serial != serial)
+        {
+            return Err(CatalogError::Corrupt("文件属性与池路径或带库归属不一致"));
+        }
+        let attributes = match &resolved {
+            None => return Ok(None),
+            Some(
+                ResolvedPath::Directory { attributes, .. } | ResolvedPath::File { attributes, .. },
+            ) => attributes.as_ref().ok_or(CatalogError::Incomplete)?,
+        };
+        let len = attributes
+            .bytes()
+            .map(|bytes| bytes.len())
+            .or_else(|| attributes.manifest().map(|manifest| manifest.len as usize))
+            .ok_or(CatalogError::Corrupt("节点属性没有内容或引用"))?;
+        if len > max_bytes {
+            return Err(CatalogError::Invalid("节点属性超过读取字节预算"));
+        }
+        drop(tr);
+        self.hydrate_resolved(namespace, resolved).await
     }
 
     async fn resolve_active_path_with_route(
@@ -394,6 +444,9 @@ impl ManagedCatalog {
         let components = path_components(path)?;
         let tr = self.db.create_trx()?;
         let namespace = routing::require_expected_active_namespace(&tr, serial, expected).await?;
+        if expected.is_some() {
+            require_pool_path_at(&tr, namespace, serial, &components).await?;
+        }
         let resolved = resolve_active_path_at(&tr, namespace, components).await?;
         drop(tr);
         self.hydrate_resolved(namespace, resolved).await
@@ -439,6 +492,9 @@ impl ManagedCatalog {
         }
         let tr = self.db.create_trx()?;
         let namespace = routing::require_expected_active_namespace(&tr, serial, expected).await?;
+        if expected.is_some() {
+            require_pool_path_at(&tr, namespace, serial, &components).await?;
+        }
         let parent = match resolve_active_path_at_mode(&tr, namespace, components, false).await? {
             Some(ResolvedPath::Directory { id, .. }) => id,
             Some(ResolvedPath::File { .. }) => {
@@ -471,6 +527,7 @@ fn plan_read(
         copy,
         placement,
         attributes,
+        ..
     } = resolved
     else {
         return Err(CatalogError::Invalid("目录不能作为普通文件读取"));
@@ -511,9 +568,19 @@ fn plan_read(
         }
         (uid, physical)
     } else {
-        cache
-            .resolve_data_file(logical)
-            .map_err(|error| CatalogError::Cache(error.to_string()))?
+        let prefix = format!("{}/", placement.pool_id);
+        logical
+            .strip_prefix(&prefix)
+            .ok_or(CatalogError::Corrupt("活动副本缺少池内路径"))?;
+        // The source construct and UID describe immutable data. Its original
+        // name need not match the current logical namespace after a rename.
+        let physical = cache
+            .required_file_by_uid(copy.ltfs_file_uid)
+            .map_err(|error| CatalogError::Cache(error.to_string()))?;
+        if physical.symlink.is_some() {
+            return Err(CatalogError::Corrupt("活动数据副本不能指向符号链接"));
+        }
+        (copy.ltfs_file_uid, physical)
     };
     if uid != copy.ltfs_file_uid || physical.length != copy.size {
         return Err(CatalogError::Corrupt(
@@ -538,7 +605,7 @@ pub(super) async fn resolve_active_path_at(
     resolve_active_path_at_mode(tr, namespace, components, true).await
 }
 
-async fn resolve_active_path_at_mode(
+pub(super) async fn resolve_active_path_at_mode(
     tr: &Transaction,
     namespace: Uuid,
     components: Vec<&[u8]>,
@@ -659,7 +726,9 @@ pub(super) fn candidate_head(receipt: &CommitReceipt) -> Result<FileHead> {
 pub(super) fn candidate_copy(receipt: &CommitReceipt, version: u64) -> PhysicalCopy {
     PhysicalCopy {
         version,
-        request_epoch: receipt.request_epoch,
+        origin: CopyOrigin::FileRequest {
+            request_epoch: receipt.request_epoch,
+        },
         volume_id: receipt.volume_id,
         volume_generation: receipt.volume_generation,
         volume_scan_id: receipt.volume_scan_id,
@@ -734,6 +803,7 @@ async fn published_target_at(
         head,
         placement,
         attributes,
+        object_metadata: object_metadata::read_at(tr, namespace, receipt.metadata_digest).await?,
     }))
 }
 
@@ -747,6 +817,11 @@ pub(super) async fn list_active_children_at(
     after: Option<&[u8]>,
     limit: usize,
 ) -> Result<Page<Child>> {
+    if let Some(raw) = tr.get(&node_key(namespace, parent), true).await?
+        && retired_nodes::from_node_record(namespace, parent, &raw)?.is_some()
+    {
+        return Err(CatalogError::Invalid("目录已删除"));
+    }
     let base_prefix = child_prefix(namespace, parent);
     let target_prefix = active_batch::path_claim_prefix_for(namespace, parent);
     let target_after = after.map(|cursor| {
@@ -953,7 +1028,7 @@ pub(super) async fn resolve_path_at(
     resolve_path_at_mode(tr, namespace, components, snapshot, true).await
 }
 
-async fn resolve_path_at_mode(
+pub(super) async fn resolve_path_at_mode(
     tr: &Transaction,
     namespace: Uuid,
     components: Vec<&[u8]>,
@@ -962,7 +1037,7 @@ async fn resolve_path_at_mode(
 ) -> Result<Option<ResolvedPath>> {
     require_namespace_readable(tr, namespace).await?;
     if tr
-        .get(&control::managed_key(namespace), true)
+        .get(&control::managed_key(namespace), snapshot)
         .await?
         .as_deref()
         != Some(&[][..])
@@ -1008,21 +1083,24 @@ async fn resolve_path_at_mode(
     }
     let _ = load_attributes;
     if node.kind == NodeKind::Directory {
-        if tr.get(&head_key(namespace, id), true).await?.is_some() {
+        if tr.get(&head_key(namespace, id), snapshot).await?.is_some() {
             return Err(CatalogError::Corrupt("目录存在文件 head"));
         }
         return Ok(Some(ResolvedPath::Directory {
             id,
+            version: node
+                .directory_version
+                .ok_or(CatalogError::Corrupt("目录属性版本缺失"))?,
             attributes: node.attributes,
         }));
     }
     let head = tr
-        .get(&head_key(namespace, id), true)
+        .get(&head_key(namespace, id), snapshot)
         .await?
         .ok_or(CatalogError::Corrupt("文件 head 缺失"))?;
     let head = decode_head(&head)?;
     let copy = tr
-        .get(&copy_key(namespace, id, head.copy_id), true)
+        .get(&copy_key(namespace, id, head.copy_id), snapshot)
         .await?
         .ok_or(CatalogError::Corrupt("当前物理副本缺失"))?;
     let copy = match decode_stored_copy(&copy)? {
@@ -1044,7 +1122,7 @@ async fn resolve_path_at_mode(
     let reverse = tr
         .get(
             &volume_key(copy.volume_id, scan.id, namespace, id, head.copy_id),
-            true,
+            snapshot,
         )
         .await?
         .ok_or(CatalogError::Corrupt("当前副本缺少卷反向索引"))?;
@@ -1056,13 +1134,221 @@ async fn resolve_path_at_mode(
         head,
         copy: Box::new(copy),
         placement,
+        object_metadata: object_metadata::read_at(
+            tr,
+            namespace,
+            node.attributes.as_ref().map(NodeAttributes::digest),
+        )
+        .await?,
         attributes: node.attributes,
     }))
+}
+
+// A source may also be an immutable, owner-fenced maintenance checkpoint.
+// Selection and byte reading still prove the current label/head and PR fence.
+pub(super) async fn read_source_at(
+    tr: &Transaction,
+    serial: &str,
+    path: &[u8],
+    resolved: ResolvedPath,
+) -> Result<ActiveReadSource> {
+    let ResolvedPath::File {
+        ref copy,
+        ref placement,
+        ..
+    } = resolved
+    else {
+        return Err(CatalogError::Invalid("目录不能作为普通文件读取"));
+    };
+    if placement.library_serial != serial || copy.media.as_ref().is_some_and(|m| m.native_symlink) {
+        return Err(CatalogError::Invalid("读取来源带库不符或为原生符号链接"));
+    }
+    let baseline = require_volume_ready(tr, copy.volume_id, None).await?;
+    if copy.volume_scan_id != baseline.id || copy.volume_generation < baseline.generation {
+        return Err(CatalogError::Corrupt("活动文件副本与导入基线不一致"));
+    }
+    let (source, baseline_source) = if copy.volume_generation == baseline.generation {
+        let identity = index_evidence::require_identity(tr, copy.volume_id, baseline).await?;
+        (identity.head().into(), Some(identity))
+    } else {
+        let index = active_volume::observed_copy_index_at(
+            tr,
+            serial,
+            copy.volume_id,
+            copy.volume_generation,
+        )
+        .await?
+        .ok_or(CatalogError::Corrupt("活动文件副本缺少已观察索引"))?;
+        (index, None)
+    };
+
+    Ok(ActiveReadSource {
+        resolved,
+        path: path.to_vec(),
+        source,
+        baseline: baseline_source,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_read_uses_original_uid_when_the_logical_name_has_changed() {
+        use crate::catalog::volume_extents::ExpectedIndex;
+        use crate::ltfs::index::{Extent, FileNode, IndexLocation, LtfsIndex};
+        use sha2::{Digest, Sha256};
+        let volume = Uuid::new_v4();
+        let namespace = Uuid::new_v4();
+        let pool = Uuid::new_v4();
+        let mut index = LtfsIndex::empty(volume, "rename read fixture".into(), 'b');
+        index.generation = 2;
+        index.self_location = IndexLocation {
+            partition: 'b',
+            start_block: 30,
+        };
+        index.previous_location = Some(IndexLocation {
+            partition: 'b',
+            start_block: 5,
+        });
+        index.highest_file_uid = 4;
+        index.root.files.push(FileNode {
+            name: "old-name".into(),
+            meta: crate::ltfs::index::NodeMeta {
+                file_uid: 2,
+                ..index.root.meta.clone()
+            },
+            length: 3,
+            xattrs: vec![crate::ltfs::index::Xattr {
+                key: "ltfs.hash.sha256sum".into(),
+                value: format!("{:x}", Sha256::digest(b"abc")),
+                base64: false,
+            }],
+            extents: vec![Extent {
+                partition: 'b',
+                start_block: 20,
+                byte_offset: 0,
+                byte_count: 3,
+                file_offset: 0,
+            }],
+            ..Default::default()
+        });
+        index.root.files.push(FileNode {
+            name: "link".into(),
+            meta: crate::ltfs::index::NodeMeta {
+                file_uid: 3,
+                ..index.root.meta.clone()
+            },
+            symlink: Some("old-name".into()),
+            ..Default::default()
+        });
+        index.root.files.push(FileNode {
+            name: "new-name".into(),
+            meta: crate::ltfs::index::NodeMeta {
+                file_uid: 4,
+                ..index.root.meta.clone()
+            },
+            length: 3,
+            extents: vec![Extent {
+                partition: 'b',
+                start_block: 21,
+                byte_offset: 0,
+                byte_count: 3,
+                file_offset: 0,
+            }],
+            ..Default::default()
+        });
+        let xml = index.to_xml().unwrap();
+        let expected = ExpectedIndex {
+            volume_uuid: volume,
+            generation: index.generation,
+            location: index.self_location,
+            sha256: Sha256::digest(&xml).into(),
+        };
+        let root = std::env::temp_dir().join(format!("rename-data-uid-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        eprintln!("rename_data_uid_workspace={}", root.display());
+        let path = root.join("original.db");
+        VolumeExtentCache::build(&xml[..], &path, expected).unwrap();
+        let cache = VolumeExtentCache::open(&path, expected).unwrap();
+        let copy = PhysicalCopy {
+            version: 1,
+            origin: CopyOrigin::FileRequest { request_epoch: 1 },
+            volume_id: volume,
+            volume_generation: index.generation,
+            volume_scan_id: Uuid::new_v4(),
+            ltfs_file_uid: 2,
+            size: 3,
+            content_digest: ContentDigest::Sha256(Sha256::digest(b"abc").into()),
+            media: None,
+        };
+        let resolved = ResolvedPath::File {
+            id: Uuid::new_v4(),
+            head: FileHead {
+                version: 1,
+                size: 3,
+                copy_id: Uuid::new_v4(),
+            },
+            copy: Box::new(copy),
+            placement: VolumePlacement {
+                volume_id: volume,
+                namespace,
+                pool_id: pool,
+                library_serial: "RENAME".into(),
+                barcode: "REN001L8".into(),
+            },
+            attributes: None,
+            object_metadata: None,
+        };
+        let original = format!("/{pool}/old-name");
+        assert!(plan_read(resolved.clone(), original.as_bytes(), &cache).is_ok());
+        let moved = format!("/{pool}/new-name");
+        let read = plan_read(resolved.clone(), moved.as_bytes(), &cache)
+            .expect("a new logical name must still read the fixed original data UID");
+        assert_eq!(read.physical.path, "old-name");
+        assert_eq!(
+            plan_read(
+                resolved.clone(),
+                format!("/{pool}/absent-name").as_bytes(),
+                &cache
+            )
+            .unwrap()
+            .physical
+            .path,
+            "old-name"
+        );
+        assert_eq!(read.physical.length, 3);
+        let mut alias = resolved.clone();
+        let ResolvedPath::File { copy, .. } = &mut alias else {
+            unreachable!()
+        };
+        copy.ltfs_file_uid = 3;
+        copy.size = 0;
+        assert!(plan_read(alias, moved.as_bytes(), &cache).is_err());
+        let mut wrong = resolved.clone();
+        let ResolvedPath::File { copy, .. } = &mut wrong else {
+            unreachable!()
+        };
+        copy.ltfs_file_uid = 999;
+        assert!(plan_read(wrong, moved.as_bytes(), &cache).is_err());
+        let mut wrong = resolved.clone();
+        let ResolvedPath::File { copy, .. } = &mut wrong else {
+            unreachable!()
+        };
+        copy.size = 4;
+        assert!(plan_read(wrong, moved.as_bytes(), &cache).is_err());
+        assert!(
+            plan_read(
+                resolved,
+                format!("/{}/new-name", Uuid::new_v4()).as_bytes(),
+                &cache
+            )
+            .is_err()
+        );
+        drop(cache);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn path_validation_rejects_ambiguous_or_unbounded_paths() {

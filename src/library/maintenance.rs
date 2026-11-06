@@ -93,7 +93,7 @@ impl<C: TapeTransport, D: TapeTransport> Library<C, D> {
     /// 从实际挂载卷更新本地 SQLite 完整索引视图，成功后单事务替换。
     /// 不创建 GPFS snapshot、不恢复 HSM stub，也不重建 EE 对象身份。
     /// 无法保真的未知 XML 会拒绝替换已有缓存。
-    pub fn tape_reconcile(&mut self, barcode: &str) -> Result<Value> {
+    pub fn refresh_tape_index_cache(&mut self, barcode: &str) -> Result<Value> {
         let path = self.maintenance_path(barcode)?;
         let (uuid, generation, xml) = self.inspect_maintenance_volume(&path, |volume, _| {
             if !volume.index().unknown_elements.is_empty() {

@@ -1136,6 +1136,14 @@ fn drive_command(
             let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as usize;
             let mut v = vec![0u8; 8];
             v[0..2].copy_from_slice(&(6u16 + 16).to_be_bytes());
+            if st.drives[idx]
+                .cartridge
+                .as_ref()
+                .and_then(|b| st.cartridges.get(b))
+                .is_some_and(|c| c.write_protected)
+            {
+                v[3] |= 0x80;
+            }
             let mut page = [0u8; 16];
             page[0] = 0x11;
             page[1] = 0x0E;

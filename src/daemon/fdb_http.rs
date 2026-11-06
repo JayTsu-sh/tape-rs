@@ -24,11 +24,36 @@ use super::{
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+#[path = "fdb_http_notify.rs"]
+mod notify;
+
+#[path = "fdb_http_prepare.rs"]
+mod prepare;
+#[path = "fdb_http_upload.rs"]
+mod upload;
+pub use upload::encode_intent as encode_upload_intent;
+#[path = "fdb_http_inventory.rs"]
+mod inventory;
+#[path = "fdb_http_lifecycle.rs"]
+mod lifecycle;
+#[path = "fdb_http_management.rs"]
+mod management;
+#[path = "fdb_http_nodes.rs"]
+mod nodes;
+#[path = "fdb_http_objects.rs"]
+mod objects;
+#[path = "fdb_http_pools.rs"]
+mod pools;
+#[path = "fdb_http_renames.rs"]
+mod renames;
+
 #[derive(Clone)]
 struct Context {
     catalog: Arc<ManagedCatalog>,
     routes: BTreeMap<String, ActiveLibraryRoute>,
     owner: Option<OwnerReads>,
+    upload_budget: Option<super::fdb_read::ReadStorageBudget>,
+    notify_streams: Arc<Semaphore>,
 }
 
 #[derive(Clone)]
@@ -175,7 +200,7 @@ async fn ready(State(ctx): State<Arc<Context>>, request: Request) -> Response {
     }
     reply(
         StatusCode::OK,
-        json!({"ready": true, "mode": if ctx.owner.is_some() { "fdb-owner-readonly" } else { "fdb-metadata-readonly" }}),
+        json!({"ready": true, "mode": if ctx.upload_budget.is_some() { "fdb-owner-writable" } else if ctx.owner.is_some() { "fdb-owner-readonly" } else { "fdb-metadata-readonly" }}),
     )
 }
 
@@ -187,18 +212,26 @@ async fn stat(
     let Some(&expected) = ctx.routes.get(&serial) else {
         return reply(StatusCode::NOT_FOUND, json!({"error": "带库未配置"}));
     };
-    let path = match decoded_path(&request) {
-        Ok(path) => path,
+    let (path, pool, _) = match content_scope(&request) {
+        Ok(scope) => scope,
         Err(error) => return invalid(error),
+    };
+    let path = match crate::managed_catalog::pool_catalog_path(
+        uuid::Uuid::parse_str(&pool).expect("validated pool"),
+        path.as_bytes(),
+    ) {
+        Ok(path) => path,
+        Err(e) => return invalid(&e.to_string()),
     };
     match ctx
         .catalog
         .resolve_active_metadata_for_route(&serial, &path, expected)
         .await
     {
-        Ok(Some(ResolvedPath::Directory { id, .. })) => reply(
+        Ok(Some(ResolvedPath::Directory { id, version, .. })) => reply(
             StatusCode::OK,
-            json!({"kind":"directory", "id":id.to_string(), "library_serial":serial}),
+            json!({"kind":"directory", "id":id.to_string(), "version":version, "library_serial":serial,
+                "namespace":expected.route.namespace.to_string(), "pool_id":pool}),
         ),
         Ok(Some(ResolvedPath::File {
             id,
@@ -217,8 +250,9 @@ async fn stat(
             reply(
                 StatusCode::OK,
                 json!({"kind":if copy.media.as_ref().is_some_and(|media| media.native_symlink) {"symlink"} else {"file"}, "id":id.to_string(), "library_serial":serial,
+                    "namespace":expected.route.namespace.to_string(), "pool_id":placement.pool_id.to_string(),
                     "size":head.size, "version":head.version,
-                    "volume_id":copy.volume_id.to_string(), "barcode":placement.barcode,
+                    "volume_id":copy.volume_id.to_string(), "generation":copy.volume_generation, "barcode":placement.barcode,
                     "digest":digest}),
             )
         }
@@ -244,9 +278,16 @@ async fn children(
     let Some(&expected) = ctx.routes.get(&serial) else {
         return reply(StatusCode::NOT_FOUND, json!({"error": "带库未配置"}));
     };
-    let path = match decoded_path(&request) {
-        Ok(path) => path,
+    let (path, pool, _) = match content_scope(&request) {
+        Ok(scope) => scope,
         Err(error) => return invalid(error),
+    };
+    let path = match crate::managed_catalog::pool_catalog_path(
+        uuid::Uuid::parse_str(&pool).expect("validated pool"),
+        path.as_bytes(),
+    ) {
+        Ok(path) => path,
+        Err(e) => return invalid(&e.to_string()),
     };
     let limit = match query_value(&request, "limit") {
         Ok(Some(value)) => match value.parse::<usize>() {
@@ -272,7 +313,7 @@ async fn children(
     {
         Ok(Some(page)) => reply(
             StatusCode::OK,
-            json!({"library_serial":serial,
+            json!({"library_serial":serial, "namespace":expected.route.namespace.to_string(), "pool_id":pool,
                 "items":page.items.iter().map(|child| json!({
                     "name":std::str::from_utf8(&child.name).ok(),
                     "name_b64":URL_SAFE_NO_PAD.encode(&child.name),
@@ -286,10 +327,177 @@ async fn children(
 }
 
 fn metadata_router(ctx: Arc<Context>) -> Router {
+    let tasks = get(management::tasks);
+    let task = get(management::get_task);
+    let tasks = if ctx.upload_budget.is_some() {
+        tasks.post(management::admit)
+    } else {
+        tasks
+    };
+    let task = if ctx.upload_budget.is_some() {
+        task.delete(management::cancel)
+    } else {
+        task
+    };
+    let pool = get(pools::show);
+    let pool = if ctx.upload_budget.is_some() {
+        pool.put(pools::create)
+            .delete(pools::delete)
+            .patch(pools::update)
+    } else {
+        pool
+    };
     Router::new()
         .route("/readyz", get(ready))
+        .route(
+            "/admin/notify/events/inject",
+            axum::routing::post(notify::inject),
+        )
+        .route("/admin/notify/consumers", get(notify::list))
+        .route(
+            "/admin/notify/consumers/{id}",
+            get(notify::show).put(notify::create).delete(notify::delete),
+        )
+        .route(
+            "/admin/notify/consumers/{id}/ack",
+            axum::routing::post(notify::ack),
+        )
+        .route("/admin/notify/consumers/{id}/events", get(notify::batch))
+        .route("/admin/notify/consumers/{id}/stream", get(notify::stream))
         .route("/v1/fdb/stat/{serial}", get(stat))
+        .route("/v1/fdb/uploads/{serial}", get(upload::status))
+        .route("/v1/fdb/upload-receipts/{serial}", get(upload::receipt))
+        .route("/v1/fdb/attributes/{serial}", get(nodes::attributes))
         .route("/v1/fdb/children/{serial}", get(children))
+        .route("/v1/fdb/objects/{serial}", get(objects::list))
+        .route("/admin/libraries/{serial}/pools", get(pools::list))
+        .route("/admin/libraries/{serial}/pools/{pool}", pool)
+        .route("/v1/fdb/control/{serial}/window", get(management::window))
+        .route(
+            "/v1/fdb/control/{serial}/prepare",
+            axum::routing::post(management::prepare),
+        )
+        .route("/v1/fdb/control/{serial}/requests", tasks)
+        .route(
+            "/v1/fdb/control/{serial}/requests/{epoch}/{operation}",
+            task,
+        )
+        .route("/v1/fdb/control/{serial}/policy", get(management::policy))
+        .route(
+            "/v1/fdb/nodes/{serial}/prepare",
+            axum::routing::post(nodes::prepare),
+        )
+        .route(
+            "/v1/fdb/nodes/{serial}/requests",
+            axum::routing::post(nodes::admit),
+        )
+        .route(
+            "/v1/fdb/nodes/{serial}/requests/{epoch}/{operation}",
+            get(nodes::status).delete(nodes::cancel),
+        )
+        .route(
+            "/v1/fdb/renames/{serial}/prepare",
+            axum::routing::post(renames::prepare),
+        )
+        .route(
+            "/v1/fdb/renames/{serial}/requests",
+            axum::routing::post(renames::admit),
+        )
+        .route(
+            "/v1/fdb/renames/{serial}/requests/{epoch}/{operation}",
+            get(renames::status).delete(renames::cancel),
+        )
+        .route("/admin/libraries", get(inventory::libraries))
+        .route("/admin/libraries/current", get(inventory::default_library))
+        .route("/admin/libraries/{serial}", get(inventory::library))
+        .route(
+            "/libraries/{serial}/admin/libraries/current",
+            get(inventory::library),
+        )
+        .route("/admin/tapes", get(inventory::tapes))
+        .route("/admin/tapes/{barcode}", get(inventory::tape))
+        .route(
+            "/libraries/{serial}/admin/tapes",
+            get(inventory::scoped_tapes),
+        )
+        .route(
+            "/libraries/{serial}/admin/tapes/{barcode}",
+            get(inventory::scoped_tape),
+        )
+        .route(
+            "/admin/libraries/{serial}/tapes",
+            get(inventory::scoped_tapes),
+        )
+        .route(
+            "/admin/libraries/{serial}/tapes/{barcode}",
+            get(inventory::scoped_tape),
+        )
+        .route(
+            "/admin/libraries/{serial}/pools/{pool}/tapes",
+            get(inventory::pool_tapes),
+        )
+        .route(
+            "/admin/libraries/{serial}/pools/{pool}/tapes/{barcode}",
+            get(inventory::pool_tape),
+        )
+        .route(
+            "/admin/libraries/{serial}/pools/{pool}/tapes/{barcode}/import",
+            axum::routing::post(inventory::pool_import),
+        )
+        .route(
+            "/admin/libraries/{serial}/rescan",
+            axum::routing::post(lifecycle::rescan),
+        )
+        .route(
+            "/admin/libraries/{serial}/tapes/{barcode}/move",
+            axum::routing::post(lifecycle::move_unassigned),
+        )
+        .route(
+            "/admin/libraries/{serial}/pools/{pool}/tapes/{barcode}/assign",
+            axum::routing::post(lifecycle::assign),
+        )
+        .route(
+            "/admin/libraries/{serial}/pools/{pool}/tapes/{barcode}/unassign",
+            axum::routing::post(lifecycle::unassign),
+        )
+        .route(
+            "/admin/libraries/{serial}/pools/{pool}/tapes/{barcode}/online",
+            axum::routing::post(lifecycle::online),
+        )
+        .route(
+            "/admin/libraries/{serial}/pools/{pool}/tapes/{barcode}/offline",
+            axum::routing::post(lifecycle::offline),
+        )
+        .route(
+            "/admin/libraries/{serial}/pools/{pool}/tapes/{barcode}/set",
+            axum::routing::post(lifecycle::set),
+        )
+        .route(
+            "/admin/libraries/{serial}/pools/{pool}/tapes/{barcode}/validate",
+            axum::routing::post(lifecycle::validate),
+        )
+        .route(
+            "/admin/libraries/{serial}/pools/{pool}/tapes/{barcode}/move",
+            axum::routing::post(lifecycle::move_tape),
+        )
+        .route("/admin/tasks", get(inventory::tasks))
+        .route(
+            "/libraries/{serial}/admin/tasks",
+            get(inventory::scoped_tasks),
+        )
+        .route("/admin/tasks/{id}", get(inventory::task))
+        .route(
+            "/libraries/{serial}/admin/tasks/{id}",
+            get(inventory::scoped_task),
+        )
+        .route(
+            "/admin/tasks/{id}/cancel",
+            axum::routing::post(inventory::cancel),
+        )
+        .route(
+            "/libraries/{serial}/admin/tasks/{id}/cancel",
+            axum::routing::post(inventory::scoped_cancel),
+        )
         .with_state(ctx)
 }
 
@@ -304,6 +512,8 @@ pub fn serve(
             catalog: Arc::new(catalog),
             routes,
             owner: None,
+            upload_budget: None,
+            notify_streams: Arc::new(Semaphore::new(64)),
         })),
     )
 }
@@ -315,20 +525,59 @@ pub fn owner_router(
     libraries: BTreeMap<String, Arc<HttpContext>>,
     peers: HashMap<u64, String>,
 ) -> Router {
+    owner_router_inner(catalog, routes, libraries, peers, None)
+}
+
+pub fn writer_router(
+    catalog: Arc<ManagedCatalog>,
+    routes: BTreeMap<String, ActiveLibraryRoute>,
+    libraries: BTreeMap<String, Arc<HttpContext>>,
+    peers: HashMap<u64, String>,
+    budget: super::fdb_read::ReadStorageBudget,
+) -> Router {
+    owner_router_inner(catalog, routes, libraries, peers, Some(budget))
+}
+
+fn owner_router_inner(
+    catalog: Arc<ManagedCatalog>,
+    routes: BTreeMap<String, ActiveLibraryRoute>,
+    libraries: BTreeMap<String, Arc<HttpContext>>,
+    peers: HashMap<u64, String>,
+    upload_budget: Option<super::fdb_read::ReadStorageBudget>,
+) -> Router {
     let ctx = Arc::new(Context {
         catalog,
         routes,
+        upload_budget,
+        notify_streams: Arc::new(Semaphore::new(64)),
         owner: Some(OwnerReads {
             libraries,
             peers,
             requests: Arc::new(Semaphore::new(32)),
         }),
     });
-    metadata_router(ctx.clone()).merge(
+    let files = if upload_budget.is_some() {
+        get(content).put(upload::write)
+    } else {
+        get(content)
+    };
+    let router = metadata_router(ctx.clone()).merge(
         Router::new()
-            .route("/v1/fdb/files/{serial}", get(content))
-            .with_state(ctx),
-    )
+            .route("/v1/fdb/files/{serial}", files)
+            .with_state(ctx.clone()),
+    );
+    if upload_budget.is_some() {
+        router.merge(
+            Router::new()
+                .route(
+                    "/v1/fdb/uploads/{serial}/prepare",
+                    axum::routing::post(prepare::prepare),
+                )
+                .with_state(ctx),
+        )
+    } else {
+        router
+    }
 }
 
 pub fn serve_owner(
@@ -337,8 +586,27 @@ pub fn serve_owner(
     routes: BTreeMap<String, ActiveLibraryRoute>,
     libraries: BTreeMap<String, Arc<HttpContext>>,
     peers: HashMap<u64, String>,
+    control: Router,
 ) -> std::io::Result<()> {
-    http::serve_router(listen, owner_router(catalog, routes, libraries, peers))
+    http::serve_router(
+        listen,
+        owner_router(catalog, routes, libraries, peers).merge(control),
+    )
+}
+
+pub fn serve_writer(
+    listen: &str,
+    catalog: Arc<ManagedCatalog>,
+    routes: BTreeMap<String, ActiveLibraryRoute>,
+    libraries: BTreeMap<String, Arc<HttpContext>>,
+    peers: HashMap<u64, String>,
+    budget: super::fdb_read::ReadStorageBudget,
+    control: Router,
+) -> std::io::Result<()> {
+    http::serve_router(
+        listen,
+        writer_router(catalog, routes, libraries, peers, budget).merge(control),
+    )
 }
 
 fn content_scope(request: &Request) -> Result<(String, String, Option<String>), &'static str> {
@@ -406,6 +674,13 @@ async fn content(
         Ok(scope) => scope,
         Err(error) => return invalid(error),
     };
+    let path = match crate::managed_catalog::pool_catalog_path(
+        uuid::Uuid::parse_str(&pool).expect("validated pool"),
+        path.as_bytes(),
+    ) {
+        Ok(path) => String::from_utf8(path).expect("UTF-8 path"),
+        Err(e) => return invalid(&e.to_string()),
+    };
     let Some(owner) = &ctx.owner else {
         return unavailable("未启用 owner 内容读取");
     };
@@ -472,7 +747,7 @@ async fn content(
     read_content(library.clone(), path, pool, range, permit).await
 }
 
-async fn read_content(
+pub(super) async fn read_content(
     library: Arc<HttpContext>,
     path: String,
     pool: String,

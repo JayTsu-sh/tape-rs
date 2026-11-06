@@ -329,13 +329,15 @@ mod acceptance {
                         (
                             source,
                             report.dp.eod,
-                            report
-                                .ip
-                                .last_index
-                                .as_ref()
-                                .ok_or("IP 索引缺失")?
-                                .index
-                                .generation,
+                            Some(
+                                report
+                                    .ip
+                                    .last_index
+                                    .as_ref()
+                                    .ok_or("IP 索引缺失")?
+                                    .index
+                                    .generation,
+                            ),
                             report.chain_depth,
                             report.chain_truncated_by_budget,
                         )

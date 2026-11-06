@@ -158,6 +158,20 @@ pub enum ExecRequest {
     Stop { round: Option<u64>, reason: String },
     /// 文件服务有已完成的上传等待落带。
     Work,
+    /// 只读准备稳定上传身份；自动选池内卷，条码仅为可选约束。
+    #[cfg(feature = "fdb")]
+    FdbPrepare {
+        spec: Box<crate::managed_catalog::ActiveUploadSpec>,
+        barcode: Option<String>,
+        reply: Sender<std::result::Result<crate::managed_catalog::ActiveFileIntent, ReadError>>,
+    },
+    /// 显式 FDB 上传，身份由调用方保留用于结果未定重试。只有 FDB writer 接受。
+    #[cfg(feature = "fdb")]
+    FdbWrite {
+        intent: Box<crate::managed_catalog::ActiveFileRequest>,
+        file: std::fs::File,
+        reply: Sender<std::result::Result<u64, ReadError>>,
+    },
     /// 已解析的池/驱动作用域，内部请求只能是 Read、ReadTo 或 Sync。
     Scoped {
         pool: String,
@@ -309,12 +323,37 @@ struct Writer {
 }
 
 #[cfg(feature = "fdb")]
+#[path = "executor_fdb_intake.rs"]
+mod fdb_intake;
+#[cfg(feature = "fdb")]
+#[path = "executor_fdb_inventory.rs"]
+mod fdb_inventory;
+#[cfg(feature = "fdb")]
+#[path = "executor_fdb_lifecycle.rs"]
+mod fdb_lifecycle;
+#[cfg(feature = "fdb")]
 #[path = "executor_fdb_loading.rs"]
 mod fdb_loading;
+#[cfg(feature = "fdb")]
+#[path = "executor_fdb_monitor.rs"]
+mod fdb_monitor;
+#[cfg(feature = "fdb")]
+#[path = "executor_fdb_nodes.rs"]
+mod fdb_nodes;
+#[cfg(feature = "fdb")]
+#[path = "executor_fdb_rename.rs"]
+mod fdb_rename;
+#[cfg(feature = "fdb")]
+#[path = "executor_fdb_writing.rs"]
+mod fdb_writing;
 
 struct Active {
     #[cfg(feature = "fdb")]
+    fdb_monitor: fdb_monitor::Schedule,
+    #[cfg(feature = "fdb")]
     fdb_reads: std::collections::BTreeMap<usize, fdb_loading::Mount>,
+    #[cfg(feature = "fdb")]
+    fdb_pending_import: std::collections::BTreeSet<String>,
     files: Arc<FileService>,
     writers: Vec<Writer>,
     next_seq: Arc<std::sync::atomic::AtomicU64>,
@@ -457,6 +496,16 @@ pub fn run(
             files = target;
         }
         match received {
+            #[cfg(feature = "fdb")]
+            Ok(ExecRequest::FdbWrite { reply, .. }) => {
+                let _ = reply.send(Err(ReadError::Failed("旧目录执行器禁止 FDB 上传".into())));
+            }
+            #[cfg(feature = "fdb")]
+            Ok(ExecRequest::FdbPrepare { reply, .. }) => {
+                let _ = reply.send(Err(ReadError::Failed(
+                    "旧目录执行器禁止准备 FDB 上传".into(),
+                )));
+            }
             Ok(ExecRequest::Scoped { .. }) => unreachable!("HTTP 不生成嵌套作用域"),
             Ok(ExecRequest::AttachPermission {
                 permission: attached,
@@ -782,6 +831,35 @@ pub fn run_fdb_owner(
     status: SharedStatus,
     control: FdbOwnerControl,
 ) {
+    run_fdb_owner_inner(provider, opts, rx, tx, files, status, control, false);
+}
+
+/// Explicit writable runtime; the readonly entry point never admits uploads.
+#[cfg(feature = "fdb")]
+pub fn run_fdb_writer(
+    provider: Box<dyn DeviceProvider>,
+    opts: ExecOptions,
+    rx: Receiver<ExecRequest>,
+    tx: Sender<ExecEvent>,
+    files: Arc<FileService>,
+    status: SharedStatus,
+    control: FdbOwnerControl,
+) {
+    run_fdb_owner_inner(provider, opts, rx, tx, files, status, control, true);
+}
+
+#[cfg(feature = "fdb")]
+#[allow(clippy::too_many_arguments)]
+fn run_fdb_owner_inner(
+    provider: Box<dyn DeviceProvider>,
+    opts: ExecOptions,
+    rx: Receiver<ExecRequest>,
+    tx: Sender<ExecEvent>,
+    files: Arc<FileService>,
+    status: SharedStatus,
+    control: FdbOwnerControl,
+    writable: bool,
+) {
     use crate::managed_catalog::ActiveOwnerOutcome;
 
     let provider: Arc<dyn DeviceProvider> = Arc::from(provider);
@@ -805,7 +883,128 @@ pub fn run_fdb_owner(
     let mut permission: Option<Arc<Permission>> = None;
     let mut active: Option<Active> = None;
     let mut next_fence_check = Instant::now();
+    let mut management_after = None;
+    let mut node_after = None;
+    let mut next_node_check = Instant::now();
+    let mut next_statistics_check = Instant::now();
     loop {
+        if writable
+            && let Some(owner) = active.as_mut().filter(|owner| {
+                owner.serving
+                    && permission
+                        .as_ref()
+                        .is_some_and(|p| p.allows(owner.round, super::permission::Phase::Serving))
+            })
+        {
+            let round = owner.round;
+            let result = runtime.block_on(async {
+                if let Some((epoch, id)) = control
+                    .catalog
+                    .next_management(&control.serial, control.route, round, management_after)
+                    .await
+                    .map_err(|e| ReadError::Lost(e.to_string()))?
+                {
+                    management_after = Some((epoch, id));
+                    let task = control
+                        .catalog
+                        .management_task(&control.serial, control.route, epoch, id)
+                        .await
+                        .map_err(|e| ReadError::Lost(e.to_string()))?
+                        .ok_or_else(|| ReadError::Lost("排队任务缺少回执".into()))?;
+                    if matches!(
+                        task["request"]["change"]["kind"].as_str(),
+                        Some("media-import" | "media-assign")
+                    ) {
+                        fdb_intake::apply(
+                            owner,
+                            permission.as_deref().expect("Serving permit checked"),
+                            &control,
+                            &opts,
+                            &status,
+                            epoch,
+                            id,
+                        )
+                        .await?;
+                        let task = control
+                            .catalog
+                            .management_task(&control.serial, control.route, epoch, id)
+                            .await
+                            .map_err(|e| ReadError::Lost(e.to_string()))?
+                            .ok_or_else(|| ReadError::Lost("介质任务回执缺失".into()))?;
+                        if matches!(
+                            task["status"].as_str(),
+                            Some("succeeded" | "failed" | "cancelled")
+                        ) {
+                            fdb_inventory::refresh(
+                                owner,
+                                permission.as_deref().expect("Serving permit checked"),
+                                &control,
+                                &opts,
+                            )
+                            .await?;
+                        }
+                    } else if matches!(
+                        task["request"]["change"]["kind"].as_str(),
+                        Some(
+                            "library-rescan"
+                                | "media-move"
+                                | "media-unassign"
+                                | "media-validate"
+                                | "media-online"
+                        )
+                    ) {
+                        Box::pin(fdb_lifecycle::apply(
+                            owner,
+                            permission.as_deref().expect("Serving permit checked"),
+                            &control,
+                            &opts,
+                            epoch,
+                            id,
+                        ))
+                        .await?;
+                    } else {
+                        match control
+                            .catalog
+                            .apply_management(&control.serial, control.route, round, epoch, id)
+                            .await
+                        {
+                            Ok(result) => info!("FDB 管理操作完成: {} {}", id, result["status"]),
+                            Err(
+                                crate::managed_catalog::CatalogError::PoolImporting
+                                | crate::managed_catalog::CatalogError::PoolBusy,
+                            ) => log::debug!("FDB 管理操作 {id} 等待原池屏障解除"),
+                            Err(error) => return Err(ReadError::Lost(error.to_string())),
+                        }
+                    }
+                }
+                if Instant::now() >= next_node_check {
+                    let progress = Box::pin(fdb_nodes::advance(
+                        owner,
+                        permission.as_deref().expect("Serving permit checked"),
+                        &control,
+                        &status,
+                        &mut node_after,
+                    ))
+                    .await?;
+                    next_node_check = Instant::now()
+                        + if progress {
+                            Duration::ZERO
+                        } else {
+                            Duration::from_secs(1)
+                        };
+                }
+                Ok::<_, ReadError>(())
+            });
+            if let Err(error) = result {
+                let reason = format!("FDB 自动任务执行失败: {error}");
+                if let Some(permit) = permission.as_ref() {
+                    permit.close(round);
+                }
+                files.close_all(&reason);
+                active = None;
+                let _ = tx.send(ExecEvent::Lost { round, reason });
+            }
+        }
         if Instant::now() >= next_fence_check {
             next_fence_check = Instant::now() + Duration::from_secs(1);
             let checked = active.as_ref().filter(|owner| owner.serving).map(|owner| {
@@ -845,6 +1044,37 @@ pub fn run_fdb_owner(
         }
         if let Some(owner) = active.as_mut().filter(|owner| owner.serving)
             && let Some(permit) = permission.as_deref()
+            && permit.allows(owner.round, super::permission::Phase::Serving)
+            && let Err(error) = runtime.block_on(fdb_monitor::tick(owner, permit, &control, &opts))
+        {
+            let round = owner.round;
+            let reason = error.to_string();
+            permit.close(round);
+            files.close_all(&reason);
+            active = None;
+            let _ = tx.send(ExecEvent::Lost { round, reason });
+        }
+        if Instant::now() >= next_statistics_check {
+            next_statistics_check = Instant::now() + Duration::from_millis(250);
+            if let Some(owner) = active.as_ref().filter(|owner| owner.serving)
+                && permission.as_ref().is_some_and(|permit| {
+                    permit.allows(owner.round, super::permission::Phase::Serving)
+                })
+                && let Err(error) =
+                    runtime.block_on(control.catalog.advance_active_pool_statistics(
+                        &control.serial,
+                        control.route,
+                        owner.round,
+                    ))
+            {
+                // Derived accounting never authorizes media I/O. Its own
+                // errors back off without replacing device recovery policy.
+                warn!("FDB 磁带容量统计暂时不可用: {error}");
+                next_statistics_check = Instant::now() + Duration::from_secs(5);
+            }
+        }
+        if let Some(owner) = active.as_mut().filter(|owner| owner.serving)
+            && let Some(permit) = permission.as_deref()
             && let Some(drive) = owner
                 .fdb_reads
                 .iter()
@@ -852,7 +1082,13 @@ pub fn run_fdb_owner(
                 .min_by_key(|(_, mount)| mount.last_used)
                 .map(|(drive, _)| *drive)
         {
-            match runtime.block_on(fdb_loading::unload(owner, permit, &control, &status, drive)) {
+            match runtime.block_on(fdb_loading::unload(
+                owner,
+                permit,
+                &control,
+                drive,
+                if writable { &['m', 'r'] } else { &['r'] },
+            )) {
                 Ok(()) => {}
                 Err(ReadError::Busy(_)) => {
                     if let Some(mount) = owner.fdb_reads.get_mut(&drive) {
@@ -1021,6 +1257,33 @@ pub fn run_fdb_owner(
                             return Err(TapeError::Catalog("FDB owner 已由更新轮次持有".into()));
                         }
                     }
+                    // A loaded destination may contain an interrupted reclaim
+                    // child. Claim its durable parent while still in Execution,
+                    // before Q/I/S4 recovery asks the pool gate for permission.
+                    let mut reclaim_after = None;
+                    loop {
+                        if !permit.allows(round, super::permission::Phase::Execution) {
+                            return Err(TapeError::NotReady("回收任务接任期间执行许可失效".into()));
+                        }
+                        for device in &owner.devices {
+                            reservation::verify_holder(device.dev.as_ref(), owner.key)?;
+                        }
+                        let page = runtime
+                            .block_on(control.catalog.claim_reclaim_reservations_page(
+                                &control.serial,
+                                control.route,
+                                round,
+                                reclaim_after.as_deref(),
+                                16,
+                            ))
+                            .map_err(|error| {
+                                TapeError::Catalog(format!("回收父任务接任失败: {error}"))
+                            })?;
+                        let Some(next) = page.next else {
+                            break;
+                        };
+                        reclaim_after = Some(next);
+                    }
                     let cache_dir = files.extent_cache_dir();
                     if cache_dir.exists() {
                         crate::local_read_storage::CacheBuild::new(&cache_dir, control.storage)?
@@ -1057,19 +1320,41 @@ pub fn run_fdb_owner(
                                 round,
                             ))
                             .map_err(|error| TapeError::Catalog(error.to_string()))?;
-                        if let Some(head) = head {
-                            let management = super::management::policy_view(
-                                &status.lock().unwrap_or_else(|e| e.into_inner()),
-                            )
-                            .management;
-                            if !super::management::tape_allowed(&management, barcode)
-                                || !super::management::drive_allowed(
+                        if let Some(mut head) = head {
+                            let management = runtime
+                                .block_on(fdb_loading::policy(
+                                    owner,
+                                    &control,
+                                    &[head.pool_id],
+                                    Some(barcode),
+                                ))
+                                .map_err(|e| TapeError::Catalog(e.to_string()))?;
+                            let can_write = writable
+                                && super::management::drive_allowed(
                                     &management,
                                     &owner.devices[slot.dev].serial,
-                                    u64::from(opts.node_id),
-                                    &head.pool_id.to_string(),
-                                    'r',
-                                )
+                                    'm',
+                                );
+                            // Recovery may write a close-tail or MAM. A known
+                            // unhealthy/read-only tape must not bypass the
+                            // same write gate merely because the owner changed.
+                            let can_write = can_write
+                                && runtime
+                                    .block_on(control.catalog.active_tape_monitor(
+                                        &control.serial,
+                                        control.route,
+                                        barcode,
+                                    ))
+                                    .map_err(|error| TapeError::Catalog(error.to_string()))?
+                                    .is_none_or(|record| record.recovery_write_allowed());
+                            if loaded.cleaning.contains(barcode)
+                                || !fdb_loading::tape_allowed(&management, barcode)
+                                || !(can_write
+                                    || super::management::drive_allowed(
+                                        &management,
+                                        &owner.devices[slot.dev].serial,
+                                        'r',
+                                    ))
                             {
                                 continue;
                             }
@@ -1088,6 +1373,87 @@ pub fn run_fdb_owner(
                                     "已装载磁带 {} 的标签、FDB 卷和索引身份不一致",
                                     barcode
                                 )));
+                            }
+                            if runtime
+                                .block_on(control.catalog.loaded_native_refresh_pending(
+                                    &control.serial,
+                                    barcode,
+                                    control.route,
+                                    round,
+                                ))
+                                .map_err(|error| TapeError::Catalog(error.to_string()))?
+                            {
+                                runtime
+                                    .block_on(fdb_monitor::index_state(
+                                        owner, &control, barcode, head.index, true,
+                                    ))
+                                    .map_err(|e| TapeError::Catalog(e.to_string()))?;
+                                owner.fdb_pending_import.insert(barcode.clone());
+                                warn!(
+                                    "已装载磁带 {barcode} 保留原刷新任务，暂停普通读写，等待接续"
+                                );
+                                continue;
+                            }
+                            if can_write {
+                                let volume = LtfsVolume::mount(device)?;
+                                let pending = runtime
+                                    .block_on(control.catalog.pending_node_rename_task(
+                                        &control.serial,
+                                        control.route,
+                                        round,
+                                        head.volume_id,
+                                    ))
+                                    .map_err(|error| TapeError::Catalog(error.to_string()))?;
+                                let recovered = if let Some(task) = pending {
+                                    runtime.block_on(Box::pin(fdb_rename::recover_loaded(
+                                        &control, permit, owner.key, volume, &task,
+                                    )))?
+                                } else {
+                                    let result = runtime.block_on(Box::pin(
+                                        super::fdb_media::establish_active_media_owner(
+                                            &control.catalog,
+                                            volume,
+                                            &control.serial,
+                                            owner.key,
+                                            permit,
+                                            usize::try_from(control.storage.index_bytes).map_err(
+                                                |_| {
+                                                    TapeError::Catalog(
+                                                        "节点恢复预算超出平台范围".into(),
+                                                    )
+                                                },
+                                            )?,
+                                        ),
+                                    ));
+                                    match result {
+                                        Ok(recovered) => recovered.into_volume(),
+                                        Err(error @ TapeError::MediaImportRequired { .. }) => {
+                                            runtime
+                                                .block_on(fdb_monitor::index_state(
+                                                    owner, &control, barcode, head.index, true,
+                                                ))
+                                                .map_err(|e| TapeError::Catalog(e.to_string()))?;
+                                            owner.fdb_pending_import.insert(barcode.clone());
+                                            warn!(
+                                                "已装载磁带 {barcode} 暂停普通读写，管理接口保持可用：{error}"
+                                            );
+                                            continue;
+                                        }
+                                        Err(error) => return Err(error),
+                                    }
+                                };
+                                drop(recovered);
+                                head = runtime
+                                    .block_on(control.catalog.active_loaded_volume_head(
+                                        &control.serial,
+                                        barcode,
+                                        control.route,
+                                        round,
+                                    ))
+                                    .map_err(|error| TapeError::Catalog(error.to_string()))?
+                                    .ok_or_else(|| {
+                                        TapeError::Catalog("FDB 恢复后卷归属消失".into())
+                                    })?;
                             }
                             let mut budget = crate::ltfs::recovery::RecoveryBudget::default();
                             budget.index_scratch.directory = files.spool_dir().to_path_buf();
@@ -1135,7 +1501,10 @@ pub fn run_fdb_owner(
                                     ),
                                 )
                                 .map_err(|error| TapeError::Catalog(error.to_string()))?;
-                            let ip_generation = proof.ip_generation;
+                            let ip_generation = proof
+                                .ip_generation
+                                .map(|generation| generation.to_string())
+                                .unwrap_or_else(|| "缺失（待维护）".into());
                             owner.fdb_reads.insert(
                                 slot.dev,
                                 fdb_loading::Mount {
@@ -1145,6 +1514,11 @@ pub fn run_fdb_owner(
                                     last_used: Instant::now(),
                                 },
                             );
+                            runtime
+                                .block_on(fdb_monitor::index_state(
+                                    owner, &control, barcode, head.index, false,
+                                ))
+                                .map_err(|e| TapeError::Catalog(e.to_string()))?;
                             verified_volumes += 1;
                             info!(
                                 "FDB owner 已核对装载介质 DP/IP 索引: 库={} 条码={} 卷={} DP代数={} IP代数={}",
@@ -1155,6 +1529,17 @@ pub fn run_fdb_owner(
                                 ip_generation
                             );
                         }
+                    }
+                    if writable {
+                        runtime
+                            .block_on(Box::pin(fdb_rename::recover(
+                                owner, permit, &control, &status,
+                            )))
+                            .map_err(|error| {
+                                TapeError::NotReady(format!(
+                                    "FDB 原 rename 接任尚未完成: {error:?}"
+                                ))
+                            })?;
                     }
                     if !permit.allows(round, super::permission::Phase::Execution) {
                         return Err(TapeError::NotReady("FDB owner 执行许可已失效".into()));
@@ -1170,6 +1555,9 @@ pub fn run_fdb_owner(
                             "FDB owner 在库存核对期间已被更新轮次接管".into(),
                         ));
                     }
+                    runtime
+                        .block_on(fdb_inventory::refresh(owner, permit, &control, &opts))
+                        .map_err(|e| TapeError::Catalog(e.to_string()))?;
                     Ok(verified_volumes)
                 })();
                 match result {
@@ -1178,7 +1566,8 @@ pub fn run_fdb_owner(
                         let _ = tx.send(ExecEvent::Serving {
                             round,
                             summary: format!(
-                                "FDB owner 只读模式，已核对 {} 卷 DP/IP 索引，支持按需装卸读取",
+                                "FDB owner {}模式，已核对 {} 卷 DP/IP 索引，支持按需装卸读取",
+                                if writable { "可写" } else { "只读" },
                                 verified_volumes
                             ),
                         });
@@ -1212,7 +1601,11 @@ pub fn run_fdb_owner(
                     if let Some(permit) = permission.as_deref() {
                         while let Some(drive) = owner.fdb_reads.keys().next().copied() {
                             match runtime.block_on(fdb_loading::unload(
-                                &mut owner, permit, &control, &status, drive,
+                                &mut owner,
+                                permit,
+                                &control,
+                                drive,
+                                if writable { &['m', 'r'] } else { &['r'] },
                             )) {
                                 Ok(()) => {}
                                 Err(ReadError::Busy(reason)) => {
@@ -1316,6 +1709,84 @@ pub fn run_fdb_owner(
                 }
                 let _ = reply.send(result);
             }
+            ExecRequest::FdbPrepare {
+                spec,
+                barcode,
+                reply,
+            } => {
+                let result = if !writable {
+                    Err(ReadError::Failed("FDB 只读模式禁止准备上传".into()))
+                } else if pool
+                    .as_ref()
+                    .is_some_and(|pool| pool != &spec.pool_id.to_string())
+                {
+                    Err(ReadError::Failed("准备上传与池作用域不一致".into()))
+                } else {
+                    match (
+                        active.as_ref().filter(|owner| owner.serving),
+                        permission.as_deref(),
+                    ) {
+                        (Some(owner), Some(permit)) => runtime.block_on(fdb_writing::prepare(
+                            owner,
+                            permit,
+                            &control,
+                            &spec,
+                            barcode.as_deref(),
+                        )),
+                        _ => Err(ReadError::Busy("FDB owner 当前不在服务".into())),
+                    }
+                };
+                if let Err(ReadError::Lost(reason)) = &result {
+                    files.close_all(reason);
+                    if let Some(owner) = active.take() {
+                        if let Some(permit) = permission.as_ref() {
+                            permit.close(owner.round);
+                        }
+                        let _ = tx.send(ExecEvent::Lost {
+                            round: owner.round,
+                            reason: reason.clone(),
+                        });
+                    }
+                }
+                let _ = reply.send(result);
+            }
+            ExecRequest::FdbWrite {
+                intent,
+                file,
+                reply,
+            } => {
+                let result = if !writable {
+                    Err(ReadError::Failed("FDB owner 只读模式禁止上传".into()))
+                } else if pool.as_ref().is_some_and(|pool| {
+                    Some(pool.as_str())
+                        != intent.pool_id.as_ref().map(|id| id.to_string()).as_deref()
+                }) {
+                    Err(ReadError::Failed("上传与池作用域不一致".into()))
+                } else {
+                    match (
+                        active.as_mut().filter(|owner| owner.serving),
+                        permission.as_deref(),
+                    ) {
+                        (Some(owner), Some(permit)) => runtime.block_on(fdb_writing::write(
+                            owner, permit, &control, &status, *intent, file,
+                        )),
+                        _ => Err(ReadError::Busy("FDB owner 当前不在服务".into())),
+                    }
+                };
+                if let Err(ReadError::Lost(reason)) = &result {
+                    files.close_all(reason);
+                    if let Some(owner) = active.take() {
+                        if let Some(permit) = permission.as_ref() {
+                            permit.close(owner.round);
+                        }
+                        let _ = tx.send(ExecEvent::Lost {
+                            round: owner.round,
+                            reason: reason.clone(),
+                        });
+                    }
+                }
+                let _ = reply.send(result);
+            }
             ExecRequest::Sync { reply, .. } => {
                 let _ = reply.send(Err("FDB owner 只读控制模式禁止旧文件同步".into()));
             }
@@ -1347,6 +1818,7 @@ async fn read_fdb(
 ) -> std::result::Result<std::fs::File, ReadError> {
     let lost = |error: TapeError| ReadError::Lost(format!("FDB owner 读取失败: {error}"));
     let permit = permission.ok_or_else(|| ReadError::Lost("FDB owner 缺少多数派许可".into()))?;
+    let _activity = permit.begin_device_activity(owner.round).map_err(lost)?;
     let pool = pool
         .map(uuid::Uuid::parse_str)
         .transpose()
@@ -1362,7 +1834,9 @@ async fn read_fdb(
         .await
         .map_err(|error| {
             let reason = format!("FDB 读取来源不可用: {error}");
-            if matches!(error, crate::managed_catalog::CatalogError::Invalid(_)) {
+            if matches!(error, crate::managed_catalog::CatalogError::PoolImporting) {
+                ReadError::Busy(reason)
+            } else if matches!(error, crate::managed_catalog::CatalogError::Invalid(_)) {
                 ReadError::Failed(reason)
             } else {
                 ReadError::Lost(reason)
@@ -1373,9 +1847,10 @@ async fn read_fdb(
         return Err(ReadError::Failed("FDB 文件不属于请求的池".into()));
     }
     let drive = fdb_loading::select(owner, permit, control, status, path, &source).await?;
+    let tracked = fdb_monitor::Tracked::new(owner.devices[drive].dev.as_ref(), "read");
     let reader = super::fdb_read::ActiveMediaReader {
         catalog: &control.catalog,
-        device: owner.devices[drive].dev.as_ref(),
+        device: &tracked,
         serial: &control.serial,
         route: control.route,
         key: owner.key,
@@ -1389,11 +1864,26 @@ async fn read_fdb(
             &owner.files.extent_cache_dir(),
             owner.files.spool_dir(),
         )
-        .await
+        .await;
+    if result.is_err() {
+        fdb_monitor::io_error(
+            owner,
+            permit,
+            control,
+            &source.placement().barcode,
+            source.source.volume_uuid,
+            tracked.error(),
+        )
+        .await;
+    }
+    let result = result
         .map_err(
             |error| match crate::local_read_storage::classify_error(error) {
                 TapeError::LocalCapacity { reason } | TapeError::LocalSpace { reason } => {
                     ReadError::Busy(reason)
+                }
+                TapeError::MediaUnavailable { barcode } => {
+                    ReadError::Busy(format!("磁带 {barcode} 离线或在黑名单中"))
                 }
                 error => lost(error),
             },
@@ -1425,6 +1915,14 @@ async fn read_fdb(
             last_used: Instant::now(),
         },
     );
+    fdb_monitor::index_state(
+        owner,
+        control,
+        &source.placement().barcode,
+        result.verified_head,
+        false,
+    )
+    .await?;
     Ok(result.file)
 }
 
@@ -1642,6 +2140,10 @@ fn process_all_uploads(
             let mut job = Active {
                 #[cfg(feature = "fdb")]
                 fdb_reads: Default::default(),
+                #[cfg(feature = "fdb")]
+                fdb_pending_import: Default::default(),
+                #[cfg(feature = "fdb")]
+                fdb_monitor: Default::default(),
                 files: writer.files.clone(),
                 writers: Vec::new(),
                 next_seq: a.next_seq.clone(),
@@ -1847,6 +2349,10 @@ fn takeover(
     Ok(Active {
         #[cfg(feature = "fdb")]
         fdb_reads: Default::default(),
+        #[cfg(feature = "fdb")]
+        fdb_pending_import: Default::default(),
+        #[cfg(feature = "fdb")]
+        fdb_monitor: Default::default(),
         files,
         writers: Vec::new(),
         next_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2172,8 +2678,6 @@ fn ensure_write_tape(
                         && super::management::drive_allowed(
                             &st.management,
                             &a.devices[d.dev].serial,
-                            u64::from(opts.node_id),
-                            &c.pool_uuid,
                             'm',
                         )
                 })
@@ -2208,13 +2712,7 @@ fn ensure_write_tape(
                 && a.density_support
                     .get(&d.dev)
                     .is_some_and(|caps| super::scheduling::compatible(caps, &c.barcode, true))
-                && super::management::drive_allowed(
-                    &st.management,
-                    &a.devices[d.dev].serial,
-                    u64::from(opts.node_id),
-                    &c.pool_uuid,
-                    'm',
-                )
+                && super::management::drive_allowed(&st.management, &a.devices[d.dev].serial, 'm')
         };
         // 1. 确保它在某个驱动器里
         let slot =
@@ -2897,7 +3395,7 @@ fn read_file<W: Write>(dev: &dyn TapeTransport, path: &str, out: &mut W) -> Resu
 /// 读请求可借用其他池的空闲写驱动；借用前关闭准入、再次确认排空并生成检查点。
 fn prepare_read(
     a: &mut Active,
-    opts: &ExecOptions,
+    _opts: &ExecOptions,
     files: &Arc<FileService>,
     status: &SharedStatus,
     tx: &Sender<ExecEvent>,
@@ -2910,7 +3408,7 @@ fn prepare_read(
         return Ok(());
     };
     let policy = super::management::policy_view(&status.lock().unwrap_or_else(|e| e.into_inner()));
-    let Some(pool) = policy
+    let Some(_) = policy
         .pools
         .iter()
         .find(|p| p.tapes.contains(&record.barcode))
@@ -2921,13 +3419,7 @@ fn prepare_read(
         a.density_support
             .get(&i)
             .is_some_and(|caps| super::scheduling::compatible(caps, &record.barcode, false))
-            && super::management::drive_allowed(
-                &policy.management,
-                &a.devices[i].serial,
-                u64::from(opts.node_id),
-                &pool.uuid,
-                'r',
-            )
+            && super::management::drive_allowed(&policy.management, &a.devices[i].serial, 'r')
     };
     let inv = inventory(&a.devices).map_err(|e| ReadError::device(e, "读取调度库存失败"))?;
     if inv.drives.iter().any(|d| {
@@ -3002,7 +3494,7 @@ fn read_any_inner<W: Write>(
     if !super::management::tape_allowed(&policy.management, &barcode) {
         return Err(Failed("磁带已离线或在黑名单中".into()));
     }
-    let pool = policy
+    policy
         .pools
         .iter()
         .find(|p| p.tapes.contains(&barcode))
@@ -3020,13 +3512,7 @@ fn read_any_inner<W: Write>(
             && caps
                 .get(&i)
                 .is_some_and(|caps| super::scheduling::compatible(caps, &barcode, false))
-            && super::management::drive_allowed(
-                &policy.management,
-                &serials[i],
-                u64::from(opts.node_id),
-                &pool.uuid,
-                'r',
-            )
+            && super::management::drive_allowed(&policy.management, &serials[i], 'r')
     };
     if a.drive.is_some_and(|i| !eligible(i)) && files.tape().is_some_and(|t| t.barcode == barcode) {
         return Err(Busy("当前驱动器没有读取资格".into()));
@@ -3433,14 +3919,14 @@ fn start_reclaim(
 fn load_aside(
     a: &mut Active,
     barcode: &str,
-    opts: &ExecOptions,
+    _opts: &ExecOptions,
     status: &SharedStatus,
 ) -> Result<usize> {
     let policy = super::management::policy_view(&status.lock().unwrap_or_else(|e| e.into_inner()));
     if !super::management::tape_allowed(&policy.management, barcode) {
         return Err(TapeError::NotReady("回收源带离线或在黑名单中".into()));
     }
-    let pool = policy
+    policy
         .pools
         .iter()
         .find(|p| p.tapes.iter().any(|b| b == barcode))
@@ -3453,13 +3939,7 @@ fn load_aside(
             && caps
                 .get(&i)
                 .is_some_and(|c| super::scheduling::compatible(c, barcode, false))
-            && super::management::drive_allowed(
-                &policy.management,
-                &serials[i],
-                u64::from(opts.node_id),
-                &pool.uuid,
-                'g',
-            )
+            && super::management::drive_allowed(&policy.management, &serials[i], 'g')
     };
     {
         let inv = inventory(&a.devices)?;

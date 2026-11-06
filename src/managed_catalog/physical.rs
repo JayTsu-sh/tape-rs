@@ -1,9 +1,7 @@
-//! Bridge from the actual uncommitted LTFS write to an Active FDB receipt.
-//! This is preparatory: production still needs a logical FDB reservation
-//! before data records are written. A full receipt cannot be known until LTFS
-//! has assigned its file UID, timestamps and content xattrs. Once written,
-//! only a sealed batch may proceed to an index commit, and a failed commit
-//! remains indeterminate until the next fenced owner inspects the medium.
+//! Bound physical attempts of immutable logical upload requests. A real owner
+//! fence and write-before-data reservation precede appends. A full receipt is
+//! derived only after LTFS assigns actual file UID and attributes; an uncertain
+//! index commit remains fenced until media recovery proves its outcome.
 
 use super::*;
 use crate::ltfs::index::FileNode;
@@ -22,6 +20,8 @@ pub struct ActiveFileIntent {
     pub request_epoch: u64,
     pub library_serial: String,
     pub pool_id: Option<Uuid>,
+    pub barcode_constraint: Option<String>,
+    /// Actual execution fence; physical attempts require a nonzero owner.
     pub owner_epoch: u64,
     pub volume_id: Uuid,
     pub volume_generation: u64,
@@ -142,44 +142,17 @@ fn prepare_file_node(
 }
 
 pub(super) fn validate_active_file_intent(intent: &ActiveFileIntent) -> Result<()> {
-    let physical_len = intent
-        .parent_path
-        .len()
-        .checked_add(intent.name.len())
-        .and_then(|length| length.checked_add(usize::from(intent.parent_path != b"/")))
-        .ok_or(CatalogError::Invalid("活动文件完整路径长度溢出"))?;
-    if physical_len > 2048 {
-        return Err(CatalogError::Invalid("活动文件完整路径超过 2048 字节"));
+    intent.request().validate()?;
+    if intent.owner_epoch == 0 {
+        return Err(CatalogError::Invalid("活动文件物理尝试尚未绑定执行 owner"));
     }
-    std::str::from_utf8(&intent.parent_path)
-        .map_err(|_| CatalogError::Invalid("LTFS 父路径必须是 UTF-8"))?;
-    lookup::path_components(&intent.parent_path)?;
-    validate_name(&intent.name)?;
-    control::validate_physical_serial(&intent.library_serial)?;
     validate_scan(
         intent.volume_id,
         VolumeScan {
             generation: intent.volume_generation,
             id: intent.volume_scan_id,
         },
-    )?;
-    if intent.namespace.is_nil()
-        || intent.file_id.is_nil()
-        || intent.operation_id.is_nil()
-        || intent.pool_id.is_some_and(|id| id.is_nil())
-        || intent.owner_epoch == 0
-        || intent.request_epoch == 0
-        || intent.volume_generation == 0
-        || intent.expected_digest == ContentDigest::Unknown
-        || intent
-            .expected_version
-            .unwrap_or(0)
-            .checked_add(1)
-            .is_none()
-    {
-        return Err(CatalogError::Invalid("活动文件写前预约身份或摘要无效"));
-    }
-    Ok(())
+    )
 }
 
 #[cfg(test)]
@@ -189,6 +162,60 @@ mod tests {
     use crate::scsi::sim::{SimCartridge, SimLibrary};
     use sha2::{Digest, Sha256};
     use std::io::Cursor;
+
+    #[test]
+    fn upload_paths_reject_xml_forbidden_characters_before_admission() {
+        let mut intent = ActiveFileIntent {
+            barcode_constraint: None,
+            namespace: Uuid::new_v4(),
+            parent: Uuid::nil(),
+            parent_path: b"/".to_vec(),
+            name: b"good".to_vec(),
+            file_id: Uuid::new_v4(),
+            expected_version: None,
+            operation_id: Uuid::new_v4(),
+            request_epoch: 1,
+            library_serial: "SIM".into(),
+            pool_id: Some(Uuid::new_v4()),
+            owner_epoch: 1,
+            volume_id: Uuid::new_v4(),
+            volume_generation: 2,
+            volume_scan_id: Uuid::new_v4(),
+            expected_size: 3,
+            expected_digest: ContentDigest::Sha256([1; 32]),
+        };
+        intent.owner_epoch = 0;
+        assert!(intent.ltfs_path().is_err());
+        assert_eq!(intent.request().ltfs_path().unwrap(), "/good");
+        assert!(
+            validate_active_file_intent(&intent).is_err(),
+            "logical identity grants no execution permission"
+        );
+        intent.owner_epoch = 1;
+        assert!(validate_active_file_intent(&intent).is_ok());
+        intent.expected_version = Some(0);
+        assert!(intent.ltfs_path().is_err());
+        intent.expected_version = None;
+        for bad in ["bad\u{1}", "bad\u{fffe}", "bad\u{ffff}"] {
+            intent.name = bad.as_bytes().to_vec();
+            assert!(
+                intent.ltfs_path().is_err(),
+                "非法 XML 文件名不能进入写前预约"
+            );
+            intent.name = b"good".to_vec();
+            intent.parent_path = format!("/{bad}").into_bytes();
+            assert!(
+                intent.ltfs_path().is_err(),
+                "非法 XML 父路径不能进入写前预约"
+            );
+            intent.parent_path = b"/".to_vec();
+        }
+        intent.name = "空 格 & < > \" 🧵".as_bytes().to_vec();
+        assert!(
+            intent.ltfs_path().is_ok(),
+            "合法 XML 特殊字符由索引 writer 转义"
+        );
+    }
 
     #[test]
     fn real_simulated_append_yields_exact_precommit_receipt() {
@@ -211,6 +238,7 @@ mod tests {
         let bytes = b"FDB physical receipt";
         let digest = ContentDigest::Sha256(Sha256::digest(bytes).into());
         let intent = ActiveFileIntent {
+            barcode_constraint: None,
             namespace: Uuid::new_v4(),
             parent: Uuid::new_v4(),
             parent_path: b"/nested".to_vec(),
@@ -244,6 +272,13 @@ mod tests {
             volume.index().generation + 1
         );
         assert_eq!(prepared.receipt.content_digest, digest);
+        let mut invalid = prepared.receipt.clone();
+        invalid.expected_version = Some(0);
+        invalid.copy_id = derive_copy_id(&invalid);
+        assert!(
+            validate_receipt(&invalid).is_err(),
+            "zero previous must not alias an original create receipt"
+        );
         assert_eq!(
             prepared.receipt.ltfs_file_uid,
             prepared.attributes.meta().unwrap().file_uid

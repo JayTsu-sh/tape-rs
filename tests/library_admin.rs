@@ -55,73 +55,56 @@ fn scheduler_predicate_enforces_each_role_and_enabled_state() {
 }
 
 #[test]
-fn local_nodegroups_have_real_membership_and_reference_safe_deletion() {
+fn new_library_schema_has_no_scheduling_groups() {
     let f = Fixture::new();
-    let mut lib = f.open();
-    assert_eq!(lib.local_nodegroup().unwrap().as_deref(), Some("G0"));
-    assert_eq!(
-        lib.nodegroup_show("G0").unwrap()["scope"],
-        "local_direct_manager"
-    );
-    lib.nodegroup_create("G1").unwrap();
-    assert!(lib.nodegroup_create("G1").is_err());
-    for name in ["", "bad/name", "a-b", "abcdefghijklmnopq", "组"] {
-        assert!(lib.nodegroup_create(name).is_err());
-    }
-    assert!(lib.nodegroup_set_local(Some("missing")).is_err());
-    lib.nodegroup_set_local(Some("G1")).unwrap();
-    assert!(lib.nodegroup_delete("G1").is_err());
-    assert_eq!(lib.nodegroup_show("G1").unwrap()["local_member"], true);
-    assert_eq!(lib.nodegroup_list().unwrap().as_array().unwrap().len(), 2);
-    drop(lib);
-    let mut lib = f.open();
-    assert_eq!(lib.local_nodegroup().unwrap().as_deref(), Some("G1"));
-    lib.nodegroup_set_local(None).unwrap();
-    assert_eq!(lib.local_nodegroup().unwrap(), None);
-    lib.nodegroup_delete("G1").unwrap();
-    assert!(lib.nodegroup_show("G1").is_err());
-    assert!(lib.nodegroup_delete("G0").is_err());
-    assert!(lib.nodegroup_delete("missing").is_err());
-    drop(lib);
-    assert_eq!(f.open().local_nodegroup().unwrap(), None);
+    let lib = f.open();
+    let db = rusqlite::Connection::open(&f.path).unwrap();
+    let group_tables: u64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name LIKE '%group%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(group_tables, 0);
+    let local_node_tables: u64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name='library_local_node'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(local_node_tables, 0);
+    let status = lib.status().unwrap();
+    assert!(status.get("nodegroups").is_none());
+    assert!(status.get("local_nodegroup").is_none());
+    assert!(status["drives"][0].get("nodegroup_name").is_none());
+    assert_eq!(status["drives"][0]["enabled"], true);
+    assert_eq!(status["drives"][0]["role"], "mrg");
 }
 
 #[test]
-fn drive_group_assignment_and_local_membership_restrict_scheduler() {
+fn all_library_pools_share_enabled_drives_with_matching_roles() {
     let f = Fixture::with_drive_count(2);
     let mut lib = f.open();
-    lib.pool_create("pool").unwrap();
-    lib.nodegroup_create("G1").unwrap();
-    assert_eq!(
-        lib.drive_nodegroup("SIMDRV0000").unwrap().as_deref(),
-        Some("G0")
-    );
-    lib.drive_set_nodegroup("SIMDRV0000", Some("G1")).unwrap();
-    assert!(!lib.drive_eligible(0, "pool", 'r').unwrap());
-    assert!(lib.drive_eligible(1, "pool", 'r').unwrap());
-    assert!(lib.nodegroup_delete("G1").is_err());
-    lib.drive_set_nodegroup("SIMDRV0000", None).unwrap();
-    assert_eq!(lib.drive_nodegroup("SIMDRV0000").unwrap(), None);
-    assert!(!lib.drive_eligible(0, "pool", 'r').unwrap());
-    lib.nodegroup_delete("G1").unwrap();
-    lib.nodegroup_set_local(None).unwrap();
-    assert!(!lib.drive_eligible(1, "pool", 'r').unwrap());
-    lib.nodegroup_set_local(Some("G0")).unwrap();
-    assert!(lib.drive_eligible(1, "pool", 'r').unwrap());
-    assert!(lib.drive_set_nodegroup("unknown", Some("G0")).is_err());
-    assert!(
-        lib.drive_set_nodegroup("SIMDRV0001", Some("missing"))
-            .is_err()
-    );
-    assert_eq!(
-        lib.status().unwrap()["drives"][0]["nodegroup_name"],
-        serde_json::Value::Null
-    );
+    lib.pool_create("first").unwrap();
+    lib.pool_create("second").unwrap();
+    lib.drive_set_role("SIMDRV0000", "r").unwrap();
+    lib.drive_set_role("SIMDRV0001", "mg").unwrap();
+    for pool in ["first", "second"] {
+        assert!(lib.drive_eligible(0, pool, 'r').unwrap());
+        assert!(!lib.drive_eligible(0, pool, 'm').unwrap());
+        assert!(!lib.drive_eligible(1, pool, 'r').unwrap());
+        assert!(lib.drive_eligible(1, pool, 'm').unwrap());
+        assert!(lib.drive_eligible(1, pool, 'g').unwrap());
+    }
+    lib.drive_set_enabled("SIMDRV0000", false).unwrap();
     drop(lib);
     let lib = f.open();
-    assert_eq!(lib.drive_nodegroup("SIMDRV0000").unwrap(), None);
-    assert!(!lib.drive_eligible(0, "pool", 'r').unwrap());
-    assert!(lib.drive_eligible(1, "pool", 'r').unwrap());
+    for pool in ["first", "second"] {
+        assert!(!lib.drive_eligible(0, pool, 'r').unwrap());
+        assert!(lib.drive_eligible(1, pool, 'm').unwrap());
+    }
 }
 
 #[test]
@@ -129,25 +112,13 @@ fn administrative_policy_changes_refuse_foreign_loaded_drives_without_side_effec
     let f = Fixture::new();
     let mut lib = f.open();
     lib.assign("pool", "LIB001L8").unwrap();
-    lib.nodegroup_create("G1").unwrap();
     f.sim.load_into_drive("LIB001L8", 0).unwrap();
     let changer_log = f.changer.command_log().len();
     let drive_log = f.drive.command_log().len();
     assert!(lib.drive_set_role("SIMDRV0000", "r").is_err());
-    assert!(lib.drive_set_nodegroup("SIMDRV0000", Some("G1")).is_err());
-    assert!(lib.drive_set_nodegroup("SIMDRV0000", None).is_err());
     assert!(lib.drive_set_enabled("SIMDRV0000", true).is_err());
-    assert!(lib.nodegroup_set_local(Some("G1")).is_err());
-    assert!(lib.nodegroup_set_local(None).is_err());
-    assert!(lib.pool_set("pool", "nodegroup", "G1").is_err());
     assert_eq!(lib.drive_role("SIMDRV0000").unwrap(), "mrg");
-    assert_eq!(
-        lib.drive_nodegroup("SIMDRV0000").unwrap().as_deref(),
-        Some("G0")
-    );
-    assert_eq!(lib.local_nodegroup().unwrap().as_deref(), Some("G0"));
     assert_eq!(lib.pool_show("pool").unwrap()["explicit"], false);
-    assert_eq!(lib.pool_nodegroup("pool").unwrap(), "G0");
     assert_eq!(f.sim.loaded_barcode(0).as_deref(), Some("LIB001L8"));
     assert!(
         f.changer.command_log()[changer_log..]
@@ -166,17 +137,13 @@ fn policy_changes_refuse_a_foreign_reservation_even_when_the_drive_is_empty() {
     use tape_rs::scsi::reservation::{ReservationKey, fence, read_status};
     let f = Fixture::new();
     let mut lib = f.open();
-    lib.nodegroup_create("G1").unwrap();
     let foreign = f.sim.drive_as(0, 99);
     fence(&foreign, ReservationKey::new(2, 200)).unwrap();
     let before = read_status(&foreign).unwrap();
     assert!(lib.drive_set_role("SIMDRV0000", "r").is_err());
-    assert!(lib.drive_set_nodegroup("SIMDRV0000", None).is_err());
     assert!(lib.drive_set_enabled("SIMDRV0000", false).is_err());
-    assert!(lib.nodegroup_set_local(Some("G1")).is_err());
     assert_eq!(read_status(&foreign).unwrap(), before);
     assert_eq!(lib.drive_role("SIMDRV0000").unwrap(), "mrg");
-    assert_eq!(lib.local_nodegroup().unwrap().as_deref(), Some("G0"));
     assert!(f.sim.loaded_barcode(0).is_none());
 }
 
@@ -186,13 +153,9 @@ fn owned_drive_policy_changes_preserve_data_and_apply_to_actual_reads() {
     let mut lib = f.formatted();
     lib.write_from("/pool/LIB001L8/file", &mut &b"keep data"[..], true)
         .unwrap();
-    lib.nodegroup_create("G1").unwrap();
     let changer_log = f.changer.command_log().len();
     let drive_log = f.drive.command_log().len();
     lib.drive_set_role("SIMDRV0000", "r").unwrap();
-    lib.pool_set("pool", "nodegroup", "G1").unwrap();
-    lib.drive_set_nodegroup("SIMDRV0000", Some("G1")).unwrap();
-    lib.nodegroup_set_local(Some("G1")).unwrap();
     assert!(
         f.changer.command_log()[changer_log..]
             .iter()
@@ -215,23 +178,21 @@ fn owned_drive_policy_changes_preserve_data_and_apply_to_actual_reads() {
 }
 
 #[test]
-fn cached_nodegroup_status_is_current_and_requires_no_transport_calls() {
+fn cached_drive_policy_is_current_and_requires_no_transport_calls() {
     let f = Fixture::new();
     let mut lib = f.open();
-    lib.nodegroup_create("G1").unwrap();
-    lib.nodegroup_set_local(Some("G1")).unwrap();
-    lib.drive_set_nodegroup("SIMDRV0000", Some("G1")).unwrap();
     lib.drive_set_role("SIMDRV0000", "g").unwrap();
+    lib.drive_set_enabled("SIMDRV0000", false).unwrap();
     let changer_log = f.changer.command_log();
     let drive_log = f.drive.command_log();
     let cached = tape_rs::library::cached_status_if_active(&f.path)
         .unwrap()
         .unwrap();
-    assert_eq!(cached["nodegroups"], lib.nodegroup_list().unwrap());
-    assert_eq!(cached["nodegroups"][1], lib.nodegroup_show("G1").unwrap());
-    assert_eq!(cached["local_nodegroup"], "G1");
-    assert_eq!(cached["drives"][0]["nodegroup_name"], "G1");
+    assert!(cached.get("nodegroups").is_none());
+    assert!(cached.get("local_nodegroup").is_none());
+    assert!(cached["drives"][0].get("nodegroup_name").is_none());
     assert_eq!(cached["drives"][0]["role"], "g");
+    assert_eq!(cached["drives"][0]["enabled"], false);
     assert_eq!(f.changer.command_log(), changer_log);
     assert_eq!(f.drive.command_log(), drive_log);
 }

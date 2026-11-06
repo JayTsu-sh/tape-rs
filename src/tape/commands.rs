@@ -354,35 +354,36 @@ impl<'a> TapeDrive<'a> {
         let mut buf = [0u8; LOG_SENSE_BUF_LEN];
         let cdb_bytes = cdb::log_sense(page_code, subpage, LOG_SENSE_BUF_LEN as u16);
         let result = self.device.execute_read(&cdb_bytes, &mut buf, 30_000)?;
+        if result.transferred > buf.len() {
+            return Err(TapeError::InvalidResponse {
+                expected: buf.len(),
+                actual: result.transferred,
+            });
+        }
         Ok(Bytes::copy_from_slice(&buf[..result.transferred]))
     }
 
     /// 读取 TapeAlert（log page 0x2E），返回被触发的 flag 编号列表
     pub fn read_tape_alerts(&self) -> Result<Vec<u16>> {
         let data = self.log_sense(0x2E, 0x00)?;
-        if data.len() < 4 {
-            return Ok(Vec::new());
+        tape_alerts(&data)
+    }
+
+    /// MODE SENSE(10) device-specific header byte3 WP，IBM GA32-0928-08。
+    /// 使用既有分区页；只读取，不改变介质或磁头位置。
+    pub fn write_protected(&self) -> Result<bool> {
+        let mut data = [0; 512];
+        let result = retry_unit_attention("监控写保护", || {
+            self.device
+                .execute_read(&cdb::mode_sense_10(0x11, 512), &mut data, 30_000)
+        })?;
+        if result.transferred > data.len() {
+            return Err(TapeError::InvalidResponse {
+                expected: data.len(),
+                actual: result.transferred,
+            });
         }
-        // Log page header: 4 bytes
-        // 之后为若干 Log Parameter: header(4) + parameter data
-        let page_len = u16::from_be_bytes([data[2], data[3]]) as usize;
-        let end = (4 + page_len).min(data.len());
-        let mut alerts = Vec::new();
-        let mut offset = 4;
-        while offset + 5 <= end {
-            let param_code = u16::from_be_bytes([data[offset], data[offset + 1]]);
-            let param_len = data[offset + 3] as usize;
-            let value_offset = offset + 4;
-            if value_offset + param_len > end {
-                break;
-            }
-            // TapeAlert flag 的 parameter data 长度为 1 字节：0/1
-            if param_len >= 1 && data[value_offset] != 0 {
-                alerts.push(param_code);
-            }
-            offset = value_offset + param_len;
-        }
-        Ok(alerts)
+        mode_write_protected(&data[..result.transferred])
     }
 
     /// 查询 SSC Device Configuration Extension 10h/01h 的 WRITE MODE。
@@ -552,6 +553,68 @@ impl<'a> TapeDrive<'a> {
     }
 }
 
+/// TapeAlert may be consumed by LOG SENSE: never retry a truncated page or
+/// interpret it as all-zero. A single read captures the whole advertised page.
+fn tape_alerts(data: &[u8]) -> Result<Vec<u16>> {
+    if data.len() < 4 {
+        return Err(TapeError::InvalidResponse {
+            expected: 4,
+            actual: data.len(),
+        });
+    }
+    let end = 4 + usize::from(u16::from_be_bytes([data[2], data[3]]));
+    if end > data.len() {
+        return Err(TapeError::InvalidResponse {
+            expected: end,
+            actual: data.len(),
+        });
+    }
+    if data[0] & 0x7f != 0x2e || data[1] != 0 {
+        return Err(TapeError::Ltfs("TapeAlert 页身份错误".into()));
+    }
+    let mut alerts = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut offset = 4;
+    while offset < end {
+        if end - offset < 5 {
+            return Err(TapeError::InvalidResponse {
+                expected: offset + 5,
+                actual: end,
+            });
+        }
+        let code = u16::from_be_bytes([data[offset], data[offset + 1]]);
+        if data[offset + 3] != 1
+            || data[offset + 4] > 1
+            || !(1..=64).contains(&code)
+            || !seen.insert(code)
+        {
+            return Err(TapeError::Ltfs("TapeAlert 参数编号、长度或值错误".into()));
+        }
+        if data[offset + 4] == 1 {
+            alerts.push(code);
+        }
+        offset += 5;
+    }
+    Ok(alerts)
+}
+
+fn mode_write_protected(data: &[u8]) -> Result<bool> {
+    if data.len() < 8 {
+        return Err(TapeError::InvalidResponse {
+            expected: 8,
+            actual: data.len(),
+        });
+    }
+    let end = 2 + usize::from(u16::from_be_bytes([data[0], data[1]]));
+    if end < 8 || end > data.len() {
+        return Err(TapeError::InvalidResponse {
+            expected: end.max(8),
+            actual: data.len(),
+        });
+    }
+    Ok(data[3] & 0x80 != 0)
+}
+
 fn short_position_matches(buf: &[u8; 20], partition: u8, block: u64) -> bool {
     buf[0] & 0x06 == 0
         && buf[1] == partition
@@ -636,5 +699,88 @@ mod write_mode_tests {
         assert!(device_write_mode(&data).is_err());
         data[16] = 0x10;
         assert!(device_write_mode(&data).is_err());
+    }
+}
+
+#[cfg(test)]
+mod monitor_response_tests {
+    use super::*;
+    use crate::scsi::device::ScsiResult;
+
+    struct Reply(Vec<u8>);
+    impl TapeTransport for Reply {
+        fn execute_no_data(&self, _: &[u8], _: u32) -> Result<ScsiResult> {
+            panic!("监控不能发送无数据的机械命令")
+        }
+        fn execute_write(&self, _: &[u8], _: &[u8], _: u32) -> Result<ScsiResult> {
+            panic!("监控不能发送写命令")
+        }
+        fn execute_read(&self, cdb: &[u8], out: &mut [u8], _: u32) -> Result<ScsiResult> {
+            assert_eq!(cdb[0], crate::scsi::cdb::opcode::LOG_SENSE);
+            out[..self.0.len()].copy_from_slice(&self.0);
+            Ok(ScsiResult {
+                transferred: self.0.len(),
+                status: 0,
+                sense: crate::scsi::sense::SenseInfo::from_bytes(&[]),
+                duration_ms: 0,
+            })
+        }
+        fn identity(&self) -> &str {
+            "monitor-reply"
+        }
+    }
+
+    #[test]
+    fn tape_alert_truncation_must_not_report_a_healthy_empty_page() {
+        let complete = [0x2e, 0, 0, 10, 0, 5, 0, 1, 1, 0, 35, 0, 1, 1];
+        for length in 0..complete.len() {
+            let device = Reply(complete[..length].to_vec());
+            assert!(
+                TapeDrive::new(&device).read_tape_alerts().is_err(),
+                "截断长度 {length}"
+            );
+        }
+        let device = Reply(complete.to_vec());
+        assert_eq!(TapeDrive::new(&device).read_tape_alerts().unwrap(), [5, 35]);
+    }
+}
+
+#[cfg(test)]
+mod monitor_parser_tests {
+    use super::*;
+    #[test]
+    fn alerts_reject_malformed_pages_duplicates_and_reserved_values() {
+        assert!(tape_alerts(&[0x2e, 0, 0, 0]).unwrap().is_empty());
+        for data in [
+            vec![0x2d, 0, 0, 0],
+            vec![0x6e, 0, 0, 0],
+            vec![0x2e, 1, 0, 0],
+            vec![0x2e, 0, 0, 5, 0, 0, 0, 1, 0],
+            vec![0x2e, 0, 0, 5, 0, 65, 0, 1, 0],
+            vec![0x2e, 0, 0, 5, 0, 1, 0, 2, 0],
+            vec![0x2e, 0, 0, 5, 0, 1, 0, 1, 2],
+            vec![0x2e, 0, 0, 10, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0],
+        ] {
+            assert!(tape_alerts(&data).is_err(), "{data:?}");
+        }
+        assert!(
+            tape_alerts(&[0x2e, 0, 0, 5, 0, 1, 0, 1, 0])
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[test]
+    fn wp_is_mode_sense_ten_byte_header_not_six_byte_offset() {
+        let mut data = [0, 6, 0x80, 0, 0, 0, 0, 0];
+        assert!(!mode_write_protected(&data).unwrap());
+        data[3] = 0x80;
+        assert!(mode_write_protected(&data).unwrap());
+        for len in 0..8 {
+            assert!(mode_write_protected(&data[..len]).is_err());
+        }
+        data[1] = 7;
+        assert!(mode_write_protected(&data).is_err());
+        data[1] = 0;
+        assert!(mode_write_protected(&data).is_err());
     }
 }

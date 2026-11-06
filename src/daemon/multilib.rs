@@ -16,7 +16,7 @@ use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use slog::Drain;
 
-use super::coordinator::Coordinator;
+use super::coordinator::{Coordinator, placement};
 use super::directory::Directory;
 use super::executor::{DeviceProvider, ExecEvent, ExecRequest};
 use super::files::FileService;
@@ -1211,6 +1211,7 @@ pub fn run(
     let mut waiters: HashMap<u64, Sender<AdminReply>> = HashMap::new();
     let mut request_id = 0u64;
     let mut shutdown: Option<(Instant, Vec<Receiver<()>>)> = None;
+    let mut shutdown_vips = super::vip::ShutdownVips::default();
     let mut snapshot_job: Option<SnapshotJob> = None;
     let mut deferred_directory = None;
     loop {
@@ -1236,13 +1237,24 @@ pub fn run(
             let done = receivers
                 .iter()
                 .all(|r| !matches!(r.try_recv(), Err(mpsc::TryRecvError::Empty)));
-            let held = state.controls[GATEWAY]
-                .vips
-                .values()
-                .any(|v| v.holder.as_ref().is_some_and(|h| h.node == cfg.id));
-            if (done && !held && running.values().all(directory_idle))
-                || Instant::now() >= *deadline
-            {
+            let held =
+                shutdown_vips.pending(cfg.id, node.raft.leader_id, &state.controls[GATEWAY].vips);
+            if done && !held && running.values().all(directory_idle) {
+                if state.controls[GATEWAY].vips.values().any(|record| {
+                    record
+                        .holder
+                        .as_ref()
+                        .is_some_and(|holder| holder.node == cfg.id)
+                }) {
+                    log::info!("本机 VIP 已确认撤址；当前无 Leader，保留未提交的占用记录后退出");
+                }
+                return Ok(());
+            }
+            if Instant::now() >= *deadline {
+                log::warn!(
+                    "等待设备、目录任务或 VIP 撤址确认超过 {:?}，保留未确认状态后退出",
+                    cfg.shutdown_grace
+                );
                 return Ok(());
             }
         }
@@ -1301,6 +1313,7 @@ pub fn run(
                     _ => false,
                 };
                 if scope == GATEWAY && valid {
+                    shutdown_vips.observe(cfg.id, &state.controls[GATEWAY].vips, &command);
                     let _ = node.propose(vec![], encode_command(GATEWAY, &command));
                 }
             }
@@ -1395,7 +1408,25 @@ pub fn run(
         if node.raft.state != StateRole::Leader {
             waiters.clear();
         }
+        let plan = placement::spread(
+            &running
+                .iter()
+                .filter(|(id, _)| id.as_str() != GATEWAY)
+                .map(|(id, r)| {
+                    (
+                        id.clone(),
+                        r.coordinator.placement_input(&state.controls[id]),
+                    )
+                })
+                .collect(),
+        );
         for (id, r) in &mut running {
+            if id != GATEWAY {
+                r.coordinator.set_placement(
+                    plan.get(id)
+                        .map(|node| (*node, state.controls[id].candidates[node].instance)),
+                );
+            }
             // `tick` may send Recover immediately. Publish the frozen source
             // index it used before the executor can consume that request.
             r.runtime
@@ -1443,8 +1474,8 @@ pub fn run(
             }
         }
         for entry in entries {
-            applied = applied.max(entry.index);
             if entry.get_entry_type() != EntryType::EntryNormal || entry.data.is_empty() {
+                applied = applied.max(entry.index);
                 continue;
             }
             let outcome = apply_entry(
@@ -1454,6 +1485,7 @@ pub fn run(
                 &entry.data,
                 pending.is_none(),
             )?;
+            applied = applied.max(entry.index);
             if let Ok(bytes) = <[u8; 8]>::try_from(entry.context.as_ref())
                 && let Some(reply) = waiters.remove(&u64::from_be_bytes(bytes))
             {
@@ -1471,6 +1503,9 @@ pub fn run(
         if pending.is_none() {
             advance_directories(&mut running, applied)?;
         }
+        // 确认已恢复/应用的全局控制位置；异步目录 job/queue/fetch 仍由独立屏障控制，
+        // 不将控制 applied 当作各目录已完成的水位。
+        node.advance_apply_to(applied);
         for (id, r) in &mut running {
             let idle = directory_idle(r);
             r.runtime
@@ -1795,6 +1830,278 @@ mod tests {
     fn config() -> LibrariesConfig {
         LibrariesConfig::parse(&json!({"default_library":"a","libraries":[{"changer_serial":"b","drive_serials":["db"]},{"changer_serial":"a","drive_serials":["da"]}]})).unwrap()
     }
+
+    struct ApplyNetwork;
+    impl Network for ApplyNetwork {
+        fn send(&self, _: raft::eraftpb::Message) {}
+    }
+
+    fn ready_apply_node(
+        root: &Path,
+        commands: &[Vec<u8>],
+        applied: u64,
+    ) -> (RaftStore, RawNode<super::super::store::ControlStorage>) {
+        std::fs::create_dir_all(root).unwrap();
+        let mut store = RaftStore::open(&root.join("raft.db"), &[1, 2, 3]).unwrap();
+        let entries: Vec<_> = commands
+            .iter()
+            .enumerate()
+            .map(|(i, data)| raft::eraftpb::Entry {
+                index: i as u64 + 1,
+                term: 7,
+                data: data.clone().into(),
+                ..Default::default()
+            })
+            .collect();
+        store.append(&entries).unwrap();
+        store
+            .set_hardstate(&raft::eraftpb::HardState {
+                term: 7,
+                vote: 2,
+                commit: entries.len() as u64,
+                ..Default::default()
+            })
+            .unwrap();
+        let node = RawNode::new(
+            &Config {
+                id: 1,
+                applied,
+                ..Default::default()
+            },
+            store.raft_storage(),
+            &slog::Logger::root(slog::Discard, slog::o!()),
+        )
+        .unwrap();
+        (store, node)
+    }
+
+    #[test]
+    fn ready_apply_waits_for_multilib_controls_and_directories() {
+        let root = std::env::temp_dir().join(format!("multilib-apply-{}", uuid::Uuid::new_v4()));
+        let commands: Vec<_> = ["a", "b"]
+            .into_iter()
+            .map(|id| {
+                encode_command(
+                    id,
+                    &Command::PoolCreate {
+                        uuid: id.into(),
+                        name: id.into(),
+                        file_limit: 100,
+                    },
+                )
+            })
+            .collect();
+        let (mut store, mut node) = ready_apply_node(&root, &commands, 0);
+        let mut state = ClusterState::new(&config());
+        let mut running: BTreeMap<_, _> = ["a", "b"]
+            .into_iter()
+            .map(|id| (id.to_owned(), running(&root, id)))
+            .collect();
+        let (_, entries, _) = on_ready(&mut node, &mut store, &ApplyNetwork).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            node.raft.raft_log.applied, 0,
+            "多库 Ready 不得提前确认控制应用"
+        );
+        let mut applied = 0;
+        for entry in entries {
+            apply_entry(&mut state, &mut running, entry.index, &entry.data, true).unwrap();
+            applied = entry.index;
+            assert!(node.raft.raft_log.applied < applied);
+        }
+        advance_directories(&mut running, applied).unwrap();
+        node.advance_apply_to(applied);
+        assert_eq!(node.raft.raft_log.applied, 2);
+        for r in running.values() {
+            assert_eq!(r.directory.as_ref().unwrap().applied_index(), 2);
+            assert_eq!(r.directory.as_ref().unwrap().pools().unwrap().len(), 1);
+        }
+        drop((running, node, store));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ready_apply_multilib_snapshot_does_not_claim_directory_catchup() {
+        let root =
+            std::env::temp_dir().join(format!("multilib-snapshot-apply-{}", uuid::Uuid::new_v4()));
+        let (mut store, mut node) = ready_apply_node(&root, &[], 0);
+        let state = ClusterState::new(&config());
+        let mut snapshot = raft::eraftpb::Snapshot::default();
+        snapshot.mut_metadata().index = 50;
+        snapshot.mut_metadata().term = 7;
+        snapshot
+            .mut_metadata()
+            .set_conf_state(raft::eraftpb::ConfState::from((vec![1, 2, 3], vec![])));
+        snapshot.set_data(state.snapshot(2, 50).into());
+        let mut message = raft::eraftpb::Message {
+            msg_type: raft::eraftpb::MessageType::MsgSnapshot,
+            from: 2,
+            to: 1,
+            term: 8,
+            ..Default::default()
+        };
+        message.set_snapshot(snapshot);
+        node.step(message).unwrap();
+        let (snapshot, entries, _) = on_ready(&mut node, &mut store, &ApplyNetwork).unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(node.raft.raft_log.applied, 0, "多库控制快照须先恢复再确认");
+        let snapshot = snapshot.unwrap();
+        let (_, source, directory_index) =
+            ClusterState::restore(&config(), snapshot.get_data()).unwrap();
+        let running: BTreeMap<_, _> = ["a", "b"]
+            .into_iter()
+            .map(|id| (id.to_owned(), running(&root, id)))
+            .collect();
+        let pending = Some((source, directory_index));
+        node.advance_apply_to(snapshot.get_metadata().index);
+        assert_eq!(node.raft.raft_log.applied, 50);
+        assert_eq!(pending, Some((2, 50)));
+        assert!(
+            running
+                .values()
+                .all(|r| r.directory.as_ref().unwrap().applied_index() == 0)
+        );
+        drop((running, node, store));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ready_apply_multilib_tracks_control_separately_from_a_blocked_catalog_job() {
+        let root =
+            std::env::temp_dir().join(format!("multilib-job-apply-{}", uuid::Uuid::new_v4()));
+        let commands = vec![
+            encode_command(
+                "b",
+                &Command::PoolCreate {
+                    uuid: "p".into(),
+                    name: "p".into(),
+                    file_limit: 100,
+                },
+            ),
+            encode_command(
+                "b",
+                &Command::TapeAssign {
+                    barcode: "T".into(),
+                    pool: "p".into(),
+                },
+            ),
+            encode_command(
+                "b",
+                &Command::CatalogPart {
+                    barcode: "T".into(),
+                    generation: 1,
+                    part: 0,
+                    files: (0..4097)
+                        .map(|i| FileRec {
+                            path: format!("/{i}"),
+                            length: 1,
+                            sha256: String::new(),
+                            version: (0, 0),
+                            deleted: false,
+                            metadata: json!({}),
+                        })
+                        .collect(),
+                },
+            ),
+        ];
+        let (mut store, mut node) = ready_apply_node(&root, &commands, 3);
+        let mut state = ClusterState::new(&config());
+        let mut running: BTreeMap<_, _> = ["a", "b"]
+            .into_iter()
+            .map(|id| (id.to_owned(), running(&root, id)))
+            .collect();
+        for (i, data) in commands.iter().enumerate() {
+            apply_entry(&mut state, &mut running, i as u64 + 1, data, true).unwrap();
+        }
+        let blocker = rusqlite::Connection::open(root.join("b.db")).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let commands = [
+            encode_command(
+                "b",
+                &Command::TapeCommitted {
+                    barcode: "T".into(),
+                    volume_uuid: "v".into(),
+                    generation: 1,
+                    files: 4097,
+                    bytes_used: 4097,
+                    bytes_written: 4097,
+                    parts: 1,
+                    full: true,
+                },
+            ),
+            encode_command(
+                "b",
+                &Command::PoolCreate {
+                    uuid: "queued".into(),
+                    name: "queued".into(),
+                    file_limit: 100,
+                },
+            ),
+            encode_command(
+                "a",
+                &Command::PoolCreate {
+                    uuid: "other".into(),
+                    name: "other".into(),
+                    file_limit: 100,
+                },
+            ),
+        ];
+        let mut message = raft::eraftpb::Message {
+            msg_type: raft::eraftpb::MessageType::MsgAppend,
+            from: 2,
+            to: 1,
+            term: 8,
+            index: 3,
+            log_term: 7,
+            commit: 6,
+            ..Default::default()
+        };
+        message.set_entries(
+            commands
+                .into_iter()
+                .enumerate()
+                .map(|(i, data)| raft::eraftpb::Entry {
+                    index: i as u64 + 4,
+                    term: 8,
+                    data: data.into(),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>()
+                .into(),
+        );
+        node.step(message).unwrap();
+        let (_, entries, _) = on_ready(&mut node, &mut store, &ApplyNetwork).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            node.raft.raft_log.applied, 3,
+            "后台目录任务不能让 Ready 提前确认控制应用"
+        );
+        for entry in entries {
+            apply_entry(&mut state, &mut running, entry.index, &entry.data, true).unwrap();
+        }
+        advance_directories(&mut running, 6).unwrap();
+        node.advance_apply_to(6);
+        assert_eq!(node.raft.raft_log.applied, 6);
+        assert_eq!(state.controls["b"].applied_index, 5);
+        assert_eq!(state.controls["a"].applied_index, 6);
+        assert!(running["b"].catalog_job.is_some());
+        assert!(!directory_idle(&running["b"]));
+        assert_eq!(Directory::applied_index_of(&root.join("b.db")).unwrap(), 3);
+        assert_eq!(running["a"].directory.as_ref().unwrap().applied_index(), 6);
+        blocker.execute_batch("COMMIT").unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while !running.values().all(directory_idle) {
+            poll_directories(&mut running).unwrap();
+            advance_directories(&mut running, 6).unwrap();
+            assert!(Instant::now() < until);
+            std::thread::yield_now();
+        }
+        assert_eq!(running["b"].directory.as_ref().unwrap().applied_index(), 6);
+        assert_eq!(node.raft.raft_log.applied, 6);
+        drop((blocker, running, node, store));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn changer_fc_port_is_canonical_and_cannot_change_through_offline_edits() {
         let value = json!({"default_library":"A", "libraries":[{
@@ -2076,15 +2383,15 @@ mod tests {
         assert_eq!(changed.drive_replacements.len(), 1);
         let mut before = ClusterState::new(&old);
         before.controls.get_mut("a").unwrap().management = json!({
-            "pools":{},"tapes":{},"drives":{"da":{"enabled":false,"role":"rg","nodegroup":"G1"}},
-            "nodegroups":["G0","G1"],"nodes":{},"tasks":{},
+            "pools":{},"tapes":{},"drives":{"da":{"enabled":false,"role":"rg"}},
+            "tasks":{},
             "inventory":{"round":7,"drives":[{"serial":"da","barcode":null}]}
         });
         let (mut restored, _, _) =
             ClusterState::restore(&changed, &before.snapshot(1, 42)).unwrap();
         assert_eq!(
             restored.controls["a"].management["drives"]["da2"],
-            json!({"enabled":false,"role":"rg","nodegroup":"G1"})
+            json!({"enabled":false,"role":"rg"})
         );
         assert!(
             restored.controls["a"].management["drives"]
@@ -2203,7 +2510,7 @@ mod tests {
         let mut before = ClusterState::new(&old);
         before.controls.get_mut("a").unwrap().management = json!({
             "pools":{},"tapes":{},"drives":{"da1":{"enabled":false},"da2":{"role":"write"}},
-            "nodegroups":[],"nodes":{},"tasks":{"1":{"id":1,"request":{"resource":"drives","action":"down","target":"da1","params":{}},"state":"queued","cancel_requested":false}},
+            "tasks":{"1":{"id":1,"request":{"resource":"drives","action":"down","target":"da1","params":{}},"state":"queued","cancel_requested":false}},
             "inventory":{"round":7,"drives":[{"serial":"da1"},{"serial":"da2"}]}
         });
         let (mut restored, _, _) =
@@ -2389,6 +2696,227 @@ mod tests {
         .unwrap();
         assert!(state.controls[GATEWAY].vips[&address].holder.is_none());
     }
+    #[test]
+    fn local_vip_withdrawal_without_quorum_finishes_single_node_shutdown() {
+        shutdown_without_quorum(false);
+    }
+
+    #[test]
+    fn local_vip_withdrawal_without_quorum_finishes_multilib_shutdown() {
+        shutdown_without_quorum(true);
+    }
+
+    fn shutdown_without_quorum(multiple: bool) {
+        struct Offline;
+        impl Network for Offline {
+            fn send(&self, _: raft::eraftpb::Message) {}
+        }
+        let root = std::env::temp_dir().join(format!("shutdown-vip-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let libraries = config();
+        let address = "192.0.2.100".parse().unwrap();
+        let mut control = ControlState::default();
+        control.apply(9, &Command::Takeover { node: 1, term: 1 });
+        control.apply(
+            10,
+            &Command::VipAcquire {
+                address,
+                node: 1,
+                round: 9,
+                expected_token: 0,
+            },
+        );
+        let data = if multiple {
+            let mut state = ClusterState::new(&libraries);
+            for value in state.controls.values_mut() {
+                *value = control.clone();
+            }
+            state.snapshot(1, 0)
+        } else {
+            ControlSnapshot {
+                control,
+                source: 1,
+                directory_index: 0,
+            }
+            .encode()
+        };
+        let path = root.join("raft.db");
+        let mut store = RaftStore::open(&path, &[1, 2, 3]).unwrap();
+        let mut snapshot = raft::eraftpb::Snapshot::default();
+        snapshot.set_data(data.into());
+        snapshot.mut_metadata().set_index(10);
+        snapshot.mut_metadata().set_term(1);
+        snapshot
+            .mut_metadata()
+            .set_conf_state(raft::eraftpb::ConfState::from((vec![1, 2, 3], vec![])));
+        store.install_snapshot(&snapshot).unwrap();
+        store
+            .set_hardstate(&raft::eraftpb::HardState {
+                term: 1,
+                commit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        drop(store);
+        let store = RaftStore::open(&path, &[1, 2, 3]).unwrap();
+        let cfg = NodeConfig {
+            id: 1,
+            peers: vec![1, 2, 3],
+            tick: Duration::from_millis(10),
+            election_ticks: 10,
+            heartbeat_ticks: 3,
+            status_file: None,
+            directory_file: None,
+            cooldown: Duration::from_secs(1),
+            snapshot: SnapshotPolicy::default(),
+            shutdown_grace: Duration::from_secs(2),
+            drives: 1,
+            coordination: Some(CoordinationConfig {
+                group: "test".into(),
+                validity: Duration::from_secs(6),
+            }),
+        };
+        let (tx, rx) = mpsc::channel();
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let mut finish_rx = Some(finish_rx);
+        let mut workers = Vec::new();
+        let mut runtimes = Vec::new();
+        let names = if multiple {
+            libraries
+                .libraries
+                .iter()
+                .map(|l| l.changer_serial.clone())
+                .chain(std::iter::once(GATEWAY.to_owned()))
+                .collect::<Vec<_>>()
+        } else {
+            vec!["a".to_owned()]
+        };
+        let count = names.len();
+        for name in names {
+            let (exec, requests) = mpsc::channel();
+            let seen = seen_tx.clone();
+            let finish = finish_rx.take();
+            workers.push(std::thread::spawn(move || {
+                while let Ok(request) = requests.recv() {
+                    if let ExecRequest::Shutdown { done } = request {
+                        seen.send(()).unwrap();
+                        if let Some(finish) = finish {
+                            finish.recv().unwrap();
+                        }
+                        done.unwrap().send(()).unwrap();
+                        return;
+                    }
+                }
+            }));
+            runtimes.push(LibraryRuntime {
+                id: name.clone(),
+                group: name.clone(),
+                drives: 1,
+                directory_file: None,
+                exec,
+                status: Arc::new(Mutex::new(NodeStatus::default())),
+                files: FileService::new(root.join(format!("spool-{name}"))).unwrap(),
+            });
+        }
+        let (completed, result) = mpsc::channel();
+        let sender = tx.clone();
+        let node = std::thread::spawn(move || {
+            let outcome = if multiple {
+                run(
+                    cfg,
+                    libraries,
+                    store,
+                    Box::new(Offline),
+                    None,
+                    sender,
+                    rx,
+                    runtimes,
+                )
+            } else {
+                let runtime = runtimes.remove(0);
+                super::super::node::run(
+                    cfg,
+                    store,
+                    Box::new(Offline),
+                    rx,
+                    runtime.exec,
+                    runtime.status,
+                )
+            };
+            completed.send(outcome).unwrap();
+        });
+        tx.send(NodeInput::Shutdown).unwrap();
+        for _ in 0..count {
+            seen_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        let proof = |node, round, token| {
+            NodeInput::Vip(Command::VipRelease {
+                address,
+                node,
+                round,
+                token,
+            })
+        };
+        if multiple {
+            tx.send(proof(1, 9, 10)).unwrap();
+        } else {
+            for invalid in [proof(2, 9, 10), proof(1, 8, 10), proof(1, 9, 9)] {
+                tx.send(invalid).unwrap();
+            }
+        }
+        std::thread::sleep(Duration::from_millis(60));
+        let waited_for_worker = !node.is_finished();
+        finish_tx.send(()).unwrap();
+        let mut waited_for_proof = true;
+        if !multiple {
+            std::thread::sleep(Duration::from_millis(80));
+            waited_for_proof = !node.is_finished();
+            let _ = tx.send(proof(1, 9, 10));
+        }
+        let early = match result.recv_timeout(Duration::from_millis(800)) {
+            Ok(outcome) => {
+                outcome.unwrap();
+                true
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                result
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap()
+                    .unwrap();
+                false
+            }
+            Err(error) => panic!("节点结果通道异常: {error}"),
+        };
+        node.join().unwrap();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        // 本机退出不能伪造 Raft 提交，磁盘上的旧占用仍须保留。
+        let store = RaftStore::open(&path, &[1, 2, 3]).unwrap();
+        assert_eq!(store.snapshot_index(), 10);
+        let bytes = store.loaded_snapshot().unwrap().get_data();
+        let held = if multiple {
+            ClusterState::restore(&config(), bytes).unwrap().0.controls[GATEWAY].vips[&address]
+                .clone()
+        } else {
+            ControlSnapshot::decode(bytes).unwrap().control.vips[&address].clone()
+        };
+        assert_eq!(held.token, 10);
+        assert_eq!(held.holder.unwrap().node, 1);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(waited_for_worker, "设备执行线程未结束时禁止提前退出");
+        assert!(
+            waited_for_proof,
+            "其他节点、旧轮次或旧 token 的撤址确认无效"
+        );
+        assert!(
+            early,
+            "设备已结束且本机确认撤址后，不应因失去多数派等满停机宽限"
+        );
+    }
+
     fn running(root: &Path, id: &str) -> Running {
         std::fs::create_dir_all(root).unwrap();
         let (exec, _rx) = mpsc::channel();

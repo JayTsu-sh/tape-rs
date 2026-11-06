@@ -542,7 +542,7 @@ fn fdb_owner_rejects_an_ip_view_newer_than_its_observed_dp_head() {
     let drive = TapeDrive::new(&dev);
     assert_eq!(
         verify_ip_not_ahead(&drive, &label, dp_generation, &RecoveryBudget::default()).unwrap(),
-        dp_generation
+        Some(dp_generation)
     );
     lib.with_cartridge_mut(BARCODE, |c| {
         let before = format!("<generationnumber>{dp_generation}</generationnumber>");
@@ -615,7 +615,7 @@ fn fdb_owner_rejects_same_generation_ip_content_or_header_conflicts() {
         let drive = TapeDrive::new(&dev);
         assert_eq!(
             verify_dp_ip_head(&drive, &label, head, &RecoveryBudget::default()).unwrap(),
-            head.generation
+            Some(head.generation)
         );
         lib.with_cartridge_mut(BARCODE, |cartridge| {
             let mut changed = false;
@@ -655,7 +655,9 @@ fn fdb_owner_accepts_lagging_ip_but_gates_same_generation_incremental_view() {
     let label = read_label_only(&dev).unwrap();
     let drive = TapeDrive::new(&dev);
     assert!(
-        verify_dp_ip_head(&drive, &label, head, &RecoveryBudget::default()).unwrap()
+        verify_dp_ip_head(&drive, &label, head, &RecoveryBudget::default())
+            .unwrap()
+            .unwrap()
             < head.generation
     );
     let mut wrong_identity = head;
@@ -745,7 +747,7 @@ fn fdb_owner_replays_delta_chain_for_same_generation_ip_read_view() {
     let drive = TapeDrive::new(&dev);
     assert_eq!(
         verify_dp_ip_head(&drive, &label, head, &RecoveryBudget::default()).unwrap(),
-        head.generation
+        Some(head.generation)
     );
     let error = verify_dp_ip_head(
         &drive,
@@ -814,7 +816,7 @@ fn fdb_owner_accepts_full_checkpoint_with_a_historical_delta_back_pointer() {
             &RecoveryBudget::default()
         )
         .unwrap(),
-        head.generation
+        Some(head.generation)
     );
 }
 
@@ -1067,7 +1069,7 @@ fn streamed_full_recovery_captures_exact_source_and_reads_without_a_volume_tree(
     assert_eq!(source.history_depth, depth);
     assert!(!source.history_truncated);
     assert_eq!(source.dp_eod, eod);
-    assert_eq!(source.ip_generation, expected.generation);
+    assert_eq!(source.ip_generation, Some(expected.generation));
     assert_eq!(source.source_bytes, xml.len() as u64);
     assert_eq!(Sha256::digest(&xml).as_slice(), expected.sha256);
     let path = std::env::temp_dir().join(format!("streamed-recovery-{}.db", uuid::Uuid::new_v4()));
@@ -1212,4 +1214,537 @@ fn streamed_full_recovery_preserves_budget_and_device_errors_and_rejects_deltas(
         )
         .is_err()
     );
+}
+
+#[cfg(feature = "fdb")]
+#[test]
+fn streamed_source_captures_full_and_incremental_payloads_without_writes() {
+    use sha2::Digest;
+    use std::collections::BTreeMap;
+    use tape_rs::ltfs::index::{IndexEntry, LtfsIndex, Xattr};
+    use tape_rs::ltfs::recovery::capture_index_source;
+    use tape_rs::ltfs::volume::read_label_only;
+    use tape_rs::tape::commands::TapeDrive;
+    let (lib, dev) = setup();
+    let mut volume = LtfsVolume::mount(&dev).unwrap();
+    volume
+        .append_file_with_xattrs(
+            "/baseline",
+            &mut Cursor::new(b"kept"),
+            &[("private", "xattrs-and-extents-must-survive")],
+        )
+        .unwrap();
+    volume.commit().unwrap();
+    let full = volume.committed_index_construct();
+    drop(volume);
+    let label = read_label_only(&dev).unwrap();
+    let drive = TapeDrive::new(&dev);
+    let before = dev.command_log().len();
+    let source = capture_index_source(&drive, &label, &RecoveryBudget::default()).unwrap();
+    assert_eq!(source.construct(), full);
+    assert!(source.predecessors().is_empty());
+    let mut baseline = false;
+    source
+        .for_each_entry(|entry| {
+            if let IndexEntry::File { path, node } = entry
+                && path == "baseline"
+            {
+                assert!(!node.extents.is_empty());
+                assert_eq!(
+                    node.xattr("private"),
+                    Some("xattrs-and-extents-must-survive")
+                );
+                baseline = true;
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert!(baseline);
+    assert!(
+        !dev.command_log()[before..]
+            .iter()
+            .any(|op| matches!(*op, 0x0a | 0x10 | 0x8d | 0x04 | 0x19))
+    );
+    drop(source);
+    let mut volume = LtfsVolume::mount(&dev).unwrap();
+    volume
+        .append_file("/dir/a", &mut Cursor::new(b"one"))
+        .unwrap();
+    volume.commit_incremental().unwrap();
+    volume
+        .append_file("/dir/b", &mut Cursor::new(b"two"))
+        .unwrap();
+    volume.commit_incremental().unwrap();
+    volume.remove_file("/dir/a").unwrap();
+    volume.rename_path("/dir/b", "/moved").unwrap();
+    volume
+        .set_node_xattr(
+            "/moved",
+            Xattr {
+                key: "source".into(),
+                value: "retained payload".into(),
+                base64: false,
+            },
+            false,
+            false,
+        )
+        .unwrap();
+    volume.commit_incremental().unwrap();
+    let head = volume.committed_index_construct();
+    assert!(head.incremental);
+    // This synthetic Full is only the independent expected logical view. Its
+    // digest must never replace the raw physical delta identity in the source.
+    let mut expected = volume.index().clone();
+    expected.incremental = false;
+    let expected_xml = expected.to_xml().unwrap();
+    drop(volume);
+    let before = dev.command_log().len();
+    let source = capture_index_source(&drive, &label, &RecoveryBudget::default()).unwrap();
+    assert_eq!(source.construct(), head);
+    assert_eq!(source.predecessors().last().unwrap(), &full);
+    assert_ne!(
+        source.construct().sha256,
+        <[u8; 32]>::from(sha2::Sha256::digest(&expected_xml))
+    );
+    let mut wanted = BTreeMap::new();
+    LtfsIndex::scan_full_reader(&expected_xml[..], |entry| {
+        let path = match &entry {
+            IndexEntry::File { path, .. } | IndexEntry::Directory { path, .. } => path.clone(),
+        };
+        wanted.insert(path, entry);
+        Ok(())
+    })
+    .unwrap();
+    let mut actual = BTreeMap::new();
+    source
+        .for_each_entry(|entry| {
+            let path = match &entry {
+                IndexEntry::File { path, .. } | IndexEntry::Directory { path, .. } => path.clone(),
+            };
+            actual.insert(path, entry);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(actual, wanted);
+    assert!(
+        !dev.command_log()[before..]
+            .iter()
+            .any(|op| matches!(*op, 0x0a | 0x10 | 0x8d | 0x04 | 0x19))
+    );
+    assert!(
+        capture_index_source(
+            &drive,
+            &label,
+            &RecoveryBudget {
+                max_chain_len: 1,
+                ..Default::default()
+            }
+        )
+        .is_err()
+    );
+    drop(source);
+    let mut checkpoint = expected.clone();
+    checkpoint.self_location = tape_rs::ltfs::index::IndexLocation {
+        partition: 'a',
+        start_block: 5,
+    };
+    checkpoint.previous_incremental_location = Some(head.location);
+    let xml = checkpoint.to_xml().unwrap();
+    lib.with_cartridge_mut(BARCODE, |cartridge| {
+        let partition = &mut cartridge.partitions[0];
+        partition.objects.truncate(4);
+        partition.objects.push(LogicalObject::Filemark);
+        for bytes in xml.chunks(64 * 1024) {
+            partition
+                .objects
+                .push(LogicalObject::Record(bytes.to_vec()));
+        }
+        partition.objects.push(LogicalObject::Filemark);
+        partition.flushed = partition.objects.len();
+    });
+    let same_generation = capture_index_source(&drive, &label, &RecoveryBudget::default()).unwrap();
+    assert!(
+        matches!(same_generation.scope(),tape_rs::ltfs::recovery::IndexSourceScope::Current{ip_generation,..} if ip_generation==Some(head.generation))
+    );
+    let mut actual = BTreeMap::new();
+    same_generation
+        .for_each_entry(|entry| {
+            let path = match &entry {
+                IndexEntry::File { path, .. } | IndexEntry::Directory { path, .. } => path.clone(),
+            };
+            actual.insert(path, entry);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(actual, wanted);
+    drop(same_generation);
+    lib.with_cartridge_mut(BARCODE, |cartridge| {
+        for object in &mut cartridge.partitions[1].objects {
+            if let LogicalObject::Record(record) = object {
+                let text = String::from_utf8_lossy(record);
+                if text.contains("<ltfsindex") && text.contains("<name>baseline</name>") {
+                    *record = text
+                        .replace("xattrs-and-extents-must-survive", "changed-predecessor")
+                        .into_bytes();
+                    break;
+                }
+            }
+        }
+    });
+    let error = capture_index_source(&drive, &label, &RecoveryBudget::default())
+        .err()
+        .expect("修改前驱不能匹配同代IP视图");
+    assert!(error.to_string().contains("同代"), "{error}");
+}
+
+#[cfg(feature = "fdb")]
+#[test]
+fn streamed_source_denies_combined_disk_budget_and_dirty_tail_without_side_effects() {
+    use std::os::unix::fs::DirBuilderExt;
+    use tape_rs::ltfs::recovery::{IndexScratchBudget, capture_index_source};
+    use tape_rs::ltfs::volume::read_label_only;
+    use tape_rs::tape::commands::TapeDrive;
+    let (lib, dev) = setup();
+    commit_file(&dev, "/committed", 1);
+    let directory = std::env::temp_dir().join(format!("source-budget-{}", uuid::Uuid::new_v4()));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&directory)
+        .unwrap();
+    std::fs::write(directory.join("keep"), b"unrelated").unwrap();
+    let label = read_label_only(&dev).unwrap();
+    let drive = TapeDrive::new(&dev);
+    let before = dev.command_log().len();
+    let error = capture_index_source(
+        &drive,
+        &label,
+        &RecoveryBudget {
+            index_scratch: IndexScratchBudget {
+                directory: directory.clone(),
+                max_bytes: 256 << 10,
+                headroom_bytes: 0,
+            },
+            ..Default::default()
+        },
+    )
+    .err()
+    .unwrap();
+    assert!(matches!(error, TapeError::LocalCapacity { .. }), "{error}");
+    assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+    assert_eq!(std::fs::read(directory.join("keep")).unwrap(), b"unrelated");
+    lib.with_cartridge_mut(BARCODE, |cartridge| {
+        let dp = &mut cartridge.partitions[1];
+        dp.objects
+            .push(LogicalObject::Record(b"unindexed tail".to_vec()));
+        dp.flushed = dp.objects.len();
+    });
+    let error = capture_index_source(&drive, &label, &RecoveryBudget::default())
+        .err()
+        .unwrap();
+    assert!(
+        matches!(error, TapeError::RecoveryRestricted { .. }),
+        "{error}"
+    );
+    assert!(
+        !dev.command_log()[before..]
+            .iter()
+            .any(|op| matches!(*op, 0x0a | 0x10 | 0x8d | 0x04 | 0x19))
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(feature = "fdb")]
+#[test]
+fn fdb_verified_dp_head_survives_an_ip_write_interrupted_before_its_first_record() {
+    use tape_rs::ltfs::recovery::verify_dp_ip_head;
+    use tape_rs::ltfs::volume::read_label_only;
+    use tape_rs::scsi::sim::{Fault, FaultAction};
+    use tape_rs::tape::commands::TapeDrive;
+    for incremental in [false, true] {
+        let (library, dev) = setup();
+        let mut volume = LtfsVolume::mount(&dev).unwrap();
+        volume
+            .append_file("/committed", &mut Cursor::new(b"original-data"))
+            .unwrap();
+        if incremental {
+            volume.commit_incremental().unwrap();
+            drop(volume);
+            // Delta commits intentionally leave IP behind. Reproduce an IP
+            // refresh that stopped after its opening FM using the same CDB.
+            let drive = TapeDrive::new(&dev);
+            drive.locate(0, 4, true).unwrap();
+            drive.write_filemark(1).unwrap();
+        } else {
+            dev.inject(Fault {
+                opcode: 0x0a,
+                after: 1,
+                remaining: 1,
+                action: FaultAction::CheckCondition {
+                    sense_key: 3,
+                    asc: 0x0c,
+                    ascq: 0,
+                },
+            });
+            let error = volume.commit().unwrap_err();
+            assert!(
+                matches!(error, TapeError::CommitFailed { ref stage, .. } if stage == "index_partition"),
+                "{error}"
+            );
+            dev.clear_faults();
+            drop(volume);
+        }
+        let mounted = LtfsVolume::mount(&dev).unwrap();
+        assert!(mounted.writable() && mounted.recovery().ip_debt);
+        assert!(mounted.recovery().ip.last_index.is_none());
+        let head = mounted.committed_index_construct();
+        let label = read_label_only(&dev).unwrap();
+        let commands = dev.command_log().len();
+        let proof = verify_dp_ip_head(
+            &TapeDrive::new(&dev),
+            &label,
+            head,
+            &RecoveryBudget::default(),
+        );
+        assert!(
+            proof.is_ok(),
+            "complete original DP must survive the empty IP construct: {proof:?}"
+        );
+        assert!(
+            !dev.command_log()[commands..]
+                .iter()
+                .any(|opcode| matches!(*opcode, 0x0a | 0x10 | 0x8d)),
+            "verification must not replay or repair either partition"
+        );
+        assert_eq!(proof.unwrap(), None);
+        let captured = tape_rs::ltfs::recovery::capture_index_source(
+            &TapeDrive::new(&dev),
+            &label,
+            &RecoveryBudget::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            captured.scope(),
+            tape_rs::ltfs::recovery::IndexSourceScope::Current {
+                ip_generation: None,
+                ..
+            }
+        ));
+        assert_eq!(captured.construct(), head);
+        let drive = TapeDrive::new(&dev);
+        drive.locate(0, 5, true).unwrap();
+        drive.write_block(b"<ltfsindex>").unwrap();
+        assert!(
+            verify_dp_ip_head(&drive, &label, head, &RecoveryBudget::default()).is_err(),
+            "partial XML must not be confused with the exact empty IP shape"
+        );
+        drive.locate(0, 4, true).unwrap();
+        drive.write_filemark(1).unwrap();
+        let mut wrong = head;
+        library.with_cartridge_mut(BARCODE, |cartridge| {
+            use sha2::{Digest, Sha256};
+            let LogicalObject::Record(xml) =
+                &mut cartridge.partitions[1].objects[head.location.start_block as usize]
+            else {
+                panic!("small raw DP index");
+            };
+            let mut index = tape_rs::ltfs::index::LtfsIndex::parse(xml).unwrap();
+            assert!(!index.root.files[0].extents.is_empty());
+            index.root.files[0].extents[0].partition = label.index_partition;
+            *xml = index.to_xml().unwrap().to_vec();
+            wrong.sha256 = Sha256::digest(xml).into();
+        });
+        let error =
+            verify_dp_ip_head(&drive, &label, wrong, &RecoveryBudget::default()).unwrap_err();
+        assert!(error.to_string().contains("引用 IP 数据"), "{error}");
+    }
+}
+
+// Raw XML captured read-only from AA0017L8 on 2026-11-04, before and after
+// EE 1.3.4 / LE 2.4.6 recovery and a native file append. Only the oldest
+// predecessor is cut to keep this fixture independent of earlier tape data.
+#[cfg(feature = "fdb")]
+fn ee_rewritten_full_history() -> (SimLibrary, SimTransport) {
+    use tape_rs::ltfs::index::LtfsIndex;
+    let (lib, dev) = setup();
+    let uuid = tape_rs::ltfs::volume::read_label_only(&dev)
+        .unwrap()
+        .volume_uuid;
+    let physical_uuid = "9fe18950-a0a9-46ed-9851-ac58faceed24";
+    let rewrite = |xml: &str| xml.replace(physical_uuid, &uuid.to_string()).into_bytes();
+    let mut oldest =
+        LtfsIndex::parse(&rewrite(include_str!("fixtures/interop-native-gen37.xml"))).unwrap();
+    oldest.previous_location = None;
+    let records = [
+        (1, 192, oldest.to_xml().unwrap().to_vec()),
+        (
+            1,
+            195,
+            rewrite(include_str!("fixtures/interop-ee-recovery-gen37.xml")),
+        ),
+        (
+            1,
+            201,
+            rewrite(include_str!("fixtures/interop-ee-unmount-gen38.xml")),
+        ),
+        (
+            0,
+            8,
+            rewrite(include_str!("fixtures/interop-ee-ip-gen38.xml")),
+        ),
+    ];
+    lib.with_cartridge_mut(BARCODE, |cartridge| {
+        for (partition, block, xml) in records {
+            let objects = &mut cartridge.partitions[partition].objects;
+            objects.resize(block + 2, LogicalObject::Filemark);
+            objects[block - 1] = LogicalObject::Filemark;
+            objects[block] = LogicalObject::Record(xml);
+            objects[block + 1] = LogicalObject::Filemark;
+        }
+    });
+    flush_all(&lib);
+    (lib, dev)
+}
+
+#[cfg(feature = "fdb")]
+#[test]
+fn streamed_recovery_accepts_real_ee_rewritten_full_history() {
+    use tape_rs::ltfs::recovery::capture_index_source;
+    use tape_rs::ltfs::volume::read_label_only;
+    use tape_rs::tape::commands::TapeDrive;
+    let (_lib, dev) = ee_rewritten_full_history();
+    let label = read_label_only(&dev).unwrap();
+    let before = dev.command_log().len();
+    let source = capture_index_source(&TapeDrive::new(&dev), &label, &RecoveryBudget::default())
+        .expect("EE 同代恢复副本的等价 XML 表示应通过流式导入校验");
+    assert_eq!(source.construct().generation, 38);
+    assert_eq!(source.construct().location.start_block, 201);
+    let volume = LtfsVolume::mount(&dev).unwrap();
+    let mut notes = Vec::new();
+    let (ok, depth, truncated) = tape_rs::ltfs::recovery::verify_chain(
+        &TapeDrive::new(&dev),
+        &label,
+        volume.recovery().dp.last_index.as_ref().unwrap(),
+        &RecoveryBudget::default(),
+        &mut notes,
+    )
+    .unwrap();
+    assert!(ok && depth == 2 && !truncated, "{notes:?}");
+    assert!(
+        !dev.command_log()[before..]
+            .iter()
+            .any(|op| matches!(op, 0x04 | 0x0a | 0x10 | 0x19 | 0x8d | 0xa5))
+    );
+}
+
+#[cfg(feature = "fdb")]
+#[test]
+fn streamed_recovery_rejects_real_changes_in_ee_rewritten_history() {
+    use tape_rs::ltfs::recovery::capture_index_source;
+    use tape_rs::ltfs::volume::read_label_only;
+    use tape_rs::tape::commands::TapeDrive;
+    for (before, after) in [
+        ("<length>16878000</length>", "<length>16878001</length>"),
+        ("<startblock>10</startblock>", "<startblock>11</startblock>"),
+        ("<fileoffset>0</fileoffset>", "<fileoffset>1</fileoffset>"),
+        (
+            "<highestfileuid>20</highestfileuid>",
+            "<highestfileuid>21</highestfileuid>",
+        ),
+        ("<readonly>false</readonly>", "<readonly>true</readonly>"),
+        (
+            "<volumelockstate>unlocked</volumelockstate>",
+            "<volumelockstate>locked</volumelockstate>",
+        ),
+        (
+            "<value>s3-acceptance-20261104</value>",
+            "<value>another-pool</value>",
+        ),
+        ("version=\"2.4.0\"", "version=\"9.9.0\""),
+        (
+            "<symlink>中文 +%2F.bin</symlink>",
+            "<symlink>other.bin</symlink>",
+        ),
+    ] {
+        let (lib, dev) = ee_rewritten_full_history();
+        let label = read_label_only(&dev).unwrap();
+        lib.with_cartridge_mut(BARCODE, |cartridge| {
+            let LogicalObject::Record(xml) = &mut cartridge.partitions[1].objects[195] else {
+                panic!("missing EE recovery construct");
+            };
+            let text = std::str::from_utf8(xml).unwrap();
+            assert!(text.contains(before), "fixture missing {before}");
+            *xml = text.replacen(before, after, 1).into_bytes();
+        });
+        let error = capture_index_source(&TapeDrive::new(&dev), &label, &RecoveryBudget::default())
+            .err()
+            .expect("同代实际逻辑变化不能当作 EE 的编码转换接受");
+        assert!(error.to_string().contains("同代"), "{before}: {error}");
+    }
+}
+
+// EE 2.4 does not consume incremental indexes. The handoff is a normal Full
+// checkpoint; its historical delta pointer is physical evidence, not content.
+#[cfg(feature = "fdb")]
+#[test]
+fn streamed_recovery_accepts_full_handoff_after_native_incremental_writes() {
+    use tape_rs::ltfs::index::IndexLocation;
+    use tape_rs::ltfs::recovery::capture_index_source;
+    use tape_rs::ltfs::volume::read_label_only;
+    use tape_rs::tape::commands::TapeDrive;
+    let (lib, dev) = setup();
+    let mut volume = LtfsVolume::mount(&dev).unwrap();
+    volume.append_file("/a", &mut Cursor::new(b"kept")).unwrap();
+    volume.commit_incremental().unwrap();
+    volume
+        .append_file("/b", &mut Cursor::new(b"added"))
+        .unwrap();
+    volume.commit_incremental().unwrap();
+    volume.unmount().unwrap();
+    let volume = LtfsVolume::mount(&dev).unwrap();
+    let prior = volume.index().clone();
+    assert!(!prior.incremental && prior.previous_incremental_location.is_some());
+    drop(volume);
+    let mut rewritten = prior.clone();
+    rewritten.creator = "IBM LTFS - Recovery (synthetic handoff fixture)".into();
+    rewritten.version = "2.4.0".into();
+    rewritten.volume_lock_state = Some("unlocked".into());
+    rewritten.previous_location = Some(prior.self_location);
+    rewritten.previous_incremental_location = None;
+    lib.with_cartridge_mut(BARCODE, |cartridge| {
+        let dp = &mut cartridge.partitions[1].objects;
+        rewritten.self_location = IndexLocation {
+            partition: 'b',
+            start_block: dp.len() as u64 + 1,
+        };
+        dp.push(LogicalObject::Filemark);
+        dp.push(LogicalObject::Record(rewritten.to_xml().unwrap().to_vec()));
+        dp.push(LogicalObject::Filemark);
+        let mut ip = rewritten.clone();
+        ip.self_location = IndexLocation {
+            partition: 'a',
+            start_block: 5,
+        };
+        ip.previous_location = Some(rewritten.self_location);
+        let objects = &mut cartridge.partitions[0].objects;
+        objects.truncate(4);
+        objects.push(LogicalObject::Filemark);
+        objects.push(LogicalObject::Record(ip.to_xml().unwrap().to_vec()));
+        objects.push(LogicalObject::Filemark);
+    });
+    flush_all(&lib);
+    let label = read_label_only(&dev).unwrap();
+    let source = capture_index_source(&TapeDrive::new(&dev), &label, &RecoveryBudget::default())
+        .expect("先关闭成 Full，再由旧 EE 重写，不能因历史增量物理指针丢失而冲突");
+    assert!(!source.construct().incremental);
+    assert_eq!(source.construct().generation, prior.generation);
+    let mut files = Vec::new();
+    source
+        .for_each_entry(|entry| {
+            if let tape_rs::ltfs::index::IndexEntry::File { path, .. } = entry {
+                files.push(path);
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(files, ["a", "b"]);
 }

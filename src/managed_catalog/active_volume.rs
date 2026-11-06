@@ -32,6 +32,9 @@ pub struct ActiveLoadedVolumeHead {
     pub volume_id: Uuid,
     pub pool_id: Uuid,
     pub index: ActiveIndexIdentity,
+    pub policy_revision: u64,
+    pub online: bool,
+    pub blacklisted: bool,
 }
 
 impl From<ExpectedIndex> for ActiveIndexIdentity {
@@ -96,7 +99,14 @@ fn observed_key(volume: Uuid) -> Vec<u8> {
     out
 }
 
-fn generation_key(volume: Uuid, generation: u64) -> Vec<u8> {
+/// The unassign transaction has fenced the owner and proved no retained or
+/// in-flight references. Clear only the current cursor: immutable generation
+/// history remains available, and a future import establishes its own baseline.
+pub(super) fn clear_unassigned_cursor_at(tr: &Transaction, volume: Uuid) {
+    tr.clear(&observed_key(volume));
+}
+
+pub(super) fn generation_key(volume: Uuid, generation: u64) -> Vec<u8> {
     let mut out = observed_key(volume);
     out.extend_from_slice(&generation.to_be_bytes());
     out
@@ -109,7 +119,7 @@ fn valid_index(volume: Uuid, index: ActiveIndexIdentity) -> bool {
         && index.location.start_block > 0
 }
 
-fn encode_index(out: &mut Vec<u8>, index: ActiveIndexIdentity) {
+pub(super) fn encode_index(out: &mut Vec<u8>, index: ActiveIndexIdentity) {
     out.extend_from_slice(&index.generation.to_be_bytes());
     out.push(index.location.partition as u8);
     out.extend_from_slice(&index.location.start_block.to_be_bytes());
@@ -117,7 +127,7 @@ fn encode_index(out: &mut Vec<u8>, index: ActiveIndexIdentity) {
     out.push(u8::from(index.incremental));
 }
 
-fn decode_index(volume: Uuid, bytes: &[u8]) -> Result<ActiveIndexIdentity> {
+pub(super) fn decode_index(volume: Uuid, bytes: &[u8]) -> Result<ActiveIndexIdentity> {
     if bytes.len() != INDEX_LEN || bytes[49] > 1 {
         return Err(CatalogError::Corrupt("活动卷索引身份长度"));
     }
@@ -137,23 +147,79 @@ fn decode_index(volume: Uuid, bytes: &[u8]) -> Result<ActiveIndexIdentity> {
     Ok(index)
 }
 
-fn encode_history(batch_id: Uuid, index: ActiveIndexIdentity) -> Vec<u8> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum IndexKind {
+    FileBatch(Uuid),
+    EmptyRecovery,
+    NodeMutation(Uuid),
+    NodeDiscard(Uuid),
+    NodeRename(Uuid),
+    NodeRenameDiscard(Uuid),
+}
+
+fn encode_history(kind: IndexKind, index: ActiveIndexIdentity) -> Vec<u8> {
     let mut out = Vec::with_capacity(HISTORY_LEN);
-    out.push(if batch_id.is_nil() { 2 } else { 1 });
-    out.extend_from_slice(batch_id.as_bytes());
+    let (tag, id) = match kind {
+        IndexKind::FileBatch(id) => (1, id),
+        IndexKind::EmptyRecovery => (2, Uuid::nil()),
+        IndexKind::NodeMutation(id) => (3, id),
+        IndexKind::NodeDiscard(id) => (4, id),
+        IndexKind::NodeRename(id) => (5, id),
+        IndexKind::NodeRenameDiscard(id) => (6, id),
+    };
+    out.push(tag);
+    out.extend_from_slice(id.as_bytes());
     encode_index(&mut out, index);
     out
 }
 
-fn decode_history(volume: Uuid, bytes: &[u8]) -> Result<(Uuid, ActiveIndexIdentity)> {
-    if bytes.len() != HISTORY_LEN || !matches!(bytes[0], 1 | 2) {
+fn decode_history(volume: Uuid, bytes: &[u8]) -> Result<(IndexKind, ActiveIndexIdentity)> {
+    if bytes.len() != HISTORY_LEN || !matches!(bytes[0], 1..=6) {
         return Err(CatalogError::Corrupt("活动卷历史批次版本或长度"));
     }
-    let batch_id = uuid_from(&bytes[1..17])?;
-    if batch_id.is_nil() != (bytes[0] == 2) {
+    let id = uuid_from(&bytes[1..17])?;
+    if id.is_nil() != (bytes[0] == 2) {
         return Err(CatalogError::Corrupt("活动卷历史批次 ID"));
     }
-    Ok((batch_id, decode_index(volume, &bytes[17..])?))
+    let kind = match bytes[0] {
+        1 => IndexKind::FileBatch(id),
+        2 => IndexKind::EmptyRecovery,
+        3 => IndexKind::NodeMutation(id),
+        4 => IndexKind::NodeDiscard(id),
+        5 => IndexKind::NodeRename(id),
+        6 => IndexKind::NodeRenameDiscard(id),
+        _ => unreachable!("validated tag"),
+    };
+    Ok((kind, decode_index(volume, &bytes[17..])?))
+}
+
+pub(super) async fn history_at(
+    tr: &Transaction,
+    serial: &str,
+    volume: Uuid,
+    generation: u64,
+) -> Result<(IndexKind, ActiveIndexIdentity)> {
+    let raw = tr
+        .get(&generation_key(volume, generation), false)
+        .await?
+        .ok_or(CatalogError::Corrupt("活动卷历史代数缺少索引身份"))?;
+    let (kind, index) = decode_history(volume, &raw)?;
+    if index.generation != generation {
+        return Err(CatalogError::Corrupt("历史索引键值代数不符"));
+    }
+    if let IndexKind::NodeMutation(attempt) = kind {
+        control::node_attempts::require_observation_at(tr, serial, attempt, index).await?;
+    }
+    if let IndexKind::NodeDiscard(attempt) = kind {
+        control::node_attempts::require_discard_at(tr, serial, attempt, index).await?;
+    }
+    if let IndexKind::NodeRename(intent) = kind {
+        control::require_rename_observation_at(tr, serial, intent, index).await?;
+    }
+    if let IndexKind::NodeRenameDiscard(intent) = kind {
+        control::require_rename_discard_at(tr, serial, intent, index).await?;
+    }
+    Ok((kind, index))
 }
 
 fn encode_record(previous: ActiveIndexIdentity, current: ActiveIndexIdentity) -> Vec<u8> {
@@ -212,8 +278,9 @@ async fn active_baseline(
     }
     Ok((
         scan,
-        index_evidence::require_source(tr, volume, scan)
+        index_evidence::require_identity(tr, volume, scan)
             .await?
+            .head()
             .into(),
     ))
 }
@@ -229,14 +296,52 @@ pub(super) async fn observed_at(
     };
     let (previous, current) = decode_record(volume, &value)?;
     require_after_baseline(baseline, previous, current)?;
-    let recorded = tr
-        .get(&generation_key(volume, current.generation), false)
-        .await?
-        .ok_or(CatalogError::Corrupt("活动卷最新代数缺少索引身份"))?;
-    if decode_history(volume, &recorded)?.1 != current {
+    if history_at(tr, serial, volume, current.generation).await?.1 != current {
         return Err(CatalogError::Corrupt("活动卷最新代数与索引身份不一致"));
     }
     Ok((scan, current))
+}
+
+fn file_count_key(volume: Uuid, generation: u64) -> Vec<u8> {
+    let mut key = generation_key(volume, generation);
+    key.push(b'f');
+    key
+}
+
+// The source and each observed S4 generation carry their exact file count.
+// Missing current records fail closed; old counts are never guessed or reused.
+pub(super) async fn file_count_at(tr: &Transaction, serial: &str, volume: Uuid) -> Result<u64> {
+    let (scan, index) = observed_at(tr, serial, volume).await?;
+    if index.generation == scan.generation {
+        return index_evidence::require_source_file_count(tr, volume, scan).await;
+    }
+    stored_file_count_at(tr, index)
+        .await?
+        .ok_or(CatalogError::Incomplete)
+}
+
+pub(super) async fn stored_file_count_at(
+    tr: &Transaction,
+    index: ActiveIndexIdentity,
+) -> Result<Option<u64>> {
+    let Some(raw) = tr
+        .get(&file_count_key(index.volume_uuid, index.generation), false)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if raw.len() != 41 || raw[0] != 1 || raw[1..33] != index.sha256 {
+        return Err(CatalogError::Corrupt("卷文件数与已观察索引摘要不符"));
+    }
+    Ok(Some(read_u64(&raw[33..41])))
+}
+fn encode_file_count(index: ActiveIndexIdentity, count: u64) -> Vec<u8> {
+    [
+        &[1],
+        index.sha256.as_slice(),
+        count.to_be_bytes().as_slice(),
+    ]
+    .concat()
 }
 
 /// The caller already checked the Active route and owner in this transaction.
@@ -265,22 +370,242 @@ pub(super) async fn observed_batch_at(
     volume: Uuid,
     generation: u64,
 ) -> Result<Option<(Uuid, ActiveIndexIdentity)>> {
+    Ok(
+        match observed_history_at(tr, serial, volume, generation).await? {
+            Some((IndexKind::FileBatch(id), index)) => Some((id, index)),
+            _ => None,
+        },
+    )
+}
+
+/// Completed batches may predate a re-import of their exact index. The
+/// immutable history remains valid at the new baseline only when the full
+/// physical identity matches the imported source, not merely its generation.
+pub(super) async fn observed_completed_batch_at(
+    tr: &Transaction,
+    serial: &str,
+    volume: Uuid,
+    generation: u64,
+) -> Result<Option<(Uuid, ActiveIndexIdentity)>> {
+    let (scan, _) = observed_at(tr, serial, volume).await?;
+    if generation != scan.generation {
+        return observed_batch_at(tr, serial, volume, generation).await;
+    }
+    let (_, baseline) = active_baseline(tr, serial, volume).await?;
+    let (kind, index) = history_at(tr, serial, volume, generation).await?;
+    if index != baseline {
+        return Err(CatalogError::Corrupt("已完成批次与导入基线索引身份不一致"));
+    }
+    Ok(match kind {
+        IndexKind::FileBatch(id) => Some((id, index)),
+        _ => None,
+    })
+}
+
+/// Readable copy sources include typed node S4, but never turn them into a
+/// sealed file batch or accept generic empty recovery as a new file source.
+pub(super) async fn observed_copy_index_at(
+    tr: &Transaction,
+    serial: &str,
+    volume: Uuid,
+    generation: u64,
+) -> Result<Option<ActiveIndexIdentity>> {
+    Ok(
+        match observed_history_at(tr, serial, volume, generation).await? {
+            Some((
+                IndexKind::FileBatch(_) | IndexKind::NodeMutation(_) | IndexKind::NodeRename(_),
+                index,
+            )) => Some(index),
+            _ => None,
+        },
+    )
+}
+
+async fn observed_history_at(
+    tr: &Transaction,
+    serial: &str,
+    volume: Uuid,
+    generation: u64,
+) -> Result<Option<(IndexKind, ActiveIndexIdentity)>> {
     let (scan, current) = observed_at(tr, serial, volume).await?;
     if generation <= scan.generation || generation > current.generation {
         return Ok(None);
     }
-    let bytes = tr
-        .get(&generation_key(volume, generation), false)
-        .await?
-        .ok_or(CatalogError::Corrupt("活动卷历史代数缺少索引身份"))?;
-    let (batch_id, index) = decode_history(volume, &bytes)?;
+    let (kind, index) = history_at(tr, serial, volume, generation).await?;
     if index.generation != generation || (generation == current.generation && index != current) {
         return Err(CatalogError::Corrupt("活动卷历史代数与最新游标不一致"));
     }
-    Ok((!batch_id.is_nil()).then_some((batch_id, index)))
+    Ok(Some((kind, index)))
+}
+
+/// Only the node observer calls this after validating opaque media evidence
+/// and all reads/encodings. These sets must have no fallible work afterward.
+pub(super) fn set_node_observation_at(
+    tr: &Transaction,
+    previous: ActiveIndexIdentity,
+    current: ActiveIndexIdentity,
+    attempt: Uuid,
+    file_count: u64,
+) {
+    set_node_index_at(
+        tr,
+        previous,
+        current,
+        IndexKind::NodeMutation(attempt),
+        file_count,
+    );
+}
+
+pub(super) fn set_rename_observation_at(
+    tr: &Transaction,
+    previous: ActiveIndexIdentity,
+    current: ActiveIndexIdentity,
+    intent: Uuid,
+    file_count: u64,
+) {
+    set_node_index_at(
+        tr,
+        previous,
+        current,
+        IndexKind::NodeRename(intent),
+        file_count,
+    );
+}
+
+pub(super) fn set_rename_discard_at(
+    tr: &Transaction,
+    previous: ActiveIndexIdentity,
+    current: ActiveIndexIdentity,
+    intent: Uuid,
+    file_count: u64,
+) {
+    set_node_index_at(
+        tr,
+        previous,
+        current,
+        IndexKind::NodeRenameDiscard(intent),
+        file_count,
+    );
+}
+
+pub(super) fn set_node_discard_at(
+    tr: &Transaction,
+    previous: ActiveIndexIdentity,
+    current: ActiveIndexIdentity,
+    attempt: Uuid,
+    file_count: u64,
+) {
+    set_node_index_at(
+        tr,
+        previous,
+        current,
+        IndexKind::NodeDiscard(attempt),
+        file_count,
+    );
+}
+
+fn set_node_index_at(
+    tr: &Transaction,
+    previous: ActiveIndexIdentity,
+    current: ActiveIndexIdentity,
+    kind: IndexKind,
+    file_count: u64,
+) {
+    let volume = current.volume_uuid;
+    tr.set(
+        &file_count_key(volume, current.generation),
+        &encode_file_count(current, file_count),
+    );
+    tr.set(&observed_key(volume), &encode_record(previous, current));
+    tr.set(
+        &generation_key(volume, current.generation),
+        &encode_history(kind, current),
+    );
 }
 
 impl ManagedCatalog {
+    /// Read-only, owner-fenced evidence for deferring an unexplained clean
+    /// medium. Any pending write/recovery/rename keeps the strict recovery path.
+    pub(crate) async fn may_defer_unobserved_media(
+        &self,
+        serial: &str,
+        owner: u64,
+        observed: ActiveIndexIdentity,
+        current: ActiveIndexIdentity,
+    ) -> Result<bool> {
+        let (route, actual_owner) = self
+            .active_library_owner(serial)
+            .await?
+            .ok_or(CatalogError::Incomplete)?;
+        if actual_owner != owner || observed.volume_uuid != current.volume_uuid {
+            return Err(CatalogError::Incomplete);
+        }
+        let tr = self.db.create_trx()?;
+        let namespace = routing::require_runtime_active_owner(&tr, serial, route, owner).await?;
+        let placement = control::verified_placement(&tr, observed.volume_uuid)
+            .await?
+            .ok_or(CatalogError::Incomplete)?;
+        if placement.library_serial != serial
+            || placement.namespace != namespace
+            || observed_at(&tr, serial, observed.volume_uuid).await?.1 != observed
+        {
+            return Err(CatalogError::Incomplete);
+        }
+        let volume = observed.volume_uuid;
+        let next = observed
+            .generation
+            .checked_add(1)
+            .ok_or(CatalogError::Invalid("卷代数溢出"))?;
+        let mut pool_hold = control::node_hold_prefix(namespace);
+        pool_hold.extend_from_slice(placement.pool_id.as_bytes());
+        if recovery_active(&tr, volume).await?
+            || tr.get(&pool_hold, false).await?.is_some()
+            || tr
+                .get(&control::node_attempts::volume_key(volume), false)
+                .await?
+                .is_some()
+            || requests::prefix_has_rows(&tr, &reservation::volume_prefix(volume, next)).await?
+            || requests::prefix_has_rows(&tr, &reservation::upgraded_prefix(volume, next)).await?
+        {
+            return Ok(false);
+        }
+        for generation in [next, current.generation] {
+            // Completed history at/before the observed head is not pending work.
+            if generation <= observed.generation {
+                continue;
+            }
+            if tr
+                .get(&active_batch::batch_key(volume, generation), false)
+                .await?
+                .is_some()
+                || tr
+                    .get(&active_batch::prepared_batch_key(volume, generation), false)
+                    .await?
+                    .is_some()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub async fn active_volume_file_count(
+        &self,
+        serial: &str,
+        route: ActiveLibraryRoute,
+        owner: u64,
+        volume: Uuid,
+    ) -> Result<u64> {
+        let tr = self.db.create_trx()?;
+        let ns = routing::require_runtime_active_owner(&tr, serial, route, owner).await?;
+        let placement = control::verified_placement(&tr, volume)
+            .await?
+            .ok_or(CatalogError::Incomplete)?;
+        if placement.namespace != ns || placement.library_serial != serial {
+            return Err(CatalogError::Invalid("文件数卷与带库作用域不符"));
+        }
+        file_count_at(&tr, serial, volume).await
+    }
     /// Resolve loaded-tape placement and the observed DP head from one FDB
     /// read version, after verifying the exact route and owner epoch.
     /// Unassigned and assigned-but-unbound cartridges return None and must
@@ -310,6 +635,9 @@ impl ManagedCatalog {
             volume_id,
             pool_id: assignment.pool_id,
             index,
+            policy_revision: assignment.revision,
+            online: assignment.online,
+            blacklisted: assignment.blacklisted,
         }))
     }
 
@@ -341,7 +669,8 @@ impl ManagedCatalog {
         if current != head {
             return Err(CatalogError::Incomplete);
         }
-        let (_, baseline) = active_baseline(&tr, serial, head.volume_uuid).await?;
+        let (scan, baseline) = active_baseline(&tr, serial, head.volume_uuid).await?;
+        let source = index_evidence::require_identity(&tr, head.volume_uuid, scan).await?;
         let mut successor = head;
         for (offset, predecessor) in predecessors.iter().enumerate() {
             if predecessor.volume_uuid != head.volume_uuid
@@ -356,16 +685,18 @@ impl ManagedCatalog {
                 baseline
             } else {
                 if predecessor.generation < baseline.generation {
-                    return Err(CatalogError::Incomplete);
+                    source
+                        .predecessors()
+                        .iter()
+                        .find(|index| index.generation == predecessor.generation)
+                        .copied()
+                        .ok_or(CatalogError::Incomplete)?
+                        .into()
+                } else {
+                    history_at(&tr, serial, head.volume_uuid, predecessor.generation)
+                        .await?
+                        .1
                 }
-                let bytes = tr
-                    .get(
-                        &generation_key(head.volume_uuid, predecessor.generation),
-                        false,
-                    )
-                    .await?
-                    .ok_or(CatalogError::Incomplete)?;
-                decode_history(head.volume_uuid, &bytes)?.1
             };
             if recorded != *predecessor {
                 return Err(CatalogError::Corrupt("介质重放前驱与 FDB 索引身份不符"));
@@ -429,11 +760,7 @@ impl ManagedCatalog {
         if generation > current.generation {
             return Ok(None);
         }
-        let bytes = tr
-            .get(&generation_key(volume, generation), false)
-            .await?
-            .ok_or(CatalogError::Corrupt("活动卷历史代数缺少索引身份"))?;
-        let (_, index) = decode_history(volume, &bytes)?;
+        let (_, index) = history_at(&tr, serial, volume, generation).await?;
         if index.generation != generation || (generation == current.generation && index != current)
         {
             return Err(CatalogError::Corrupt("活动卷历史代数与最新游标不一致"));
@@ -444,6 +771,7 @@ impl ManagedCatalog {
     /// Record an already successful LTFS commit after device PR verification.
     /// This does not publish any file: a later runtime batch must reconcile
     /// and atomically publish the media delta with its logical head/copy rows.
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_active_volume_index(
         &self,
         serial: &str,
@@ -452,6 +780,7 @@ impl ManagedCatalog {
         batch_id: Uuid,
         previous: ActiveIndexIdentity,
         current: ActiveIndexIdentity,
+        file_count: u64,
     ) -> Result<ActiveIndexOutcome> {
         control::validate_physical_serial(serial)?;
         if batch_id.is_nil()
@@ -486,29 +815,39 @@ impl ManagedCatalog {
                             {
                                 return Ok(ActiveIndexOutcome::StaleOwner);
                             }
+                            control::node_attempts::require_no_pending_at(&tr, volume).await?;
                             let (scan, baseline) = active_baseline(&tr, serial, volume).await?;
                             let saved = tr.get(&observed, false).await?;
                             let observed_index = if let Some(bytes) = saved {
                                 let (saved_previous, saved_current) =
                                     decode_record(volume, &bytes)?;
                                 require_after_baseline(baseline, saved_previous, saved_current)?;
-                                let recorded = tr
-                                    .get(&generation_key(volume, saved_current.generation), false)
-                                    .await?
-                                    .ok_or(CatalogError::Corrupt("活动卷最新代数缺少索引身份"))?;
-                                let (recorded_batch, recorded_index) =
-                                    decode_history(volume, &recorded)?;
+                                let (recorded_kind, recorded_index) =
+                                    history_at(&tr, serial, volume, saved_current.generation)
+                                        .await?;
                                 if recorded_index != saved_current {
                                     return Err(CatalogError::Corrupt(
                                         "活动卷最新代数与索引身份不一致",
                                     ));
                                 }
                                 if saved_previous == previous && saved_current == current {
-                                    return Ok(if recorded_batch == batch_id {
-                                        ActiveIndexOutcome::AlreadyRecorded
-                                    } else {
-                                        ActiveIndexOutcome::BatchConflict
-                                    });
+                                    if tr
+                                        .get(&file_count_key(volume, current.generation), false)
+                                        .await?
+                                        .as_deref()
+                                        != Some(encode_file_count(current, file_count).as_slice())
+                                    {
+                                        return Err(CatalogError::Corrupt(
+                                            "已观察卷文件数缺失或冲突",
+                                        ));
+                                    }
+                                    return Ok(
+                                        if recorded_kind == IndexKind::FileBatch(batch_id) {
+                                            ActiveIndexOutcome::AlreadyRecorded
+                                        } else {
+                                            ActiveIndexOutcome::BatchConflict
+                                        },
+                                    );
                                 }
                                 saved_current
                             } else {
@@ -520,13 +859,13 @@ impl ManagedCatalog {
                             if recovery_active(&tr, volume).await? {
                                 return Ok(ActiveIndexOutcome::IndexConflict);
                             }
-                            if let Some(existing) = tr.get(&generation, false).await? {
-                                let (existing_batch, existing_index) =
-                                    decode_history(volume, &existing)?;
+                            if tr.get(&generation, false).await?.is_some() {
+                                let (existing_kind, existing_index) =
+                                    history_at(&tr, serial, volume, current.generation).await?;
                                 if existing_index != current {
                                     return Ok(ActiveIndexOutcome::IndexConflict);
                                 }
-                                if existing_batch != batch_id {
+                                if existing_kind != IndexKind::FileBatch(batch_id) {
                                     return Ok(ActiveIndexOutcome::BatchConflict);
                                 }
                             }
@@ -543,8 +882,15 @@ impl ManagedCatalog {
                             {
                                 return Ok(ActiveIndexOutcome::BatchConflict);
                             }
+                            tr.set(
+                                &file_count_key(volume, current.generation),
+                                &encode_file_count(current, file_count),
+                            );
                             tr.set(&observed, &encode_record(previous, current));
-                            tr.set(&generation, &encode_history(batch_id, current));
+                            tr.set(
+                                &generation,
+                                &encode_history(IndexKind::FileBatch(batch_id), current),
+                            );
                             Ok(ActiveIndexOutcome::Recorded)
                         }
                         .await,
@@ -593,6 +939,7 @@ impl ManagedCatalog {
                             {
                                 return Ok(ActiveRecoveryOutcome::StaleOwner);
                             }
+                            control::node_attempts::require_no_pending_at(&tr, volume).await?;
                             let (_, current) = observed_at(&tr, serial, volume).await?;
                             if current != previous {
                                 return Ok(ActiveRecoveryOutcome::IndexConflict);
@@ -674,16 +1021,20 @@ impl ManagedCatalog {
                             {
                                 return Ok(ActiveRecoveryOutcome::StaleOwner);
                             }
+                            control::node_attempts::require_no_pending_at(&tr, volume).await?;
                             let (_, current) = observed_at(&tr, serial, volume).await?;
                             if let Some(index) = recovered
                                 && current == index
                             {
+                                file_count_at(&tr, serial, volume).await?;
                                 let saved = tr
                                     .get(&history, false)
                                     .await?
                                     .ok_or(CatalogError::Corrupt("空收尾历史缺失"))?;
                                 return Ok(
-                                    if decode_history(volume, &saved)? == (Uuid::nil(), index) {
+                                    if decode_history(volume, &saved)?
+                                        == (IndexKind::EmptyRecovery, index)
+                                    {
                                         ActiveRecoveryOutcome::AlreadyRecorded
                                     } else {
                                         ActiveRecoveryOutcome::IndexConflict
@@ -713,8 +1064,14 @@ impl ManagedCatalog {
                                 if tr.get(&history, false).await?.is_some() {
                                     return Ok(ActiveRecoveryOutcome::IndexConflict);
                                 }
+                                // Tail discard creates no files; preserve the proven prior count.
+                                let count = file_count_at(&tr, serial, volume).await?;
+                                tr.set(
+                                    &file_count_key(volume, index.generation),
+                                    &encode_file_count(index, count),
+                                );
                                 tr.set(&observed, &encode_record(previous, index));
-                                tr.set(&history, &encode_history(Uuid::nil(), index));
+                                tr.set(&history, &encode_history(IndexKind::EmptyRecovery, index));
                             }
                             tr.clear(&marker);
                             Ok(if recovered.is_some() {
@@ -779,10 +1136,10 @@ mod tests {
         assert!(decode_record(volume, &invalid).is_err());
 
         let batch_id = Uuid::new_v4();
-        let history = encode_history(batch_id, current);
+        let history = encode_history(IndexKind::FileBatch(batch_id), current);
         assert_eq!(
             decode_history(volume, &history).unwrap(),
-            (batch_id, current)
+            (IndexKind::FileBatch(batch_id), current)
         );
         for end in 0..history.len() {
             assert!(decode_history(volume, &history[..end]).is_err());
@@ -797,11 +1154,50 @@ mod tests {
         invalid[25] = 0;
         assert!(decode_history(volume, &invalid).is_err());
 
-        let empty = encode_history(Uuid::nil(), current);
+        let node = encode_history(IndexKind::NodeMutation(batch_id), current);
+        assert_ne!(
+            node,
+            encode_history(IndexKind::FileBatch(batch_id), current)
+        );
+        assert_eq!(
+            decode_history(volume, &node).unwrap(),
+            (IndexKind::NodeMutation(batch_id), current)
+        );
+        let discarded = encode_history(IndexKind::NodeDiscard(batch_id), current);
+        assert_ne!(discarded, node);
+        assert_ne!(
+            discarded,
+            encode_history(IndexKind::FileBatch(batch_id), current)
+        );
+        assert_eq!(
+            decode_history(volume, &discarded).unwrap(),
+            (IndexKind::NodeDiscard(batch_id), current)
+        );
+        let renamed = encode_history(IndexKind::NodeRename(batch_id), current);
+        assert_ne!(renamed, node);
+        assert_ne!(renamed, discarded);
+        assert_eq!(
+            decode_history(volume, &renamed).unwrap(),
+            (IndexKind::NodeRename(batch_id), current)
+        );
+        let rename_discard = encode_history(IndexKind::NodeRenameDiscard(batch_id), current);
+        assert_ne!(rename_discard, discarded);
+        assert_ne!(rename_discard, renamed);
+        assert_eq!(
+            decode_history(volume, &rename_discard).unwrap(),
+            (IndexKind::NodeRenameDiscard(batch_id), current)
+        );
+        let mut invalid = renamed.clone();
+        invalid[0] = 7;
+        assert!(decode_history(volume, &invalid).is_err());
+        invalid = renamed;
+        invalid[1..17].fill(0);
+        assert!(decode_history(volume, &invalid).is_err());
+        let empty = encode_history(IndexKind::EmptyRecovery, current);
         assert_eq!(empty[0], 2);
         assert_eq!(
             decode_history(volume, &empty).unwrap(),
-            (Uuid::nil(), current)
+            (IndexKind::EmptyRecovery, current)
         );
         let mut invalid = empty.clone();
         invalid[0] = 1;

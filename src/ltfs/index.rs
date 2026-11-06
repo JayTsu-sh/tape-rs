@@ -27,6 +27,8 @@ pub struct IndexLocation {
 }
 
 /// 单个 extent：文件在磁带上连续的一段。
+#[cfg_attr(feature = "fdb", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "fdb", serde(deny_unknown_fields))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Extent {
     pub partition: char,
@@ -39,6 +41,8 @@ pub struct Extent {
 }
 
 /// 通用的时间戳/uid 字段集合（文件与目录共用）。
+#[cfg_attr(feature = "fdb", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "fdb", serde(deny_unknown_fields))]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NodeMeta {
     pub readonly: bool,
@@ -85,6 +89,8 @@ impl MetadataChange {
 /// 扩展属性（LTFS 2.5.1 §9.2.13）。`value` 原样保存索引里的文本；
 /// `base64 == true` 表示索引里带 `type="base64"`，`value` 是编码后的文本。
 /// 原样保存是为了回写时逐字节不变。
+#[cfg_attr(feature = "fdb", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "fdb", serde(deny_unknown_fields))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Xattr {
     pub key: String,
@@ -92,11 +98,34 @@ pub struct Xattr {
     pub base64: bool,
 }
 
+/// Equality evidence only: XML text and base64 may encode the same bytes.
+/// Keep the original representation untouched for round-trip serialization.
+pub(super) fn canonical_xattrs(xattrs: &[Xattr]) -> Result<Vec<(String, Vec<u8>)>> {
+    use base64::Engine;
+    let mut values = xattrs
+        .iter()
+        .map(|x| {
+            let value = if x.base64 {
+                base64::engine::general_purpose::STANDARD
+                    .decode(&x.value)
+                    .map_err(|e| TapeError::Ltfs(format!("索引扩展属性 Base64 非法: {e}")))?
+            } else {
+                x.value.as_bytes().to_vec()
+            };
+            Ok((x.key.clone(), value))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    values.sort();
+    Ok(values)
+}
+
 /// 文件内容哈希（LTFS 2.5.1 附录 F.3，十六进制小写）。一个文件可以同时带多种。
 /// IBM LTFS 写的是 md5sum；本实现两个都写，校验时优先 sha256sum。
 pub const XATTR_MD5: &str = "ltfs.hash.md5sum";
 pub const XATTR_SHA256: &str = "ltfs.hash.sha256sum";
 
+#[cfg_attr(feature = "fdb", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "fdb", serde(deny_unknown_fields))]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileNode {
     /// 增量中明确出现的字段；None 表示完整对象。
@@ -130,6 +159,8 @@ impl FileNode {
     }
 }
 
+#[cfg_attr(feature = "fdb", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "fdb", serde(deny_unknown_fields))]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DirectoryNode {
     /// 增量导航目录可能只有 name 与 contents。
@@ -142,7 +173,9 @@ pub struct DirectoryNode {
 }
 
 /// 完整索引逐条扫描得到的节点。目录在其子节点之后到达，路径相对卷根。
-#[derive(Debug)]
+#[cfg_attr(feature = "fdb", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "fdb", serde(deny_unknown_fields))]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexEntry {
     File { path: String, node: FileNode },
     Directory { path: String, node: DirectoryNode },
@@ -264,7 +297,7 @@ impl LtfsIndex {
 
     /// 从分段输入解析索引，不保留整份 XML；内存只含事件缓冲与文件树。
     pub fn parse_reader<R: std::io::BufRead>(input: R) -> Result<Self> {
-        Self::parse_with(input, false, false, true, |_| Ok(()))
+        Self::parse_with(input, false, Some(false), true, |_| Ok(()))
     }
 
     /// 逐条扫描完整索引，避免把全部文件挂进内存目录树。回调失败立即停止；
@@ -275,7 +308,7 @@ impl LtfsIndex {
         input: R,
         emit: F,
     ) -> Result<Self> {
-        Self::parse_with(input, true, false, true, emit)
+        Self::parse_with(input, true, Some(false), true, emit)
     }
 
     /// Stream a raw incremental construct without materializing the full
@@ -284,7 +317,7 @@ impl LtfsIndex {
         input: R,
         emit: F,
     ) -> Result<Self> {
-        Self::parse_with(input, true, true, true, emit)
+        Self::parse_with(input, true, Some(true), true, emit)
     }
 
     /// The callback must enforce unique paths on disk and keep all output
@@ -298,13 +331,26 @@ impl LtfsIndex {
         input: R,
         emit: F,
     ) -> Result<Self> {
-        Self::parse_with(input, true, true, false, emit)
+        Self::parse_with(input, true, Some(true), false, emit)
+    }
+
+    /// Discover a Full or Incremental construct in a single streamed read.
+    /// The callback must enforce unique paths and keep its output provisional.
+    #[cfg(feature = "fdb")]
+    pub(crate) fn scan_any_reader_to_disk<
+        R: std::io::BufRead,
+        F: FnMut(IndexEntry) -> Result<()>,
+    >(
+        input: R,
+        emit: F,
+    ) -> Result<Self> {
+        Self::parse_with(input, true, None, false, emit)
     }
 
     fn parse_with<R: std::io::BufRead, F: FnMut(IndexEntry) -> Result<()>>(
         input: R,
         streaming: bool,
-        incremental_stream: bool,
+        incremental_stream: Option<bool>,
         check_paths: bool,
         mut emit: F,
     ) -> Result<Self> {
@@ -333,7 +379,7 @@ impl LtfsIndex {
                 _ => {}
             }
             if let Some(entry) = p.pending_entry.take() {
-                if incremental_stream {
+                if incremental_stream != Some(false) {
                     super::incremental::validate_incremental_entry(&entry)?;
                     let path = match &entry {
                         IndexEntry::File { path, .. } | IndexEntry::Directory { path, .. } => path,
@@ -346,7 +392,7 @@ impl LtfsIndex {
             }
         }
         let index = p.finish()?;
-        if streaming && index.incremental != incremental_stream {
+        if streaming && incremental_stream.is_some_and(|kind| index.incremental != kind) {
             return Err(TapeError::Ltfs("逐条扫描的索引类型不匹配".into()));
         }
         index.validate_incremental()?;
@@ -651,6 +697,34 @@ fn write_directory<W: std::io::Write>(
     d: &DirectoryNode,
     incremental: bool,
 ) -> Result<()> {
+    // Keep memory proportional to depth without consuming a call frame per
+    // directory. Preserve the same depth-first XML and sibling order.
+    let mut pending = Some(d);
+    let mut stack = Vec::new();
+    loop {
+        if let Some(directory) = pending.take()
+            && write_directory_start(w, directory, incremental)?
+        {
+            stack.push(directory.subdirs.iter());
+        }
+        let Some(children) = stack.last_mut() else {
+            return Ok(());
+        };
+        if let Some(child) = children.next() {
+            pending = Some(child);
+        } else {
+            w.write_event(Event::End(BytesEnd::new("contents")))?;
+            w.write_event(Event::End(BytesEnd::new("directory")))?;
+            stack.pop();
+        }
+    }
+}
+
+fn write_directory_start<W: std::io::Write>(
+    w: &mut Writer<W>,
+    d: &DirectoryNode,
+    incremental: bool,
+) -> Result<bool> {
     w.write_event(Event::Start(BytesStart::new("directory")))?;
     write_text(w, "name", &d.name)?;
     if d.delta_fields
@@ -659,7 +733,7 @@ fn write_directory<W: std::io::Write>(
     {
         w.write_event(Event::Empty(BytesStart::new("deleted")))?;
         w.write_event(Event::End(BytesEnd::new("directory")))?;
-        return Ok(());
+        return Ok(false);
     }
     write_meta(w, &d.meta, &d.delta_fields)?;
     if present(&d.delta_fields, "extendedattributes") {
@@ -672,12 +746,7 @@ fn write_directory<W: std::io::Write>(
     for f in &d.files {
         write_file(w, f, incremental)?;
     }
-    for sub in &d.subdirs {
-        write_directory(w, sub, incremental)?;
-    }
-    w.write_event(Event::End(BytesEnd::new("contents")))?;
-    w.write_event(Event::End(BytesEnd::new("directory")))?;
-    Ok(())
+    Ok(true)
 }
 
 // ----- 解析器 -----
@@ -685,7 +754,7 @@ fn write_directory<W: std::io::Write>(
 /// 栈式 XML 状态机：维护 path 栈 + "当前"目录/文件/extent。
 struct IndexParser {
     streaming: bool,
-    incremental_stream: bool,
+    incremental_stream: Option<bool>,
     root_seen: bool,
     pending_entry: Option<IndexEntry>,
     incremental: bool,
@@ -768,7 +837,7 @@ impl IndexParser {
     fn new() -> Self {
         Self {
             streaming: false,
-            incremental_stream: false,
+            incremental_stream: Some(false),
             root_seen: false,
             pending_entry: None,
             incremental: false,
@@ -801,7 +870,10 @@ impl IndexParser {
     fn on_start(&mut self, e: BytesStart<'_>) -> Result<()> {
         let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
         self.text.clear();
-        if self.path.len() >= 512 {
+        // A managed path may contain 1024 components, in addition to the
+        // volume root. Each directory adds directory/contents tags; leave
+        // room for a leaf's attributes and extents, while bounding XML input.
+        if self.path.len() >= 2 * (1024 + 1) + 8 {
             return Err(TapeError::Ltfs("索引 XML 嵌套深度超过预算".into()));
         }
         if matches!(name.as_str(), "name" | "key" | "symlink")
@@ -825,12 +897,15 @@ impl IndexParser {
         }
         match name.as_str() {
             "ltfsindex" | "ltfsincrementalindex" => {
-                if self.streaming && name == "ltfsincrementalindex" && !self.incremental_stream {
+                if self.streaming
+                    && name == "ltfsincrementalindex"
+                    && self.incremental_stream == Some(false)
+                {
                     return Err(TapeError::Ltfs(
                         "逐条扫描仅支持完整索引；增量索引须先重放".into(),
                     ));
                 }
-                if self.streaming && name == "ltfsindex" && self.incremental_stream {
+                if self.streaming && name == "ltfsindex" && self.incremental_stream == Some(true) {
                     return Err(TapeError::Ltfs("增量逐条扫描收到完整索引".into()));
                 }
                 self.incremental = name == "ltfsincrementalindex";
@@ -1092,9 +1167,13 @@ impl IndexParser {
                     let path = self.entry_path(&done.name);
                     if self.dir_stack.is_empty() {
                         self.root_seen = true;
+                        // The root name is a volume label, never a path component.
+                        // Keep it in the header, but emit the canonical namespace root.
+                        let mut root = done.clone();
+                        root.name.clear();
                         self.pending_entry = Some(IndexEntry::Directory {
-                            path,
-                            node: done.clone(),
+                            path: String::new(),
+                            node: root,
                         });
                         self.dir_stack.push(done);
                     } else {
@@ -1230,6 +1309,13 @@ mod tests {
     }
 
     #[test]
+    fn excessive_xml_nesting_is_rejected_without_recursion() {
+        let xml = format!("{}{}", "<unknown>".repeat(3000), "</unknown>".repeat(3000));
+        let error = LtfsIndex::parse(xml.as_bytes()).unwrap_err();
+        assert!(error.to_string().contains("嵌套深度超过预算"));
+    }
+
+    #[test]
     fn bounded_xml_size_matches_escaped_utf8_and_preserves_errors() {
         let mut index = LtfsIndex::empty(Uuid::nil(), "边界<&>".into(), 'b');
         index.root.xattrs.push(Xattr {
@@ -1314,6 +1400,34 @@ mod tests {
             }
         }
         assert_eq!(files, 2);
+    }
+
+    #[test]
+    fn streamed_named_volume_root_is_not_a_namespace_directory() {
+        let mut full = LtfsIndex::parse(IBM_STYLE.as_bytes()).unwrap();
+        full.root.name = "REA_AA18_1103".into();
+        let xml = full.to_xml().unwrap();
+        let mut roots = Vec::new();
+        let mut files = Vec::new();
+        let scanned = LtfsIndex::scan_full_reader(&xml[..], |entry| {
+            match entry {
+                IndexEntry::Directory { path, node }
+                    if node.meta.file_uid == full.root.meta.file_uid =>
+                {
+                    roots.push((path, node.name))
+                }
+                IndexEntry::File { path, .. } => files.push(path),
+                _ => {}
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(roots, vec![(String::new(), String::new())]);
+        assert_eq!(scanned.root.name, "REA_AA18_1103");
+        assert_eq!(scanned.root.meta, full.root.meta);
+        let mut expected = Vec::new();
+        full.walk_files(|path, _| expected.push(path.to_owned()));
+        assert_eq!(files, expected);
     }
 
     #[test]
