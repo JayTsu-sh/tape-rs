@@ -7,6 +7,119 @@ use crate::ltfs::index::IndexEntry;
 use crate::ltfs::index_equivalence::FullIndexComparison;
 use crate::ltfs::volume::CommittedIndexConstruct;
 
+/// Assign needs to prove emptiness, not construct a writable in-memory volume.
+/// A Full entry can safely refuse early, without claiming a valid whole index.
+/// Empty deltas require the existing disk replay and final object set instead.
+/// All byte/event allocations and chain headers are bounded independently of
+/// file count; the parser already caps XML nesting at 512.
+pub(crate) fn probe_empty_volume(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    budget: &RecoveryBudget,
+) -> Result<bool> {
+    let mut budget = budget.clone();
+    budget.max_index_bytes = budget.max_index_bytes.min(16 << 20);
+    budget.max_chain_len = budget.max_chain_len.min(8);
+    if label.blocksize as usize > budget.max_index_bytes {
+        return Err(TapeError::LocalCapacity {
+            reason: "非强制空卷检查的块大小超出内存预算".into(),
+        });
+    }
+    drive.locate_eod(1)?;
+    let eod = drive.read_position()?;
+    if eod.partition != 1 {
+        return Err(TapeError::RecoveryRestricted {
+            reason: "空卷检查 DP EOD 分区不符".into(),
+        });
+    }
+    let closing = back_fm(drive)?.ok_or_else(|| TapeError::RecoveryRestricted {
+        reason: "空卷检查 DP 缺少结束文件标记".into(),
+    })?;
+    let opening = back_fm(drive)?.ok_or_else(|| TapeError::RecoveryRestricted {
+        reason: "空卷检查 DP 缺少起始文件标记".into(),
+    })?;
+    let start = opening
+        .checked_add(1)
+        .ok_or_else(|| TapeError::Ltfs("DP 构造位置溢出".into()))?;
+    if start < P1_DATA_START || start >= closing {
+        return Err(TapeError::RecoveryRestricted {
+            reason: "空卷检查 DP 末构造位置无效".into(),
+        });
+    }
+    drive.locate(1, start, true)?;
+    let mut reader = ConstructReader::new(
+        drive,
+        start,
+        label.blocksize as usize,
+        budget.max_index_bytes,
+    );
+    let mut found_object = false;
+    let parsed = LtfsIndex::scan_any_reader_to_disk(&mut reader, |entry| {
+        let nonempty_full = match entry {
+            IndexEntry::File { node, .. } => node.delta_fields.is_none(),
+            IndexEntry::Directory { path, node } => !path.is_empty() && node.delta_fields.is_none(),
+        };
+        if nonempty_full {
+            found_object = true;
+            return Err(TapeError::Refused {
+                reason: "当前 Full 构造中发现文件或目录，未证明空卷".into(),
+            });
+        }
+        Ok(())
+    });
+    let head = match parsed {
+        Err(TapeError::Refused { .. }) if found_object && reader.error.is_none() => {
+            return Ok(false);
+        }
+        Err(error) => return Err(reader.error.take().unwrap_or(error)),
+        Ok(head) => head,
+    };
+    if !reader.ended
+        || reader.next.checked_sub(1) != Some(closing)
+        || reader.next != eod.block_number
+    {
+        return Err(TapeError::RecoveryRestricted {
+            reason: "空卷检查 DP 构造未闭合或不紧邻 EOD".into(),
+        });
+    }
+    validate_candidate(&head, label, label.data_partition, start)
+        .map_err(|reason| TapeError::RecoveryRestricted { reason })?;
+    let expected = CommittedIndexConstruct {
+        volume_uuid: label.volume_uuid,
+        generation: head.generation,
+        location: head.self_location,
+        sha256: reader.sha.finalize().into(),
+        incremental: head.incremental,
+    };
+    let proof = verify_dp_ip_head_with_evidence(drive, label, expected, &budget)?;
+    if proof.ip_generation != expected.generation || !proof.empty_unlocked {
+        return Ok(false);
+    }
+    // The index proof uses P0's identity. Both physical labels must agree
+    // before emptiness can authorize clearing the volume by FORMAT.
+    for (partition, location) in [(0, label.index_partition), (1, label.data_partition)] {
+        drive.locate(partition, crate::ltfs::volume::LABEL_BLOCK, true)?;
+        let mut bytes = vec![0; 64 * 1024];
+        let n = drive.read_block(&mut bytes)?;
+        let mut actual = LtfsLabel::parse(bytes.get(..n).ok_or(TapeError::InvalidResponse {
+            expected: bytes.len(),
+            actual: n,
+        })?)?;
+        if actual.location != location || drive.read_block(&mut bytes)? != 0 {
+            return Err(TapeError::RecoveryRestricted {
+                reason: "空卷检查分区标签位置或闭合标记不符".into(),
+            });
+        }
+        actual.location = label.location;
+        if actual.to_xml()? != label.to_xml()? {
+            return Err(TapeError::RecoveryRestricted {
+                reason: "空卷检查两分区标签不一致".into(),
+            });
+        }
+    }
+    Ok(true)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct StreamedFullRecovery {
     pub construct: CommittedIndexConstruct,

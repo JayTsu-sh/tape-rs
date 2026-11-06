@@ -14,6 +14,191 @@ use std::sync::{
 use uuid::Uuid;
 
 #[test]
+fn nonforce_large_nonempty_index_is_rejected_before_whole_tree_mount() {
+    let lib = SimLibrary::new(1, 2, 1);
+    lib.insert_cartridge(SimCartridge::blank("TEST01L8", 1 << 30), 0)
+        .unwrap();
+    lib.load_into_drive("TEST01L8", 0).unwrap();
+    let dev = lib.drive(0);
+    crate::ltfs::mkltfs::mkltfs(&dev, &Default::default()).unwrap();
+    let mut volume = crate::ltfs::volume::LtfsVolume::mount(&dev).unwrap();
+    for id in 0..4000 {
+        volume
+            .append_file(&format!("file-{id}"), &mut std::io::Cursor::new(b"keep"))
+            .unwrap();
+    }
+    volume.commit().unwrap();
+    drop(volume);
+    struct CappedReads<'a> {
+        dev: &'a dyn TapeTransport,
+        reads: Cell<usize>,
+    }
+    impl TapeTransport for CappedReads<'_> {
+        fn identity(&self) -> &str {
+            self.dev.identity()
+        }
+        fn execute_no_data(&self, cdb: &[u8], timeout: u32) -> Result<ScsiResult> {
+            assert_ne!(cdb[0], opcode::FORMAT_MEDIUM);
+            self.dev.execute_no_data(cdb, timeout)
+        }
+        fn execute_read(&self, cdb: &[u8], buf: &mut [u8], timeout: u32) -> Result<ScsiResult> {
+            if cdb[0] == opcode::READ_6 {
+                self.reads.set(self.reads.get() + 1);
+                if self.reads.get() > 4 {
+                    return Err(TapeError::ScsiHost(3));
+                }
+            }
+            self.dev.execute_read(cdb, buf, timeout)
+        }
+        fn execute_write(&self, _: &[u8], _: &[u8], _: u32) -> Result<ScsiResult> {
+            panic!("nonforce inspection must never write")
+        }
+    }
+    let guarded = CappedReads {
+        dev: &dev,
+        reads: Cell::new(0),
+    };
+    let result = nonforce_empty(&guarded, &crate::ltfs::recovery::RecoveryBudget::default());
+    assert!(
+        matches!(result, Ok(false)),
+        "known first file must reject without reading/materializing the entire index: {result:?}; reads={}",
+        guarded.reads.get()
+    );
+    assert!(guarded.reads.get() <= 4);
+}
+
+#[test]
+fn nonforce_empty_full_requires_bounded_resources_and_matching_labels() {
+    use crate::ltfs::recovery::RecoveryBudget;
+    let lib = SimLibrary::new(1, 2, 1);
+    lib.insert_cartridge(SimCartridge::blank("TEST01L8", 1 << 30), 0)
+        .unwrap();
+    lib.load_into_drive("TEST01L8", 0).unwrap();
+    let dev = lib.drive(0);
+    crate::ltfs::mkltfs::mkltfs(&dev, &Default::default()).unwrap();
+    assert!(nonforce_empty(&dev, &RecoveryBudget::default()).unwrap());
+    let mut budget = RecoveryBudget::default();
+    budget.index_scratch.max_bytes = 0;
+    assert!(matches!(
+        nonforce_empty(&dev, &budget),
+        Err(TapeError::LocalCapacity { .. })
+    ));
+    let mut volume = crate::ltfs::volume::LtfsVolume::mount(&dev).unwrap();
+    volume.set_root_xattr("large", &"x".repeat(8192)).unwrap();
+    volume.commit().unwrap();
+    drop(volume);
+    budget = RecoveryBudget {
+        max_index_bytes: 4096,
+        ..RecoveryBudget::default()
+    };
+    assert!(matches!(
+        nonforce_empty(&dev, &budget),
+        Err(TapeError::LocalCapacity { .. })
+    ));
+    assert!(nonforce_empty(&dev, &RecoveryBudget::default()).unwrap());
+    lib.with_cartridge_mut("TEST01L8", |cart| {
+        if let crate::scsi::sim::LogicalObject::Record(xml) = &mut cart.partitions[1].objects[2] {
+            let mut label = crate::ltfs::label::LtfsLabel::parse(xml).unwrap();
+            label.volume_uuid = Uuid::new_v4();
+            *xml = label.to_xml().unwrap().to_vec();
+        } else {
+            panic!("label must be a record");
+        }
+    });
+    assert!(nonforce_empty(&dev, &RecoveryBudget::default()).is_err());
+}
+
+#[test]
+fn nonforce_empty_delta_requires_final_replay_and_same_generation_ip() {
+    use crate::ltfs::{index::IndexLocation, recovery::RecoveryBudget, volume::LtfsVolume};
+    let lib = SimLibrary::new(1, 2, 1);
+    lib.insert_cartridge(SimCartridge::blank("TEST01L8", 1 << 30), 0)
+        .unwrap();
+    lib.load_into_drive("TEST01L8", 0).unwrap();
+    let dev = lib.drive(0);
+    crate::ltfs::mkltfs::mkltfs(&dev, &Default::default()).unwrap();
+    let mut volume = LtfsVolume::mount(&dev).unwrap();
+    volume
+        .append_file("keep", &mut std::io::Cursor::new(b"keep"))
+        .unwrap();
+    volume.commit_incremental().unwrap();
+    assert!(!nonforce_empty(&dev, &RecoveryBudget::default()).unwrap());
+    volume.remove_file("keep").unwrap();
+    volume.commit_incremental().unwrap();
+    assert!(volume.index().incremental && volume.index().root.files.is_empty());
+    assert!(
+        !nonforce_empty(&dev, &RecoveryBudget::default()).unwrap(),
+        "IP debt cannot prove safe emptiness"
+    );
+    let mut ip = volume.index().clone();
+    ip.incremental = false;
+    ip.materialized = false;
+    ip.previous_incremental_location = Some(ip.self_location);
+    ip.self_location = IndexLocation {
+        partition: 'a',
+        start_block: crate::ltfs::volume::FIRST_INDEX_BLOCK,
+    };
+    let xml = ip.to_xml().unwrap();
+    drop(volume);
+    let drive = TapeDrive::new(&dev);
+    drive
+        .locate(0, crate::ltfs::volume::P1_DATA_START, true)
+        .unwrap();
+    drive.write_filemark(1).unwrap();
+    drive.write_block(&xml).unwrap();
+    drive.write_filemark(1).unwrap();
+    drive.write_filemark(0).unwrap();
+    assert!(
+        nonforce_empty(&dev, &RecoveryBudget::default()).unwrap(),
+        "disk replay must use the final deleted-empty view"
+    );
+    let budget = RecoveryBudget {
+        max_chain_len: 1,
+        ..RecoveryBudget::default()
+    };
+    assert!(
+        matches!(
+            nonforce_empty(&dev, &budget),
+            Err(TapeError::LocalCapacity { .. })
+        ),
+        "bounded replay must preserve resource uncertainty"
+    );
+}
+
+#[test]
+fn nonforce_single_large_attribute_and_xml_depth_are_resource_limits() {
+    use crate::ltfs::{index::LtfsIndex, recovery::RecoveryBudget, volume::LtfsVolume};
+    let lib = SimLibrary::new(1, 2, 1);
+    lib.insert_cartridge(SimCartridge::blank("TEST01L8", 1 << 30), 0)
+        .unwrap();
+    lib.load_into_drive("TEST01L8", 0).unwrap();
+    let dev = lib.drive(0);
+    crate::ltfs::mkltfs::mkltfs(&dev, &Default::default()).unwrap();
+    let mut volume = LtfsVolume::mount(&dev).unwrap();
+    volume
+        .set_root_xattr("giant", &"x".repeat(17 << 20))
+        .unwrap();
+    volume.commit().unwrap();
+    drop(volume);
+    assert!(
+        matches!(
+            nonforce_empty(&dev, &RecoveryBudget::default()),
+            Err(TapeError::LocalCapacity { .. })
+        ),
+        "single event must obey the hard16MiB limit"
+    );
+    let xml = format!(
+        "<ltfsindex>{}{}</ltfsindex>",
+        "<directory>".repeat(513),
+        "</directory>".repeat(513)
+    );
+    assert!(matches!(
+        LtfsIndex::scan_any_reader_to_disk(xml.as_bytes(), |_| Ok(())),
+        Err(TapeError::LocalCapacity { .. })
+    ));
+}
+
+#[test]
 fn probe_failure_requires_complete_current_sense_before_releasing_unknown_result() {
     use crate::scsi::sense::SenseInfo;
     let error = |sense: Option<SenseInfo>, key, asc| TapeError::ScsiCommand {
@@ -212,7 +397,7 @@ fn assignment_format_unknown_keeps_original_uuid_without_reformatting() {
         .build()
         .unwrap();
     let catalog = Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());
-    for case in 0..8 {
+    for case in 0..9 {
         let ns = Uuid::new_v4();
         let serial = format!("ASSIGN-FAULT-{ns}");
         let challenge = Uuid::new_v4();
@@ -224,12 +409,15 @@ fn assignment_format_unknown_keeps_original_uuid_without_reformatting() {
             ))
             .unwrap();
         let round = route.initial_owner_epoch;
-        let control = FdbOwnerControl {
+        let mut control = FdbOwnerControl {
             catalog: catalog.clone(),
             serial: serial.clone(),
             route,
             storage: Default::default(),
         };
+        if case == 8 {
+            control.storage.index_bytes = 0;
+        }
         let lib = SimLibrary::new(1, 3, 1);
         lib.enable_changer_pr();
         let mut cartridge = SimCartridge::blank("TEST01L8", 1 << 20);
@@ -244,7 +432,7 @@ fn assignment_format_unknown_keeps_original_uuid_without_reformatting() {
             cartridge.partitions[0].flushed = 4;
         }
         lib.insert_cartridge(cartridge, 0).unwrap();
-        if case == 7 {
+        if case >= 7 {
             lib.load_into_drive("TEST01L8", 0).unwrap();
             crate::ltfs::mkltfs::mkltfs(
                 &lib.drive(0),
@@ -327,7 +515,7 @@ fn assignment_format_unknown_keeps_original_uuid_without_reformatting() {
                     break;
                 }
             }
-            if case == 7 && job.diagnostic.is_some() {
+            if case >= 7 && job.diagnostic.is_some() {
                 let _ = job.poll(context(), &mut publisher, &runtime).unwrap();
             }
             let task = saved(context(), &runtime, &request);
@@ -350,9 +538,12 @@ fn assignment_format_unknown_keeps_original_uuid_without_reformatting() {
                 assert!(
                     task["execution"]["error"]
                         .as_str()
-                        .unwrap()
-                        .contains("SCSI host error"),
-                    "original transport diagnostic must survive: {task}"
+                        .is_some_and(|e| e.contains(if case == 7 {
+                            "SCSI host error"
+                        } else {
+                            "临时盘"
+                        })),
+                    "original dependency diagnostic must survive: {task}"
                 );
                 assert!(
                     runtime

@@ -33,14 +33,15 @@ fn all_partitions_blank(device: &dyn TapeTransport) -> Result<bool> {
     }
     Ok(true)
 }
-fn nonforce_empty(device: &dyn TapeTransport) -> Result<bool> {
+fn nonforce_empty(
+    device: &dyn TapeTransport,
+    budget: &crate::ltfs::recovery::RecoveryBudget,
+) -> Result<bool> {
     match crate::ltfs::volume::probe_format(device)? {
         crate::ltfs::volume::FormatProbe::Blank => all_partitions_blank(device),
         crate::ltfs::volume::FormatProbe::Ltfs => {
-            let volume = crate::ltfs::volume::LtfsVolume::mount(device)?;
-            Ok(volume.writable()
-                && volume.index().root.files.is_empty()
-                && volume.index().root.subdirs.is_empty())
+            let label = crate::ltfs::volume::read_label_only(device)?;
+            crate::ltfs::recovery::probe_empty_volume(&TapeDrive::new(device), &label, budget)
         }
         crate::ltfs::volume::FormatProbe::Foreign(_) => Ok(false),
     }
@@ -696,7 +697,11 @@ impl Job {
                 return Ok(Publication::Confirmed(false));
             }
             if self.request.value()["change"]["force_format"] != true {
-                let result = nonforce_empty(&guard);
+                let mut budget = crate::ltfs::recovery::RecoveryBudget::default();
+                budget.index_scratch.directory = context.active.files.spool_dir().to_path_buf();
+                budget.index_scratch.max_bytes = context.control.storage.index_bytes;
+                budget.index_scratch.headroom_bytes = context.control.storage.headroom_bytes;
+                let result = nonforce_empty(&guard, &budget);
                 // Recovery may deliberately fall back after a failed read. A
                 // transport/authority failure is never proof of invalid media,
                 // even when that fallback returns a semantic error or a view.
@@ -709,9 +714,15 @@ impl Job {
                 }
                 let safe = match result {
                     Ok(safe) => safe,
+                    Err(
+                        error @ (TapeError::LocalCapacity { .. }
+                        | TapeError::LocalSpace { .. }
+                        | TapeError::Io(_)
+                        | TapeError::CatalogDb(_)),
+                    ) => return Err(error),
                     Err(error) => {
                         self.reject = Some(bounded_error(&format!(
-                            "非强制检查已完成，LTFS标签或索引不可读：{error}；未开始格式化"
+                            "非强制检查未能证明安全空卷：{error}；未开始格式化"
                         )));
                         return Ok(Publication::Confirmed(false));
                     }
