@@ -20,8 +20,8 @@
 | library/tape list/show | 954098a3 / 2f7e768 | 真实库存、nodes/active_node、CLI表格/JSON及HTTP分页排序；FDB故障不伪报成功。assigned/offline/corrupt合成行不算物理故障。tape-native-library-tape-queries-physical-20261106/FINAL.json |
 | 异步rescan | 4e2e6343 / 62c20cc | 完整库存、CLI/HTTP同原任务、取消、坏回执、跨owner及FDB恢复。tape-native-library-rescan-physical-20261106/FINAL.json |
 | 部分库存拒绝 | 9bb17897 / 15acf27 | 真实GOOD回复的截断/缺元素拒绝，2344字节43元素完整通过；新版周期采样/rescan。tape-complete-changer-status-physical-20261106/FINAL.json |
-| 异步tape move | b3432f5d / 4555b85 | storage/I-E往返、已分配带归槽、原计划跨owner、queued取消、真实FDB故障及历史回执保护。tape-native-media-move-physical-20261106/FINAL.json |
-| force assign及大索引nonforce拒绝 | bf555de8、128e2c38 / PR37 | AA42强制格式化/分配、提交前FDB故障恢复及完成后切换；AA43大索引同原任务从实际OOM恢复并安全拒绝，原4GiB限额未提高。不是执行中FORMAT接管。tape-native-media-assign-bounded-physical-20261106/FINAL.json |
+| 异步tape move | b3432f5d / 4555b85 | storage/I-E往返、原计划跨owner、queued取消、真实FDB故障及历史回执保护。tape-native-media-move-physical-20261106/FINAL.json |
+| force assign及大索引nonforce拒绝 | bf555de8、128e2c38 / PR37 | AA42强制格式化/分配、已分配带归槽、提交前FDB故障恢复及完成后切换；AA43大索引同原任务从实际OOM恢复并安全拒绝，原4GiB限额未提高。不是执行中FORMAT接管。tape-native-media-assign-bounded-physical-20261106/FINAL.json |
 | **nonforce空LTFS正例（本轮补齐）** | 128e2c38 / 2b70b883产品路径 | 实际CLI/HTTP以force=false分配AA47，三节点原终态/归属一致，归1005且未导入索引；原67任务字节保持，总69。tape-format-safety-evidence-20261106/main-empty-positive/COMPLETE.json |
 | **回收completed回执窗口（本轮补齐）** | b9a66cb测试 / 2b70b883生产函数 | 真实finish_reclaim一次FORMAT GOOD；原回执留置时50次drive_reclaim零新CDB，随后应用原完成命令并释放状态、归槽。tape-legacy-reclaim-evidence-20261106/PHYSICAL-RESULT.json及POST-LEGACY.json。独立operator/SQLite阶段夹具，不证明迁移全过程或Raft HA。 |
 
