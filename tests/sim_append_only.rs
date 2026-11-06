@@ -35,6 +35,7 @@ impl TapeTransport for AppendOnly<'_> {
                     sense_key: 7,
                     asc: 0x5a,
                     ascq: 2,
+                    sense: None,
                 });
             }
             self.permission.set(None);

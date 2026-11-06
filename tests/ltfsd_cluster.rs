@@ -210,6 +210,7 @@ impl tape_rs::scsi::transport::TapeTransport for PausingTransport {
                 sense_key: if medium { 3 } else { 6 },
                 asc: if medium { 0x11 } else { 0x2a },
                 ascq: if medium { 0 } else { 3 },
+                sense: None,
             });
         }
         let pause = self.pause.as_ref().filter(|p| {
