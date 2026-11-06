@@ -91,7 +91,7 @@ pub fn capture_index_source(
         start,
         label.blocksize as usize,
         budget.max_index_bytes,
-    );
+    )?;
     let parsed = LtfsIndex::scan_any_reader_to_disk(&mut reader, |entry| replay.stage(0, entry));
     let head = match parsed {
         Ok(head) => head,

@@ -52,7 +52,7 @@ pub(crate) fn probe_empty_volume(
         start,
         label.blocksize as usize,
         budget.max_index_bytes,
-    );
+    )?;
     let mut found_object = false;
     let parsed = LtfsIndex::scan_any_reader_to_disk(&mut reader, |entry| {
         let nonempty_full = match entry {
@@ -166,7 +166,7 @@ fn full_at(
         start,
         label.blocksize as usize,
         budget.max_index_bytes,
-    );
+    )?;
     let parsed = if let Some(output) = output {
         LtfsIndex::scan_full_reader(
             BufReader::new(CaptureReader {

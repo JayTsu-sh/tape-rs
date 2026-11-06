@@ -20,7 +20,7 @@ const REPORT_DENSITY_BUF_LEN: usize = 1024;
 /// RECEIVE DIAGNOSTIC RESULTS 响应缓冲区长度。
 const DIAG_RESULT_BUF_LEN: usize = 4 * 1024;
 /// READ(6) / WRITE(6) transfer length 最大值（CDB 字段 24-bit）。
-const SCSI_6_TRANSFER_MAX: usize = 0xFF_FFFF;
+pub(crate) const SCSI_6_TRANSFER_MAX: usize = 0xFF_FFFF;
 
 /// 校验 SPACE(6) 的 24-bit 有符号 count 范围。
 fn ensure_space_count(count: i32) -> Result<()> {

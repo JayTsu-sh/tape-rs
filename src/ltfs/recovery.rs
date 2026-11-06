@@ -24,7 +24,7 @@ use std::io::{BufRead, Read};
 
 use crate::error::{Result, TapeError};
 use crate::scsi::transport::TapeTransport;
-use crate::tape::commands::TapeDrive;
+use crate::tape::commands::{SCSI_6_TRANSFER_MAX, TapeDrive};
 
 use super::index::{IndexLocation, LtfsIndex};
 use super::label::LtfsLabel;
@@ -272,8 +272,22 @@ struct ConstructReader<'a, 'd> {
 }
 
 impl<'a, 'd> ConstructReader<'a, 'd> {
-    fn new(drive: &'a TapeDrive<'d>, start: u64, block_size: usize, max_bytes: usize) -> Self {
-        Self {
+    fn new(
+        drive: &'a TapeDrive<'d>,
+        start: u64,
+        block_size: usize,
+        max_bytes: usize,
+    ) -> Result<Self> {
+        // The label is external input. Reject unsupported sizes before allocating
+        // a physical record buffer; TapeDrive applies the same READ(6) bound.
+        if block_size == 0 || block_size > SCSI_6_TRANSFER_MAX {
+            return Err(TapeError::LocalCapacity {
+                reason: format!(
+                    "索引块大小 {block_size} 超出单块预算 1..={SCSI_6_TRANSFER_MAX} 字节"
+                ),
+            });
+        }
+        Ok(Self {
             drive,
             buf: vec![0; block_size],
             offset: 0,
@@ -285,7 +299,7 @@ impl<'a, 'd> ConstructReader<'a, 'd> {
             done: false,
             error: None,
             sha: Sha256::new(),
-        }
+        })
     }
 }
 
@@ -403,7 +417,7 @@ pub(crate) fn confirmed_index_reader<'a, 'd>(
             candidate.start_block,
             label.blocksize as usize,
             budget.max_index_bytes,
-        ),
+        )?,
         expected_next,
     })
 }
@@ -416,7 +430,7 @@ fn read_until_fm(
     max_bytes: usize,
 ) -> Result<(IndexConstruct, bool, u64)> {
     drive.locate(partition, start, true)?;
-    let mut reader = ConstructReader::new(drive, start, block_size, max_bytes);
+    let mut reader = ConstructReader::new(drive, start, block_size, max_bytes)?;
     // 前缀可跨短记录，解析时将这些字节接回流的开头。
     let mut prefix = Vec::new();
     while prefix.len() < 512 {
@@ -579,7 +593,7 @@ pub(crate) fn with_verified_dp_construct<T>(
         location.start_block,
         label.blocksize as usize,
         budget.max_index_bytes,
-    );
+    )?;
     let value = match consume(&mut reader) {
         Ok(value) => value,
         Err(error) => return Err(reader.error.take().unwrap_or(error)),
@@ -828,7 +842,7 @@ fn replay_captured_chain(
             location.start_block,
             label.blocksize as usize,
             budget.max_index_bytes,
-        );
+        )?;
         let emit = |entry| replay.stage(chain.len() as u32, entry);
         let parsed = if incremental {
             LtfsIndex::scan_incremental_reader_to_disk(&mut reader, emit)
@@ -945,7 +959,7 @@ fn scan_ip_not_ahead(
         start,
         label.blocksize as usize,
         budget.max_index_bytes,
-    );
+    )?;
     let parsed = LtfsIndex::scan_full_reader(&mut reader, emit);
     let index = match parsed {
         Ok(index) => index,
@@ -999,7 +1013,7 @@ where
         location.start_block,
         label.blocksize as usize,
         budget.max_index_bytes,
-    );
+    )?;
     let parsed = LtfsIndex::scan_full_reader(&mut reader, emit);
     let index = match parsed {
         Ok(index) => index,
@@ -1809,4 +1823,53 @@ pub fn dp_index_location(report: &RecoveryReport, dp_char: char) -> Option<Index
         partition: dp_char,
         start_block: c.start_block,
     })
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+    use crate::ltfs::mkltfs::{MkltfsOptions, mkltfs};
+    use crate::scsi::sim::{SimCartridge, SimLibrary};
+
+    #[test]
+    fn index_block_allocation_checks_boundaries_before_buffering() {
+        let library = SimLibrary::new(1, 1, 0);
+        let device = library.drive(0);
+        let drive = TapeDrive::new(&device);
+        for size in [0, SCSI_6_TRANSFER_MAX + 1, u32::MAX as usize, usize::MAX] {
+            assert!(matches!(
+                ConstructReader::new(&drive, 5, size, 8usize << 30),
+                Err(TapeError::LocalCapacity { .. })
+            ));
+        }
+        for size in [512 << 10, SCSI_6_TRANSFER_MAX] {
+            let reader = ConstructReader::new(&drive, 5, size, 8usize << 30).unwrap();
+            assert_eq!(reader.buf.len(), size);
+            assert_eq!(reader.next, 5);
+            assert!(!reader.done && !reader.ended);
+        }
+        assert!(device.command_log().is_empty());
+    }
+
+    #[test]
+    fn oversized_index_block_is_capacity_error_before_a_tape_read() {
+        let library = SimLibrary::new(1, 1, 0);
+        library
+            .insert_cartridge(SimCartridge::blank("BOUNDRL8", 32 << 20), 0)
+            .unwrap();
+        library.load_into_drive("BOUNDRL8", 0).unwrap();
+        let device = library.drive(0);
+        mkltfs(
+            &device,
+            &MkltfsOptions {
+                volume_id: "BOUNDR".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let before = device.command_log().len();
+        let result = read_until_fm(&TapeDrive::new(&device), 1, 5, 1 << 24, 8usize << 30);
+        assert!(matches!(result, Err(TapeError::LocalCapacity { .. })));
+        assert!(!device.command_log()[before..].contains(&0x08));
+    }
 }
