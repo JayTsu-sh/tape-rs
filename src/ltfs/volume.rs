@@ -1464,6 +1464,22 @@ impl<'a> LtfsVolume<'a> {
         Ok(())
     }
 
+    /// Stage exact attributes of an already created reclaim directory/link.
+    /// The managed actor must persist its intent and serialize this volume
+    /// before calling. No node is created, no content is copied, and nothing
+    /// is published or written until the ordinary guarded commit succeeds.
+    /// This is not destination readback or permission to erase the source.
+    pub fn preserve_reclaimed_metadata(
+        &mut self,
+        path: &str,
+        source: &super::index::IndexEntry,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        self.working.preserve_reclaimed_metadata(path, source)?;
+        self.dirty = true;
+        Ok(())
+    }
+
     pub fn set_node_readonly(&mut self, path: &str, readonly: bool) -> Result<()> {
         self.ensure_writable()?;
         self.working.set_node_readonly(path, readonly)?;

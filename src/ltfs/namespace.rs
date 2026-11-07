@@ -2,6 +2,9 @@
 use super::index::{DirectoryNode, FileNode, LtfsIndex, NodeMeta, Xattr};
 use crate::error::{Result, TapeError};
 
+#[path = "namespace_relocation.rs"]
+mod relocation;
+
 fn error(s: &str) -> TapeError {
     TapeError::Ltfs(s.into())
 }
