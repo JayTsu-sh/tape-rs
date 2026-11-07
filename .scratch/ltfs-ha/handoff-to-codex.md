@@ -27,6 +27,7 @@
 - 独立 FDB 集群使用 45153；保留原 namespace、state、服务单元和端口。不得碰 45151/45152，不清除原任务门闩或设备预约来制造就绪。
 - 已消费的实测 controller 不重跑。未知副作用保留原请求及检查点，按项目恢复流程核对；格式化、擦除沿用显式确认门槛。
 - 两轮占用父任务均已按原 handle 在零子任务状态安全关闭，原排队请求均终态。首次 `accept-exclusion-v1.py` 因占用原因被掩盖退出 1，证据 `EXCLUSION-V1-ORIGINAL-SETTLEMENT-v1.json`。修复后 `accept-exclusion-upload-v1.py` 的严格 PoolBusy、引用保护和原任务回执检查通过，但脚本误要求专用 rescan 终态重放为 200 而退出 1；现有路由/测试要求 202，原响应正文与原终态一致。只读补验 `settle-exclusion-upload-v1.py` 原进程退出 0，核实新旧正文、被拒写对象 404、原回执未变及 14 类占用为空。总证据 `EXCLUSION-UPLOAD-ACCEPTANCE-SETTLEMENT-v1.json`。L85 同池同卷、在线且非黑名单，最新修订号为 3。没有重新提交管理操作或 PUT，没有 FORMAT/ERASE；不把原失败进程改记为成功。后续不得重跑这些已消费脚本。
+- 后续正常 HA 实测仍使用普通 `fa7a2d7`：207/node1/round701278 正常停止，208/node2/round727643 接管。executor 在 Serving 前已按原身份领取父任务；E/Rp/原索引字节保持，父记录仅更新 owner，三个原请求仍 queued。旧 owner 查询/释放被拒绝，原零子任务按原 handle 关闭后，两个 rescan 成功、unassign 被引用保护拒绝；207 正常加入，三节点就绪，新旧正文及原回执不变，14 类占用为空。两个私有测试 helper 均已退出。原 `accept-v2.py` 误要求新节点尚未领取原父而退出 1；`resume-original-v2.py` 按原操作续接退出 0，没有新建父任务或管理请求。证据 `ha-exclusion-20261107-v1/recovery-v2/COMPLETE.json`，详细边界见互斥规范；不重跑这些已消费脚本，不将其当作复制中或元数据准备任务的 HA 验收。
 
 ## 验证证据与已知限制
 
@@ -36,7 +37,7 @@
 - READ/WRITE 后取消的精确故障边界由 SimLibrary 加隔离 FDB 验证；不把它描述为已在实带注入同一故障。
 - 历史物理矩阵 24 项通过，各自绑定实际源码版本；不能称为最终候选统一重跑，完整原生 reclaim 未验收。
 - 已有 owner 定向用例在默认 debug 小栈下溢出，基线 `6dbbd808` 同条件也复现。8 MiB 调试回归通过；正常 release 实带验证未扩大生产栈。
-- 恢复开发的本地集成提交为 `a07768f`，保留了 PR #39 的 rename 原任务守卫。旧本地测试 FDB 35127 连续超时，原失败日志保留；新建独立本地测试实例后该回归通过，未重启或清理旧库，也未改真实集群。当前测试实例位置读本地 `/work/tmp/tape-reclaim-resume-20261107/PRIVATE-FDB-v1.json`，不要沿用旧测试路径。
+- 恢复开发的本地集成提交为 `a07768f`，保留了 PR #39 的 rename 原任务守卫。旧本地测试 FDB 35127 连续超时，原失败日志保留，未重启或清理旧库。后建的隔离 FDB 43843 又因所在文件系统余量低于 5% 触发 Ratekeeper Reason7，普通事务超时；仅该实例正常停止、冷迁移原数据到余量充足的本地磁盘后，同 cluster 文件/端口的最小读及原 HA 回归通过，未改保护阈值或真实集群。旧数据和失败证据保留，当前 PID、argv、数据目录见 `/work/tmp/tape-reclaim-resume-20261107/ha-exclusion-20261107-v1/PRIVATE-FDB-RELOCATED-v1.json`；原 `PRIVATE-FDB-v1.json` 只记录迁移前实例。不要沿用旧 PID 或清理其他项目的数据。
 - 新查询的源卷头篡改用例已实际先红后绿；初次测试代码编译错误与真实断言失败分别保留。最新源码、审查和检查结果查本地 `/work/tmp/tape-reclaim-resume-20261107`；后续互斥部署与部分实测不代表完整原生 reclaim 通过。
 - 原始记录在本地 `/work/tmp/tape-wip-integration-evidence-20261106`、`/work/tmp/tape-wip-independent-b-20261106`，核心入口为前者 `PR39-MERGED-v1.json`、`PR39-MERGE-ACCEPTANCE-v1.json`。现场脚本和失败日志保留原位，不作为待合入产品源码。
 
