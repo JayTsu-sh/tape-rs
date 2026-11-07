@@ -1,5 +1,5 @@
-//! Durable preparation only. No execution admission exists in this kernel.
-//! Prepared can therefore be closed without claiming any device result.
+//! Durable metadata intent, without device execution or erase authority.
+//! Once admitted, unknown media results retain the original plan and claims.
 use super::*;
 use metadata_plan::Plan;
 
@@ -7,6 +7,7 @@ use metadata_plan::Plan;
 #[serde(rename_all = "snake_case")]
 enum Phase {
     Prepared,
+    Writing,
     Closed,
 }
 
@@ -29,6 +30,9 @@ impl ReclaimMetadataWrite {
     }
     pub fn owner(&self) -> u64 {
         self.0.owner
+    }
+    pub fn writing(&self) -> bool {
+        self.0.phase == Phase::Writing
     }
     pub fn closed(&self) -> bool {
         self.0.phase == Phase::Closed
@@ -54,6 +58,34 @@ impl ReclaimMetadataWrite {
         }
         Ok(value)
     }
+}
+
+/// A committed state transition, never permission to issue a CDB.
+/// A replay or ambiguous commit requires observing the original media result.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReclaimMetadataAdmission {
+    task: ReclaimMetadataWrite,
+    needs_observation: bool,
+}
+impl ReclaimMetadataAdmission {
+    pub fn task(&self) -> &ReclaimMetadataWrite {
+        &self.task
+    }
+    pub fn needs_observation(&self) -> bool {
+        self.needs_observation
+    }
+}
+
+fn require_phase_history(
+    original: &ReclaimMetadataWrite,
+    current: &ReclaimMetadataWrite,
+) -> Result<()> {
+    // Writing and unwritten Closed are distinct branches from Prepared.
+    // A retained reply must never be reinterpreted as the other branch.
+    if original.0.phase != Phase::Prepared && original.0.phase != current.0.phase {
+        return Err(CatalogError::Corrupt("回收元数据阶段与原回执冲突"));
+    }
+    Ok(())
 }
 
 fn latest_key(reservation: &ReclaimReservation, uid: u64) -> Vec<u8> {
@@ -163,9 +195,69 @@ async fn load_at(
     Ok(Some(task))
 }
 
+async fn input_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    owner: u64,
+    file: &ReclaimFile,
+    request: &ActiveFileRequest,
+    plan: &ReclaimMetadataPlan,
+) -> Result<ReclaimMetadataInput> {
+    let input = Box::pin(relocation::metadata_input_at(
+        tr,
+        reservation,
+        owner,
+        file,
+        request,
+    ))
+    .await?;
+    if input.fingerprint()? != plan.0.input
+        || input.source().byte_proof().object() != &plan.0.source
+    {
+        return Err(CatalogError::Invalid("回收元数据计划改变原正文或目标证明"));
+    }
+    Ok(input)
+}
+
+async fn target_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    plan: &ReclaimMetadataPlan,
+    input: &ReclaimMetadataInput,
+) -> Result<()> {
+    require_pool_without_reclaim_at(tr, reservation.namespace(), reservation.spec().pool).await?;
+    let (_, index) = active_volume::observed_at(tr, reservation.serial(), plan.volume()).await?;
+    let mut encoded = Vec::new();
+    active_volume::encode_index(&mut encoded, index);
+    let count = active_volume::file_count_at(tr, reservation.serial(), plan.volume()).await?;
+    if encoded != plan.0.previous || count != plan.0.physical_files {
+        return Err(CatalogError::Invalid(
+            "回收元数据准入时目标卷头或物理文件计数改变",
+        ));
+    }
+    let pool_raw = tr
+        .get(
+            &pool_key(reservation.namespace(), reservation.spec().pool),
+            false,
+        )
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+    let pool = decode_pool(reservation.spec().pool, &pool_raw)?;
+    if count.checked_add(1).is_none_or(|n| n > pool.file_limit) {
+        return Err(CatalogError::Incomplete);
+    }
+    tape_monitor::require_data_writable(
+        tr,
+        reservation.namespace(),
+        reservation.serial(),
+        &input.destination().placement().barcode,
+    )
+    .await
+}
+
 impl ManagedCatalog {
     /// Fix the new raw node and one physical-file slot atomically, with no CDB.
-    /// A duplicate returns the same Prepared/Closed record; it never retries I/O.
+    /// A duplicate returns the retained original phase; it never retries I/O.
     pub async fn prepare_reclaim_metadata_write(
         &self,
         reservation: &ReclaimReservation,
@@ -185,21 +277,8 @@ impl ManagedCatalog {
                     requests::retry_result(
                         async {
                             parent_at(&tr, reservation, owner).await?;
-                            let input = Box::pin(relocation::metadata_input_at(
-                                &tr,
-                                reservation,
-                                owner,
-                                file,
-                                request,
-                            ))
-                            .await?;
-                            if input.fingerprint()? != plan.0.input
-                                || input.source().byte_proof().object() != &plan.0.source
-                            {
-                                return Err(CatalogError::Invalid(
-                                    "回收元数据计划改变原正文或目标证明",
-                                ));
-                            }
+                            let input =
+                                input_at(&tr, reservation, owner, file, request, plan).await?;
                             if let Some(saved) =
                                 load_at(&tr, reservation, plan.0.source.uid).await?
                             {
@@ -214,49 +293,7 @@ impl ManagedCatalog {
                                 return Ok(saved);
                             }
                             require_idle_at(&tr, reservation).await?;
-                            require_pool_without_reclaim_at(
-                                &tr,
-                                reservation.namespace(),
-                                reservation.spec().pool,
-                            )
-                            .await?;
-                            let (_, index) = active_volume::observed_at(
-                                &tr,
-                                reservation.serial(),
-                                plan.volume(),
-                            )
-                            .await?;
-                            let mut encoded = Vec::new();
-                            active_volume::encode_index(&mut encoded, index);
-                            let count = active_volume::file_count_at(
-                                &tr,
-                                reservation.serial(),
-                                plan.volume(),
-                            )
-                            .await?;
-                            if encoded != plan.0.previous || count != plan.0.physical_files {
-                                return Err(CatalogError::Invalid(
-                                    "回收元数据准备时目标卷头或物理文件计数改变",
-                                ));
-                            }
-                            let pool_raw = tr
-                                .get(
-                                    &pool_key(reservation.namespace(), reservation.spec().pool),
-                                    false,
-                                )
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
-                            let pool = decode_pool(reservation.spec().pool, &pool_raw)?;
-                            if count.checked_add(1).is_none_or(|n| n > pool.file_limit) {
-                                return Err(CatalogError::Incomplete);
-                            }
-                            tape_monitor::require_data_writable(
-                                &tr,
-                                reservation.namespace(),
-                                reservation.serial(),
-                                &input.destination().placement().barcode,
-                            )
-                            .await?;
+                            target_at(&tr, reservation, plan, &input).await?;
                             native_device::require_volume_quiescent_at(
                                 &tr,
                                 reservation.namespace(),
@@ -287,6 +324,76 @@ impl ManagedCatalog {
             .await?
     }
 
+    /// Atomically mark the original plan as potentially written before I/O.
+    /// Only a fresh transition can proceed to the guarded device actor. Replays,
+    /// including a commit whose reply was lost, must observe instead of replaying.
+    /// Device execution/recovery is not implemented by this catalog kernel.
+    pub async fn admit_reclaim_metadata_write(
+        &self,
+        reservation: &ReclaimReservation,
+        owner: u64,
+        file: &ReclaimFile,
+        request: &ActiveFileRequest,
+        original: &ReclaimMetadataWrite,
+    ) -> Result<ReclaimMetadataAdmission> {
+        request.validate()?;
+        original.encode()?;
+        if original.owner() != owner {
+            return Err(CatalogError::OwnerFenced);
+        }
+        self.db
+            .run(|tr, _| {
+                Box::pin(async move {
+                    requests::retry_result(
+                        async {
+                            parent_at(&tr, reservation, owner).await?;
+                            let plan = original.plan();
+                            let mut task = load_at(&tr, reservation, plan.0.source.uid)
+                                .await?
+                                .ok_or(CatalogError::Incomplete)?;
+                            if task.owner() != owner {
+                                return Err(CatalogError::OwnerFenced);
+                            }
+                            if task.plan() != plan {
+                                return Err(CatalogError::Invalid("准入改变原回收元数据计划"));
+                            }
+                            require_phase_history(original, &task)?;
+                            let needs_observation = match task.0.phase {
+                                Phase::Closed => {
+                                    return Err(CatalogError::Invalid(
+                                        "已关闭的元数据任务不能重新准入",
+                                    ));
+                                }
+                                Phase::Writing => true,
+                                Phase::Prepared => false,
+                            };
+                            // Replays keep the same child/retirement identity;
+                            // changed arguments cannot become a new plan.
+                            let input =
+                                input_at(&tr, reservation, owner, file, request, &plan).await?;
+                            if needs_observation {
+                                return Ok(ReclaimMetadataAdmission {
+                                    task,
+                                    needs_observation: true,
+                                });
+                            }
+                            target_at(&tr, reservation, &plan, &input).await?;
+                            task.0.phase = Phase::Writing;
+                            let raw = task.encode()?;
+                            let key = task_key(reservation, &plan)?;
+                            tr.set(&key, &raw);
+                            Ok(ReclaimMetadataAdmission {
+                                task,
+                                needs_observation: false,
+                            })
+                        }
+                        .await,
+                    )
+                })
+            })
+            .await?
+    }
+
     /// Read the retained original task. Missing/corrupt slots are never repaired.
     pub async fn reclaim_metadata_write_status(
         &self,
@@ -304,6 +411,7 @@ impl ManagedCatalog {
     }
 
     /// HA may claim only after the same parent has already been claimed.
+    /// Claiming Writing preserves uncertainty; it does not retry device I/O.
     pub async fn claim_reclaim_metadata_write(
         &self,
         reservation: &ReclaimReservation,
@@ -334,7 +442,8 @@ impl ManagedCatalog {
             .await?
     }
 
-    /// Close only preparation: this kernel has no transition that admits I/O.
+    /// Close only Prepared; Writing retains all claims until media recovery.
+    /// The original plan and exact own claims remain bound throughout.
     /// Keep the original plan/receipt; clear only its exact verified own claims.
     pub async fn close_prepared_reclaim_metadata_write(
         &self,
@@ -357,8 +466,12 @@ impl ManagedCatalog {
                             if task.plan() != original.plan() {
                                 return Err(CatalogError::Invalid("关闭改变原元数据计划"));
                             }
+                            require_phase_history(original, &task)?;
                             if task.closed() {
                                 return Ok(task);
+                            }
+                            if task.writing() {
+                                return Err(CatalogError::PoolBusy);
                             }
                             task.0.phase = Phase::Closed;
                             let raw = task.encode()?;

@@ -23,8 +23,8 @@ mod metadata_plan;
 pub use metadata_plan::ReclaimMetadataPlan;
 #[path = "reclaim_metadata_write.rs"]
 mod metadata_write;
-pub use metadata_write::ReclaimMetadataWrite;
 pub(super) use metadata_write::require_idle_at as require_metadata_idle_at;
+pub use metadata_write::{ReclaimMetadataAdmission, ReclaimMetadataWrite};
 #[path = "reclaim_file_metadata.rs"]
 mod metadata;
 pub(super) use metadata::require_no_metadata_at;

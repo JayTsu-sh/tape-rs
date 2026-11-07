@@ -5931,6 +5931,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "需要隔离 FDB_TEST_CLUSTER；真实持久任务加 SimLibrary，不访问实际设备"]
     async fn lifecycle_real_fdb_and_sim_complete_assign_validate_move_unassign_and_replay() {
+        Box::pin(native_lifecycle(false)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；原正文实读/退休与元数据准入，不访问实际设备"]
+    async fn reclaim_metadata_admission_retains_uncertain_writes_across_takeover() {
+        Box::pin(native_lifecycle(true)).await;
+    }
+
+    async fn native_lifecycle(admit_metadata: bool) {
         use crate::managed_catalog::{ManagedCatalog, ManagementRequest};
         let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
         let _network = unsafe { foundationdb::boot() };
@@ -7086,6 +7096,353 @@ mod tests {
             .unwrap()
             .unwrap()
             .to_vec();
+        if admit_metadata {
+            Box::pin(async {
+                let commands = fixture.commands.lock().unwrap().clone();
+                assert!(!metadata_write.writing());
+                assert!(
+                    catalog
+                        .admit_reclaim_metadata_write(
+                            &reserved,
+                            fixture.owner.round + 1,
+                            &scanned,
+                            &input_request,
+                            &metadata_write
+                        )
+                        .await
+                        .is_err()
+                );
+                // Capacity can change after preparation; admission must recheck it.
+                let tr = raw_catalog.create_trx().unwrap();
+                tr.set(&pool_key, &full_pool);
+                tr.commit().await.unwrap();
+                assert!(
+                    catalog
+                        .admit_reclaim_metadata_write(
+                            &reserved,
+                            fixture.owner.round,
+                            &scanned,
+                            &input_request,
+                            &metadata_write
+                        )
+                        .await
+                        .is_err()
+                );
+                assert_eq!(
+                    catalog
+                        .reclaim_metadata_write_status(
+                            &reserved,
+                            fixture.owner.round,
+                            source_data_uid
+                        )
+                        .await
+                        .unwrap(),
+                    Some(metadata_write.clone())
+                );
+                let tr = raw_catalog.create_trx().unwrap();
+                tr.set(&pool_key, &pool_bytes);
+                tr.commit().await.unwrap();
+                let offline =
+                    ManagedCatalog::open(Some(unavailable_path.to_str().unwrap())).unwrap();
+                let failed = tokio::time::timeout(
+                    Duration::from_secs(12),
+                    Box::pin(offline.admit_reclaim_metadata_write(
+                        &reserved,
+                        fixture.owner.round,
+                        &scanned,
+                        &input_request,
+                        &metadata_write,
+                    )),
+                )
+                .await
+                .expect("准入的 FDB 依赖故障须有界返回");
+                assert!(failed.is_err());
+                let (a, b) = tokio::join!(
+                    Box::pin(catalog.admit_reclaim_metadata_write(
+                        &reserved,
+                        fixture.owner.round,
+                        &scanned,
+                        &input_request,
+                        &metadata_write
+                    )),
+                    Box::pin(observer.admit_reclaim_metadata_write(
+                        &reserved,
+                        fixture.owner.round,
+                        &scanned,
+                        &input_request,
+                        &metadata_write
+                    ))
+                );
+                let a = a.unwrap();
+                let b = b.unwrap();
+                assert_ne!(
+                    a.needs_observation(),
+                    b.needs_observation(),
+                    "并发准入只有一次新转换，其余须观察原结果"
+                );
+                assert_eq!(a.task(), b.task());
+                let writing = a.task().clone();
+                assert!(writing.writing());
+                assert!(!writing.closed());
+                assert_eq!(writing.plan(), metadata_plan);
+                assert_eq!(
+                    observer
+                        .reclaim_metadata_write_status(
+                            &reserved,
+                            fixture.owner.round,
+                            source_data_uid
+                        )
+                        .await
+                        .unwrap(),
+                    Some(writing.clone())
+                );
+                assert_eq!(
+                    catalog
+                        .prepare_reclaim_metadata_write(
+                            &reserved,
+                            fixture.owner.round,
+                            &scanned,
+                            &input_request,
+                            &metadata_plan
+                        )
+                        .await
+                        .unwrap(),
+                    writing
+                );
+                // Lost admission reply is not permission to replay a possible write.
+                assert!(
+                    observer
+                        .admit_reclaim_metadata_write(
+                            &reserved,
+                            fixture.owner.round,
+                            &scanned,
+                            &input_request,
+                            &metadata_write
+                        )
+                        .await
+                        .unwrap()
+                        .needs_observation()
+                );
+                let mut changed_request = input_request.clone();
+                changed_request.operation_id = uuid::Uuid::new_v4();
+                assert!(
+                    catalog
+                        .admit_reclaim_metadata_write(
+                            &reserved,
+                            fixture.owner.round,
+                            &scanned,
+                            &changed_request,
+                            &writing
+                        )
+                        .await
+                        .is_err(),
+                    "观察原结果也不能接受另一个子请求"
+                );
+                let keys = [
+                    &latest_metadata_key,
+                    &metadata_task_key,
+                    &metadata_active_key,
+                    &metadata_volume_key,
+                ];
+                let tr = raw_catalog.create_trx().unwrap();
+                let mut rows = Vec::new();
+                for key in keys {
+                    rows.push(tr.get(key, false).await.unwrap().unwrap().to_vec());
+                }
+                for original in [&metadata_write, &writing] {
+                    assert!(matches!(
+                        catalog
+                            .close_prepared_reclaim_metadata_write(
+                                &reserved,
+                                fixture.owner.round,
+                                original
+                            )
+                            .await
+                            .as_ref()
+                            .map_err(|e| e.domain()),
+                        Err(crate::managed_catalog::CatalogError::PoolBusy)
+                    ));
+                }
+                // A retained Writing reply cannot become an unwritten close
+                // when a canonical record's phase is rolled back.
+                let raw_writing = rows[1].clone();
+                let raw_prepared = String::from_utf8(raw_writing.clone())
+                    .unwrap()
+                    .replace("\"phase\":\"writing\"", "\"phase\":\"prepared\"")
+                    .into_bytes();
+                assert_ne!(raw_prepared, raw_writing);
+                let tr = raw_catalog.create_trx().unwrap();
+                tr.set(&metadata_task_key, &raw_prepared);
+                tr.commit().await.unwrap();
+                assert!(
+                    catalog
+                        .admit_reclaim_metadata_write(
+                            &reserved,
+                            fixture.owner.round,
+                            &scanned,
+                            &input_request,
+                            &writing
+                        )
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    catalog
+                        .close_prepared_reclaim_metadata_write(
+                            &reserved,
+                            fixture.owner.round,
+                            &writing
+                        )
+                        .await
+                        .is_err()
+                );
+                let tr = raw_catalog.create_trx().unwrap();
+                assert_eq!(
+                    tr.get(&metadata_task_key, false)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .as_ref(),
+                    raw_prepared.as_slice()
+                );
+                assert_eq!(
+                    tr.get(&metadata_active_key, false)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .as_ref(),
+                    active.as_slice()
+                );
+                tr.set(&metadata_task_key, &raw_writing);
+                tr.commit().await.unwrap();
+                for (key, raw) in keys.into_iter().zip(&rows) {
+                    let tr = raw_catalog.create_trx().unwrap();
+                    assert_eq!(
+                        tr.get(key, false).await.unwrap().unwrap().as_ref(),
+                        raw.as_slice()
+                    );
+                    tr.clear(key);
+                    tr.commit().await.unwrap();
+                    assert!(
+                        catalog
+                            .admit_reclaim_metadata_write(
+                                &reserved,
+                                fixture.owner.round,
+                                &scanned,
+                                &input_request,
+                                &writing
+                            )
+                            .await
+                            .is_err()
+                    );
+                    assert!(
+                        catalog
+                            .close_prepared_reclaim_metadata_write(
+                                &reserved,
+                                fixture.owner.round,
+                                &writing
+                            )
+                            .await
+                            .is_err()
+                    );
+                    let tr = raw_catalog.create_trx().unwrap();
+                    assert!(
+                        tr.get(key, false).await.unwrap().is_none(),
+                        "未知写入的缺失占用不得补建或清除"
+                    );
+                    tr.set(key, raw);
+                    tr.commit().await.unwrap();
+                }
+                let old = fixture.owner.round;
+                let next = old + 100;
+                catalog
+                    .claim_active_owner_epoch(&serial, next)
+                    .await
+                    .unwrap();
+                assert!(
+                    catalog
+                        .admit_reclaim_metadata_write(
+                            &reserved,
+                            old,
+                            &scanned,
+                            &input_request,
+                            &writing
+                        )
+                        .await
+                        .is_err()
+                );
+                let parents = catalog
+                    .claim_reclaim_reservations_page(&serial, route, next, None, 16)
+                    .await
+                    .unwrap();
+                assert_eq!(parents.items.len(), 1);
+                assert!(
+                    catalog
+                        .reclaim_metadata_write_status(&parents.items[0], next, source_data_uid)
+                        .await
+                        .is_err(),
+                    "先领取父，再显式领取原元数据任务"
+                );
+                let recovered = catalog
+                    .claim_reclaim_metadata_write(&parents.items[0], next, source_data_uid)
+                    .await
+                    .unwrap();
+                assert!(recovered.writing());
+                assert_eq!(recovered.plan(), metadata_plan);
+                assert_eq!(recovered.owner(), next);
+                assert!(
+                    catalog
+                        .admit_reclaim_metadata_write(
+                            &parents.items[0],
+                            next,
+                            &scanned,
+                            &input_request,
+                            &recovered
+                        )
+                        .await
+                        .unwrap()
+                        .needs_observation()
+                );
+                assert!(
+                    catalog
+                        .close_prepared_reclaim_metadata_write(&parents.items[0], next, &recovered)
+                        .await
+                        .is_err(),
+                    "接管 Writing 不能冒充未开写关闭"
+                );
+                assert_eq!(
+                    catalog
+                        .reclaim_metadata_write_status(&parents.items[0], next, source_data_uid)
+                        .await
+                        .unwrap(),
+                    Some(recovered)
+                );
+                let tr = raw_catalog.create_trx().unwrap();
+                assert_eq!(
+                    tr.get(&metadata_active_key, false)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .as_ref(),
+                    active.as_slice()
+                );
+                assert_eq!(
+                    tr.get(&metadata_volume_key, false)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .as_ref(),
+                    active.as_slice()
+                );
+                assert_eq!(
+                    *fixture.commands.lock().unwrap(),
+                    commands,
+                    "持久准入和未知结果恢复没有设备 I/O"
+                );
+            })
+            .await;
+            return;
+        }
         // The normal node discovery path must recognize the typed claim and stop.
         assert!(matches!(
             catalog
