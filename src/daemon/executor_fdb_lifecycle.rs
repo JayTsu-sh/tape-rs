@@ -3091,7 +3091,7 @@ mod tests {
                     &inventory,
                     &[ReclaimNodeReadRequest {
                         original: original.clone(),
-                        destination: destination
+                        destination
                     }],
                     &cache_dir,
                     spool
@@ -3160,7 +3160,7 @@ mod tests {
                 &inventory,
                 &[ReclaimNodeReadRequest {
                     original: original.clone(),
-                    destination: destination,
+                    destination,
                 }],
                 &cache_dir,
                 spool,
@@ -3215,7 +3215,7 @@ mod tests {
                     &inventory,
                     &[ReclaimNodeReadRequest {
                         original: original.clone(),
-                        destination: destination
+                        destination
                     }],
                     &cache_dir,
                     spool
@@ -3259,7 +3259,7 @@ mod tests {
                     &inventory,
                     &[ReclaimNodeReadRequest {
                         original: original.clone(),
-                        destination: destination
+                        destination
                     }],
                     &cache_dir,
                     spool
@@ -3277,7 +3277,7 @@ mod tests {
                     &inventory,
                     &[ReclaimNodeReadRequest {
                         original: original.clone(),
-                        destination: destination
+                        destination
                     }],
                     &cache_dir,
                     spool

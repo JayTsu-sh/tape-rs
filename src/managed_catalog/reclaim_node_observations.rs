@@ -165,12 +165,12 @@ impl ManagedCatalog {
                             for (observation, (key, raw, _)) in observations.iter().zip(prepared) {
                                 require_source_at(&tr, reservation, &manifest, &observation.0)
                                     .await?;
-                                if let Some(old) = tr.get(key, false).await? {
-                                    if old.as_ref() != raw.as_slice() {
-                                        return Err(CatalogError::Corrupt(
-                                            "原始节点观察指纹键存在不同内容",
-                                        ));
-                                    }
+                                if let Some(old) = tr.get(key, false).await?
+                                    && old.as_ref() != raw.as_slice()
+                                {
+                                    return Err(CatalogError::Corrupt(
+                                        "原始节点观察指纹键存在不同内容",
+                                    ));
                                 }
                             }
                             let fingerprints = prepared.iter().map(|(_, _, fp)| *fp).collect();
