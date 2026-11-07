@@ -50,6 +50,8 @@ default-features = false
 [features]
 fuse = ["dep:fuser"]
 fdb = ["dep:foundationdb", "dep:futures-executor"]
+# 仅实验室故障验收；正常发行构建不包含设备提交暂停检查点。
+hardware-fault-tests = ["fdb"]
 
 [[bin]]
 name = "tape-fuse"

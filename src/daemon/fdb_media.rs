@@ -33,6 +33,10 @@ use crate::managed_catalog::{
 };
 use crate::scsi::reservation::ReservationKey;
 
+#[cfg(feature = "hardware-fault-tests")]
+#[path = "fdb_media_s4_gate.rs"]
+mod s4_gate;
+
 #[derive(Debug)]
 pub struct ActiveMediaUpload {
     pub intent: ActiveFileIntent,
@@ -1299,6 +1303,8 @@ pub async fn commit_active_media_batch<'a>(
     let previous = ActiveIndexIdentity::from(volume.verified_committed_index_construct()?);
     let volume_id = previous.volume_uuid;
     let physical_paths = paths_for_batch(volume_id, previous.generation, batch_id, uploads)?;
+    #[cfg(feature = "hardware-fault-tests")]
+    let test_gate = s4_gate::arm_from_environment(previous, batch_id, uploads)?;
     let serial = &uploads[0].intent.library_serial;
     let observed = catalog
         .observed_active_volume_index(serial, volume_id)
@@ -1400,6 +1406,10 @@ pub async fn commit_active_media_batch<'a>(
     )?;
     volume.sync_batch()?;
     let current = ActiveIndexIdentity::from(volume.verified_committed_index_construct()?);
+    #[cfg(feature = "hardware-fault-tests")]
+    if let Some(gate) = test_gate {
+        gate.after_s4(current)?;
+    }
     expect_outcome(
         "登记已提交索引",
         catalog
