@@ -78,7 +78,7 @@ impl ReadTarget<'_> {
                 .catalog
                 .reclaim_read_source(reservation, reader.key.round(), request)
                 .await
-                .map(Some),
+                .map(|read| Some(read.into_source())),
         };
         result.map_err(|error| TapeError::Catalog(error.to_string()))
     }
@@ -237,7 +237,7 @@ impl ActiveMediaReader<'_> {
             .bind_verified_metadata(
                 reservation,
                 request,
-                source.copy(),
+                source.source().copy(),
                 (&read.metadata, read.verified_head),
                 &captured,
             )

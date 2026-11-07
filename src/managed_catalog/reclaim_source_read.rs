@@ -6,6 +6,32 @@ use super::*;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReclaimSourceRead(ReadEvidence);
 
+/// Original physical source and its retained byte proof at one FDB read version.
+/// The lookup is historical evidence, not a fresh physical read or a write permit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReclaimReadSource {
+    source: ActiveReadSource,
+    proof: ReclaimSourceRead,
+}
+
+impl ReclaimReadSource {
+    pub fn source(&self) -> &ActiveReadSource {
+        &self.source
+    }
+    pub fn byte_proof(&self) -> &ReclaimSourceRead {
+        &self.proof
+    }
+    pub(crate) fn into_source(self) -> ActiveReadSource {
+        self.source
+    }
+    pub(in crate::managed_catalog) fn new(
+        source: ActiveReadSource,
+        proof: ReclaimSourceRead,
+    ) -> Self {
+        Self { source, proof }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReadEvidence {
@@ -30,6 +56,10 @@ impl ReclaimSourceRead {
     /// were checked against that value, including when SHA-256 is preferred.
     pub fn md5(&self) -> Option<[u8; 16]> {
         self.0.md5
+    }
+
+    pub fn source_node(&self) -> ReclaimSourceNode {
+        ReclaimSourceNode(self.0.object.clone())
     }
 
     pub(super) fn object(&self) -> &Object {

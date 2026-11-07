@@ -13,7 +13,7 @@ mod ledger;
 pub(super) use ledger::clear_reserved_at;
 #[path = "reclaim_source_read.rs"]
 mod read;
-pub use read::ReclaimSourceRead;
+pub use read::{ReclaimReadSource, ReclaimSourceRead};
 #[path = "reclaim_data_relocation.rs"]
 mod relocation;
 pub use relocation::ReclaimDataProgress;

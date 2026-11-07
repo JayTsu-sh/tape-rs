@@ -3639,6 +3639,132 @@ mod tests {
                 let mut actual = Vec::new();
                 read.file.read_to_end(&mut actual).unwrap();
                 assert_eq!(actual, bytes);
+                let query_commands = fixture.drive_log();
+                let spec = crate::managed_catalog::ActiveUploadSpec {
+                    pool_id: pool.id,
+                    path: file.path().as_bytes().to_vec(),
+                    operation_id: file.operation(),
+                    expected_version: Some(file.version()),
+                    size: file.size(),
+                    digest: ContentDigest::Sha256(evidence.sha256()),
+                };
+                let pending = catalog
+                    .maintenance_status(control.route.route.namespace)
+                    .await
+                    .unwrap()
+                    .pending;
+                let child = catalog
+                    .prepare_reclaim_upload(
+                        &reserved,
+                        fixture.owner.round,
+                        "EEDESTL8",
+                        &spec,
+                        &evidence,
+                    )
+                    .await
+                    .unwrap();
+                let request = child.request();
+                let saved = catalog
+                    .reclaim_read_source(&reserved, fixture.owner.round, &request)
+                    .await
+                    .unwrap();
+                assert_eq!(saved.byte_proof(), &evidence);
+                assert_eq!(saved.byte_proof().md5(), expected_md5);
+                assert_eq!(saved.source().copy(), &read.metadata.copy);
+                let original_node = saved.byte_proof().source_node();
+                assert_eq!(original_node.uid(), read.metadata.copy.ltfs_file_uid);
+                assert_eq!(
+                    catalog
+                        .reclaim_source_nodes(
+                            &reserved,
+                            fixture.owner.round,
+                            &inventory,
+                            &[original_node.uid()]
+                        )
+                        .await
+                        .unwrap(),
+                    vec![original_node]
+                );
+                assert!(
+                    catalog
+                        .reclaim_read_source(&reserved, fixture.owner.round + 1, &request)
+                        .await
+                        .is_err()
+                );
+                let reopened = ManagedCatalog::open(Some(&cluster)).unwrap();
+                assert_eq!(
+                    reopened
+                        .reclaim_read_source(&reserved, fixture.owner.round, &request)
+                        .await
+                        .unwrap(),
+                    saved
+                );
+                // The original child fingerprint and reverse identity bind the
+                // measured secondary hash as well as the preferred SHA.
+                let mut key = b"tape-rs/catalog/22/@/".to_vec();
+                key.extend_from_slice(request.namespace.as_bytes());
+                key.extend_from_slice(b"Rc");
+                key.extend_from_slice(&reserved.intent()["epoch"].as_u64().unwrap().to_be_bytes());
+                key.extend_from_slice(
+                    uuid::Uuid::parse_str(reserved.intent()["operation"].as_str().unwrap())
+                        .unwrap()
+                        .as_bytes(),
+                );
+                key.extend_from_slice(request.operation_id.as_bytes());
+                let db = foundationdb::Database::new(Some(&cluster)).unwrap();
+                let tr = db.create_trx().unwrap();
+                let original = tr.get(&key, false).await.unwrap().unwrap().to_vec();
+                let mut changed: Value = serde_json::from_slice(&original).unwrap();
+                let hash = if expected_md5.is_some() {
+                    "md5"
+                } else {
+                    "sha256"
+                };
+                let first = changed["source_read"][hash][0].as_u64().unwrap();
+                changed["source_read"][hash][0] = json!(first ^ 0x80);
+                let changed = changed.to_string().into_bytes();
+                tr.set(&key, &changed);
+                tr.commit().await.unwrap();
+                assert!(
+                    reopened
+                        .reclaim_read_source(&reserved, fixture.owner.round, &request)
+                        .await
+                        .is_err()
+                );
+                let tr = db.create_trx().unwrap();
+                assert_eq!(
+                    tr.get(&key, false).await.unwrap().unwrap().as_ref(),
+                    changed.as_slice()
+                );
+                tr.set(&key, &original);
+                tr.commit().await.unwrap();
+                assert_eq!(
+                    reopened
+                        .reclaim_read_source(&reserved, fixture.owner.round, &request)
+                        .await
+                        .unwrap(),
+                    saved
+                );
+                assert_eq!(
+                    catalog
+                        .cancel_unstarted_reclaim_upload(&reserved, fixture.owner.round, &request)
+                        .await
+                        .unwrap(),
+                    crate::managed_catalog::PublishOutcome::RequestCancelled
+                );
+                assert_eq!(
+                    catalog
+                        .maintenance_status(request.namespace)
+                        .await
+                        .unwrap()
+                        .pending,
+                    pending
+                );
+                assert_eq!(
+                    fixture.drive_log(),
+                    query_commands,
+                    "恢复原字节证明和取消未开写子任务均不发CDB"
+                );
             } else {
                 assert!(
                     result.is_err(),
@@ -3657,12 +3783,22 @@ mod tests {
                     .reserved_reclaim_status(&reserved, fixture.owner.round)
                     .await
                     .unwrap()["children"],
-                0
+                if valid { 1 } else { 0 }
             );
-            catalog
-                .release_reserved_reclaim(&reserved, fixture.owner.round)
-                .await
-                .unwrap();
+            if valid {
+                assert!(
+                    catalog
+                        .release_reserved_reclaim(&reserved, fixture.owner.round)
+                        .await
+                        .is_err(),
+                    "cancelled child does not remove original parent safety fence"
+                );
+            } else {
+                catalog
+                    .release_reserved_reclaim(&reserved, fixture.owner.round)
+                    .await
+                    .unwrap();
+            }
         }
     }
 
