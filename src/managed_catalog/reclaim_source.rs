@@ -24,7 +24,7 @@ pub(super) use metadata::require_no_metadata_at;
 pub use metadata::{ReclaimFileMetadata, ReclaimMetadataProgress};
 #[path = "reclaim_node_metadata.rs"]
 mod node_metadata;
-pub use node_metadata::{ReclaimNodeDestination, ReclaimNodeMetadata};
+pub use node_metadata::{ReclaimNodeDestination, ReclaimNodeMetadata, ReclaimNodeReadRequest};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

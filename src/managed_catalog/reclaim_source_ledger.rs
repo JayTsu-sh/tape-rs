@@ -107,8 +107,10 @@ pub(super) async fn require_complete_at(
 /// children. Clearing only its read-proof prefix cannot erase tape contents.
 pub(in super::super) fn clear_reserved_at(tr: &Transaction, reservation: &ReclaimReservation) {
     tr.clear(&own_key(reservation, b'm'));
-    let prefix = own_key(reservation, b'e');
-    tr.clear_range(&prefix, &prefix_end(&prefix));
+    for kind in *b"en" {
+        let prefix = own_key(reservation, kind);
+        tr.clear_range(&prefix, &prefix_end(&prefix));
+    }
 }
 
 async fn require_inventory_at(
@@ -156,28 +158,37 @@ async fn require_object_at(
 }
 
 impl ManagedCatalog {
-    /// Resolve one node of the complete original inventory, with the same
-    /// parent/owner/assignment/head/row checks as its bounded enumeration.
-    pub async fn reclaim_source_node(
+    /// Resolve 1..32 distinct original nodes in one FDB read version, with
+    /// exactly the same complete source seal checks as bounded enumeration.
+    pub async fn reclaim_source_nodes(
         &self,
         reservation: &ReclaimReservation,
         owner: u64,
         inventory: &ReclaimSourceInventory<'_>,
-        uid: u64,
-    ) -> Result<ReclaimSourceNode> {
-        if uid == 0 {
-            return Err(CatalogError::Invalid("回收源节点 UID 不能为零"));
+        uids: &[u64],
+    ) -> Result<Vec<ReclaimSourceNode>> {
+        if !(1..=PAGE).contains(&uids.len()) {
+            return Err(CatalogError::Invalid("精确读取回收源节点必须为 1..=32 项"));
         }
-        let entry = inventory
-            .source
-            .entry_by_uid(uid)
-            .map_err(cache)?
-            .ok_or(CatalogError::Incomplete)?;
-        let object = Object::capture(entry)?;
+        let mut seen = std::collections::HashSet::new();
+        let mut objects = Vec::with_capacity(uids.len());
+        for uid in uids {
+            if *uid == 0 || !seen.insert(*uid) {
+                return Err(CatalogError::Invalid("回收源节点 UID 不能为零或重复"));
+            }
+            let entry = inventory
+                .source
+                .entry_by_uid(*uid)
+                .map_err(cache)?
+                .ok_or(CatalogError::Incomplete)?;
+            objects.push(Object::capture(entry)?);
+        }
         let tr = self.db.create_trx()?;
         require_inventory_at(&tr, reservation, owner, inventory).await?;
-        require_object_at(&tr, reservation, &object).await?;
-        Ok(ReclaimSourceNode(object))
+        for object in &objects {
+            require_object_at(&tr, reservation, object).await?;
+        }
+        Ok(objects.into_iter().map(ReclaimSourceNode).collect())
     }
 
     /// Read original nodes in physical path order using the immutable actual

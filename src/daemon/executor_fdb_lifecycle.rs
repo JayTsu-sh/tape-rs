@@ -2563,8 +2563,8 @@ mod tests {
         use crate::ltfs::index::IndexEntry;
         use crate::ltfs::recovery::{RecoveryBudget, capture_index_source};
         use crate::managed_catalog::{
-            ManagedCatalog, ManagementRequest, ReclaimNodeDestination, ReclaimSourceInventory,
-            ReclaimSpec,
+            ManagedCatalog, ManagementRequest, ReclaimNodeDestination, ReclaimNodeReadRequest,
+            ReclaimSourceInventory, ReclaimSpec,
         };
         let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
         let _network = unsafe { foundationdb::boot() };
@@ -2772,38 +2772,280 @@ mod tests {
         let spool = fixture.owner.files.spool_dir();
         let before = fixture.drive_log().len();
         let changer_before = fixture.changer_log();
-        for (source_uid, target_uid) in &targets {
-            let original = catalog
-                .reclaim_source_node(&reserved, fixture.owner.round, &inventory, *source_uid)
-                .await
-                .unwrap();
-            let reader = super::super::super::fdb_read::ActiveMediaReader {
-                catalog: &catalog,
-                device: fixture.device(),
-                serial: &control.serial,
-                route: control.route,
-                key: fixture.owner.key,
-                permission: &fixture.permit,
-                storage: control.storage,
-            };
-            let proof = reader
+        let source_uids: Vec<_> = targets.iter().map(|(source, _)| *source).collect();
+        let originals = catalog
+            .reclaim_source_nodes(&reserved, fixture.owner.round, &inventory, &source_uids)
+            .await
+            .unwrap();
+        let requests: Vec<_> = originals
+            .iter()
+            .zip(&targets)
+            .map(|(original, (_, uid))| ReclaimNodeReadRequest {
+                original: original.clone(),
+                destination: ReclaimNodeDestination {
+                    volume: target_uuid,
+                    uid: *uid,
+                },
+            })
+            .collect();
+        let reader = super::super::super::fdb_read::ActiveMediaReader {
+            catalog: &catalog,
+            device: fixture.device(),
+            serial: &control.serial,
+            route: control.route,
+            key: fixture.owner.key,
+            permission: &fixture.permit,
+            storage: control.storage,
+        };
+        let batch = reader
+            .read_reclaim_node_metadata(&reserved, &inventory, &requests, &cache_dir, spool)
+            .await
+            .unwrap();
+        assert_eq!(batch.len(), 3);
+        let batch_reads = fixture.drive_log()[before..]
+            .iter()
+            .filter(|op| **op == 0x08)
+            .count();
+        let single_begin = fixture.drive_log().len();
+        for (request, observed) in requests.iter().zip(&batch) {
+            let single = reader
                 .read_reclaim_node_metadata(
                     &reserved,
                     &inventory,
-                    &original,
-                    ReclaimNodeDestination {
-                        volume: target_uuid,
-                        uid: *target_uid,
-                    },
+                    std::slice::from_ref(request),
                     &cache_dir,
                     spool,
                 )
                 .await
                 .unwrap();
-            assert_eq!(proof.source_uid(), *source_uid);
-            assert_eq!(proof.destination().uid, *target_uid);
-            assert_eq!(proof.target_path(), original.path());
+            assert_eq!(single.as_slice(), std::slice::from_ref(observed));
+            assert_eq!(observed.source_uid(), request.original.uid());
+            assert_eq!(observed.destination(), request.destination);
+            assert_eq!(observed.target_path(), request.original.path());
         }
+        let single_reads = fixture.drive_log()[single_begin..]
+            .iter()
+            .filter(|op| **op == 0x08)
+            .count();
+        assert!(
+            batch_reads > 0 && single_reads > batch_reads,
+            "batch READ count {batch_reads}, three singleton READs {single_reads}"
+        );
+        eprintln!(
+            "metadata readback READs: batch={batch_reads}, three singleton calls={single_reads}"
+        );
+        let expected_fingerprints: Vec<_> = batch
+            .iter()
+            .map(|proof| proof.fingerprint().unwrap())
+            .collect();
+        let observation_key = |uid: u64, fp: [u8; 32]| {
+            let mut key = b"tape-rs/catalog/22/@/".to_vec();
+            key.extend_from_slice(control.route.route.namespace.as_bytes());
+            key.extend_from_slice(b"Rn");
+            key.extend_from_slice(&reserved.intent()["epoch"].as_u64().unwrap().to_be_bytes());
+            key.extend_from_slice(
+                uuid::Uuid::parse_str(reserved.intent()["operation"].as_str().unwrap())
+                    .unwrap()
+                    .as_bytes(),
+            );
+            key.extend_from_slice(&uid.to_be_bytes());
+            key.extend_from_slice(&fp);
+            key
+        };
+        let db_meta = foundationdb::Database::new(Some(&cluster)).unwrap();
+        let keys: Vec<_> = batch
+            .iter()
+            .zip(&expected_fingerprints)
+            .map(|(proof, fp)| observation_key(proof.source_uid(), *fp))
+            .collect();
+        assert!(
+            catalog
+                .reclaim_node_observation(
+                    &reserved,
+                    fixture.owner.round,
+                    batch[0].source_uid(),
+                    expected_fingerprints[0]
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let tr = db_meta.create_trx().unwrap();
+        tr.set(&keys[1], b"corrupt-observation");
+        tr.commit().await.unwrap();
+        assert!(
+            catalog
+                .record_reclaim_node_observations(&reserved, fixture.owner.round, &batch)
+                .await
+                .is_err()
+        );
+        let tr = db_meta.create_trx().unwrap();
+        assert!(tr.get(&keys[0], false).await.unwrap().is_none());
+        assert!(tr.get(&keys[2], false).await.unwrap().is_none());
+        assert_eq!(
+            tr.get(&keys[1], false).await.unwrap().unwrap().as_ref(),
+            b"corrupt-observation"
+        );
+        tr.clear(&keys[1]);
+        tr.commit().await.unwrap();
+        let no_record_io = fixture.drive_log();
+        assert_eq!(
+            catalog
+                .record_reclaim_node_observations(&reserved, fixture.owner.round, &batch)
+                .await
+                .unwrap(),
+            expected_fingerprints
+        );
+        assert_eq!(
+            catalog
+                .record_reclaim_node_observations(&reserved, fixture.owner.round, &batch)
+                .await
+                .unwrap(),
+            expected_fingerprints,
+            "原观察记录重提幂等"
+        );
+        let reopened = ManagedCatalog::open(Some(&cluster)).unwrap();
+        for (proof, fp) in batch.iter().zip(&expected_fingerprints) {
+            assert_eq!(
+                reopened
+                    .reclaim_node_observation(
+                        &reserved,
+                        fixture.owner.round,
+                        proof.source_uid(),
+                        *fp
+                    )
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                Some(proof)
+            );
+        }
+        assert_eq!(
+            fixture.drive_log(),
+            no_record_io,
+            "记录及接管读取观察结果不访问介质"
+        );
+        assert!(
+            catalog
+                .record_reclaim_node_observations(&reserved, fixture.owner.round + 1, &batch)
+                .await
+                .is_err()
+        );
+        assert!(
+            catalog
+                .reclaim_node_observation(
+                    &reserved,
+                    fixture.owner.round + 1,
+                    batch[0].source_uid(),
+                    expected_fingerprints[0]
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            catalog
+                .reclaim_node_observation(
+                    &reserved,
+                    fixture.owner.round,
+                    0,
+                    expected_fingerprints[0]
+                )
+                .await
+                .is_err()
+        );
+        for invalid in [
+            Vec::new(),
+            vec![batch[0].clone(); 33],
+            vec![batch[0].clone(); 2],
+        ] {
+            assert!(
+                catalog
+                    .record_reclaim_node_observations(&reserved, fixture.owner.round, &invalid)
+                    .await
+                    .is_err()
+            );
+        }
+        let tr = db_meta.create_trx().unwrap();
+        let raw = tr.get(&keys[0], false).await.unwrap().unwrap().to_vec();
+        let canonical_tamper = String::from_utf8(raw.clone())
+            .unwrap()
+            .replace("NODES1L8", "OTHER1L8")
+            .into_bytes();
+        assert_ne!(canonical_tamper, raw);
+        tr.set(&keys[0], &canonical_tamper);
+        tr.commit().await.unwrap();
+        assert!(
+            reopened
+                .reclaim_node_observation(
+                    &reserved,
+                    fixture.owner.round,
+                    batch[0].source_uid(),
+                    expected_fingerprints[0]
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            catalog
+                .record_reclaim_node_observations(&reserved, fixture.owner.round, &batch)
+                .await
+                .is_err(),
+            "指纹不符不能自动修复或覆盖原记录"
+        );
+        let tr = db_meta.create_trx().unwrap();
+        assert_eq!(
+            tr.get(&keys[0], false).await.unwrap().unwrap().as_ref(),
+            canonical_tamper.as_slice()
+        );
+        tr.set(&keys[0], &raw);
+        tr.commit().await.unwrap();
+        let no_io = fixture.drive_log();
+        let mut mixed = requests.clone();
+        mixed[1].destination.volume = uuid::Uuid::new_v4();
+        let duplicate_source = vec![
+            requests[0].clone(),
+            ReclaimNodeReadRequest {
+                original: requests[0].original.clone(),
+                destination: requests[1].destination,
+            },
+        ];
+        for bad in [
+            Vec::new(),
+            vec![requests[0].clone(); 33],
+            vec![requests[0].clone(); 2],
+            mixed,
+            duplicate_source,
+        ] {
+            assert!(
+                reader
+                    .read_reclaim_node_metadata(&reserved, &inventory, &bad, &cache_dir, spool)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(fixture.drive_log(), no_io, "非法批次不发CDB");
+        }
+        for uids in [
+            Vec::new(),
+            vec![source_uids[0]; 33],
+            vec![source_uids[0]; 2],
+            vec![source_uids[0], u64::MAX],
+        ] {
+            assert!(
+                catalog
+                    .reclaim_source_nodes(&reserved, fixture.owner.round, &inventory, &uids)
+                    .await
+                    .is_err()
+            );
+        }
+        let mut missing_last = requests.clone();
+        missing_last.last_mut().unwrap().destination.uid = u64::MAX;
+        assert!(
+            reader
+                .read_reclaim_node_metadata(&reserved, &inventory, &missing_last, &cache_dir, spool)
+                .await
+                .is_err(),
+            "最后一项失败不能返回前面已经核对的部分证明"
+        );
         assert_eq!(
             fixture.changer_log(),
             changer_before,
@@ -2817,8 +3059,10 @@ mod tests {
         );
         let (source_uid, target_uid) = targets[0];
         let original = catalog
-            .reclaim_source_node(&reserved, fixture.owner.round, &inventory, source_uid)
+            .reclaim_source_nodes(&reserved, fixture.owner.round, &inventory, &[source_uid])
             .await
+            .unwrap()
+            .pop()
             .unwrap();
         let destination = ReclaimNodeDestination {
             volume: target_uuid,
@@ -2845,8 +3089,10 @@ mod tests {
                 .read_reclaim_node_metadata(
                     &reserved,
                     &inventory,
-                    &original,
-                    destination,
+                    &[ReclaimNodeReadRequest {
+                        original: original.clone(),
+                        destination: destination
+                    }],
                     &cache_dir,
                     spool
                 )
@@ -2884,7 +3130,14 @@ mod tests {
             assert!(
                 reader
                     .read_reclaim_node_metadata(
-                        &reserved, &inventory, &original, bad, &cache_dir, spool
+                        &reserved,
+                        &inventory,
+                        &[ReclaimNodeReadRequest {
+                            original: original.clone(),
+                            destination: bad
+                        }],
+                        &cache_dir,
+                        spool
                     )
                     .await
                     .is_err()
@@ -2905,8 +3158,10 @@ mod tests {
             .read_reclaim_node_metadata(
                 &reserved,
                 &inventory,
-                &original,
-                destination,
+                &[ReclaimNodeReadRequest {
+                    original: original.clone(),
+                    destination: destination,
+                }],
                 &cache_dir,
                 spool,
             )
@@ -2958,8 +3213,10 @@ mod tests {
                 .read_reclaim_node_metadata(
                     &reserved,
                     &inventory,
-                    &original,
-                    destination,
+                    &[ReclaimNodeReadRequest {
+                        original: original.clone(),
+                        destination: destination
+                    }],
                     &cache_dir,
                     spool
                 )
@@ -2974,8 +3231,10 @@ mod tests {
         tr.commit().await.unwrap();
         assert_eq!(
             catalog
-                .reclaim_source_node(&reserved, fixture.owner.round, &inventory, source_uid)
+                .reclaim_source_nodes(&reserved, fixture.owner.round, &inventory, &[source_uid])
                 .await
+                .unwrap()
+                .pop()
                 .unwrap(),
             original
         );
@@ -2998,8 +3257,10 @@ mod tests {
                 .read_reclaim_node_metadata(
                     &reserved,
                     &inventory,
-                    &original,
-                    destination,
+                    &[ReclaimNodeReadRequest {
+                        original: original.clone(),
+                        destination: destination
+                    }],
                     &cache_dir,
                     spool
                 )
@@ -3014,8 +3275,10 @@ mod tests {
                 .read_reclaim_node_metadata(
                     &reserved,
                     &inventory,
-                    &original,
-                    destination,
+                    &[ReclaimNodeReadRequest {
+                        original: original.clone(),
+                        destination: destination
+                    }],
                     &cache_dir,
                     spool
                 )
@@ -3038,6 +3301,13 @@ mod tests {
             .release_reserved_reclaim(&reserved, fixture.owner.round)
             .await
             .unwrap();
+        let tr = db_meta.create_trx().unwrap();
+        for key in &keys {
+            assert!(
+                tr.get(key, false).await.unwrap().is_none(),
+                "reserved read-only observation cleanup只清原parent记录"
+            );
+        }
         assert_eq!(fixture.formats(), 2, "只有两个模拟预格式化介质");
     }
 
@@ -3418,15 +3688,22 @@ mod tests {
         );
         assert_eq!(
             catalog
-                .reclaim_source_node(&reserved, fixture.owner.round, &inventory, root_node.uid())
+                .reclaim_source_nodes(
+                    &reserved,
+                    fixture.owner.round,
+                    &inventory,
+                    &[root_node.uid()]
+                )
                 .await
+                .unwrap()
+                .pop()
                 .unwrap(),
             **root_node
         );
         for uid in [0, u64::MAX] {
             assert!(
                 catalog
-                    .reclaim_source_node(&reserved, fixture.owner.round, &inventory, uid)
+                    .reclaim_source_nodes(&reserved, fixture.owner.round, &inventory, &[uid])
                     .await
                     .is_err()
             );
@@ -3537,11 +3814,11 @@ mod tests {
             );
             assert!(
                 catalog
-                    .reclaim_source_node(
+                    .reclaim_source_nodes(
                         &reserved,
                         fixture.owner.round,
                         &inventory,
-                        first_nodes.items[0].uid()
+                        &[first_nodes.items[0].uid()]
                     )
                     .await
                     .is_err()

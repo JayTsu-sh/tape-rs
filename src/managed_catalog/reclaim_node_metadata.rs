@@ -2,10 +2,36 @@
 //! logical publication, complete source coverage and erase authorization.
 use super::*;
 
+#[path = "reclaim_node_observations.rs"]
+mod observations;
+
+fn encode_observation(evidence: &NodeEvidence) -> Result<Vec<u8>> {
+    let raw = serde_json::to_vec(evidence).map_err(cache)?;
+    if raw.len() > 90_000 {
+        return Err(CatalogError::Invalid("原始节点元数据证明超出预算"));
+    }
+    Ok(raw)
+}
+
+fn observation_fingerprint(raw: &[u8]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"tape-rs/reclaim-node-observation/1");
+    hash.update((raw.len() as u64).to_be_bytes());
+    hash.update(raw);
+    hash.finalize().into()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReclaimNodeDestination {
     pub volume: Uuid,
     pub uid: u64,
+}
+
+/// One source node and its already-loaded physical destination in a read batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReclaimNodeReadRequest {
+    pub original: ReclaimSourceNode,
+    pub destination: ReclaimNodeDestination,
 }
 
 /// Only the owner-fenced actual-index reader constructs this observation.
@@ -39,6 +65,9 @@ impl ReclaimNodeMetadata {
     }
     pub fn target_path(&self) -> &str {
         &self.0.target.path
+    }
+    pub fn fingerprint(&self) -> Result<[u8; 32]> {
+        Ok(observation_fingerprint(&encode_observation(&self.0)?))
     }
 }
 
@@ -144,9 +173,7 @@ impl ReclaimSourceInventory<'_> {
             target_index,
             target_attributes,
         };
-        if serde_json::to_vec(&proof).map_err(cache)?.len() > 90_000 {
-            return Err(CatalogError::Invalid("原始节点元数据证明超出预算"));
-        }
+        encode_observation(&proof)?;
         Ok(ReclaimNodeMetadata(proof))
     }
 }
