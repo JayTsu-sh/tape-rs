@@ -16,6 +16,8 @@ pub(super) struct Observer {
     mechanical: Option<fdb_move::Job>,
     assignment: Option<fdb_assign::Job>,
     evicted: Vec<usize>,
+    installed: Option<(usize, fdb_loading::Mount)>,
+    cleared_imports: Vec<String>,
     cursor: Option<(u64, uuid::Uuid)>,
     next: Instant,
     failures: u32,
@@ -30,6 +32,8 @@ impl Default for Observer {
             mechanical: None,
             assignment: None,
             evicted: Vec::new(),
+            installed: None,
+            cleared_imports: Vec::new(),
             cursor: None,
             next: Instant::now(),
             failures: 0,
@@ -70,6 +74,12 @@ impl Observer {
             }
         }
     }
+    pub(super) fn busy(&self) -> bool {
+        self.task.is_some()
+            || self.mechanical.is_some()
+            || self.assignment.is_some()
+            || !self.publisher.idle()
+    }
     fn task_identity(&self) -> String {
         self.mechanical
             .as_ref()
@@ -95,6 +105,13 @@ impl Observer {
         node: u8,
         runtime: &tokio::runtime::Runtime,
     ) -> Result<()> {
+        // An automatic data request may have lost its mechanical reply. It has
+        // priority over new samples and explicit tasks, including when idle.
+        match runtime.block_on(fdb_loading::settle_automatic(active, permission, control)) {
+            Ok(()) => {}
+            Err(ReadError::Busy(_)) => return Ok(()),
+            Err(error) => return Err(TapeError::Catalog(error.to_string())),
+        }
         let result = self.poll(
             Context {
                 active,
@@ -109,6 +126,16 @@ impl Observer {
         // read or idle-unload can run, including after an unknown CDB outcome.
         for drive in self.evicted.drain(..) {
             active.fdb_reads.remove(&drive);
+        }
+        if let Some((drive, mount)) = self.installed.take()
+            && result.is_ok()
+        {
+            active.fdb_reads.insert(drive, mount);
+        }
+        for barcode in self.cleared_imports.drain(..) {
+            if result.is_ok() {
+                active.fdb_pending_import.remove(&barcode);
+            }
         }
         result
     }
@@ -162,8 +189,12 @@ impl Observer {
                     .map_err(|e| TapeError::Catalog(e.to_string()))?;
                 if request.value()["change"]["kind"] == "media-assign" {
                     self.assignment = Some(fdb_assign::Job::new(request, &task)?);
-                } else {
+                } else if request.value()["change"]["kind"] == "media-move" {
                     self.mechanical = Some(fdb_move::Job::new(request, &task)?);
+                } else {
+                    // The original native task owns the library until its
+                    // checkpoint is settled by its sole actor.
+                    return Ok(());
                 }
             }
         }
@@ -235,6 +266,10 @@ impl Observer {
                 context.lost(format!("分配原任务{}：{error}", self.task_identity()))
             })?;
             if self.confirmed(&context, "分配", result)? == Some(true) {
+                self.installed = self
+                    .assignment
+                    .as_ref()
+                    .and_then(|job| job.verified_mount(context.active));
                 self.assignment = None;
                 self.next = Instant::now() + Duration::from_millis(250);
             }
@@ -250,6 +285,17 @@ impl Observer {
                 context.lost(format!("搬带原任务{}：{error}", self.task_identity()))
             })?;
             if self.confirmed(&context, "搬带", result)? == Some(true) {
+                if let Some(job) = &self.mechanical
+                    && job.request.value()["change"]["pool"].is_null()
+                    && job.request.value()["change"]["volume"].is_null()
+                {
+                    self.cleared_imports.push(
+                        job.request.value()["change"]["barcode"]
+                            .as_str()
+                            .expect("barcode")
+                            .to_owned(),
+                    );
+                }
                 self.mechanical = None;
                 self.next = Instant::now() + Duration::from_millis(250);
             }

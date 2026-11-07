@@ -709,6 +709,30 @@ pub fn inventory_observation(s: &crate::daemon::node::NodeStatus) -> Value {
         "owner_matches_current":matches})
 }
 
+/// EE-shaped library attributes, sourced only from configuration and observations.
+pub fn library_inventory_view(
+    serial: &str,
+    drives: &[String],
+    s: &crate::daemon::node::NodeStatus,
+) -> Value {
+    let inv = &s.management["inventory"];
+    json!({
+        "name":serial,"id":serial,"serial":serial,"changer_serial":serial,
+        "model":inv["scsi_product_id"],"scsi_vendor_id":inv["scsi_vendor_id"],
+        "scsi_product_id":inv["scsi_product_id"],
+        "scsi_firmware_revision":inv["scsi_firmware_revision"],
+        "num_of_drives":drives.len(),"drive_serials":drives,
+        "num_of_ieslots":inv["num_of_ieslots"],"num_of_slots":inv["num_of_slots"],
+        "host_device_name":inv["host_device_name"],"host_scsi_address":inv["host_scsi_address"],
+        "host_device_node":inv["owner"],
+        "active_node":s.executor.as_ref().filter(|e|e.fenced && s.executor_ready && !s.shutting_down).map(|e|e.node),
+        "nodes":s.candidates.iter().map(|(id,c)|json!({"id":id,"advertised_eligible":c.eligible,"drives":c.drives})).collect::<Vec<_>>(),
+        "executor":s.executor.as_ref().map(|e|json!({"node":e.node,"round":e.round,"fenced":e.fenced})),
+        "executor_ready":s.executor_ready,"inventory_observation":inventory_observation(s),
+        "applied_index":s.applied_index
+    })
+}
+
 fn partition_view(
     s: &crate::daemon::node::NodeStatus,
     barcode: &str,

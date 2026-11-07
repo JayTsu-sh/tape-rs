@@ -48,6 +48,19 @@ pub(super) async fn library_view(
         .catalog
         .active_library_management_view(serial, route)
         .await?;
+    let status = inventory::snapshot(ctx, serial).await?;
+    let drives = status.management["inventory"]["drives"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|drive| drive["serial"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    let extra = super::super::management::library_inventory_view(serial, &drives, &status);
+    for (key, value) in extra.as_object().expect("library view") {
+        if !view.as_object().expect("library row").contains_key(key) {
+            view[key] = value.clone();
+        }
+    }
     view["inventory_age_seconds"] = age(&view["inventory"]["observed_at"]);
     view["inventory_owner_current"] = if view["inventory"].is_null() {
         Value::Null
@@ -238,6 +251,15 @@ pub(super) async fn tapes(
         .await
     {
         Ok(mut v) => {
+            let status = match inventory::snapshot(&ctx, &serial).await {
+                Ok(value) => value,
+                Err(error) => return pools::failure(error),
+            };
+            for row in v["items"].as_array_mut().expect("catalog tape page") {
+                if let Err(error) = inventory::enrich_tape(&ctx, &serial, &status, row).await {
+                    return pools::failure(error);
+                }
+            }
             if let Some(b) = v["next"].as_str() {
                 v["next"] = json!(encode_cursor(&serial, route, pool, b));
             }
@@ -268,7 +290,16 @@ pub(super) async fn tape(
         .active_tape_for_route(&serial, route, &barcode)
         .await
     {
-        Ok(Some(value)) if pool.is_none_or(|p| value["assignment"]["pool"] == p.to_string()) => {
+        Ok(Some(mut value))
+            if pool.is_none_or(|p| value["assignment"]["pool"] == p.to_string()) =>
+        {
+            let status = match inventory::snapshot(&ctx, &serial).await {
+                Ok(value) => value,
+                Err(error) => return pools::failure(error),
+            };
+            if let Err(error) = inventory::enrich_tape(&ctx, &serial, &status, &mut value).await {
+                return pools::failure(error);
+            }
             reply(
                 StatusCode::OK,
                 json!({"version":1,"library_serial":serial,"namespace":route.route.namespace.to_string(),"tape":value}),
@@ -277,6 +308,50 @@ pub(super) async fn tape(
         Ok(_) => reply(StatusCode::NOT_FOUND, json!({"error":"tape_not_found"})),
         Err(e) => pools::failure(e),
     }
+}
+
+// Pool hierarchy delegates to the same scoped reader and cursor protocol.
+fn pool_request(mut request: Request, pool: &str) -> Result<Request, Box<Response>> {
+    known_query(&request, &["limit", "after"])?;
+    let id = Uuid::parse_str(pool)
+        .ok()
+        .filter(|id| !id.is_nil() && id.to_string() == pool)
+        .ok_or_else(|| Box::new(invalid("池UUID无效")))?;
+    let query = request
+        .uri()
+        .query()
+        .filter(|query| !query.is_empty())
+        .map(|query| format!("{query}&"))
+        .unwrap_or_default();
+    *request.uri_mut() = format!("/admin/tapes?{query}pool={id}")
+        .parse()
+        .map_err(|_| Box::new(invalid("磁带查询路径无效")))?;
+    Ok(request)
+}
+pub(super) async fn pool_tapes(
+    state: State<Arc<Context>>,
+    Path((serial, pool)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    let request = match pool_request(request, &pool) {
+        Ok(value) => value,
+        Err(error) => return *error,
+    };
+    tapes(state, Path(serial), request).await
+}
+pub(super) async fn pool_tape(
+    state: State<Arc<Context>>,
+    Path((serial, pool, barcode)): Path<(String, String, String)>,
+    request: Request,
+) -> Response {
+    if let Err(error) = known_query(&request, &[]) {
+        return *error;
+    }
+    let request = match pool_request(request, &pool) {
+        Ok(value) => value,
+        Err(error) => return *error,
+    };
+    tape(state, Path((serial, barcode)), request).await
 }
 
 #[cfg(test)]

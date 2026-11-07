@@ -31,12 +31,20 @@ impl Snapshot {
             reservation::verify_holder(device.dev.as_ref(), context.active.key)?;
         }
         let (map, rows) = management::elements(&context.active.devices)?;
+        let changer = context
+            .active
+            .devices
+            .iter()
+            .find(|d| d.kind == DeviceKind::Changer)
+            .ok_or_else(|| refused("没有换带器"))?;
+        let descriptor = crate::scsi::inquiry::standard_inquiry(changer.dev.as_ref())?;
         let observation = management::observation_from_elements(
             &context.active.devices,
             context.node,
             context.active.round,
             &map,
             &rows,
+            &descriptor,
         )?;
         // DVCID may contain vendor/model text. Bind each DTE through the same
         // strict unique configured-drive mapping used by the observation.

@@ -19,6 +19,9 @@ use uuid::Uuid;
 use crate::error::{Result, TapeError};
 use crate::ltfs::label::LTFS_VERSION;
 
+#[path = "index_read_budget.rs"]
+mod read_budget;
+
 /// Index 的"位置"：partition + 起始块号。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexLocation {
@@ -27,6 +30,8 @@ pub struct IndexLocation {
 }
 
 /// 单个 extent：文件在磁带上连续的一段。
+#[cfg_attr(feature = "fdb", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "fdb", serde(deny_unknown_fields))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Extent {
     pub partition: char,
@@ -39,6 +44,8 @@ pub struct Extent {
 }
 
 /// 通用的时间戳/uid 字段集合（文件与目录共用）。
+#[cfg_attr(feature = "fdb", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "fdb", serde(deny_unknown_fields))]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NodeMeta {
     pub readonly: bool,
@@ -85,6 +92,8 @@ impl MetadataChange {
 /// 扩展属性（LTFS 2.5.1 §9.2.13）。`value` 原样保存索引里的文本；
 /// `base64 == true` 表示索引里带 `type="base64"`，`value` 是编码后的文本。
 /// 原样保存是为了回写时逐字节不变。
+#[cfg_attr(feature = "fdb", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "fdb", serde(deny_unknown_fields))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Xattr {
     pub key: String,
@@ -92,11 +101,34 @@ pub struct Xattr {
     pub base64: bool,
 }
 
+/// Equality evidence only: XML text and base64 may encode the same bytes.
+/// Keep the original representation untouched for round-trip serialization.
+pub(super) fn canonical_xattrs(xattrs: &[Xattr]) -> Result<Vec<(String, Vec<u8>)>> {
+    use base64::Engine;
+    let mut values = xattrs
+        .iter()
+        .map(|x| {
+            let value = if x.base64 {
+                base64::engine::general_purpose::STANDARD
+                    .decode(&x.value)
+                    .map_err(|e| TapeError::Ltfs(format!("索引扩展属性 Base64 非法: {e}")))?
+            } else {
+                x.value.as_bytes().to_vec()
+            };
+            Ok((x.key.clone(), value))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    values.sort();
+    Ok(values)
+}
+
 /// 文件内容哈希（LTFS 2.5.1 附录 F.3，十六进制小写）。一个文件可以同时带多种。
 /// IBM LTFS 写的是 md5sum；本实现两个都写，校验时优先 sha256sum。
 pub const XATTR_MD5: &str = "ltfs.hash.md5sum";
 pub const XATTR_SHA256: &str = "ltfs.hash.sha256sum";
 
+#[cfg_attr(feature = "fdb", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "fdb", serde(deny_unknown_fields))]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileNode {
     /// 增量中明确出现的字段；None 表示完整对象。
@@ -130,6 +162,8 @@ impl FileNode {
     }
 }
 
+#[cfg_attr(feature = "fdb", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "fdb", serde(deny_unknown_fields))]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DirectoryNode {
     /// 增量导航目录可能只有 name 与 contents。
@@ -142,7 +176,9 @@ pub struct DirectoryNode {
 }
 
 /// 完整索引逐条扫描得到的节点。目录在其子节点之后到达，路径相对卷根。
-#[derive(Debug)]
+#[cfg_attr(feature = "fdb", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "fdb", serde(deny_unknown_fields))]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexEntry {
     File { path: String, node: FileNode },
     Directory { path: String, node: DirectoryNode },
@@ -320,22 +356,47 @@ impl LtfsIndex {
         streaming: bool,
         incremental_stream: Option<bool>,
         check_paths: bool,
-        mut emit: F,
+        emit: F,
     ) -> Result<Self> {
+        Self::parse_with_limits(
+            input,
+            streaming,
+            incremental_stream,
+            check_paths,
+            emit,
+            read_budget::Limits::default(),
+        )
+    }
+
+    fn parse_with_limits<R: std::io::BufRead, F: FnMut(IndexEntry) -> Result<()>>(
+        input: R,
+        streaming: bool,
+        incremental_stream: Option<bool>,
+        check_paths: bool,
+        mut emit: F,
+        limits: read_budget::Limits,
+    ) -> Result<Self> {
+        let input = read_budget::EventReader::new(input, streaming.then_some(limits.event));
         let mut reader = Reader::from_reader(input);
         reader.config_mut().trim_text(false);
         let mut p = IndexParser::new();
         p.streaming = streaming;
-        p.incremental_stream = incremental_stream.unwrap_or(false);
+        p.incremental_stream = incremental_stream;
+        p.resources = read_budget::MetadataBudget::new(limits);
         let mut seen_paths = BTreeSet::new();
         let mut bufv = Vec::new();
         loop {
             bufv.clear();
-            match reader.read_event_into(&mut bufv)? {
+            reader.get_mut().next_event();
+            let event = reader.read_event_into(&mut bufv);
+            if event.is_err() && reader.get_mut().exhausted() {
+                return Err(read_budget::event_exceeded());
+            }
+            match event? {
                 Event::Eof => break,
                 Event::Start(e) => {
                     if incremental_stream.is_none() && p.path.is_empty() {
-                        p.incremental_stream = e.name().as_ref() == b"ltfsincrementalindex";
+                        p.incremental_stream = Some(e.name().as_ref() == b"ltfsincrementalindex");
                     }
                     p.on_start(e)?;
                 }
@@ -344,15 +405,37 @@ impl LtfsIndex {
                     p.on_start(e)?;
                     p.on_end(end)?;
                 }
-                Event::End(e) => p.on_end(e)?,
-                Event::Text(t) => p.on_text(&t.unescape()?),
-                Event::CData(t) => p.on_text(
-                    std::str::from_utf8(t.as_ref()).map_err(|e| TapeError::Ltfs(e.to_string()))?,
-                ),
+                Event::End(e) => {
+                    if streaming {
+                        p.resources.charge(e.as_ref().len())?;
+                    }
+                    p.on_end(e)?;
+                }
+                Event::Text(t) => {
+                    let decoded = t.unescape()?;
+                    if p.ignores_layout_text(&decoded) {
+                        continue;
+                    }
+                    if streaming {
+                        p.resources.charge(t.as_ref().len())?;
+                    }
+                    p.on_text(&decoded)?;
+                }
+                Event::CData(t) => {
+                    let text = std::str::from_utf8(t.as_ref())
+                        .map_err(|e| TapeError::Ltfs(e.to_string()))?;
+                    if p.ignores_layout_text(text) {
+                        continue;
+                    }
+                    if streaming {
+                        p.resources.charge(t.as_ref().len())?;
+                    }
+                    p.on_text(text)?;
+                }
                 _ => {}
             }
             if let Some(entry) = p.pending_entry.take() {
-                if p.incremental_stream {
+                if p.incremental_stream == Some(true) {
                     super::incremental::validate_incremental_entry(&entry)?;
                     let path = match &entry {
                         IndexEntry::File { path, .. } | IndexEntry::Directory { path, .. } => path,
@@ -364,7 +447,7 @@ impl LtfsIndex {
                 emit(entry)?;
             }
         }
-        let expected_incremental = p.incremental_stream;
+        let expected_incremental = p.incremental_stream.unwrap_or(false);
         let index = p.finish()?;
         if streaming && index.incremental != expected_incremental {
             return Err(TapeError::Ltfs("逐条扫描的索引类型不匹配".into()));
@@ -671,6 +754,34 @@ fn write_directory<W: std::io::Write>(
     d: &DirectoryNode,
     incremental: bool,
 ) -> Result<()> {
+    // Keep memory proportional to depth without consuming a call frame per
+    // directory. Preserve the same depth-first XML and sibling order.
+    let mut pending = Some(d);
+    let mut stack = Vec::new();
+    loop {
+        if let Some(directory) = pending.take()
+            && write_directory_start(w, directory, incremental)?
+        {
+            stack.push(directory.subdirs.iter());
+        }
+        let Some(children) = stack.last_mut() else {
+            return Ok(());
+        };
+        if let Some(child) = children.next() {
+            pending = Some(child);
+        } else {
+            w.write_event(Event::End(BytesEnd::new("contents")))?;
+            w.write_event(Event::End(BytesEnd::new("directory")))?;
+            stack.pop();
+        }
+    }
+}
+
+fn write_directory_start<W: std::io::Write>(
+    w: &mut Writer<W>,
+    d: &DirectoryNode,
+    incremental: bool,
+) -> Result<bool> {
     w.write_event(Event::Start(BytesStart::new("directory")))?;
     write_text(w, "name", &d.name)?;
     if d.delta_fields
@@ -679,7 +790,7 @@ fn write_directory<W: std::io::Write>(
     {
         w.write_event(Event::Empty(BytesStart::new("deleted")))?;
         w.write_event(Event::End(BytesEnd::new("directory")))?;
-        return Ok(());
+        return Ok(false);
     }
     write_meta(w, &d.meta, &d.delta_fields)?;
     if present(&d.delta_fields, "extendedattributes") {
@@ -692,20 +803,16 @@ fn write_directory<W: std::io::Write>(
     for f in &d.files {
         write_file(w, f, incremental)?;
     }
-    for sub in &d.subdirs {
-        write_directory(w, sub, incremental)?;
-    }
-    w.write_event(Event::End(BytesEnd::new("contents")))?;
-    w.write_event(Event::End(BytesEnd::new("directory")))?;
-    Ok(())
+    Ok(true)
 }
 
 // ----- 解析器 -----
 
 /// 栈式 XML 状态机：维护 path 栈 + "当前"目录/文件/extent。
 struct IndexParser {
+    resources: read_budget::MetadataBudget,
     streaming: bool,
-    incremental_stream: bool,
+    incremental_stream: Option<bool>,
     root_seen: bool,
     pending_entry: Option<IndexEntry>,
     incremental: bool,
@@ -787,8 +894,9 @@ const KNOWN_ELEMENTS: &[&str] = &[
 impl IndexParser {
     fn new() -> Self {
         Self {
+            resources: read_budget::MetadataBudget::new(read_budget::Limits::default()),
             streaming: false,
-            incremental_stream: false,
+            incremental_stream: Some(false),
             root_seen: false,
             pending_entry: None,
             incremental: false,
@@ -819,9 +927,18 @@ impl IndexParser {
     }
 
     fn on_start(&mut self, e: BytesStart<'_>) -> Result<()> {
+        if self.streaming {
+            self.resources.start(
+                matches!(e.name().as_ref(), b"directory" | b"file"),
+                e.as_ref().len(),
+            )?;
+        }
         let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
         self.text.clear();
-        if self.path.len() >= 512 {
+        // A managed path may contain 1024 components, in addition to the
+        // volume root. Each directory adds directory/contents tags; leave
+        // room for a leaf's attributes and extents, while bounding XML input.
+        if self.path.len() >= 2 * (1024 + 1) + 8 {
             return Err(TapeError::LocalCapacity {
                 reason: "索引 XML 嵌套深度超过预算".into(),
             });
@@ -835,6 +952,11 @@ impl IndexParser {
         }
 
         if !KNOWN_ELEMENTS.contains(&name.as_str()) && !self.unknown_elements.contains(&name) {
+            if self.streaming {
+                return Err(TapeError::Ltfs(format!(
+                    "逐条扫描遇到无法保真的索引元素: {name}"
+                )));
+            }
             self.unknown_elements.push(name.clone());
         }
 
@@ -847,12 +969,15 @@ impl IndexParser {
         }
         match name.as_str() {
             "ltfsindex" | "ltfsincrementalindex" => {
-                if self.streaming && name == "ltfsincrementalindex" && !self.incremental_stream {
+                if self.streaming
+                    && name == "ltfsincrementalindex"
+                    && self.incremental_stream == Some(false)
+                {
                     return Err(TapeError::Ltfs(
                         "逐条扫描仅支持完整索引；增量索引须先重放".into(),
                     ));
                 }
-                if self.streaming && name == "ltfsindex" && self.incremental_stream {
+                if self.streaming && name == "ltfsindex" && self.incremental_stream == Some(true) {
                     return Err(TapeError::Ltfs("增量逐条扫描收到完整索引".into()));
                 }
                 self.incremental = name == "ltfsincrementalindex";
@@ -919,12 +1044,41 @@ impl IndexParser {
         Ok(())
     }
 
-    fn on_text(&mut self, t: &str) {
+    fn ignores_layout_text(&self, text: &str) -> bool {
+        self.streaming
+            && text.trim().is_empty()
+            && matches!(
+                self.path.last().map(String::as_str),
+                None | Some(
+                    "ltfsindex"
+                        | "ltfsincrementalindex"
+                        | "directory"
+                        | "contents"
+                        | "file"
+                        | "extendedattributes"
+                        | "xattr"
+                        | "extentinfo"
+                        | "extent"
+                        | "location"
+                        | "previousgenerationlocation"
+                        | "previousincrementallocation"
+                )
+            )
+    }
+
+    fn on_text(&mut self, t: &str) -> Result<()> {
+        if self.streaming {
+            self.resources.text(self.text.len(), t.len())?;
+        }
         self.text.push_str(t);
+        Ok(())
     }
 
     fn on_end(&mut self, _e: BytesEnd<'_>) -> Result<()> {
         let name = self.path.pop().unwrap_or_default();
+        if self.streaming && matches!(name.as_str(), "file" | "directory") {
+            self.resources.end_node()?;
+        }
         let parent = self.path.last().cloned().unwrap_or_default();
         let mut text = std::mem::take(&mut self.text);
         if self.percent_encoded.remove(&self.path.len()) {
@@ -1114,9 +1268,13 @@ impl IndexParser {
                     let path = self.entry_path(&done.name);
                     if self.dir_stack.is_empty() {
                         self.root_seen = true;
+                        // The root name is a volume label, never a path component.
+                        // Keep it in the header, but emit the canonical namespace root.
+                        let mut root = done.clone();
+                        root.name.clear();
                         self.pending_entry = Some(IndexEntry::Directory {
-                            path,
-                            node: done.clone(),
+                            path: String::new(),
+                            node: root,
                         });
                         self.dir_stack.push(done);
                     } else {
@@ -1241,6 +1399,193 @@ mod tests {
     use std::io::{BufReader, BufWriter, Seek, Write};
 
     #[test]
+    fn streamed_xml_event_limit_stops_before_buffering_the_whole_token() {
+        use std::{
+            cell::Cell,
+            io::{self, BufRead, Read},
+            rc::Rc,
+        };
+        struct RepeatedText {
+            bytes: [u8; 16],
+            consumed: Rc<Cell<usize>>,
+            remaining: usize,
+        }
+        impl Read for RepeatedText {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                let n = out.len().min(self.bytes.len()).min(self.remaining);
+                out[..n].copy_from_slice(&self.bytes[..n]);
+                self.consume(n);
+                Ok(n)
+            }
+        }
+        impl BufRead for RepeatedText {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                Ok(&self.bytes[..self.bytes.len().min(self.remaining)])
+            }
+            fn consume(&mut self, n: usize) {
+                self.remaining -= n;
+                self.consumed.set(self.consumed.get() + n);
+            }
+        }
+        let consumed = Rc::new(Cell::new(0));
+        let input = RepeatedText {
+            bytes: [b'x'; 16],
+            consumed: consumed.clone(),
+            remaining: 8192,
+        };
+        let result = LtfsIndex::parse_with_limits(
+            input,
+            true,
+            Some(false),
+            false,
+            |_| Ok(()),
+            read_budget::Limits {
+                event: 128,
+                field: 128,
+                resident: 1024,
+            },
+        );
+        assert!(matches!(result, Err(TapeError::LocalCapacity { .. })));
+        assert_eq!(consumed.get(), 128);
+    }
+
+    #[test]
+    fn streamed_split_text_and_cdata_cannot_bypass_field_or_node_limits() {
+        let limits = read_budget::Limits {
+            event: 1024,
+            field: 16,
+            resident: 4096,
+        };
+        let split =
+            b"<ltfsindex><creator>12345678<![CDATA[12345678]]><![CDATA[x]]></creator></ltfsindex>";
+        assert!(matches!(
+            LtfsIndex::parse_with_limits(
+                split.as_slice(),
+                true,
+                Some(false),
+                false,
+                |_| Ok(()),
+                limits
+            ),
+            Err(TapeError::LocalCapacity { .. })
+        ));
+        // Each small field is below the per-field/event ceiling; the open
+        // directory's accumulated metadata must still be bounded.
+        let mut xml = String::from("<ltfsindex><directory><name></name><extendedattributes>");
+        for i in 0..30 {
+            write!(
+                xml,
+                "<xattr><key>k{i}</key><value><![CDATA[small]]></value></xattr>"
+            )
+            .unwrap();
+        }
+        xml.push_str("</extendedattributes></directory></ltfsindex>");
+        let limits = read_budget::Limits {
+            event: 1024,
+            field: 128,
+            resident: 1024,
+        };
+        assert!(matches!(
+            LtfsIndex::parse_with_limits(
+                xml.as_bytes(),
+                true,
+                Some(false),
+                false,
+                |_| Ok(()),
+                limits
+            ),
+            Err(TapeError::LocalCapacity { .. })
+        ));
+    }
+
+    #[test]
+    fn streamed_metadata_budget_releases_each_emitted_file() {
+        let mut xml = format!(
+            "<ltfsindex><creator>test</creator><volumeuuid>{}</volumeuuid><generationnumber>1</generationnumber><highestfileuid>1001</highestfileuid><directory><name></name><fileuid>1</fileuid><contents>",
+            Uuid::nil()
+        );
+        for i in 0..1000 {
+            write!(
+                xml,
+                "\n  <file><name>f{i}</name><length>0</length><fileuid>{}</fileuid></file>",
+                i + 2
+            )
+            .unwrap();
+        }
+        xml.push_str("</contents></directory></ltfsindex>");
+        let limits = read_budget::Limits {
+            event: 1024,
+            field: 1024,
+            resident: 1024,
+        };
+        let mut files = 0;
+        let index = LtfsIndex::parse_with_limits(
+            xml.as_bytes(),
+            true,
+            Some(false),
+            false,
+            |entry| {
+                if matches!(entry, IndexEntry::File { .. }) {
+                    files += 1;
+                }
+                Ok(())
+            },
+            limits,
+        )
+        .unwrap();
+        assert_eq!(files, 1000);
+        assert!(index.root.files.is_empty() && index.root.subdirs.is_empty());
+    }
+
+    #[test]
+    fn streamed_open_ancestor_metadata_shares_one_resident_budget() {
+        let mut xml = String::from("<ltfsindex>");
+        for i in 0..10 {
+            write!(xml,"<directory><name>d{i}</name><fileuid>{}</fileuid><extendedattributes><xattr><key>k</key><value>{}</value></xattr></extendedattributes><contents>",i+1,"x".repeat(100)).unwrap();
+        }
+        for _ in 0..10 {
+            xml.push_str("</contents></directory>");
+        }
+        xml.push_str("</ltfsindex>");
+        let limits = read_budget::Limits {
+            event: 1024,
+            field: 128,
+            resident: 2500,
+        };
+        assert!(matches!(
+            LtfsIndex::parse_with_limits(
+                xml.as_bytes(),
+                true,
+                Some(false),
+                false,
+                |_| Ok(()),
+                limits
+            ),
+            Err(TapeError::LocalCapacity { .. })
+        ));
+    }
+
+    #[test]
+    fn streamed_layout_skipping_preserves_name_and_attribute_whitespace() {
+        let xml = format!(
+            "<ltfsindex><creator>test</creator><volumeuuid>{}</volumeuuid><generationnumber>1</generationnumber><highestfileuid>2</highestfileuid><directory><name></name><fileuid>1</fileuid><contents>\n  <file><name>  name  </name><length>0</length><fileuid>2</fileuid><extendedattributes><xattr><key>user.space</key><value><![CDATA[   ]]></value></xattr></extendedattributes></file>\n</contents></directory></ltfsindex>",
+            Uuid::nil()
+        );
+        let mut files = 0;
+        LtfsIndex::scan_full_reader(xml.as_bytes(), |entry| {
+            if let IndexEntry::File { path, node } = entry {
+                assert_eq!(path, "  name  ");
+                assert_eq!(node.name, "  name  ");
+                assert_eq!(node.xattr("user.space"), Some("   "));
+                files += 1;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(files, 1);
+    }
+
+    #[test]
     fn empty_roundtrip() {
         let idx = LtfsIndex::empty(Uuid::nil(), "tape-rs".into(), 'b');
         let xml = idx.to_xml().unwrap();
@@ -1249,6 +1594,13 @@ mod tests {
         assert_eq!(back.generation, 1);
         assert!(back.root.files.is_empty());
         assert!(back.root.subdirs.is_empty());
+    }
+
+    #[test]
+    fn excessive_xml_nesting_is_rejected_without_recursion() {
+        let xml = format!("{}{}", "<unknown>".repeat(3000), "</unknown>".repeat(3000));
+        let error = LtfsIndex::parse(xml.as_bytes()).unwrap_err();
+        assert!(error.to_string().contains("嵌套深度超过预算"));
     }
 
     #[test]
@@ -1336,6 +1688,34 @@ mod tests {
             }
         }
         assert_eq!(files, 2);
+    }
+
+    #[test]
+    fn streamed_named_volume_root_is_not_a_namespace_directory() {
+        let mut full = LtfsIndex::parse(IBM_STYLE.as_bytes()).unwrap();
+        full.root.name = "REA_AA18_1103".into();
+        let xml = full.to_xml().unwrap();
+        let mut roots = Vec::new();
+        let mut files = Vec::new();
+        let scanned = LtfsIndex::scan_full_reader(&xml[..], |entry| {
+            match entry {
+                IndexEntry::Directory { path, node }
+                    if node.meta.file_uid == full.root.meta.file_uid =>
+                {
+                    roots.push((path, node.name))
+                }
+                IndexEntry::File { path, .. } => files.push(path),
+                _ => {}
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(roots, vec![(String::new(), String::new())]);
+        assert_eq!(scanned.root.name, "REA_AA18_1103");
+        assert_eq!(scanned.root.meta, full.root.meta);
+        let mut expected = Vec::new();
+        full.walk_files(|path, _| expected.push(path.to_owned()));
+        assert_eq!(files, expected);
     }
 
     #[test]

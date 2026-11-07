@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 assert_eq!(attr("delete"), Some(b"old".to_vec()));
             }
             println!(
-                "PASS {mode}: generation {} version {:?}",
+                "PASS {mode}: generation {:?} version {:?}",
                 s.generation, s.version
             );
         }

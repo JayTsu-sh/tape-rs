@@ -322,7 +322,7 @@ async fn head_at(tr: &Transaction, ns: Uuid, serial: &str) -> Result<u64> {
 
 // Existing control writers commit domain-error results. A notification failure
 // after their writes must instead abort the transaction, including corruption.
-fn atomic_error(error: CatalogError) -> CatalogError {
+pub(super) fn atomic_error(error: CatalogError) -> CatalogError {
     match error {
         CatalogError::Fdb(_) | CatalogError::Client(_) => error,
         other => CatalogError::Fdb(FdbBindingError::CustomError(Box::new(other))),
@@ -416,6 +416,112 @@ pub(super) async fn require_changed_at(
         }
         _ => Err(CatalogError::Corrupt("通知投影孤立或缺失")),
     }
+}
+
+/// Shared by HTTP inventory and durable tape-state events. Physical absence is
+/// meaningful only when the cached inventory belongs to the current owner.
+pub fn tape_inventory_state<'a>(
+    data: &'a Value,
+    inventory: &Value,
+    owner_matches: bool,
+) -> &'a str {
+    let barcode = &data["barcode"];
+    let locations: Vec<_> = inventory["volumes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|v| v["barcode"] == *barcode)
+        .collect();
+    let cleaning = crate::changer::element::cleaning_source(
+        locations
+            .first()
+            .and_then(|v| v["medium_type"].as_u64())
+            .and_then(|v| v.try_into().ok()),
+        barcode.as_str(),
+    )
+    .is_some();
+    let assignment = &data["assignment"];
+    let monitor = &data["monitor"];
+    if locations.len() > 1 {
+        "duplicated"
+    } else if cleaning {
+        "non_supported"
+    } else if assignment["blacklisted"] == true {
+        "blacklisted"
+    } else if assignment["online"] == false {
+        "offline"
+    } else if monitor["media_fault"].is_string() {
+        monitor["state"].as_str().unwrap_or("unknown")
+    } else if assignment.is_null() {
+        "unassigned"
+    } else if !data["task_id"].is_null() {
+        "importing"
+    } else if assignment["volume"].is_null() {
+        "assigned_unverified"
+    } else if locations.is_empty() && owner_matches {
+        "missing"
+    } else {
+        monitor["state"].as_str().unwrap_or("unknown")
+    }
+}
+
+pub(super) async fn tape_changed_at(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    barcode: &str,
+    reason: &str,
+) -> Result<()> {
+    let result = async {
+        // Staged imports have no active virtual pool roots yet. Notifications
+        // begin with the live management model, never with provisional imports.
+        let Some(active) = tr.get(&routing::active_key(serial), false).await? else { return Ok(()); };
+        if routing::decode_active(&active)?.route.namespace != ns { return Ok(()); }
+        let data = inventory::inventory_entry(tr, serial, ns, barcode).await?
+            .unwrap_or_else(|| json!({"barcode":barcode,"assignment":null,"pool":null}));
+        let observation = inventory::read_at(tr, serial, ns).await?.unwrap_or(Value::Null);
+        let owner = tr.get(&owner_key(serial), false).await?;
+        let owner_matches = owner.as_deref().is_some_and(|v| v.len() == 8
+            && observation["round"].as_u64() == Some(read_u64(v)));
+        let state = tape_inventory_state(&data, &observation, owner_matches);
+        let locations: Vec<_> = observation["volumes"].as_array().into_iter().flatten()
+            .filter(|v| v["barcode"] == barcode)
+            .map(|v| json!({"address":v["address"],"element_type":v["element_type"],"medium_type":v["medium_type"]})).collect();
+        let monitor = &data["monitor"];
+        let sample = &monitor["sample"];
+        // Timestamps, capacity byte counters, owner epochs and transient progress
+        // do not create repeated state events. Alert history is deliberately sticky.
+        let current = json!({"barcode":barcode,"state":state,"pool":data["pool"]["id"],
+            "volume_uuid":data["assignment"]["volume"],"online":data["assignment"]["online"],
+            "blacklisted":data["assignment"]["blacklisted"],
+            "offline_message":data["assignment"]["offline_message"],"locations":locations,
+            "write_protected":sample["write_protected"],"alert_history":monitor["alert_history"],
+            "alert_history_details":monitor["alert_history_details"],"media_fault_evidence":monitor["media_fault_evidence"],
+            "media_fault":monitor["media_fault"],"import_required":monitor["import_required"],
+            "requires_validation":monitor["requires_validation"],"task_id":data["task_id"]});
+        let entity = format!("tape-state:{barcode}");
+        let k = entity_key(ns, serial, b's', &entity);
+        let prior = match tr.get(&k, false).await? { Some(v) => Some(decode(&v)?["current"].clone()), None => None };
+        require_changed_at(tr,ns,serial,&entity,"tape.state.changed",prior.as_ref()).await?;
+        let previous=prior.clone().unwrap_or(Value::Null);
+        if previous == current { return Ok(()); }
+        let data = json!({"barcode":barcode,"pool":current["pool"],
+            "previous":previous,"current":current,"reason":reason});
+        // A state subscriber must also see transitions that coincide with a
+        // pool move, a new alert or a physical location change.
+        changed_at(tr,ns,serial,&entity,"tape.state.changed",prior.as_ref(),current.clone()).await?;
+        if !previous.is_null() {
+            for (changed, kind) in [
+                (previous["pool"] != current["pool"] || previous["volume_uuid"] != current["volume_uuid"], "tape.assignment.changed"),
+                (previous["alert_history"] != current["alert_history"], "tape.alert.raised"),
+                (previous["locations"] != current["locations"], "tape.location.changed"),
+            ] {
+                if changed { append_event_at(tr, ns, serial, kind, data.clone(),None).await?; }
+            }
+        }
+        Ok(())
+    }.await;
+    result.map_err(atomic_error)
 }
 
 pub(super) async fn changed_at(
@@ -826,6 +932,103 @@ mod tests {
             &[state[0].clone(), "task.status.changed".into()]
         ));
     }
+    #[test]
+    fn notify_state_precedence_matches_inventory() {
+        let data = json!({"barcode":"AA0017L8","assignment":{"online":true,"volume":"v"},"monitor":{"state":"appendable"}});
+        assert_eq!(tape_inventory_state(&data, &json!({}), true), "missing");
+        assert_eq!(tape_inventory_state(&data, &json!({}), false), "appendable");
+        let mut data = data;
+        data["assignment"]["online"] = json!(false);
+        data["assignment"]["blacklisted"] = json!(true);
+        assert_eq!(tape_inventory_state(&data, &json!({}), true), "blacklisted");
+        let physical = json!({"volumes":[{"barcode":"AA0017L8"},{"barcode":"AA0017L8"}]});
+        assert_eq!(tape_inventory_state(&data, &physical, true), "duplicated");
+    }
+}
+
+#[cfg(test)]
+mod fdb_tests {
+    use super::*;
+    #[test]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；验证通知故障回滚业务事务，不访问硬件"]
+    fn notify_atomic_event_log_deduplicates_retries_and_aborts_partial_writes() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let c = ManagedCatalog::open(Some(&cluster)).unwrap();
+            let ns = Uuid::new_v4();
+            let serial = "NOTIFY_ATOMIC";
+            for attempt in 0..2 {
+                c.db.run(|tr, _| async move {
+                    requests::retry_result(
+                        changed_at(
+                            &tr,
+                            ns,
+                            serial,
+                            "monitor",
+                            "library.monitor.changed",
+                            (attempt > 0).then_some(&json!({"status":"ok"})),
+                            json!({"status":"ok"}),
+                        )
+                        .await,
+                    )
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            }
+            let tr = c.db.create_trx().unwrap();
+            assert_eq!(head_at(&tr, ns, serial).await.unwrap(), 1);
+            let first = tr
+                .get(&event_key(ns, serial, 1), false)
+                .await
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            c.db.run(|tr, _| async move {
+                tr.set(&base(ns, serial, b'h'), b"corrupt");
+                Ok(())
+            })
+            .await
+            .unwrap();
+            let marker = entity_key(ns, serial, b'x', "business-state");
+            let result =
+                c.db.run(|tr, _| {
+                    let marker = marker.clone();
+                    async move {
+                        tr.set(&marker, b"must-not-commit");
+                        requests::retry_result(
+                            changed_at(
+                                &tr,
+                                ns,
+                                serial,
+                                "monitor",
+                                "library.monitor.changed",
+                                Some(&json!({"status":"ok"})),
+                                json!({"status":"failed"}),
+                            )
+                            .await,
+                        )
+                    }
+                })
+                .await;
+            assert!(result.is_err());
+            let tr = c.db.create_trx().unwrap();
+            assert!(tr.get(&marker, false).await.unwrap().is_none());
+            assert_eq!(
+                tr.get(&event_key(ns, serial, 1), false)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .to_vec(),
+                first
+            );
+        });
+    }
 }
 
 impl ManagedCatalog {
@@ -1020,7 +1223,7 @@ impl ManagedCatalog {
 }
 
 #[cfg(test)]
-mod fdb_tests {
+mod retention_fdb_tests {
     use super::*;
 
     #[tokio::test]

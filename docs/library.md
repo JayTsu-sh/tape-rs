@@ -64,7 +64,7 @@ tape-library --library-state /isolated/library.sqlite task clearhistory --yes
 
 恢复不执行保存的链接目标，不读取它们指向的宿主路径。它保留原始保存路径层级和链接文本，不承诺还原权限、时间、GPFS inode、私有 xattr、stub 或 HSM 副本登记。中途磁带/磁盘失败可能留下部分恢复文件，保留作诊断，重试应选择新的空目录。原始语义、别名和 xattr 可由 `ltfs::ee::EeManifest` 查询，原始索引不会因此修改。
 
-新增持久表与原表增量共存，包括 `library_tasks`、角色配置和 `library_volume_indexes`。缓存是带读取结果，不是修改带的授权；重新分配或换介质后必须重新刷新索引缓存。本地控制器不承担跨主机接管；多节点管理使用 ltfsd 的 [管理模型](multi-library.md)。
+新增持久表与原表增量共存，包括 `library_tasks`、角色配置和 `library_volume_indexes`。缓存是带读取结果，不是修改带的授权；重新分配或换介质后必须重新刷新索引缓存。本地控制器不承担跨主机接管；多节点管理使用 ltfsd 的 [管理模型](management-model.md)。
 
 容量在实际挂载和完整写提交后采样 DP MAM 0x0000/0x0001，必须两个属性都存在且数值有效；缺失、读失败或算术溢出不伪造零。查询标明 `capacity_source=observed_dp_mam` 和观测时间，并不是每次查询都装带。失败访问/下次恢复前使旧观测失效；没有全池观测时，容量和告警条件都明确 unknown/null。它不估算 EE 的 reclaimable/non-appendable 空间，不能代替现场容量规划。
 

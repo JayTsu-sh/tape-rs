@@ -2830,7 +2830,13 @@ fn file_metadata_survives_catalog_publication_and_takeover() {
     });
     let mut cl = Client::new(c.start_http());
     let imported = cl.stat("/imported").unwrap().unwrap();
-    assert_eq!(imported.version, (1, 5));
+    assert_eq!(
+        imported.version,
+        tape_rs::client::FileVersion::Raft {
+            round: 1,
+            sequence: 5
+        }
+    );
     assert_eq!(imported.metadata["modify_time"], expected_time);
     assert!(
         imported.metadata["xattrs"]
@@ -2841,14 +2847,20 @@ fn file_metadata_survives_catalog_publication_and_takeover() {
     );
     cl.put("/new", b"new data").unwrap();
     let written = cl.stat("/new").unwrap().unwrap();
-    assert_eq!(written.version.0, round);
+    assert!(
+        matches!(written.version,tape_rs::client::FileVersion::Raft {round:observed,..} if observed==round)
+    );
     assert!(!written.metadata["modify_time"].as_str().unwrap().is_empty());
     let db = c.dir.join(format!("directory-{}.db", leader));
     c.wait("目录保存元数据", || {
         let d = tape_rs::daemon::directory::Directory::open_reader(&db).unwrap();
-        d.stat(POOL, "/new")
-            .unwrap()
-            .is_some_and(|r| r.version == written.version && r.metadata == written.metadata)
+        d.stat(POOL, "/new").unwrap().is_some_and(|r| {
+            tape_rs::client::FileVersion::Raft {
+                round: r.version.0,
+                sequence: r.version.1,
+            } == written.version
+                && r.metadata == written.metadata
+        })
     });
     c.isolated.lock().unwrap().insert(leader);
     let (next, next_round) = c.wait_serving(Some(leader), round + 1);
@@ -4455,13 +4467,52 @@ fn s3_anonymous_objects_survive_owner_failover_and_share_file_namespace() {
         s3_http(&addrs[&new_owner], "GET", &path, "", b"").0 == 503
     });
     c.isolated.lock().unwrap().clear();
-    let (recovered, _) = c.wait_serving(None, 0);
+    c.wait_serving(None, 0);
+    // Healing the network does not pin an executor for the following RPCs.
+    // Retry transient unavailability and timeout on these idempotent requests.
+    // There is no concurrent recreation here; both DELETEs must eventually be
+    // confirmed with 204, and the final read must still return 404.
+    let request_current = |method: &str| {
+        for id in 1..=3 {
+            let status = c.st(id);
+            if status
+                .executor
+                .as_ref()
+                .is_some_and(|e| e.node == id && e.fenced)
+                && status.local.contains("服务中")
+            {
+                let result = s3_http(&addrs[&id], method, &path, "", b"");
+                if !matches!(result.0, 503 | 504) {
+                    return Some(result);
+                }
+            }
+        }
+        None
+    };
     c.wait("S3 多数派恢复读回", || {
-        s3_http(&addrs[&recovered], "GET", &path, "", b"").2 == b"new"
+        let Some(result) = request_current("GET") else {
+            return false;
+        };
+        assert_eq!(result.0, 200);
+        assert_eq!(result.2, b"new");
+        true
     });
-    assert_eq!(s3_http(&addrs[&recovered], "DELETE", &path, "", b"").0, 204);
-    assert_eq!(s3_http(&addrs[&recovered], "DELETE", &path, "", b"").0, 204);
-    assert_eq!(s3_http(&addrs[&recovered], "GET", &path, "", b"").0, 404);
+    for _ in 0..2 {
+        c.wait("S3 恢复后删除及重复删除", || {
+            let Some(result) = request_current("DELETE") else {
+                return false;
+            };
+            assert_eq!(result.0, 204, "{}", String::from_utf8_lossy(&result.2));
+            true
+        });
+    }
+    c.wait("S3 已删除对象不可见", || {
+        let Some(result) = request_current("GET") else {
+            return false;
+        };
+        assert_eq!(result.0, 404);
+        true
+    });
     c.shutdown();
 }
 

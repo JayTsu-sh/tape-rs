@@ -20,7 +20,7 @@ const REPORT_DENSITY_BUF_LEN: usize = 1024;
 /// RECEIVE DIAGNOSTIC RESULTS 响应缓冲区长度。
 const DIAG_RESULT_BUF_LEN: usize = 4 * 1024;
 /// READ(6) / WRITE(6) transfer length 最大值（CDB 字段 24-bit）。
-const SCSI_6_TRANSFER_MAX: usize = 0xFF_FFFF;
+pub(crate) const SCSI_6_TRANSFER_MAX: usize = 0xFF_FFFF;
 
 /// 校验 SPACE(6) 的 24-bit 有符号 count 范围。
 fn ensure_space_count(count: i32) -> Result<()> {
@@ -338,6 +338,15 @@ impl<'a> TapeDrive<'a> {
     pub fn format(&self, format: u8, verify: bool) -> Result<()> {
         info!("格式化介质（format={}, verify={}）...", format, verify);
         let cdb_bytes = cdb::format_medium(format, false, verify);
+        // IBM GA32-0928-08 §4.2.3/§5.2.1：FORMAT 影响多个分区，
+        // append-only 下须独立的 Format 授权，不能用 Current Position 代替。
+        // 不关闭 append-only；授权前精确核验 BOP0，且不重试该授权。
+        // 调用方仍须保持原来的显式格式化确认、介质身份和独占执行权。
+        if self.append_only_mode()? {
+            self.require_overwrite_position(0, 0)?;
+            self.device
+                .execute_no_data(&cdb::allow_overwrite_format(), 30_000)?;
+        }
         retry_unit_attention("FORMAT MEDIUM", || {
             self.device.execute_no_data(&cdb_bytes, 28_800_000)
         })?;
@@ -432,6 +441,13 @@ impl<'a> TapeDrive<'a> {
 
     /// 一次位置绑定的覆盖授权；不自动重试，调用方必须先核验 PR 与位置。
     pub fn allow_overwrite_current(&self, partition: u8, block: u64) -> Result<()> {
+        self.require_overwrite_position(partition, block)?;
+        self.device
+            .execute_no_data(&cdb::allow_overwrite_current(partition, block), 30_000)?;
+        Ok(())
+    }
+
+    fn require_overwrite_position(&self, partition: u8, block: u64) -> Result<()> {
         let mut position = [0; 20];
         // 覆盖授权的定位证据：UA/复位不能被重试吞掉。
         let got = self
@@ -448,8 +464,6 @@ impl<'a> TapeDrive<'a> {
                 "覆盖授权前位置不精确或不匹配".into(),
             ));
         }
-        self.device
-            .execute_no_data(&cdb::allow_overwrite_current(partition, block), 30_000)?;
         Ok(())
     }
 
@@ -823,7 +837,7 @@ mod monitor_parser_tests {
 
 #[cfg(test)]
 mod partition_count_tests {
-    use super::*;
+    use super::defined_partition_count;
     #[test]
     fn defined_partition_count_checks_header_page_and_descriptors() {
         let mut v = vec![

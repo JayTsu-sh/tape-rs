@@ -173,11 +173,55 @@ fn control_only_snapshot_catchup_restores_owner_permission_without_sqlite_bundle
             ..Default::default()
         })))
         .unwrap();
+    wait(|| statuses[&(3, LIB.into())].lock().unwrap().leader == 3);
+    wait(|| {
+        statuses[&(3, LIB.into())]
+            .lock()
+            .unwrap()
+            .candidates
+            .get(&3)
+            .is_some_and(|candidate| candidate.eligible)
+    });
+    // 健康设备 owner 不随控制 Leader 自动迁移。明确提交正常分配，才能验证
+    // 快照追齐的节点 3 真正取得新轮次、fencing 和后续 Serving ReadIndex 许可。
+    let (previous_round, instance, group, term) = {
+        let status = statuses[&(3, LIB.into())].lock().unwrap();
+        let candidate = &status.candidates[&3];
+        assert!(candidate.eligible);
+        (
+            status.executor.as_ref().unwrap().round,
+            candidate.instance,
+            candidate.group.clone(),
+            status.term,
+        )
+    };
+    let (reply, answer) = mpsc::channel();
+    peers[&3]
+        .send(NodeInput::Library {
+            library: LIB.into(),
+            event: Box::new(NodeInput::Admin {
+                cmd: Command::AssignExecutor {
+                    node: 3,
+                    instance,
+                    term,
+                    expected_round: Some(previous_round),
+                    group,
+                },
+                reply,
+            }),
+        })
+        .unwrap();
+    assert!(matches!(
+        answer.recv_timeout(Duration::from_secs(3)).unwrap(),
+        AdminReply::Ok(_)
+    ));
     wait(|| {
         let s = statuses[&(3, LIB.into())].lock().unwrap();
         s.leader == 3
             && s.executor_ready
-            && s.executor.as_ref().is_some_and(|e| e.node == 3)
+            && s.executor
+                .as_ref()
+                .is_some_and(|e| e.node == 3 && e.fenced && e.round > previous_round)
             && s.local.contains("服务中")
     });
     for id in 1..=3 {

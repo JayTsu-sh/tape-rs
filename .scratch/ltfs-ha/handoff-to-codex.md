@@ -1,3 +1,11 @@
+## 当前集成接续入口（2026-11-07）
+
+历史 WIP 的活动分支是 `integrate/historical-wip-20261106`，工作树 `/work/tmp/tape-wip-integration-20261106`；生产源代码提交 `f6d53f2b07ab593a17e690c2282224c507d80bd1` 已通过软件检查与增量 review，并部署到 207–209 的独立 B605d 环境。本工作树后续文档提交不代表重新部署。`/work/jay/tape-rs` 的原 main 脏内容及其他 worktree 保留，不要覆盖、reset 或当作当前集成源码。
+
+实时进度、原请求和现场状态以 `/work/jay/tape-rs/.scratch/ltfs-ha/handoff-to-codex.md` 末尾及其 `local/handoff-history.md` 为准；此处以下旧记录是历史背景。开始时先按 AGENTS.md 核工作树、分支、HEAD，再读实时交接。独立现场证据目录 `/work/tmp/tape-wip-independent-b-20261106`，软件证据目录 `/work/tmp/tape-wip-integration-evidence-20261106`。旧 one-shot 控制器不可重跑，须先核原 session、原 task_id 与终态。
+
+B 库源 f6 的空84生命周期 `native-lifecycle84-v12-summary.json` 已实际通过；S3合批 `acceptance-batch-optimized-v2.py` 原 session41505 正在执行时，本条写入，只能以原进程及最终 summary 判定。FUSE-v2尚未启动；不要在原合批读写期间并发更改池或停节点/FDB。A/6070已释放，禁止访问；AA0000、8A0043和旧正式磁带仍受保护。当前完整 native reclaim、真实 S4 中断验收、整版最终 review 与 GitHub main 合入尚未完成，不能把局部验收当作全部完成。
+
 # 交接给 Codex（2026-09-24）
 
 最新接续摘要见 [docs/CLAUDE-HANDOFF.md](../../docs/CLAUDE-HANDOFF.md)。2026-09-27 已部署符号链接回收修复并通过 Holo 正式集群回归；下列旧版本和“尚未部署”描述按末尾最新记录更新。

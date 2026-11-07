@@ -52,6 +52,15 @@ pub fn allow_overwrite_current(partition: u8, block: u64) -> [u8; 16] {
     cdb
 }
 
+/// IBM GA32-0928-08 §5.2.1 Table 34：一次 Format 覆盖授权。
+/// 仅供显式格式化流程使用；此类型的 partition/object 字段被设备忽略。
+pub fn allow_overwrite_format() -> [u8; 16] {
+    let mut cdb = [0; 16];
+    cdb[0] = opcode::ALLOW_OVERWRITE;
+    cdb[2] = 2;
+    cdb
+}
+
 /// MODE SENSE(10) 当前值子页，保持既有page0入口字节不变。
 pub fn mode_sense_10_subpage(page: u8, subpage: u8, alloc_len: u16) -> [u8; 10] {
     let mut cdb = mode_sense_10(page, alloc_len);

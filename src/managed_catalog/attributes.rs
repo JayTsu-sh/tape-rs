@@ -42,6 +42,10 @@ impl NodeAttributes {
         if meta.file_uid == 0 {
             return Err(CatalogError::Invalid("LTFS 节点 fileuid 必须大于零"));
         }
+        super::link_kind::classify(&xattrs, symlink.as_deref())?;
+        if super::ee_internal::declared(&xattrs)? && symlink.is_some() {
+            return Err(CatalogError::Invalid("符号链接不能携带 EE 内部目录标记"));
+        }
         let encoded = encode(&meta, &xattrs, symlink.as_deref())?;
         let digest = hash(&encoded);
         Ok(Self {
@@ -56,6 +60,7 @@ impl NodeAttributes {
     }
 
     pub fn from_file(node: &FileNode) -> Result<Self> {
+        super::ee_internal::require_location(&node.xattrs, "", super::NodeKind::File)?;
         Self::new(node.meta.clone(), node.xattrs.clone(), node.symlink.clone())
     }
 
@@ -82,6 +87,69 @@ impl NodeAttributes {
             AttributeStorage::Complete { symlink, .. } => symlink.as_deref(),
             AttributeStorage::External(_) => None,
         }
+    }
+
+    /// 普通内容替换保留逻辑属性，重新分配时间、UID及内容摘要。
+    /// 同时返回原属性编码长度，供整个媒体批次累计读取预算。
+    pub(crate) fn content_replacement(&self) -> Result<(crate::ltfs::volume::FileMetadata, usize)> {
+        let AttributeStorage::Complete {
+            meta,
+            xattrs,
+            encoded,
+            ..
+        } = self.storage.as_ref()
+        else {
+            return Err(CatalogError::Incomplete);
+        };
+        if self.link_kind()? == super::link_kind::LinkKind::Native {
+            return Err(CatalogError::Invalid("普通内容覆盖不能替换原生符号链接"));
+        }
+        let mut replacement = crate::ltfs::volume::FileMetadata::replacement(
+            xattrs
+                .iter()
+                .filter(|attr| attr.key != crate::ltfs::volume::XATTR_VERSION)
+                .cloned()
+                .collect(),
+        );
+        replacement.meta.readonly = meta.readonly;
+        Ok((replacement, encoded.len()))
+    }
+
+    /// Relocating bytes preserves logical timestamps and access flags. Physical
+    /// UID, extents and hashes are supplied by the destination append itself.
+    pub(crate) fn data_relocation(&self) -> Result<(crate::ltfs::volume::FileMetadata, usize)> {
+        let AttributeStorage::Complete {
+            meta,
+            xattrs,
+            encoded,
+            ..
+        } = self.storage.as_ref()
+        else {
+            return Err(CatalogError::Incomplete);
+        };
+        if self.link_kind()? == super::link_kind::LinkKind::Native {
+            return Err(CatalogError::Invalid(
+                "原生符号链接必须作为节点迁移，不能读取其目标",
+            ));
+        }
+        Ok((
+            crate::ltfs::volume::FileMetadata {
+                meta: meta.clone(),
+                xattrs: xattrs
+                    .iter()
+                    .filter(|attr| attr.key != crate::ltfs::volume::XATTR_VERSION)
+                    .cloned()
+                    .collect(),
+            },
+            encoded.len(),
+        ))
+    }
+
+    pub(super) fn link_kind(&self) -> Result<super::link_kind::LinkKind> {
+        super::link_kind::classify(
+            self.xattrs().ok_or(CatalogError::Incomplete)?,
+            self.symlink(),
+        )
     }
 
     pub fn digest(&self) -> [u8; 32] {
@@ -199,6 +267,14 @@ impl NodeAttributes {
         if file_uid == 0 {
             return Err(CatalogError::Corrupt("LTFS 节点属性 fileuid 必须大于零"));
         }
+        super::link_kind::classify(&xattrs, symlink.as_deref())
+            .map_err(|_| CatalogError::Corrupt("LTFS 原生符号链接类型标记无效"))?;
+        if super::ee_internal::declared(&xattrs)
+            .map_err(|_| CatalogError::Corrupt("EE 内部目录归属标记无效"))?
+            && symlink.is_some()
+        {
+            return Err(CatalogError::Corrupt("符号链接携带 EE 内部目录标记"));
+        }
         let meta = NodeMeta {
             readonly,
             creation_time: times.remove(0),
@@ -300,6 +376,88 @@ fn encode(meta: &NodeMeta, xattrs: &[Xattr], symlink: Option<&str>) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_replacement_preserves_attributes_without_reusing_source_identity() {
+        let binary = Xattr {
+            key: "user.binary".into(),
+            value: "AP9B".into(),
+            base64: true,
+        };
+        let attrs = NodeAttributes::new(
+            NodeMeta {
+                readonly: true,
+                file_uid: 99,
+                modify_time: "2020-01-02T03:04:05.000000000Z".into(),
+                ..Default::default()
+            },
+            vec![
+                binary.clone(),
+                Xattr {
+                    key: crate::ltfs::volume::XATTR_VERSION.into(),
+                    value: "17.23".into(),
+                    base64: false,
+                },
+            ],
+            None,
+        )
+        .unwrap();
+        let (replacement, bytes) = attrs.content_replacement().unwrap();
+        assert_eq!(bytes, attrs.bytes().unwrap().len());
+        assert_eq!(replacement.xattrs, vec![binary.clone()]);
+        assert!(replacement.meta.readonly);
+        assert_eq!(replacement.meta.file_uid, 0);
+        assert_ne!(
+            replacement.meta.modify_time,
+            attrs.meta().unwrap().modify_time
+        );
+        assert_eq!(attrs.meta().unwrap().file_uid, 99);
+        assert_eq!(attrs.xattrs().unwrap().len(), 2);
+        let (relocated, bytes) = attrs.data_relocation().unwrap();
+        assert_eq!(bytes, attrs.bytes().unwrap().len());
+        assert_eq!(relocated.meta, *attrs.meta().unwrap());
+        assert_eq!(relocated.xattrs, vec![binary]);
+    }
+
+    #[test]
+    fn content_replacement_rejects_native_links_and_missing_attribute_content() {
+        let meta = NodeMeta {
+            file_uid: 1,
+            ..Default::default()
+        };
+        for markers in [vec![], vec![super::super::link_kind::native_marker()]] {
+            let native =
+                NodeAttributes::new(meta.clone(), markers, Some("missing".into())).unwrap();
+            assert!(matches!(
+                native.content_replacement(),
+                Err(CatalogError::Invalid(_))
+            ));
+            assert!(matches!(
+                native.data_relocation(),
+                Err(CatalogError::Invalid(_))
+            ));
+        }
+        let external = NodeAttributes::from_manifest(AttributeManifest {
+            digest: [1; 32],
+            len: (INLINE_LIMIT + 1) as u32,
+            chunks: (INLINE_LIMIT + 1).div_ceil(CHUNK_SIZE) as u16,
+        })
+        .unwrap();
+        assert!(matches!(
+            external.content_replacement(),
+            Err(CatalogError::Incomplete)
+        ));
+        assert!(matches!(
+            external.data_relocation(),
+            Err(CatalogError::Incomplete)
+        ));
+        let alias = NodeAttributes::new(meta, vec![], Some(".LTFSEE_DATA/body".into())).unwrap();
+        assert!(alias.content_replacement().is_ok());
+        assert_eq!(
+            alias.data_relocation().unwrap().0.meta,
+            *alias.meta().unwrap()
+        );
+    }
 
     #[test]
     fn roundtrip_preserves_exact_ltfs_fields_and_rejects_corruption() {

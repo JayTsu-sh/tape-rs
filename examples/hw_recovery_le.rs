@@ -13,9 +13,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     expected.extend_from_slice(b"LE after barrier VCI recovery\n");
     let s = c.stat(p)?.expect("LE 新文件存在");
     assert_eq!(s.barcode, "RT2502L8");
-    assert_eq!(s.generation, 85);
+    assert_eq!(s.generation, Some(85));
     assert_eq!(s.length, expected.len() as u64);
-    assert_eq!(s.version, (0, 0));
+    assert_eq!(
+        s.version,
+        tape_rs::client::FileVersion::Raft {
+            round: 0,
+            sequence: 0
+        }
+    );
     assert_eq!(c.stat_path(p)?.unwrap().state, "committed");
     assert_eq!(c.get(p)?, expected);
     let mut out = Vec::new();

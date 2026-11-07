@@ -41,7 +41,7 @@ async fn observe(
     element_type: u8,
 ) -> String {
     let at = crate::ltfs::label::ltfs_time_now();
-    let value = json!({"library_serial":serial,"owner":2,"round":owner,"observed_at":at,"volumes":[{"barcode":"TEST01L8","address":address,"element_type":element_type,"medium_type":1,"source_address":null,"home_slot":if element_type==2{Some(1)}else{None}}],"drives":[{"serial":"SIMDRV0000","address":1,"barcode":null}]});
+    let value = json!({"num_of_slots":8,"num_of_ieslots":1,"scsi_vendor_id":"SIM","scsi_product_id":"SIM-CHANGER","scsi_firmware_revision":"0001","library_serial":serial,"owner":2,"round":owner,"observed_at":at,"volumes":[{"barcode":"TEST01L8","address":address,"element_type":element_type,"medium_type":1,"source_address":null,"home_slot":if element_type==2{Some(1)}else{None}}],"drives":[{"serial":"SIMDRV0000","address":1,"barcode":null}]});
     c.record_active_library_inventory(serial, route, owner, &value)
         .await
         .unwrap();

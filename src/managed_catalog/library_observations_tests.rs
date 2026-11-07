@@ -1,7 +1,7 @@
 use super::*;
 
 fn observation(serial: &str, owner: u64) -> Value {
-    json!({"library_serial":serial,"owner":1,"round":owner,"observed_at":"2026-11-05T00:00:00.000000000Z",
+    json!({"num_of_slots":8,"num_of_ieslots":1,"scsi_vendor_id":"SIM","scsi_product_id":"SIM-CHANGER","scsi_firmware_revision":"0001","library_serial":serial,"owner":1,"round":owner,"observed_at":"2026-11-05T00:00:00.000000000Z",
         "volumes":[{"barcode":"A001L8","address":1001,"element_type":2,"medium_type":1,"source_address":null,"home_slot":1},
             {"barcode":"B001L8","address":1002,"element_type":2,"medium_type":null,"source_address":null,"home_slot":2}],
         "drives":[{"serial":"DRIVE-A","address":256,"barcode":null},{"serial":"DRIVE-B","address":257,"barcode":null}]})
@@ -65,6 +65,12 @@ fn inventory_semantics_ignore_order_owner_and_poll_time_but_detect_slot_moves() 
     next["volumes"][1]["home_slot"] = json!(3);
     let moved = input("LIB", 101, &next).unwrap();
     assert_ne!(inventory_view(&first), inventory_view(&moved));
+    let mut descriptor = original.clone();
+    descriptor["scsi_firmware_revision"] = json!("0002");
+    assert_ne!(
+        inventory_view(&first),
+        inventory_view(&input("LIB", 100, &descriptor).unwrap())
+    );
     assert_eq!(
         inventory_view(&first)["num_of_volumes"],
         inventory_view(&moved)["num_of_volumes"]
@@ -75,6 +81,11 @@ fn inventory_rejects_inconsistent_duplicate_unbounded_and_malformed_facts() {
     let original = observation("LIB", 100);
     let mut variants = Vec::new();
     for (path, value) in [
+        ("/num_of_slots", json!(65536)),
+        ("/num_of_ieslots", json!(-1)),
+        ("/scsi_vendor_id", json!("")),
+        ("/scsi_product_id", json!("01234567890123456")),
+        ("/scsi_firmware_revision", json!("bad\n")),
         ("/round", json!(99)),
         ("/owner", json!(0)),
         ("/owner", Value::Null),
@@ -190,7 +201,7 @@ async fn library_observations_are_scoped_deduplicated_fenced_and_atomic_with_eve
     let head = notify_key(ns, &serial, b'h');
     assert_eq!(
         rows(&c, std::slice::from_ref(&head)).await,
-        vec![Some(1u64.to_be_bytes().to_vec())]
+        vec![Some(3u64.to_be_bytes().to_vec())]
     );
     assert_eq!(
         c.active_library_inventory(&serial, route)
@@ -216,7 +227,7 @@ async fn library_observations_are_scoped_deduplicated_fenced_and_atomic_with_eve
         .unwrap();
     assert_eq!(
         rows(&c, std::slice::from_ref(&head)).await,
-        vec![Some(1u64.to_be_bytes().to_vec())]
+        vec![Some(3u64.to_be_bytes().to_vec())]
     );
     let cache = inventory_key(ns, &serial);
     let before = rows(&c, &[cache.clone(), head.clone()]).await;
@@ -234,7 +245,7 @@ async fn library_observations_are_scoped_deduplicated_fenced_and_atomic_with_eve
         .unwrap();
     assert_eq!(
         rows(&c, std::slice::from_ref(&head)).await,
-        vec![Some(2u64.to_be_bytes().to_vec())]
+        vec![Some(6u64.to_be_bytes().to_vec())]
     );
     next["volumes"].as_array_mut().unwrap().reverse();
     next["drives"].as_array_mut().unwrap().reverse();
@@ -243,7 +254,7 @@ async fn library_observations_are_scoped_deduplicated_fenced_and_atomic_with_eve
         .unwrap();
     assert_eq!(
         rows(&c, std::slice::from_ref(&head)).await,
-        vec![Some(2u64.to_be_bytes().to_vec())]
+        vec![Some(6u64.to_be_bytes().to_vec())]
     );
     next = input(&serial, current, &next)
         .map(|v| json_value(&v))
@@ -382,7 +393,8 @@ async fn library_observations_are_scoped_deduplicated_fenced_and_atomic_with_eve
     );
     assert_eq!(
         rows(&c, std::slice::from_ref(&head)).await,
-        vec![Some(7u64.to_be_bytes().to_vec())]
+        // Inventory changes also emit per-tape state and location events.
+        vec![Some(13u64.to_be_bytes().to_vec())]
     );
     let keys = vec![cache.clone(), monitor_key(ns, &serial), head.clone()];
     let before = rows(&c, &keys).await;
@@ -540,7 +552,7 @@ async fn library_observations_are_scoped_deduplicated_fenced_and_atomic_with_eve
         .notify_batch(&serial, route, "audit", generation)
         .await
         .unwrap();
-    assert_eq!(batch["through"], 9);
+    assert_eq!(batch["through"], 15);
     assert_eq!(batch["events"].as_array().unwrap().len(), 9);
     assert_eq!(
         batch["events"]
@@ -558,12 +570,18 @@ async fn library_observations_are_scoped_deduplicated_fenced_and_atomic_with_eve
             .iter()
             .all(|e| e["injected"] == false && e["library"] == serial)
     );
+    let inventory_events = batch["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["event_type"] == INVENTORY_EVENT)
+        .collect::<Vec<_>>();
     assert_eq!(
-        batch["events"][0]["data"]["current"]["num_of_volumes"],
-        batch["events"][1]["data"]["current"]["num_of_volumes"]
+        inventory_events[0]["data"]["current"]["num_of_volumes"],
+        inventory_events[1]["data"]["current"]["num_of_volumes"]
     );
     assert_ne!(
-        batch["events"][0]["data"]["current"]["snapshot_sha256"],
-        batch["events"][1]["data"]["current"]["snapshot_sha256"]
+        inventory_events[0]["data"]["current"]["snapshot_sha256"],
+        inventory_events[1]["data"]["current"]["snapshot_sha256"]
     );
 }

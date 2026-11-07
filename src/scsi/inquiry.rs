@@ -62,7 +62,25 @@ pub struct InquiryStandard {
 pub fn standard_inquiry(dev: &dyn TapeTransport) -> Result<InquiryStandard> {
     let cdb_bytes = cdb::inquiry(96);
     let mut buf = [0u8; 96];
-    dev.execute_read(&cdb_bytes, &mut buf, 10_000)?;
+    let result = dev.execute_read(&cdb_bytes, &mut buf, 10_000)?;
+    if result.transferred < 36 || result.transferred > buf.len() {
+        return Err(crate::error::TapeError::InvalidResponse {
+            expected: 36,
+            actual: result.transferred,
+        });
+    }
+    let declared = 5 + usize::from(buf[4]);
+    if declared < 36 || result.transferred < declared.min(buf.len()) {
+        return Err(crate::error::TapeError::InvalidResponse {
+            expected: declared.max(36).min(buf.len()),
+            actual: result.transferred,
+        });
+    }
+    if buf[0] & 0xe0 != 0 || !buf[8..36].iter().all(|b| (0x20..=0x7e).contains(b)) {
+        return Err(crate::error::TapeError::Refused {
+            reason: "标准 INQUIRY 的设备限定符或描述字段无效".into(),
+        });
+    }
     Ok(InquiryStandard {
         peripheral_type: buf[0] & 0x1F,
         vendor: String::from_utf8_lossy(&buf[8..16]).trim().to_string(),
@@ -118,6 +136,82 @@ pub fn read_unit_serial(dev: &dyn TapeTransport) -> Option<String> {
 #[cfg(test)]
 mod fc_port_tests {
     use super::*;
+
+    #[test]
+    fn standard_inquiry_checks_transferred_declared_size_and_descriptor_bytes() {
+        struct Reply {
+            transferred: usize,
+            additional: u8,
+            invalid_text: bool,
+        }
+        impl TapeTransport for Reply {
+            fn identity(&self) -> &str {
+                "inquiry-fixture"
+            }
+            fn execute_no_data(&self, _: &[u8], _: u32) -> Result<crate::scsi::device::ScsiResult> {
+                unreachable!()
+            }
+            fn execute_write(
+                &self,
+                _: &[u8],
+                _: &[u8],
+                _: u32,
+            ) -> Result<crate::scsi::device::ScsiResult> {
+                unreachable!()
+            }
+            fn execute_read(
+                &self,
+                _: &[u8],
+                out: &mut [u8],
+                _: u32,
+            ) -> Result<crate::scsi::device::ScsiResult> {
+                out.fill(0);
+                out[0] = 8;
+                out[4] = self.additional;
+                out[8..16].copy_from_slice(b"IBM     ");
+                out[16..32].copy_from_slice(b"3573-TL         ");
+                out[32..36].copy_from_slice(b"0001");
+                if self.invalid_text {
+                    out[8] = 0;
+                }
+                Ok(crate::scsi::device::ScsiResult {
+                    status: 0,
+                    sense: crate::scsi::sense::SenseInfo::from_bytes(&[]),
+                    transferred: self.transferred,
+                    duration_ms: 0,
+                })
+            }
+        }
+        for transferred in [0, 4, 5, 31, 35, 36, 95, 96, 97] {
+            for additional in [0, 30, 31, 91, 255] {
+                let expected = transferred <= 96
+                    && additional >= 31
+                    && transferred >= (usize::from(additional) + 5).min(96);
+                let result = standard_inquiry(&Reply {
+                    transferred,
+                    additional,
+                    invalid_text: false,
+                });
+                assert_eq!(
+                    result.is_ok(),
+                    expected,
+                    "transferred={transferred}, additional={additional}"
+                );
+                if let Ok(value) = result {
+                    assert_eq!(value.product, "3573-TL");
+                    assert_eq!(value.peripheral_type, 8);
+                }
+            }
+        }
+        assert!(
+            standard_inquiry(&Reply {
+                transferred: 96,
+                additional: 91,
+                invalid_text: true
+            })
+            .is_err()
+        );
+    }
 
     #[test]
     fn fc_wwpn_requires_a_nonzero_exact_identifier() {

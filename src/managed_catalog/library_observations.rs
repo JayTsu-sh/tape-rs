@@ -41,6 +41,11 @@ struct Observation {
     observed_at: String,
     volumes: Vec<Volume>,
     drives: Vec<Drive>,
+    num_of_slots: u16,
+    num_of_ieslots: u16,
+    scsi_vendor_id: String,
+    scsi_product_id: String,
+    scsi_firmware_revision: String,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -90,6 +95,18 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 }
 fn normalize(value: &mut Observation, serial: &str, owner: u64) -> Result<()> {
     validate_physical_serial(serial)?;
+    for (text, limit, required) in [
+        (&value.scsi_vendor_id, 8, true),
+        (&value.scsi_product_id, 16, true),
+        (&value.scsi_firmware_revision, 4, false),
+    ] {
+        if (required && text.is_empty())
+            || text.len() > limit
+            || !text.bytes().all(|b| (0x20..=0x7e).contains(&b))
+        {
+            return Err(CatalogError::Invalid("带库 INQUIRY 描述字段无效"));
+        }
+    }
     if value.library_serial != serial
         || owner == 0
         || owner > MAX_OWNER_EPOCH
@@ -171,8 +188,22 @@ fn input(serial: &str, owner: u64, value: &Value) -> Result<Observation> {
             "observed_at",
             "volumes",
             "drives",
+            "num_of_slots",
+            "num_of_ieslots",
+            "scsi_vendor_id",
+            "scsi_product_id",
+            "scsi_firmware_revision",
         ],
-    ) || volumes.len() > MAX_ITEMS
+    ) || !number(&value["num_of_slots"], u16::MAX.into())
+        || !number(&value["num_of_ieslots"], u16::MAX.into())
+        || [
+            ("scsi_vendor_id", 8),
+            ("scsi_product_id", 16),
+            ("scsi_firmware_revision", 4),
+        ]
+        .iter()
+        .any(|(key, limit)| value[*key].as_str().is_none_or(|s| s.len() > *limit))
+        || volumes.len() > MAX_ITEMS
         || drives.len() > MAX_ITEMS
         || !number(&value["owner"], u64::MAX)
         || !number(&value["round"], u64::MAX)
@@ -213,7 +244,10 @@ fn input(serial: &str, owner: u64, value: &Value) -> Result<Observation> {
     Ok(observation)
 }
 fn inventory_view(observation: &Observation) -> Value {
-    let physical = json!({"volumes":observation.volumes,"drives":observation.drives});
+    let physical = json!({"volumes":observation.volumes,"drives":observation.drives,
+        "num_of_slots":observation.num_of_slots,"num_of_ieslots":observation.num_of_ieslots,
+        "scsi_vendor_id":observation.scsi_vendor_id,"scsi_product_id":observation.scsi_product_id,
+        "scsi_firmware_revision":observation.scsi_firmware_revision});
     json!({"num_of_volumes":observation.volumes.len(),"num_of_drives":observation.drives.len(),
         "snapshot_sha256":format!("{:x}",Sha256::digest(physical.to_string()))})
 }
@@ -345,6 +379,54 @@ pub(super) async fn rescan_result_at(
     Ok(result)
 }
 
+pub(super) async fn record_inventory_at(
+    tr: &Transaction,
+    serial: &str,
+    ns: Uuid,
+    owner: u64,
+    value: &Value,
+) -> Result<()> {
+    let observation = input(serial, owner, value)?;
+    let record = InventoryRecord {
+        version: 1,
+        namespace: ns.to_string(),
+        owner_epoch: owner,
+        observation,
+    };
+    let raw = encode(&record)?;
+    let old = inventory_at(tr, ns, serial).await?;
+    let before = old.as_ref().map(|r| inventory_view(&r.observation));
+    notifications::changed_at(
+        tr,
+        ns,
+        serial,
+        INVENTORY_ENTITY,
+        INVENTORY_EVENT,
+        before.as_ref(),
+        inventory_view(&record.observation),
+    )
+    .await?;
+    tr.set(&inventory_key(ns, serial), &raw);
+    let mut names = std::collections::BTreeSet::new();
+    for observation in [
+        old.as_ref().map(|r| json_value(&r.observation)),
+        Some(value.clone()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for v in observation["volumes"].as_array().into_iter().flatten() {
+            if let Some(name) = v["barcode"].as_str() {
+                names.insert(name.to_owned());
+            }
+        }
+    }
+    for name in names {
+        notifications::tape_changed_at(tr, ns, serial, &name, "inventory_observed").await?;
+    }
+    Ok(())
+}
+
 impl ManagedCatalog {
     /// Persist one complete observation from a current, externally guarded owner.
     /// Identical physical inventory updates its timestamp without another event.
@@ -355,36 +437,14 @@ impl ManagedCatalog {
         owner: u64,
         value: &Value,
     ) -> Result<()> {
-        let observation = input(serial, owner, value)?;
-        let record = InventoryRecord {
-            version: 1,
-            namespace: route.route.namespace.to_string(),
-            owner_epoch: owner,
-            observation,
-        };
-        let raw = encode(&record)?;
-        let record = &record;
-        let raw = raw.as_slice();
+        input(serial, owner, value)?;
         self.db
             .run(|tr, _| async move {
                 requests::retry_result(
                     async {
                         let ns = routing::require_runtime_active_owner(&tr, serial, route, owner)
                             .await?;
-                        let old = inventory_at(&tr, ns, serial).await?;
-                        let before = old.as_ref().map(|r| inventory_view(&r.observation));
-                        notifications::changed_at(
-                            &tr,
-                            ns,
-                            serial,
-                            INVENTORY_ENTITY,
-                            INVENTORY_EVENT,
-                            before.as_ref(),
-                            inventory_view(&record.observation),
-                        )
-                        .await?;
-                        tr.set(&inventory_key(ns, serial), raw);
-                        Ok(())
+                        record_inventory_at(&tr, serial, ns, owner, value).await
                     }
                     .await,
                 )

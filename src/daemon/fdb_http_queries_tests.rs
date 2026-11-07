@@ -110,6 +110,7 @@ async fn run_queries(cluster: &str) {
         catalog: catalog.clone(),
         routes: BTreeMap::from([(serial.clone(), route)]),
         owner: None,
+        upload_budget: None,
         notify_streams: Arc::new(Semaphore::new(1)),
         notify_requests: Arc::new(Semaphore::new(1)),
         admin_requests: Arc::new(Semaphore::new(32)),
@@ -174,7 +175,7 @@ async fn run_queries(cluster: &str) {
     }
     let observed_at = crate::ltfs::label::ltfs_time_now();
     let physical=(0..105).rev().map(|i|json!({"barcode":format!("T{i:03}L8"),"address":1001+i,"element_type":2,"medium_type":1,"source_address":null,"home_slot":i+1})).collect::<Vec<_>>();
-    let observation = json!({"library_serial":serial,"owner":2,"round":epoch,"observed_at":observed_at,"volumes":physical,"drives":[{"serial":"SIMDRV0000","address":1,"barcode":null}]});
+    let observation = json!({"num_of_slots":8,"num_of_ieslots":1,"scsi_vendor_id":"SIM","scsi_product_id":"SIM-CHANGER","scsi_firmware_revision":"0001","library_serial":serial,"owner":2,"round":epoch,"observed_at":observed_at,"volumes":physical,"drives":[{"serial":"SIMDRV0000","address":1,"barcode":null}]});
     catalog
         .record_active_library_inventory(&serial, route, epoch, &observation)
         .await
@@ -428,6 +429,7 @@ async fn run_queries(cluster: &str) {
     let owner_ctx = Arc::new(Context {
         catalog: catalog.clone(),
         routes: BTreeMap::from([(serial.clone(), route)]),
+        upload_budget: None,
         owner: Some(OwnerRuntime {
             libraries: BTreeMap::from([(serial.clone(), http)]),
             peers: HashMap::from([
@@ -563,6 +565,7 @@ async fn run_queries(cluster: &str) {
         catalog: Arc::new(ManagedCatalog::open(Some(fail_path.to_str().unwrap())).unwrap()),
         routes: BTreeMap::from([(serial.clone(), route)]),
         owner: None,
+        upload_budget: None,
         notify_streams: Arc::new(Semaphore::new(1)),
         notify_requests: Arc::new(Semaphore::new(1)),
         admin_requests: Arc::new(Semaphore::new(32)),

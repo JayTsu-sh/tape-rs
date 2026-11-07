@@ -59,7 +59,7 @@ fn require_request(
     Ok(())
 }
 async fn original(tr: &Transaction, serial: &str, request: &ManagementRequest) -> Result<Value> {
-    let task = read_task(
+    let task = read_task_at(
         tr,
         request.namespace(),
         serial,
@@ -200,7 +200,7 @@ impl ManagedCatalog {
                 }
                 write_task(&tr, request, &task).await?;
                 Ok(task)
-            }.await)
+            }.await.map_err(notifications::atomic_error))
         }).await?
     }
     /// Persist command intent and recheck pinned pool/assignment before every stage.
@@ -248,7 +248,8 @@ impl ManagedCatalog {
                         write_task(&tr, request, &task).await?;
                         Ok(task)
                     }
-                    .await,
+                    .await
+                    .map_err(notifications::atomic_error),
                 )
             })
             .await?
@@ -278,7 +279,8 @@ impl ManagedCatalog {
                         write_task(&tr, request, &task).await?;
                         Ok(task)
                     }
-                    .await,
+                    .await
+                    .map_err(notifications::atomic_error),
                 )
             })
             .await?
@@ -341,20 +343,21 @@ impl ManagedCatalog {
                         write_task(&tr, request, &task).await?;
                         Ok(task)
                     }
-                    .await,
+                    .await
+                    .map_err(notifications::atomic_error),
                 )
             })
             .await?
     }
-    /// Device proof is the exact complete, empty generation reread after format;
-    /// no index-readiness or imported file heads are fabricated by assignment.
+    /// Publish the exact captured empty baseline with assignment and the original
+    /// terminal receipt. Nothing is writable before this transaction commits.
     pub async fn complete_media_assign(
         &self,
         serial: &str,
         route: ActiveLibraryRoute,
         owner: u64,
         request: &ManagementRequest,
-        index: ActiveIndexIdentity,
+        source: &NativeMediaSource,
         captured_at: &str,
     ) -> Result<Value> {
         require_request(serial, route, request)?;
@@ -364,6 +367,13 @@ impl ManagedCatalog {
                 .expect("volume"),
         )
         .expect("validated volume");
+        let head = source.identity.head();
+        let index: ActiveIndexIdentity = head.into();
+        if source.files != 0 || source.paths != 0 || !source.identity.predecessors().is_empty() {
+            return Err(CatalogError::Invalid(
+                "分配基线必须是完整且无文件的真实索引来源",
+            ));
+        }
         if index.volume_uuid != volume
             || index.generation != 1
             || index.incremental
@@ -380,6 +390,11 @@ impl ManagedCatalog {
                             .await?;
                         let mut task = original(&tr, serial, request).await?;
                         if !matches!(task["status"].as_str(), Some("queued" | "running")) {
+                            if task["status"] == "succeeded"
+                                && task["result"]["source"] != native_media::source_value(source)
+                            {
+                                return Err(CatalogError::Invalid("分配成功回执与原索引来源不符"));
+                            }
                             return Ok(task);
                         }
                         let (_, mut execution) = owned(&tr, serial, ns, owner, request).await?;
@@ -421,6 +436,23 @@ impl ManagedCatalog {
                             library_serial: serial.into(),
                             barcode: execution.plan.barcode.clone(),
                         };
+                        let scan = VolumeScan {
+                            generation: index.generation,
+                            id: request.operation(),
+                        };
+                        for key in [
+                            scan_key(volume, scan.id),
+                            source_key(volume, scan.id),
+                            native_media::assigned_base_key(ns, volume),
+                        ] {
+                            if tr.get(&key, false).await?.is_some() {
+                                return Err(CatalogError::Corrupt("分配基线目标已存在"));
+                            }
+                        }
+                        let revision = source_revision(&tr, ns)
+                            .await?
+                            .checked_add(1)
+                            .ok_or(CatalogError::Corrupt("分配来源修订号溢出"))?;
                         tr.set(&placement_key(volume), &encode_placement(&placement));
                         tr.set(&barcode_key(serial, &placement.barcode), volume.as_bytes());
                         tr.set(
@@ -431,11 +463,26 @@ impl ManagedCatalog {
                             &namespace_assignment_key(ns, pool_id, serial, &placement.barcode),
                             &encode_namespace_assignment(serial, &placement.barcode),
                         );
-                        tr.set(&unavailable_volume_key(ns, volume), &[]);
+                        tr.set(
+                            &ready_volume_key(volume),
+                            &encode_ready_volume(scan, serial),
+                        );
+                        tr.set(
+                            &scan_key(volume, scan.id),
+                            &encode_scan_manifest(scan, serial, ScanState::Ready),
+                        );
+                        tr.set(
+                            &source_key(volume, scan.id),
+                            &index_evidence::encode_source(&source.identity, source.files),
+                        );
+                        tr.set(&source_revision_key(ns), &revision.to_be_bytes());
+                        tr.set(&native_media::assigned_base_key(ns, volume), b"/");
+                        tr.clear(&unavailable_volume_key(ns, volume));
                         result["barcode"] = json!(placement.barcode);
                         result["pool"] = json!(pool_id.to_string());
                         result["volume"] = json!(volume.to_string());
-                        result["index_imported"] = json!(false);
+                        result["index_imported"] = json!(true);
+                        result["source"] = native_media::source_value(source);
                         result["index_sha256"] = json!(
                             index
                                 .sha256
@@ -451,10 +498,26 @@ impl ManagedCatalog {
                         execution.error = None;
                         task["execution"] = execution.value();
                         write_task(&tr, request, &task).await?;
+                        native_device::record_native_assign_home_at(
+                            &tr,
+                            request,
+                            volume,
+                            execution.plan.home_address,
+                        );
                         finish(&tr, serial, request);
+                        namespace_visibility::publish(&tr, ns);
+                        notifications::tape_changed_at(
+                            &tr,
+                            ns,
+                            serial,
+                            &execution.plan.barcode,
+                            "assign_completed",
+                        )
+                        .await?;
                         Ok(task)
                     }
-                    .await,
+                    .await
+                    .map_err(notifications::atomic_error),
                 )
             })
             .await?

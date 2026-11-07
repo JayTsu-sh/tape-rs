@@ -2,6 +2,7 @@
 //! FDB imports may resume from a path cursor, but must compare the complete
 //! source digest with the imported namespace before making it visible.
 
+use crate::ltfs::recovery::{CapturedIndexSource, IndexSourceIdentity};
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::os::unix::fs::PermissionsExt;
@@ -88,6 +89,7 @@ pub struct ImportSpool {
     stats: ImportSpoolStats,
     candidates: ImportCandidateStats,
     source: ExpectedIndex,
+    identity: IndexSourceIdentity,
 }
 
 struct StoredManifest {
@@ -102,6 +104,7 @@ struct StoredManifest {
     rows: Vec<u8>,
     candidate_count: String,
     candidate_rows: Vec<u8>,
+    identity: Vec<u8>,
 }
 
 impl ImportSpool {
@@ -135,6 +138,62 @@ impl ImportSpool {
         path: &Path,
         expected: ExpectedIndex,
     ) -> Result<ImportSpoolStats> {
+        Self::build_inner(input, path, expected, None)
+    }
+
+    fn build_inner<R: Read>(
+        input: R,
+        path: &Path,
+        expected: ExpectedIndex,
+        storage: Option<&mut crate::local_read_storage::CacheBuild>,
+    ) -> Result<ImportSpoolStats> {
+        Self::build_entries(path, expected, storage, |emit| {
+            let mut hashed = HashingRead {
+                inner: input,
+                sha: Sha256::new(),
+            };
+            let index = LtfsIndex::scan_full_reader(BufReader::new(&mut hashed), emit)?;
+            let sha256 = hashed.sha.finalize().into();
+            let identity = IndexSourceIdentity::new(
+                crate::ltfs::volume::CommittedIndexConstruct {
+                    volume_uuid: index.volume_uuid,
+                    generation: index.generation,
+                    location: index.self_location,
+                    sha256,
+                    incremental: false,
+                },
+                Vec::new(),
+            )?;
+            Ok((index, identity))
+        })
+    }
+
+    pub(crate) fn build_captured(
+        source: &CapturedIndexSource,
+        path: &Path,
+        storage: &mut crate::local_read_storage::CacheBuild,
+    ) -> Result<ImportSpoolStats> {
+        let head = source.construct();
+        let expected = ExpectedIndex {
+            volume_uuid: head.volume_uuid,
+            generation: head.generation,
+            location: head.location,
+            sha256: head.sha256,
+        };
+        Self::build_entries(path, expected, Some(storage), |emit| {
+            source.for_each_entry(emit)?;
+            Ok((source.header().clone(), source.identity()?))
+        })
+    }
+
+    fn build_entries(
+        path: &Path,
+        expected: ExpectedIndex,
+        mut storage: Option<&mut crate::local_read_storage::CacheBuild>,
+        produce: impl FnOnce(
+            &mut dyn FnMut(IndexEntry) -> Result<()>,
+        ) -> Result<(LtfsIndex, IndexSourceIdentity)>,
+    ) -> Result<ImportSpoolStats> {
         if path.exists() {
             return Err(TapeError::Catalog(format!(
                 "LTFS 导入清单已存在: {}",
@@ -160,7 +219,7 @@ impl ImportSpool {
         conn.execute_batch(
             "PRAGMA journal_mode=DELETE;
              PRAGMA synchronous=FULL;
-             PRAGMA user_version=3;
+             PRAGMA user_version=4;
              CREATE TABLE manifest (
                id INTEGER PRIMARY KEY CHECK(id=1),
                volume_uuid TEXT NOT NULL, generation TEXT NOT NULL,
@@ -168,7 +227,7 @@ impl ImportSpool {
                source_sha256 BLOB NOT NULL, files TEXT NOT NULL,
                directories TEXT NOT NULL, max_attribute_bytes TEXT NOT NULL,
                rows_sha256 BLOB NOT NULL,
-               candidate_count TEXT NOT NULL, candidate_sha256 BLOB NOT NULL
+               candidate_count TEXT NOT NULL, candidate_sha256 BLOB NOT NULL, identity BLOB NOT NULL
              );
              CREATE TABLE nodes (
                path TEXT PRIMARY KEY, uid TEXT NOT NULL UNIQUE,
@@ -189,14 +248,11 @@ impl ImportSpool {
             max_attribute_bytes: 0,
             rows_sha256: [0; 32],
         };
-        let mut hashed = HashingRead {
-            inner: input,
-            sha: Sha256::new(),
-        };
         let mut ee_alias_seen = false;
         let mut ee_internal_seen = false;
         let mut ee_data_dir_seen = false;
-        let index = LtfsIndex::scan_full_reader(BufReader::new(&mut hashed), |entry| {
+        let mut ee_owned_seen = false;
+        let (index, identity) = produce(&mut |entry| {
             let (path, kind, length, attributes) = match entry {
                 IndexEntry::File { path, node } => {
                     ContentDigest::from_ltfs_xattrs(&node.xattrs)
@@ -224,9 +280,26 @@ impl ImportSpool {
                 }
             };
             validate_path(&path)?;
-            if let Some(target) = attributes.symlink()
-                && target.contains(".LTFSEE_DATA/")
+            ee_owned_seen |= super::ee_internal::require_location(
+                attributes.xattrs().expect("complete source attributes"),
+                &path,
+                kind,
+            )
+            .map_err(|e| TapeError::Catalog(e.to_string()))?;
+
+            if let Some(storage) = storage.as_deref_mut() {
+                storage.admit(
+                    &conn,
+                    &temp,
+                    path.len() + attributes.bytes().map_or(0, |b| b.len()) + 256,
+                )?;
+            }
+            if attributes
+                .link_kind()
+                .map_err(|e| TapeError::Catalog(e.to_string()))?
+                == super::link_kind::LinkKind::EeAlias
             {
+                let target = attributes.symlink().expect("classified EE alias");
                 resolve_ee_alias_target(&path, target)?;
                 ee_alias_seen = true;
             }
@@ -261,11 +334,15 @@ impl ImportSpool {
             }
             Ok(())
         })?;
-        let source_sha256: [u8; 32] = hashed.sha.finalize().into();
+        let source_head = identity.head();
         if index.volume_uuid != expected.volume_uuid
             || index.generation != expected.generation
             || index.self_location != expected.location
-            || source_sha256 != expected.sha256
+            || source_head.volume_uuid != expected.volume_uuid
+            || source_head.generation != expected.generation
+            || source_head.location != expected.location
+            || source_head.sha256 != expected.sha256
+            || source_head.incremental != index.incremental
         {
             return Err(TapeError::Catalog(
                 "LTFS 导入清单的索引身份或原文摘要不符".into(),
@@ -273,6 +350,15 @@ impl ImportSpool {
         }
         let root = NodeAttributes::new(index.root.meta, index.root.xattrs, None)
             .map_err(|e| TapeError::Catalog(e.to_string()))?;
+        super::ee_internal::require_location(
+            root.xattrs().expect("complete root attributes"),
+            "",
+            NodeKind::Directory,
+        )
+        .map_err(|e| TapeError::Catalog(e.to_string()))?;
+        if let Some(storage) = storage.as_deref_mut() {
+            storage.admit(&conn, &temp, root.bytes().map_or(0, |b| b.len()) + 256)?;
+        }
         insert_node(&conn, "", NodeKind::Directory, None, &root)?;
         stats.directories = stats
             .directories
@@ -282,7 +368,8 @@ impl ImportSpool {
             .max_attribute_bytes
             .max(root.bytes().unwrap().len() as u64);
         drop(root);
-        if ee_internal_seen != ee_alias_seen || ee_alias_seen != ee_data_dir_seen {
+        let ee_confirmed = ee_alias_seen || ee_owned_seen;
+        if ee_internal_seen != ee_confirmed || ee_confirmed != ee_data_dir_seen {
             return Err(TapeError::Catalog(
                 "无法确认 .LTFSEE_DATA 为 EE 内部数据目录".into(),
             ));
@@ -300,17 +387,22 @@ impl ImportSpool {
         stats.rows_sha256 = checked.rows_sha256;
         let candidates = digest_candidates(&conn)?;
         conn.execute(
-            "INSERT INTO manifest(id,volume_uuid,generation,partition,start_block,source_sha256,files,directories,max_attribute_bytes,rows_sha256,candidate_count,candidate_sha256)
-             VALUES (1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            "INSERT INTO manifest(id,volume_uuid,generation,partition,start_block,source_sha256,files,directories,max_attribute_bytes,rows_sha256,candidate_count,candidate_sha256,identity)
+             VALUES (1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             params![
                 expected.volume_uuid.to_string(), expected.generation.to_string(),
                 expected.location.partition.to_string(), expected.location.start_block.to_string(),
                 &expected.sha256[..], stats.files.to_string(), stats.directories.to_string(),
                 stats.max_attribute_bytes.to_string(), &stats.rows_sha256[..],
-                candidates.entries.to_string(), &candidates.rows_sha256[..],
+                candidates.entries.to_string(), &candidates.rows_sha256[..],identity.to_bytes(),
             ],
         )?;
         conn.execute_batch("COMMIT;")?;
+        if let Some(storage) = storage {
+            storage.admit(&conn, &temp, 4096)?;
+            storage.finish()?;
+        }
+
         drop(conn);
         File::open(&temp)?.sync_all()?;
         fs::hard_link(&temp, path)?;
@@ -325,19 +417,19 @@ impl ImportSpool {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         let version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version != 3 {
+        if version != 4 {
             return Err(TapeError::Catalog(format!(
                 "LTFS 导入清单版本 {version} 不受支持"
             )));
         }
         let row: Option<StoredManifest> = conn.query_row(
-            "SELECT volume_uuid,generation,partition,start_block,source_sha256,files,directories,max_attribute_bytes,rows_sha256,candidate_count,candidate_sha256 FROM manifest WHERE id=1",
+            "SELECT volume_uuid,generation,partition,start_block,source_sha256,files,directories,max_attribute_bytes,rows_sha256,candidate_count,candidate_sha256,identity FROM manifest WHERE id=1",
             [],
             |r| Ok(StoredManifest {
                 volume: r.get(0)?, generation: r.get(1)?, partition: r.get(2)?,
                 block: r.get(3)?, source: r.get(4)?, files: r.get(5)?,
                 directories: r.get(6)?, max_attributes: r.get(7)?, rows: r.get(8)?,
-                candidate_count: r.get(9)?, candidate_rows: r.get(10)?,
+                candidate_count: r.get(9)?, candidate_rows: r.get(10)?,identity:r.get(11)?,
             }),
         ).optional()?;
         let Some(StoredManifest {
@@ -352,6 +444,7 @@ impl ImportSpool {
             rows,
             candidate_count,
             candidate_rows,
+            identity,
         }) = row
         else {
             return Err(TapeError::Catalog("LTFS 导入清单未完成".into()));
@@ -363,6 +456,15 @@ impl ImportSpool {
             || source.as_slice() != expected.sha256
         {
             return Err(TapeError::Catalog("LTFS 导入清单来源不匹配".into()));
+        }
+        let identity = IndexSourceIdentity::from_bytes(&identity)?;
+        let head = identity.head();
+        if head.volume_uuid != expected.volume_uuid
+            || head.generation != expected.generation
+            || head.location != expected.location
+            || head.sha256 != expected.sha256
+        {
+            return Err(TapeError::Catalog("清单来源身份与原文摘要不符".into()));
         }
         let rows_sha256: [u8; 32] = rows
             .try_into()
@@ -391,6 +493,7 @@ impl ImportSpool {
                 rows_sha256: candidate_sha256,
             },
             source: expected,
+            identity,
         };
         spool.verify_all()?;
         Ok(spool)
@@ -404,6 +507,10 @@ impl ImportSpool {
         self.candidates
     }
 
+    pub fn identity(&self) -> &IndexSourceIdentity {
+        &self.identity
+    }
+
     pub fn source(&self) -> ExpectedIndex {
         self.source
     }
@@ -412,6 +519,7 @@ impl ImportSpool {
     /// the same files before their index identity is recorded in FDB. The
     /// inventory contains directories too; the extent cache intentionally does not.
     pub fn verify_extent_cache(&self, cache: &VolumeExtentCache) -> Result<()> {
+        cache.verify_source(&self.identity)?;
         // All three cursors use the existing SQLite TEXT UID indexes. Keep one
         // node/file at a time, and retain each cached file's extent proof check.
         let mut stmt = self
@@ -557,7 +665,15 @@ impl ImportSpool {
         if logical.kind != NodeKind::File {
             return Err(TapeError::Catalog("LTFS 数据来源不是文件".into()));
         }
-        let data = if let Some(target) = logical.attributes.symlink() {
+        let kind = logical
+            .attributes
+            .link_kind()
+            .map_err(|e| TapeError::Catalog(e.to_string()))?;
+        if kind == super::link_kind::LinkKind::Native {
+            return Err(TapeError::Catalog("原生符号链接没有数据载荷".into()));
+        }
+        let data = if kind == super::link_kind::LinkKind::EeAlias {
+            let target = logical.attributes.symlink().expect("classified EE alias");
             let path = resolve_ee_alias_target(&logical.path, target)?;
             let data = self
                 .node_by_path(&path)?
@@ -1010,8 +1126,189 @@ mod tests {
     use crate::ltfs::index::{DirectoryNode, FileNode, NodeMeta, XATTR_MD5, Xattr};
     use std::io::{BufWriter, Write};
 
+    #[test]
+    fn captured_incremental_cache_and_spool_bind_the_complete_historical_source() {
+        use crate::local_read_storage::{CacheBuild, ReadStorageBudget};
+        use crate::ltfs::mkltfs::{MkltfsOptions, mkltfs};
+        use crate::ltfs::recovery::{
+            IndexSourceScope, RecoveryBudget, capture_index_source, capture_recorded_index_source,
+            verify_recorded_source_constructs,
+        };
+        use crate::ltfs::volume::{LtfsVolume, read_label_only};
+        use crate::scsi::sim::{LogicalObject, SimCartridge, SimLibrary};
+
+        let library = SimLibrary::new(1, 2, 1);
+        let barcode = "CAPTUREL8";
+        library
+            .insert_cartridge(SimCartridge::blank(barcode, 64 << 20), 0)
+            .unwrap();
+        library.load_into_drive(barcode, 0).unwrap();
+        let device = library.drive(0);
+        mkltfs(
+            &device,
+            &MkltfsOptions {
+                volume_id: "SOURCE".into(),
+                block_size: 64 * 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut volume = LtfsVolume::mount(&device).unwrap();
+        volume
+            .append_file_with_xattrs(
+                "/baseline",
+                &mut b"kept".as_slice(),
+                &[("private", "original-attribute")],
+            )
+            .unwrap();
+        volume.commit().unwrap();
+        volume
+            .append_file("/deleted", &mut b"gone".as_slice())
+            .unwrap();
+        volume.commit_incremental().unwrap();
+        volume.remove_file("/deleted").unwrap();
+        volume
+            .append_file("/latest", &mut b"latest".as_slice())
+            .unwrap();
+        volume.commit_incremental().unwrap();
+        let head = volume.committed_index_construct();
+        drop(volume);
+        let base = std::env::temp_dir().join(format!("captured-pair-{}", Uuid::new_v4()));
+        fs::create_dir(&base).unwrap();
+        let mut budget = RecoveryBudget::default();
+        budget.index_scratch.directory = base.clone();
+        budget.index_scratch.max_bytes = 32 << 20;
+        budget.index_scratch.headroom_bytes = 0;
+        let storage = ReadStorageBudget {
+            cache_bytes: 32 << 20,
+            headroom_bytes: 0,
+            ..Default::default()
+        };
+        let label = read_label_only(&device).unwrap();
+        let drive = TapeDrive::new(&device);
+        let before = device.command_log().len();
+        let captured = capture_index_source(&drive, &label, &budget).unwrap();
+        let identity = captured.identity().unwrap();
+        assert_eq!(identity.head(), head);
+        assert_eq!(identity.predecessors().len(), 2);
+        let expected = super::super::index_evidence::expected_index(&identity);
+        let spool_path = base.join("spool.sqlite");
+        let cache_path = base.join("cache.sqlite");
+        {
+            let mut reservation = CacheBuild::new(&base, storage).unwrap();
+            ImportSpool::build_captured(&captured, &spool_path, &mut reservation).unwrap();
+        }
+        {
+            let mut reservation = CacheBuild::new(&base, storage).unwrap();
+            assert!(
+                VolumeExtentCache::build_captured(&captured, &cache_path, &mut reservation)
+                    .is_err()
+            );
+            assert!(!cache_path.exists(), "组合临时盘预算不足不能发布缓存");
+        }
+        {
+            let mut reservation = CacheBuild::new(
+                &base,
+                ReadStorageBudget {
+                    cache_bytes: 64 << 20,
+                    ..storage
+                },
+            )
+            .unwrap();
+            VolumeExtentCache::build_captured(&captured, &cache_path, &mut reservation).unwrap();
+        }
+        let spool = ImportSpool::open(&spool_path, expected).unwrap();
+        assert_eq!(spool.identity(), &identity);
+        let cache = VolumeExtentCache::open_captured(&cache_path, &identity).unwrap();
+        spool.verify_extent_cache(&cache).unwrap();
+        assert_eq!(cache.file_count().unwrap(), 2);
+        let node = spool.node_by_path("baseline").unwrap().unwrap();
+        assert_eq!(
+            node.attributes
+                .xattrs()
+                .unwrap()
+                .iter()
+                .find(|x| x.key == "private")
+                .unwrap()
+                .value,
+            "original-attribute"
+        );
+        assert!(spool.node_by_path("deleted").unwrap().is_none());
+        assert!(VolumeExtentCache::open_incremental(&cache_path, expected).is_err());
+        assert!(VolumeExtentCache::open(&cache_path, expected).is_err());
+        let raw_path = base.join("raw-delta.sqlite");
+        VolumeExtentCache::build_verified_from_media(
+            &drive, &label, &budget, &raw_path, expected, true,
+        )
+        .unwrap();
+        let raw = VolumeExtentCache::open_incremental(&raw_path, expected).unwrap();
+        assert_eq!(raw.file_count().unwrap(), 1);
+        assert!(
+            spool.verify_extent_cache(&raw).is_err(),
+            "原始 delta 子集不能冒充完整重放"
+        );
+        let mut changed = identity.predecessors().to_vec();
+        changed[0].sha256[0] ^= 1;
+        let wrong = IndexSourceIdentity::new(head, changed).unwrap();
+        assert!(VolumeExtentCache::open_captured(&cache_path, &wrong).is_err());
+        assert!(
+            !device.command_log()[before..]
+                .iter()
+                .any(|op| matches!(*op, 0x0a | 0x10 | 0x8d | 0x04 | 0x19))
+        );
+        drop(captured);
+        // A later Full replaces IP and is now at DP EOD. The old incremental
+        // source is still a valid immutable historical baseline for cold reads.
+        let mut volume = LtfsVolume::mount(&device).unwrap();
+        volume
+            .append_file("/after", &mut b"new-generation".as_slice())
+            .unwrap();
+        volume.commit().unwrap();
+        drop(volume);
+        let before = device.command_log().len();
+        let historical = capture_recorded_index_source(&drive, &label, &identity, &budget).unwrap();
+        assert_eq!(historical.scope(), IndexSourceScope::Recorded);
+        assert_eq!(historical.identity().unwrap(), identity);
+        assert!(historical.source_bytes() > 0);
+        let mut count = 0;
+        historical
+            .for_each_entry(|_| {
+                count += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(count, 3);
+        verify_recorded_source_constructs(&drive, &label, &identity, &budget).unwrap();
+        drop(historical);
+        library.with_cartridge_mut(barcode, |cartridge| {
+            for object in &mut cartridge.partitions[1].objects {
+                if let LogicalObject::Record(bytes) = object {
+                    let text = String::from_utf8_lossy(bytes);
+                    if text.contains("original-attribute") {
+                        *bytes = text
+                            .replace("original-attribute", "modified-attribute")
+                            .into_bytes();
+                        break;
+                    }
+                }
+            }
+        });
+        assert!(capture_recorded_index_source(&drive, &label, &identity, &budget).is_err());
+        assert!(verify_recorded_source_constructs(&drive, &label, &identity, &budget).is_err());
+        assert!(
+            !device.command_log()[before..]
+                .iter()
+                .any(|op| matches!(*op, 0x0a | 0x10 | 0x8d | 0x04 | 0x19))
+        );
+        drop(raw);
+        drop(cache);
+        drop(spool);
+        fs::remove_dir_all(base).unwrap();
+    }
+
     fn fixture() -> (Vec<u8>, ExpectedIndex) {
         let mut index = LtfsIndex::empty(Uuid::new_v4(), "import-spool-test".into(), 'b');
+        index.self_location.start_block = 5;
         index.highest_file_uid = 4;
         index.root.subdirs.push(DirectoryNode {
             name: "目录".into(),
@@ -1064,6 +1361,7 @@ mod tests {
     #[test]
     fn byte_budget_pages_keep_oversized_nodes_without_skipping_rows() {
         let mut index = LtfsIndex::empty(Uuid::new_v4(), "page-byte-budget".into(), 'b');
+        index.self_location.start_block = 5;
         index.highest_file_uid = 3;
         index.root.xattrs.push(Xattr {
             key: "root-large".into(),
@@ -1183,6 +1481,7 @@ mod tests {
     fn ordered_source_verification_handles_text_uids_extents_and_corruption() {
         use crate::ltfs::index::{DirectoryNode, Extent};
         let mut index = LtfsIndex::empty(Uuid::new_v4(), "ordered-source".into(), 'b');
+        index.self_location.start_block = 5;
         index.highest_file_uid = u64::MAX;
         index.root.files = vec![
             FileNode {
@@ -1306,6 +1605,7 @@ mod tests {
     #[test]
     fn ordered_source_verification_accepts_no_files_and_checks_trailing_directories() {
         let mut index = LtfsIndex::empty(Uuid::new_v4(), "empty-source".into(), 'b');
+        index.self_location.start_block = 5;
         index.highest_file_uid = 1;
         let xml = index.to_xml().unwrap();
         let expected = ExpectedIndex {
@@ -1601,6 +1901,7 @@ mod tests {
     #[test]
     fn reserved_ee_data_directory_without_alias_is_not_silently_omitted() {
         let mut index = LtfsIndex::empty(Uuid::new_v4(), "reserved-data-test".into(), 'b');
+        index.self_location.start_block = 5;
         index.highest_file_uid = 2;
         index.root.subdirs.push(DirectoryNode {
             name: ".LTFSEE_DATA".into(),
@@ -1635,6 +1936,67 @@ mod tests {
             ..expected
         };
         assert!(ImportSpool::build(xml.as_ref(), &path, expected).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn marked_private_data_without_alias_is_hidden_but_misplaced_markers_are_rejected() {
+        // Inert XML codec fixture; actual Full/delta proof is tested on Sim.
+        let mut index = LtfsIndex::empty(Uuid::new_v4(), "owned-ee-test".into(), 'b');
+        index.self_location.start_block = 5;
+        index.highest_file_uid = 3;
+        index.root.subdirs.push(DirectoryNode {
+            name: ".LTFSEE_DATA".into(),
+            meta: NodeMeta {
+                file_uid: 2,
+                ..Default::default()
+            },
+            xattrs: super::super::ee_internal::stamp(&[]).unwrap(),
+            files: vec![FileNode {
+                name: "data".into(),
+                meta: NodeMeta {
+                    file_uid: 3,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let path = std::env::temp_dir().join(format!("tape-rs-owned-ee-{}.db", Uuid::new_v4()));
+        let build = |index: &LtfsIndex| {
+            let xml = index.to_xml().unwrap();
+            let expected = ExpectedIndex {
+                volume_uuid: index.volume_uuid,
+                generation: index.generation,
+                location: index.self_location,
+                sha256: Sha256::digest(&xml).into(),
+            };
+            ImportSpool::build(xml.as_ref(), &path, expected).map(|stats| (stats, expected))
+        };
+        let (stats, expected) = build(&index).unwrap();
+        assert_eq!((stats.files, stats.directories), (1, 2));
+        let spool = ImportSpool::open(&path, expected).unwrap();
+        assert!(
+            spool
+                .candidate_page(None, 1000)
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
+        assert!(spool.node_by_path(".LTFSEE_DATA/data").unwrap().is_some());
+        drop(spool);
+        fs::remove_file(&path).unwrap();
+        let original = index.clone();
+        index.root.subdirs[0].name = "other".into();
+        assert!(build(&index).is_err());
+        assert!(!path.exists());
+        index = original.clone();
+        index.root.xattrs = index.root.subdirs[0].xattrs.clone();
+        assert!(build(&index).is_err());
+        assert!(!path.exists());
+        index = original;
+        index.root.subdirs[0].files[0].xattrs = index.root.subdirs[0].xattrs.clone();
+        assert!(build(&index).is_err());
         assert!(!path.exists());
     }
 

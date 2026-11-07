@@ -4,9 +4,10 @@
 use std::path::Path;
 
 use crate::catalog::volume_extents::{ExpectedIndex, VolumeExtentCache};
-use crate::ltfs::index::IndexLocation;
 
 use super::*;
+use crate::ltfs::recovery::IndexSourceIdentity;
+use crate::ltfs::volume::CommittedIndexConstruct;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceOutcome {
@@ -42,31 +43,37 @@ fn validate_source(volume: Uuid, scan: VolumeScan, source: ExpectedIndex) -> Res
     Ok(())
 }
 
-fn encode_source(source: ExpectedIndex) -> Vec<u8> {
-    let mut value = Vec::with_capacity(42);
+pub(super) fn encode_source(source: &IndexSourceIdentity, file_count: u64) -> Vec<u8> {
+    let mut value = Vec::new();
     value.push(1);
-    value.push(source.location.partition as u8);
-    value.extend_from_slice(&source.location.start_block.to_be_bytes());
-    value.extend_from_slice(&source.sha256);
+    value.extend_from_slice(&file_count.to_be_bytes());
+    value.extend_from_slice(&source.to_bytes());
     value
 }
 
-pub(super) fn decode_source(volume: Uuid, scan: VolumeScan, value: &[u8]) -> Result<ExpectedIndex> {
-    if value.len() != 42 || value[0] != 1 {
+pub(super) fn decode_source(
+    volume: Uuid,
+    scan: VolumeScan,
+    value: &[u8],
+) -> Result<(IndexSourceIdentity, u64)> {
+    if value.len() < 77 || value[0] != 1 {
         return Err(CatalogError::Corrupt("卷索引证据版本或长度"));
     }
-    let source = ExpectedIndex {
-        volume_uuid: volume,
-        generation: scan.generation,
-        location: IndexLocation {
-            partition: value[1] as char,
-            start_block: read_u64(&value[2..10]),
-        },
-        sha256: value[10..42].try_into().expect("validated length"),
-    };
-    validate_source(volume, scan, source)
+    let identity = IndexSourceIdentity::from_bytes(&value[9..])
+        .map_err(|_| CatalogError::Corrupt("卷索引来源身份或完整链"))?;
+    validate_source(volume, scan, expected_index(&identity))
         .map_err(|_| CatalogError::Corrupt("卷索引证据身份或位置"))?;
-    Ok(source)
+    Ok((identity, read_u64(&value[1..9])))
+}
+
+pub(super) fn expected_index(identity: &IndexSourceIdentity) -> ExpectedIndex {
+    let head = identity.head();
+    ExpectedIndex {
+        volume_uuid: head.volume_uuid,
+        generation: head.generation,
+        location: head.location,
+        sha256: head.sha256,
+    }
 }
 
 pub(super) async fn require_source(
@@ -74,12 +81,37 @@ pub(super) async fn require_source(
     volume: Uuid,
     scan: VolumeScan,
 ) -> Result<ExpectedIndex> {
+    let identity = require_identity(tr, volume, scan).await?;
+    if identity.head().incremental {
+        return Err(CatalogError::Invalid("Building 导入要求原始 Full 来源"));
+    }
+    Ok(expected_index(&identity))
+}
+
+pub(super) async fn require_identity(
+    tr: &Transaction,
+    volume: Uuid,
+    scan: VolumeScan,
+) -> Result<IndexSourceIdentity> {
     let value = tr.get(&source_key(volume, scan.id), false).await?;
     decode_source(
         volume,
         scan,
         value.as_deref().ok_or(CatalogError::Incomplete)?,
     )
+    .map(|source| source.0)
+}
+
+pub(super) async fn require_source_file_count(
+    tr: &Transaction,
+    volume: Uuid,
+    scan: VolumeScan,
+) -> Result<u64> {
+    let raw = tr
+        .get(&source_key(volume, scan.id), false)
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+    Ok(decode_source(volume, scan, &raw)?.1)
 }
 
 pub(super) async fn managed_source_ready(
@@ -90,7 +122,7 @@ pub(super) async fn managed_source_ready(
     if !control::volume_is_managed(tr, volume).await? {
         return Ok(true);
     }
-    match require_source(tr, volume, scan).await {
+    match require_identity(tr, volume, scan).await {
         Ok(_) => Ok(true),
         Err(CatalogError::Incomplete) => Ok(false),
         Err(error) => Err(error),
@@ -158,8 +190,22 @@ impl ManagedCatalog {
         spool
             .verify_extent_cache(&cache)
             .map_err(|error| CatalogError::Cache(error.to_string()))?;
+        let file_count = cache
+            .file_count()
+            .map_err(|error| CatalogError::Cache(error.to_string()))?;
         let key = source_key(volume, scan.id);
-        let value = encode_source(source);
+        let identity = IndexSourceIdentity::new(
+            CommittedIndexConstruct {
+                volume_uuid: source.volume_uuid,
+                generation: source.generation,
+                location: source.location,
+                sha256: source.sha256,
+                incremental: false,
+            },
+            Vec::new(),
+        )
+        .map_err(|_| CatalogError::Invalid("Full 来源身份无效"))?;
+        let value = encode_source(&identity, file_count);
         let pending = encode_ready_volume(scan, serial);
         self.db
             .run(|tr, _| {
@@ -193,11 +239,11 @@ impl ManagedCatalog {
                         Err(error) => return Ok(Err(error)),
                     };
                     if let Some(old) = tr.get(&key, false).await? {
-                        let old = match decode_source(volume, scan, &old) {
-                            Ok(old) => old,
+                        match decode_source(volume, scan, &old) {
+                            Ok(_) => {}
                             Err(error) => return Ok(Err(error)),
                         };
-                        return Ok(Ok(if old == source {
+                        return Ok(Ok(if old.as_ref() == value.as_slice() {
                             SourceOutcome::AlreadyRecorded
                         } else {
                             SourceOutcome::SourceConflict
@@ -239,6 +285,7 @@ impl ManagedCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ltfs::index::IndexLocation;
 
     #[test]
     fn source_codec_binds_location_and_rejects_bad_records() {
@@ -256,16 +303,31 @@ mod tests {
             },
             sha256: [7; 32],
         };
-        let encoded = encode_source(source);
-        assert_eq!(decode_source(volume, scan, &encoded).unwrap(), source);
+        let identity = IndexSourceIdentity::new(
+            CommittedIndexConstruct {
+                volume_uuid: source.volume_uuid,
+                generation: source.generation,
+                location: source.location,
+                sha256: source.sha256,
+                incremental: false,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        let encoded = encode_source(&identity, 37);
+        assert_eq!(
+            decode_source(volume, scan, &encoded).unwrap(),
+            (identity, 37)
+        );
+        assert!(decode_source(volume, scan, &[1; 50]).is_err());
         for end in 0..encoded.len() {
             assert!(decode_source(volume, scan, &encoded[..end]).is_err());
         }
         let mut invalid = encoded.clone();
-        invalid[1] = b'z';
+        invalid[34] = b'z';
         assert!(decode_source(volume, scan, &invalid).is_err());
         invalid = encoded;
-        invalid[2..10].fill(0);
+        invalid[35..43].fill(0);
         assert!(decode_source(volume, scan, &invalid).is_err());
         assert!(validate_source(Uuid::new_v4(), scan, source).is_err());
     }

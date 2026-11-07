@@ -18,11 +18,13 @@ serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 md-5 = "0.10"
 sha2 = "0.10"
+crc32fast = "1.5"
 raft = { version = "0.7", default-features = false, features = ["protobuf-codec"] }
 protobuf = "2"
 slog = "2"
 slog-stdlog = "4"
 base64 = "0.22"
+unicode-width = "0.2"
 
 # HTTP 接入；只启用 HTTP/1，业务与设备执行仍使用现有同步通道。
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
@@ -30,8 +32,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "fs", "io-util", 
 hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 http-body-util = "0.1"
+httpdate = "1"
 tokio-util = { version = "0.7", features = ["io"] }
 foundationdb = { version = "0.11", default-features = false, features = ["fdb-7_3", "embedded-fdb-include"], optional = true }
+futures-executor = { version = "0.3", optional = true }
 
 [dev-dependencies]
 # 集成测试直接查控制存储，验证日志确实被压缩过
@@ -45,7 +49,9 @@ default-features = false
 
 [features]
 fuse = ["dep:fuser"]
-fdb = ["dep:foundationdb"]
+fdb = ["dep:foundationdb", "dep:futures-executor"]
+# 仅实验室故障验收；正常发行构建不包含设备提交暂停检查点。
+hardware-fault-tests = ["fdb"]
 
 [[bin]]
 name = "tape-fuse"

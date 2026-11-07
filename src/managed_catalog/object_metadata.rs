@@ -62,6 +62,12 @@ impl ObjectMetadata {
                 || axum::http::HeaderName::from_bytes(name.as_bytes()).is_err()
                 || name.bytes().any(|b| b.is_ascii_uppercase())
                 || axum::http::HeaderValue::from_str(value).is_err()
+                || (matches!(
+                    name.as_str(),
+                    "x-amz-checksum-crc32" | "x-amz-checksum-sha256"
+                ) && STANDARD.decode(value).ok().is_none_or(|bytes| {
+                    bytes.len() != if name.ends_with("crc32") { 4 } else { 32 }
+                }))
             {
                 return Err(CatalogError::Invalid("对象 HTTP 属性无效"));
             }
@@ -152,6 +158,8 @@ fn allowed(name: &str) -> bool {
                 | "content-disposition"
                 | "cache-control"
                 | "expires"
+                | "x-amz-checksum-crc32"
+                | "x-amz-checksum-sha256"
         )
 }
 
@@ -349,5 +357,20 @@ mod tests {
         let mut raw = value.encode();
         raw.push(b' ');
         assert!(ObjectMetadata::decode(&raw).is_err());
+    }
+
+    #[test]
+    fn checksum_projection_validates_digest_lengths() {
+        let headers = r#"{"x-amz-checksum-crc32":"NSRBwg==","x-amz-checksum-sha256":"ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0="}"#;
+        let value = ObjectMetadata::from_parts(None, Some((headers, false))).unwrap();
+        assert_eq!(ObjectMetadata::decode(&value.encode()).unwrap(), value);
+        for bad in [
+            r#"{"x-amz-checksum-crc32":"not base64"}"#,
+            r#"{"x-amz-checksum-crc32":"AAAA"}"#,
+            r#"{"x-amz-checksum-sha256":"AAAAAA=="}"#,
+            r#"{"x-amz-checksum-crc32c":"AAAAAA=="}"#,
+        ] {
+            assert!(ObjectMetadata::from_parts(None, Some((bad, false))).is_err());
+        }
     }
 }

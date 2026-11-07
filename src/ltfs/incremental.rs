@@ -286,7 +286,33 @@ fn merge_meta(dst: &mut NodeMeta, src: &NodeMeta, f: &Fields) {
     }
 }
 
-fn merge_dir(dst: &mut DirectoryNode, patch: &DirectoryNode, root: bool) -> Result<()> {
+pub(super) fn merge_file_metadata(out: &mut FileNode, f: &FileNode) {
+    merge_meta(&mut out.meta, &f.meta, &f.delta_fields);
+    if has(&f.delta_fields, "length") {
+        out.length = f.length;
+    }
+    if has(&f.delta_fields, "openforwrite") {
+        out.open_for_write = f.open_for_write;
+    }
+    if has(&f.delta_fields, "extentinfo") {
+        out.extents = f.extents.clone();
+        out.symlink = None;
+    }
+    if f.symlink.is_some() && has(&f.delta_fields, "symlink") {
+        out.symlink = f.symlink.clone();
+        out.extents.clear();
+    }
+    if has(&f.delta_fields, "extendedattributes") {
+        out.xattrs = f.xattrs.clone();
+    }
+    out.delta_fields = None;
+}
+
+pub(super) fn merge_directory_metadata(
+    dst: &mut DirectoryNode,
+    patch: &DirectoryNode,
+    root: bool,
+) -> Result<()> {
     if root && has(&patch.delta_fields, "fileuid") && dst.meta.file_uid != patch.meta.file_uid {
         return Err(bad("根目录 UID 变化"));
     }
@@ -298,6 +324,11 @@ fn merge_dir(dst: &mut DirectoryNode, patch: &DirectoryNode, root: bool) -> Resu
         dst.xattrs = patch.xattrs.clone();
     }
     dst.delta_fields = None;
+    Ok(())
+}
+
+fn merge_dir(dst: &mut DirectoryNode, patch: &DirectoryNode, root: bool) -> Result<()> {
+    merge_directory_metadata(dst, patch, root)?;
     for f in &patch.files {
         if deleted(&f.delta_fields) {
             continue;
@@ -308,25 +339,7 @@ fn merge_dir(dst: &mut DirectoryNode, patch: &DirectoryNode, root: bool) -> Resu
             .position(|v| v.name == f.name && v.meta.file_uid == f.meta.file_uid);
         if let Some(i) = existing {
             let out = &mut dst.files[i];
-            merge_meta(&mut out.meta, &f.meta, &f.delta_fields);
-            if has(&f.delta_fields, "length") {
-                out.length = f.length;
-            }
-            if has(&f.delta_fields, "openforwrite") {
-                out.open_for_write = f.open_for_write;
-            }
-            if has(&f.delta_fields, "extentinfo") {
-                out.extents = f.extents.clone();
-                out.symlink = None;
-            }
-            if f.symlink.is_some() && has(&f.delta_fields, "symlink") {
-                out.symlink = f.symlink.clone();
-                out.extents.clear();
-            }
-            if has(&f.delta_fields, "extendedattributes") {
-                out.xattrs = f.xattrs.clone();
-            }
-            out.delta_fields = None;
+            merge_file_metadata(out, f);
         } else {
             complete(&f.delta_fields, false)?;
             dst.files.retain(|v| v.name != f.name);

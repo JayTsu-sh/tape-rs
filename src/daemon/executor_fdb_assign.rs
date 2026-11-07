@@ -371,7 +371,7 @@ pub(super) struct Job {
     execution: Option<AssignExecution>,
     load_attempted: bool,
     format_attempted: bool,
-    proof: Option<ActiveIndexIdentity>,
+    proof: Option<crate::managed_catalog::NativeMediaSource>,
     completion: Option<Completion>,
     publishing: bool,
     diagnostic: Option<(String, bool)>,
@@ -421,6 +421,30 @@ impl Job {
             self.request.value()["change"]["volume"],
             self.execution.as_ref().map(|e| e.phase)
         )
+    }
+    pub(super) fn verified_mount(&self, active: &Active) -> Option<(usize, fdb_loading::Mount)> {
+        if !self.publishing || self.completion.is_none() || self.reject.is_some() {
+            return None;
+        }
+        let proof = self.proof.as_ref()?;
+        let plan = self.plan.as_ref()?;
+        let drive = active.devices.iter().position(|device| {
+            device.kind == DeviceKind::Drive
+                && Some(device.serial.as_str()) == plan.drive.drive_serial.as_deref()
+        })?;
+        let pool = self.request.value()["change"]["pool"]
+            .as_str()?
+            .parse()
+            .ok()?;
+        Some((
+            drive,
+            fdb_loading::Mount {
+                barcode: plan.barcode.clone(),
+                volume: proof.index().volume_uuid,
+                pool,
+                last_used: Instant::now(),
+            },
+        ))
     }
     fn accept(&mut self, task: Value) -> Result<bool> {
         if task["status"] != "running" {
@@ -586,7 +610,7 @@ impl Job {
                     route,
                     owner,
                     &self.request,
-                    self.proof.expect("proof"),
+                    self.proof.as_ref().expect("proof"),
                     &completion.captured_at,
                 ),
             )
@@ -801,7 +825,15 @@ impl Job {
             if !reconcile(&after, &p)? {
                 return Err(refused("格式化后原物理位置尚未确认"));
             }
-            self.proof = Some(proof);
+            let baseline = fdb_intake::capture_empty_baseline(
+                &guard,
+                context.active.files.spool_dir(),
+                context.control.storage,
+            )?;
+            if ActiveIndexIdentity::from(baseline.identity.head()) != proof {
+                return Err(refused("空卷捕获来源与格式化读回索引不符"));
+            }
+            self.proof = Some(baseline);
             publisher.request_sample(owner, after.observation);
             self.publishing = true;
             return Ok(Publication::Confirmed(false));

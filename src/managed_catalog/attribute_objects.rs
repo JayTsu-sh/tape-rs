@@ -295,12 +295,24 @@ impl ManagedCatalog {
     ) -> Result<bool> {
         let tr = self.db.create_trx()?;
         require_namespace_readable(&tr, namespace).await?;
-        let attributes = if let Some((locator, receipt, _)) =
-            lookup::published_file_receipt_at(&tr, namespace, id).await?
+        let published = lookup::published_file_receipt_at(&tr, namespace, id).await?;
+        let raw = tr.get(&node_key(namespace, id), true).await?;
+        if let Some(bytes) = raw.as_deref()
+            && retired_nodes::from_node_record(namespace, id, bytes)?.is_some()
         {
+            let active = tr.get(&namespace_key(namespace), true).await?.as_deref()
+                == Some(&[NamespaceState::Active as u8][..]);
+            if !active || published.is_some() {
+                return Err(CatalogError::Corrupt(
+                    "已删除 inode 与命名空间或活动发布不一致",
+                ));
+            }
+            return Ok(false);
+        }
+        let attributes = if let Some((locator, receipt, _)) = published {
             active_batch::prepared_attributes_at(&tr, locator.batch_id, &receipt).await?
         } else {
-            let Some(raw) = tr.get(&node_key(namespace, id), true).await? else {
+            let Some(raw) = raw else {
                 return Ok(false);
             };
             decode_node(&raw)?.attributes
@@ -366,6 +378,19 @@ pub(super) async fn require_complete(
         .ok_or(CatalogError::Incomplete)?;
     if decode_progress(&raw, manifest)? != manifest.chunks {
         return Err(CatalogError::Incomplete);
+    }
+    Ok(())
+}
+
+/// Validate immutable attribute references before the caller starts mutating
+/// catalog rows. Inline values have no independently stored object to check.
+pub(super) async fn require_attributes(
+    tr: &Transaction,
+    namespace: Uuid,
+    attributes: Option<&NodeAttributes>,
+) -> Result<()> {
+    if let Some(manifest) = attributes.and_then(NodeAttributes::manifest) {
+        require_complete(tr, namespace, manifest).await?;
     }
     Ok(())
 }
@@ -500,7 +525,7 @@ mod tests {
         // Publication refuses absent and partially uploaded objects.
         let tr = catalog.db.create_trx().unwrap();
         assert!(
-            write_attribute_chunks(&tr, ns, Uuid::nil(), false, Some(&attributes))
+            require_attributes(&tr, ns, Some(&attributes))
                 .await
                 .is_err()
         );
@@ -557,6 +582,30 @@ mod tests {
                 .unwrap()
                 .symlink
         );
+        // Publication reads the immutable object's completion marker with
+        // conflict detection before adding any visible catalog mutations.
+        let validation = catalog.db.create_trx().unwrap();
+        require_attributes(&validation, ns, Some(&attributes))
+            .await
+            .unwrap();
+        let marker = progress_key(ns, manifest);
+        let mut probe = marker.clone();
+        probe.push(0xff);
+        let concurrent = catalog.db.create_trx().unwrap();
+        let original = concurrent
+            .get(&marker, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .to_vec();
+        concurrent.clear(&marker);
+        concurrent.commit().await.unwrap();
+        validation.set(&probe, b"must-not-publish");
+        assert_eq!(validation.commit().await.unwrap_err().code(), 1020);
+        let restore = catalog.db.create_trx().unwrap();
+        assert!(restore.get(&probe, false).await.unwrap().is_none());
+        restore.set(&marker, &original);
+        restore.commit().await.unwrap();
         struct SlowHash {
             hash: sha2::Sha256,
             first: bool,

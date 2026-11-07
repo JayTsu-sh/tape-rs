@@ -31,6 +31,7 @@ pub(super) fn handle(
             return Ok(false);
         }
         let s = ctx.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
         if resource == "catalog" && target == "current" && action == "audit" {
             match ctx.files.catalog_cutover_audit() {
                 Ok(audit) => respond_json(

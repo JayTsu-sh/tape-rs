@@ -105,6 +105,10 @@ impl Deref for ScratchDatabase {
 }
 
 impl ScratchDatabase {
+    pub(super) fn reserved_bytes(&self) -> u64 {
+        self.storage.allocated.get()
+    }
+
     pub(super) fn new(budget: &IndexScratchBudget) -> Result<Self> {
         let limit = (budget.max_bytes / PAGE_SIZE * PAGE_SIZE).min(i64::MAX as u64);
         if limit < PAGE_SIZE * 16 {

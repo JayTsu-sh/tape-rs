@@ -20,7 +20,11 @@ pub mod fdb_http;
 #[cfg(feature = "fdb")]
 pub mod fdb_media;
 #[cfg(feature = "fdb")]
+pub mod fdb_node_media;
+#[cfg(feature = "fdb")]
 pub mod fdb_read;
+#[cfg(feature = "fdb")]
+pub mod fdb_rename_media;
 pub mod files;
 pub mod gateway;
 pub mod http;

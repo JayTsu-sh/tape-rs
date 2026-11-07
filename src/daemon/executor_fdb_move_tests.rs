@@ -21,7 +21,9 @@ fn snapshot(lib: &SimLibrary) -> Snapshot {
         },
     ];
     let (map, rows) = management::elements(&devices).unwrap();
-    let observation = management::observation_from_elements(&devices, 2, 92, &map, &rows).unwrap();
+    let descriptor = crate::scsi::inquiry::standard_inquiry(devices[0].dev.as_ref()).unwrap();
+    let observation =
+        management::observation_from_elements(&devices, 2, 92, &map, &rows, &descriptor).unwrap();
     Snapshot {
         map,
         rows,

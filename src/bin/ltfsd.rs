@@ -27,7 +27,8 @@ use tape_rs::daemon::vip::{HttpVip, VipConfig};
 #[derive(Parser)]
 #[command(
     name = "ltfsd",
-    about = "磁带库高可用守护进程（骨架）：Raft 选主 + 设备层隔离 + 自动接管"
+    about = "磁带库高可用守护进程（骨架）：Raft 选主 + 设备层隔离 + 自动接管",
+    group(clap::ArgGroup::new("s3_access_mode").multiple(true))
 )]
 struct Args {
     /// 本节点编号（1..=255，同时写进预留键）
@@ -64,10 +65,10 @@ struct Args {
     #[cfg(feature = "fdb")]
     #[arg(
         long,
+        group = "fdb_owner_mode",
         requires_all = ["fdb_cluster_file", "client_listen", "libraries_config"],
         conflicts_with_all = [
             "fdb_metadata_readonly",
-            "http_vip",
             "demo_write",
             "salvage",
             "expand_libraries_offline",
@@ -76,21 +77,30 @@ struct Args {
         ]
     )]
     fdb_owner_readonly: bool,
+    /// FDB 可写 owner；仅向显式已归属卷提交上传，并在接任时恢复未确认批次
+    #[cfg(feature = "fdb")]
+    #[arg(long, group = "fdb_owner_mode", requires_all = ["fdb_cluster_file", "client_listen", "libraries_config"],
+        conflicts_with_all = ["fdb_metadata_readonly", "fdb_owner_readonly", "demo_write", "salvage", "expand_libraries_offline", "replace_drive_offline", "remove_drive_offline"])]
+    fdb_owner_writable: bool,
+    /// 在独立 S3 端口提供 FDB 对象访问；写操作要求可写 owner，可共用受管理 VIP
+    #[cfg(feature = "fdb")]
+    #[arg(long, group = "s3_access_mode", requires_all = ["s3_listen", "fdb_owner_mode"])]
+    fdb_s3: bool,
     /// FDB owner 每库索引核验临时库上限（MiB；默认 131072）
     #[cfg(feature = "fdb")]
-    #[arg(long, requires = "fdb_owner_readonly", value_parser = clap::value_parser!(u64).range(1..=8796093022207))]
+    #[arg(long, requires = "fdb_owner_mode", value_parser = clap::value_parser!(u64).range(1..=8796093022207))]
     fdb_read_index_mib: Option<u64>,
     /// FDB owner 每库 extent 缓存总预算（MiB；默认 131072）
     #[cfg(feature = "fdb")]
-    #[arg(long, requires = "fdb_owner_readonly", value_parser = clap::value_parser!(u64).range(1..=8796093022207))]
+    #[arg(long, requires = "fdb_owner_mode", value_parser = clap::value_parser!(u64).range(1..=8796093022207))]
     fdb_read_cache_mib: Option<u64>,
-    /// FDB owner 单文件下载暂存上限（MiB；默认 131072）
+    /// FDB owner 单文件上传/下载暂存上限（MiB；默认 131072）
     #[cfg(feature = "fdb")]
-    #[arg(long, requires = "fdb_owner_readonly", value_parser = clap::value_parser!(u64).range(1..=8796093022207))]
+    #[arg(long, requires = "fdb_owner_mode", value_parser = clap::value_parser!(u64).range(1..=8796093022207))]
     fdb_read_spool_mib: Option<u64>,
     /// FDB owner 本地读取预留文件系统余量（MiB；默认 1024，可为 0）
     #[cfg(feature = "fdb")]
-    #[arg(long, requires = "fdb_owner_readonly", value_parser = clap::value_parser!(u64).range(..=8796093022207))]
+    #[arg(long, requires = "fdb_owner_mode", value_parser = clap::value_parser!(u64).range(..=8796093022207))]
     fdb_read_headroom_mib: Option<u64>,
     /// 多库 JSON 配置（default_library、libraries）；与单库设备参数互斥
     #[arg(long, conflicts_with_all = ["changer_serial", "drive_serials"])]
@@ -153,14 +163,15 @@ struct Args {
     /// 客户端接口（HTTP）的监听地址。不给则不开
     #[arg(long)]
     client_listen: Option<String>,
-    /// 匿名 S3 HTTP 监听地址（path-style）；不给则不开，使用原 pool 与文件服务
-    #[arg(long, requires_all = ["client_listen", "http_vip"])]
+    /// 匿名 S3 HTTP 监听地址（path-style）；须启用 FDB owner 与 --fdb-s3
+    #[arg(long, requires_all = ["client_listen", "s3_access_mode"])]
+    #[cfg_attr(feature = "fdb", arg(requires = "fdb_s3"))]
     s3_listen: Option<String>,
     /// 各节点 S3 端口，主机取自 --peer；须与各节点 --s3-listen 的端口一致
     #[arg(long, default_value_t = 7402)]
     s3_port: u16,
     /// 同子网 HTTP IPv4 VIP：单库跟随设备 owner，多库跟随统一入口；不给则不管理地址
-    #[arg(long, requires_all = ["http_vip_interface", "client_listen"])]
+    #[arg(long, group = "s3_access_mode", requires_all = ["http_vip_interface", "client_listen"])]
     http_vip: Option<Ipv4Addr>,
     /// HTTP VIP 所在以太网接口，各节点可不同（最多 13 字节）
     #[arg(long, requires = "http_vip")]
@@ -226,7 +237,7 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
     if let Err(error) = validate_s3_listen(args.s3_listen.as_deref(), args.s3_port) {
-        eprintln!("S3 VIP 监听配置失败：{error}");
+        eprintln!("S3 监听配置失败：{error}");
         std::process::exit(2);
     }
     if args.s3_listen.is_some() && args.libraries_config.is_none() && args.changer_serial.is_none()
@@ -234,9 +245,17 @@ fn main() {
         eprintln!("S3 入口必须配置 --changer-serial 或 --libraries-config，以稳定标识带库");
         std::process::exit(2);
     }
+    #[cfg(not(feature = "fdb"))]
+    if args.s3_listen.is_some() {
+        eprintln!("S3 入口要求启用 fdb 构建特性和 FDB owner 模式");
+        std::process::exit(2);
+    }
     #[cfg(feature = "fdb")]
-    if args.s3_listen.is_some() && (args.fdb_metadata_readonly || args.fdb_owner_readonly) {
-        eprintln!("S3 第一版不支持 FDB 只读模式，请使用现有可写文件目录后端");
+    if args.s3_listen.is_some()
+        && (args.fdb_metadata_readonly || args.fdb_owner_readonly || args.fdb_owner_writable)
+        && !args.fdb_s3
+    {
+        eprintln!("S3 入口要求显式配置 --fdb-s3 和 FDB owner 模式");
         std::process::exit(2);
     }
     let mut peers: HashMap<u64, String> = HashMap::new();
@@ -396,7 +415,7 @@ fn main() {
         return;
     }
     #[cfg(feature = "fdb")]
-    let fdb_owner = if args.fdb_owner_readonly {
+    let fdb_owner = if args.fdb_owner_readonly || args.fdb_owner_writable {
         let storage = fdb_read_budget(&args).unwrap_or_else(|error| {
             eprintln!("FDB 本地读取预算无效：{error}");
             std::process::exit(2);
@@ -412,6 +431,7 @@ fn main() {
                 std::process::exit(2);
             });
         Some(FdbOwnerMode {
+            writable: args.fdb_owner_writable,
             storage,
             catalog: Arc::new(catalog),
             routes: fdb_routes.take().expect("FDB 活动路由预检已通过"),
@@ -567,7 +587,7 @@ fn main() {
         peers: ids,
         tick: Duration::from_millis(args.tick_ms),
         election_ticks: 10,
-        heartbeat_ticks: 3,
+        heartbeat_ticks: 1,
         status_file: Some(args.data_dir.join("status.json")),
         directory_file: Some(directory_file),
         cooldown: Duration::from_secs(20),
@@ -600,18 +620,6 @@ fn main() {
             client_addrs,
             wait_timeout: Duration::from_secs(600),
         });
-        if let Some(s3_listen) = &args.s3_listen {
-            tape_rs::daemon::s3::serve(
-                s3_listen,
-                std::collections::BTreeMap::from([(
-                    args.changer_serial.clone().expect("已检查 S3 带库身份"),
-                    ctx.clone(),
-                )]),
-                ctx.clone(),
-                s3_peer_addrs(&args, &peers),
-            )
-            .expect("启动 S3 接口");
-        }
         http::serve(listen, ctx).expect("启动客户端接口");
         if let Some(vip) = http_vip.as_mut() {
             vip.start(status.clone(), files.clone(), inbox_tx.clone())
@@ -680,10 +688,10 @@ fn preflight_catalog(
         let active = runtime
             .block_on(catalog.active_library_route(serial))
             .map_err(|error| TapeError::Ltfs(format!("带库 {serial} 的 FDB 路由无效：{error}")))?;
-        if args.fdb_metadata_readonly || args.fdb_owner_readonly {
+        if args.fdb_metadata_readonly || args.fdb_owner_readonly || args.fdb_owner_writable {
             let route = active.ok_or_else(|| {
                 TapeError::Ltfs(format!(
-                    "带库 {serial} 尚未激活 FDB 路由，禁止启动只读元数据入口"
+                    "带库 {serial} 尚未激活 FDB 路由，禁止启动 FDB 运行时"
                 ))
             })?;
             active_routes.insert(serial.clone(), route);
@@ -718,6 +726,7 @@ fn fdb_read_budget(args: &Args) -> Result<tape_rs::daemon::fdb_read::ReadStorage
 
 #[cfg(feature = "fdb")]
 struct FdbOwnerMode {
+    writable: bool,
     storage: tape_rs::daemon::fdb_read::ReadStorageBudget,
     catalog: Arc<tape_rs::managed_catalog::ManagedCatalog>,
     routes: std::collections::BTreeMap<String, tape_rs::managed_catalog::ActiveLibraryRoute>,
@@ -726,7 +735,7 @@ struct FdbOwnerMode {
 fn validate_s3_listen(listen: Option<&str>, port: u16) -> Result<(), String> {
     if let Some(listen) = listen {
         let address: std::net::SocketAddrV4 = listen.parse().map_err(|_| {
-            "S3 监听地址须为 0.0.0.0:<端口>，同时接收 VIP 请求和节点间转发".to_string()
+            "S3 监听地址须为 0.0.0.0:<端口>，同时接收客户端请求和节点间转发".to_string()
         })?;
         if !address.ip().is_unspecified() || address.port() == 0 || address.port() != port {
             return Err("S3 监听地址须为 0.0.0.0:<s3-port>，各节点端口必须一致".into());
@@ -735,6 +744,7 @@ fn validate_s3_listen(listen: Option<&str>, port: u16) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "fdb")]
 fn s3_peer_addrs(args: &Args, peers: &HashMap<u64, String>) -> HashMap<u64, String> {
     peers
         .iter()
@@ -893,12 +903,18 @@ fn run_libraries(
                         .get(&library.changer_serial)
                         .expect("已预检全部带库活动路由"),
                 });
+        #[cfg(feature = "fdb")]
+        let fdb_writable = fdb_owner.as_ref().is_some_and(|mode| mode.writable);
         thread::Builder::new()
             .name(format!("ltfsd-{}", library.changer_serial))
             .spawn(move || {
                 #[cfg(feature = "fdb")]
                 if let Some(control) = fdb_control {
-                    executor::run_fdb_owner(provider, opts, requests, events, f, s, control);
+                    if fdb_writable {
+                        executor::run_fdb_writer(provider, opts, requests, events, f, s, control);
+                    } else {
+                        executor::run_fdb_owner(provider, opts, requests, events, f, s, control);
+                    }
                     return;
                 }
                 executor::run(provider, opts, requests, events, f, s);
@@ -980,12 +996,26 @@ fn run_libraries(
         wait_timeout: Duration::from_secs(600),
     });
     if let Some(listen) = &args.s3_listen {
-        tape_rs::daemon::s3::serve(
-            listen,
-            contexts.clone(),
-            gateway.clone(),
-            s3_peer_addrs(&args, &peers),
-        )?;
+        #[cfg(feature = "fdb")]
+        {
+            let mode = fdb_owner.as_ref().ok_or_else(|| {
+                tape_rs::error::TapeError::NotReady("S3 入口要求 FDB owner".into())
+            })?;
+            tape_rs::daemon::s3::serve_fdb(
+                listen,
+                mode.catalog.clone(),
+                mode.routes.clone(),
+                contexts.clone(),
+                gateway.clone(),
+                s3_peer_addrs(&args, &peers),
+                mode.writable,
+                mode.storage,
+            )?;
+        }
+        #[cfg(not(feature = "fdb"))]
+        return Err(tape_rs::error::TapeError::NotReady(format!(
+            "S3 入口 {listen} 要求 fdb 构建特性"
+        )));
     }
     if let Some(listen) = &args.client_listen {
         #[cfg(feature = "fdb")]
@@ -997,25 +1027,41 @@ fn run_libraries(
                 .expect("clap 已检查 FDB 集群文件路径");
             let catalog = tape_rs::managed_catalog::ManagedCatalog::open(Some(cluster))
                 .map_err(|error| tape_rs::error::TapeError::Catalog(error.to_string()))?;
-            tape_rs::daemon::fdb_http::serve_owner(
-                listen,
-                Arc::new(catalog),
-                mode.routes.clone(),
-                contexts,
-                client_addrs,
-            )?;
+            let control = gateway::control_router(
+                config.clone(),
+                contexts.clone(),
+                gateway.clone(),
+                client_addrs.clone(),
+            );
+            if mode.writable {
+                tape_rs::daemon::fdb_http::serve_writer(
+                    listen,
+                    Arc::new(catalog),
+                    mode.routes.clone(),
+                    contexts,
+                    client_addrs,
+                    mode.storage,
+                    control,
+                )?;
+            } else {
+                tape_rs::daemon::fdb_http::serve_owner(
+                    listen,
+                    Arc::new(catalog),
+                    mode.routes.clone(),
+                    contexts,
+                    client_addrs,
+                    control,
+                )?;
+            }
         } else {
             gateway::serve(listen, config.clone(), contexts, gateway, client_addrs)?;
-            if let Some(vip) = vip.as_mut() {
-                vip.start(gateway_status, gateway_files, tx.clone())?;
-            }
         }
         #[cfg(not(feature = "fdb"))]
         {
             gateway::serve(listen, config.clone(), contexts, gateway, client_addrs)?;
-            if let Some(vip) = vip.as_mut() {
-                vip.start(gateway_status, gateway_files, tx.clone())?;
-            }
+        }
+        if let Some(vip) = vip.as_mut() {
+            vip.start(gateway_status, gateway_files, tx.clone())?;
         }
     }
     let mut ids: Vec<_> = peers.keys().copied().collect();
@@ -1026,7 +1072,7 @@ fn run_libraries(
         peers: ids,
         tick: Duration::from_millis(args.tick_ms),
         election_ticks: 10,
-        heartbeat_ticks: 3,
+        heartbeat_ticks: 1,
         status_file: Some(args.data_dir.join("status.json")),
         directory_file: (!fdb_active).then_some(bundle),
         cooldown: Duration::from_secs(20),
@@ -1057,6 +1103,41 @@ fn run_libraries(
 #[cfg(all(test, feature = "fdb"))]
 mod fdb_owner_cli_tests {
     use super::*;
+
+    #[test]
+    fn fdb_owners_accept_the_managed_vip_with_explicit_s3() {
+        for mode in ["--fdb-owner-readonly", "--fdb-owner-writable"] {
+            assert!(
+                Args::try_parse_from([
+                    "ltfsd",
+                    "--id",
+                    "1",
+                    "--listen",
+                    "127.0.0.1:7400",
+                    "--peer",
+                    "1=127.0.0.1:7400",
+                    "--data-dir",
+                    "/tmp/fdb-vip-cli",
+                    "--libraries-config",
+                    "/tmp/libs.json",
+                    "--client-listen",
+                    "0.0.0.0:7401",
+                    "--fdb-cluster-file",
+                    "/tmp/fdb.cluster",
+                    mode,
+                    "--fdb-s3",
+                    "--s3-listen",
+                    "0.0.0.0:7402",
+                    "--http-vip",
+                    "192.0.2.100",
+                    "--http-vip-interface",
+                    "eth0",
+                ])
+                .is_ok(),
+                "{mode}"
+            );
+        }
+    }
 
     #[test]
     fn local_storage_flags_validate_units_limits_and_owner_scope() {
@@ -1142,6 +1223,21 @@ mod fdb_owner_cli_tests {
             "--fdb-owner-readonly",
         ]);
         assert!(Args::try_parse_from(&allowed).is_ok());
+        let mut s3 = allowed.clone();
+        s3.extend(["--s3-listen", "0.0.0.0:7402", "--fdb-s3"]);
+        assert!(Args::try_parse_from(&s3).is_ok());
+        s3.pop();
+        assert!(
+            Args::try_parse_from(&s3).is_err(),
+            "FDB S3 必须显式启用且不能隐式启用 VIP"
+        );
+        let mut writable = allowed.clone();
+        *writable.last_mut().unwrap() = "--fdb-owner-writable";
+        assert!(Args::try_parse_from(&writable).is_ok());
+        writable.extend(["--fdb-read-cache-mib", "64"]);
+        assert!(Args::try_parse_from(&writable).is_ok());
+        writable.push("--fdb-owner-readonly");
+        assert!(Args::try_parse_from(&writable).is_err());
         let mut missing = base.to_vec();
         missing.push("--fdb-owner-readonly");
         assert!(Args::try_parse_from(&missing).is_err());

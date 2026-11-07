@@ -15,7 +15,7 @@ fn reservation_key(intent: &ActiveFileIntent) -> Vec<u8> {
 
 // A volume-local reverse index keeps takeover recovery proportional to the
 // interrupted batch, not to every file in a large namespace.
-fn volume_prefix(volume: Uuid, generation: u64) -> Vec<u8> {
+pub(super) fn volume_prefix(volume: Uuid, generation: u64) -> Vec<u8> {
     let mut out = key(b'2');
     out.extend_from_slice(volume.as_bytes());
     out.extend_from_slice(&generation.to_be_bytes());
@@ -29,7 +29,7 @@ fn volume_key(intent: &ActiveFileIntent) -> Vec<u8> {
     out
 }
 
-fn upgraded_prefix(volume: Uuid, generation: u64) -> Vec<u8> {
+pub(super) fn upgraded_prefix(volume: Uuid, generation: u64) -> Vec<u8> {
     let mut out = key(b'4');
     out.extend_from_slice(volume.as_bytes());
     out.extend_from_slice(&generation.to_be_bytes());
@@ -108,7 +108,7 @@ fn claim_value(intent: &ActiveFileIntent) -> [u8; 24] {
     value
 }
 
-fn same_logical(left: &ActiveFileIntent, right: &ActiveFileIntent) -> bool {
+fn same_attempt(left: &ActiveFileIntent, right: &ActiveFileIntent) -> bool {
     // An owner takeover changes the execution fence, not the upload request.
     ActiveFileIntent {
         owner_epoch: right.owner_epoch,
@@ -116,9 +116,10 @@ fn same_logical(left: &ActiveFileIntent, right: &ActiveFileIntent) -> bool {
     } == *right
 }
 
-fn encode(intent: &ActiveFileIntent, permit: u16) -> Vec<u8> {
+pub(super) fn encode(intent: &ActiveFileIntent, permit: u16) -> Vec<u8> {
     let payload = serde_json::json!({
-        "version": 1, "permit": permit,
+        "version": 2, "permit": permit,
+        "barcode": intent.barcode_constraint,
         "parent": intent.parent.to_string(),
         "parent_path": std::str::from_utf8(&intent.parent_path).expect("validated UTF-8 path"),
         "name": intent.name,
@@ -163,7 +164,7 @@ pub(super) fn decode(
             .and_then(|value| value.as_u64())
             .ok_or_else(corrupt)
     };
-    if number("version")? != 1 {
+    if number("version")? != 2 {
         return Err(corrupt());
     }
     let previous = match v.get("previous") {
@@ -182,6 +183,11 @@ pub(super) fn decode(
         None => return Err(corrupt()),
     };
     let intent = ActiveFileIntent {
+        barcode_constraint: match v.get("barcode") {
+            Some(serde_json::Value::Null) => None,
+            Some(value) => Some(value.as_str().ok_or_else(corrupt)?.to_owned()),
+            None => return Err(corrupt()),
+        },
         namespace,
         parent: id("parent")?,
         parent_path: v
@@ -247,24 +253,73 @@ fn receipt_stub(intent: &ActiveFileIntent) -> CommitReceipt {
     receipt
 }
 
-fn cancellation_fingerprint(intent: &ActiveFileIntent) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(b"tape-rs/active-reservation-cancel/1");
-    digest.update(receipt_fingerprint(&receipt_stub(intent)));
-    digest.update((intent.parent_path.len() as u32).to_be_bytes());
-    digest.update(&intent.parent_path);
-    digest.finalize().into()
+/// Negative reads conflict with admission of this exact request. They do not
+/// authorize cancelling a Q/I/S4 operation whose device outcome is unknown.
+pub(super) async fn require_no_attempt_at(
+    tr: &Transaction,
+    intent: &ActiveFileIntent,
+) -> Result<()> {
+    let receipt = receipt_stub(intent);
+    for key in [
+        reservation_key(intent),
+        volume_key(intent),
+        upgraded_key(intent),
+        requests::intent_key(&receipt),
+        active_batch::claim_key(&receipt),
+    ] {
+        if tr.get(&key, false).await?.is_some() {
+            return Err(CatalogError::PoolBusy);
+        }
+    }
+    Ok(())
+}
+
+/// Used only for a pre-Q reclaim child whose original epoch pin still exists.
+/// A later retry of its durable cancellation must not repeat this head test:
+/// other children can legitimately advance the volume after cancellation.
+pub(super) async fn require_unstarted_at(
+    tr: &Transaction,
+    intent: &ActiveFileIntent,
+) -> Result<()> {
+    require_no_attempt_at(tr, intent).await?;
+    for key in [
+        path_key(intent),
+        file_key(intent),
+        active_batch::batch_key(intent.volume_id, intent.volume_generation),
+        active_batch::prepared_batch_key(intent.volume_id, intent.volume_generation),
+    ] {
+        if tr.get(&key, false).await?.is_some() {
+            return Err(CatalogError::PoolBusy);
+        }
+    }
+    if active_volume::recovery_active(tr, intent.volume_id).await? {
+        return Err(CatalogError::PoolBusy);
+    }
+    let (scan, index) =
+        active_volume::observed_at(tr, &intent.library_serial, intent.volume_id).await?;
+    if scan.id != intent.volume_scan_id || index.generation >= intent.volume_generation {
+        return Err(CatalogError::PoolBusy);
+    }
+    Ok(())
+}
+
+pub(super) fn cancellation_fingerprint(intent: &ActiveFileIntent) -> [u8; 32] {
+    intent.request().fingerprint()
 }
 
 pub(super) async fn parent_matches_at(tr: &Transaction, intent: &ActiveFileIntent) -> Result<bool> {
-    let components = lookup::path_components(&intent.parent_path)?;
+    let path = match intent.pool_id {
+        Some(pool) => pool_catalog_path(pool, &intent.parent_path)?,
+        None => intent.parent_path.clone(),
+    };
+    let components = lookup::path_components(&path)?;
     Ok(matches!(
         lookup::resolve_path_at(tr, intent.namespace, components, false).await?,
         Some(lookup::ResolvedPath::Directory { id, .. }) if id == intent.parent
     ))
 }
 
-fn matches_receipt(intent: &ActiveFileIntent, receipt: &CommitReceipt) -> bool {
+pub(super) fn matches_receipt(intent: &ActiveFileIntent, receipt: &CommitReceipt) -> bool {
     let stub = receipt_stub(intent);
     receipt.namespace == stub.namespace
         && receipt.parent == stub.parent
@@ -347,7 +402,61 @@ pub(super) async fn volume_reservations_empty(
     Ok(true)
 }
 
+pub(super) async fn active_file_attempt_at(
+    tr: &Transaction,
+    request: &ActiveFileRequest,
+) -> Result<Option<ActiveFileIntent>> {
+    let namespace = request.namespace;
+    let mut key = requests::epoch_prefix(b'0', namespace, request.request_epoch);
+    key.extend_from_slice(request.operation_id.as_bytes());
+    let saved = if let Some(raw) = tr.get(&key, false).await? {
+        Some(decode(&raw, namespace, request.request_epoch, request.operation_id)?.0)
+    } else {
+        let mut key = requests::epoch_prefix(b'I', namespace, request.request_epoch);
+        key.extend_from_slice(request.operation_id.as_bytes());
+        if let Some(raw) = tr.get(&key, false).await? {
+            let receipt = requests::decode_intent(
+                &raw,
+                namespace,
+                request.request_epoch,
+                request.operation_id,
+            )?;
+            let permit = requests::matching_permit(&raw, &receipt)?
+                .ok_or(CatalogError::Corrupt("原物理尝试准入许可不一致"))?;
+            Some(intent_for_upgraded_at(tr, &receipt, permit).await?)
+        } else {
+            None
+        }
+    };
+    if saved
+        .as_ref()
+        .is_some_and(|intent| intent.request() != *request)
+    {
+        return Err(CatalogError::Invalid("原操作已绑定其他逻辑请求"));
+    }
+    Ok(saved)
+}
+
 impl ManagedCatalog {
+    /// A logical retry must reuse any admitted physical attempt, including an
+    /// upgraded receipt. Absence alone permits the actor to select its first
+    /// physical target; it never permits replacing an existing attempt.
+    pub async fn active_file_attempt(
+        &self,
+        request: &ActiveFileRequest,
+        route: ActiveLibraryRoute,
+    ) -> Result<Option<ActiveFileIntent>> {
+        request.validate()?;
+        let tr = self.db.create_trx()?;
+        let namespace =
+            routing::require_expected_active_namespace(&tr, &request.library_serial, Some(route))
+                .await?;
+        if namespace != request.namespace {
+            return Err(CatalogError::Invalid("上传不属于活动命名空间"));
+        }
+        active_file_attempt_at(&tr, request).await
+    }
+
     /// Recover the original physical path of one outstanding observed receipt.
     /// Legacy synthetic requests without a write-before-data reservation are
     /// deliberately unsupported here; media recovery requires the durable
@@ -553,8 +662,38 @@ impl ManagedCatalog {
         })
     }
 
-    /// Durable logical reservation. The executor must obtain the drive PR and
-    /// verify the medium separately; Registered permits data records, not S4.
+    /// Read a retained upload result by its original pre-append identity.
+    /// The Active route and original fingerprint are checked at one read version;
+    /// the execution epoch is irrelevant and no reservation or media I/O occurs.
+    pub async fn active_upload_result(
+        &self,
+        intent: &ActiveFileRequest,
+        route: ActiveLibraryRoute,
+    ) -> Result<Option<PublishOutcome>> {
+        intent.validate()?;
+        let tr = self.db.create_trx()?;
+        let namespace =
+            routing::require_expected_active_namespace(&tr, &intent.library_serial, Some(route))
+                .await?;
+        if namespace != intent.namespace {
+            return Err(CatalogError::Invalid("上传不属于活动命名空间"));
+        }
+        let window = requests::window(&tr, namespace).await?;
+        if intent.request_epoch < window.first_retained {
+            return Ok(Some(PublishOutcome::RequestExpired));
+        }
+        if intent.request_epoch > window.accepting {
+            return Ok(Some(PublishOutcome::RequestEpochClosed));
+        }
+        tr.get(
+            &op_key(namespace, intent.request_epoch, intent.operation_id),
+            false,
+        )
+        .await?
+        .map(|bytes| requests::reservation_terminal_result(&bytes, &intent.fingerprint()))
+        .transpose()
+    }
+
     pub async fn reserve_active_file(&self, intent: &ActiveFileIntent) -> Result<PublishOutcome> {
         validate_active_file_intent(intent)?;
         let intent = intent.clone();
@@ -593,13 +732,23 @@ impl ManagedCatalog {
                                 )
                                 .await?
                             {
-                                return requests::terminal_result(
+                                return requests::reservation_terminal_result(
                                     &terminal,
                                     &cancellation_fingerprint(&intent),
                                 );
                             }
+                            let sealed_reclaim =
+                                control::reclaim::require_intent_at(&tr, &intent).await?;
                             if !control::receipt_placement_matches(&tr, &stub).await? {
                                 return Ok(PublishOutcome::PlacementMismatch);
+                            }
+                            if let Some(barcode) = &intent.barcode_constraint {
+                                let placement =
+                                    control::verified_placement(&tr, intent.volume_id).await?;
+                                if !placement.is_some_and(|placement| placement.barcode == *barcode)
+                                {
+                                    return Ok(PublishOutcome::PlacementMismatch);
+                                }
                             }
                             if !parent_matches_at(&tr, &intent).await? {
                                 return Ok(PublishOutcome::MissingParent);
@@ -627,13 +776,18 @@ impl ManagedCatalog {
                             }
                             let key = reservation_key(&intent);
                             if let Some(existing) = tr.get(&key, false).await? {
-                                let (saved, _) = decode(
+                                let (saved, permit) = decode(
                                     &existing,
                                     intent.namespace,
                                     intent.request_epoch,
                                     intent.operation_id,
                                 )?;
-                                if !same_logical(&saved, &intent) {
+                                if sealed_reclaim.is_some_and(|original| original != permit) {
+                                    return Err(CatalogError::Corrupt(
+                                        "回收子请求的 Q 准入名额改变",
+                                    ));
+                                }
+                                if !same_attempt(&saved, &intent) {
                                     return Ok(PublishOutcome::OperationConflict);
                                 }
                                 if !claims_match(&tr, &intent).await? {
@@ -649,7 +803,7 @@ impl ManagedCatalog {
                             if tr.get(&requests::intent_key(&stub), false).await?.is_some() {
                                 return Ok(PublishOutcome::OperationConflict);
                             }
-                            if intent.request_epoch != w.accepting {
+                            if intent.request_epoch != w.accepting && sealed_reclaim.is_none() {
                                 return Ok(PublishOutcome::RequestEpochClosed);
                             }
                             if !active_batch::target_matches_baseline(&tr, &stub).await? {
@@ -672,15 +826,21 @@ impl ManagedCatalog {
                                     return Ok(PublishOutcome::BatchClaimed);
                                 }
                             }
-                            let Some(permit) = maintenance::reserve_identity(
-                                &tr,
-                                intent.namespace,
-                                intent.request_epoch,
-                                intent.operation_id,
-                            )
-                            .await?
-                            else {
-                                return Ok(PublishOutcome::AdmissionLimited);
+                            let permit = match sealed_reclaim {
+                                Some(permit) => permit,
+                                None => {
+                                    let Some(permit) = maintenance::reserve_identity(
+                                        &tr,
+                                        intent.namespace,
+                                        intent.request_epoch,
+                                        intent.operation_id,
+                                    )
+                                    .await?
+                                    else {
+                                        return Ok(PublishOutcome::AdmissionLimited);
+                                    };
+                                    permit
+                                }
                             };
                             tr.set(&key, &encode(&intent, permit));
                             tr.set(&volume_key(&intent), intent.namespace.as_bytes());
@@ -864,7 +1024,7 @@ impl ManagedCatalog {
                             {
                                 return Err(CatalogError::Corrupt("升级倒排与原预约不一致"));
                             }
-                            if !same_logical(&saved, &intent) {
+                            if !same_attempt(&saved, &intent) {
                                 return Ok(PublishOutcome::OperationConflict);
                             }
                             if tr
@@ -979,6 +1139,7 @@ mod tests {
     #[test]
     fn reservation_record_binds_logical_identity_and_detects_corruption() {
         let intent = ActiveFileIntent {
+            barcode_constraint: None,
             namespace: Uuid::new_v4(),
             parent: Uuid::nil(),
             parent_path: b"/".to_vec(),
@@ -1029,7 +1190,7 @@ mod tests {
         );
         let mut takeover = intent.clone();
         takeover.owner_epoch += 1;
-        assert!(same_logical(&intent, &takeover));
+        assert!(same_attempt(&intent, &takeover));
         assert_eq!(
             cancellation_fingerprint(&intent),
             cancellation_fingerprint(&takeover)
@@ -1047,6 +1208,6 @@ mod tests {
         moved.parent_path = vec![b'/', 0xff];
         assert!(validate_active_file_intent(&moved).is_err());
         takeover.volume_generation += 1;
-        assert!(!same_logical(&intent, &takeover));
+        assert!(!same_attempt(&intent, &takeover));
     }
 }

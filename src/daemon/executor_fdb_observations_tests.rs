@@ -178,7 +178,7 @@ fn publisher_preserves_complete_samples_and_owner_boundaries() {
     let first = inventory(&runtime, &control);
     assert_eq!(first["volumes"].as_array().unwrap().len(), 2);
     assert_eq!(first["drives"].as_array().unwrap().len(), 1);
-    assert_eq!(head(&runtime, &control), 2);
+    assert_eq!(head(&runtime, &control), 4);
     assert_eq!(
         log.lock()
             .unwrap()
@@ -196,7 +196,7 @@ fn publisher_preserves_complete_samples_and_owner_boundaries() {
     due(&mut publisher);
     publisher.poll(context(), &runtime).unwrap();
     let stable = inventory(&runtime, &control);
-    assert_eq!(head(&runtime, &control), 2);
+    assert_eq!(head(&runtime, &control), 4);
     let last_success = monitor(&runtime, &control)["last_success"].clone();
     provider.changer.inject(Fault {
         opcode: opcode::READ_ELEMENT_STATUS,
@@ -210,11 +210,11 @@ fn publisher_preserves_complete_samples_and_owner_boundaries() {
     let failed = monitor(&runtime, &control);
     assert_eq!(failed["last_success"], last_success);
     assert!(failed["error"].as_str().unwrap().contains("host"));
-    assert_eq!(head(&runtime, &control), 3);
+    assert_eq!(head(&runtime, &control), 5);
     due(&mut publisher);
     publisher.poll(context(), &runtime).unwrap();
     assert!(monitor(&runtime, &control)["error"].is_null());
-    assert_eq!(head(&runtime, &control), 4);
+    assert_eq!(head(&runtime, &control), 6);
     // A nonresponsive, separate cluster injects a real client/RPC timeout without
     // stopping the shared private FDB. The same captured payload must be retried.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -273,7 +273,7 @@ fn publisher_preserves_complete_samples_and_owner_boundaries() {
         "重试旧采样不能刷新巡检时间"
     );
     assert!(publisher.pending.is_none());
-    assert_eq!(head(&runtime, &control), 4);
+    assert_eq!(head(&runtime, &control), 6);
     // The SDK transaction really commits; the caller then loses that ACK and
     // resumes the original monitor stage. Neither timestamps nor events rewind.
     let captured_at = pending["observed_at"].as_str().unwrap().to_owned();
@@ -310,7 +310,7 @@ fn publisher_preserves_complete_samples_and_owner_boundaries() {
     publisher.poll(context(), &runtime).unwrap();
     assert!(log.lock().unwrap().is_empty());
     assert_eq!(monitor(&runtime, &control), confirmed_monitor);
-    assert_eq!(head(&runtime, &control), 4);
+    assert_eq!(head(&runtime, &control), 6);
     assert!(
         runtime
             .block_on(catalog.record_library_monitor(&serial, route, round, "not-a-time", None))
@@ -323,7 +323,7 @@ fn publisher_preserves_complete_samples_and_owner_boundaries() {
         inventory(&runtime, &control)["drives"][0]["barcode"],
         "TEST01L8"
     );
-    assert_eq!(head(&runtime, &control), 5);
+    assert_eq!(head(&runtime, &control), 9);
     // Corrupt only this test's existing cache, prove no automatic repair, restore
     // its exact bytes, and require a new owner before a blocked publisher resumes.
     let db = foundationdb::Database::new(Some(&cluster)).unwrap();
@@ -407,7 +407,7 @@ fn publisher_preserves_complete_samples_and_owner_boundaries() {
     assert!(!publisher.blocked);
     assert_eq!(inventory(&runtime, &control)["round"], next);
     assert_eq!(inventory(&runtime, &control)["owner"], 3);
-    assert_eq!(head(&runtime, &control), 5);
+    assert_eq!(head(&runtime, &control), 9);
     log.lock().unwrap().clear();
     due(&mut publisher);
     publisher.poll(context(), &runtime).unwrap();
@@ -420,7 +420,7 @@ fn publisher_preserves_complete_samples_and_owner_boundaries() {
     assert!(publisher.poll(context2(), &runtime).is_err());
     assert_eq!(inventory(&runtime, &control), before_loss);
     assert_eq!(monitor(&runtime, &control), monitor_before);
-    assert_eq!(head(&runtime, &control), 5);
+    assert_eq!(head(&runtime, &control), 9);
     drop(active2);
     drop(active);
     drop(files);
