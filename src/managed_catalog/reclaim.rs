@@ -22,10 +22,10 @@ pub use retirement::ReclaimBodyDestination;
 #[path = "reclaim_source.rs"]
 mod source;
 pub use source::{
-    ReclaimDataProgress, ReclaimFileMetadata, ReclaimMetadataInput, ReclaimMetadataProgress,
-    ReclaimNodeDestination, ReclaimNodeMetadata, ReclaimNodeReadRequest, ReclaimReadSource,
-    ReclaimSourceInventory, ReclaimSourceNode, ReclaimSourceNodeKind, ReclaimSourceProgress,
-    ReclaimSourceRead,
+    ReclaimDataProgress, ReclaimFileMetadata, ReclaimMetadataInput, ReclaimMetadataPlan,
+    ReclaimMetadataProgress, ReclaimMetadataWrite, ReclaimNodeDestination, ReclaimNodeMetadata,
+    ReclaimNodeReadRequest, ReclaimReadSource, ReclaimSourceInventory, ReclaimSourceNode,
+    ReclaimSourceNodeKind, ReclaimSourceProgress, ReclaimSourceRead,
 };
 
 fn domain(ns: Uuid, kind: u8) -> Vec<u8> {
@@ -133,6 +133,27 @@ async fn pool_gate_at(tr: &Transaction, ns: Uuid, pool: Uuid) -> Result<Option<V
         return Err(CatalogError::Corrupt("回收池写屏障身份或格式损坏"));
     }
     Ok(Some(token))
+}
+
+async fn require_metadata_copy_idle_at(tr: &Transaction, ns: Uuid, pool: Uuid) -> Result<()> {
+    if let Some(token) = pool_gate_at(tr, ns, pool).await? {
+        let mut key = domain(ns, b'A');
+        key.extend_from_slice(
+            &token["epoch"]
+                .as_u64()
+                .expect("validated epoch")
+                .to_be_bytes(),
+        );
+        key.extend_from_slice(
+            Uuid::parse_str(token["operation"].as_str().expect("validated operation"))
+                .expect("validated UUID")
+                .as_bytes(),
+        );
+        if tr.get(&key, false).await?.is_some() {
+            return Err(CatalogError::PoolBusy);
+        }
+    }
+    Ok(())
 }
 
 pub(super) async fn require_pool_write_at(tr: &Transaction, ns: Uuid, pool: Uuid) -> Result<()> {
@@ -306,6 +327,7 @@ impl ManagedCatalog {
                         if value["phase"] != "reserved" || value["children"] != 0 {
                             return Err(CatalogError::PoolBusy);
                         }
+                        source::require_metadata_idle_at(&tr, reservation).await?;
                         walk::clear_reserved_at(&tr, reservation).await?;
                         source::clear_reserved_at(&tr, reservation);
                         tr.clear(&gate_key(reservation.namespace(), reservation.spec().pool));

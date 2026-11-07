@@ -103,10 +103,11 @@ pub use control::{
     NodeRenameVolumeProjection, NodeRenameVolumeProjectionStats, NotifyConnectionAction,
     NotifyFilter, PoolPolicy, PoolRecord, PreparedNodeMutationInputs, PreparedNodeRenameInputs,
     ReclaimBodyDestination, ReclaimDataProgress, ReclaimFile, ReclaimFileMetadata,
-    ReclaimMetadataInput, ReclaimMetadataProgress, ReclaimNodeDestination, ReclaimNodeMetadata,
-    ReclaimNodeReadRequest, ReclaimReadSource, ReclaimReservation, ReclaimSourceInventory,
-    ReclaimSourceNode, ReclaimSourceNodeKind, ReclaimSourceProgress, ReclaimSourceRead,
-    ReclaimSpec, ReclaimWalk, TapeAssignment, VolumePlacement,
+    ReclaimMetadataInput, ReclaimMetadataPlan, ReclaimMetadataProgress, ReclaimMetadataWrite,
+    ReclaimNodeDestination, ReclaimNodeMetadata, ReclaimNodeReadRequest, ReclaimReadSource,
+    ReclaimReservation, ReclaimSourceInventory, ReclaimSourceNode, ReclaimSourceNodeKind,
+    ReclaimSourceProgress, ReclaimSourceRead, ReclaimSpec, ReclaimWalk, TapeAssignment,
+    VolumePlacement,
 };
 pub use cutover::{
     FrozenSnapshotIdentity, VerifiedNodeExport, inspect_frozen_snapshot, verify_node_export,

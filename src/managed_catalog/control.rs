@@ -49,10 +49,10 @@ pub use automatic_media::{AutomaticMediaAction, AutomaticMediaCommand, Automatic
 pub(super) mod reclaim;
 pub use reclaim::{
     ReclaimBodyDestination, ReclaimDataProgress, ReclaimFile, ReclaimFileMetadata,
-    ReclaimMetadataInput, ReclaimMetadataProgress, ReclaimNodeDestination, ReclaimNodeMetadata,
-    ReclaimNodeReadRequest, ReclaimReadSource, ReclaimReservation, ReclaimSourceInventory,
-    ReclaimSourceNode, ReclaimSourceNodeKind, ReclaimSourceProgress, ReclaimSourceRead,
-    ReclaimSpec, ReclaimWalk,
+    ReclaimMetadataInput, ReclaimMetadataPlan, ReclaimMetadataProgress, ReclaimMetadataWrite,
+    ReclaimNodeDestination, ReclaimNodeMetadata, ReclaimNodeReadRequest, ReclaimReadSource,
+    ReclaimReservation, ReclaimSourceInventory, ReclaimSourceNode, ReclaimSourceNodeKind,
+    ReclaimSourceProgress, ReclaimSourceRead, ReclaimSpec, ReclaimWalk,
 };
 #[path = "node_baseline.rs"]
 mod node_baseline;

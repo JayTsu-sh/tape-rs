@@ -208,6 +208,17 @@ pub(in crate::managed_catalog) async fn require_request_at(
     request: &ActiveFileRequest,
     owner: u64,
 ) -> Result<()> {
+    if let Some(pool) = request.pool_id {
+        require_metadata_copy_idle_at(tr, request.namespace, pool).await?;
+    }
+    require_request_identity_at(tr, request, owner).await
+}
+
+pub(super) async fn require_request_identity_at(
+    tr: &Transaction,
+    request: &ActiveFileRequest,
+    owner: u64,
+) -> Result<()> {
     if let Some(pool) = request.pool_id
         && let Some((saved, _)) = child_at(
             tr,
@@ -229,6 +240,9 @@ pub(in crate::managed_catalog) async fn require_intent_at(
     tr: &Transaction,
     intent: &ActiveFileIntent,
 ) -> Result<Option<u16>> {
+    if let Some(pool) = intent.pool_id {
+        require_metadata_copy_idle_at(tr, intent.namespace, pool).await?;
+    }
     if let Some(pool) = intent.pool_id
         && let Some((mut saved, permit)) = child_at(
             tr,
@@ -393,6 +407,7 @@ impl ManagedCatalog {
             Box::pin(async move { requests::retry_result(async {
                 let mut parent = record_at(&tr, reservation, owner).await?;
                 if parent["owner_epoch"] != owner { return Err(CatalogError::OwnerFenced); }
+                source::require_metadata_idle_at(&tr, reservation).await?;
                 require_pool_without_reclaim_at(&tr, reservation.namespace(), source.pool).await?;
                 let (_, source_index) = source_state_at(&tr, reservation).await?;
                 let mut source_index_bytes = Vec::new(); active_volume::encode_index(&mut source_index_bytes, source_index);

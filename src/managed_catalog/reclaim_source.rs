@@ -18,6 +18,13 @@ pub use read::{ReclaimReadSource, ReclaimSourceRead};
 mod relocation;
 pub(super) use relocation::require_no_data_at;
 pub use relocation::{ReclaimDataProgress, ReclaimMetadataInput};
+#[path = "reclaim_metadata_plan.rs"]
+mod metadata_plan;
+pub use metadata_plan::ReclaimMetadataPlan;
+#[path = "reclaim_metadata_write.rs"]
+mod metadata_write;
+pub use metadata_write::ReclaimMetadataWrite;
+pub(super) use metadata_write::require_idle_at as require_metadata_idle_at;
 #[path = "reclaim_file_metadata.rs"]
 mod metadata;
 pub(super) use metadata::require_no_metadata_at;

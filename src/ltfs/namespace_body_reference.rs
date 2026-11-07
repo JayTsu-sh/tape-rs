@@ -40,6 +40,38 @@ fn require_body(source: &FileNode, body: &FileNode) -> Result<()> {
     Ok(())
 }
 
+impl FileNode {
+    /// Pure staging recipe shared by the durable reclaim planner and writer.
+    /// The caller must separately prove actual source/donor bytes and scope.
+    pub(crate) fn reclaimed_reference(
+        path: &str,
+        uid: u64,
+        body: &FileNode,
+        source: &IndexEntry,
+    ) -> Result<Self> {
+        let IndexEntry::File { node: source, .. } = source else {
+            return Err(error("正文引用的原节点必须是普通文件"));
+        };
+        require_body(source, body)?;
+        let p = parts(path)?;
+        let name = p.last().ok_or_else(|| error("不能用文件覆盖根目录"))?;
+        if uid <= 1 || !crate::ltfs::xml_text_valid(path) {
+            return Err(error("正文引用的目的 UID 或路径无效"));
+        }
+        let mut meta = source.meta.clone();
+        meta.file_uid = uid;
+        Ok(Self {
+            name: name.to_string(),
+            length: source.length,
+            meta,
+            extents: body.extents.clone(),
+            xattrs: source.xattrs.clone(),
+            open_for_write: source.open_for_write,
+            ..Default::default()
+        })
+    }
+}
+
 impl LtfsIndex {
     pub(in crate::ltfs) fn reference_reclaimed_body(
         &mut self,
@@ -48,10 +80,7 @@ impl LtfsIndex {
         body: &FileNode,
         source: &IndexEntry,
     ) -> Result<()> {
-        let IndexEntry::File { node: source, .. } = source else {
-            return Err(error("正文引用的原节点必须是普通文件"));
-        };
-        require_body(source, body)?;
+        let node = FileNode::reclaimed_reference(path, uid, body, source)?;
         let next_uid = self
             .highest_file_uid
             .checked_add(1)
@@ -72,17 +101,6 @@ impl LtfsIndex {
         }
         // All fallible checks precede mutation. Keep the source attributes,
         // but never its physical UID, name or source-volume block addresses.
-        let mut meta = source.meta.clone();
-        meta.file_uid = uid;
-        let node = FileNode {
-            name: name.to_string(),
-            length: source.length,
-            meta,
-            extents: body.extents.clone(),
-            xattrs: source.xattrs.clone(),
-            open_for_write: source.open_for_write,
-            ..Default::default()
-        };
         parent.files.push(node);
         self.highest_file_uid = uid;
         Ok(())

@@ -4868,6 +4868,12 @@ mod tests {
                 tr.clear(&metadata_key);
                 tr.commit().await.unwrap();
             }
+            let plan_target = capture_index_source(
+                &TapeDrive::new(fixture.device()),
+                &crate::ltfs::volume::read_label_only(fixture.device()).unwrap(),
+                &RecoveryBudget::default(),
+            )
+            .unwrap();
             let drive = fixture.drive_log();
             let changer = fixture.changer_log();
             assert!(
@@ -4942,6 +4948,18 @@ mod tests {
                 input.destination().copy().volume_id,
                 read.metadata.copy.volume_id
             );
+            let raw_plan = inventory
+                .plan_reclaimed_body(&input, &plan_target, "raw-blob")
+                .unwrap();
+            assert_eq!(raw_plan.uid(), plan_target.header().highest_file_uid + 1);
+            assert_eq!(raw_plan.path(), "raw-blob");
+            assert_eq!(raw_plan.volume(), input.destination().copy().volume_id);
+            assert!(
+                inventory
+                    .plan_reclaimed_body(&input, &captured, "raw-blob")
+                    .is_err(),
+                "源卷不能当作目标卷"
+            );
             assert_eq!(
                 observer
                     .reclaim_metadata_input(
@@ -4975,6 +4993,18 @@ mod tests {
             };
         }
         assert!(next.is_none());
+        let latest_target = capture_index_source(
+            &TapeDrive::new(fixture.device()),
+            &crate::ltfs::volume::read_label_only(fixture.device()).unwrap(),
+            &RecoveryBudget::default(),
+        )
+        .unwrap();
+        assert!(
+            inventory
+                .plan_reclaimed_body(&metadata_receipts[0].2, &latest_target, "raw-blob")
+                .is_err(),
+            "后续已知卷头不能替代原实读正文的精确物理位置证明"
+        );
         let drive_after = fixture.drive_log();
         let observer = ManagedCatalog::open(Some(&cluster)).unwrap();
         let first = catalog
@@ -6428,6 +6458,13 @@ mod tests {
             )
             .await
             .unwrap();
+        let captured_target = crate::ltfs::recovery::capture_index_source(
+            &TapeDrive::new(fixture.owner.devices[drive].dev.as_ref()),
+            &crate::ltfs::volume::read_label_only(fixture.owner.devices[drive].dev.as_ref())
+                .unwrap(),
+            &crate::ltfs::recovery::RecoveryBudget::default(),
+        )
+        .unwrap();
         let mut wrong = verified.verified_head;
         wrong.sha256[0] ^= 1;
         assert!(
@@ -6880,6 +6917,292 @@ mod tests {
             &verified.metadata.placement
         );
         assert_eq!(input.destination().index(), verified.verified_head);
+        let metadata_plan = inventory
+            .plan_reclaimed_body(&input, &captured_target, "reclaimed-raw")
+            .unwrap();
+        assert_eq!(
+            metadata_plan.uid(),
+            captured_target.header().highest_file_uid + 1
+        );
+        assert_eq!(metadata_plan.volume(), verified.metadata.copy.volume_id);
+        assert_eq!(metadata_plan.path(), "reclaimed-raw");
+        for path in [
+            "",
+            "/absolute",
+            "../escape",
+            "double//slash",
+            "missing/file",
+            &input_request.ltfs_path().unwrap()[1..],
+        ] {
+            assert!(
+                inventory
+                    .plan_reclaimed_body(&input, &captured_target, path)
+                    .is_err(),
+                "{path}"
+            );
+        }
+        assert!(
+            catalog
+                .prepare_reclaim_metadata_write(
+                    &reserved,
+                    fixture.owner.round + 1,
+                    &scanned,
+                    &input_request,
+                    &metadata_plan
+                )
+                .await
+                .is_err()
+        );
+        let mut latest_metadata_key = own_row(b'T');
+        latest_metadata_key.extend_from_slice(&source_data_uid.to_be_bytes());
+        let mut metadata_task_key = own_row(b'W');
+        metadata_task_key.extend_from_slice(&source_data_uid.to_be_bytes());
+        metadata_task_key.extend_from_slice(&metadata_plan.fingerprint().unwrap());
+        let metadata_active_key = own_row(b'A');
+        let mut metadata_volume_key = b"tape-rs/catalog/22/@/".to_vec();
+        metadata_volume_key.extend_from_slice(uuid::Uuid::nil().as_bytes());
+        metadata_volume_key.extend_from_slice(b"Qv");
+        metadata_volume_key.extend_from_slice(metadata_plan.volume().as_bytes());
+        let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let unavailable_path = fixture.root.join("metadata-unavailable.cluster");
+        std::fs::write(
+            &unavailable_path,
+            format!(
+                "offline:{}@{}\n",
+                uuid::Uuid::new_v4().simple(),
+                unavailable.local_addr().unwrap()
+            ),
+        )
+        .unwrap();
+        let offline = ManagedCatalog::open(Some(unavailable_path.to_str().unwrap())).unwrap();
+        let unavailable_result = tokio::time::timeout(
+            Duration::from_secs(12),
+            Box::pin(offline.prepare_reclaim_metadata_write(
+                &reserved,
+                fixture.owner.round,
+                &scanned,
+                &input_request,
+                &metadata_plan,
+            )),
+        )
+        .await
+        .expect("准备任务的 FDB 依赖故障须有界返回");
+        assert!(matches!(
+            unavailable_result,
+            Err(crate::managed_catalog::CatalogError::Fdb(_)
+                | crate::managed_catalog::CatalogError::Client(_))
+        ));
+        drop(offline);
+        drop(unavailable);
+        let mut pool_key = b"tape-rs/catalog/22/T/".to_vec();
+        pool_key.extend_from_slice(namespace.as_bytes());
+        pool_key.extend_from_slice(pool.id.as_bytes());
+        let tr = raw_catalog.create_trx().unwrap();
+        let pool_bytes = tr.get(&pool_key, false).await.unwrap().unwrap().to_vec();
+        let mut full_pool = pool_bytes.clone();
+        full_pool[9..17].copy_from_slice(&1u64.to_be_bytes());
+        tr.set(&pool_key, &full_pool);
+        tr.commit().await.unwrap();
+        assert!(
+            catalog
+                .prepare_reclaim_metadata_write(
+                    &reserved,
+                    fixture.owner.round,
+                    &scanned,
+                    &input_request,
+                    &metadata_plan
+                )
+                .await
+                .is_err(),
+            "正文复用也必须占用物理文件名额"
+        );
+        let tr = raw_catalog.create_trx().unwrap();
+        for key in [
+            &latest_metadata_key,
+            &metadata_task_key,
+            &metadata_active_key,
+            &metadata_volume_key,
+        ] {
+            assert!(
+                tr.get(key, false).await.unwrap().is_none(),
+                "失败准备不能留下半条任务"
+            );
+        }
+        tr.set(&pool_key, &pool_bytes);
+        tr.commit().await.unwrap();
+        let (first, duplicate) = tokio::join!(
+            Box::pin(catalog.prepare_reclaim_metadata_write(
+                &reserved,
+                fixture.owner.round,
+                &scanned,
+                &input_request,
+                &metadata_plan
+            )),
+            Box::pin(observer.prepare_reclaim_metadata_write(
+                &reserved,
+                fixture.owner.round,
+                &scanned,
+                &input_request,
+                &metadata_plan
+            ))
+        );
+        let metadata_write = first.unwrap();
+        assert_eq!(duplicate.unwrap(), metadata_write);
+        assert_eq!(metadata_write.plan(), metadata_plan);
+        assert!(!metadata_write.closed());
+        assert_eq!(
+            observer
+                .reclaim_metadata_write_status(&reserved, fixture.owner.round, source_data_uid)
+                .await
+                .unwrap(),
+            Some(metadata_write.clone())
+        );
+        let tr = raw_catalog.create_trx().unwrap();
+        let active = tr
+            .get(&metadata_active_key, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .to_vec();
+        // The normal node discovery path must recognize the typed claim and stop.
+        assert!(matches!(
+            catalog
+                .pending_node_mutation_attempt(
+                    &serial,
+                    route,
+                    fixture.owner.round,
+                    metadata_plan.volume()
+                )
+                .await,
+            Err(crate::managed_catalog::CatalogError::PoolBusy)
+        ));
+        assert!(matches!(
+            catalog
+                .pending_node_rename_task(
+                    &serial,
+                    route,
+                    fixture.owner.round,
+                    metadata_plan.volume()
+                )
+                .await,
+            Err(crate::managed_catalog::CatalogError::PoolBusy)
+        ));
+        assert!(
+            catalog
+                .check_active_upload_gate(route, fixture.owner.round, &input_request)
+                .await
+                .is_err()
+        );
+        let changed_plan = inventory
+            .plan_reclaimed_body(&input, &captured_target, "different-raw")
+            .unwrap();
+        assert!(
+            catalog
+                .prepare_reclaim_metadata_write(
+                    &reserved,
+                    fixture.owner.round,
+                    &scanned,
+                    &input_request,
+                    &changed_plan
+                )
+                .await
+                .is_err()
+        );
+        let original_task = tr
+            .get(&metadata_task_key, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .to_vec();
+        for key in [
+            &latest_metadata_key,
+            &metadata_task_key,
+            &metadata_active_key,
+            &metadata_volume_key,
+        ] {
+            let tr = raw_catalog.create_trx().unwrap();
+            let old = tr.get(key, false).await.unwrap().unwrap().to_vec();
+            tr.clear(key);
+            tr.commit().await.unwrap();
+            assert!(
+                catalog
+                    .reclaim_metadata_write_status(&reserved, fixture.owner.round, source_data_uid)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                catalog
+                    .prepare_reclaim_metadata_write(
+                        &reserved,
+                        fixture.owner.round,
+                        &scanned,
+                        &input_request,
+                        &metadata_plan
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                catalog
+                    .close_prepared_reclaim_metadata_write(
+                        &reserved,
+                        fixture.owner.round,
+                        &metadata_write
+                    )
+                    .await
+                    .is_err()
+            );
+            let tr = raw_catalog.create_trx().unwrap();
+            assert!(
+                tr.get(key, false).await.unwrap().is_none(),
+                "缺失记录不得自动修复或解锁"
+            );
+            tr.set(key, &old);
+            tr.commit().await.unwrap();
+        }
+        let tr = raw_catalog.create_trx().unwrap();
+        // Preserve the typed wire's canonical field order; fail on the changed
+        // immutable identity, rather than merely on JSON key ordering.
+        let needle = format!(
+            "\"expected\":{{\"path\":\"reclaimed-raw\",\"uid\":{}",
+            metadata_plan.uid()
+        );
+        let replacement = format!(
+            "\"expected\":{{\"path\":\"reclaimed-raw\",\"uid\":{}",
+            metadata_plan.uid() + 1
+        );
+        let changed = std::str::from_utf8(&original_task)
+            .unwrap()
+            .replace(&needle, &replacement)
+            .into_bytes();
+        assert_ne!(changed, original_task);
+        tr.set(&metadata_task_key, &changed);
+        tr.commit().await.unwrap();
+        assert!(
+            catalog
+                .reclaim_metadata_write_status(&reserved, fixture.owner.round, source_data_uid)
+                .await
+                .is_err()
+        );
+        let tr = raw_catalog.create_trx().unwrap();
+        assert_eq!(
+            tr.get(&metadata_task_key, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            changed
+        );
+        assert_eq!(
+            tr.get(&metadata_active_key, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            active
+        );
+        tr.set(&metadata_task_key, &original_task);
+        tr.commit().await.unwrap();
         assert_eq!(
             observer
                 .reclaim_metadata_input(&reserved, fixture.owner.round, &scanned, &input_request,)
@@ -7378,6 +7701,103 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(claimed.items.len(), 1);
+        assert!(
+            observer
+                .reclaim_metadata_write_status(&reserved, old_round, source_data_uid)
+                .await
+                .is_err()
+        );
+        assert!(
+            observer
+                .reclaim_metadata_write_status(&claimed.items[0], next_round, source_data_uid)
+                .await
+                .is_err(),
+            "父任务领取后仍须显式领取原元数据任务"
+        );
+        let claimed_write = catalog
+            .claim_reclaim_metadata_write(&claimed.items[0], next_round, source_data_uid)
+            .await
+            .unwrap();
+        assert_eq!(claimed_write.plan(), metadata_plan);
+        assert_eq!(claimed_write.owner(), next_round);
+        assert!(!claimed_write.closed());
+        assert!(
+            catalog
+                .close_prepared_reclaim_metadata_write(
+                    &claimed.items[0],
+                    old_round,
+                    &metadata_write
+                )
+                .await
+                .is_err()
+        );
+        let closed = catalog
+            .close_prepared_reclaim_metadata_write(&claimed.items[0], next_round, &claimed_write)
+            .await
+            .unwrap();
+        assert!(closed.closed());
+        assert_eq!(closed.plan(), metadata_plan);
+        assert_eq!(
+            observer
+                .prepare_reclaim_metadata_write(
+                    &claimed.items[0],
+                    next_round,
+                    &scanned,
+                    &input_request,
+                    &metadata_plan
+                )
+                .await
+                .unwrap(),
+            closed,
+            "关闭后的普通重试只返回原终态，不能隐式重开任务"
+        );
+        assert_eq!(
+            observer
+                .close_prepared_reclaim_metadata_write(
+                    &claimed.items[0],
+                    next_round,
+                    &claimed_write
+                )
+                .await
+                .unwrap(),
+            closed
+        );
+        assert_eq!(
+            observer
+                .reclaim_metadata_write_status(&claimed.items[0], next_round, source_data_uid)
+                .await
+                .unwrap(),
+            Some(closed.clone())
+        );
+        let tr = raw_catalog.create_trx().unwrap();
+        assert!(tr.get(&metadata_active_key, false).await.unwrap().is_none());
+        assert!(tr.get(&metadata_volume_key, false).await.unwrap().is_none());
+        assert!(tr.get(&metadata_task_key, false).await.unwrap().is_some());
+        // Idempotent closure must not clear resources subsequently owned by
+        // another operation, even when the old reply was lost.
+        tr.set(&metadata_active_key, b"other-operation");
+        tr.set(&metadata_volume_key, b"other-operation");
+        tr.commit().await.unwrap();
+        assert_eq!(
+            observer
+                .close_prepared_reclaim_metadata_write(
+                    &claimed.items[0],
+                    next_round,
+                    &claimed_write
+                )
+                .await
+                .unwrap(),
+            closed
+        );
+        let tr = raw_catalog.create_trx().unwrap();
+        for key in [&metadata_active_key, &metadata_volume_key] {
+            assert_eq!(
+                tr.get(key, false).await.unwrap().unwrap().as_ref(),
+                b"other-operation"
+            );
+            tr.clear(key);
+        }
+        tr.commit().await.unwrap();
         let drive_before_replay = fixture.drive_log();
         let changer_before_replay = fixture.changer_log();
         assert_eq!(

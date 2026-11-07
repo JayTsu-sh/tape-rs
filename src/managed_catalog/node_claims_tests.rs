@@ -78,3 +78,51 @@ fn shared_claim_rejects_invalid_scope_without_a_loose_fallback() {
         assert!(encode(&NodeVolumeClaim::Rename(Box::new(value))).is_err());
     }
 }
+
+#[test]
+fn reclaim_metadata_claim_retains_typed_original_identity_and_rejects_other_payloads() {
+    let ns = Uuid::new_v4();
+    let mut task = management::prefix(ns, b'R');
+    task.push(b'W');
+    let offset = task.len();
+    task.extend_from_slice(&u64::MAX.to_be_bytes());
+    task.extend_from_slice(Uuid::new_v4().as_bytes());
+    task.extend_from_slice(&u64::MAX.to_be_bytes());
+    task.extend_from_slice(&[9; 32]);
+    let value = ReclaimMetadataVolumeClaim {
+        namespace: ns.to_string(),
+        volume: Uuid::new_v4().to_string(),
+        task,
+        fingerprint: [9; 32],
+    };
+    let claim = NodeVolumeClaim::ReclaimMetadata(Box::new(value.clone()));
+    let raw = encode(&claim).unwrap();
+    assert_eq!(&raw[..2], &[1, 2]);
+    assert_eq!(decode(&raw).unwrap(), claim);
+    for len in [0, 1, 2, raw.len() - 1] {
+        assert!(decode(&raw[..len]).is_err());
+    }
+    for range in [
+        offset..offset + 8,
+        offset + 8..offset + 24,
+        offset + 24..offset + 32,
+    ] {
+        let mut changed = value.clone();
+        changed.task[range].fill(0);
+        assert!(encode(&NodeVolumeClaim::ReclaimMetadata(Box::new(changed))).is_err());
+    }
+    let mut changed = value.clone();
+    changed.task[0] ^= 1;
+    assert!(encode(&NodeVolumeClaim::ReclaimMetadata(Box::new(changed))).is_err());
+    let mut changed = value;
+    changed.fingerprint[0] ^= 1;
+    assert!(encode(&NodeVolumeClaim::ReclaimMetadata(Box::new(changed))).is_err());
+    let mut body: serde_json::Value = serde_json::from_slice(&raw[2..]).unwrap();
+    body["unexpected"] = true.into();
+    let mut invalid = vec![1, 2];
+    invalid.extend(node_mutation::canonical(&body).unwrap());
+    assert!(decode(&invalid).is_err());
+    let mut wrong_type = raw;
+    wrong_type[1] = 1;
+    assert!(decode(&wrong_type).is_err());
+}

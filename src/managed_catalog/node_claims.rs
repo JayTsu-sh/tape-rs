@@ -1,4 +1,4 @@
-//! One typed exclusion slot for both single-node and rename media work.
+//! One typed exclusion slot for node, rename and reclaim metadata media work.
 //! Parsing is not authorization: the corresponding original ledger must match.
 use super::*;
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,41 @@ pub(in crate::managed_catalog) struct RenameVolumeClaim {
 pub(in crate::managed_catalog) enum NodeVolumeClaim {
     Single(Box<NodeMutationAttempt>),
     Rename(Box<RenameVolumeClaim>),
+    ReclaimMetadata(Box<ReclaimMetadataVolumeClaim>),
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::managed_catalog) struct ReclaimMetadataVolumeClaim {
+    pub namespace: String,
+    pub volume: String,
+    pub task: Vec<u8>,
+    pub fingerprint: [u8; 32],
+}
+impl ReclaimMetadataVolumeClaim {
+    fn encode(&self) -> Result<Vec<u8>> {
+        let ns = node_mutation::id(&self.namespace)?;
+        node_mutation::id(&self.volume)?;
+        let mut prefix = management::prefix(ns, b'R');
+        prefix.push(b'W');
+        if !self.task.starts_with(&prefix)
+            || self.task.len() != prefix.len() + 64
+            || self.task[self.task.len() - 32..] != self.fingerprint
+        {
+            return Err(bad());
+        }
+        let suffix = &self.task[prefix.len()..];
+        if suffix[..8] == [0; 8] || suffix[8..24] == [0; 16] || suffix[24..32] == [0; 8] {
+            return Err(bad());
+        }
+        node_mutation::canonical(self)
+    }
+    fn decode(raw: &[u8]) -> Result<Self> {
+        let value: Self = serde_json::from_slice(raw).map_err(|_| bad())?;
+        if value.encode()? != raw {
+            return Err(bad());
+        }
+        Ok(value)
+    }
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -113,6 +148,7 @@ pub(in crate::managed_catalog) fn encode(claim: &NodeVolumeClaim) -> Result<Vec<
     let (kind, body) = match claim {
         NodeVolumeClaim::Single(value) => (0, node_attempts::encode(value)?),
         NodeVolumeClaim::Rename(value) => (1, value.encode()?),
+        NodeVolumeClaim::ReclaimMetadata(value) => (2, value.encode()?),
     };
     if body.len() > MAX_BODY {
         return Err(bad());
@@ -132,6 +168,9 @@ pub(in crate::managed_catalog) fn decode(raw: &[u8]) -> Result<NodeVolumeClaim> 
         )?))),
         1 => Ok(NodeVolumeClaim::Rename(Box::new(
             RenameVolumeClaim::decode(&raw[2..])?,
+        ))),
+        2 => Ok(NodeVolumeClaim::ReclaimMetadata(Box::new(
+            ReclaimMetadataVolumeClaim::decode(&raw[2..])?,
         ))),
         _ => Err(bad()),
     }

@@ -344,7 +344,7 @@ impl ManagedCatalog {
         self.db.run(|tr,_| async move {requests::retry_result(async {
             let parent=record_at(&tr,reservation,owner).await?;
             if parent["owner_epoch"]!=owner {return Err(CatalogError::OwnerFenced);}
-            children::require_request_at(&tr,request,owner).await?;
+            children::require_request_identity_at(&tr,request,owner).await?;
             if file.operation()!=request.operation_id || file.file_id()!=request.file_id
                 || Some(file.version)!=request.expected_version || file.path!=request.ltfs_path()?
                 || file.size!=request.expected_size {

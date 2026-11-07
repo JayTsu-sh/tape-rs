@@ -16,6 +16,19 @@ impl ReclaimMetadataInput {
     pub fn destination(&self) -> &ReclaimBodyDestination {
         &self.destination
     }
+    pub(super) fn fingerprint(&self) -> Result<[u8; 32]> {
+        let mut index = Vec::new();
+        active_volume::encode_index(&mut index, self.destination.index());
+        let value = json!({"source":self.source.byte_proof().value()?,
+            "copy":copy_records::encode_physical_copy(self.destination.copy())?,
+            "head":encode_head(self.destination.head()),"index":index,
+            "verification":self.destination.verification_sha256(),
+            "retirement":self.destination.retirement()});
+        let mut hash = Sha256::new();
+        hash.update(b"tape-rs/reclaim-metadata-input/1");
+        hash.update(value.to_string().as_bytes());
+        Ok(hash.finalize().into())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
