@@ -50,7 +50,7 @@ ltfsctl -e HOST:7401 tape move EMPTY_BARCODE -l LIBRARY -L homeslot --request mo
 ltfsctl -e HOST:7401 task show NAMESPACE:LIBRARY_SERIAL:EPOCH:OPERATION -l LIBRARY
 ```
 
-多库环境的池操作与导入必须明确选库。池可按库内名称或 UUID 选择，但原请求固定 UUID、namespace 和必要 revision。创建池先保存稳定 UUID；响应丢失后 `pool create --request FILE` 使用原文件恢复，不创建替代 UUID。删除和修改也先保存原请求。移除重复的 `fdb pool`、`fdb tape import` 及节点组入口，不保留兼容别名。
+多库环境的池操作与导入必须明确选库。池可按库内名称或 UUID 选择，但原请求固定 UUID、namespace 和必要 revision。创建池先保存稳定 UUID；响应丢失后 `pool create --request FILE` 使用原文件恢复，不创建替代 UUID。删除和修改也先保存原请求。移除重复的 `fdb pool`、`fdb tape` 及节点组入口，不保留兼容别名。
 
 ## 首版命令覆盖清单
 
@@ -119,6 +119,8 @@ ltfsctl -e HOST:7401 task show NAMESPACE:LIBRARY_SERIAL:EPOCH:OPERATION -l LIBRA
 assign 使用原请求固定的待创建 volume UUID。格式化前持久记录操作阶段与授权，完成后重新核验标签和索引，最后才发布 FDB 归属。未知探测或 mount 错误不是“空白”；格式化开始后的错误必须保留已写或结果未知的证据，不能回滚数据库后声称介质未变。原任务接续不能生成新的 UUID 或绕过确认门槛。
 
 move 每次实际移动前核验条码、原位置、home、address map、空闲目的位置和所有权；去 I/E 仅允许未分池或已离线成员。驱动器中的介质先安全关闭和正常退带，再移动并核对库存。超时或接管后先观察真实位置，不能盲重放 MOVE 或自动逆向补偿。
+
+普通 S3/FUSE 请求的自动装卸与 import 同样受 FDB 原机械检查点约束：先固定条码、卷、驱动器和地址，再持久记录本次命令授权。命令回执未知后，后续请求与接管节点只能读取库存或 TUR 来核实原后置条件，不能换目标或再次发送原 LOAD、UNLOAD、MOVE。尚不能确认时保留原占用和健康 owner，普通数据接口保持不可用；取消也须先结清原机械结果。FDB 不可达或原结果未结清时，计划停机不卸带、不释放相关设备预约。池实际挂载数已超过新上限时，导入先等待卸带或运维调整上限，不在一次导入中隐式连续淘汰多盘磁带。
 
 unassign 的证明覆盖卷反向副本索引、已发布上传 claim、历史有效副本、在途写入及维护占用；不能仅数当前路径，也不能用临时下载声称完成 resident 恢复。证明与解除归属之间须阻止新引用进入。validate 只声明实际执行的标签/index/结构核验，不把它说成全文件正文校验；SCSI 诊断保留原始状态与 sense。
 

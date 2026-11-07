@@ -1420,7 +1420,16 @@ fn run_fdb_owner_inner(
                         crate::local_read_storage::CacheBuild::new(&cache_dir, control.storage)?
                             .trim_to_budget()?;
                     }
-                    let loaded = inventory_inner(&owner.devices, true)?;
+                    match runtime.block_on(fdb_loading::guard(owner, permit, &control)) {
+                        Ok(()) => {}
+                        // Preserve this fenced owner while the original automatic
+                        // command remains unknown. FDB readiness rejects data I/O;
+                        // the sole observer only checks its physical postcondition.
+                        Err(ReadError::Busy(_)) => return Ok(0),
+                        Err(error) => return Err(TapeError::Catalog(error.to_string())),
+                    }
+                    let loaded = fdb_loading::recovery_inventory(owner, permit, &control)
+                        .map_err(|error| TapeError::Catalog(error.to_string()))?;
                     let configured_drives = owner
                         .devices
                         .iter()
@@ -1489,13 +1498,68 @@ fn run_fdb_owner_inner(
                             {
                                 continue;
                             }
-                            let device = owner.devices[slot.dev].dev.as_ref();
+                            let placement = crate::managed_catalog::VolumePlacement {
+                                volume_id: head.volume_id,
+                                namespace: control.route.route.namespace,
+                                pool_id: head.pool_id,
+                                library_serial: control.serial.clone(),
+                                barcode: barcode.clone(),
+                            };
+                            runtime
+                                .block_on(fdb_loading::recovery_load(
+                                    owner, permit, &control, &placement, head.index, can_write,
+                                    slot,
+                                ))
+                                .map_err(|error| TapeError::Catalog(error.to_string()))?;
+                            let checked = fdb_loading::operation_guard(
+                                owner,
+                                permit,
+                                owner.devices[slot.dev].dev.as_ref(),
+                                || {
+                                    futures_executor::block_on(async {
+                                        fdb_loading::guard(owner, permit, &control).await?;
+                                        let current = control
+                                            .catalog
+                                            .active_loaded_volume_head(
+                                                &control.serial,
+                                                barcode,
+                                                control.route,
+                                                owner.round,
+                                            )
+                                            .await
+                                            .map_err(|error| ReadError::Lost(error.to_string()))?
+                                            .ok_or_else(|| {
+                                                ReadError::Lost("恢复原卷归属缺失".into())
+                                            })?;
+                                        let policy = fdb_loading::policy(
+                                            owner,
+                                            &control,
+                                            &[placement.pool_id],
+                                            Some(barcode),
+                                        )
+                                        .await?;
+                                        if current.volume_id != placement.volume_id
+                                            || current.pool_id != placement.pool_id
+                                            || !fdb_loading::tape_allowed(&policy, barcode)
+                                            || !super::management::drive_allowed(
+                                                &policy,
+                                                &owner.devices[slot.dev].serial,
+                                                if can_write { 'm' } else { 'r' },
+                                            )
+                                        {
+                                            return Err(ReadError::Lost(
+                                                "恢复原卷、磁带或驱动器策略改变".into(),
+                                            ));
+                                        }
+                                        Ok(())
+                                    })
+                                    .map_err(
+                                        |error: ReadError| TapeError::Catalog(error.to_string()),
+                                    )
+                                },
+                            );
+                            let device: &dyn TapeTransport = &checked;
                             let drive = TapeDrive::new(device);
-                            if loaded.cleaning.contains(barcode) {
-                                return Err(TapeError::NotReady("FDB 分配指向清洗带".into()));
-                            }
-                            drive.load()?;
-                            wait_ready(device)?;
                             let label = crate::ltfs::volume::read_label_only(device)?;
                             if label.volume_uuid != head.volume_id
                                 || head.index.volume_uuid != head.volume_id
@@ -1519,6 +1583,8 @@ fn run_fdb_owner_inner(
                                         owner, &control, barcode, head.index, true,
                                     ))
                                     .map_err(|e| TapeError::Catalog(e.to_string()))?;
+                                checked.verify_proof()?;
+                                drop(checked);
                                 owner.fdb_pending_import.insert(barcode.clone());
                                 warn!(
                                     "已装载磁带 {barcode} 保留原刷新任务，暂停普通读写，等待接续"
@@ -1564,6 +1630,8 @@ fn run_fdb_owner_inner(
                                                     owner, &control, barcode, head.index, true,
                                                 ))
                                                 .map_err(|e| TapeError::Catalog(e.to_string()))?;
+                                            checked.verify_proof()?;
+                                            drop(checked);
                                             owner.fdb_pending_import.insert(barcode.clone());
                                             warn!(
                                                 "已装载磁带 {barcode} 暂停普通读写，管理接口保持可用：{error}"
@@ -1636,6 +1704,8 @@ fn run_fdb_owner_inner(
                                 .ip_generation
                                 .map(|generation| generation.to_string())
                                 .unwrap_or_else(|| "缺失（待维护）".into());
+                            checked.verify_proof()?;
+                            drop(checked);
                             owner.fdb_reads.insert(
                                 slot.dev,
                                 fdb_loading::Mount {
@@ -1728,8 +1798,21 @@ fn run_fdb_owner_inner(
             ExecRequest::Shutdown { done } => {
                 files.close_all("FDB owner 正在停机");
                 if let Some(mut owner) = active.take() {
-                    let mut release = true;
-                    if let Some(permit) = permission.as_deref() {
+                    let mut release = false;
+                    if let Some(permit) = permission.as_deref()
+                        && (permit.allows(owner.round, super::permission::Phase::Serving)
+                            || permit.allows(owner.round, super::permission::Phase::Execution))
+                    {
+                        match runtime.block_on(control.catalog.require_active_library_readable(
+                            &control.serial,
+                            control.route,
+                            owner.round,
+                        )) {
+                            Ok(()) => release = true,
+                            Err(error) => warn!("FDB 停机保留原机械检查点和设备预留: {error}"),
+                        }
+                    }
+                    if release && let Some(permit) = permission.as_deref() {
                         while let Some(drive) = owner.fdb_reads.keys().next().copied() {
                             match runtime.block_on(fdb_loading::unload(
                                 &mut owner,
@@ -1740,7 +1823,8 @@ fn run_fdb_owner_inner(
                             )) {
                                 Ok(()) => {}
                                 Err(ReadError::Busy(reason)) => {
-                                    warn!("FDB 只读停机保留装载介质: {reason}");
+                                    warn!("FDB 只读停机保留装载介质和设备预留: {reason}");
+                                    release = false;
                                     break;
                                 }
                                 Err(error) => {
@@ -1753,6 +1837,13 @@ fn run_fdb_owner_inner(
                     } else {
                         release = false;
                     }
+                    release &= runtime
+                        .block_on(control.catalog.require_active_library_readable(
+                            &control.serial,
+                            control.route,
+                            owner.round,
+                        ))
+                        .is_ok();
                     for device in owner.devices.iter().filter(|_| release) {
                         if let Err(error) =
                             reservation::release_and_unregister(device.dev.as_ref(), owner.key)

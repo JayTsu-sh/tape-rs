@@ -105,6 +105,13 @@ impl Observer {
         node: u8,
         runtime: &tokio::runtime::Runtime,
     ) -> Result<()> {
+        // An automatic data request may have lost its mechanical reply. It has
+        // priority over new samples and explicit tasks, including when idle.
+        match runtime.block_on(fdb_loading::settle_automatic(active, permission, control)) {
+            Ok(()) => {}
+            Err(ReadError::Busy(_)) => return Ok(()),
+            Err(error) => return Err(TapeError::Catalog(error.to_string())),
+        }
         let result = self.poll(
             Context {
                 active,

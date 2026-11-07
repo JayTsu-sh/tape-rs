@@ -153,20 +153,26 @@ pub(super) async fn publish_intake_home_at(
     // Called in the publication transaction, after the medium UUID and source
     // chain have been proved. A transaction failure must roll publication back.
     let result = async {
+        super::native_media::load::require_settled_at(tr, import).await?;
         let key = intake_home_key(import);
-        let Some(raw) = tr.get(&key, false).await? else { return Ok(()); };
+        let Some(raw) = tr.get(&key, false).await? else {
+            super::native_media::load::clear_at(tr, import);
+            return Ok(());
+        };
         let bytes: [u8; 2] = raw.as_ref().try_into()
             .map_err(|_| CatalogError::Corrupt("导入装载源槽位编码"))?;
         let request = import.request();
         let value = json!({"version":1,"namespace":request.namespace().to_string(),"library":request.value()["library"],"barcode":import.barcode(),"pool":import.pool().to_string(),"volume":volume.to_string(),"home":u16::from_be_bytes(bytes),"epoch":request.epoch(),"operation":request.operation().to_string(),"fingerprint":request.fingerprint()});
         tr.set(&home_key(request.namespace(), request.value()["library"].as_str().expect("validated library"), import.barcode()), &encoded(&value));
         tr.clear(&key);
+        super::native_media::load::clear_at(tr, import);
         Ok(())
     }.await;
     result.map_err(notifications::atomic_error)
 }
 pub(super) fn clear_intake_home_at(tr: &Transaction, import: &NativeMediaImport) {
     tr.clear(&intake_home_key(import));
+    super::native_media::load::clear_at(tr, import);
 }
 fn record_home_at(tr: &Transaction, task: &NativeDeviceTask, state: &Value) {
     // The immutable plan and successful physical postcondition were verified
@@ -425,7 +431,11 @@ pub(super) async fn require_library_available(
     ns: Uuid,
     serial: &str,
 ) -> Result<()> {
-    if tr.get(&library_gate(ns, serial), false).await?.is_some() {
+    if tr.get(&library_gate(ns, serial), false).await?.is_some()
+        || super::automatic_media::pending_at(tr, ns, serial)
+            .await?
+            .is_some()
+    {
         return Err(CatalogError::PoolBusy);
     }
     Ok(())

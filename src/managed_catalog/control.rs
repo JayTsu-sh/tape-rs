@@ -38,8 +38,11 @@ pub use active_pools::ActivePoolCreation;
 #[path = "pool_roots.rs"]
 mod pool_roots;
 pub(super) use pool_roots::{initial_pool_root, reject_generic_pool_root_at};
+#[path = "automatic_media.rs"]
+pub(super) mod automatic_media;
 #[path = "native_device.rs"]
 pub(super) mod native_device;
+pub use automatic_media::{AutomaticMediaAction, AutomaticMediaCommand, AutomaticMediaPlan};
 #[path = "reclaim.rs"]
 pub(super) mod reclaim;
 pub use reclaim::{
@@ -91,7 +94,10 @@ pub use node_attempts::{
 };
 #[path = "native_media.rs"]
 pub(super) mod native_media;
-pub use native_media::{NativeMediaImport, NativeMediaSource};
+pub use native_media::{
+    NativeMediaEvictionPlan, NativeMediaImport, NativeMediaLoadPhase, NativeMediaLoadPlan,
+    NativeMediaLoadProgress, NativeMediaSource,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolRecord {

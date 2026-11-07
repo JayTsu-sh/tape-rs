@@ -236,7 +236,11 @@ impl ManagedCatalog {
     ) -> Result<()> {
         let tr = self.db.create_trx()?;
         let ns = routing::require_runtime_active_owner(&tr, serial, route, owner).await?;
-        if pending_at(&tr, ns, serial).await?.is_some() {
+        if pending_at(&tr, ns, serial).await?.is_some()
+            || super::automatic_media::pending_at(&tr, ns, serial)
+                .await?
+                .is_some()
+        {
             return Err(CatalogError::PoolBusy);
         }
         Ok(())

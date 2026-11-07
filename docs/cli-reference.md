@@ -384,14 +384,9 @@ ctl fdb control cancel /var/lib/tape-client/pool-policy.json
 
 ## FDB 策略与节点查询
 
-常用运维使用上面的 `tape offline/online/set`。底层 FDB 策略请求仍可直接保存和查询：
+磁带运维统一使用 `tape show/offline/online/set`，原请求仍持久保存并可查询。驱动策略使用：
 
 ```sh
-ctl fdb tape show TAPE001L8 -l LIBRARY_SERIAL
-ctl fdb tape set TAPE001L8 -l LIBRARY_SERIAL --namespace NAMESPACE_UUID \
-  --patch '{"online":false}' --request /var/lib/tape-client/offline.json
-ctl fdb tape set TAPE001L8 -l LIBRARY_SERIAL --namespace NAMESPACE_UUID \
-  --patch '{"blacklisted":false}' --request /var/lib/tape-client/allow.json
 ctl fdb drive show DRIVE_SERIAL -l LIBRARY_SERIAL
 ctl fdb drive set DRIVE_SERIAL -l LIBRARY_SERIAL --namespace NAMESPACE_UUID \
   --patch '{"enabled":true,"role":"mr"}' --request /var/lib/tape-client/drive.json

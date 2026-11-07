@@ -180,6 +180,7 @@ pub(super) async fn apply(
         .await
         .map_err(lost)?;
     if current["abort"] == true {
+        fdb_loading::settle_cancelled(owner, permit, control, &intake).await?;
         control
             .catalog
             .rollback_native_media_page(&intake, owner.round)

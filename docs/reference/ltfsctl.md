@@ -4,7 +4,7 @@
 
 本页由 `tools/generate-cli-reference.py` 从实际构建产物递归采集 `--help` 生成，不表示所有服务模式均支持所有命令，也不表示列出的操作均已完成硬件验收。可选命令随构建特性变化，下面的帮助为本次构建内容。
 
-构建产物 SHA256：`a9617ff8cce9ddbb69fab8a85472834f2da7f0b652e36ebb71830efadd9d0d18`。共 86 个帮助入口。
+构建产物 SHA256：`bfc53a79d3948e867059a03ec1992993bef6821bf6d73134b61f0b9b2000592c`。共 83 个帮助入口。
 
 ## 目录
 
@@ -30,9 +30,6 @@
 - [ltfsctl fdb fs run](#ltfsctl-fdb-fs-run)
 - [ltfsctl fdb fs status](#ltfsctl-fdb-fs-status)
 - [ltfsctl fdb fs cancel](#ltfsctl-fdb-fs-cancel)
-- [ltfsctl fdb tape](#ltfsctl-fdb-tape)
-- [ltfsctl fdb tape show](#ltfsctl-fdb-tape-show)
-- [ltfsctl fdb tape set](#ltfsctl-fdb-tape-set)
 - [ltfsctl fdb control](#ltfsctl-fdb-control)
 - [ltfsctl fdb control run](#ltfsctl-fdb-control-run)
 - [ltfsctl fdb control status](#ltfsctl-fdb-control-status)
@@ -300,7 +297,6 @@ Usage: ltfsctl --endpoint <ENDPOINTS> fdb [OPTIONS] <COMMAND>
 Commands:
   rename    原双路径重命名；持久准备、运行、查询或取消
   fs        文件、目录和链接变更；先保存逻辑请求，再提交或查询原请求
-  tape      原生接入已格式化 LTFS 介质；显式条码任务，不格式化或写入磁带
   control   FDB 持久化管理任务：查询、重试及取消原请求
   drive     FDB 驱动器策略
   init      从三节点冻结屏障初始化全新空目录；需 fdb 特性，不导入旧目录、不操作磁带
@@ -512,59 +508,6 @@ Options:
   -l, --library <LIBRARY>  目标带库的真实 changer 序列号；省略时访问默认库
   -p, --pool <POOL>        文件命名空间的池名称或 UUID；库内有多个池时必填
   -h, --help               Print help
-```
-
-## ltfsctl fdb tape
-
-```text
-原生接入已格式化 LTFS 介质；显式条码任务，不格式化或写入磁带
-
-Usage: ltfsctl fdb tape [OPTIONS] <COMMAND>
-
-Commands:
-  show  显示当前 FDB 条码归属及在线/黑名单策略
-  set   规范 JSON patch：online=false、blacklisted、offline_message；上线请使用 tape online
-  help  Print this message or the help of the given subcommand(s)
-
-Options:
-  -l, --library <LIBRARY>  目标带库的真实 changer 序列号；省略时访问默认库
-  -p, --pool <POOL>        文件命名空间的池名称或 UUID；库内有多个池时必填
-  -h, --help               Print help
-```
-
-## ltfsctl fdb tape show
-
-```text
-显示当前 FDB 条码归属及在线/黑名单策略
-
-Usage: ltfsctl fdb tape show [OPTIONS] <BARCODE>
-
-Arguments:
-  <BARCODE>
-
-Options:
-  -l, --library <LIBRARY>  目标带库的真实 changer 序列号；省略时访问默认库
-  -p, --pool <POOL>        文件命名空间的池名称或 UUID；库内有多个池时必填
-  -h, --help               Print help
-```
-
-## ltfsctl fdb tape set
-
-```text
-规范 JSON patch：online=false、blacklisted、offline_message；上线请使用 tape online
-
-Usage: ltfsctl fdb tape set [OPTIONS] --patch <PATCH> --namespace <NAMESPACE> --request <REQUEST> <BARCODE>
-
-Arguments:
-  <BARCODE>
-
-Options:
-      --patch <PATCH>
-  -l, --library <LIBRARY>      目标带库的真实 changer 序列号；省略时访问默认库
-      --namespace <NAMESPACE>  预期的 Active namespace，防止切换后误改另一目录
-  -p, --pool <POOL>            文件命名空间的池名称或 UUID；库内有多个池时必填
-      --request <REQUEST>      原请求的保存位置；目标必须不存在，文件系统变更使用目录
-  -h, --help                   Print help
 ```
 
 ## ltfsctl fdb control

@@ -1672,6 +1672,650 @@ mod tests {
         native_fixture_for_serial(catalog, None).await
     }
 
+    #[derive(Clone, Copy)]
+    enum MechanicalBoundary {
+        Load,
+        Unload,
+        Move,
+    }
+    struct IntakeLoadBoundary {
+        trigger: MechanicalBoundary,
+        inner: Box<dyn TapeTransport + Send>,
+        loads: Arc<std::sync::atomic::AtomicUsize>,
+        changed: Arc<std::sync::atomic::AtomicBool>,
+        later: Arc<std::sync::Mutex<Vec<u8>>>,
+        after_load: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+        fail_before_load: bool,
+    }
+    impl IntakeLoadBoundary {
+        fn record(&self, cdb: &[u8]) {
+            if self.changed.load(std::sync::atomic::Ordering::SeqCst) && cdb[0] != 0x5e {
+                self.later.lock().unwrap().push(cdb[0]);
+            }
+        }
+    }
+    impl TapeTransport for IntakeLoadBoundary {
+        fn identity(&self) -> &str {
+            self.inner.identity()
+        }
+        fn session_epoch(&self) -> Option<u64> {
+            self.inner.session_epoch()
+        }
+        fn execution_guard(&self) -> Option<(u64, usize)> {
+            self.inner.execution_guard()
+        }
+        fn execute_no_data(
+            &self,
+            cdb: &[u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            self.record(cdb);
+            let triggered = match self.trigger {
+                MechanicalBoundary::Load => cdb[0] == 0x1b && cdb[4] & 1 != 0,
+                MechanicalBoundary::Unload => cdb[0] == 0x1b && cdb[4] & 1 == 0,
+                MechanicalBoundary::Move => cdb[0] == 0xa5,
+            };
+            if triggered {
+                let first = self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                if first && self.fail_before_load {
+                    self.changed
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    return (self.after_load)().and_then(|()| Err(TapeError::ScsiHost(3)));
+                }
+                let result = self.inner.execute_no_data(cdb, timeout)?;
+                if first {
+                    self.changed
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    (self.after_load)()?;
+                }
+                return Ok(result);
+            }
+            self.inner.execute_no_data(cdb, timeout)
+        }
+        fn execute_read(
+            &self,
+            cdb: &[u8],
+            data: &mut [u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            self.record(cdb);
+            self.inner.execute_read(cdb, data, timeout)
+        }
+        fn execute_write(
+            &self,
+            cdb: &[u8],
+            data: &[u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            self.record(cdb);
+            self.inner.execute_write(cdb, data, timeout)
+        }
+    }
+
+    async fn begin_loading_import(
+        control: &FdbOwnerControl,
+        pool: uuid::Uuid,
+        round: u64,
+    ) -> crate::managed_catalog::NativeMediaImport {
+        let request = crate::managed_catalog::ManagementRequest::parse(json!({
+            "version":1,"library":control.serial,"namespace":control.route.route.namespace.to_string(),
+            "epoch":1,"operation":uuid::Uuid::new_v4().to_string(),
+            "change":{"kind":"media-import","pool":pool.to_string(),"barcode":"LIFE00L8","volume":null,"path":"/","merge_tapes":true}
+        })).unwrap();
+        control
+            .catalog
+            .admit_management(&control.serial, control.route, round, &request)
+            .await
+            .unwrap();
+        control
+            .catalog
+            .start_native_media(
+                &control.serial,
+                control.route,
+                round,
+                request.epoch(),
+                request.operation(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 装带中取消原任务，无实际设备"]
+    async fn intake_load_cancellation_stops_before_the_next_device_command() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        let (mut fixture, control, pool, status) = native_fixture(catalog.clone()).await;
+        TapeDrive::new(fixture.device()).unload().unwrap();
+        let intake = begin_loading_import(&control, pool.id, fixture.owner.round).await;
+        let cancelled = intake.clone();
+        let round = fixture.owner.round;
+        let loads = Arc::new(AtomicUsize::new(0));
+        let changed = Arc::new(AtomicBool::new(false));
+        let later = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let inner = std::mem::replace(
+            &mut fixture.owner.devices[0].dev,
+            Box::new(fixture.lib.drive_as(0, 1)),
+        );
+        fixture.owner.devices[0].dev = Box::new(IntakeLoadBoundary {
+            trigger: MechanicalBoundary::Load,
+            inner,
+            loads: loads.clone(),
+            changed,
+            later: later.clone(),
+            fail_before_load: false,
+            after_load: Arc::new(move || {
+                futures_executor::block_on(catalog.abort_native_media(&cancelled, round, None))
+                    .map_err(|e| TapeError::Catalog(e.to_string()))
+            }),
+        });
+        let result = fdb_loading::select_intake(
+            &mut fixture.owner,
+            &fixture.permit,
+            &control,
+            &status,
+            &intake,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        let later = later.lock().unwrap().clone();
+        assert!(
+            later.is_empty(),
+            "原任务失效后仍向设备发送了 CDB: {later:?}"
+        );
+        assert!(matches!(
+            control
+                .catalog
+                .rollback_native_media_page(&intake, round)
+                .await
+                .unwrap_err()
+                .domain(),
+            crate::managed_catalog::CatalogError::Incomplete
+        ));
+        assert!(
+            control
+                .catalog
+                .require_active_library_readable(&control.serial, control.route, round)
+                .await
+                .is_err()
+        );
+        fdb_loading::settle_cancelled(&fixture.owner, &fixture.permit, &control, &intake)
+            .await
+            .unwrap();
+        assert_eq!(loads.load(Ordering::SeqCst), 1, "取消结清不能重发 LOAD");
+        assert!(
+            control
+                .catalog
+                .rollback_native_media_page(&intake, round)
+                .await
+                .unwrap()
+        );
+        control
+            .catalog
+            .require_active_library_readable(&control.serial, control.route, round)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim LOAD 回执未知及接管，不访问实际设备"]
+    async fn intake_unknown_load_is_observed_without_reissue_after_takeover() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        for fail_before_load in [false, true] {
+            let (mut fixture, control, pool, status) = native_fixture(catalog.clone()).await;
+            TapeDrive::new(fixture.device()).unload().unwrap();
+            let intake = begin_loading_import(&control, pool.id, fixture.owner.round).await;
+            let loads = Arc::new(AtomicUsize::new(0));
+            let changed = Arc::new(AtomicBool::new(false));
+            let later = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let inner = std::mem::replace(
+                &mut fixture.owner.devices[0].dev,
+                Box::new(fixture.lib.drive_as(0, 1)),
+            );
+            fixture.owner.devices[0].dev = Box::new(IntakeLoadBoundary {
+                trigger: MechanicalBoundary::Load,
+                inner,
+                loads: loads.clone(),
+                changed: changed.clone(),
+                later: later.clone(),
+                fail_before_load,
+                after_load: Arc::new(|| Err(TapeError::ScsiHost(3))),
+            });
+            assert!(matches!(
+                fdb_loading::select_intake(
+                    &mut fixture.owner,
+                    &fixture.permit,
+                    &control,
+                    &status,
+                    &intake
+                )
+                .await,
+                Err(ReadError::Lost(_))
+            ));
+            let checkpoint = catalog
+                .native_media_load_progress(&intake, fixture.owner.round)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                checkpoint.phase,
+                crate::managed_catalog::NativeMediaLoadPhase::LoadIssued
+            );
+            assert!(
+                !catalog
+                    .issue_native_media_load(&intake, fixture.owner.round)
+                    .await
+                    .unwrap(),
+                "第二次调用不能取得原 LOAD 的授权"
+            );
+            let mut other = checkpoint.plan.clone();
+            other.drive_serial.push_str("-OTHER");
+            assert!(
+                catalog
+                    .prepare_native_media_load(&intake, fixture.owner.round, &other)
+                    .await
+                    .is_err(),
+                "禁止改变原目标"
+            );
+            let next = fixture.owner.round + 1;
+            fixture.permit.renew(
+                next,
+                Phase::Fencing,
+                Instant::now() + Duration::from_secs(60),
+            );
+            fixture.owner = takeover(
+                &Provider {
+                    lib: fixture.lib.clone(),
+                    commands: fixture.commands.clone(),
+                },
+                &fixture.opts,
+                next,
+                Some(&fixture.permit),
+                fixture.owner.files.clone(),
+            )
+            .unwrap();
+            fixture.permit.renew(
+                next,
+                Phase::Serving,
+                Instant::now() + Duration::from_secs(60),
+            );
+            catalog
+                .claim_active_owner_epoch(&control.serial, next)
+                .await
+                .unwrap();
+            let original = intake.request();
+            let resumed = catalog
+                .start_native_media(
+                    &control.serial,
+                    control.route,
+                    next,
+                    original.epoch(),
+                    original.operation(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let inner = std::mem::replace(
+                &mut fixture.owner.devices[0].dev,
+                Box::new(fixture.lib.drive_as(0, 1)),
+            );
+            fixture.owner.devices[0].dev = Box::new(IntakeLoadBoundary {
+                trigger: MechanicalBoundary::Load,
+                inner,
+                loads: loads.clone(),
+                changed,
+                later,
+                fail_before_load: false,
+                after_load: Arc::new(|| Ok(())),
+            });
+            let result = fdb_loading::select_intake(
+                &mut fixture.owner,
+                &fixture.permit,
+                &control,
+                &status,
+                &resumed,
+            )
+            .await;
+            assert_eq!(
+                loads.load(Ordering::SeqCst),
+                1,
+                "接管重放了原未知 LOAD，fail_before_load={fail_before_load}"
+            );
+            assert_eq!(result.is_ok(), !fail_before_load);
+            assert!(
+                !catalog.native_media_status(&resumed, next).await.unwrap()["abort"]
+                    .as_bool()
+                    .unwrap()
+            );
+            if fail_before_load {
+                catalog
+                    .abort_native_media(&resumed, next, None)
+                    .await
+                    .unwrap();
+                assert!(
+                    fdb_loading::settle_cancelled(
+                        &fixture.owner,
+                        &fixture.permit,
+                        &control,
+                        &resumed
+                    )
+                    .await
+                    .is_err()
+                );
+                assert!(matches!(
+                    catalog
+                        .rollback_native_media_page(&resumed, next)
+                        .await
+                        .unwrap_err()
+                        .domain(),
+                    crate::managed_catalog::CatalogError::Incomplete
+                ));
+                assert!(
+                    catalog
+                        .require_active_library_readable(&control.serial, control.route, next)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(loads.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 普通读写装带回执未知，不访问实际设备"]
+    async fn ordinary_load_unknown_result_cannot_be_reissued_by_the_next_request() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        for fail_before_load in [false, true] {
+            let (mut fixture, control, _, status) = assigned_batch_fixture(catalog.clone()).await;
+            let head = catalog
+                .active_loaded_volume_head(
+                    &control.serial,
+                    "LIFE00L8",
+                    control.route,
+                    fixture.owner.round,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let placement = catalog
+                .volume_placement(head.volume_id)
+                .await
+                .unwrap()
+                .unwrap();
+            TapeDrive::new(fixture.device()).unload().unwrap();
+            fixture.owner.fdb_reads.clear();
+            let loads = Arc::new(AtomicUsize::new(0));
+            let inner = std::mem::replace(
+                &mut fixture.owner.devices[0].dev,
+                Box::new(fixture.lib.drive_as(0, 1)),
+            );
+            fixture.owner.devices[0].dev = Box::new(IntakeLoadBoundary {
+                trigger: MechanicalBoundary::Load,
+                inner,
+                loads: loads.clone(),
+                changed: Arc::new(AtomicBool::new(false)),
+                later: Arc::new(std::sync::Mutex::new(Vec::new())),
+                fail_before_load,
+                after_load: Arc::new(|| Err(TapeError::ScsiHost(3))),
+            });
+            assert!(
+                fdb_loading::select_write(
+                    &mut fixture.owner,
+                    &fixture.permit,
+                    &control,
+                    &status,
+                    &placement,
+                    head.index
+                )
+                .await
+                .is_err()
+            );
+            let result = fdb_loading::select_write(
+                &mut fixture.owner,
+                &fixture.permit,
+                &control,
+                &status,
+                &placement,
+                head.index,
+            )
+            .await;
+            assert_eq!(
+                loads.load(Ordering::SeqCst),
+                1,
+                "新数据请求重发了原未知 LOAD，before={fail_before_load}"
+            );
+            assert_eq!(result.is_ok(), !fail_before_load, "{result:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim MOVE未知和取消保留原gate，不访问实际设备"]
+    async fn intake_unknown_move_observes_fixed_destination_and_never_replays() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        for fail_before_load in [false, true] {
+            let (mut fixture, control, pool, status) = native_fixture(catalog.clone()).await;
+            TapeDrive::new(fixture.device()).unload().unwrap();
+            let changer = fixture
+                .owner
+                .devices
+                .iter()
+                .position(|d| d.kind == DeviceKind::Changer)
+                .unwrap();
+            let mut medium = MediumChanger::new(fixture.owner.devices[changer].dev.as_ref());
+            let map = medium.load_address_map().unwrap().clone();
+            medium.move_medium(map.dt_start, map.storage_start).unwrap();
+            let intake = begin_loading_import(&control, pool.id, fixture.owner.round).await;
+            let moves = Arc::new(AtomicUsize::new(0));
+            let inner = std::mem::replace(
+                &mut fixture.owner.devices[changer].dev,
+                Box::new(fixture.lib.changer_as(1)),
+            );
+            fixture.owner.devices[changer].dev = Box::new(IntakeLoadBoundary {
+                trigger: MechanicalBoundary::Move,
+                inner,
+                loads: moves.clone(),
+                changed: Arc::new(AtomicBool::new(false)),
+                later: Arc::new(std::sync::Mutex::new(Vec::new())),
+                fail_before_load,
+                after_load: Arc::new(|| Err(TapeError::ScsiHost(3))),
+            });
+            assert!(
+                fdb_loading::select_intake(
+                    &mut fixture.owner,
+                    &fixture.permit,
+                    &control,
+                    &status,
+                    &intake
+                )
+                .await
+                .is_err()
+            );
+            let result = fdb_loading::select_intake(
+                &mut fixture.owner,
+                &fixture.permit,
+                &control,
+                &status,
+                &intake,
+            )
+            .await;
+            assert_eq!(moves.load(Ordering::SeqCst), 1, "未知MOVE被重发");
+            assert_eq!(result.is_ok(), !fail_before_load, "{result:?}");
+            if fail_before_load {
+                catalog
+                    .abort_native_media(&intake, fixture.owner.round, None)
+                    .await
+                    .unwrap();
+                assert!(
+                    fdb_loading::settle_cancelled(
+                        &fixture.owner,
+                        &fixture.permit,
+                        &control,
+                        &intake
+                    )
+                    .await
+                    .is_err()
+                );
+                assert!(
+                    catalog
+                        .rollback_native_media_page(&intake, fixture.owner.round)
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    catalog
+                        .require_active_library_readable(
+                            &control.serial,
+                            control.route,
+                            fixture.owner.round
+                        )
+                        .await
+                        .is_err()
+                );
+                assert_eq!(moves.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 自动UNLOAD/MOVE回执未知，不访问实际设备"]
+    async fn ordinary_unload_unknown_keeps_original_bundle_and_excludes_new_tasks() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        for trigger in [MechanicalBoundary::Unload, MechanicalBoundary::Move] {
+            for fail_before_load in [false, true] {
+                let (mut fixture, control, _, status) =
+                    assigned_batch_fixture(catalog.clone()).await;
+                let head = catalog
+                    .active_loaded_volume_head(
+                        &control.serial,
+                        "LIFE00L8",
+                        control.route,
+                        fixture.owner.round,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let placement = catalog
+                    .volume_placement(head.volume_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                fdb_loading::select_write(
+                    &mut fixture.owner,
+                    &fixture.permit,
+                    &control,
+                    &status,
+                    &placement,
+                    head.index,
+                )
+                .await
+                .unwrap();
+                let device = match trigger {
+                    MechanicalBoundary::Move => fixture
+                        .owner
+                        .devices
+                        .iter()
+                        .position(|d| d.kind == DeviceKind::Changer)
+                        .unwrap(),
+                    _ => 0,
+                };
+                let calls = Arc::new(AtomicUsize::new(0));
+                let placeholder: Box<dyn TapeTransport + Send> = if device == 0 {
+                    Box::new(fixture.lib.drive_as(0, 1))
+                } else {
+                    Box::new(fixture.lib.changer_as(1))
+                };
+                let inner = std::mem::replace(&mut fixture.owner.devices[device].dev, placeholder);
+                fixture.owner.devices[device].dev = Box::new(IntakeLoadBoundary {
+                    trigger,
+                    inner,
+                    loads: calls.clone(),
+                    changed: Arc::new(AtomicBool::new(false)),
+                    later: Arc::new(std::sync::Mutex::new(Vec::new())),
+                    fail_before_load,
+                    after_load: Arc::new(|| Err(TapeError::ScsiHost(3))),
+                });
+                assert!(
+                    fdb_loading::unload(&mut fixture.owner, &fixture.permit, &control, 0, &['r'])
+                        .await
+                        .is_err()
+                );
+                let original = catalog
+                    .automatic_media_pending(&control.serial, control.route, fixture.owner.round)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    catalog
+                        .require_active_library_readable(
+                            &control.serial,
+                            control.route,
+                            fixture.owner.round
+                        )
+                        .await
+                        .is_err()
+                );
+                let (saved, grant) = catalog
+                    .issue_automatic_media(
+                        &control.serial,
+                        control.route,
+                        fixture.owner.round,
+                        &original.plan,
+                    )
+                    .await
+                    .unwrap();
+                assert!(!grant);
+                assert_eq!(saved, original);
+                let mut changed = original.plan.clone();
+                changed.destination = changed.destination.wrapping_add(1);
+                assert!(
+                    catalog
+                        .issue_automatic_media(
+                            &control.serial,
+                            control.route,
+                            fixture.owner.round,
+                            &changed
+                        )
+                        .await
+                        .is_err()
+                );
+                let _retry =
+                    fdb_loading::unload(&mut fixture.owner, &fixture.permit, &control, 0, &['r'])
+                        .await;
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "未知机械命令被重发");
+                let pending = catalog
+                    .automatic_media_pending(&control.serial, control.route, fixture.owner.round)
+                    .await
+                    .unwrap();
+                let complete = matches!(trigger, MechanicalBoundary::Move) && !fail_before_load;
+                assert_eq!(pending.is_none(), complete);
+                if !complete {
+                    assert_eq!(pending, Some(original));
+                }
+            }
+        }
+    }
+
     async fn native_fixture_for_serial(
         catalog: Arc<crate::managed_catalog::ManagedCatalog>,
         physical_serial: Option<&str>,

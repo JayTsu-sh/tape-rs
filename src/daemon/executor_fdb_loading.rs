@@ -2,6 +2,13 @@
 use super::*;
 use crate::managed_catalog::{ActiveIndexIdentity, ActiveReadSource, VolumePlacement};
 
+#[path = "executor_fdb_automatic_media.rs"]
+mod automatic;
+pub(super) use automatic::settle_pending as settle_automatic;
+#[path = "executor_fdb_intake_load.rs"]
+mod intake_load;
+pub(super) use intake_load::settle_cancelled;
+
 pub(super) struct Mount {
     pub barcode: String,
     pub volume: uuid::Uuid,
@@ -44,6 +51,7 @@ pub(super) async fn guard(
     control: &FdbOwnerControl,
 ) -> std::result::Result<(), ReadError> {
     authority_guard(owner, permit, control).await?;
+    automatic::settle_pending(owner, permit, control).await?;
     control
         .catalog
         .require_active_library_readable(&control.serial, control.route, owner.round)
@@ -93,7 +101,31 @@ async fn unload_guard(
         authority_guard(owner, permit, control).await?;
         maintenance_unload_guard(owner, control, task, drive, destination).await
     } else {
-        intake_guard(owner, permit, control, intake).await
+        intake_guard(owner, permit, control, intake).await?;
+        if let Some(intake) = intake {
+            let progress = control
+                .catalog
+                .native_media_load_progress(intake, owner.round)
+                .await
+                .map_err(lost)?
+                .ok_or_else(|| lost("原导入退带计划缺失"))?;
+            let eviction = progress
+                .plan
+                .eviction
+                .as_ref()
+                .ok_or_else(|| lost("原导入退带身份缺失"))?;
+            if progress.phase != crate::managed_catalog::NativeMediaLoadPhase::EvictionIssued
+                || eviction.drive_serial != owner.devices[drive].serial
+                || !owner.fdb_reads.get(&drive).is_some_and(|mount| {
+                    mount.barcode == eviction.barcode
+                        && mount.volume == eviction.volume
+                        && mount.pool == eviction.pool
+                })
+            {
+                return Err(lost("原导入退带命令阶段或驱动器、卷身份改变"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -119,6 +151,220 @@ pub(super) fn operation_guard<'a, F: Fn() -> Result<()> + 'a>(
         reservation::verify_holder(inner, key)?;
         original()
     })
+}
+
+#[derive(Clone, Copy)]
+enum IoScope<'a> {
+    Automatic {
+        command: &'a crate::managed_catalog::AutomaticMediaCommand,
+        original: Option<&'a IoScope<'a>>,
+    },
+    LibraryObservation,
+    IntakeObservation(&'a crate::managed_catalog::NativeMediaImport),
+    Target(Target<'a>),
+    Unload {
+        mount: &'a Mount,
+        drive: usize,
+        roles: &'a [char],
+        maintenance: Option<(&'a crate::managed_catalog::NativeDeviceTask, u16)>,
+        intake: Option<&'a crate::managed_catalog::NativeMediaImport>,
+    },
+}
+
+fn checked_device<'a>(
+    owner: &'a Active,
+    permit: &'a Permission,
+    control: &'a FdbOwnerControl,
+    device: usize,
+    scope: IoScope<'a>,
+) -> fdb_operation_guard::Guard<'a, impl Fn() -> Result<()> + 'a> {
+    operation_guard(
+        owner,
+        permit,
+        owner.devices[device].dev.as_ref(),
+        move || {
+            futures_executor::block_on(async {
+                let (scope, automatic) = if let IoScope::Automatic { command, original } = scope {
+                    authority_guard(owner, permit, control).await?;
+                    control
+                        .catalog
+                        .require_automatic_media(
+                            &control.serial,
+                            control.route,
+                            owner.round,
+                            command,
+                        )
+                        .await
+                        .map_err(lost)?;
+                    let Some(original) = original else {
+                        return Ok(());
+                    };
+                    (*original, true)
+                } else {
+                    (scope, false)
+                };
+                let (pool, barcode, drive, roles, allow_offline) = match scope {
+                    IoScope::Automatic { .. } => return Err(lost("自动机械守卫不能嵌套")),
+                    IoScope::LibraryObservation => {
+                        guard(owner, permit, control).await?;
+                        return Ok(());
+                    }
+                    IoScope::IntakeObservation(intake) => {
+                        authority_guard(owner, permit, control).await?;
+                        control
+                            .catalog
+                            .native_media_status(intake, owner.round)
+                            .await
+                            .map_err(lost)?;
+                        return Ok(());
+                    }
+                    IoScope::Target(target) => {
+                        if !automatic {
+                            intake_guard(owner, permit, control, target.intake).await?;
+                        }
+                        if let Some((path, source)) = target.read {
+                            if control
+                                .catalog
+                                .resolve_active_read_source_for_owner(
+                                    &control.serial,
+                                    path.as_bytes(),
+                                    control.route,
+                                    owner.round,
+                                )
+                                .await
+                                .map_err(lost)?
+                                .as_ref()
+                                != Some(source)
+                            {
+                                return Err(lost("装载原文件副本已改变"));
+                            }
+                        } else if target.intake.is_none() {
+                            let head = control
+                                .catalog
+                                .active_loaded_volume_head(
+                                    &control.serial,
+                                    &target.placement.barcode,
+                                    control.route,
+                                    owner.round,
+                                )
+                                .await
+                                .map_err(lost)?
+                                .ok_or_else(|| lost("装载原卷归属已失效"))?;
+                            if head.index != target.index
+                                || head.pool_id != target.placement.pool_id
+                            {
+                                return Err(lost("装载原卷索引或池身份已改变"));
+                            }
+                        }
+                        (
+                            target.placement.pool_id,
+                            target.placement.barcode.as_str(),
+                            (owner.devices[device].kind == DeviceKind::Drive).then_some(device),
+                            if target.writable {
+                                &['m'][..]
+                            } else {
+                                &['r'][..]
+                            },
+                            false,
+                        )
+                    }
+                    IoScope::Unload {
+                        mount,
+                        drive,
+                        roles,
+                        maintenance,
+                        intake,
+                    } => {
+                        if !automatic {
+                            unload_guard(owner, permit, control, maintenance, intake, drive)
+                                .await?;
+                        }
+                        binding(owner, control, mount).await?;
+                        (
+                            mount.pool,
+                            mount.barcode.as_str(),
+                            Some(drive),
+                            roles,
+                            maintenance.is_some(),
+                        )
+                    }
+                };
+                let current = policy(owner, control, &[pool], Some(barcode)).await?;
+                if !allow_offline && !tape_allowed(&current, barcode) {
+                    return Err(lost("原机械操作的磁带策略已禁止访问"));
+                }
+                if let Some(drive) = drive
+                    && !roles.iter().any(|role| {
+                        super::super::management::drive_allowed(
+                            &current,
+                            &owner.devices[drive].serial,
+                            *role,
+                        )
+                    })
+                {
+                    return Err(lost("原机械操作的驱动器角色已改变"));
+                }
+                Ok(())
+            })
+            .map_err(|error: ReadError| TapeError::Catalog(error.to_string()))
+        },
+    )
+}
+
+fn changer_index(owner: &Active) -> std::result::Result<usize, ReadError> {
+    owner
+        .devices
+        .iter()
+        .position(|device| device.kind == DeviceKind::Changer)
+        .ok_or_else(|| lost("逻辑库没有配置换带器"))
+}
+
+fn checked_inventory(
+    owner: &Active,
+    permit: &Permission,
+    control: &FdbOwnerControl,
+    scope: IoScope<'_>,
+) -> std::result::Result<Inventory, ReadError> {
+    let checked = checked_device(owner, permit, control, changer_index(owner)?, scope);
+    let result = (|| {
+        let mut changer = MediumChanger::new(&checked);
+        changer.load_address_map()?;
+        inventory_elements(&owner.devices, &changer.read_all_status()?, true)
+    })();
+    checked.verify_proof().map_err(lost)?;
+    result.map_err(lost)
+}
+
+fn checked_move(
+    owner: &Active,
+    permit: &Permission,
+    control: &FdbOwnerControl,
+    scope: IoScope<'_>,
+    from: u16,
+    to: u16,
+) -> std::result::Result<(), ReadError> {
+    let checked = checked_device(owner, permit, control, changer_index(owner)?, scope);
+    let result = (|| {
+        let mut changer = MediumChanger::new(&checked);
+        changer.load_address_map()?;
+        changer.move_medium(from, to)
+    })();
+    checked.verify_proof().map_err(lost)?;
+    result.map_err(lost)
+}
+
+fn drive_io<T>(
+    owner: &Active,
+    permit: &Permission,
+    control: &FdbOwnerControl,
+    scope: IoScope<'_>,
+    drive: usize,
+    operation: impl FnOnce(&dyn TapeTransport) -> Result<T>,
+) -> std::result::Result<T, ReadError> {
+    let checked = checked_device(owner, permit, control, drive, scope);
+    let result = operation(&checked);
+    checked.verify_proof().map_err(lost)?;
+    result.map_err(lost)
 }
 pub(super) fn node_operation_guard<'a>(
     owner: &Active,
@@ -293,6 +539,7 @@ pub(super) async fn unload_for_maintenance(
         if label.volume_uuid != head.volume_id {
             return Err(lost("退带前实际卷UUID与原计划不符"));
         }
+        checked.verify_proof().map_err(lost)?;
         drop(checked);
         owner.fdb_reads.insert(
             drive,
@@ -380,7 +627,14 @@ async fn unload_inner(
     let _activity = permit.begin_device_activity(owner.round).map_err(lost)?;
     unload_guard(owner, permit, control, maintenance, intake, drive).await?;
     binding(owner, control, mount).await?;
-    let inventory = inventory_inner(&owner.devices, true).map_err(lost)?;
+    let scope = IoScope::Unload {
+        mount,
+        drive,
+        roles,
+        maintenance,
+        intake,
+    };
+    let inventory = checked_inventory(owner, permit, control, scope)?;
     let slot = inventory
         .drives
         .iter()
@@ -419,12 +673,31 @@ async fn unload_inner(
     if inventory.cleaning.contains(barcode) {
         return Err(lost("禁止卸载清洗带"));
     }
+    let intake_destination = if let Some(intake) = intake {
+        let progress = control
+            .catalog
+            .native_media_load_progress(intake, owner.round)
+            .await
+            .map_err(lost)?
+            .ok_or_else(|| lost("原导入退带计划缺失"))?;
+        let eviction = progress
+            .plan
+            .eviction
+            .as_ref()
+            .ok_or_else(|| lost("原导入退带身份缺失"))?;
+        if eviction.source != slot.addr {
+            return Err(lost("原退带源驱动器地址改变"));
+        }
+        Some(eviction.home)
+    } else {
+        None
+    };
     let destination = maintenance
         .map(|(_, home)| home)
+        .or(intake_destination)
         .filter(|home| inventory.empty_slots.contains(home))
         .or_else(|| {
-            maintenance
-                .is_none()
+            (maintenance.is_none() && intake.is_none())
                 .then(|| {
                     home.filter(|home| inventory.empty_slots.contains(home))
                         .or_else(|| inventory.empty_slots.first().copied())
@@ -432,8 +705,14 @@ async fn unload_inner(
                 .flatten()
         })
         .ok_or_else(|| ReadError::Busy("没有空存储槽位可卸带".into()))?;
-    let label =
-        crate::ltfs::volume::read_label_only(owner.devices[drive].dev.as_ref()).map_err(lost)?;
+    let label = drive_io(
+        owner,
+        permit,
+        control,
+        scope,
+        drive,
+        crate::ltfs::volume::read_label_only,
+    )?;
     if label.volume_uuid != mount.volume {
         return Err(lost("卸带前介质 UUID 不匹配"));
     }
@@ -442,16 +721,32 @@ async fn unload_inner(
     if let Some((task, destination)) = maintenance {
         maintenance_unload_guard(owner, control, task, drive, destination).await?;
     }
-    TapeDrive::new(owner.devices[drive].dev.as_ref())
-        .unload()
-        .map_err(lost)?;
+    if maintenance.is_none() && intake.is_none() {
+        let role = roles
+            .iter()
+            .copied()
+            .find(|role| {
+                super::super::management::drive_allowed(
+                    &management,
+                    &owner.devices[drive].serial,
+                    *role,
+                )
+            })
+            .ok_or_else(|| lost("自动退带缺少当前可用角色"))?;
+        automatic::unload_move(owner, permit, control, scope, slot, destination, role).await?;
+        owner.fdb_reads.remove(&drive);
+        return Ok(());
+    }
+    drive_io(owner, permit, control, scope, drive, |device| {
+        TapeDrive::new(device).unload()
+    })?;
     // UNLOAD 与 MOVE 分开核对；UNLOAD 成功后失权时绝不继续移动。
     unload_guard(owner, permit, control, maintenance, intake, drive).await?;
     binding(owner, control, mount).await?;
     if let Some((task, destination)) = maintenance {
         maintenance_unload_guard(owner, control, task, drive, destination).await?;
     }
-    let before_move = inventory_inner(&owner.devices, true).map_err(lost)?;
+    let before_move = checked_inventory(owner, permit, control, scope)?;
     if !before_move.empty_slots.contains(&destination)
         || !before_move.drives.iter().any(|current| {
             current.dev == drive
@@ -465,10 +760,10 @@ async fn unload_inner(
         return Err(lost("退带后库存改变，停止 MOVE"));
     }
     info!("FDB 只读卸带: {} -> 槽位 {destination:#06x}", barcode);
-    move_medium(&owner.devices, slot.addr, destination).map_err(lost)?;
+    checked_move(owner, permit, control, scope, slot.addr, destination)?;
     unload_guard(owner, permit, control, maintenance, intake, drive).await?;
     binding(owner, control, mount).await?;
-    let after_move = inventory_inner(&owner.devices, true).map_err(lost)?;
+    let after_move = checked_inventory(owner, permit, control, scope)?;
     if after_move.slots.get(barcode) != Some(&destination)
         || !after_move
             .drives
@@ -529,6 +824,7 @@ pub(super) async fn select_write(
     .await
 }
 
+#[derive(Clone, Copy)]
 struct Target<'a> {
     placement: &'a VolumePlacement,
     index: ActiveIndexIdentity,
@@ -573,7 +869,7 @@ pub(super) async fn select_intake(
         sha256: [0; 32],
         incremental: false,
     };
-    select_target(
+    intake_load::select(
         owner,
         permit,
         control,
@@ -618,7 +914,8 @@ async fn select_target(
         return Err(ReadError::Busy("磁带离线或在黑名单中".into()));
     }
     intake_guard(owner, permit, control, target.intake).await?;
-    let inventory = inventory_inner(&owner.devices, true).map_err(lost)?;
+    let scope = IoScope::Target(target);
+    let inventory = checked_inventory(owner, permit, control, scope)?;
     if inventory.cleaning.contains(barcode) {
         return Err(ReadError::Failed("清洗带不能执行 LTFS 读取".into()));
     }
@@ -637,25 +934,14 @@ async fn select_target(
         if !allowed(slot.dev) {
             return Err(ReadError::Busy("目标驱动器没有读取资格".into()));
         }
-        if target.intake.is_some() {
-            // READ ELEMENT STATUS reports cartridge presence, not threading.
-            // A planned stop may leave an unassigned cartridge inside a drive
-            // after UNLOAD. Intake must LOAD it under the current guards.
-            intake_guard(owner, permit, control, target.intake).await?;
-            let device = owner.devices[slot.dev].dev.as_ref();
-            TapeDrive::new(device).load().map_err(lost)?;
-            wait_ready(device).map_err(lost)?;
-            intake_guard(owner, permit, control, target.intake).await?;
-        }
         if target.writable {
+            let checked = checked_device(owner, permit, control, slot.dev, scope);
             let raw = crate::scsi::transport::retry_unit_attention(
                 "FDB 写入密度能力查询",
-                || {
-                    TapeDrive::new(owner.devices[slot.dev].dev.as_ref())
-                        .report_density_support(false)
-                },
-            )
-            .map_err(lost)?;
+                || TapeDrive::new(&checked).report_density_support(false),
+            );
+            checked.verify_proof().map_err(lost)?;
+            let raw = raw.map_err(lost)?;
             if !super::super::scheduling::densities(&raw).is_some_and(|densities| {
                 super::super::scheduling::compatible(&densities, barcode, true)
             }) {
@@ -685,9 +971,7 @@ async fn select_target(
                 return Err(lost("按需装载的当前卷或池身份不符"));
             }
             intake_guard(owner, permit, control, target.intake).await?;
-            let drive = TapeDrive::new(owner.devices[slot.dev].dev.as_ref());
-            drive.load().map_err(lost)?;
-            wait_ready(owner.devices[slot.dev].dev.as_ref()).map_err(lost)?;
+            automatic::load(owner, permit, control, target, slot.dev, slot.addr).await?;
             intake_guard(owner, permit, control, target.intake).await?;
         }
         if target.writable && target.intake.is_none() && owner.fdb_reads.contains_key(&slot.dev) {
@@ -710,10 +994,12 @@ async fn select_target(
         .ok_or_else(|| ReadError::Busy("目标磁带不在可调度存储槽位中".into()))?;
     let mut compatible = Vec::new();
     for slot in inventory.drives.iter().filter(|slot| allowed(slot.dev)) {
+        let checked = checked_device(owner, permit, control, slot.dev, scope);
         let raw =
             crate::scsi::transport::retry_unit_attention("FDB 读取密度能力查询", || {
-                TapeDrive::new(owner.devices[slot.dev].dev.as_ref()).report_density_support(false)
+                TapeDrive::new(&checked).report_density_support(false)
             });
+        checked.verify_proof().map_err(lost)?;
         match raw {
             Ok(raw)
                 if super::super::scheduling::densities(&raw).is_some_and(|densities| {
@@ -831,7 +1117,7 @@ async fn select_target(
             return Err(lost("写入卷在装载前改变"));
         }
     }
-    let before = inventory_inner(&owner.devices, true).map_err(lost)?;
+    let before = checked_inventory(owner, permit, control, scope)?;
     let destination = before
         .drives
         .iter()
@@ -841,18 +1127,10 @@ async fn select_target(
     if before.slots.get(barcode) != Some(&from) || before.cleaning.contains(barcode) {
         return Err(lost("装载前目标条码或槽位改变"));
     }
-    if let Some(intake) = target.intake {
-        control
-            .catalog
-            .record_native_media_load_home(intake, owner.round, from)
-            .await
-            .map_err(lost)?;
-        intake_guard(owner, permit, control, target.intake).await?;
-    }
     info!("FDB 只读装载: {barcode} -> {}", owner.devices[drive].serial);
-    move_medium(&owner.devices, from, destination).map_err(lost)?;
+    automatic::move_in(owner, permit, control, target, drive, from, destination).await?;
     intake_guard(owner, permit, control, target.intake).await?;
-    let after = inventory_inner(&owner.devices, true).map_err(lost)?;
+    let after = checked_inventory(owner, permit, control, scope)?;
     if !after.empty_slots.contains(&from)
         || !after.drives.iter().any(|slot| {
             slot.dev == drive
@@ -865,10 +1143,7 @@ async fn select_target(
     {
         return Err(lost("装载后的库存未确认移动结果"));
     }
-    TapeDrive::new(owner.devices[drive].dev.as_ref())
-        .load()
-        .map_err(lost)?;
-    wait_ready(owner.devices[drive].dev.as_ref()).map_err(lost)?;
+    automatic::load(owner, permit, control, target, drive, destination).await?;
     intake_guard(owner, permit, control, target.intake).await?;
     if target.intake.is_some() {
         // Intake owns label/format validation and its durable failure/undo.
@@ -876,8 +1151,14 @@ async fn select_target(
         // that the already verified owner or MOVE result was lost.
         return Ok(drive);
     }
-    let label =
-        crate::ltfs::volume::read_label_only(owner.devices[drive].dev.as_ref()).map_err(lost)?;
+    let label = drive_io(
+        owner,
+        permit,
+        control,
+        scope,
+        drive,
+        crate::ltfs::volume::read_label_only,
+    )?;
     if label.volume_uuid != target.index.volume_uuid {
         return Err(lost("装载后磁带 UUID 不匹配"));
     }
@@ -894,6 +1175,40 @@ async fn select_target(
         fdb_monitor::write_allowed(owner, control, barcode, false).await?;
     }
     Ok(drive)
+}
+
+/// Recovery obeys the same durable automatic command and per-CDB authority as requests.
+pub(super) fn recovery_inventory(
+    owner: &Active,
+    permit: &Permission,
+    control: &FdbOwnerControl,
+) -> std::result::Result<Inventory, ReadError> {
+    checked_inventory(owner, permit, control, IoScope::LibraryObservation)
+}
+pub(super) async fn recovery_load(
+    owner: &Active,
+    permit: &Permission,
+    control: &FdbOwnerControl,
+    placement: &VolumePlacement,
+    index: ActiveIndexIdentity,
+    writable: bool,
+    slot: &DriveSlot,
+) -> std::result::Result<(), ReadError> {
+    automatic::load(
+        owner,
+        permit,
+        control,
+        Target {
+            placement,
+            index,
+            read: None,
+            writable,
+            intake: None,
+        },
+        slot.dev,
+        slot.addr,
+    )
+    .await
 }
 
 #[cfg(test)]

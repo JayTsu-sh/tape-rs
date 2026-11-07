@@ -258,7 +258,7 @@ fn tape_policy_is_atomic_fenced_scoped_and_guards_media_primitives() {
         let permission = Arc::new(Permission::default());
         permission.renew(next_owner,Phase::Fencing,Instant::now()+Duration::from_secs(120));
         let trace = Arc::new(Mutex::new(Vec::new()));
-        let provider = Provider {library:f.library.clone(),serial:f.serial.clone(),trace:trace.clone(),permission:permission.clone(),fail_vci:Arc::new(AtomicBool::new(false)),fail_read:Arc::new(AtomicBool::new(false))};
+        let provider = Provider {library:f.library.clone(),serial:f.serial.clone(),trace:trace.clone(),permission:permission.clone(),fail_vci:Arc::new(AtomicBool::new(false)),fail_read:Arc::new(AtomicBool::new(false)),fail_load:Arc::new(AtomicBool::new(false)),fail_load_before:Arc::new(AtomicBool::new(false))};
         let devices = provider.open_all().unwrap().into_iter().map(|mut device| {
             device.dev = Box::new(tape_rs::daemon::permission::GuardedTransport::new(device.dev,permission.clone(),next_owner));
             device

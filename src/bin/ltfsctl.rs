@@ -143,11 +143,6 @@ enum FdbCmd {
         #[command(subcommand)]
         cmd: FdbFilesystemCmd,
     },
-    /// 原生接入已格式化 LTFS 介质；显式条码任务，不格式化或写入磁带
-    Tape {
-        #[command(subcommand)]
-        cmd: FdbTapeCmd,
-    },
     /// FDB 持久化管理任务：查询、重试及取消原请求
     Control {
         #[command(subcommand)]
@@ -228,20 +223,6 @@ struct FdbChangeArgs {
     /// 原请求的保存位置；目标必须不存在，文件系统变更使用目录
     #[arg(long)]
     request: std::path::PathBuf,
-}
-
-#[derive(Subcommand)]
-enum FdbTapeCmd {
-    /// 显示当前 FDB 条码归属及在线/黑名单策略
-    Show { barcode: String },
-    /// 规范 JSON patch：online=false、blacklisted、offline_message；上线请使用 tape online
-    Set {
-        barcode: String,
-        #[arg(long)]
-        patch: String,
-        #[command(flatten)]
-        change: FdbChangeArgs,
-    },
 }
 
 #[derive(Subcommand)]
@@ -547,46 +528,6 @@ fn main() {
                             }
                         }
                     }
-                    FdbCmd::Tape { cmd } => {
-                        let library = args
-                            .library
-                            .as_deref()
-                            .ok_or("FDB tape 必须指定 --library")?;
-                        match cmd {
-                            FdbTapeCmd::Show { barcode } => {
-                                let value = client.management_policy(library, "tape", &barcode)?;
-                                if let Some(pool) = &args.pool
-                                    && value["policy"]["pool"]
-                                        != pool.parse::<uuid::Uuid>()?.to_string()
-                                {
-                                    return Err("磁带不属于指定池".into());
-                                }
-                                print_json(value);
-                            }
-                            FdbTapeCmd::Set {
-                                barcode,
-                                patch,
-                                change,
-                            } => {
-                                let patch: serde_json::Value = serde_json::from_str(&patch)?;
-                                let value = client.management_policy(library, "tape", &barcode)?;
-                                fdb_scope(&value, change.namespace)?;
-                                if let Some(pool) = &args.pool
-                                    && value["policy"]["pool"]
-                                        != pool.parse::<uuid::Uuid>()?.to_string()
-                                {
-                                    return Err("磁带不属于指定池".into());
-                                }
-                                fdb_change(
-                                    &client,
-                                    library,
-                                    change,
-                                    serde_json::json!({"kind":"tape","barcode":barcode,"pool":value["policy"]["pool"],"volume":value["policy"]["volume"],"revision":value["policy"]["revision"],"patch":patch}),
-                                )?;
-                            }
-                        }
-                    }
-
                     FdbCmd::Control { cmd } => {
                         if let FdbControlCmd::List { limit, after } = cmd {
                             let library = args

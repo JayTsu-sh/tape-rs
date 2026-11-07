@@ -6,10 +6,15 @@ use crate::ltfs::recovery::IndexSourceIdentity;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+#[path = "native_media_load.rs"]
+pub(super) mod load;
 #[path = "native_media_refresh.rs"]
 mod refresh;
 #[path = "native_media_target.rs"]
 mod target;
+pub use load::{
+    NativeMediaEvictionPlan, NativeMediaLoadPhase, NativeMediaLoadPlan, NativeMediaLoadProgress,
+};
 
 #[derive(Clone, Debug)]
 pub struct NativeMediaImport {
@@ -886,31 +891,6 @@ impl ManagedCatalog {
         }.await.map_err(notifications::atomic_error))}).await?
     }
 
-    /// Persist the observed storage source before the actor issues MOVE. A
-    /// successful source publication binds this proof to the read-back UUID.
-    pub async fn record_native_media_load_home(
-        &self,
-        import: &NativeMediaImport,
-        owner: u64,
-        home: u16,
-    ) -> Result<()> {
-        self.db
-            .run(|tr, _| async move {
-                requests::retry_result(
-                    async {
-                        let saved = state(&tr, import, owner).await?;
-                        if saved["abort"] == true {
-                            return Err(CatalogError::PoolImporting);
-                        }
-                        native_device::stage_intake_home_at(&tr, import, home).await
-                    }
-                    .await
-                    .map_err(notifications::atomic_error),
-                )
-            })
-            .await?
-    }
-
     pub async fn native_media_status(
         &self,
         import: &NativeMediaImport,
@@ -1133,6 +1113,7 @@ impl ManagedCatalog {
                             return Ok(true);
                         }
                         let value = state(&tr, import, owner).await?;
+                        load::require_settled_at(&tr, import).await?;
 
                         if value["phase"] != "rollback" {
                             return Err(CatalogError::Invalid("任务未进入回滚"));

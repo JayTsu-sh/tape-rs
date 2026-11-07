@@ -17,6 +17,82 @@ fn queued_native_uploads_recover_original_batch_after_unknown_s4() {
     queued_uploads(UploadScene::UnknownS4);
 }
 
+#[test]
+#[ignore = "需要隔离 FDB_TEST_CLUSTER；真实owner线程与Sim未知LOAD重启，不访问实际设备"]
+fn automatic_load_checkpoint_survives_owner_restart_without_refencing_or_reissue() {
+    let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+    let _network = unsafe { foundationdb::boot() };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for before in [true, false] {
+        let f = rt.block_on(fixture(&cluster));
+        let owner = Owner::start(&f, 12, json!({}));
+        owner.fail_load_before.store(before, Ordering::SeqCst);
+        owner.fail_load.store(true, Ordering::SeqCst);
+        let failed = owner.read(0);
+        assert!(matches!(failed, Err(ReadError::Lost(_))), "{failed:?}");
+        assert!(matches!(
+            next_owner_event(&owner.events),
+            ExecEvent::Lost { round: 12, .. }
+        ));
+        let original = rt
+            .block_on(f.catalog.automatic_media_pending(&f.serial, f.route, 12))
+            .unwrap()
+            .unwrap();
+        let loads = |trace: &Arc<Mutex<Vec<Vec<u8>>>>| {
+            trace
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c[0] == 0x1b && c[4] & 1 != 0)
+                .count()
+        };
+        assert_eq!(loads(&owner.trace), 1);
+        drop(owner);
+        let recovered = Owner::start(&f, 13, json!({}));
+        assert_eq!(loads(&recovered.trace), 0, "Recover重发了原LOAD");
+        if before {
+            assert_eq!(
+                rt.block_on(f.catalog.automatic_media_pending(&f.serial, f.route, 13))
+                    .unwrap(),
+                Some(original.clone())
+            );
+            assert!(matches!(recovered.read(0), Err(ReadError::Busy(_))));
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(
+                !recovered
+                    .events
+                    .try_iter()
+                    .any(|event| matches!(event, ExecEvent::Lost { .. })),
+                "等待机械完成时撤销健康owner"
+            );
+            assert_eq!(loads(&recovered.trace), 0);
+            drop(recovered);
+            assert_eq!(
+                rt.block_on(f.catalog.automatic_media_pending(&f.serial, f.route, 13))
+                    .unwrap(),
+                Some(original)
+            );
+            tape_rs::scsi::reservation::verify_holder(
+                &f.library.drive_as(0, 71),
+                ReservationKey::new(71, 13),
+            )
+            .unwrap();
+        } else {
+            assert!(
+                rt.block_on(f.catalog.automatic_media_pending(&f.serial, f.route, 13))
+                    .unwrap()
+                    .is_none()
+            );
+            recovered.expect(0);
+            assert_eq!(loads(&recovered.trace), 0);
+            drop(recovered);
+        }
+    }
+}
+
 enum UploadScene {
     Fresh,
     UnknownS4,
@@ -706,12 +782,17 @@ struct Provider {
     permission: Arc<Permission>,
     fail_vci: Arc<AtomicBool>,
     fail_read: Arc<AtomicBool>,
+    fail_load: Arc<AtomicBool>,
+    fail_load_before: Arc<AtomicBool>,
 }
 
 struct FailVci {
+    library: SimLibrary,
     inner: Box<dyn TapeTransport + Send>,
     fail: Arc<AtomicBool>,
     fail_read: Arc<AtomicBool>,
+    fail_load: Arc<AtomicBool>,
+    fail_load_before: Arc<AtomicBool>,
 }
 impl TapeTransport for FailVci {
     fn execute_no_data(
@@ -719,7 +800,22 @@ impl TapeTransport for FailVci {
         cdb: &[u8],
         timeout: u32,
     ) -> tape_rs::error::Result<tape_rs::scsi::device::ScsiResult> {
-        self.inner.execute_no_data(cdb, timeout)
+        if cdb[0] == 0x1b && cdb[4] & 1 != 0 && self.fail_load.swap(false, Ordering::SeqCst) {
+            if !self.fail_load_before.load(Ordering::SeqCst) {
+                self.inner.execute_no_data(cdb, timeout)?;
+            }
+            return Err(tape_rs::error::TapeError::ScsiHost(3));
+        }
+        let result = self.inner.execute_no_data(cdb, timeout)?;
+        if cdb[0] == 0xa5
+            && self.fail_load.load(Ordering::SeqCst)
+            && self.library.loaded_barcode(0).is_some()
+        {
+            // Sim MOVE auto-threads. Model the supported unthreaded-drive
+            // case before the actor's TUR/LOAD, without changing production CDBs.
+            TapeDrive::new(&self.library.drive_as(0, 71)).unload()?;
+        }
+        Ok(result)
     }
     fn execute_read(
         &self,
@@ -778,9 +874,12 @@ impl DeviceProvider for Provider {
             let inner = std::mem::replace(&mut device.dev, Box::new(self.library.changer_as(71)));
             device.dev = Box::new(ScheduleTransport {
                 inner: Box::new(FailVci {
+                    library: self.library.clone(),
                     inner,
                     fail: self.fail_vci.clone(),
                     fail_read: self.fail_read.clone(),
+                    fail_load: self.fail_load.clone(),
+                    fail_load_before: self.fail_load_before.clone(),
                 }),
                 trace: self.trace.clone(),
                 permission: self.permission.clone(),
@@ -859,6 +958,8 @@ struct Owner {
     status: SharedStatus,
     fail_vci: Arc<AtomicBool>,
     fail_read: Arc<AtomicBool>,
+    fail_load: Arc<AtomicBool>,
+    fail_load_before: Arc<AtomicBool>,
 }
 impl Owner {
     // Scheduling scenes explicitly install native FDB policy before starting
@@ -921,6 +1022,8 @@ impl Owner {
         let trace = Arc::new(Mutex::new(Vec::new()));
         let fail_vci = Arc::new(AtomicBool::new(false));
         let fail_read = Arc::new(AtomicBool::new(false));
+        let fail_load = Arc::new(AtomicBool::new(false));
+        let fail_load_before = Arc::new(AtomicBool::new(false));
         let provider = Provider {
             library: f.library.clone(),
             serial: f.serial.clone(),
@@ -928,6 +1031,8 @@ impl Owner {
             permission: permission.clone(),
             fail_vci: fail_vci.clone(),
             fail_read: fail_read.clone(),
+            fail_load: fail_load.clone(),
+            fail_load_before: fail_load_before.clone(),
         };
         let control = FdbOwnerControl {
             catalog: f.catalog.clone(),
@@ -999,6 +1104,8 @@ impl Owner {
             status: http_status,
             fail_vci,
             fail_read,
+            fail_load,
+            fail_load_before,
         }
     }
     fn read(&self, i: usize) -> std::result::Result<Vec<u8>, ReadError> {

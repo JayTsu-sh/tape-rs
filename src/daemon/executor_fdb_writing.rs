@@ -193,9 +193,17 @@ pub(super) async fn write(
     request: ActiveFileRequest,
     file: std::fs::File,
 ) -> std::result::Result<u64, ReadError> {
-    write_batch(owner, permit, control, status, vec![(request, file)])
-        .await
-        .remove(0)
+    // Large lifecycle fixtures must not embed the complete write-batch state
+    // in every await of this test-only single-upload adapter.
+    Box::pin(write_batch(
+        owner,
+        permit,
+        control,
+        status,
+        vec![(request, file)],
+    ))
+    .await
+    .remove(0)
 }
 
 pub(super) async fn write_batch(

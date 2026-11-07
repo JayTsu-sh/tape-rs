@@ -88,9 +88,9 @@ ltfsctl -e NODE:7401 --library SERIAL pool delete POOL_UUID --request delete-poo
 ltfsctl -e NODE:7401 --library SERIAL fdb drive set DRIVE_SERIAL --patch '{"role":"mr","enabled":true}' --namespace NAMESPACE_UUID --request drive.json
 ltfsctl -e NODE:7401 --library SERIAL pool set POOL_UUID mount_limit 1 --request pool.json
 ltfsctl -e NODE:7401 --library SERIAL pool set POOL_UUID name archive --request rename.json
-ltfsctl -e NODE:7401 --library SERIAL fdb tape show BARCODE
-ltfsctl -e NODE:7401 --library SERIAL fdb tape set BARCODE --patch '{"online":false}' --namespace NAMESPACE_UUID --request offline.json
-ltfsctl -e NODE:7401 --library SERIAL fdb tape set BARCODE --patch '{"blacklisted":false}' --namespace NAMESPACE_UUID --request allow.json
+ltfsctl -e NODE:7401 --library SERIAL tape show BARCODE
+ltfsctl -e NODE:7401 --library SERIAL --pool POOL tape offline BARCODE --request offline.json
+ltfsctl -e NODE:7401 --library SERIAL --pool POOL tape set BARCODE --patch '{"blacklisted":false}' --request allow.json
 ltfsctl -e NODE:7401 --library SERIAL --pool POOL tape online BARCODE --request online.json
 ltfsctl -e NODE:7401 fdb control status pool.json
 ltfsctl -e NODE:7401 fdb control run pool.json
