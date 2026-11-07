@@ -12,6 +12,8 @@ ltfsctl -e NODE:7411 --library SERIAL task cancel --request rescan.json
 
 返回 queued 或 HTTP 202 只代表接收任务。用 `task show` 查询至 succeeded、failed 或 cancelled。queued 可以取消；running 不接受取消，不能把正在执行的设备命令当作已停止。返回 failed 时保留原设备错误和巡检时间，旧完整库存与 last_success 保留。
 
+专用 `POST /libraries/SERIAL/admin/library/rescan` 对同一请求的终态重放仍返回 HTTP 202，正文返回原任务和原回执，不重新扫描。判断结果须读取正文的 `status` 或查询原任务，不能把 202 等同于 queued，也不能要求终态重放必须返回 200。
+
 HTTP：先 GET `/libraries/SERIAL/admin/context` 获取 namespace 和管理窗口 accepting，再 POST `/libraries/SERIAL/admin/library/rescan`。POST 必须有且只有一个 `x-tapers-catalog-namespace` 头，正文严格为：
 
 ```json

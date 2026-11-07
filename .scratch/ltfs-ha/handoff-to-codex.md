@@ -11,7 +11,7 @@
 - 这 9 个提交属于未完成原生 reclaim 的依赖链，只有软件、Sim/private FDB 证据；完整父流程、逐对象覆盖和实带验收尚未闭合。同一 FDB 读版本输入已绑定原源实读、目标实读/退休回执和 b/d/g 账本；查询不创建或修复记录，也不授予 I/O 权限。
 - 当前新增元数据固定计划与准备任务：从实际源/目标捕获流式核对路径和物理文件数，固定新 UID、路径、目标卷头及原属性/目标 extent 指纹。FDB 的 `RA`/`RW`/`RT` 记录和现有节点卷占用在同一事务取得；重复准备、查询、显式 HA 领取与未开写关闭均保留原计划，缺失占用不自动修复。它只实现 Prepared/Closed，没有执行准入或设备写入；首次旧回执清理回归发现准备占用误挡历史验证，已拆开只读身份检查和写入准入，后续结果查本地证据。
 - 该准备内核已本地提交 `9b3ac375322b52d35d72ad4a46371a9f09972cf3`，六项软件检查及两项隔离 FDB/Sim 回归全部通过，规范与需求审查均为零发现；随后随互斥版本部署，未向 GitHub 发布。
-- 用户随后要求参考 EE 命令互斥，并明确“同一 library 内互斥，不同 library 可并行”。`767aea9c86df6d6c222913a988cb2b4067396d87` 已补库级持久占用及原任务索引，接 rescan、reclaim 父任务、unassign 与原子 tape set/offline；缺失或损坏时拒绝，不自动补锁。规范见 `docs/management-task-exclusion.md`；六项软件及八项隔离回归通过，两轴审查零发现。真实 B 库确认冲突请求排队、查询和读取可用，但 S3 写入占用原因被误报为没有可调度卷，整体验收尚未通过。当前修复在设备访问前检查原池占用，实际准入仍须重新核验；完整原生 reclaim 与未实现命令仍未开放。
+- 用户随后要求参考 EE 命令互斥，并明确“同一 library 内互斥，不同 library 可并行”。`767aea9c86df6d6c222913a988cb2b4067396d87` 已补库级持久占用及原任务索引，接 rescan、reclaim 父任务、unassign 与原子 tape set/offline；缺失或损坏时拒绝，不自动补锁。该片六项软件及八项隔离回归通过，两轴审查零发现。首次真实 B 库发现 S3 写入占用原因被误报；修复 `fa7a2d732fd6ce60d0eb68e5770d234aefdb7d0e` 在设备访问前检查原池占用，并保留实际准入重核。真实 RED/GREEN、六项软件及四项隔离回归、两轴审查均通过，限定现场路径与未覆盖项见 `docs/management-task-exclusion.md`。完整原生 reclaim 与未实现命令仍未开放，未向 GitHub 发布。
 - 仍需补执行前持久化状态、逐 CDB 原任务守卫、未知提交恢复、关闭后的显式新尝试、完整属性与全源对象覆盖及真实 B 库验收。目标新代次须重新实读核验，不能仅用旧摘要代替；源 MD5 存在而正文副本未记 MD5 的情况仍保守拒绝。公共 FDB 原生 reclaim 入口继续拒绝执行，不能将当前准备内核视为已验收功能。
 - 旧文档分支的 PDF 已在 main；旧 AGENTS/CONTEXT 已由现行管理及故障规范替代，不整体合回旧分支。
 - 核对 Raft 初始化或成员替换方案时，读 [固定 raft-rs 0.7.0 源码研究](../../docs/research/raft-membership-bootstrap.md)。该文档区分源码事实与项目建议，不代表项目已实现成员变更。
@@ -22,11 +22,11 @@
 
 - 只允许 B605d 库参与已有授权实验；A/B6070 已释放给其他人，禁止操作。
 - 可写实验介质为 `L00284L8`、`L00285L8`。保护 AA0000、8A0043、正式 8A0042/8A0047、AA0013 和清洁带。
-- 最近已核实的三节点部署源码为 `767aea9c86df6d6c222913a988cb2b4067396d87`，普通 release 配置，无 GPFS、测试故障环境或 `RUST_MIN_STACK`。
-- 部署目录 `/opt/tape-rs/v1-20261107-767aea9c86df`，`ltfsd` SHA256 为 `7f95ff3b68a8523b1aee7736da39f72ae3e68bd88987db235ba2bab4002df285`。
+- 最近已核实的三节点部署源码为 `fa7a2d732fd6ce60d0eb68e5770d234aefdb7d0e`，普通 release 配置，无 GPFS、测试故障环境或 `RUST_MIN_STACK`。
+- 部署目录 `/opt/tape-rs/v1-20261107-fa7a2d732fd6`，`ltfsd` SHA256 为 `943e8ed8934ce72eaf0a52a23d36e3a0db5f90558b15ca77e63b8f8aa9e6059b`。
 - 独立 FDB 集群使用 45153；保留原 namespace、state、服务单元和端口。不得碰 45151/45152，不清除原任务门闩或设备预约来制造就绪。
 - 已消费的实测 controller 不重跑。未知副作用保留原请求及检查点，按项目恢复流程核对；格式化、擦除沿用显式确认门槛。
-- `accept-exclusion-v1.py` 原进程退出 1，失败在明确占用诊断断言，不能按任意 503 放宽。原父 `f0ba03b9-d8eb-4e4d-9c15-8cd3c424725d` 已按原 handle 在零子任务状态关闭；原四个排队请求均终态，14 类占用为空。L85 同池同卷、在线且非黑名单，修订号变为 2；unassign 因保留副本引用失败。详细证据 `EXCLUSION-V1-ORIGINAL-SETTLEMENT-v1.json`；后续必须用新版本控制脚本、新请求和现场预检，不重跑已消费脚本。
+- 两轮占用父任务均已按原 handle 在零子任务状态安全关闭，原排队请求均终态。首次 `accept-exclusion-v1.py` 因占用原因被掩盖退出 1，证据 `EXCLUSION-V1-ORIGINAL-SETTLEMENT-v1.json`。修复后 `accept-exclusion-upload-v1.py` 的严格 PoolBusy、引用保护和原任务回执检查通过，但脚本误要求专用 rescan 终态重放为 200 而退出 1；现有路由/测试要求 202，原响应正文与原终态一致。只读补验 `settle-exclusion-upload-v1.py` 原进程退出 0，核实新旧正文、被拒写对象 404、原回执未变及 14 类占用为空。总证据 `EXCLUSION-UPLOAD-ACCEPTANCE-SETTLEMENT-v1.json`。L85 同池同卷、在线且非黑名单，最新修订号为 3。没有重新提交管理操作或 PUT，没有 FORMAT/ERASE；不把原失败进程改记为成功。后续不得重跑这些已消费脚本。
 
 ## 验证证据与已知限制
 
