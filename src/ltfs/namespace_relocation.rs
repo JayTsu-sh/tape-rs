@@ -5,7 +5,7 @@ use crate::ltfs::index::{IndexEntry, MetadataChange};
 use base64::Engine;
 use std::collections::HashSet;
 
-fn attributes(meta: &NodeMeta, xattrs: &[Xattr]) -> Result<()> {
+pub(super) fn attributes(meta: &NodeMeta, xattrs: &[Xattr]) -> Result<()> {
     if meta.file_uid == 0 {
         return Err(error("回收源节点 UID 不能为零"));
     }

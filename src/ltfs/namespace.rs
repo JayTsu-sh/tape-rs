@@ -2,6 +2,9 @@
 use super::index::{DirectoryNode, FileNode, LtfsIndex, NodeMeta, Xattr};
 use crate::error::{Result, TapeError};
 
+#[cfg(feature = "fdb")]
+#[path = "namespace_body_reference.rs"]
+mod body_reference;
 #[path = "namespace_relocation.rs"]
 mod relocation;
 
