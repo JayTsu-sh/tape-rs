@@ -55,10 +55,10 @@ impl ReclaimReservation {
     pub fn spec(&self) -> ReclaimSpec {
         ReclaimSpec::parse(&self.intent["change"]).expect("validated reclaim identity")
     }
-    fn namespace(&self) -> Uuid {
+    pub(crate) fn namespace(&self) -> Uuid {
         self.route.route.namespace
     }
-    fn serial(&self) -> &str {
+    pub(crate) fn serial(&self) -> &str {
         self.intent["library"].as_str().expect("validated library")
     }
     fn fingerprint(&self) -> String {

@@ -5958,11 +5958,158 @@ mod tests {
         .await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；受原任务/PR/Permission 保护的 Sim 元数据执行，无实际设备"]
+    async fn reclaim_metadata_actor_commits_once_and_reobserves_without_rewrite() {
+        Box::pin(native_lifecycle(MetadataCase::Execution(
+            MetadataExecutionCase::Commit,
+        )))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；受原任务/PR/Permission 保护的 Sim 元数据执行，无实际设备"]
+    async fn reclaim_metadata_actor_observes_lost_admission_without_starting_a_write() {
+        Box::pin(native_lifecycle(MetadataCase::Execution(
+            MetadataExecutionCase::LostAdmission,
+        )))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；受原任务/PR/Permission 保护的 Sim 元数据执行，无实际设备"]
+    async fn reclaim_metadata_actor_recognizes_dp_commit_after_ip_write_failure() {
+        Box::pin(native_lifecycle(MetadataCase::Execution(
+            MetadataExecutionCase::IpFailure,
+        )))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；受原任务/PR/Permission 保护的 Sim 元数据执行，无实际设备"]
+    async fn reclaim_metadata_actor_retains_a_truncated_tail_without_repair_or_rewrite() {
+        Box::pin(native_lifecycle(MetadataCase::Execution(
+            MetadataExecutionCase::ClosingFailure,
+        )))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；WRITE 后撤回许可，Sim，无实际设备"]
+    async fn reclaim_metadata_actor_stops_after_permission_loss_during_index_write() {
+        Box::pin(native_lifecycle(MetadataCase::Execution(
+            MetadataExecutionCase::PermissionAfterWrite,
+        )))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；最后 PR-IN 后撤权，真实内层守卫拒绝下一媒体 CDB"]
+    async fn reclaim_metadata_actor_stops_when_permission_expires_after_final_pr_read() {
+        Box::pin(native_lifecycle(MetadataCase::Execution(
+            MetadataExecutionCase::PermissionAfterPr,
+        )))
+        .await;
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum MetadataExecutionCase {
+        Commit,
+        LostAdmission,
+        IpFailure,
+        ClosingFailure,
+        PermissionAfterWrite,
+        PermissionAfterPr,
+    }
+
+    struct MetadataFault<'a> {
+        inner: &'a dyn TapeTransport,
+        mode: MetadataExecutionCase,
+        matching: std::sync::atomic::AtomicUsize,
+        fired: std::sync::atomic::AtomicBool,
+        permission: &'a Permission,
+        round: u64,
+    }
+    impl MetadataFault<'_> {
+        fn before(&self, opcode: u8) -> Result<()> {
+            let selected = match self.mode {
+                MetadataExecutionCase::IpFailure => Some(0x0a),
+                MetadataExecutionCase::ClosingFailure => Some(0x10),
+                _ => None,
+            };
+            if selected == Some(opcode)
+                && self
+                    .matching
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    == 1
+                && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(TapeError::NotReady("注入元数据索引命令回执故障".into()));
+            }
+            Ok(())
+        }
+    }
+    impl TapeTransport for MetadataFault<'_> {
+        fn identity(&self) -> &str {
+            self.inner.identity()
+        }
+        fn session_epoch(&self) -> Option<u64> {
+            self.inner.session_epoch()
+        }
+        fn execution_guard(&self) -> Option<(u64, usize)> {
+            self.inner.execution_guard()
+        }
+        fn execute_no_data(
+            &self,
+            cdb: &[u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            self.before(cdb[0])?;
+            self.inner.execute_no_data(cdb, timeout)
+        }
+        fn execute_read(
+            &self,
+            cdb: &[u8],
+            data: &mut [u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            self.before(cdb[0])?;
+            let result = self.inner.execute_read(cdb, data, timeout);
+            if result.is_ok()
+                && cdb[0] == 0x5e
+                && cdb[1] & 0x1f == 1
+                && self.mode == MetadataExecutionCase::PermissionAfterPr
+                && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.permission.close(self.round);
+            }
+            result
+        }
+        fn execute_write(
+            &self,
+            cdb: &[u8],
+            data: &[u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            self.before(cdb[0])?;
+            let result = self.inner.execute_write(cdb, data, timeout);
+            if result.is_ok()
+                && cdb[0] == 0x0a
+                && self.mode == MetadataExecutionCase::PermissionAfterWrite
+                && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.permission.close(self.round);
+            }
+            result
+        }
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum MetadataCase {
         Prepared,
         Admission,
         Observation { changed_root: bool },
+        Execution(MetadataExecutionCase),
     }
 
     async fn native_lifecycle(metadata_case: MetadataCase) {
@@ -7121,6 +7268,109 @@ mod tests {
             .unwrap()
             .unwrap()
             .to_vec();
+        if let MetadataCase::Execution(mode) = metadata_case {
+            Box::pin(async {
+                use crate::daemon::fdb_reclaim_media::ReclaimMetadataWriter;
+                use crate::managed_catalog::ReclaimMetadataObservationKind;
+                fixture.permit.renew(fixture.owner.round, Phase::Serving, Instant::now() + Duration::from_secs(60));
+                let budget = crate::ltfs::recovery::RecoveryBudget::default();
+                if mode == MetadataExecutionCase::Commit {
+                    let raw = fixture.lib.drive_as(0, 1);
+                    let mut unchecked = ReclaimMetadataWriter {
+                        catalog: &catalog, device: &raw, route, key: fixture.owner.key,
+                        permission: &fixture.permit, budget: &budget,
+                    };
+                    assert!(unchecked.execute(&reserved, &scanned, &input_request, &metadata_write, Some(&captured)).await.is_err(), "raw transport 必须在准入和设备访问前拒绝");
+                    assert!(raw.command_log().is_empty(), "raw transport 拒绝必须零 I/O");
+                }
+                let device = MetadataFault {
+                    inner: fixture.owner.devices[drive].dev.as_ref(), mode,
+                    matching: std::sync::atomic::AtomicUsize::new(0),
+                    fired: std::sync::atomic::AtomicBool::new(false),
+                    permission: &fixture.permit,
+                    round: fixture.owner.round,
+                };
+                let mut writer = ReclaimMetadataWriter {
+                    catalog: &catalog, device: &device, route,
+                    key: fixture.owner.key, permission: &fixture.permit, budget: &budget,
+                };
+                let original_commands = fixture.commands.lock().unwrap().clone();
+                let foreign = Permission::default();
+                foreign.renew(fixture.owner.round, Phase::Serving, Instant::now() + Duration::from_secs(60));
+                let mut mismatched = ReclaimMetadataWriter {
+                    catalog: &catalog, device: &device, route, key: fixture.owner.key,
+                    permission: &foreign, budget: &budget,
+                };
+                assert!(mismatched.execute(&reserved, &scanned, &input_request, &metadata_write, Some(&captured)).await.is_err());
+                assert_eq!(*fixture.commands.lock().unwrap(), original_commands, "异许可实例必须零设备 I/O");
+                assert!(writer.execute(&reserved, &scanned, &input_request, &metadata_write, Some(&captured_target)).await.is_err(), "其他卷不是原源实读");
+                assert_eq!(*fixture.commands.lock().unwrap(), original_commands);
+                assert_eq!(catalog.reclaim_metadata_write_status(&reserved, fixture.owner.round, source_data_uid).await.unwrap(), Some(metadata_write.clone()));
+                if mode == MetadataExecutionCase::LostAdmission {
+                    catalog.admit_reclaim_metadata_write(&reserved, fixture.owner.round, &scanned, &input_request, &metadata_write).await.unwrap();
+                }
+                let first = writer.execute(&reserved, &scanned, &input_request, &metadata_write,
+                    if mode == MetadataExecutionCase::LostAdmission {None} else {Some(&captured)}).await;
+                if mode == MetadataExecutionCase::PermissionAfterPr {
+                    assert!(first.is_err());
+                    assert!(device.fired.load(std::sync::atomic::Ordering::SeqCst));
+                    let commands = fixture.commands.lock().unwrap().clone();
+                    assert!(commands[original_commands.len()..].iter().all(|(_, op)| *op == 0x5e), "最后 PR 核对之后撤权，内层拒绝第一条媒体 CDB");
+                    let task = catalog.reclaim_metadata_write_status(&reserved, fixture.owner.round, source_data_uid).await.unwrap().unwrap();
+                    assert!(task.writing() && task.observation().unwrap().is_none());
+                    assert!(writer.execute(&reserved, &scanned, &input_request, &task, None).await.is_err());
+                    assert_eq!(*fixture.commands.lock().unwrap(), commands);
+                    let tr = raw_catalog.create_trx().unwrap();
+                    assert_eq!(tr.get(&metadata_active_key,false).await.unwrap().unwrap().as_ref(), active.as_slice());
+                    assert_eq!(tr.get(&metadata_volume_key,false).await.unwrap().unwrap().as_ref(), active.as_slice());
+                    return;
+                }
+                let failure = matches!(mode, MetadataExecutionCase::IpFailure | MetadataExecutionCase::ClosingFailure | MetadataExecutionCase::PermissionAfterWrite);
+                if failure {
+                    let error = first.unwrap_err();
+                    let stage = match mode {
+                        MetadataExecutionCase::IpFailure => "index_partition",
+                        MetadataExecutionCase::ClosingFailure => "closing_fm",
+                        MetadataExecutionCase::PermissionAfterWrite => "index_records",
+                        _ => unreachable!(),
+                    };
+                    assert!(matches!(error, TapeError::CommitFailed { stage: ref actual, .. } if actual == stage), "{error}");
+                    assert!(device.fired.load(std::sync::atomic::Ordering::SeqCst));
+                    let retained = catalog.reclaim_metadata_write_status(&reserved, fixture.owner.round, source_data_uid).await.unwrap().unwrap();
+                    assert!(retained.writing());
+                    assert!(retained.observation().unwrap().is_none());
+                } else {
+                    let result = first.unwrap();
+                    assert!(result.writing());
+                    let expected = if mode == MetadataExecutionCase::LostAdmission {ReclaimMetadataObservationKind::Unchanged} else {ReclaimMetadataObservationKind::Committed};
+                    assert_eq!(result.observation().unwrap().unwrap().kind(), expected);
+                }
+                let before_retry = fixture.commands.lock().unwrap().len();
+                let replay = writer.execute(&reserved, &scanned, &input_request, &metadata_write, None).await;
+                if matches!(mode, MetadataExecutionCase::ClosingFailure | MetadataExecutionCase::PermissionAfterWrite) {
+                    assert!(replay.is_err(), "截断尾部不能观察为完成或自动修复");
+                } else {
+                    let replay = replay.unwrap();
+                    let observed = replay.observation().unwrap().unwrap();
+                    let expected = if mode == MetadataExecutionCase::LostAdmission {ReclaimMetadataObservationKind::Unchanged} else {ReclaimMetadataObservationKind::Committed};
+                    assert_eq!(observed.kind(), expected);
+                    let again = writer.execute(&reserved, &scanned, &input_request, &replay, None).await.unwrap();
+                    assert_eq!(again, replay);
+                }
+                assert!(!fixture.commands.lock().unwrap()[before_retry..].iter().any(|(_,op)|matches!(op,0x04|0x0a|0x10|0x19|0x8d|0xa5)), "任何重试只读，不格式化/重写/MAM/搬带");
+                let task = catalog.reclaim_metadata_write_status(&reserved, fixture.owner.round, source_data_uid).await.unwrap().unwrap();
+                assert!(task.writing());
+                assert!(catalog.close_prepared_reclaim_metadata_write(&reserved, fixture.owner.round, &task).await.is_err());
+                let tr = raw_catalog.create_trx().unwrap();
+                assert_eq!(tr.get(&metadata_active_key,false).await.unwrap().unwrap().as_ref(), active.as_slice());
+                assert_eq!(tr.get(&metadata_volume_key,false).await.unwrap().unwrap().as_ref(), active.as_slice());
+                let before_fence = fixture.commands.lock().unwrap().clone();
+                fixture.permit.close(fixture.owner.round);
+                assert!(writer.execute(&reserved, &scanned, &input_request, &task, None).await.is_err());
+                assert_eq!(*fixture.commands.lock().unwrap(), before_fence, "许可失效不再发送设备命令");
+            }).await;
+            return;
+        }
         if let MetadataCase::Observation { changed_root } = metadata_case {
             Box::pin(async {
                 use crate::managed_catalog::ReclaimMetadataObservationKind;

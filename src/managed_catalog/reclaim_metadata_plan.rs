@@ -34,6 +34,9 @@ impl ReclaimMetadataPlan {
     pub fn uid(&self) -> u64 {
         self.0.expected.uid
     }
+    pub fn source_uid(&self) -> u64 {
+        self.0.source.uid
+    }
     pub fn volume(&self) -> Uuid {
         Uuid::parse_str(&self.0.volume).expect("validated metadata volume")
     }
@@ -46,6 +49,64 @@ impl ReclaimMetadataPlan {
         hash.update(b"tape-rs/reclaim-metadata-plan/1");
         hash.update(self.encode()?);
         Ok(hash.finalize().into())
+    }
+    pub(crate) fn validate_source(&self, source: &CapturedIndexSource) -> Result<()> {
+        self.encode()?;
+        let mut head = Vec::new();
+        active_volume::encode_index(&mut head, source.construct().into());
+        let entry = source
+            .entry_by_uid(self.source_uid())
+            .map_err(cache)?
+            .ok_or(CatalogError::Incomplete)?;
+        if head != self.0.source_index || Object::capture(entry)? != self.0.source {
+            return Err(CatalogError::Invalid("元数据执行来源改变原封存节点或索引"));
+        }
+        Ok(())
+    }
+
+    /// Stage exactly one raw reference on the already selected target. This
+    /// changes only the in-memory working tree and does not grant I/O authority.
+    pub(crate) fn stage_reference(
+        &self,
+        volume: &mut crate::ltfs::volume::LtfsVolume<'_>,
+        source: &CapturedIndexSource,
+        target: &CapturedIndexSource,
+    ) -> Result<()> {
+        self.validate_source(source)?;
+        if self.observe_current(target, None)?.kind() != ReclaimMetadataObservationKind::Unchanged
+            || volume.verified_committed_index_construct().map_err(cache)? != target.construct()
+        {
+            return Err(CatalogError::Invalid("元数据执行卷头不同于原目标计划"));
+        }
+        let entry = source
+            .entry_by_uid(self.source_uid())
+            .map_err(cache)?
+            .ok_or(CatalogError::Incomplete)?;
+        let donor_entry = target
+            .entry_by_uid(self.0.donor.uid)
+            .map_err(cache)?
+            .ok_or(CatalogError::Incomplete)?;
+        let IndexEntry::File { node: donor, .. } = donor_entry else {
+            return Err(CatalogError::Incomplete);
+        };
+        let node = FileNode::reclaimed_reference(self.path(), self.uid(), &donor, &entry)
+            .map_err(cache)?;
+        if Object::capture(IndexEntry::File {
+            path: self.path().into(),
+            node,
+        })? != self.0.expected
+        {
+            return Err(CatalogError::Invalid("元数据执行节点偏离原固定计划"));
+        }
+        volume
+            .reference_reclaimed_body(
+                self.path(),
+                self.uid(),
+                &self.0.donor.path,
+                self.0.donor.uid,
+                &entry,
+            )
+            .map_err(cache)
     }
     pub(super) fn encode(&self) -> Result<Vec<u8>> {
         let p = &self.0;

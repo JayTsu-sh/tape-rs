@@ -62,14 +62,14 @@ fn confirmed_response(cdb: &[u8], error: &TapeError) -> bool {
 }
 
 /// 每条 CDB 前后核实原任务；一次失权即锁定此实例，不能因依赖恢复自行续写。
-pub(super) struct Guard<'a, F> {
+pub(in crate::daemon) struct Guard<'a, F> {
     inner: &'a dyn TapeTransport,
     authority: F,
     lost: Mutex<Option<String>>,
 }
 
 impl<'a, F: Fn() -> Result<()>> Guard<'a, F> {
-    pub(super) fn new(inner: &'a dyn TapeTransport, authority: F) -> Self {
+    pub(in crate::daemon) fn new(inner: &'a dyn TapeTransport, authority: F) -> Self {
         Self {
             inner,
             authority,
@@ -101,7 +101,7 @@ impl<'a, F: Fn() -> Result<()>> Guard<'a, F> {
 
     /// Check the latched result after a caller collected or wrapped an error.
     /// A final unknown CDB must not disappear behind a successful helper result.
-    pub(super) fn verify_proof(&self) -> Result<()> {
+    pub(in crate::daemon) fn verify_proof(&self) -> Result<()> {
         self.check()
     }
 

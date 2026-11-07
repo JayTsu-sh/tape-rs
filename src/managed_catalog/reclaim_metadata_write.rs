@@ -415,6 +415,34 @@ impl ManagedCatalog {
             .await?
     }
 
+    /// Read-only, same-version recheck for a fresh device execution. Losing an
+    /// input, claim, writable policy or original head prevents the next CDB.
+    /// Re-observing an uncertain result uses the original Writing status only.
+    pub(crate) async fn verify_reclaim_metadata_execution(
+        &self,
+        reservation: &ReclaimReservation,
+        owner: u64,
+        file: &ReclaimFile,
+        request: &ActiveFileRequest,
+        original: &ReclaimMetadataWrite,
+    ) -> Result<()> {
+        request.validate()?;
+        let tr = self.db.create_trx()?;
+        parent_at(&tr, reservation, owner).await?;
+        let plan = original.plan();
+        let task = load_at(&tr, reservation, plan.source_uid())
+            .await?
+            .ok_or(CatalogError::Incomplete)?;
+        if task.owner() != owner || original.owner() != owner {
+            return Err(CatalogError::OwnerFenced);
+        }
+        if task != *original || !task.writing() {
+            return Err(CatalogError::Invalid("设备执行改变原 Writing 任务或观察"));
+        }
+        let input = input_at(&tr, reservation, owner, file, request, &plan).await?;
+        target_at(&tr, reservation, &plan, &input).await
+    }
+
     /// Retain actual media observations on the original Writing task. This does
     /// not publish a volume head, close the task or release any of its claims.
     /// A committed observation cannot be replaced by an older clean snapshot.

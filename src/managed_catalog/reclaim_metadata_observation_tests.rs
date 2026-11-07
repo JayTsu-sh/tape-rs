@@ -95,10 +95,18 @@ fn observe(previous_delta: bool, current_delta: bool) {
     let unchanged = plan.observe_current(&before, None).unwrap();
     assert_eq!(unchanged.kind(), ReclaimMetadataObservationKind::Unchanged);
     check_codec(&plan, &unchanged);
+    let key = crate::scsi::reservation::ReservationKey::new(1, 7);
+    crate::scsi::reservation::fence(&device, key).unwrap();
     let mut volume = LtfsVolume::mount(&device).unwrap();
-    volume
-        .reference_reclaimed_body("raw", uid, "body", donor.meta.file_uid, &donor_entry)
-        .unwrap();
+    volume.set_reservation_guard(Some(key));
+    let mut invalid = plan.clone();
+    invalid.0.source.sha256[0] ^= 1;
+    assert!(
+        invalid
+            .stage_reference(&mut volume, &before, &before)
+            .is_err()
+    );
+    plan.stage_reference(&mut volume, &before, &before).unwrap();
     if current_delta {
         volume.commit_incremental().unwrap();
     } else {

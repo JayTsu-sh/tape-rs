@@ -324,7 +324,7 @@ struct Writer {
 
 #[cfg(feature = "fdb")]
 #[path = "executor_fdb_operation_guard.rs"]
-mod fdb_operation_guard;
+pub(super) mod fdb_operation_guard;
 
 #[cfg(feature = "fdb")]
 #[path = "executor_fdb_intake.rs"]
