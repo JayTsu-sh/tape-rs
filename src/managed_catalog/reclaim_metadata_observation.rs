@@ -35,6 +35,70 @@ impl ReclaimMetadataObservation {
     pub fn physical_files(&self) -> u64 {
         self.physical_files
     }
+
+    // Private durable codec: callers cannot deserialize their own evidence.
+    pub(super) fn encode(&self, plan: &ReclaimMetadataPlan) -> Result<Vec<u8>> {
+        let mut raw = vec![
+            1,
+            match self.kind {
+                ReclaimMetadataObservationKind::Unchanged => 0,
+                ReclaimMetadataObservationKind::Committed => 1,
+            },
+        ];
+        raw.extend_from_slice(&self.plan);
+        active_volume::encode_index(&mut raw, self.current);
+        raw.extend_from_slice(&self.physical_files.to_be_bytes());
+        raw.extend_from_slice(&Self::checksum(&raw));
+        if Self::decode(plan, &raw)? != *self {
+            return Err(CatalogError::Corrupt("回收元数据观察的卷身份不同"));
+        }
+        Ok(raw)
+    }
+
+    pub(super) fn decode(plan: &ReclaimMetadataPlan, raw: &[u8]) -> Result<Self> {
+        if raw.len() != 124 || raw[0] != 1 || raw[1] > 1 {
+            return Err(CatalogError::Corrupt("回收元数据观察版本或长度无效"));
+        }
+        if Self::checksum(&raw[..92]) != raw[92..124] {
+            return Err(CatalogError::Corrupt("回收元数据观察完整性校验失败"));
+        }
+        let fingerprint = plan.fingerprint()?;
+        let current = active_volume::decode_index(plan.volume(), &raw[34..84])?;
+        let previous = active_volume::decode_index(plan.volume(), &plan.0.previous)?;
+        let files = u64::from_be_bytes(raw[84..92].try_into().unwrap());
+        let kind = if raw[1] == 0 {
+            ReclaimMetadataObservationKind::Unchanged
+        } else {
+            ReclaimMetadataObservationKind::Committed
+        };
+        let matches = match kind {
+            ReclaimMetadataObservationKind::Unchanged => {
+                current == previous && files == plan.0.physical_files
+            }
+            ReclaimMetadataObservationKind::Committed => {
+                previous.generation.checked_add(1) == Some(current.generation)
+                    && current.location.partition == previous.location.partition
+                    && current.location.start_block > previous.location.start_block
+                    && plan.0.physical_files.checked_add(1) == Some(files)
+            }
+        };
+        if raw[2..34] != fingerprint || !matches {
+            return Err(CatalogError::Corrupt("回收元数据观察与固定计划不同"));
+        }
+        Ok(Self {
+            plan: fingerprint,
+            current,
+            kind,
+            physical_files: files,
+        })
+    }
+
+    fn checksum(raw: &[u8]) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(b"tape-rs/reclaim-metadata-observation/1");
+        hash.update(raw);
+        hash.finalize().into()
+    }
 }
 
 impl ReclaimMetadataPlan {

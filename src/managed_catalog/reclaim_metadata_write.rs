@@ -18,6 +18,7 @@ struct Record {
     plan: Plan,
     owner: u64,
     phase: Phase,
+    observation: Option<Vec<u8>>,
 }
 
 /// A retained fixed plan, never a device I/O permit or migration receipt.
@@ -37,9 +38,20 @@ impl ReclaimMetadataWrite {
     pub fn closed(&self) -> bool {
         self.0.phase == Phase::Closed
     }
+    /// Retained snapshot evidence, never permission to replay or release claims.
+    pub fn observation(&self) -> Result<Option<ReclaimMetadataObservation>> {
+        self.0
+            .observation
+            .as_deref()
+            .map(|raw| ReclaimMetadataObservation::decode(&self.plan(), raw))
+            .transpose()
+    }
     fn encode(&self) -> Result<Vec<u8>> {
         self.plan().encode()?;
-        if self.0.version != 1 || self.0.owner == 0 || self.0.owner > 0xFFFF_FFFF_FFFF {
+        if self.observation()?.is_some() && !self.writing() {
+            return Err(CatalogError::Corrupt("未开写任务不能保留介质结果观察"));
+        }
+        if self.0.version != 2 || self.0.owner == 0 || self.0.owner > 0xFFFF_FFFF_FFFF {
             return Err(CatalogError::Corrupt("回收元数据任务版本或 owner 无效"));
         }
         let raw = serde_json::to_vec(&self.0).map_err(cache)?;
@@ -84,6 +96,14 @@ fn require_phase_history(
     // A retained reply must never be reinterpreted as the other branch.
     if original.0.phase != Phase::Prepared && original.0.phase != current.0.phase {
         return Err(CatalogError::Corrupt("回收元数据阶段与原回执冲突"));
+    }
+    if let Some(before) = original.observation()? {
+        let after = current
+            .observation()?
+            .ok_or(CatalogError::Corrupt("回收元数据任务丢失已持久化的原观察"))?;
+        if before != after && before.kind() == ReclaimMetadataObservationKind::Committed {
+            return Err(CatalogError::Corrupt("回收元数据任务改变已提交观察"));
+        }
     }
     Ok(())
 }
@@ -301,10 +321,11 @@ impl ManagedCatalog {
                             )
                             .await?;
                             let task = ReclaimMetadataWrite(Record {
-                                version: 1,
+                                version: 2,
                                 plan: plan.0.clone(),
                                 owner,
                                 phase: Phase::Prepared,
+                                observation: None,
                             });
                             let raw = task.encode()?;
                             let key = task_key(reservation, plan)?;
@@ -386,6 +407,66 @@ impl ManagedCatalog {
                                 task,
                                 needs_observation: false,
                             })
+                        }
+                        .await,
+                    )
+                })
+            })
+            .await?
+    }
+
+    /// Retain actual media observations on the original Writing task. This does
+    /// not publish a volume head, close the task or release any of its claims.
+    /// A committed observation cannot be replaced by an older clean snapshot.
+    pub async fn record_reclaim_metadata_observation(
+        &self,
+        reservation: &ReclaimReservation,
+        owner: u64,
+        original: &ReclaimMetadataWrite,
+        observation: &ReclaimMetadataObservation,
+    ) -> Result<ReclaimMetadataWrite> {
+        original.encode()?;
+        if original.owner() != owner {
+            return Err(CatalogError::OwnerFenced);
+        }
+        if !original.writing() {
+            return Err(CatalogError::Invalid(
+                "只有原 Writing 任务可保留介质结果观察",
+            ));
+        }
+        let raw = observation.encode(&original.plan())?;
+        let raw = raw.as_slice();
+        self.db
+            .run(|tr, _| {
+                Box::pin(async move {
+                    requests::retry_result(
+                        async {
+                            parent_at(&tr, reservation, owner).await?;
+                            let plan = original.plan();
+                            let mut task = load_at(&tr, reservation, plan.0.source.uid)
+                                .await?
+                                .ok_or(CatalogError::Incomplete)?;
+                            if task.owner() != owner {
+                                return Err(CatalogError::OwnerFenced);
+                            }
+                            if task.plan() != plan {
+                                return Err(CatalogError::Invalid("观察改变原回收元数据计划"));
+                            }
+                            require_phase_history(original, &task)?;
+                            if task.0.observation.as_deref() == Some(raw) {
+                                return Ok(task);
+                            }
+                            if task.observation()?.is_some_and(|saved| {
+                                saved.kind() == ReclaimMetadataObservationKind::Committed
+                            }) {
+                                return Err(CatalogError::Invalid(
+                                    "已提交介质结果观察不能回退或改变",
+                                ));
+                            }
+                            task.0.observation = Some(raw.to_vec());
+                            let encoded = task.encode()?;
+                            tr.set(&task_key(reservation, &plan)?, &encoded);
+                            Ok(task)
                         }
                         .await,
                     )

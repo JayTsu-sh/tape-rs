@@ -7136,6 +7136,18 @@ mod tests {
                     metadata_plan.observe_current(&captured, None).is_err(),
                     "其他卷的实际来源不是目的结果"
                 );
+                assert!(
+                    catalog
+                        .record_reclaim_metadata_observation(
+                            &reserved,
+                            fixture.owner.round,
+                            &metadata_write,
+                            &unchanged
+                        )
+                        .await
+                        .is_err(),
+                    "Prepared 不能冒充已开写观察"
+                );
                 let admitted = Box::pin(catalog.admit_reclaim_metadata_write(
                     &reserved,
                     fixture.owner.round,
@@ -7146,7 +7158,41 @@ mod tests {
                 .await
                 .unwrap();
                 assert!(!admitted.needs_observation());
-                let writing = admitted.task().clone();
+                let admitted_task = admitted.task().clone();
+                assert!(
+                    catalog
+                        .record_reclaim_metadata_observation(
+                            &reserved,
+                            fixture.owner.round + 1,
+                            &admitted_task,
+                            &unchanged
+                        )
+                        .await
+                        .is_err()
+                );
+                let writing = catalog
+                    .record_reclaim_metadata_observation(
+                        &reserved,
+                        fixture.owner.round,
+                        &admitted_task,
+                        &unchanged,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(writing.observation().unwrap(), Some(unchanged.clone()));
+                assert_eq!(
+                    catalog
+                        .record_reclaim_metadata_observation(
+                            &reserved,
+                            fixture.owner.round,
+                            &admitted_task,
+                            &unchanged
+                        )
+                        .await
+                        .unwrap(),
+                    writing,
+                    "丢失保存回执后只返回原快照"
+                );
                 let checked = fdb_loading::operation_guard(
                     &fixture.owner,
                     &fixture.permit,
@@ -7212,7 +7258,7 @@ mod tests {
                 )
                 .unwrap();
                 assert!(metadata_plan.observe_current(&actual, None).is_err());
-                if changed_root {
+                let saved = if changed_root {
                     let error = metadata_plan
                         .observe_current(&actual, Some(&predecessor))
                         .unwrap_err();
@@ -7220,6 +7266,7 @@ mod tests {
                         error.to_string().contains("对象树"),
                         "新增节点正确仍须拒绝无关树变化: {error}"
                     );
+                    writing.clone()
                 } else {
                     let observed = metadata_plan
                         .observe_current(&actual, Some(&predecessor))
@@ -7241,7 +7288,43 @@ mod tests {
                         observed,
                         "重复观察不改变原证明"
                     );
-                }
+                    let saved = catalog
+                        .record_reclaim_metadata_observation(
+                            &reserved,
+                            fixture.owner.round,
+                            &writing,
+                            &observed,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(saved.observation().unwrap(), Some(observed.clone()));
+                    assert_eq!(
+                        catalog
+                            .record_reclaim_metadata_observation(
+                                &reserved,
+                                fixture.owner.round,
+                                &writing,
+                                &observed
+                            )
+                            .await
+                            .unwrap(),
+                        saved,
+                        "未取得保存回执仍只重读原记录"
+                    );
+                    assert!(
+                        catalog
+                            .record_reclaim_metadata_observation(
+                                &reserved,
+                                fixture.owner.round,
+                                &admitted_task,
+                                &unchanged
+                            )
+                            .await
+                            .is_err(),
+                        "旧快照不能回退已提交观察"
+                    );
+                    saved
+                };
                 assert_eq!(
                     catalog
                         .reclaim_metadata_write_status(
@@ -7251,7 +7334,7 @@ mod tests {
                         )
                         .await
                         .unwrap(),
-                    Some(writing.clone()),
+                    Some(saved.clone()),
                     "观察本身不完成任务或释放未知写入占用"
                 );
                 assert!(
@@ -7259,10 +7342,170 @@ mod tests {
                         .close_prepared_reclaim_metadata_write(
                             &reserved,
                             fixture.owner.round,
-                            &writing
+                            &saved
                         )
                         .await
                         .is_err()
+                );
+                let retained = saved.observation().unwrap().unwrap();
+                for key in [
+                    &metadata_active_key,
+                    &metadata_volume_key,
+                    &latest_metadata_key,
+                    &metadata_task_key,
+                ] {
+                    let tr = raw_catalog.create_trx().unwrap();
+                    let original = tr.get(key, false).await.unwrap().unwrap().to_vec();
+                    tr.clear(key);
+                    tr.commit().await.unwrap();
+                    assert!(
+                        catalog
+                            .record_reclaim_metadata_observation(
+                                &reserved,
+                                fixture.owner.round,
+                                &saved,
+                                &retained
+                            )
+                            .await
+                            .is_err(),
+                        "观察保存不能补建缺失的原任务或占用"
+                    );
+                    let tr = raw_catalog.create_trx().unwrap();
+                    assert!(tr.get(key, false).await.unwrap().is_none());
+                    tr.set(key, &original);
+                    tr.commit().await.unwrap();
+                }
+                let tr = raw_catalog.create_trx().unwrap();
+                let original = tr
+                    .get(&metadata_task_key, false)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .to_vec();
+                for offset in [None, Some(51usize), Some(83)] {
+                    let mut corrupt: Value = serde_json::from_slice(&original).unwrap();
+                    let bytes = corrupt["observation"].as_array_mut().unwrap();
+                    if let Some(offset) = offset {
+                        bytes[offset] = json!(bytes[offset].as_u64().unwrap() ^ 1);
+                    } else {
+                        bytes.push(json!(0));
+                    }
+                    let corrupt = serde_json::to_vec(&corrupt).unwrap();
+                    let tr = raw_catalog.create_trx().unwrap();
+                    tr.set(&metadata_task_key, &corrupt);
+                    tr.commit().await.unwrap();
+                    assert!(
+                        catalog
+                            .reclaim_metadata_write_status(
+                                &reserved,
+                                fixture.owner.round,
+                                source_data_uid
+                            )
+                            .await
+                            .is_err()
+                    );
+                    assert!(
+                        catalog
+                            .record_reclaim_metadata_observation(
+                                &reserved,
+                                fixture.owner.round,
+                                &saved,
+                                &retained
+                            )
+                            .await
+                            .is_err()
+                    );
+                    let tr = raw_catalog.create_trx().unwrap();
+                    assert_eq!(
+                        tr.get(&metadata_task_key, false)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .as_ref(),
+                        corrupt.as_slice()
+                    );
+                    tr.set(&metadata_task_key, &original);
+                    tr.commit().await.unwrap();
+                }
+                let commands = fixture.commands.lock().unwrap().clone();
+                let previous_owner = fixture.owner.round;
+                let next = previous_owner + 100;
+                catalog
+                    .claim_active_owner_epoch(&serial, next)
+                    .await
+                    .unwrap();
+                assert!(
+                    catalog
+                        .record_reclaim_metadata_observation(
+                            &reserved,
+                            previous_owner,
+                            &saved,
+                            &unchanged
+                        )
+                        .await
+                        .is_err()
+                );
+                let parents = catalog
+                    .claim_reclaim_reservations_page(&serial, route, next, None, 16)
+                    .await
+                    .unwrap();
+                assert_eq!(parents.items.len(), 1);
+                assert!(
+                    catalog
+                        .reclaim_metadata_write_status(&parents.items[0], next, source_data_uid)
+                        .await
+                        .is_err()
+                );
+                let recovered = catalog
+                    .claim_reclaim_metadata_write(&parents.items[0], next, source_data_uid)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    recovered.observation().unwrap(),
+                    saved.observation().unwrap()
+                );
+                assert!(recovered.writing());
+                assert_eq!(recovered.plan(), metadata_plan);
+                assert_eq!(
+                    catalog
+                        .record_reclaim_metadata_observation(
+                            &parents.items[0],
+                            next,
+                            &recovered,
+                            &retained
+                        )
+                        .await
+                        .unwrap(),
+                    recovered,
+                    "新 owner 保留原观察回执"
+                );
+                assert!(
+                    catalog
+                        .close_prepared_reclaim_metadata_write(&parents.items[0], next, &recovered)
+                        .await
+                        .is_err()
+                );
+                let tr = raw_catalog.create_trx().unwrap();
+                assert_eq!(
+                    tr.get(&metadata_active_key, false)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .as_ref(),
+                    active.as_slice()
+                );
+                assert_eq!(
+                    tr.get(&metadata_volume_key, false)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .as_ref(),
+                    active.as_slice()
+                );
+                assert_eq!(
+                    *fixture.commands.lock().unwrap(),
+                    commands,
+                    "保存与接管观察不发送 CDB"
                 );
             })
             .await;

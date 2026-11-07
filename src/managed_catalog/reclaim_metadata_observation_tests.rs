@@ -92,10 +92,9 @@ fn observe(previous_delta: bool, current_delta: bool) {
         target_tree: tree.finish(),
     });
     plan.encode().unwrap();
-    assert_eq!(
-        plan.observe_current(&before, None).unwrap().kind(),
-        ReclaimMetadataObservationKind::Unchanged
-    );
+    let unchanged = plan.observe_current(&before, None).unwrap();
+    assert_eq!(unchanged.kind(), ReclaimMetadataObservationKind::Unchanged);
+    check_codec(&plan, &unchanged);
     let mut volume = LtfsVolume::mount(&device).unwrap();
     volume
         .reference_reclaimed_body("raw", uid, "body", donor.meta.file_uid, &donor_entry)
@@ -112,12 +111,9 @@ fn observe(previous_delta: bool, current_delta: bool) {
         capture_recorded_index_source(&drive, &label, &plan.previous_source().unwrap(), &budget)
             .unwrap();
     let commands = device.command_log().len();
-    assert_eq!(
-        plan.observe_current(&actual, Some(&predecessor))
-            .unwrap()
-            .kind(),
-        ReclaimMetadataObservationKind::Committed
-    );
+    let committed = plan.observe_current(&actual, Some(&predecessor)).unwrap();
+    assert_eq!(committed.kind(), ReclaimMetadataObservationKind::Committed);
+    check_codec(&plan, &committed);
     assert_eq!(plan.observe_current(&actual, None).is_ok(), current_delta);
     if !current_delta {
         assert!(
@@ -163,4 +159,29 @@ fn observe(previous_delta: bool, current_delta: bool) {
         commands,
         "判定本身不发送设备命令"
     );
+}
+
+fn check_codec(plan: &ReclaimMetadataPlan, observation: &ReclaimMetadataObservation) {
+    let raw = observation.encode(plan).unwrap();
+    assert_eq!(
+        ReclaimMetadataObservation::decode(plan, &raw).unwrap(),
+        *observation
+    );
+    for end in 0..raw.len() {
+        assert!(ReclaimMetadataObservation::decode(plan, &raw[..end]).is_err());
+    }
+    let mut changed = raw.clone();
+    changed.push(0);
+    assert!(ReclaimMetadataObservation::decode(plan, &changed).is_err());
+    for offset in std::iter::once(51).chain(0..raw.len()) {
+        let mut changed = raw.clone();
+        changed[offset] ^= 1;
+        assert!(
+            ReclaimMetadataObservation::decode(plan, &changed).is_err(),
+            "完整观测快照损坏必须拒绝，offset={offset}"
+        );
+    }
+    let mut changed = observation.clone();
+    changed.current.volume_uuid = Uuid::new_v4();
+    assert!(changed.encode(plan).is_err());
 }
