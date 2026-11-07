@@ -13,7 +13,7 @@ mod ledger;
 pub(super) use ledger::clear_reserved_at;
 #[path = "reclaim_source_read.rs"]
 mod read;
-pub use read::ReclaimSourceRead;
+pub use read::{ReclaimReadSource, ReclaimSourceRead};
 #[path = "reclaim_data_relocation.rs"]
 mod relocation;
 pub use relocation::ReclaimDataProgress;
@@ -22,10 +22,13 @@ pub(super) use relocation::require_no_data_at;
 mod metadata;
 pub(super) use metadata::require_no_metadata_at;
 pub use metadata::{ReclaimFileMetadata, ReclaimMetadataProgress};
+#[path = "reclaim_node_metadata.rs"]
+mod node_metadata;
+pub use node_metadata::{ReclaimNodeDestination, ReclaimNodeMetadata, ReclaimNodeReadRequest};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Kind {
+pub enum ReclaimSourceNodeKind {
     Directory,
     File,
     Symlink,
@@ -36,9 +39,35 @@ enum Kind {
 struct Object {
     path: String,
     uid: u64,
-    kind: Kind,
+    kind: ReclaimSourceNodeKind,
     length: Option<u64>,
     sha256: [u8; 32],
+}
+
+/// One node from the original sealed physical inventory, not a destination
+/// receipt. The private payload cannot be supplied as caller-created evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReclaimSourceNode(Object);
+
+impl ReclaimSourceNode {
+    /// LTFS path without a leading slash; the empty path identifies the root.
+    pub fn path(&self) -> &str {
+        &self.0.path
+    }
+    pub fn uid(&self) -> u64 {
+        self.0.uid
+    }
+    pub fn kind(&self) -> ReclaimSourceNodeKind {
+        self.0.kind
+    }
+    /// None for directories; Some(0) remains a real zero-length file or link.
+    pub fn length(&self) -> Option<u64> {
+        self.0.length
+    }
+    /// Digest of the complete original node, including attributes and extents.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        self.0.sha256
+    }
 }
 
 struct HashWriter<'a>(&'a mut Sha256);
@@ -67,7 +96,12 @@ impl Object {
                 {
                     return Err(CatalogError::Invalid("回收源目录必须是完整的无子树节点"));
                 }
-                (path, node.meta.file_uid, Kind::Directory, None)
+                (
+                    path,
+                    node.meta.file_uid,
+                    ReclaimSourceNodeKind::Directory,
+                    None,
+                )
             }
             IndexEntry::File { path, node } => {
                 if node.delta_fields.is_some() || node.open_for_write == Some(true) {
@@ -79,9 +113,9 @@ impl Object {
                     ));
                 }
                 let kind = if node.symlink.is_some() {
-                    Kind::Symlink
+                    ReclaimSourceNodeKind::Symlink
                 } else {
-                    Kind::File
+                    ReclaimSourceNodeKind::File
                 };
                 (path, node.meta.file_uid, kind, Some(node.length))
             }
@@ -104,8 +138,8 @@ impl Object {
 
     fn encode(&self) -> Result<Vec<u8>> {
         if self.uid == 0
-            || (self.kind == Kind::Directory) != self.length.is_none()
-            || self.path.is_empty() && self.kind != Kind::Directory
+            || (self.kind == ReclaimSourceNodeKind::Directory) != self.length.is_none()
+            || self.path.is_empty() && self.kind != ReclaimSourceNodeKind::Directory
         {
             return Err(CatalogError::Corrupt("回收源对象 UID、类型或长度"));
         }
@@ -139,9 +173,9 @@ impl Counts {
         };
         increment(&mut self.objects, 1)?;
         match object.kind {
-            Kind::Directory => increment(&mut self.directories, 1)?,
-            Kind::Symlink => increment(&mut self.symlinks, 1)?,
-            Kind::File => {
+            ReclaimSourceNodeKind::Directory => increment(&mut self.directories, 1)?,
+            ReclaimSourceNodeKind::Symlink => increment(&mut self.symlinks, 1)?,
+            ReclaimSourceNodeKind::File => {
                 increment(&mut self.files, 1)?;
                 increment(
                     &mut self.data_bytes,
@@ -242,7 +276,8 @@ impl<'a> ReclaimSourceInventory<'a> {
                     .as_ref()
                     .is_some_and(|p| object.path.as_bytes() <= p.as_bytes())
                     || previous.is_none()
-                        && (!object.path.is_empty() || object.kind != Kind::Directory)
+                        && (!object.path.is_empty()
+                            || object.kind != ReclaimSourceNodeKind::Directory)
                 {
                     return Err(callback(CatalogError::Corrupt(
                         "回收源对象顺序或根目录不完整",
@@ -276,10 +311,10 @@ impl<'a> ReclaimSourceInventory<'a> {
         self.summary.counts.data_bytes
     }
 
-    fn page(&self, after: Option<&str>) -> Result<Vec<Object>> {
-        let mut rows = Vec::with_capacity(PAGE);
+    fn page(&self, after: Option<&str>, limit: usize) -> Result<Vec<Object>> {
+        let mut rows = Vec::with_capacity(limit);
         self.source
-            .for_each_entry_page(after, PAGE, |entry| {
+            .for_each_entry_page(after, limit, |entry| {
                 rows.push(Object::capture(entry).map_err(callback)?);
                 Ok(())
             })

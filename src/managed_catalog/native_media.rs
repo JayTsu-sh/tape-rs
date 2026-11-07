@@ -3387,6 +3387,7 @@ mod tests {
                 &original_read.read,
                 source_head,
                 Sha256::digest([]).into(),
+                None,
             )
             .unwrap();
         let original_read_metadata = original_read.read.clone();
@@ -3414,7 +3415,8 @@ mod tests {
                         &scanned,
                         &wrong,
                         observed,
-                        Sha256::digest([]).into()
+                        Sha256::digest([]).into(),
+                        None
                     )
                     .is_err()
             );

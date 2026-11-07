@@ -1464,6 +1464,48 @@ impl<'a> LtfsVolume<'a> {
         Ok(())
     }
 
+    /// Stage exact attributes of an already created reclaim directory/link.
+    /// The managed actor must persist its intent and serialize this volume
+    /// before calling. No node is created, no content is copied, and nothing
+    /// is published or written until the ordinary guarded commit succeeds.
+    /// This is not destination readback or permission to erase the source.
+    pub fn preserve_reclaimed_metadata(
+        &mut self,
+        path: &str,
+        source: &super::index::IndexEntry,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        self.working.preserve_reclaimed_metadata(path, source)?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// 为原始 EE 数据节点保留独立属性，正文复用本卷已提交的文件 extent。
+    /// 调用方须先持久化原回收计划并实读核验正文；本方法不授予 FDB 覆盖或擦除权限。
+    #[cfg(feature = "fdb")]
+    pub fn reference_reclaimed_body(
+        &mut self,
+        path: &str,
+        uid: u64,
+        body_path: &str,
+        body_uid: u64,
+        source: &super::index::IndexEntry,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        let body = self
+            .index
+            .find_file(body_path)
+            .filter(|node| node.meta.file_uid == body_uid)
+            .ok_or_else(|| TapeError::Ltfs("回收引用的已提交正文身份不符".into()))?;
+        if self.working.find_file(body_path) != Some(body) {
+            return Err(TapeError::Ltfs("回收引用的正文有未提交修改".into()));
+        }
+        self.working
+            .reference_reclaimed_body(path, uid, body, source)?;
+        self.dirty = true;
+        Ok(())
+    }
+
     pub fn set_node_readonly(&mut self, path: &str, readonly: bool) -> Result<()> {
         self.ensure_writable()?;
         self.working.set_node_readonly(path, readonly)?;

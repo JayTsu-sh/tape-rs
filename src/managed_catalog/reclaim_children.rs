@@ -286,7 +286,7 @@ impl ManagedCatalog {
         reservation: &ReclaimReservation,
         owner: u64,
         request: &ActiveFileRequest,
-    ) -> Result<ActiveReadSource> {
+    ) -> Result<ReclaimReadSource> {
         request.validate()?;
         let tr = self.db.create_trx()?;
         let parent = record_at(&tr, reservation, owner).await?;
@@ -330,12 +330,19 @@ impl ManagedCatalog {
             &serde_json::from_value::<Vec<u8>>(child["source_copy"].clone())
                 .map_err(|_| CatalogError::Corrupt("回收原副本"))?,
         )?;
+        let proof = ReclaimSourceRead::require_source(
+            &child["source_read"],
+            &reservation.fingerprint(),
+            &head,
+            &copy,
+            &saved,
+        )?;
         source_state_at(&tr, reservation).await?;
         let placement = control::verified_placement(&tr, spec.volume)
             .await?
             .ok_or(CatalogError::Incomplete)?;
         let path = pool_catalog_path(spec.pool, &request.ltfs_path()?.into_bytes())?;
-        lookup::read_source_at(
+        let source = lookup::read_source_at(
             &tr,
             reservation.serial(),
             &path,
@@ -348,7 +355,8 @@ impl ManagedCatalog {
                 object_metadata: None,
             },
         )
-        .await
+        .await?;
+        Ok(ReclaimReadSource::new(source, proof))
     }
 
     /// Atomically seal the original source/target and pin its result epoch.

@@ -370,6 +370,9 @@ mod fdb_move;
 #[cfg(feature = "fdb")]
 #[path = "executor_fdb_assign.rs"]
 mod fdb_assign;
+#[cfg(feature = "fdb")]
+#[path = "executor_fdb_initialize.rs"]
+mod fdb_initialize;
 
 #[cfg(all(test, feature = "fdb"))]
 #[path = "executor_fdb_observations_fixture.rs"]

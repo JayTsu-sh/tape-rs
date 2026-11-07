@@ -98,6 +98,7 @@ async fn reclaim_prepared_cancel_settles_original_permit_once_and_survives_gc_an
             &original_read.read,
             source_head,
             Sha256::digest([]).into(),
+            None,
         )
         .unwrap();
     let spec = ActiveUploadSpec {
