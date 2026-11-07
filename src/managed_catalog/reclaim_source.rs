@@ -16,8 +16,8 @@ mod read;
 pub use read::{ReclaimReadSource, ReclaimSourceRead};
 #[path = "reclaim_data_relocation.rs"]
 mod relocation;
-pub use relocation::ReclaimDataProgress;
 pub(super) use relocation::require_no_data_at;
+pub use relocation::{ReclaimDataProgress, ReclaimMetadataInput};
 #[path = "reclaim_file_metadata.rs"]
 mod metadata;
 pub(super) use metadata::require_no_metadata_at;

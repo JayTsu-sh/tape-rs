@@ -278,6 +278,83 @@ pub(in crate::managed_catalog) async fn require_receipt_at(
     Ok(())
 }
 
+pub(super) async fn read_source_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    owner: u64,
+    request: &ActiveFileRequest,
+) -> Result<ReclaimReadSource> {
+    request.validate()?;
+    let parent = record_at(tr, reservation, owner).await?;
+    if parent["owner_epoch"] != owner {
+        return Err(CatalogError::OwnerFenced);
+    }
+    let spec = reservation.spec();
+    if request.namespace != reservation.namespace() || request.pool_id != Some(spec.pool) {
+        return Err(CatalogError::Invalid("回收读取不属于原池"));
+    }
+    let (saved, _) = child_at(
+        tr,
+        request.namespace,
+        spec.pool,
+        request.request_epoch,
+        request.operation_id,
+        owner,
+    )
+    .await?
+    .ok_or(CatalogError::Incomplete)?;
+    if saved.request() != *request {
+        return Err(CatalogError::Invalid("回收读取原请求改变"));
+    }
+    let raw = tr
+        .get(
+            &child_key(
+                request.namespace,
+                &reservation.token(),
+                request.operation_id,
+            )?,
+            false,
+        )
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+    let child = decode(&raw)?;
+    let head = decode_head(
+        &serde_json::from_value::<Vec<u8>>(child["source_head"].clone())
+            .map_err(|_| CatalogError::Corrupt("回收原文件头"))?,
+    )?;
+    let copy = copy_records::decode_copy(
+        &serde_json::from_value::<Vec<u8>>(child["source_copy"].clone())
+            .map_err(|_| CatalogError::Corrupt("回收原副本"))?,
+    )?;
+    let proof = ReclaimSourceRead::require_source(
+        &child["source_read"],
+        &reservation.fingerprint(),
+        &head,
+        &copy,
+        &saved,
+    )?;
+    source_state_at(tr, reservation).await?;
+    let placement = control::verified_placement(tr, spec.volume)
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+    let path = pool_catalog_path(spec.pool, &request.ltfs_path()?.into_bytes())?;
+    let source = lookup::read_source_at(
+        tr,
+        reservation.serial(),
+        &path,
+        ResolvedPath::File {
+            id: request.file_id,
+            head,
+            copy: Box::new(copy),
+            placement,
+            attributes: None,
+            object_metadata: None,
+        },
+    )
+    .await?;
+    Ok(ReclaimReadSource::new(source, proof))
+}
+
 impl ManagedCatalog {
     /// Resolve the immutable original copy even after its logical path has
     /// published a destination. This never authorizes a read after unassignment.
@@ -287,76 +364,8 @@ impl ManagedCatalog {
         owner: u64,
         request: &ActiveFileRequest,
     ) -> Result<ReclaimReadSource> {
-        request.validate()?;
         let tr = self.db.create_trx()?;
-        let parent = record_at(&tr, reservation, owner).await?;
-        if parent["owner_epoch"] != owner {
-            return Err(CatalogError::OwnerFenced);
-        }
-        let spec = reservation.spec();
-        if request.namespace != reservation.namespace() || request.pool_id != Some(spec.pool) {
-            return Err(CatalogError::Invalid("回收读取不属于原池"));
-        }
-        let (saved, _) = child_at(
-            &tr,
-            request.namespace,
-            spec.pool,
-            request.request_epoch,
-            request.operation_id,
-            owner,
-        )
-        .await?
-        .ok_or(CatalogError::Incomplete)?;
-        if saved.request() != *request {
-            return Err(CatalogError::Invalid("回收读取原请求改变"));
-        }
-        let raw = tr
-            .get(
-                &child_key(
-                    request.namespace,
-                    &reservation.token(),
-                    request.operation_id,
-                )?,
-                false,
-            )
-            .await?
-            .ok_or(CatalogError::Incomplete)?;
-        let child = decode(&raw)?;
-        let head = decode_head(
-            &serde_json::from_value::<Vec<u8>>(child["source_head"].clone())
-                .map_err(|_| CatalogError::Corrupt("回收原文件头"))?,
-        )?;
-        let copy = copy_records::decode_copy(
-            &serde_json::from_value::<Vec<u8>>(child["source_copy"].clone())
-                .map_err(|_| CatalogError::Corrupt("回收原副本"))?,
-        )?;
-        let proof = ReclaimSourceRead::require_source(
-            &child["source_read"],
-            &reservation.fingerprint(),
-            &head,
-            &copy,
-            &saved,
-        )?;
-        source_state_at(&tr, reservation).await?;
-        let placement = control::verified_placement(&tr, spec.volume)
-            .await?
-            .ok_or(CatalogError::Incomplete)?;
-        let path = pool_catalog_path(spec.pool, &request.ltfs_path()?.into_bytes())?;
-        let source = lookup::read_source_at(
-            &tr,
-            reservation.serial(),
-            &path,
-            ResolvedPath::File {
-                id: request.file_id,
-                head,
-                copy: Box::new(copy),
-                placement,
-                attributes: None,
-                object_metadata: None,
-            },
-        )
-        .await?;
-        Ok(ReclaimReadSource::new(source, proof))
+        Box::pin(read_source_at(&tr, reservation, owner, request)).await
     }
 
     /// Atomically seal the original source/target and pin its result epoch.

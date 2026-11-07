@@ -14,14 +14,57 @@ pub(super) fn retirement_receipt(
         "target_proof_sha256":format!("{:x}",Sha256::digest(target_raw))})
 }
 
-/// Every failing proof precedes the exact X1/V/receipt mutations.
-pub(super) async fn retire_at(
+/// Retained actual destination body proof, not a new medium read or I/O permit.
+/// Only the original sealed child and its completed retirement construct it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReclaimBodyDestination {
+    copy: PhysicalCopy,
+    head: FileHead,
+    placement: VolumePlacement,
+    index: ActiveIndexIdentity,
+    verification_sha256: [u8; 32],
+    retirement: Value,
+}
+impl ReclaimBodyDestination {
+    pub fn copy(&self) -> &PhysicalCopy {
+        &self.copy
+    }
+    pub fn head(&self) -> &FileHead {
+        &self.head
+    }
+    pub fn placement(&self) -> &VolumePlacement {
+        &self.placement
+    }
+    pub fn index(&self) -> ActiveIndexIdentity {
+        self.index
+    }
+    pub(super) fn verification_sha256(&self) -> [u8; 32] {
+        self.verification_sha256
+    }
+    pub(super) fn retirement(&self) -> &Value {
+        &self.retirement
+    }
+}
+
+struct PendingRetirement {
+    source_key: Vec<u8>,
+    reverse: Vec<u8>,
+    retired_key: Vec<u8>,
+    marker: Vec<u8>,
+    receipt: Vec<u8>,
+}
+struct CheckedRetirement {
+    destination: ReclaimBodyDestination,
+    pending: Option<PendingRetirement>,
+}
+
+async fn check_retirement_at(
     tr: &Transaction,
     reservation: &ReclaimReservation,
     owner: u64,
     file: &ReclaimFile,
     request: &ActiveFileRequest,
-) -> Result<bool> {
+) -> Result<CheckedRetirement> {
     request.validate()?;
     let parent = record_at(tr, reservation, owner).await?;
     if parent["owner_epoch"] != owner {
@@ -161,6 +204,14 @@ pub(super) async fn retire_at(
     let receipt = retirement_receipt(reservation, file, request, &source_raw, &raw_proof);
     let mut retired_key = verification_key;
     retired_key[domain(ns, b'v').len() - 1] = b'x';
+    let destination = ReclaimBodyDestination {
+        copy: *copy,
+        head,
+        placement,
+        index: verified_index,
+        verification_sha256: Sha256::digest(&raw_proof).into(),
+        retirement: receipt.clone(),
+    };
     if let Some(old) = tr.get(&retired_key, false).await? {
         if decode(&old)? != receipt
             || source_now.as_deref() != Some(marker.as_slice())
@@ -168,7 +219,10 @@ pub(super) async fn retire_at(
         {
             return Err(CatalogError::Corrupt("退休回执与源副本/倒排不一致"));
         }
-        return Ok(false);
+        return Ok(CheckedRetirement {
+            destination,
+            pending: None,
+        });
     }
     if source_now.as_deref() != Some(source_raw.as_slice())
         || !reverse_now
@@ -177,13 +231,49 @@ pub(super) async fn retire_at(
     {
         return Err(CatalogError::Corrupt("退休前原副本或倒排已改变"));
     }
-    // All reads, encodings and fallible proofs precede mutations:
-    // retry_result commits domain errors returned as Ok(Err(...)).
-    let receipt = receipt.to_string();
-    tr.set(&source_key, &marker);
-    tr.clear(&reverse);
-    tr.set(&retired_key, receipt.as_bytes());
+    Ok(CheckedRetirement {
+        destination,
+        pending: Some(PendingRetirement {
+            source_key,
+            reverse,
+            retired_key,
+            marker,
+            receipt: receipt.to_string().into_bytes(),
+        }),
+    })
+}
+
+/// Every failing proof precedes the exact X1/V/receipt mutations.
+pub(super) async fn retire_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    owner: u64,
+    file: &ReclaimFile,
+    request: &ActiveFileRequest,
+) -> Result<bool> {
+    let checked = Box::pin(check_retirement_at(tr, reservation, owner, file, request)).await?;
+    let Some(pending) = checked.pending else {
+        return Ok(false);
+    };
+    tr.set(&pending.source_key, &pending.marker);
+    tr.clear(&pending.reverse);
+    tr.set(&pending.retired_key, &pending.receipt);
     Ok(true)
+}
+
+/// Read-only validation; a missing retirement is not created by this lookup.
+pub(super) async fn retired_destination_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    owner: u64,
+    file: &ReclaimFile,
+    request: &ActiveFileRequest,
+) -> Result<ReclaimBodyDestination> {
+    let checked = Box::pin(check_retirement_at(tr, reservation, owner, file, request)).await?;
+    if checked.pending.is_some() {
+        return Err(CatalogError::Incomplete);
+    }
+    Ok(checked.destination)
 }
 
 impl ManagedCatalog {

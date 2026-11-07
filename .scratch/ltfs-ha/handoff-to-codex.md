@@ -8,7 +8,7 @@
 - PR #39 已合入 GitHub main，合并提交 `591469170428c49ddfa4f93f9d7f969e78ac9aae`；其代码树与实带验证的 `f42c775292cdaee65221b1bc64aeeb0fb13e80d0` 相同。
 - 原目录的大量差异是旧 WIP。额外 10 份源码和 4 份测试已复核，没有需要独立合入的正确修复；旧实现会削弱 main 的故障守卫、回执或测试覆盖。已直接采用 main，未归档旧源码。
 - 已合入的旧 worktree 已删除。现仍只使用本目录的 `main` 工作树；保留分支 `integrate/historical-wip-20261106` 的 9 个提交已无冲突接回本地，尚未向 GitHub main 发布。保留原分支 `8caca7e2511a052c54745f90d787c7acb45f7896` 作为现有开发来源，不新建代码归档。
-- 这 9 个提交属于未完成原生 reclaim 的依赖链，只有软件、Sim/private FDB 证据；完整父流程、逐对象覆盖和实带验收尚未闭合。下一项为元数据写入前的持久化原意图及目标 UID/卷头/物理文件名额绑定。公共 FDB 原生 reclaim 入口继续拒绝执行，不能将这些提交视为已验收功能。
+- 这 9 个提交属于未完成原生 reclaim 的依赖链，只有软件、Sim/private FDB 证据；完整父流程、逐对象覆盖和实带验收尚未闭合。当前补元数据写入准备所需的同一 FDB 读版本输入：原源实读、目标实读/退休回执和 b/d/g 账本须共同有效，查询不创建或修复记录，也不授予 I/O 权限。固定 UID/路径、物理文件名额及真正的持久化写入任务仍待实现。公共 FDB 原生 reclaim 入口继续拒绝执行，不能将这些提交视为已验收功能。
 - 旧文档分支的 PDF 已在 main；旧 AGENTS/CONTEXT 已由现行管理及故障规范替代，不整体合回旧分支。
 - 核对 Raft 初始化或成员替换方案时，读 [固定 raft-rs 0.7.0 源码研究](../../docs/research/raft-membership-bootstrap.md)。该文档区分源码事实与项目建议，不代表项目已实现成员变更。
 
@@ -31,6 +31,8 @@
 - READ/WRITE 后取消的精确故障边界由 SimLibrary 加隔离 FDB 验证；不把它描述为已在实带注入同一故障。
 - 历史物理矩阵 24 项通过，各自绑定实际源码版本；不能称为最终候选统一重跑，完整原生 reclaim 未验收。
 - 已有 owner 定向用例在默认 debug 小栈下溢出，基线 `6dbbd808` 同条件也复现。8 MiB 调试回归通过；正常 release 实带验证未扩大生产栈。
+- 恢复开发的本地集成提交为 `a07768f`，保留了 PR #39 的 rename 原任务守卫。旧本地测试 FDB 35127 连续超时，原失败日志保留；新建独立本地测试实例后该回归通过，未重启或清理旧库，也未改真实集群。当前测试实例位置读本地 `/work/tmp/tape-reclaim-resume-20261107/PRIVATE-FDB-v1.json`，不要沿用旧测试路径。
+- 新查询的源卷头篡改用例已实际先红后绿；初次测试代码编译错误与真实断言失败分别保留。新实现尚未部署到实物；最新源码、审查和检查结果查本地 `/work/tmp/tape-reclaim-resume-20261107`，不能把软件回归当真实带库通过。
 - 原始记录在本地 `/work/tmp/tape-wip-integration-evidence-20261106`、`/work/tmp/tape-wip-independent-b-20261106`，核心入口为前者 `PR39-MERGED-v1.json`、`PR39-MERGE-ACCEPTANCE-v1.json`。现场脚本和失败日志保留原位，不作为待合入产品源码。
 
 查证历史或恢复现场上下文时，再读本地 `.scratch/ltfs-ha/local/handoff-history.md`。本机 `.git/info/exclude` 排除了现场证据、CodeGraph 索引和 EE 参考输入；它不隐藏 `src/` 或 `tests/` 的产品改动。

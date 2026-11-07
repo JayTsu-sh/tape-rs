@@ -4910,7 +4910,6 @@ mod tests {
                     .unwrap(),
                 metadata_progress
             );
-            metadata_receipts.push((file.clone(), intent.request()));
             let progress = catalog
                 .seal_reclaim_data_relocation(
                     &reserved,
@@ -4924,6 +4923,38 @@ mod tests {
                 (progress.files(), progress.bytes(), progress.total_files()),
                 (1, bytes.len() as u64, 1)
             );
+            let input = catalog
+                .reclaim_metadata_input(&reserved, fixture.owner.round, &file, &intent.request())
+                .await
+                .unwrap();
+            assert_eq!(input.source().byte_proof(), &evidence);
+            assert_eq!(
+                input.source().byte_proof().source_node().uid(),
+                read.metadata.copy.ltfs_file_uid
+            );
+            assert_eq!(
+                input.destination().copy().content_digest,
+                ContentDigest::Sha256(evidence.sha256())
+            );
+            assert_eq!(input.destination().copy().size, bytes.len() as u64);
+            assert_eq!(input.destination().placement().pool_id, pool.id);
+            assert_ne!(
+                input.destination().copy().volume_id,
+                read.metadata.copy.volume_id
+            );
+            assert_eq!(
+                observer
+                    .reclaim_metadata_input(
+                        &reserved,
+                        fixture.owner.round,
+                        &file,
+                        &intent.request(),
+                    )
+                    .await
+                    .unwrap(),
+                input
+            );
+            metadata_receipts.push((file.clone(), intent.request(), input));
             if let Some(previous) = &previous_progress {
                 assert_eq!(&progress, previous, "两个alias的同一数据UID只计数一次");
             }
@@ -4958,13 +4989,21 @@ mod tests {
         assert_eq!(second.items.len(), 1);
         assert!(second.next.is_none());
         assert_ne!(first.items[0].operation_id, second.items[0].operation_id);
-        for (file, request) in metadata_receipts {
+        for (file, request, input) in metadata_receipts {
             let resumed = observer
                 .resume_reclaim_file_metadata(&reserved, fixture.owner.round, &file, &request)
                 .await
                 .unwrap()
                 .unwrap();
             assert_eq!((resumed.files(), resumed.aliases()), (0, 2));
+            assert_eq!(
+                observer
+                    .reclaim_metadata_input(&reserved, fixture.owner.round, &file, &request,)
+                    .await
+                    .unwrap(),
+                input,
+                "later target generations retain the original actual donor proof"
+            );
         }
         assert_eq!(
             fixture.drive_log(),
@@ -6659,6 +6698,10 @@ mod tests {
                 assert!(tr.get(key, false).await.unwrap().is_none());
             }
         };
+        assert!(catalog.reclaim_metadata_input(
+            &reserved, fixture.owner.round, &scanned, &intent.request(),
+        ).await.is_err(), "read-only input must not create a missing retirement or ledger");
+        assert_unretired().await;
         // Genuine unavailable dependency, isolated from the running test FDB.
         // This port is reserved by our listener and has no FDB protocol server.
         let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -6692,6 +6735,23 @@ mod tests {
             ),
             "{failure:?}"
         );
+        let input_failure = tokio::time::timeout(
+            Duration::from_secs(12),
+            Box::pin(offline.reclaim_metadata_input(
+                &reserved,
+                fixture.owner.round,
+                &scanned,
+                &intent.request(),
+            )),
+        )
+        .await
+        .expect("unavailable input lookup must obey the existing transaction budget");
+        assert!(matches!(
+            input_failure,
+            Err(crate::managed_catalog::CatalogError::Fdb(_)
+                | crate::managed_catalog::CatalogError::Client(_))
+        ));
+        assert_unretired().await;
         let metadata_failure = tokio::time::timeout(
             Duration::from_secs(12),
             Box::pin(offline.seal_reclaim_file_metadata(
@@ -6719,7 +6779,10 @@ mod tests {
         // all fail before either retirement or aggregate progress is written.
         for (key, replacement) in [
             (own_row(b'm'), None),
-            (source_object_key, Some(b"fixture-corrupt-object".to_vec())),
+            (
+                source_object_key.clone(),
+                Some(b"fixture-corrupt-object".to_vec()),
+            ),
             (
                 data_destination_key.clone(),
                 Some(b"fixture-conflicting-destination".to_vec()),
@@ -6800,6 +6863,186 @@ mod tests {
                 .unwrap(),
             data_progress
         );
+        let input_request = intent.request();
+        let input = catalog
+            .reclaim_metadata_input(&reserved, fixture.owner.round, &scanned, &input_request)
+            .await
+            .unwrap();
+        assert_eq!(input.source().byte_proof(), &source_read);
+        assert_eq!(
+            input.source().byte_proof().source_node().uid(),
+            source_data_uid
+        );
+        assert_eq!(input.destination().copy(), &verified.metadata.copy);
+        assert_eq!(input.destination().head(), &verified.metadata.head);
+        assert_eq!(
+            input.destination().placement(),
+            &verified.metadata.placement
+        );
+        assert_eq!(input.destination().index(), verified.verified_head);
+        assert_eq!(
+            observer
+                .reclaim_metadata_input(&reserved, fixture.owner.round, &scanned, &input_request,)
+                .await
+                .unwrap(),
+            input
+        );
+        assert!(
+            catalog
+                .reclaim_metadata_input(
+                    &reserved,
+                    fixture.owner.round + 1,
+                    &scanned,
+                    &input_request,
+                )
+                .await
+                .is_err()
+        );
+        let mut wrong_request = input_request.clone();
+        wrong_request.expected_size += 1;
+        assert!(
+            catalog
+                .reclaim_metadata_input(&reserved, fixture.owner.round, &scanned, &wrong_request,)
+                .await
+                .is_err()
+        );
+        // Keep canonical field order while altering only the sealed source
+        // index SHA: a valid-looking but different source head is not input.
+        let manifest_key = own_row(b'm');
+        let tr = raw_catalog.create_trx().unwrap();
+        let manifest_raw = tr
+            .get(&manifest_key, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .to_vec();
+        let manifest: Value = serde_json::from_slice(&manifest_raw).unwrap();
+        let before_head = serde_json::to_string(&manifest["summary"]["head"]).unwrap();
+        let mut altered_head = manifest["summary"]["head"].clone();
+        let head_cells = altered_head.as_array_mut().unwrap();
+        let last = head_cells.last_mut().unwrap();
+        *last = json!(last.as_u64().unwrap() ^ 1);
+        let changed_manifest = std::str::from_utf8(&manifest_raw)
+            .unwrap()
+            .replace(
+                &format!("\"head\":{before_head}"),
+                &format!("\"head\":{}", serde_json::to_string(&altered_head).unwrap()),
+            )
+            .into_bytes();
+        assert_ne!(changed_manifest, manifest_raw);
+        tr.set(&manifest_key, &changed_manifest);
+        tr.commit().await.unwrap();
+        assert!(
+            catalog
+                .reclaim_metadata_input(&reserved, fixture.owner.round, &scanned, &input_request,)
+                .await
+                .is_err(),
+            "source manifest head must match the original current source"
+        );
+        let tr = raw_catalog.create_trx().unwrap();
+        assert_eq!(
+            tr.get(&manifest_key, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            changed_manifest.as_slice()
+        );
+        tr.set(&manifest_key, &manifest_raw);
+        tr.commit().await.unwrap();
+        let watched = [
+            &data_body_key,
+            &data_destination_key,
+            &data_progress_key,
+            &retired_key,
+            &source_object_key,
+        ];
+        let tr = raw_catalog.create_trx().unwrap();
+        let mut original_rows = Vec::new();
+        for key in watched {
+            original_rows.push((
+                key.clone(),
+                tr.get(key, false).await.unwrap().unwrap().to_vec(),
+            ));
+        }
+        for (key, original) in &original_rows {
+            let corrupt = if key == &data_body_key
+                || key == &data_destination_key
+                || key == &data_progress_key
+            {
+                let mut value: Value = serde_json::from_slice(original).unwrap();
+                value["version"] = json!(2);
+                value.to_string().into_bytes()
+            } else {
+                b"corrupt-original-input".to_vec()
+            };
+            for replacement in [None, Some(corrupt)] {
+                let tr = raw_catalog.create_trx().unwrap();
+                match &replacement {
+                    Some(bytes) => tr.set(key, bytes),
+                    None => tr.clear(key),
+                }
+                tr.commit().await.unwrap();
+                assert!(
+                    catalog
+                        .reclaim_metadata_input(
+                            &reserved,
+                            fixture.owner.round,
+                            &scanned,
+                            &input_request,
+                        )
+                        .await
+                        .is_err(),
+                    "missing or corrupt original row must not produce donor input"
+                );
+                let tr = raw_catalog.create_trx().unwrap();
+                for (other, expected) in &original_rows {
+                    let expected = if other == key {
+                        replacement.clone()
+                    } else {
+                        Some(expected.clone())
+                    };
+                    assert_eq!(
+                        tr.get(other, false).await.unwrap().map(|v| v.to_vec()),
+                        expected,
+                        "failed lookup must never repair, clear or partially rewrite any original row"
+                    );
+                }
+                tr.set(key, original);
+                tr.commit().await.unwrap();
+            }
+        }
+        // Ordinary result retention may end after the original verification:
+        // use the exact terminal already sealed in the target readback proof.
+        let tr = raw_catalog.create_trx().unwrap();
+        let terminal = tr
+            .get(&terminal_key, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .to_vec();
+        tr.clear(&terminal_key);
+        tr.commit().await.unwrap();
+        assert_eq!(
+            observer
+                .reclaim_metadata_input(&reserved, fixture.owner.round, &scanned, &input_request,)
+                .await
+                .unwrap(),
+            input
+        );
+        let tr = raw_catalog.create_trx().unwrap();
+        assert!(tr.get(&terminal_key, false).await.unwrap().is_none());
+        tr.set(&terminal_key, &terminal);
+        tr.commit().await.unwrap();
+        assert_eq!(
+            catalog
+                .reclaim_metadata_input(&reserved, fixture.owner.round, &scanned, &input_request,)
+                .await
+                .unwrap(),
+            input
+        );
+        assert_eq!(fixture.drive_log(), drive_before_metadata);
+        assert_eq!(fixture.changer_log(), changer_before_metadata);
         let metadata_progress = catalog
             .seal_reclaim_file_metadata(
                 &reserved,
@@ -7117,6 +7360,19 @@ mod tests {
                 .is_err(),
             "先领取原父任务再恢复子证明"
         );
+        assert!(
+            observer
+                .reclaim_metadata_input(&reserved, old_round, &scanned, &input_request,)
+                .await
+                .is_err()
+        );
+        assert!(
+            observer
+                .reclaim_metadata_input(&reserved, next_round, &scanned, &input_request,)
+                .await
+                .is_err(),
+            "new owner must first claim the original parent"
+        );
         let claimed = catalog
             .claim_reclaim_reservations_page(&serial, route, next_round, None, 16)
             .await
@@ -7142,6 +7398,14 @@ mod tests {
                 .await
                 .unwrap(),
             Some(metadata_progress)
+        );
+        assert_eq!(
+            observer
+                .reclaim_metadata_input(&claimed.items[0], next_round, &scanned, &input_request,)
+                .await
+                .unwrap(),
+            input,
+            "HA keeps the exact source and donor without another body read"
         );
         assert_eq!(fixture.drive_log(), drive_before_replay);
         assert_eq!(fixture.changer_log(), changer_before_replay);

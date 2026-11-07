@@ -18,12 +18,14 @@ pub use walk::{ReclaimFile, ReclaimWalk};
 mod recovery;
 #[path = "reclaim_retirement.rs"]
 mod retirement;
+pub use retirement::ReclaimBodyDestination;
 #[path = "reclaim_source.rs"]
 mod source;
 pub use source::{
-    ReclaimDataProgress, ReclaimFileMetadata, ReclaimMetadataProgress, ReclaimNodeDestination,
-    ReclaimNodeMetadata, ReclaimNodeReadRequest, ReclaimReadSource, ReclaimSourceInventory,
-    ReclaimSourceNode, ReclaimSourceNodeKind, ReclaimSourceProgress, ReclaimSourceRead,
+    ReclaimDataProgress, ReclaimFileMetadata, ReclaimMetadataInput, ReclaimMetadataProgress,
+    ReclaimNodeDestination, ReclaimNodeMetadata, ReclaimNodeReadRequest, ReclaimReadSource,
+    ReclaimSourceInventory, ReclaimSourceNode, ReclaimSourceNodeKind, ReclaimSourceProgress,
+    ReclaimSourceRead,
 };
 
 fn domain(ns: Uuid, kind: u8) -> Vec<u8> {
