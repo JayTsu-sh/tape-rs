@@ -419,12 +419,16 @@ async fn seal_metadata_at(
         || proof.source_copy != <[u8; 32]>::from(Sha256::digest(&source_raw))
         || proof.node.uid != logical_uid
         || proof.data.uid != source.ltfs_file_uid
-        || (proof.node.kind == Kind::Symlink) != source.media.as_ref().is_some_and(|m| m.ee_alias)
-        || !matches!(proof.node.kind, Kind::File | Kind::Symlink)
+        || (proof.node.kind == ReclaimSourceNodeKind::Symlink)
+            != source.media.as_ref().is_some_and(|m| m.ee_alias)
+        || !matches!(
+            proof.node.kind,
+            ReclaimSourceNodeKind::File | ReclaimSourceNodeKind::Symlink
+        )
         || target["head"] != json!(proof.target_head)
         || target["copy"] != json!(proof.target_copy)
         || target["index"] != json!(proof.target_index)
-        || proof.target.kind != Kind::File
+        || proof.target.kind != ReclaimSourceNodeKind::File
     {
         return Err(CatalogError::Invalid(
             "原始元数据证明与原子请求、源副本或目的回执不符",
@@ -497,7 +501,7 @@ async fn seal_metadata_at(
         }
     };
     if previous.is_none() {
-        let count = if proof.node.kind == Kind::File {
+        let count = if proof.node.kind == ReclaimSourceNodeKind::File {
             &mut progress.files
         } else {
             &mut progress.aliases

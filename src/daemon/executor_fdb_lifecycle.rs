@@ -2709,6 +2709,11 @@ mod tests {
                 )
                 .unwrap();
         }
+        // More than one source page, without changing the two logical files
+        // below: empty physical directories must remain visible to reclaim.
+        for i in 0..40 {
+            volume.create_directory(&format!("/empty-{i:02}")).unwrap();
+        }
         volume.commit().unwrap();
         drop(volume);
         // Establish an actual SMC home through the public unassigned move;
@@ -2809,18 +2814,203 @@ mod tests {
         )
         .unwrap();
         let inventory = ReclaimSourceInventory::from_captured(&captured).unwrap();
+        let before_nodes = fixture.drive_log();
+        let before_changer = fixture.changer_log();
+        assert!(
+            catalog
+                .reclaim_source_nodes_page(&reserved, fixture.owner.round, &inventory, None, 32)
+                .await
+                .is_err(),
+            "unsealed inventory must not enumerate partial source nodes"
+        );
+        let mut sealed_pages = 0;
         loop {
-            if catalog
+            let progress = catalog
                 .seal_reclaim_source_inventory_page(&reserved, fixture.owner.round, &inventory)
                 .await
-                .unwrap()
-                .complete()
-            {
+                .unwrap();
+            sealed_pages += 1;
+            if progress.complete() {
                 break;
             }
+            assert!(
+                catalog
+                    .reclaim_source_nodes_page(&reserved, fixture.owner.round, &inventory, None, 32)
+                    .await
+                    .is_err(),
+                "one sealed page is not a complete inventory"
+            );
         }
+        assert_eq!(sealed_pages, 2);
+        assert_eq!(inventory.objects(), 46);
+        assert_eq!(inventory.directories(), 43);
         assert_eq!(inventory.files(), 1);
         assert_eq!(inventory.symlinks(), 2);
+        let first_nodes = catalog
+            .reclaim_source_nodes_page(&reserved, fixture.owner.round, &inventory, None, 32)
+            .await
+            .unwrap();
+        assert_eq!(first_nodes.items.len(), 32);
+        let last_nodes = catalog
+            .reclaim_source_nodes_page(
+                &reserved,
+                fixture.owner.round,
+                &inventory,
+                first_nodes.next.as_deref(),
+                32,
+            )
+            .await
+            .unwrap();
+        assert_eq!(last_nodes.items.len(), 14);
+        assert!(last_nodes.next.is_none());
+        let nodes: Vec<_> = first_nodes.items.iter().chain(&last_nodes.items).collect();
+        assert!(
+            nodes
+                .windows(2)
+                .all(|pair| pair[0].path().as_bytes() < pair[1].path().as_bytes())
+        );
+        use crate::managed_catalog::ReclaimSourceNodeKind;
+        let root_node = nodes.iter().find(|n| n.path().is_empty()).unwrap();
+        assert_eq!(root_node.kind(), ReclaimSourceNodeKind::Directory);
+        assert_eq!(root_node.length(), None);
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n.path() == "empty-39" && n.kind() == ReclaimSourceNodeKind::Directory)
+        );
+        assert!(nodes.iter().any(|n| n.path() == ".LTFSEE_DATA/blob"
+            && n.kind() == ReclaimSourceNodeKind::File
+            && n.length() == Some(bytes.len() as u64)));
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n.path() == "docs/alias2" && n.kind() == ReclaimSourceNodeKind::Symlink)
+        );
+        let reopened = ManagedCatalog::open(Some(&cluster)).unwrap();
+        assert_eq!(
+            reopened
+                .reclaim_source_nodes_page(&reserved, fixture.owner.round, &inventory, None, 32)
+                .await
+                .unwrap(),
+            first_nodes
+        );
+        for limit in [0, 33, usize::MAX] {
+            assert!(
+                catalog
+                    .reclaim_source_nodes_page(
+                        &reserved,
+                        fixture.owner.round,
+                        &inventory,
+                        None,
+                        limit
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        let cursor = first_nodes.next.as_ref().unwrap();
+        for bad in [cursor[..cursor.len() - 1].to_vec(), {
+            let mut key = cursor.clone();
+            key[0] ^= 1;
+            key
+        }] {
+            assert!(
+                catalog
+                    .reclaim_source_nodes_page(
+                        &reserved,
+                        fixture.owner.round,
+                        &inventory,
+                        Some(&bad),
+                        32
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            catalog
+                .reclaim_source_nodes_page(&reserved, fixture.owner.round + 1, &inventory, None, 32)
+                .await
+                .is_err()
+        );
+
+        // Each persisted row must match its UID key and canonical encoding.
+        // Corrupt data is diagnosed without changing the original ledger.
+        let mut node_prefix = b"tape-rs/catalog/22/@/".to_vec();
+        node_prefix.extend_from_slice(control.route.route.namespace.as_bytes());
+        node_prefix.extend_from_slice(b"Re");
+        node_prefix.extend_from_slice(&reserved.intent()["epoch"].as_u64().unwrap().to_be_bytes());
+        node_prefix.extend_from_slice(
+            uuid::Uuid::parse_str(reserved.intent()["operation"].as_str().unwrap())
+                .unwrap()
+                .as_bytes(),
+        );
+        let mut node_key = node_prefix;
+        node_key.extend_from_slice(&first_nodes.items[0].uid().to_be_bytes());
+        let db = foundationdb::Database::new(Some(&cluster)).unwrap();
+        let tr = db.create_trx().unwrap();
+        let original = tr.get(&node_key, false).await.unwrap().unwrap().to_vec();
+        let changed_uid = String::from_utf8(original.clone()).unwrap().replace(
+            &format!("\"uid\":{}", first_nodes.items[0].uid()),
+            &format!("\"uid\":{}", first_nodes.items[1].uid()),
+        );
+        assert_ne!(changed_uid.as_bytes(), original);
+        let changed_path = String::from_utf8(original.clone())
+            .unwrap()
+            .replace("\"path\":\"\"", "\"path\":\"fake-root\"");
+        assert_ne!(changed_path.as_bytes(), original);
+        // A fully canonical same-UID replacement must not be returned as an
+        // original node. Likewise a missing root must fail, not return 45 nodes.
+        let tr = db.create_trx().unwrap();
+        tr.clear(&node_key);
+        tr.commit().await.unwrap();
+        assert!(
+            catalog
+                .reclaim_source_nodes_page(&reserved, fixture.owner.round, &inventory, None, 32)
+                .await
+                .is_err()
+        );
+        let tr = db.create_trx().unwrap();
+        assert!(tr.get(&node_key, false).await.unwrap().is_none());
+        tr.set(&node_key, &original);
+        tr.commit().await.unwrap();
+        for corrupt in [
+            b"{".to_vec(),
+            [original.as_slice(), b" "].concat(),
+            changed_uid.into_bytes(),
+            changed_path.into_bytes(),
+            vec![b'x'; 48_001],
+        ] {
+            let tr = db.create_trx().unwrap();
+            tr.set(&node_key, &corrupt);
+            tr.commit().await.unwrap();
+            assert!(
+                catalog
+                    .reclaim_source_nodes_page(&reserved, fixture.owner.round, &inventory, None, 32)
+                    .await
+                    .is_err()
+            );
+            let tr = db.create_trx().unwrap();
+            assert_eq!(
+                tr.get(&node_key, false).await.unwrap().unwrap().as_ref(),
+                corrupt.as_slice()
+            );
+            tr.set(&node_key, &original);
+            tr.commit().await.unwrap();
+        }
+        assert_eq!(
+            catalog
+                .reclaim_source_nodes_page(&reserved, fixture.owner.round, &inventory, None, 32)
+                .await
+                .unwrap(),
+            first_nodes
+        );
+        assert_eq!(
+            fixture.drive_log(),
+            before_nodes,
+            "source node paging and recovery issue no CDBs"
+        );
+        assert_eq!(fixture.changer_log(), before_changer);
         let mut next = Some(file);
         let mut previous_progress = None;
         let mut metadata_receipts = Vec::new();

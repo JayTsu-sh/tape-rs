@@ -64,29 +64,32 @@ fn source_inventory_includes_root_empty_directories_links_and_unmapped_ee_data()
         ),
         (47, 3, 42, 2, 166)
     );
-    let first = inventory.page(None).unwrap();
+    let first = inventory.page(None, PAGE).unwrap();
     assert_eq!(first.len(), PAGE);
     assert_eq!(first[0].path, "");
-    let last = inventory.page(Some(&first.last().unwrap().path)).unwrap();
+    let last = inventory
+        .page(Some(&first.last().unwrap().path), PAGE)
+        .unwrap();
     assert_eq!(last.len(), 15);
     assert!(
         inventory
-            .page(Some(&last.last().unwrap().path))
+            .page(Some(&last.last().unwrap().path), PAGE)
             .unwrap()
             .is_empty()
     );
     let rows: Vec<_> = first.into_iter().chain(last).collect();
     assert!(
         rows.iter()
-            .any(|row| row.path == ".LTFSEE_DATA/unmapped" && row.kind == Kind::File)
+            .any(|row| row.path == ".LTFSEE_DATA/unmapped"
+                && row.kind == ReclaimSourceNodeKind::File)
     );
     assert!(
         rows.iter()
-            .any(|row| row.path == "empty" && row.kind == Kind::Directory)
+            .any(|row| row.path == "empty" && row.kind == ReclaimSourceNodeKind::Directory)
     );
     assert!(
         rows.iter()
-            .any(|row| row.path == "opaque" && row.kind == Kind::Symlink)
+            .any(|row| row.path == "opaque" && row.kind == ReclaimSourceNodeKind::Symlink)
     );
     let mut digest = inventory.summary.seed();
     for (i, row) in rows.iter().enumerate() {
@@ -135,7 +138,7 @@ fn incremental_source_inventory_uses_replayed_nodes_and_refuses_recorded_scope()
     );
     assert_eq!(
         inventory
-            .page(None)
+            .page(None, PAGE)
             .unwrap()
             .iter()
             .map(|o| o.path.as_str())

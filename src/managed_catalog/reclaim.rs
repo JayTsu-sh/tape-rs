@@ -22,7 +22,7 @@ mod retirement;
 mod source;
 pub use source::{
     ReclaimDataProgress, ReclaimFileMetadata, ReclaimMetadataProgress, ReclaimSourceInventory,
-    ReclaimSourceProgress, ReclaimSourceRead,
+    ReclaimSourceNode, ReclaimSourceNodeKind, ReclaimSourceProgress, ReclaimSourceRead,
 };
 
 fn domain(ns: Uuid, kind: u8) -> Vec<u8> {

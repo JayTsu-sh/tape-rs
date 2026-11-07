@@ -112,6 +112,88 @@ pub(in super::super) fn clear_reserved_at(tr: &Transaction, reservation: &Reclai
 }
 
 impl ManagedCatalog {
+    /// Read original nodes in physical path order using the immutable actual
+    /// source capture. Every returned node must still have its exact sealed
+    /// record; missing or canonically altered rows cannot shrink the inventory.
+    /// Neither a page nor exhaustion proves relocation or permission to format.
+    pub async fn reclaim_source_nodes_page(
+        &self,
+        reservation: &ReclaimReservation,
+        owner: u64,
+        inventory: &ReclaimSourceInventory<'_>,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Page<ReclaimSourceNode>> {
+        if !(1..=PAGE).contains(&limit) {
+            return Err(CatalogError::Invalid("回收源对象分页必须在 1..=32"));
+        }
+        let prefix = own_key(reservation, b'e');
+        let cursor = if let Some(key) = after {
+            if !key.starts_with(&prefix) || key.len() != prefix.len() + 8 {
+                return Err(CatalogError::Invalid("回收源对象游标不属于原父任务"));
+            }
+            let uid =
+                u64::from_be_bytes(key[prefix.len()..].try_into().expect("checked UID length"));
+            let entry = inventory
+                .source
+                .entry_by_uid(uid)
+                .map_err(cache)?
+                .ok_or(CatalogError::Invalid("回收源游标节点不在原实际索引中"))?;
+            Some(Object::capture(entry)?)
+        } else {
+            None
+        };
+        // The source is immutable and budgeted. Capture rows before opening the
+        // FDB read version, so local XML/SQLite work does not age a transaction.
+        let rows = inventory.page(cursor.as_ref().map(|node| node.path.as_str()), limit)?;
+        let next = if rows.len() == limit
+            && !inventory
+                .page(Some(&rows.last().expect("nonempty page").path), 1)?
+                .is_empty()
+        {
+            Some(object_key(
+                reservation,
+                rows.last().expect("nonempty page").uid,
+            ))
+        } else {
+            None
+        };
+        let tr = self.db.create_trx()?;
+        let parent = record_at(&tr, reservation, owner).await?;
+        if parent["owner_epoch"] != owner {
+            return Err(CatalogError::OwnerFenced);
+        }
+        let (_, index) = source_state_at(&tr, reservation).await?;
+        let progress = require_complete_at(&tr, reservation).await?;
+        let mut head = Vec::new();
+        active_volume::encode_index(&mut head, index);
+        if progress.summary != inventory.summary
+            || progress.summary.volume != index.volume_uuid.to_string()
+            || progress.summary.head != head
+        {
+            return Err(CatalogError::Corrupt(
+                "回收源清单与原实际捕获或封存卷索引不一致",
+            ));
+        }
+        for object in cursor.iter().chain(&rows) {
+            let expected = object.encode()?;
+            if tr
+                .get(&object_key(reservation, object.uid), false)
+                .await?
+                .as_deref()
+                != Some(expected.as_slice())
+            {
+                return Err(CatalogError::Corrupt(
+                    "回收源对象缺失或与原实际封存节点不一致",
+                ));
+            }
+        }
+        Ok(Page {
+            items: rows.into_iter().map(ReclaimSourceNode).collect(),
+            next,
+        })
+    }
+
     /// Seal at most 32 original nodes atomically. Root, empty directories,
     /// symlinks and EE internal objects are included without interpretation.
     /// No field here claims these nodes have a safe destination or are retired.
@@ -144,7 +226,7 @@ impl ManagedCatalog {
                             if progress.complete {
                                 return Ok(progress);
                             }
-                            let rows = inventory.page(progress.after.as_deref())?;
+                            let rows = inventory.page(progress.after.as_deref(), PAGE)?;
                             if rows.is_empty() {
                                 return Err(CatalogError::Corrupt(
                                     "回收源清单在预计对象数之前结束",
@@ -158,7 +240,7 @@ impl ManagedCatalog {
                                     .is_some_and(|p| object.path.as_bytes() <= p.as_bytes())
                                     || progress.after.is_none()
                                         && (!object.path.is_empty()
-                                            || object.kind != Kind::Directory)
+                                            || object.kind != ReclaimSourceNodeKind::Directory)
                                 {
                                     return Err(CatalogError::Corrupt(
                                         "回收源清单分页顺序改变或缺失根目录",

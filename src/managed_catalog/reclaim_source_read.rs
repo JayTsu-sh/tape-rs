@@ -52,7 +52,7 @@ impl ReclaimSourceRead {
                 != json!({"path":intent.ltfs_path()?,"file":intent.file_id.to_string(),
                 "version":intent.expected_version,"size":intent.expected_size,"operation":intent.operation_id.to_string()})
             || proof.file_head != encode_head(head)
-            || proof.object.kind != Kind::File
+            || proof.object.kind != ReclaimSourceNodeKind::File
             || proof.object.uid != copy.ltfs_file_uid
             || proof.object.length != Some(copy.size)
             || proof.copy_sha256

@@ -174,7 +174,7 @@ pub(super) async fn seal_data_at(
     let object_raw = object.encode()?;
     if evidence.inventory() != manifest.summary.digest
         || evidence.index() != manifest.summary.head
-        || object.kind != Kind::File
+        || object.kind != ReclaimSourceNodeKind::File
         || tr
             .get(&ledger::object_key(reservation, object.uid), false)
             .await?
