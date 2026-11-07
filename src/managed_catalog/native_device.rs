@@ -397,6 +397,11 @@ async fn read_state(tr: &Transaction, task: &NativeDeviceTask, owner: u64) -> Re
     if receipt["status"] != "running" || receipt["owner_epoch"] != owner {
         return Err(CatalogError::OwnerFenced);
     }
+    if task.kind() == "media-unassign" {
+        management::exclusion::LibraryTaskClaim::for_request(&task.request)?
+            .require_owned(tr)
+            .await?;
+    }
     if tr.get(&task.gate(), false).await?.as_deref() != Some(task.token().as_slice()) {
         return Err(CatalogError::Corrupt("设备任务维护屏障缺失或身份不符"));
     }
@@ -720,15 +725,29 @@ impl ManagedCatalog {
                         )
                         .await?;
                         let task = NativeDeviceTask { request, route };
-                        if !management::device_kind(task.kind()) || task.kind() == "media-assign" {
+                        if !management::device_kind(task.kind())
+                            || matches!(task.kind(), "media-assign" | "library-rescan")
+                        {
                             return Err(CatalogError::Invalid("不是通用原生设备任务"));
                         }
                         if !matches!(receipt["status"].as_str(), Some("queued" | "running")) {
                             return Ok(None);
                         }
-                        if receipt["status"] == "queued" {
+                        let starting = receipt["status"] == "queued";
+                        let exclusion = if task.kind() == "media-unassign" {
+                            Some(management::exclusion::LibraryTaskClaim::for_request(
+                                &task.request,
+                            )?)
+                        } else {
+                            None
+                        };
+                        if starting {
                             let ns = task.request.namespace();
                             require_library_available(&tr, ns, serial).await?;
+                            if exclusion.is_some() {
+                                management::exclusion::require_available_at(&tr, ns, serial)
+                                    .await?;
+                            }
                             if let Some(pool) = task.pool() {
                                 reclaim::require_pool_write_at(&tr, ns, pool).await?;
                                 native_media::require_pool_readable(&tr, ns, pool).await?;
@@ -759,6 +778,9 @@ impl ManagedCatalog {
                             }
                             tr.set(&task.journal(), &encoded(&new_state(&task)));
                         } else {
+                            if let Some(claim) = &exclusion {
+                                claim.require_owned(&tr).await?;
+                            }
                             let old_owner = receipt["owner_epoch"]
                                 .as_u64()
                                 .ok_or(CatalogError::Corrupt("设备任务 owner"))?;
@@ -797,6 +819,9 @@ impl ManagedCatalog {
                                 "device_task_started",
                             )
                             .await?;
+                        }
+                        if starting && let Some(claim) = &exclusion {
+                            claim.acquire(&tr);
                         }
                         Ok(Some(task))
                     }
@@ -943,6 +968,13 @@ impl ManagedCatalog {
                             return Ok(saved);
                         }
                         let state = read_state(&tr, task, owner).await?;
+                        let exclusion = if task.kind() == "media-unassign" {
+                            Some(management::exclusion::LibraryTaskClaim::for_request(
+                                &task.request,
+                            )?)
+                        } else {
+                            None
+                        };
                         let cancelled = state["cancel_requested"] == true;
                         if !matches!(
                             state["phase"].as_str(),
@@ -1112,6 +1144,9 @@ impl ManagedCatalog {
                                 "device_task_completed",
                             )
                             .await?;
+                        }
+                        if let Some(claim) = &exclusion {
+                            claim.release(&tr);
                         }
                         Ok(receipt)
                     }

@@ -131,6 +131,9 @@ pub(super) async fn child_at(
             "回收复制子请求索引缺失或与封存身份不符",
         ));
     }
+    management::exclusion::LibraryTaskClaim::for_reclaim(&token)?
+        .require_owned(tr)
+        .await?;
     let bytes: Vec<u8> = serde_json::from_value(value["attempt"].clone())
         .map_err(|_| CatalogError::Corrupt("回收子请求编码"))?;
     let (intent, permit) = reservation::decode(&bytes, ns, epoch, operation)?;

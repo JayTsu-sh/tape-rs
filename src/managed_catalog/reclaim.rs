@@ -205,6 +205,9 @@ async fn record_at(
     {
         return Err(CatalogError::Corrupt("回收预留与池屏障不一致"));
     }
+    management::exclusion::LibraryTaskClaim::for_reclaim(&reservation.token())?
+        .require_owned(tr)
+        .await?;
     Ok(value)
 }
 
@@ -268,12 +271,15 @@ impl ManagedCatalog {
                 let window=management::window(&tr,ns).await?;
                 if epoch!=window.accepting {return Err(CatalogError::Invalid("回收管理请求代次已关闭"));}
                 require_pool_writable_at(&tr,ns,spec.pool).await?;
+                management::exclusion::require_available_at(&tr,ns,serial).await?;
+                let claim=management::exclusion::LibraryTaskClaim::for_reclaim(&reservation.token())?;
                 if requests::has_namespace_holds(&tr,ns).await? || active_volume::recovery_active(&tr,spec.volume).await? {
                     return Err(CatalogError::PoolBusy);
                 }
                 let value=json!({"version":1,"intent":reservation.intent,"fingerprint":reservation.fingerprint(),"owner_epoch":owner,"phase":"reserved","children":0});
                 tr.set(&reservation.journal_key(),value.to_string().as_bytes());
                 tr.set(&gate_key(ns,spec.pool),reservation.token().to_string().as_bytes());
+                claim.acquire(&tr);
                 Ok(reservation)
             }.await) }
         }).await?
@@ -328,10 +334,14 @@ impl ManagedCatalog {
                             return Err(CatalogError::PoolBusy);
                         }
                         source::require_metadata_idle_at(&tr, reservation).await?;
+                        let claim = management::exclusion::LibraryTaskClaim::for_reclaim(
+                            &reservation.token(),
+                        )?;
                         walk::clear_reserved_at(&tr, reservation).await?;
                         source::clear_reserved_at(&tr, reservation);
                         tr.clear(&gate_key(reservation.namespace(), reservation.spec().pool));
                         tr.clear(&reservation.journal_key());
+                        claim.release(&tr);
                         Ok(())
                     }
                     .await,

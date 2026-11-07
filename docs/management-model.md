@@ -79,6 +79,8 @@ ltfsctl -e HOST:7401 task show NAMESPACE:LIBRARY_SERIAL:EPOCH:OPERATION -l LIBRA
 
 耗时设备命令先持久登记原任务再开始 I/O；CLI/HTTP 返回原 task_id，以 task list/show 查询阶段和终态。多盘请求逐盘持久保存结果，部分成功不能伪装成整个批次的物理原子回滚。`assign`、`import`、`unassign` 和机械 `move` 的区别及 EE 版本依据见 [生命周期研究](research/ee-management-lifecycle.md)。
 
+运维任务按物理 Library 互斥，同库跨池也适用，不同库可并行。rescan、reclaim、unassign 与 tape set/offline 的启动检查由共享 FDB 后端执行；查询和排队不等于取得执行权。原任务及其占用必须一起恢复，不能因超时、断线或 HA 自动解锁。EE 参考清单、参数互斥及当前原生 reclaim 的未开放边界见 [管理命令互斥](management-task-exclusion.md)。
+
 ## HTTP 层级
 
 以下均为运维管理接口；文件下载、上传及 S3 是独立的数据接口。

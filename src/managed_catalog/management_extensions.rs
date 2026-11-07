@@ -161,6 +161,7 @@ async fn apply_change(
     match text(change, "kind")? {
         "pool-delete" => Err(CatalogError::Invalid("池操作必须由共享池执行器处理")),
         "tape" => {
+            exclusion::require_available_at(tr, namespace, serial).await?;
             reclaim::require_pool_write_at(tr, namespace, id(change, "pool")?).await?;
             let mut assignment =
                 tape_policy_at(tr, namespace, serial, text(change, "barcode")?).await?;
