@@ -464,37 +464,32 @@ async fn write_group(
     fdb_loading::guard(owner, permit, control).await?;
     let round = owner.round;
     let session = owner.write_session.take();
+    let original_intents = writes
+        .iter()
+        .map(|(_, plan)| plan.intent.clone())
+        .collect::<Vec<_>>();
     let seen_reservations = std::cell::RefCell::new(vec![false; writes.len()]);
     let checked =
         fdb_loading::operation_guard(owner, permit, owner.devices[drive].dev.as_ref(), || {
             futures_executor::block_on(async {
-                control
+                let observed = control
                     .catalog
-                    .require_active_library_readable(&control.serial, control.route, round)
+                    .check_active_write_group(
+                        &control.serial,
+                        control.route,
+                        round,
+                        &original_intents,
+                    )
                     .await
                     .map_err(|e| TapeError::Catalog(e.to_string()))?;
-                for (n, (_, plan)) in writes.iter().enumerate() {
-                    let original_intent = &plan.intent;
-                    control
-                        .catalog
-                        .check_active_upload_gate(control.route, round, &original_intent.request())
-                        .await
-                        .map_err(|e| TapeError::Catalog(e.to_string()))?;
-                    let current = control
-                        .catalog
-                        .active_file_attempt(&original_intent.request(), control.route)
-                        .await
-                        .map_err(|e| TapeError::Catalog(e.to_string()))?;
-                    if let Some(current) = current {
-                        if current != *original_intent {
-                            return Err(TapeError::Catalog("上传原物理尝试已改变".into()));
-                        }
-                        seen_reservations.borrow_mut()[n] = true;
-                    } else if seen_reservations.borrow()[n] {
-                        return Err(TapeError::Catalog(
-                            "上传原物理尝试已被移除，停止后续命令".into(),
-                        ));
-                    }
+                let mut seen = seen_reservations.borrow_mut();
+                if seen.iter().zip(&observed).any(|(seen, now)| *seen && !now) {
+                    return Err(TapeError::Catalog(
+                        "上传原物理尝试已被移除，停止后续命令".into(),
+                    ));
+                }
+                for (seen, now) in seen.iter_mut().zip(observed) {
+                    *seen |= now;
                 }
                 Ok(())
             })

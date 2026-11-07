@@ -203,7 +203,7 @@ pub(super) async fn child_at(
     Ok(Some((intent, permit)))
 }
 
-pub(super) async fn require_request_at(
+pub(in crate::managed_catalog) async fn require_request_at(
     tr: &Transaction,
     request: &ActiveFileRequest,
     owner: u64,

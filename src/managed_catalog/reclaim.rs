@@ -8,7 +8,9 @@ use sha2::{Digest, Sha256};
 mod children;
 #[path = "reclaim_prepared_cancel.rs"]
 mod prepared_cancel;
-pub(in crate::managed_catalog) use children::{require_intent_at, require_receipt_at};
+pub(in crate::managed_catalog) use children::{
+    require_intent_at, require_receipt_at, require_request_at,
+};
 #[path = "reclaim_walk.rs"]
 mod walk;
 pub use walk::{ReclaimFile, ReclaimWalk};

@@ -402,6 +402,41 @@ pub(super) async fn volume_reservations_empty(
     Ok(true)
 }
 
+pub(super) async fn active_file_attempt_at(
+    tr: &Transaction,
+    request: &ActiveFileRequest,
+) -> Result<Option<ActiveFileIntent>> {
+    let namespace = request.namespace;
+    let mut key = requests::epoch_prefix(b'0', namespace, request.request_epoch);
+    key.extend_from_slice(request.operation_id.as_bytes());
+    let saved = if let Some(raw) = tr.get(&key, false).await? {
+        Some(decode(&raw, namespace, request.request_epoch, request.operation_id)?.0)
+    } else {
+        let mut key = requests::epoch_prefix(b'I', namespace, request.request_epoch);
+        key.extend_from_slice(request.operation_id.as_bytes());
+        if let Some(raw) = tr.get(&key, false).await? {
+            let receipt = requests::decode_intent(
+                &raw,
+                namespace,
+                request.request_epoch,
+                request.operation_id,
+            )?;
+            let permit = requests::matching_permit(&raw, &receipt)?
+                .ok_or(CatalogError::Corrupt("原物理尝试准入许可不一致"))?;
+            Some(intent_for_upgraded_at(tr, &receipt, permit).await?)
+        } else {
+            None
+        }
+    };
+    if saved
+        .as_ref()
+        .is_some_and(|intent| intent.request() != *request)
+    {
+        return Err(CatalogError::Invalid("原操作已绑定其他逻辑请求"));
+    }
+    Ok(saved)
+}
+
 impl ManagedCatalog {
     /// A logical retry must reuse any admitted physical attempt, including an
     /// upgraded receipt. Absence alone permits the actor to select its first
@@ -419,34 +454,7 @@ impl ManagedCatalog {
         if namespace != request.namespace {
             return Err(CatalogError::Invalid("上传不属于活动命名空间"));
         }
-        let mut key = requests::epoch_prefix(b'0', namespace, request.request_epoch);
-        key.extend_from_slice(request.operation_id.as_bytes());
-        let saved = if let Some(raw) = tr.get(&key, false).await? {
-            Some(decode(&raw, namespace, request.request_epoch, request.operation_id)?.0)
-        } else {
-            let mut key = requests::epoch_prefix(b'I', namespace, request.request_epoch);
-            key.extend_from_slice(request.operation_id.as_bytes());
-            if let Some(raw) = tr.get(&key, false).await? {
-                let receipt = requests::decode_intent(
-                    &raw,
-                    namespace,
-                    request.request_epoch,
-                    request.operation_id,
-                )?;
-                let permit = requests::matching_permit(&raw, &receipt)?
-                    .ok_or(CatalogError::Corrupt("原物理尝试准入许可不一致"))?;
-                Some(intent_for_upgraded_at(&tr, &receipt, permit).await?)
-            } else {
-                None
-            }
-        };
-        if saved
-            .as_ref()
-            .is_some_and(|intent| intent.request() != *request)
-        {
-            return Err(CatalogError::Invalid("原操作已绑定其他逻辑请求"));
-        }
-        Ok(saved)
+        active_file_attempt_at(&tr, request).await
     }
 
     /// Recover the original physical path of one outstanding observed receipt.

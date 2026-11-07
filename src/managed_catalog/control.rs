@@ -42,6 +42,8 @@ pub(super) use pool_roots::{initial_pool_root, reject_generic_pool_root_at};
 pub(super) mod automatic_media;
 #[path = "native_device.rs"]
 pub(super) mod native_device;
+#[path = "write_guard.rs"]
+mod write_guard;
 pub use automatic_media::{AutomaticMediaAction, AutomaticMediaCommand, AutomaticMediaPlan};
 #[path = "reclaim.rs"]
 pub(super) mod reclaim;

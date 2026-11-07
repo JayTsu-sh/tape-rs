@@ -225,6 +225,21 @@ async fn save(
     task["execution"] = execution.value();
     write_task(tr, request, task).await
 }
+pub(in crate::managed_catalog) async fn require_readable_at(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+) -> Result<()> {
+    if pending_at(tr, ns, serial).await?.is_some()
+        || super::automatic_media::pending_at(tr, ns, serial)
+            .await?
+            .is_some()
+    {
+        return Err(CatalogError::PoolBusy);
+    }
+    Ok(())
+}
+
 impl ManagedCatalog {
     /// Device readers and automatic loaders must yield to the original
     /// mechanical checkpoint. Metadata/task inspection remains available.
@@ -236,14 +251,7 @@ impl ManagedCatalog {
     ) -> Result<()> {
         let tr = self.db.create_trx()?;
         let ns = routing::require_runtime_active_owner(&tr, serial, route, owner).await?;
-        if pending_at(&tr, ns, serial).await?.is_some()
-            || super::automatic_media::pending_at(&tr, ns, serial)
-                .await?
-                .is_some()
-        {
-            return Err(CatalogError::PoolBusy);
-        }
-        Ok(())
+        require_readable_at(&tr, ns, serial).await
     }
     /// Strict persistent recovery priority. A gate never grants execution rights.
     pub async fn active_library_mechanical_task(

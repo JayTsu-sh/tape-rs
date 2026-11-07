@@ -1503,6 +1503,153 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；逐CDB原写入组权限及查询耗时，不操作设备"]
+    async fn write_group_checks_every_original_attempt_and_fresh_authority() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let c = ManagedCatalog::open(Some(&cluster)).unwrap();
+        let (serial, route, pool) = fixture(&c).await;
+        let root = std::env::temp_dir().join(format!("write-group-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let (spool, proof) = target_source(&root, 0);
+        let intake = start(&c, &serial, route, pool.id, 100, "GUARD0L8").await;
+        c.bind_native_media_source(&intake, 100, &proof)
+            .await
+            .unwrap();
+        c.begin_native_media_projection(&intake, 100).await.unwrap();
+        c.finish_native_media(&intake, 100, &proof).await.unwrap();
+        let mut intents = Vec::new();
+        for n in 0..8 {
+            let spec = ActiveUploadSpec {
+                pool_id: pool.id,
+                path: format!("/guard-{n}").into_bytes(),
+                operation_id: Uuid::new_v4(),
+                expected_version: None,
+                size: 3,
+                digest: ContentDigest::Sha256(Sha256::digest(b"one").into()),
+            };
+            intents.push(
+                c.prepare_active_upload(&serial, route, 100, "GUARD0L8", &spec)
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            c.check_active_write_group(&serial, route, 100, &intents)
+                .await
+                .unwrap(),
+            vec![false; 8]
+        );
+        for intent in &intents[..4] {
+            assert_eq!(
+                c.reserve_active_file(intent).await.unwrap(),
+                PublishOutcome::Registered
+            );
+        }
+        let expected = vec![true, true, true, true, false, false, false, false];
+        assert_eq!(
+            c.check_active_write_group(&serial, route, 100, &intents)
+                .await
+                .unwrap(),
+            expected
+        );
+        // Compare the former production call sequence with the same original
+        // group on the same real FDB. Timings are diagnostic, not flaky gates.
+        let started = std::time::Instant::now();
+        for _ in 0..20 {
+            c.require_active_library_readable(&serial, route, 100)
+                .await
+                .unwrap();
+            for intent in &intents {
+                c.check_active_upload_gate(route, 100, &intent.request())
+                    .await
+                    .unwrap();
+                let current = c
+                    .active_file_attempt(&intent.request(), route)
+                    .await
+                    .unwrap();
+                assert!(current.as_ref().is_none_or(|current| current == intent));
+            }
+        }
+        let separate_seconds = started.elapsed().as_secs_f64();
+        let started = std::time::Instant::now();
+        for _ in 0..20 {
+            assert_eq!(
+                c.check_active_write_group(&serial, route, 100, &intents)
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+        eprintln!(
+            "write_group_fdb_comparison rounds=20 files=8 separate_seconds={separate_seconds:.6} coherent_seconds={:.6}",
+            started.elapsed().as_secs_f64()
+        );
+        for n in 0..4 {
+            let mut changed = intents.clone();
+            changed[n].volume_generation += 1;
+            assert!(
+                c.check_active_write_group(&serial, route, 100, &changed)
+                    .await
+                    .is_err(),
+                "original physical attempt {n}"
+            );
+        }
+        let mut changed = intents.clone();
+        changed[7].namespace = Uuid::new_v4();
+        assert!(
+            c.check_active_write_group(&serial, route, 100, &changed)
+                .await
+                .is_err()
+        );
+        changed[7] = intents[7].clone();
+        changed[7].library_serial = "OTHER-LIBRARY".into();
+        assert!(
+            c.check_active_write_group(&serial, route, 100, &changed)
+                .await
+                .is_err()
+        );
+        assert!(
+            c.check_active_write_group(&serial, route, 100, &[])
+                .await
+                .is_err()
+        );
+        // Neither a malformed explicit nor an automatic mechanical checkpoint
+        // can disappear behind the new shared read transaction.
+        for gate in [
+            native_device::library_gate(route.route.namespace, &serial),
+            super::super::automatic_media::gate(route.route.namespace, &serial),
+        ] {
+            let tr = c.db.create_trx().unwrap();
+            assert!(tr.get(&gate, false).await.unwrap().is_none());
+            tr.set(&gate, b"malformed-original-gate");
+            tr.commit().await.unwrap();
+            assert!(
+                c.check_active_write_group(&serial, route, 100, &intents)
+                    .await
+                    .is_err()
+            );
+            let tr = c.db.create_trx().unwrap();
+            tr.clear(&gate);
+            tr.commit().await.unwrap();
+            assert_eq!(
+                c.check_active_write_group(&serial, route, 100, &intents)
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+        assert!(c.claim_active_owner_epoch(&serial, 101).await.is_ok());
+        assert!(matches!(
+            c.check_active_write_group(&serial, route, 100, &intents)
+                .await,
+            Err(CatalogError::OwnerFenced)
+        ));
+        drop(spool);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     #[ignore = "需要隔离 FDB_TEST_CLUSTER；已分配磁带同池索引刷新，不操作设备"]
     async fn native_refresh_assigned_volume_updates_in_place_and_preserves_assignment() {
         let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
@@ -3397,6 +3544,12 @@ mod tests {
         c.check_active_upload_gate(route, 100, &request)
             .await
             .unwrap();
+        assert_eq!(
+            c.check_active_write_group(&serial, route, 100, std::slice::from_ref(&saved))
+                .await
+                .unwrap(),
+            vec![false]
+        );
         assert!(matches!(
             c.rotate_active_request_epoch(
                 route.route.namespace,
@@ -3451,6 +3604,11 @@ mod tests {
                 .is_err(),
             "原回收子身份不能随父屏障消失而获得普通上传准入"
         );
+        assert!(
+            c.check_active_write_group(&serial, route, 100, std::slice::from_ref(&saved))
+                .await
+                .is_err()
+        );
         assert!(c.reserve_active_file(&saved).await.is_err());
         assert_eq!(
             c.active_file_attempt(&request, route).await.unwrap(),
@@ -3494,6 +3652,11 @@ mod tests {
             tr.commit().await.unwrap();
             assert!(
                 c.check_active_upload_gate(route, 100, &request)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                c.check_active_write_group(&serial, route, 100, std::slice::from_ref(&saved))
                     .await
                     .is_err()
             );
@@ -3569,6 +3732,12 @@ mod tests {
         assert_eq!(
             c.reserve_active_file(&saved).await.unwrap(),
             PublishOutcome::Registered
+        );
+        assert_eq!(
+            c.check_active_write_group(&serial, route, 100, std::slice::from_ref(&saved))
+                .await
+                .unwrap(),
+            vec![true]
         );
         assert_eq!(
             c.maintenance_status(route.route.namespace)
