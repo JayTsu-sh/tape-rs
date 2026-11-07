@@ -114,6 +114,10 @@ impl ActiveMediaReader<'_> {
         // a caller-supplied pathname. Rewind before returning it to the writer.
         read.file.rewind()?;
         let mut sha = Sha256::new();
+        let expected_md5 = inventory
+            .expected_read_md5(read.metadata.copy.ltfs_file_uid)
+            .map_err(|e| TapeError::Catalog(e.to_string()))?;
+        let mut md5 = expected_md5.map(|_| Md5::new());
         let mut buffer = vec![0; 1024 * 1024];
         let mut remaining = read.metadata.copy.size;
         loop {
@@ -125,9 +129,18 @@ impl ActiveMediaReader<'_> {
                 .checked_sub(count as u64)
                 .ok_or_else(|| TapeError::Catalog("源暂存正文超过已核验长度".into()))?;
             sha.update(&buffer[..count]);
+            if let Some(hash) = md5.as_mut() {
+                hash.update(&buffer[..count]);
+            }
         }
         if remaining != 0 {
             return Err(TapeError::Catalog("源暂存正文短于已核验长度".into()));
+        }
+        let md5 = md5.map(|hash| <[u8; 16]>::from(hash.finalize()));
+        if md5 != expected_md5 {
+            return Err(TapeError::Catalog(
+                "回收源实读 MD5 与原始数据节点不一致".into(),
+            ));
         }
         read.file.rewind()?;
         self.check_device_owner()?;
@@ -142,6 +155,7 @@ impl ActiveMediaReader<'_> {
                 &read.metadata,
                 read.verified_head,
                 sha.finalize().into(),
+                md5,
             )
             .map_err(|e| TapeError::Catalog(e.to_string()))?;
         Ok((read, evidence))

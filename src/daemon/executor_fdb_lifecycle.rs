@@ -3444,6 +3444,229 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 实读 EE 数据 UID 的全部已知哈希，不访问实际设备"]
+    async fn reclaim_source_read_rejects_conflicting_secondary_md5() {
+        use crate::ltfs::recovery::{RecoveryBudget, capture_index_source};
+        use crate::managed_catalog::{
+            ContentDigest, ManagedCatalog, ManagementRequest, ReclaimSourceInventory, ReclaimSpec,
+        };
+        use sha2::{Digest, Sha256};
+        use std::io::{Cursor, Read};
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog = Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());
+        let bytes: Vec<u8> = (0..(128 * 1024 + 13)).map(|i| (i % 251) as u8).collect();
+        let md5 = <[u8; 16]>::from(md5::Md5::digest(&bytes));
+        let correct_md5 = md5.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        for (recorded_md5, sha256, valid) in [
+            (Some("00".repeat(16)), true, false),
+            (Some(correct_md5.clone()), true, true),
+            (Some(correct_md5.to_uppercase()), false, true),
+            (None, true, true),
+        ] {
+            let (mut fixture, control, pool, status) =
+                Box::pin(native_fixture(catalog.clone())).await;
+            fixture.format(uuid::Uuid::new_v4());
+            let mut volume = LtfsVolume::mount(fixture.device()).unwrap();
+            volume.set_hash_policy(crate::ltfs::volume::HashPolicy { md5: false, sha256 });
+
+            volume
+                .append_file("/.LTFSEE_DATA/blob", &mut Cursor::new(&bytes))
+                .unwrap();
+            volume
+                .add_symlink("/docs/alias", "../.LTFSEE_DATA/blob")
+                .unwrap();
+            volume
+                .add_symlink("/docs/alias2", "../.LTFSEE_DATA/blob")
+                .unwrap();
+            let expected_md5 = recorded_md5.as_ref().map(|_| md5);
+            if let Some(recorded) = recorded_md5 {
+                volume
+                    .set_node_xattr(
+                        "/.LTFSEE_DATA/blob",
+                        crate::ltfs::index::Xattr {
+                            key: crate::ltfs::index::XATTR_MD5.into(),
+                            value: recorded,
+                            base64: false,
+                        },
+                        false,
+                        false,
+                    )
+                    .unwrap();
+            }
+            volume.commit().unwrap();
+            drop(volume);
+            // Establish an actual SMC home through the public unassigned move;
+            // direct Sim loading intentionally has no durable/source-address proof.
+            let initial_home=ManagementRequest::parse(json!({"version":1,"library":control.serial,
+            "namespace":control.route.route.namespace.to_string(),"epoch":1,"operation":uuid::Uuid::new_v4().to_string(),
+            "change":{"kind":"media-move","pool":null,"barcode":"LIFE00L8","volume":null,
+            "revision":null,"destination":"homeslot"}})).unwrap();
+            let homed = execute(&mut fixture, &control, &status, &initial_home).await;
+            assert_eq!(homed["status"], "succeeded", "{homed}");
+            let import=ManagementRequest::parse(json!({"version":1,"library":control.serial,
+            "namespace":control.route.route.namespace.to_string(),"epoch":1,
+            "operation":uuid::Uuid::new_v4().to_string(),"change":{"kind":"media-import",
+            "pool":pool.id.to_string(),"barcode":"LIFE00L8","volume":null,"path":"/","merge_tapes":true}})).unwrap();
+            let task = execute(&mut fixture, &control, &status, &import).await;
+            assert_eq!(task["status"], "succeeded", "{task}");
+            let current = catalog
+                .tape_assignment(&control.serial, "LIFE00L8")
+                .await
+                .unwrap()
+                .unwrap();
+            let home=ManagementRequest::parse(json!({"version":1,"library":control.serial,
+            "namespace":control.route.route.namespace.to_string(),"epoch":1,"operation":uuid::Uuid::new_v4().to_string(),
+            "change":{"kind":"media-move","pool":pool.id.to_string(),"barcode":"LIFE00L8",
+            "volume":current.volume_id.unwrap().to_string(),"revision":current.revision,"destination":"homeslot"}})).unwrap();
+            let homed = execute(&mut fixture, &control, &status, &home).await;
+            assert_eq!(homed["status"], "succeeded", "{homed}");
+            fixture
+                .lib
+                .insert_cartridge(SimCartridge::blank("EEDESTL8", 128 << 20), 1)
+                .unwrap();
+            let assign=ManagementRequest::parse(json!({"version":1,"library":control.serial,
+            "namespace":control.route.route.namespace.to_string(),"epoch":1,"operation":uuid::Uuid::new_v4().to_string(),
+            "change":{"kind":"media-assign","pool":pool.id.to_string(),"barcode":"EEDESTL8",
+            "volume":uuid::Uuid::new_v4().to_string(),"confirm_format":true,"force_format":false}})).unwrap();
+            let assigned = execute(&mut fixture, &control, &status, &assign).await;
+            assert_eq!(assigned["status"], "succeeded", "{assigned}");
+            let assignment = catalog
+                .tape_assignment(&control.serial, "LIFE00L8")
+                .await
+                .unwrap()
+                .unwrap();
+            let spec =
+                ReclaimSpec::parse(&json!({"kind":"media-reclaim","pool":pool.id.to_string(),
+            "barcode":"LIFE00L8","volume":assignment.volume_id.unwrap().to_string(),
+            "revision":assignment.revision,"confirm_format":true,"unassign":false}))
+                .unwrap();
+            let reserved = catalog
+                .reserve_reclaim_pool(
+                    &control.serial,
+                    control.route,
+                    fixture.owner.round,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    &spec,
+                )
+                .await
+                .unwrap();
+            let file = loop {
+                let walk = catalog
+                    .step_reclaim_walk(&reserved, fixture.owner.round)
+                    .await
+                    .unwrap();
+                if let Some(file) = walk.current() {
+                    break file.clone();
+                }
+                assert!(!walk.complete());
+            };
+            assert_eq!(file.path(), "/docs/alias");
+            let placement = catalog
+                .volume_placement(spec.volume())
+                .await
+                .unwrap()
+                .unwrap();
+            let source_head = catalog
+                .active_loaded_volume_head(
+                    &control.serial,
+                    spec.barcode(),
+                    control.route,
+                    fixture.owner.round,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            fdb_loading::select_write(
+                &mut fixture.owner,
+                &fixture.permit,
+                &control,
+                &status,
+                &placement,
+                source_head.index,
+            )
+            .await
+            .unwrap();
+            let captured = capture_index_source(
+                &TapeDrive::new(fixture.device()),
+                &crate::ltfs::volume::read_label_only(fixture.device()).unwrap(),
+                &RecoveryBudget::default(),
+            )
+            .unwrap();
+            let inventory = ReclaimSourceInventory::from_captured(&captured).unwrap();
+            loop {
+                if catalog
+                    .seal_reclaim_source_inventory_page(&reserved, fixture.owner.round, &inventory)
+                    .await
+                    .unwrap()
+                    .complete()
+                {
+                    break;
+                }
+            }
+            let before = fixture.drive_log();
+            let before_changer = fixture.changer_log();
+            let reader = super::super::super::fdb_read::ActiveMediaReader {
+                catalog: &catalog,
+                device: fixture.device(),
+                serial: &control.serial,
+                route: control.route,
+                key: fixture.owner.key,
+                permission: &fixture.permit,
+                storage: control.storage,
+            };
+            let result = Box::pin(reader.read_reclaim_file_with_cache(
+                &reserved,
+                &file,
+                &inventory,
+                &fixture.owner.files.extent_cache_dir(),
+                fixture.owner.files.spool_dir(),
+            ))
+            .await;
+            if valid {
+                let (mut read, evidence) = result.unwrap();
+                assert_eq!(
+                    read.metadata.copy.content_digest,
+                    if sha256 {
+                        ContentDigest::Sha256(Sha256::digest(&bytes).into())
+                    } else {
+                        ContentDigest::Md5(md5)
+                    }
+                );
+                assert_eq!(evidence.sha256(), <[u8; 32]>::from(Sha256::digest(&bytes)));
+                assert_eq!(evidence.md5(), expected_md5);
+                let mut actual = Vec::new();
+                read.file.read_to_end(&mut actual).unwrap();
+                assert_eq!(actual, bytes);
+            } else {
+                assert!(
+                    result.is_err(),
+                    "a valid preferred SHA must not hide conflicting raw data-node MD5"
+                );
+                assert!(result.err().unwrap().to_string().contains("MD5"));
+            }
+            assert!(
+                !fixture.drive_log()[before.len()..]
+                    .iter()
+                    .any(|op| matches!(op, 0x04 | 0x0a | 0x10 | 0x19 | 0x8d))
+            );
+            assert_eq!(fixture.changer_log(), before_changer);
+            assert_eq!(
+                catalog
+                    .reserved_reclaim_status(&reserved, fixture.owner.round)
+                    .await
+                    .unwrap()["children"],
+                0
+            );
+            catalog
+                .release_reserved_reclaim(&reserved, fixture.owner.round)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim EE alias/Unknown 正文实读，不访问实际设备"]
     async fn reclaim_source_read_hashes_unknown_ee_body_and_binds_data_uid() {
         use crate::ltfs::recovery::{RecoveryBudget, capture_index_source};
