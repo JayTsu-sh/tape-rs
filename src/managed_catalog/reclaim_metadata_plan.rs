@@ -1,6 +1,7 @@
 //! Fixed raw-file reference recipe; neither execution nor source erase authority.
 use super::*;
 use crate::ltfs::index::FileNode;
+use crate::ltfs::recovery::IndexSourceIdentity;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -13,9 +14,12 @@ pub(super) struct Plan {
     pub input: [u8; 32],
     pub volume: String,
     pub previous: Vec<u8>,
+    pub previous_source: Vec<u8>,
     pub donor: Object,
     pub expected: Object,
     pub physical_files: u64,
+    pub target_objects: u64,
+    pub target_tree: [u8; 32],
 }
 
 /// Constructed only from captured source/target indexes and retained byte proof.
@@ -33,6 +37,10 @@ impl ReclaimMetadataPlan {
     pub fn volume(&self) -> Uuid {
         Uuid::parse_str(&self.0.volume).expect("validated metadata volume")
     }
+    /// Descriptor for an explicit verified historical read, never media proof.
+    pub fn previous_source(&self) -> Result<IndexSourceIdentity> {
+        IndexSourceIdentity::from_bytes(&self.0.previous_source).map_err(cache)
+    }
     pub fn fingerprint(&self) -> Result<[u8; 32]> {
         let mut hash = Sha256::new();
         hash.update(b"tape-rs/reclaim-metadata-plan/1");
@@ -46,7 +54,7 @@ impl ReclaimMetadataPlan {
         p.expected.encode()?;
         let volume = Uuid::parse_str(&p.volume).map_err(cache)?;
         let head = active_volume::decode_index(volume, &p.previous)?;
-        if p.version != 1
+        if p.version != 2
             || volume.is_nil()
             || volume.to_string() != p.volume
             || p.parent.len() != 64
@@ -63,6 +71,8 @@ impl ReclaimMetadataPlan {
             || p.expected.uid <= 1
             || head.generation.checked_add(1).is_none()
             || p.physical_files.checked_add(1).is_none()
+            || p.target_objects <= p.physical_files
+            || ActiveIndexIdentity::from(self.previous_source()?.head()) != head
         {
             return Err(CatalogError::Corrupt(
                 "回收元数据固定计划身份、类型或名额无效",
@@ -135,6 +145,7 @@ impl ReclaimSourceInventory<'_> {
         let parent = path.rsplit_once('/').map_or("", |(p, _)| p);
         let mut parent_found = false;
         let mut files = 0u64;
+        let mut tree = TargetTree::new(target.header().volume_uuid);
         target
             .for_each_entry(|entry| {
                 let entry_path = match &entry {
@@ -154,6 +165,8 @@ impl ReclaimSourceInventory<'_> {
                 if entry_path == path {
                     return Err(callback(CatalogError::Invalid("回收元数据目的路径已存在")));
                 }
+                tree.add(&Object::capture(entry).map_err(callback)?)
+                    .map_err(callback)?;
                 Ok(())
             })
             .map_err(cache)?;
@@ -167,7 +180,7 @@ impl ReclaimSourceInventory<'_> {
         let mut previous = Vec::new();
         active_volume::encode_index(&mut previous, destination.index());
         let plan = ReclaimMetadataPlan(Plan {
-            version: 1,
+            version: 2,
             parent,
             inventory: self.summary.digest,
             source,
@@ -175,14 +188,61 @@ impl ReclaimSourceInventory<'_> {
             input: input.fingerprint()?,
             volume: destination.copy().volume_id.to_string(),
             previous,
+            previous_source: target.identity().map_err(cache)?.to_bytes(),
             donor: Object::capture(donor_entry)?,
             expected: Object::capture(IndexEntry::File {
                 path: path.into(),
                 node,
             })?,
             physical_files: files,
+            target_objects: tree.objects,
+            target_tree: tree.finish(),
         });
         plan.encode()?;
         Ok(plan)
+    }
+}
+
+/// Canonical path-ordered stream; no tree or path set is retained in memory.
+pub(super) struct TargetTree {
+    hash: Sha256,
+    previous: Option<String>,
+    pub(super) objects: u64,
+}
+impl TargetTree {
+    pub(super) fn new(volume: Uuid) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(b"tape-rs/reclaim-metadata-target-tree/1");
+        hash.update(volume.as_bytes());
+        Self {
+            hash,
+            previous: None,
+            objects: 0,
+        }
+    }
+    pub(super) fn add(&mut self, object: &Object) -> Result<()> {
+        if self
+            .previous
+            .as_ref()
+            .is_some_and(|p| object.path.as_bytes() <= p.as_bytes())
+            || self.previous.is_none()
+                && (!object.path.is_empty() || object.kind != ReclaimSourceNodeKind::Directory)
+        {
+            return Err(CatalogError::Corrupt(
+                "回收元数据目标对象顺序或根目录不完整",
+            ));
+        }
+        let raw = object.encode()?;
+        self.objects = self
+            .objects
+            .checked_add(1)
+            .ok_or(CatalogError::Invalid("回收元数据目标对象计数溢出"))?;
+        self.hash.update((raw.len() as u64).to_be_bytes());
+        self.hash.update(raw);
+        self.previous = Some(object.path.clone());
+        Ok(())
+    }
+    pub(super) fn finish(self) -> [u8; 32] {
+        self.hash.finalize().into()
     }
 }

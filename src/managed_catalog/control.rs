@@ -49,7 +49,8 @@ pub use automatic_media::{AutomaticMediaAction, AutomaticMediaCommand, Automatic
 pub(super) mod reclaim;
 pub use reclaim::{
     ReclaimBodyDestination, ReclaimDataProgress, ReclaimFile, ReclaimFileMetadata,
-    ReclaimMetadataAdmission, ReclaimMetadataInput, ReclaimMetadataPlan, ReclaimMetadataProgress,
+    ReclaimMetadataAdmission, ReclaimMetadataInput, ReclaimMetadataObservation,
+    ReclaimMetadataObservationKind, ReclaimMetadataPlan, ReclaimMetadataProgress,
     ReclaimMetadataWrite, ReclaimNodeDestination, ReclaimNodeMetadata, ReclaimNodeReadRequest,
     ReclaimReadSource, ReclaimReservation, ReclaimSourceInventory, ReclaimSourceNode,
     ReclaimSourceNodeKind, ReclaimSourceProgress, ReclaimSourceRead, ReclaimSpec, ReclaimWalk,

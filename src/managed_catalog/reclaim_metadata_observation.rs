@@ -1,0 +1,161 @@
+//! Read-only current-media evidence. No catalog mutation, I/O admission,
+//! claim release, metadata coverage or source erase authority is produced.
+use super::*;
+use metadata_plan::TargetTree;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReclaimMetadataObservationKind {
+    Unchanged,
+    Committed,
+}
+
+#[cfg(test)]
+#[path = "reclaim_metadata_observation_tests.rs"]
+mod tests;
+
+/// Constructed only from the original plan and a verified current on-disk view.
+/// Unchanged describes the observed clean head, never permission to replay I/O.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReclaimMetadataObservation {
+    plan: [u8; 32],
+    current: ActiveIndexIdentity,
+    kind: ReclaimMetadataObservationKind,
+    physical_files: u64,
+}
+impl ReclaimMetadataObservation {
+    pub fn plan_fingerprint(&self) -> [u8; 32] {
+        self.plan
+    }
+    pub fn current(&self) -> ActiveIndexIdentity {
+        self.current
+    }
+    pub fn kind(&self) -> ReclaimMetadataObservationKind {
+        self.kind
+    }
+    pub fn physical_files(&self) -> u64 {
+        self.physical_files
+    }
+}
+
+impl ReclaimMetadataPlan {
+    /// Observe a clean current DP head and its fully replayed object tree.
+    /// Every original object, including root/empty-directory/link attributes,
+    /// must remain exact; a committed result adds only the fixed new raw node.
+    /// Full heads additionally require an actual recorded read of the original
+    /// predecessor: their header pointer alone cannot prove its raw SHA.
+    pub fn observe_current(
+        &self,
+        target: &CapturedIndexSource,
+        predecessor: Option<&CapturedIndexSource>,
+    ) -> Result<ReclaimMetadataObservation> {
+        self.encode()?;
+        current_proof(target.scope(), target.header())?;
+        let current: ActiveIndexIdentity = target.construct().into();
+        let previous = active_volume::decode_index(self.volume(), &self.0.previous)?;
+        let original = self.previous_source()?;
+        let header = target.header();
+        if current.volume_uuid != self.volume()
+            || header.volume_uuid != current.volume_uuid
+            || header.generation != current.generation
+            || header.self_location != current.location
+        {
+            return Err(CatalogError::Invalid(
+                "回收元数据观察的当前卷头不属于原计划",
+            ));
+        }
+        let kind = if current == previous {
+            if header.highest_file_uid.checked_add(1) != Some(self.uid())
+                || target.identity().map_err(cache)? != original
+            {
+                return Err(CatalogError::Invalid(
+                    "回收元数据未变化卷头的 UID 或来源链与原计划不同",
+                ));
+            }
+            ReclaimMetadataObservationKind::Unchanged
+        } else {
+            let linked = if current.incremental {
+                let chain = target.predecessors();
+                chain.first() == Some(&original.head())
+                    && chain.get(1..) == Some(original.predecessors())
+            } else {
+                let pointer = if previous.incremental {
+                    header.previous_incremental_location
+                } else {
+                    header.previous_location
+                };
+                match predecessor {
+                    Some(source) if source.scope() == IndexSourceScope::Recorded => {
+                        pointer == Some(previous.location)
+                            && source.identity().map_err(cache)? == original
+                    }
+                    _ => false,
+                }
+            };
+            if previous.generation.checked_add(1) != Some(current.generation)
+                || current.location.partition != previous.location.partition
+                || current.location.start_block <= previous.location.start_block
+                || header.highest_file_uid != self.uid()
+                || !linked
+            {
+                return Err(CatalogError::Invalid(
+                    "回收元数据观察偏离原代次、UID 或索引前驱",
+                ));
+            }
+            ReclaimMetadataObservationKind::Committed
+        };
+        let donor = target
+            .entry_by_uid(self.0.donor.uid)
+            .map_err(cache)?
+            .ok_or(CatalogError::Incomplete)?;
+        if Object::capture(donor)? != self.0.donor {
+            return Err(CatalogError::Invalid("回收元数据观察的原正文节点改变"));
+        }
+        let mut tree = TargetTree::new(self.volume());
+        let mut added = false;
+        let mut files = 0u64;
+        target
+            .for_each_entry(|entry| {
+                if matches!(entry, IndexEntry::File { .. }) {
+                    files = files.checked_add(1).ok_or_else(|| {
+                        callback(CatalogError::Invalid("回收元数据观察文件计数溢出"))
+                    })?;
+                }
+                let object = Object::capture(entry).map_err(callback)?;
+                if object.uid == self.uid() {
+                    if kind != ReclaimMetadataObservationKind::Committed
+                        || added
+                        || object != self.0.expected
+                    {
+                        return Err(callback(CatalogError::Invalid(
+                            "回收元数据观察的新节点与固定计划不同",
+                        )));
+                    }
+                    added = true;
+                } else {
+                    tree.add(&object).map_err(callback)?;
+                }
+                Ok(())
+            })
+            .map_err(cache)?;
+        let expected_files = if kind == ReclaimMetadataObservationKind::Committed {
+            self.0.physical_files.checked_add(1)
+        } else {
+            Some(self.0.physical_files)
+        };
+        if added != (kind == ReclaimMetadataObservationKind::Committed)
+            || Some(files) != expected_files
+            || tree.objects != self.0.target_objects
+            || tree.finish() != self.0.target_tree
+        {
+            return Err(CatalogError::Invalid(
+                "回收元数据观察改变原对象树或缺少固定新增节点",
+            ));
+        }
+        Ok(ReclaimMetadataObservation {
+            plan: self.fingerprint()?,
+            current,
+            kind,
+            physical_files: files,
+        })
+    }
+}

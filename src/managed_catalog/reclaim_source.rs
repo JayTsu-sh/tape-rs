@@ -21,6 +21,9 @@ pub use relocation::{ReclaimDataProgress, ReclaimMetadataInput};
 #[path = "reclaim_metadata_plan.rs"]
 mod metadata_plan;
 pub use metadata_plan::ReclaimMetadataPlan;
+#[path = "reclaim_metadata_observation.rs"]
+mod metadata_observation;
+pub use metadata_observation::{ReclaimMetadataObservation, ReclaimMetadataObservationKind};
 #[path = "reclaim_metadata_write.rs"]
 mod metadata_write;
 pub(super) use metadata_write::require_idle_at as require_metadata_idle_at;

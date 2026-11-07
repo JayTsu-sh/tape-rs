@@ -23,9 +23,10 @@ pub use retirement::ReclaimBodyDestination;
 mod source;
 pub use source::{
     ReclaimDataProgress, ReclaimFileMetadata, ReclaimMetadataAdmission, ReclaimMetadataInput,
-    ReclaimMetadataPlan, ReclaimMetadataProgress, ReclaimMetadataWrite, ReclaimNodeDestination,
-    ReclaimNodeMetadata, ReclaimNodeReadRequest, ReclaimReadSource, ReclaimSourceInventory,
-    ReclaimSourceNode, ReclaimSourceNodeKind, ReclaimSourceProgress, ReclaimSourceRead,
+    ReclaimMetadataObservation, ReclaimMetadataObservationKind, ReclaimMetadataPlan,
+    ReclaimMetadataProgress, ReclaimMetadataWrite, ReclaimNodeDestination, ReclaimNodeMetadata,
+    ReclaimNodeReadRequest, ReclaimReadSource, ReclaimSourceInventory, ReclaimSourceNode,
+    ReclaimSourceNodeKind, ReclaimSourceProgress, ReclaimSourceRead,
 };
 
 fn domain(ns: Uuid, kind: u8) -> Vec<u8> {

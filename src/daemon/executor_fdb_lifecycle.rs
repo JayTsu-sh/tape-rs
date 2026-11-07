@@ -5931,16 +5931,41 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "需要隔离 FDB_TEST_CLUSTER；真实持久任务加 SimLibrary，不访问实际设备"]
     async fn lifecycle_real_fdb_and_sim_complete_assign_validate_move_unassign_and_replay() {
-        Box::pin(native_lifecycle(false)).await;
+        Box::pin(native_lifecycle(MetadataCase::Prepared)).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "需要隔离 FDB_TEST_CLUSTER；原正文实读/退休与元数据准入，不访问实际设备"]
     async fn reclaim_metadata_admission_retains_uncertain_writes_across_takeover() {
-        Box::pin(native_lifecycle(true)).await;
+        Box::pin(native_lifecycle(MetadataCase::Admission)).await;
     }
 
-    async fn native_lifecycle(admit_metadata: bool) {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；真实 Sim 索引提交与完整对象树观察，无实际设备"]
+    async fn reclaim_metadata_observation_recognizes_only_the_exact_sim_commit() {
+        Box::pin(native_lifecycle(MetadataCase::Observation {
+            changed_root: false,
+        }))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；实际 Sim 提交中篡改无关属性，拒绝错误覆盖"]
+    async fn reclaim_metadata_observation_rejects_an_unrelated_sim_tree_change() {
+        Box::pin(native_lifecycle(MetadataCase::Observation {
+            changed_root: true,
+        }))
+        .await;
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum MetadataCase {
+        Prepared,
+        Admission,
+        Observation { changed_root: bool },
+    }
+
+    async fn native_lifecycle(metadata_case: MetadataCase) {
         use crate::managed_catalog::{ManagedCatalog, ManagementRequest};
         let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
         let _network = unsafe { foundationdb::boot() };
@@ -7096,7 +7121,154 @@ mod tests {
             .unwrap()
             .unwrap()
             .to_vec();
-        if admit_metadata {
+        if let MetadataCase::Observation { changed_root } = metadata_case {
+            Box::pin(async {
+                use crate::managed_catalog::ReclaimMetadataObservationKind;
+                let unchanged = metadata_plan
+                    .observe_current(&captured_target, None)
+                    .unwrap();
+                assert_eq!(unchanged.kind(), ReclaimMetadataObservationKind::Unchanged);
+                assert_eq!(
+                    unchanged.plan_fingerprint(),
+                    metadata_plan.fingerprint().unwrap()
+                );
+                assert!(
+                    metadata_plan.observe_current(&captured, None).is_err(),
+                    "其他卷的实际来源不是目的结果"
+                );
+                let admitted = Box::pin(catalog.admit_reclaim_metadata_write(
+                    &reserved,
+                    fixture.owner.round,
+                    &scanned,
+                    &input_request,
+                    &metadata_write,
+                ))
+                .await
+                .unwrap();
+                assert!(!admitted.needs_observation());
+                let writing = admitted.task().clone();
+                let checked = fdb_loading::operation_guard(
+                    &fixture.owner,
+                    &fixture.permit,
+                    fixture.owner.devices[drive].dev.as_ref(),
+                    || {
+                        futures_executor::block_on(async {
+                            let current = catalog
+                                .reclaim_metadata_write_status(
+                                    &reserved,
+                                    fixture.owner.round,
+                                    source_data_uid,
+                                )
+                                .await
+                                .map_err(|e| TapeError::Catalog(e.to_string()))?;
+                            if current.as_ref() != Some(&writing) || !writing.writing() {
+                                return Err(TapeError::Catalog("Sim 元数据观察原任务改变".into()));
+                            }
+                            Ok(())
+                        })
+                    },
+                );
+                let label = crate::ltfs::volume::read_label_only(&checked).unwrap();
+                let recorded = crate::ltfs::recovery::capture_recorded_index_source(
+                    &TapeDrive::new(&checked),
+                    &label,
+                    &captured_target.identity().unwrap(),
+                    &crate::ltfs::recovery::RecoveryBudget::default(),
+                )
+                .unwrap();
+                assert!(
+                    metadata_plan.observe_current(&recorded, None).is_err(),
+                    "历史来源不充当当前提交证明"
+                );
+                let source_entry = captured.entry_by_uid(source_data_uid).unwrap().unwrap();
+                let donor_path = input_request.ltfs_path().unwrap();
+                let mut volume = LtfsVolume::mount(&checked).unwrap();
+                volume.set_reservation_guard(Some(fixture.owner.key));
+                if changed_root {
+                    volume.set_root_xattr("test.unrelated", "changed").unwrap();
+                }
+                volume
+                    .reference_reclaimed_body(
+                        metadata_plan.path(),
+                        metadata_plan.uid(),
+                        &donor_path,
+                        input.destination().copy().ltfs_file_uid,
+                        &source_entry,
+                    )
+                    .unwrap();
+                volume.commit().unwrap();
+                drop(volume);
+                let actual = crate::ltfs::recovery::capture_index_source(
+                    &TapeDrive::new(&checked),
+                    &label,
+                    &crate::ltfs::recovery::RecoveryBudget::default(),
+                )
+                .unwrap();
+                let predecessor = crate::ltfs::recovery::capture_recorded_index_source(
+                    &TapeDrive::new(&checked),
+                    &label,
+                    &metadata_plan.previous_source().unwrap(),
+                    &crate::ltfs::recovery::RecoveryBudget::default(),
+                )
+                .unwrap();
+                assert!(metadata_plan.observe_current(&actual, None).is_err());
+                if changed_root {
+                    let error = metadata_plan
+                        .observe_current(&actual, Some(&predecessor))
+                        .unwrap_err();
+                    assert!(
+                        error.to_string().contains("对象树"),
+                        "新增节点正确仍须拒绝无关树变化: {error}"
+                    );
+                } else {
+                    let observed = metadata_plan
+                        .observe_current(&actual, Some(&predecessor))
+                        .unwrap();
+                    assert_eq!(observed.kind(), ReclaimMetadataObservationKind::Committed);
+                    assert_eq!(
+                        observed.current(),
+                        crate::managed_catalog::ActiveIndexIdentity::from(actual.construct())
+                    );
+                    assert_eq!(
+                        observed.plan_fingerprint(),
+                        metadata_plan.fingerprint().unwrap()
+                    );
+                    assert_eq!(observed.physical_files(), unchanged.physical_files() + 1);
+                    assert_eq!(
+                        metadata_plan
+                            .observe_current(&actual, Some(&predecessor))
+                            .unwrap(),
+                        observed,
+                        "重复观察不改变原证明"
+                    );
+                }
+                assert_eq!(
+                    catalog
+                        .reclaim_metadata_write_status(
+                            &reserved,
+                            fixture.owner.round,
+                            source_data_uid
+                        )
+                        .await
+                        .unwrap(),
+                    Some(writing.clone()),
+                    "观察本身不完成任务或释放未知写入占用"
+                );
+                assert!(
+                    catalog
+                        .close_prepared_reclaim_metadata_write(
+                            &reserved,
+                            fixture.owner.round,
+                            &writing
+                        )
+                        .await
+                        .is_err()
+                );
+            })
+            .await;
+            return;
+        }
+        if metadata_case == MetadataCase::Admission {
             Box::pin(async {
                 let commands = fixture.commands.lock().unwrap().clone();
                 assert!(!metadata_write.writing());
