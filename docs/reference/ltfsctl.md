@@ -4,7 +4,7 @@
 
 本页由 `tools/generate-cli-reference.py` 从实际构建产物递归采集 `--help` 生成，不表示所有服务模式均支持所有命令，也不表示列出的操作均已完成硬件验收。可选命令随构建特性变化，下面的帮助为本次构建内容。
 
-构建产物 SHA256：`bfc53a79d3948e867059a03ec1992993bef6821bf6d73134b61f0b9b2000592c`。共 83 个帮助入口。
+构建产物 SHA256：`78d6dd96c8b24cdfe997025639ddc7092c68cf0b1b98e9515f6d0738594eaff1`。共 83 个帮助入口。
 
 ## 目录
 
@@ -1323,7 +1323,7 @@ Commands:
   online    实际装带验证后解除离线；返回管理任务号
   set       设置黑名单及离线属性；返回管理任务号
   validate  异步核验标签、LTFS 索引和结构；不读取全部文件正文
-  reclaim   回收：把带上还活着的文件搬到同池的其他带上，然后重新格式化这盘带。 需要两台驱动器；命令立即返回，搬迁在后台进行，进度看 `pool list`
+  reclaim   回收：FDB 原生模式尚未开放，会拒绝此命令。 目录模式需要两台驱动器，后台搬迁有效文件后重新格式化源带
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1514,7 +1514,7 @@ Options:
 ## ltfsctl tape reclaim
 
 ```text
-回收：把带上还活着的文件搬到同池的其他带上，然后重新格式化这盘带。 需要两台驱动器；命令立即返回，搬迁在后台进行，进度看 `pool list`
+回收：FDB 原生模式尚未开放，会拒绝此命令。 目录模式需要两台驱动器，后台搬迁有效文件后重新格式化源带
 
 Usage: ltfsctl tape reclaim [OPTIONS] <BARCODE>
 

@@ -138,35 +138,50 @@ impl Rename<'_> {
         }
         let (drive, placement) = self.select(owner, task, Some(id)).await?;
         self.guard(owner).await?;
-        let mounted = LtfsVolume::mount(owner.devices[drive].dev.as_ref()).map_err(media_error)?;
-        // No original rename group is admitted yet. Generic recovery is legal
-        // here, before participant recipes and shared claims are complete.
-        let mut mounted = Box::pin(super::super::fdb_media::establish_active_media_owner(
-            catalog,
-            mounted,
-            &self.control.serial,
-            owner.key,
+        let original_task = task.clone();
+        let checked = fdb_loading::node_operation_guard(
+            owner,
             self.permit,
-            self.budget,
-        ))
-        .await
-        .map_err(media_error)?
-        .into_volume();
-        let actual: ActiveIndexIdentity = mounted
-            .verified_committed_index_construct()
-            .map_err(media_error)?
-            .into();
-        if actual.volume_uuid != id {
-            return Err(lost("rename 准备卷标签与原参与身份不符"));
-        }
-        let mut view = self
-            .projection(owner.round, manifest, spool, request, mounted.index())
-            .await?;
-        catalog
-            .save_node_rename_volume_plan(route, owner.round, manifest, &mut view)
+            self.control,
+            owner.devices[drive].dev.as_ref(),
+            &original_task,
+        );
+        let result = async {
+            let mounted = LtfsVolume::mount(&checked).map_err(media_error)?;
+            // No original rename group is admitted yet. Generic recovery is legal
+            // here, before participant recipes and shared claims are complete.
+            let mut mounted = Box::pin(super::super::fdb_media::establish_active_media_owner(
+                catalog,
+                mounted,
+                &self.control.serial,
+                owner.key,
+                self.permit,
+                self.budget,
+            ))
             .await
-            .map_err(catalog_error)?;
-        drop(mounted);
+            .map_err(media_error)?
+            .into_volume();
+            let actual: ActiveIndexIdentity = mounted
+                .verified_committed_index_construct()
+                .map_err(media_error)?
+                .into();
+            if actual.volume_uuid != id {
+                return Err(lost("rename 准备卷标签与原参与身份不符"));
+            }
+            let mut view = self
+                .projection(owner.round, manifest, spool, request, mounted.index())
+                .await?;
+            catalog
+                .save_node_rename_volume_plan(route, owner.round, manifest, &mut view)
+                .await
+                .map_err(catalog_error)?;
+            drop(mounted);
+            Ok(())
+        }
+        .await;
+        checked.verify_proof().map_err(media_error)?;
+        result?;
+        drop(checked);
         self.guard(owner).await?;
         self.remember(owner, drive, placement);
         Ok(())

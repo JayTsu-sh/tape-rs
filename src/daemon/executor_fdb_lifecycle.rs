@@ -2316,6 +2316,272 @@ mod tests {
         }
     }
 
+    /// Cancel the real queued rename after a successful device response, while
+    /// keeping its Raft execution permission valid. Only the FDB/task guard
+    /// can prevent subsequent commands in the recipe's generic recovery path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim rename 准备中取消与未索引尾部，不访问实际设备"]
+    async fn rename_recipe_stops_on_original_task_loss_during_mount_and_tail_recovery() {
+        use crate::managed_catalog::{
+            ManagedCatalog, ManagementRequest, NodeMutationTaskState, NodeRenameRevision,
+            NodeRenameSpec, ResolvedPath,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Boundary {
+            inner: Box<dyn TapeTransport + Send>,
+            opcode: u8,
+            fired: Arc<AtomicBool>,
+            later: Arc<std::sync::Mutex<Vec<u8>>>,
+            cancel: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+        }
+        impl Boundary {
+            fn before(&self, cdb: &[u8]) {
+                if self.fired.load(Ordering::SeqCst) {
+                    self.later.lock().unwrap().push(cdb[0]);
+                }
+            }
+            fn after(&self, cdb: &[u8]) -> Result<()> {
+                if cdb[0] == self.opcode && !self.fired.swap(true, Ordering::SeqCst) {
+                    (self.cancel)()?;
+                }
+                Ok(())
+            }
+        }
+        impl TapeTransport for Boundary {
+            fn identity(&self) -> &str {
+                self.inner.identity()
+            }
+            fn execution_guard(&self) -> Option<(u64, usize)> {
+                self.inner.execution_guard()
+            }
+            fn execute_no_data(
+                &self,
+                cdb: &[u8],
+                timeout: u32,
+            ) -> Result<crate::scsi::device::ScsiResult> {
+                self.before(cdb);
+                let result = self.inner.execute_no_data(cdb, timeout)?;
+                self.after(cdb)?;
+                Ok(result)
+            }
+            fn execute_read(
+                &self,
+                cdb: &[u8],
+                data: &mut [u8],
+                timeout: u32,
+            ) -> Result<crate::scsi::device::ScsiResult> {
+                self.before(cdb);
+                let result = self.inner.execute_read(cdb, data, timeout)?;
+                self.after(cdb)?;
+                Ok(result)
+            }
+            fn execute_write(
+                &self,
+                cdb: &[u8],
+                data: &[u8],
+                timeout: u32,
+            ) -> Result<crate::scsi::device::ScsiResult> {
+                self.before(cdb);
+                let result = self.inner.execute_write(cdb, data, timeout)?;
+                self.after(cdb)?;
+                Ok(result)
+            }
+        }
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog = Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());
+        for opcode in [0x08, 0x0a] {
+            let (mut fixture, control, pool, status) =
+                Box::pin(native_fixture(catalog.clone())).await;
+            fixture.format(uuid::Uuid::new_v4());
+            let bytes = b"rename recipe original committed body";
+            let mut volume = LtfsVolume::mount(fixture.device()).unwrap();
+            volume
+                .append_file("/recipe-source.bin", &mut std::io::Cursor::new(bytes))
+                .unwrap();
+            volume.commit().unwrap();
+            drop(volume);
+            let home=ManagementRequest::parse(json!({"version":1,"library":control.serial,
+                "namespace":control.route.route.namespace.to_string(),"epoch":1,"operation":uuid::Uuid::new_v4().to_string(),
+                "change":{"kind":"media-move","pool":null,"barcode":"LIFE00L8","volume":null,"revision":null,"destination":"homeslot"}})).unwrap();
+            assert_eq!(
+                execute(&mut fixture, &control, &status, &home).await["status"],
+                "succeeded"
+            );
+            let import=ManagementRequest::parse(json!({"version":1,"library":control.serial,
+                "namespace":control.route.route.namespace.to_string(),"epoch":1,"operation":uuid::Uuid::new_v4().to_string(),
+                "change":{"kind":"media-import","pool":pool.id.to_string(),"barcode":"LIFE00L8","volume":null,"path":"/","merge_tapes":true}})).unwrap();
+            assert_eq!(
+                execute(&mut fixture, &control, &status, &import).await["status"],
+                "succeeded"
+            );
+            let namespace = control.route.route.namespace;
+            let root_path = format!("/{}", pool.id);
+            let source_path = format!("/{}/recipe-source.bin", pool.id);
+            let root = catalog
+                .resolve_active_path_for_route(&control.serial, root_path.as_bytes(), control.route)
+                .await
+                .unwrap()
+                .unwrap();
+            let source = catalog
+                .resolve_active_path_for_route(
+                    &control.serial,
+                    source_path.as_bytes(),
+                    control.route,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let revision = |node: &ResolvedPath| match node {
+                ResolvedPath::Directory { id, version, .. } => NodeRenameRevision {
+                    namespace,
+                    inode: *id,
+                    version: *version,
+                },
+                ResolvedPath::File { id, head, .. } => NodeRenameRevision {
+                    namespace,
+                    inode: *id,
+                    version: head.version,
+                },
+            };
+            let spec = NodeRenameSpec {
+                pool: pool.id,
+                operation: uuid::Uuid::new_v4(),
+                from: "/recipe-source.bin".into(),
+                to: "/recipe-target.bin".into(),
+                source: revision(&source),
+                source_parent: revision(&root),
+                destination_parent: revision(&root),
+                target: None,
+                no_replace: true,
+            };
+            let request = catalog
+                .prepare_node_rename_request(
+                    &control.serial,
+                    control.route,
+                    fixture.owner.round,
+                    &spec,
+                    &crate::ltfs::label::ltfs_time_now(),
+                )
+                .await
+                .unwrap();
+            catalog
+                .upload_node_rename_request(control.route, fixture.owner.round, &request, 16 << 20)
+                .await
+                .unwrap();
+            let task = catalog
+                .queue_node_rename_request(control.route, fixture.owner.round, &request, 16 << 20)
+                .await
+                .unwrap();
+            // Deliberate Sim fixture damage only: a real unindexed DP record,
+            // with all original committed file extents and FDB facts intact.
+            let mut volume = LtfsVolume::mount(fixture.device()).unwrap();
+            volume
+                .append_file(
+                    "/uncommitted-fixture.bin",
+                    &mut std::io::Cursor::new(b"unindexed tail"),
+                )
+                .unwrap();
+            drop(volume);
+            TapeDrive::new(fixture.device()).write_filemark(0).unwrap();
+            let probe = LtfsVolume::mount(fixture.device()).unwrap();
+            assert_eq!(
+                probe.recovery().dp.tail,
+                crate::ltfs::recovery::TailKind::UnindexedData
+            );
+            drop(probe);
+            let fired = Arc::new(AtomicBool::new(false));
+            let later = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let cancel_catalog = catalog.clone();
+            let serial = control.serial.clone();
+            let route = control.route;
+            let round = fixture.owner.round;
+            let original = task.clone();
+            let inner = std::mem::replace(
+                &mut fixture.owner.devices[0].dev,
+                Box::new(fixture.lib.drive_as(0, 1)),
+            );
+            fixture.owner.devices[0].dev = Box::new(Boundary {
+                inner,
+                opcode,
+                fired: fired.clone(),
+                later: later.clone(),
+                cancel: Arc::new(move || {
+                    let ended = futures_executor::block_on(cancel_catalog.cancel_node_rename_task(
+                        &serial,
+                        route,
+                        round,
+                        original.request_epoch,
+                        original.operation,
+                    ))
+                    .map_err(|e| TapeError::Catalog(e.to_string()))?;
+                    assert_eq!(ended.state, NodeMutationTaskState::Cancelled);
+                    Ok(())
+                }),
+            });
+            let outcome = Box::pin(fdb_rename::advance(
+                &mut fixture.owner,
+                &fixture.permit,
+                &control,
+                &status,
+                &task,
+            ))
+            .await;
+            assert!(
+                fired.load(Ordering::SeqCst),
+                "real recipe must reach injected response, opcode={opcode:#x}"
+            );
+            let later = later.lock().unwrap().clone();
+            // The shared operation guard verifies PR before querying the
+            // original task: one pair of read-only PR INs is its authority
+            // check, not a continuation of media I/O. Once task loss is seen,
+            // the latch must also prevent further PR checks on fallbacks.
+            assert!(
+                later.len() <= 2 && later.iter().all(|opcode| *opcode == 0x5e),
+                "rename recipe continued media I/O or repeated authority probes after original task cancellation, opcode={opcode:#x}: {:?}",
+                later
+            );
+            assert!(matches!(outcome, Err(ReadError::Lost(_))));
+            assert_eq!(
+                catalog
+                    .node_mutation_task(
+                        &control.serial,
+                        control.route,
+                        task.request_epoch,
+                        task.operation
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                NodeMutationTaskState::Cancelled
+            );
+            assert_eq!(
+                catalog
+                    .resolve_active_path_for_route(
+                        &control.serial,
+                        source_path.as_bytes(),
+                        control.route
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                source
+            );
+            assert!(
+                catalog
+                    .resolve_active_path_for_route(
+                        &control.serial,
+                        format!("/{}/recipe-target.bin", pool.id).as_bytes(),
+                        control.route
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
     async fn native_fixture_for_serial(
         catalog: Arc<crate::managed_catalog::ManagedCatalog>,
         physical_serial: Option<&str>,

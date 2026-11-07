@@ -58,7 +58,7 @@ ltfsctl -e HOST:7401 pool list -l SERIAL --json
 ltfsctl -e HOST:7401 pool show archive -l SERIAL
 ltfsctl -e HOST:7401 tape list -l SERIAL -p archive --json
 ltfsctl -e HOST:7401 tape import BARCODE -l SERIAL -p archive --request import.json
-ltfsctl -e HOST:7401 task show NAMESPACE:EPOCH:OPERATION -l SERIAL
+ltfsctl -e HOST:7401 task show NAMESPACE:LIBRARY:EPOCH:OPERATION -l SERIAL
 ```
 
 `library rescan` 和介质命令异步返回持久任务号；列表/详情读取缓存观测，不逐卷读取索引。所有设备任务先保存规范原请求，再提交到相应 Library/Pool/Tape 的 HTTP 路径；不能用空正文或临时 `{location:...}` 代替完整请求。重试保留原 namespace、epoch、operation 和操作参数。任务状态、进度及终态在 FDB，SQLite 只承担本地缓存；owner 切换接续原任务。

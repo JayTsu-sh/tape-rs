@@ -388,8 +388,8 @@ enum TapeCmd {
     Set(lifecycle::Set),
     /// 异步核验标签、LTFS 索引和结构；不读取全部文件正文
     Validate(lifecycle::Targets),
-    /// 回收：把带上还活着的文件搬到同池的其他带上，然后重新格式化这盘带。
-    /// 需要两台驱动器；命令立即返回，搬迁在后台进行，进度看 `pool list`
+    /// 回收：FDB 原生模式尚未开放，会拒绝此命令。
+    /// 目录模式需要两台驱动器，后台搬迁有效文件后重新格式化源带
     Reclaim { barcode: String },
 }
 
