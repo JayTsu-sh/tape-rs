@@ -21,8 +21,9 @@ mod retirement;
 #[path = "reclaim_source.rs"]
 mod source;
 pub use source::{
-    ReclaimDataProgress, ReclaimFileMetadata, ReclaimMetadataProgress, ReclaimSourceInventory,
-    ReclaimSourceNode, ReclaimSourceNodeKind, ReclaimSourceProgress, ReclaimSourceRead,
+    ReclaimDataProgress, ReclaimFileMetadata, ReclaimMetadataProgress, ReclaimNodeDestination,
+    ReclaimNodeMetadata, ReclaimSourceInventory, ReclaimSourceNode, ReclaimSourceNodeKind,
+    ReclaimSourceProgress, ReclaimSourceRead,
 };
 
 fn domain(ns: Uuid, kind: u8) -> Vec<u8> {

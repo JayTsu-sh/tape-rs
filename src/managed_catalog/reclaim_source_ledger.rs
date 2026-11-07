@@ -111,7 +111,75 @@ pub(in super::super) fn clear_reserved_at(tr: &Transaction, reservation: &Reclai
     tr.clear_range(&prefix, &prefix_end(&prefix));
 }
 
+async fn require_inventory_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    owner: u64,
+    inventory: &ReclaimSourceInventory<'_>,
+) -> Result<()> {
+    let parent = record_at(tr, reservation, owner).await?;
+    if parent["owner_epoch"] != owner {
+        return Err(CatalogError::OwnerFenced);
+    }
+    let (_, index) = source_state_at(tr, reservation).await?;
+    let progress = require_complete_at(tr, reservation).await?;
+    let mut head = Vec::new();
+    active_volume::encode_index(&mut head, index);
+    if progress.summary != inventory.summary
+        || progress.summary.volume != index.volume_uuid.to_string()
+        || progress.summary.head != head
+    {
+        return Err(CatalogError::Corrupt(
+            "回收源清单与原实际捕获或封存卷索引不一致",
+        ));
+    }
+    Ok(())
+}
+
+async fn require_object_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    object: &Object,
+) -> Result<()> {
+    let expected = object.encode()?;
+    if tr
+        .get(&object_key(reservation, object.uid), false)
+        .await?
+        .as_deref()
+        != Some(expected.as_slice())
+    {
+        return Err(CatalogError::Corrupt(
+            "回收源对象缺失或与原实际封存节点不一致",
+        ));
+    }
+    Ok(())
+}
+
 impl ManagedCatalog {
+    /// Resolve one node of the complete original inventory, with the same
+    /// parent/owner/assignment/head/row checks as its bounded enumeration.
+    pub async fn reclaim_source_node(
+        &self,
+        reservation: &ReclaimReservation,
+        owner: u64,
+        inventory: &ReclaimSourceInventory<'_>,
+        uid: u64,
+    ) -> Result<ReclaimSourceNode> {
+        if uid == 0 {
+            return Err(CatalogError::Invalid("回收源节点 UID 不能为零"));
+        }
+        let entry = inventory
+            .source
+            .entry_by_uid(uid)
+            .map_err(cache)?
+            .ok_or(CatalogError::Incomplete)?;
+        let object = Object::capture(entry)?;
+        let tr = self.db.create_trx()?;
+        require_inventory_at(&tr, reservation, owner, inventory).await?;
+        require_object_at(&tr, reservation, &object).await?;
+        Ok(ReclaimSourceNode(object))
+    }
+
     /// Read original nodes in physical path order using the immutable actual
     /// source capture. Every returned node must still have its exact sealed
     /// record; missing or canonically altered rows cannot shrink the inventory.
@@ -159,34 +227,9 @@ impl ManagedCatalog {
             None
         };
         let tr = self.db.create_trx()?;
-        let parent = record_at(&tr, reservation, owner).await?;
-        if parent["owner_epoch"] != owner {
-            return Err(CatalogError::OwnerFenced);
-        }
-        let (_, index) = source_state_at(&tr, reservation).await?;
-        let progress = require_complete_at(&tr, reservation).await?;
-        let mut head = Vec::new();
-        active_volume::encode_index(&mut head, index);
-        if progress.summary != inventory.summary
-            || progress.summary.volume != index.volume_uuid.to_string()
-            || progress.summary.head != head
-        {
-            return Err(CatalogError::Corrupt(
-                "回收源清单与原实际捕获或封存卷索引不一致",
-            ));
-        }
+        require_inventory_at(&tr, reservation, owner, inventory).await?;
         for object in cursor.iter().chain(&rows) {
-            let expected = object.encode()?;
-            if tr
-                .get(&object_key(reservation, object.uid), false)
-                .await?
-                .as_deref()
-                != Some(expected.as_slice())
-            {
-                return Err(CatalogError::Corrupt(
-                    "回收源对象缺失或与原实际封存节点不一致",
-                ));
-            }
+            require_object_at(&tr, reservation, object).await?;
         }
         Ok(Page {
             items: rows.into_iter().map(ReclaimSourceNode).collect(),

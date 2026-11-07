@@ -21,7 +21,8 @@ use crate::ltfs::volume::{CommittedIndexConstruct, read_cached_file_to_writer, r
 use crate::managed_catalog::{
     ActiveFileRequest, ActiveIndexIdentity, ActiveLibraryRoute, ActiveLoadedVolumeHead,
     ActiveReadSource, ContentDigest, ManagedCatalog, ReclaimFile, ReclaimFileMetadata,
-    ReclaimReservation, ReclaimSourceInventory, ReclaimSourceRead, ResolvedRead,
+    ReclaimNodeDestination, ReclaimNodeMetadata, ReclaimReservation, ReclaimSourceInventory,
+    ReclaimSourceNode, ReclaimSourceRead, ResolvedRead,
 };
 use crate::scsi::reservation::{ReservationKey, verify_holder};
 use crate::scsi::transport::TapeTransport;
@@ -228,6 +229,103 @@ impl ActiveMediaReader<'_> {
             )
             .map_err(|e| TapeError::Catalog(e.to_string()))?;
         Ok((read, evidence))
+    }
+
+    /// Observe raw metadata on an already loaded destination. No data body,
+    /// media loading, metadata change or erase authority is produced here.
+    pub async fn read_reclaim_node_metadata(
+        &self,
+        reservation: &ReclaimReservation,
+        inventory: &ReclaimSourceInventory<'_>,
+        original: &ReclaimSourceNode,
+        destination: ReclaimNodeDestination,
+        cache_dir: &Path,
+        spool_dir: &Path,
+    ) -> Result<ReclaimNodeMetadata> {
+        if reservation.intent()["library"] != self.serial
+            || reservation.intent()["namespace"] != self.route.route.namespace.to_string()
+            || destination.volume == reservation.spec().volume()
+            || destination.volume.is_nil()
+            || destination.uid == 0
+        {
+            return Err(TapeError::Catalog(
+                "原始节点元数据读取作用域或目的无效".into(),
+            ));
+        }
+        let before_source = self
+            .catalog
+            .reclaim_source_node(reservation, self.key.round(), inventory, original.uid())
+            .await
+            .map_err(|e| TapeError::Catalog(e.to_string()))?;
+        if before_source != *original {
+            return Err(TapeError::Catalog(
+                "原始节点不属于本任务完整封存清单".into(),
+            ));
+        }
+        let placement = self
+            .catalog
+            .volume_placement(destination.volume)
+            .await
+            .map_err(|e| TapeError::Catalog(e.to_string()))?
+            .ok_or_else(|| TapeError::Catalog("原始节点目的磁带未分配".into()))?;
+        if placement.namespace != self.route.route.namespace
+            || placement.library_serial != self.serial
+            || placement.pool_id != reservation.spec().pool()
+        {
+            return Err(TapeError::Catalog("原始节点目的磁带不属于原回收池".into()));
+        }
+        self.check_device_owner()?;
+        let (label, before) = self
+            .verify_media_head(&placement.barcode, destination.volume, spool_dir, || {
+                reclaim_cache_space(cache_dir, self.storage)
+            })
+            .await?;
+        let mut budget = RecoveryBudget::default();
+        budget.max_index_bytes = budget
+            .max_index_bytes
+            .min(usize::try_from(self.storage.index_bytes).unwrap_or(usize::MAX));
+        budget.index_scratch.directory = spool_dir.to_path_buf();
+        budget.index_scratch.max_bytes = self.storage.index_bytes;
+        budget.index_scratch.headroom_bytes = self.storage.headroom_bytes;
+        let captured = retry_after_space_reclaim(
+            || capture_index_source(&TapeDrive::new(self.device), &label, &budget),
+            || reclaim_cache_space(cache_dir, self.storage),
+        )?;
+        let (_, after) = self
+            .verify_media_head(&placement.barcode, destination.volume, spool_dir, || {
+                reclaim_cache_space(cache_dir, self.storage)
+            })
+            .await?;
+        let after_placement = self
+            .catalog
+            .volume_placement(destination.volume)
+            .await
+            .map_err(|e| TapeError::Catalog(e.to_string()))?;
+        let after_source = self
+            .catalog
+            .reclaim_source_node(reservation, self.key.round(), inventory, original.uid())
+            .await
+            .map_err(|e| TapeError::Catalog(e.to_string()))?;
+        self.check_readable().await?;
+        self.check_device_owner()?;
+        if before != after
+            || after_placement.as_ref() != Some(&placement)
+            || after_source != before_source
+        {
+            return Err(TapeError::Catalog(
+                "原始节点实读期间来源、目的归属或索引改变".into(),
+            ));
+        }
+        inventory
+            .bind_verified_node_metadata(
+                reservation,
+                original,
+                destination,
+                &placement,
+                after.index,
+                &captured,
+            )
+            .map_err(|e| TapeError::Catalog(e.to_string()))
     }
 
     fn check_device_owner(&self) -> Result<()> {

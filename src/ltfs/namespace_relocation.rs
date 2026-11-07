@@ -44,6 +44,33 @@ fn attributes(meta: &NodeMeta, xattrs: &[Xattr]) -> Result<()> {
     Ok(())
 }
 
+impl IndexEntry {
+    /// Shared staging/readback validation for a complete raw metadata node.
+    pub(crate) fn validate_reclaimed_metadata(&self) -> Result<()> {
+        match self {
+            Self::Directory { node, .. } => {
+                if node.delta_fields.is_some() || !node.files.is_empty() || !node.subdirs.is_empty()
+                {
+                    return Err(error("回收目录属性需要完整的无子树源节点"));
+                }
+                attributes(&node.meta, &node.xattrs)
+            }
+            Self::File { node, .. } => {
+                if node.delta_fields.is_some()
+                    || node.open_for_write == Some(true)
+                    || node.symlink.as_ref().is_none_or(|target| {
+                        target.is_empty() || !crate::ltfs::xml_text_valid(target)
+                    })
+                    || !node.extents.is_empty()
+                {
+                    return Err(error("回收节点属性只接受完整目录或无正文的符号链接"));
+                }
+                attributes(&node.meta, &node.xattrs)
+            }
+        }
+    }
+}
+
 impl LtfsIndex {
     /// Metadata only: target existence/type and the whole source are checked
     /// before mutation. Source UID and subtree/data extents are never copied.
@@ -53,13 +80,9 @@ impl LtfsIndex {
         source: &IndexEntry,
     ) -> Result<()> {
         let p = parts(path)?;
+        source.validate_reclaimed_metadata()?;
         match source {
             IndexEntry::Directory { node, .. } => {
-                if node.delta_fields.is_some() || !node.files.is_empty() || !node.subdirs.is_empty()
-                {
-                    return Err(error("回收目录属性需要完整的无子树源节点"));
-                }
-                attributes(&node.meta, &node.xattrs)?;
                 let target = dir_mut(&mut self.root, &p)?;
                 if target.meta.file_uid == 0 || target.delta_fields.is_some() {
                     return Err(error("回收目的目录尚未完整初始化"));
@@ -70,16 +93,6 @@ impl LtfsIndex {
                 target.xattrs = node.xattrs.clone();
             }
             IndexEntry::File { node, .. } => {
-                if node.delta_fields.is_some()
-                    || node.open_for_write == Some(true)
-                    || node.symlink.as_ref().is_none_or(|target| {
-                        target.is_empty() || !crate::ltfs::xml_text_valid(target)
-                    })
-                    || !node.extents.is_empty()
-                {
-                    return Err(error("回收节点属性只接受完整目录或无正文的符号链接"));
-                }
-                attributes(&node.meta, &node.xattrs)?;
                 let (name, parents) = p
                     .split_last()
                     .ok_or_else(|| error("根节点不能是符号链接"))?;

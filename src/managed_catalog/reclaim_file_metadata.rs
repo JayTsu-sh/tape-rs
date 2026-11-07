@@ -48,7 +48,7 @@ impl ReclaimMetadataProgress {
 
 // Compare all user attributes without relying on their XML order. Reject
 // duplicates even for fields whose value is deliberately regenerated.
-fn xattrs(attrs: &[Xattr]) -> Result<BTreeMap<&str, (&str, bool)>> {
+pub(super) fn xattrs(attrs: &[Xattr]) -> Result<BTreeMap<&str, (&str, bool)>> {
     let mut result = BTreeMap::new();
     for attr in attrs {
         if result

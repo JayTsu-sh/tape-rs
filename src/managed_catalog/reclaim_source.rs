@@ -22,6 +22,9 @@ pub(super) use relocation::require_no_data_at;
 mod metadata;
 pub(super) use metadata::require_no_metadata_at;
 pub use metadata::{ReclaimFileMetadata, ReclaimMetadataProgress};
+#[path = "reclaim_node_metadata.rs"]
+mod node_metadata;
+pub use node_metadata::{ReclaimNodeDestination, ReclaimNodeMetadata};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -2511,6 +2511,536 @@ mod tests {
             panic!("生命周期任务未达到终态");
         })
     }
+    struct MetadataReadBoundary<'a> {
+        inner: &'a dyn TapeTransport,
+        after: &'a dyn Fn() -> Result<()>,
+        triggered: std::sync::atomic::AtomicBool,
+    }
+    impl TapeTransport for MetadataReadBoundary<'_> {
+        fn identity(&self) -> &str {
+            self.inner.identity()
+        }
+        fn execution_guard(&self) -> Option<(u64, usize)> {
+            self.inner.execution_guard()
+        }
+        // A fault-capable proxy never offers a reusable write session epoch.
+        fn execute_no_data(
+            &self,
+            cdb: &[u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            self.inner.execute_no_data(cdb, timeout)
+        }
+        fn execute_write(
+            &self,
+            cdb: &[u8],
+            buf: &[u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            self.inner.execute_write(cdb, buf, timeout)
+        }
+        fn execute_read(
+            &self,
+            cdb: &[u8],
+            buf: &mut [u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            let result = self.inner.execute_read(cdb, buf, timeout)?;
+            if cdb.first() == Some(&0x08)
+                && !self
+                    .triggered
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                (self.after)()?;
+            }
+            Ok(result)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；真实Sim owner/PR目录与链接实读，不访问真实设备"]
+    async fn reclaim_node_metadata_reader_requires_original_fences_and_actual_destination() {
+        use crate::ltfs::index::IndexEntry;
+        use crate::ltfs::recovery::{RecoveryBudget, capture_index_source};
+        use crate::managed_catalog::{
+            ManagedCatalog, ManagementRequest, ReclaimNodeDestination, ReclaimSourceInventory,
+            ReclaimSpec,
+        };
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog = Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());
+        let (mut fixture, control, pool, status) = Box::pin(native_fixture(catalog.clone())).await;
+        let request = |change: Value| {
+            ManagementRequest::parse(json!({"version":1,"library":control.serial,
+            "namespace":control.route.route.namespace.to_string(),"epoch":1,
+            "operation":uuid::Uuid::new_v4().to_string(),"change":change}))
+            .unwrap()
+        };
+        fixture.format(uuid::Uuid::new_v4());
+        let mut volume = LtfsVolume::mount(fixture.device()).unwrap();
+        volume.create_directory("/empty").unwrap();
+        volume.add_symlink("/link", "../missing").unwrap();
+        volume
+            .set_node_xattr(
+                "/link",
+                crate::ltfs::index::Xattr {
+                    key: "tapers.fdb.nativeSymlink".into(),
+                    value: "1".into(),
+                    base64: false,
+                },
+                false,
+                false,
+            )
+            .unwrap();
+        volume
+            .set_node_xattr(
+                "/empty",
+                crate::ltfs::index::Xattr {
+                    key: "user.binary".into(),
+                    value: "AP9B".into(),
+                    base64: true,
+                },
+                false,
+                false,
+            )
+            .unwrap();
+        volume.commit().unwrap();
+        drop(volume);
+        let captured = capture_index_source(
+            &TapeDrive::new(fixture.device()),
+            &crate::ltfs::volume::read_label_only(fixture.device()).unwrap(),
+            &RecoveryBudget::default(),
+        )
+        .unwrap();
+        let mut source_nodes = Vec::new();
+        captured
+            .for_each_entry(|entry| {
+                source_nodes.push(entry);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(source_nodes.len(), 3);
+        let home = request(
+            json!({"kind":"media-move","pool":null,"barcode":"LIFE00L8","volume":null,"revision":null,"destination":"homeslot"}),
+        );
+        assert_eq!(
+            execute(&mut fixture, &control, &status, &home).await["status"],
+            "succeeded"
+        );
+        let import = request(
+            json!({"kind":"media-import","pool":pool.id.to_string(),"barcode":"LIFE00L8","volume":null,"path":"/","merge_tapes":true}),
+        );
+        assert_eq!(
+            execute(&mut fixture, &control, &status, &import).await["status"],
+            "succeeded"
+        );
+        let assignment = catalog
+            .tape_assignment(&control.serial, "LIFE00L8")
+            .await
+            .unwrap()
+            .unwrap();
+        let home = request(
+            json!({"kind":"media-move","pool":pool.id.to_string(),"barcode":"LIFE00L8","volume":assignment.volume_id.unwrap().to_string(),"revision":assignment.revision,"destination":"homeslot"}),
+        );
+        assert_eq!(
+            execute(&mut fixture, &control, &status, &home).await["status"],
+            "succeeded"
+        );
+
+        // Preformatted foreign media are fixture setup, before any import or
+        // reclaim admission. No naked write is made during the managed read.
+        fixture
+            .lib
+            .insert_cartridge(SimCartridge::blank("NODES1L8", 128 << 20), 1)
+            .unwrap();
+        let changer = fixture
+            .owner
+            .devices
+            .iter()
+            .find(|d| d.kind == DeviceKind::Changer)
+            .unwrap()
+            .dev
+            .as_ref();
+        let mut robot = MediumChanger::new(changer);
+        let map = robot.load_address_map().unwrap().clone();
+        robot
+            .move_medium(map.storage_start + 1, map.dt_start)
+            .unwrap();
+        let target_uuid = uuid::Uuid::new_v4();
+        mkltfs(
+            fixture.device(),
+            &MkltfsOptions {
+                volume_id: "NODES1".into(),
+                volume_uuid: Some(target_uuid),
+                block_size: fixture.opts.block_size,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut target = LtfsVolume::mount(fixture.device()).unwrap();
+        target.create_directory("/padding").unwrap();
+        target.create_directory("/empty").unwrap();
+        target.add_symlink("/link", "../missing").unwrap();
+        for entry in &source_nodes {
+            let path = match entry {
+                IndexEntry::Directory { path, .. } | IndexEntry::File { path, .. } => path,
+            };
+            target
+                .preserve_reclaimed_metadata(&format!("/{path}"), entry)
+                .unwrap();
+        }
+        target.commit_incremental().unwrap();
+        let mut targets = Vec::new();
+        for entry in &source_nodes {
+            match entry {
+                IndexEntry::Directory { path, node } => targets.push((
+                    node.meta.file_uid,
+                    target.index().find_directory(path).unwrap().meta.file_uid,
+                )),
+                IndexEntry::File { path, node } => targets.push((
+                    node.meta.file_uid,
+                    target.index().find_file(path).unwrap().meta.file_uid,
+                )),
+            }
+        }
+        drop(target);
+        let home = request(
+            json!({"kind":"media-move","pool":null,"barcode":"NODES1L8","volume":null,"revision":null,"destination":"homeslot"}),
+        );
+        assert_eq!(
+            execute(&mut fixture, &control, &status, &home).await["status"],
+            "succeeded"
+        );
+        let import = request(
+            json!({"kind":"media-import","pool":pool.id.to_string(),"barcode":"NODES1L8","volume":null,"path":"/mirror","merge_tapes":true}),
+        );
+        assert_eq!(
+            execute(&mut fixture, &control, &status, &import).await["status"],
+            "succeeded"
+        );
+        let assignment = catalog
+            .tape_assignment(&control.serial, "LIFE00L8")
+            .await
+            .unwrap()
+            .unwrap();
+        let spec=ReclaimSpec::parse(&json!({"kind":"media-reclaim","pool":pool.id.to_string(),"barcode":"LIFE00L8","volume":assignment.volume_id.unwrap().to_string(),"revision":assignment.revision,"confirm_format":true,"unassign":false})).unwrap();
+        let reserved = catalog
+            .reserve_reclaim_pool(
+                &control.serial,
+                control.route,
+                fixture.owner.round,
+                1,
+                uuid::Uuid::new_v4(),
+                &spec,
+            )
+            .await
+            .unwrap();
+        let inventory = ReclaimSourceInventory::from_captured(&captured).unwrap();
+        assert!(
+            catalog
+                .seal_reclaim_source_inventory_page(&reserved, fixture.owner.round, &inventory)
+                .await
+                .unwrap()
+                .complete()
+        );
+        let placement = catalog
+            .volume_placement(target_uuid)
+            .await
+            .unwrap()
+            .unwrap();
+        let head = catalog
+            .active_loaded_volume_head(
+                &control.serial,
+                &placement.barcode,
+                control.route,
+                fixture.owner.round,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        fdb_loading::select_write(
+            &mut fixture.owner,
+            &fixture.permit,
+            &control,
+            &status,
+            &placement,
+            head.index,
+        )
+        .await
+        .unwrap();
+        let cache_dir = fixture.owner.files.extent_cache_dir();
+        let spool = fixture.owner.files.spool_dir();
+        let before = fixture.drive_log().len();
+        let changer_before = fixture.changer_log();
+        for (source_uid, target_uid) in &targets {
+            let original = catalog
+                .reclaim_source_node(&reserved, fixture.owner.round, &inventory, *source_uid)
+                .await
+                .unwrap();
+            let reader = super::super::super::fdb_read::ActiveMediaReader {
+                catalog: &catalog,
+                device: fixture.device(),
+                serial: &control.serial,
+                route: control.route,
+                key: fixture.owner.key,
+                permission: &fixture.permit,
+                storage: control.storage,
+            };
+            let proof = reader
+                .read_reclaim_node_metadata(
+                    &reserved,
+                    &inventory,
+                    &original,
+                    ReclaimNodeDestination {
+                        volume: target_uuid,
+                        uid: *target_uid,
+                    },
+                    &cache_dir,
+                    spool,
+                )
+                .await
+                .unwrap();
+            assert_eq!(proof.source_uid(), *source_uid);
+            assert_eq!(proof.destination().uid, *target_uid);
+            assert_eq!(proof.target_path(), original.path());
+        }
+        assert_eq!(
+            fixture.changer_log(),
+            changer_before,
+            "元数据读取不移动磁带"
+        );
+        assert!(
+            !fixture.drive_log()[before..]
+                .iter()
+                .any(|op| matches!(*op, 0x04 | 0x0a | 0x10 | 0x19 | 0x8d)),
+            "元数据读取不写带"
+        );
+        let (source_uid, target_uid) = targets[0];
+        let original = catalog
+            .reclaim_source_node(&reserved, fixture.owner.round, &inventory, source_uid)
+            .await
+            .unwrap();
+        let destination = ReclaimNodeDestination {
+            volume: target_uuid,
+            uid: target_uid,
+        };
+        let before = fixture.drive_log();
+        let foreign = Permission::default();
+        foreign.renew(
+            fixture.owner.round,
+            Phase::Serving,
+            Instant::now() + Duration::from_secs(60),
+        );
+        let foreign_reader = super::super::super::fdb_read::ActiveMediaReader {
+            catalog: &catalog,
+            device: fixture.device(),
+            serial: &control.serial,
+            route: control.route,
+            key: fixture.owner.key,
+            permission: &foreign,
+            storage: control.storage,
+        };
+        assert!(
+            foreign_reader
+                .read_reclaim_node_metadata(
+                    &reserved,
+                    &inventory,
+                    &original,
+                    destination,
+                    &cache_dir,
+                    spool
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(fixture.drive_log(), before, "不同许可实例不发送CDB");
+        let reader = super::super::super::fdb_read::ActiveMediaReader {
+            catalog: &catalog,
+            device: fixture.device(),
+            serial: &control.serial,
+            route: control.route,
+            key: fixture.owner.key,
+            permission: &fixture.permit,
+            storage: control.storage,
+        };
+        for bad in [
+            ReclaimNodeDestination {
+                volume: uuid::Uuid::nil(),
+                ..destination
+            },
+            ReclaimNodeDestination {
+                volume: spec.volume(),
+                ..destination
+            },
+            ReclaimNodeDestination {
+                uid: 0,
+                ..destination
+            },
+            ReclaimNodeDestination {
+                volume: uuid::Uuid::new_v4(),
+                ..destination
+            },
+        ] {
+            assert!(
+                reader
+                    .read_reclaim_node_metadata(
+                        &reserved, &inventory, &original, bad, &cache_dir, spool
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(fixture.drive_log(), before);
+        }
+        let host_error = || Err(TapeError::ScsiHost(3));
+        let boundary = MetadataReadBoundary {
+            inner: fixture.device(),
+            after: &host_error,
+            triggered: std::sync::atomic::AtomicBool::new(false),
+        };
+        let faulty = super::super::super::fdb_read::ActiveMediaReader {
+            device: &boundary,
+            ..reader
+        };
+        let failed = faulty
+            .read_reclaim_node_metadata(
+                &reserved,
+                &inventory,
+                &original,
+                destination,
+                &cache_dir,
+                spool,
+            )
+            .await;
+        assert!(matches!(failed, Err(TapeError::ScsiHost(3))), "{failed:?}");
+        assert!(boundary.triggered.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            fixture.drive_log()[before.len()..]
+                .iter()
+                .filter(|op| **op == 0x08)
+                .count(),
+            1,
+            "已生效但失败的READ不重放"
+        );
+
+        let mut node_key = b"tape-rs/catalog/22/@/".to_vec();
+        node_key.extend_from_slice(control.route.route.namespace.as_bytes());
+        node_key.extend_from_slice(b"Re");
+        node_key.extend_from_slice(&reserved.intent()["epoch"].as_u64().unwrap().to_be_bytes());
+        node_key.extend_from_slice(
+            uuid::Uuid::parse_str(reserved.intent()["operation"].as_str().unwrap())
+                .unwrap()
+                .as_bytes(),
+        );
+        node_key.extend_from_slice(&source_uid.to_be_bytes());
+        let db = foundationdb::Database::new(Some(&cluster)).unwrap();
+        let tr = db.create_trx().unwrap();
+        let original_row = tr.get(&node_key, false).await.unwrap().unwrap().to_vec();
+        let remove_source = || -> Result<()> {
+            let tr = db
+                .create_trx()
+                .map_err(|e| TapeError::Catalog(e.to_string()))?;
+            tr.clear(&node_key);
+            futures_executor::block_on(tr.commit())
+                .map_err(|e| TapeError::Catalog(e.to_string()))?;
+            Ok(())
+        };
+        let boundary = MetadataReadBoundary {
+            inner: fixture.device(),
+            after: &remove_source,
+            triggered: std::sync::atomic::AtomicBool::new(false),
+        };
+        let changed = super::super::super::fdb_read::ActiveMediaReader {
+            device: &boundary,
+            ..reader
+        };
+        assert!(
+            changed
+                .read_reclaim_node_metadata(
+                    &reserved,
+                    &inventory,
+                    &original,
+                    destination,
+                    &cache_dir,
+                    spool
+                )
+                .await
+                .is_err(),
+            "实读期间原源封存行消失，不能产生证明"
+        );
+        assert!(boundary.triggered.load(std::sync::atomic::Ordering::SeqCst));
+        let tr = db.create_trx().unwrap();
+        assert!(tr.get(&node_key, false).await.unwrap().is_none());
+        tr.set(&node_key, &original_row);
+        tr.commit().await.unwrap();
+        assert_eq!(
+            catalog
+                .reclaim_source_node(&reserved, fixture.owner.round, &inventory, source_uid)
+                .await
+                .unwrap(),
+            original
+        );
+
+        let close_permission = || -> Result<()> {
+            fixture.permit.close(fixture.owner.round);
+            Ok(())
+        };
+        let boundary = MetadataReadBoundary {
+            inner: fixture.device(),
+            after: &close_permission,
+            triggered: std::sync::atomic::AtomicBool::new(false),
+        };
+        let closed = super::super::super::fdb_read::ActiveMediaReader {
+            device: &boundary,
+            ..reader
+        };
+        assert!(
+            closed
+                .read_reclaim_node_metadata(
+                    &reserved,
+                    &inventory,
+                    &original,
+                    destination,
+                    &cache_dir,
+                    spool
+                )
+                .await
+                .is_err(),
+            "实读期间许可关闭不能继续产生证明"
+        );
+        assert!(boundary.triggered.load(std::sync::atomic::Ordering::SeqCst));
+        let before_closed = fixture.drive_log();
+        assert!(
+            reader
+                .read_reclaim_node_metadata(
+                    &reserved,
+                    &inventory,
+                    &original,
+                    destination,
+                    &cache_dir,
+                    spool
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fixture.drive_log(),
+            before_closed,
+            "已关闭的原许可不发送CDB，不能降级或重新开启同一轮次"
+        );
+        assert!(
+            catalog
+                .check_reclaim_source_unreferenced(&reserved, fixture.owner.round)
+                .await
+                .is_err(),
+            "原始元数据实读不是逻辑引用迁移或FORMAT权限"
+        );
+        catalog
+            .release_reserved_reclaim(&reserved, fixture.owner.round)
+            .await
+            .unwrap();
+        assert_eq!(fixture.formats(), 2, "只有两个模拟预格式化介质");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires disposable FDB_TEST_CLUSTER; SimLibrary only, no real hardware"]
     async fn unassigned_loaded_move_waits_for_serving_and_replays_without_media_writes() {
@@ -2886,6 +3416,21 @@ mod tests {
                 .iter()
                 .any(|n| n.path() == "docs/alias2" && n.kind() == ReclaimSourceNodeKind::Symlink)
         );
+        assert_eq!(
+            catalog
+                .reclaim_source_node(&reserved, fixture.owner.round, &inventory, root_node.uid())
+                .await
+                .unwrap(),
+            **root_node
+        );
+        for uid in [0, u64::MAX] {
+            assert!(
+                catalog
+                    .reclaim_source_node(&reserved, fixture.owner.round, &inventory, uid)
+                    .await
+                    .is_err()
+            );
+        }
         let reopened = ManagedCatalog::open(Some(&cluster)).unwrap();
         assert_eq!(
             reopened
@@ -2987,6 +3532,17 @@ mod tests {
             assert!(
                 catalog
                     .reclaim_source_nodes_page(&reserved, fixture.owner.round, &inventory, None, 32)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                catalog
+                    .reclaim_source_node(
+                        &reserved,
+                        fixture.owner.round,
+                        &inventory,
+                        first_nodes.items[0].uid()
+                    )
                     .await
                     .is_err()
             );
