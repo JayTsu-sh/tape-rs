@@ -6215,6 +6215,28 @@ mod tests {
             )
             .await
             .unwrap();
+        let blocked_upload = ActiveUploadSpec {
+            operation_id: uuid::Uuid::new_v4(),
+            ..upload.clone()
+        };
+        let commands_before = fixture.commands.lock().unwrap().clone();
+        let blocked = fdb_writing::prepare(
+            &fixture.owner,
+            &fixture.permit,
+            &control,
+            &blocked_upload,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&blocked, Err(ReadError::Busy(reason)) if reason.contains("池或带库正在执行互斥操作")),
+            "普通上传须明确报告原回收占用: {blocked:?}"
+        );
+        assert_eq!(
+            *fixture.commands.lock().unwrap(),
+            commands_before,
+            "已知池占用时不得访问驱动器或机械手"
+        );
         let scanned = loop {
             let progress = catalog
                 .step_reclaim_walk(&reserved, fixture.owner.round)
