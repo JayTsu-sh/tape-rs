@@ -1,3 +1,11 @@
+# 发布接续：报告缺陷修复 PR #43（2026-11-08）
+
+用户此前授权审查通过后合入GitHub主分支，本轮修复按此执行。基线e2380b5，产品8bd242a和3bc8cf2已分别完成真实B补验，当前现场三节点仍3bc8cf2。9c42490之前的5提交全部规范/需求两轴终审0，原两个P3文档问题已修正；发布追踪增量仅文档，不更改产品/测试或扩大验收结论。
+
+PR：https://github.com/JayTsu-sh/tape-rs/pull/43 。本条记录于合入前，最终是否MERGED、主分支SHA/树、临时分支清理，以GitHub实际状态及 `/work/tmp/tape-readiness-gap-20261108-l6b6og6u/MERGED-CLOSEOUT.json` 和本地handoff-history为准，不提前宣称成功。所有源/测试字节仍与已检查/部署候选相同；不重跑任何已消费controller、不额外部署或碰A。完整native reclaim及其余性能/现场限制仍按报告保留。
+
+---
+
 # 当前接续：机械暂忙诊断补验通过，四项报告缺陷已收口（2026-11-08）
 
 产品提交 `3bc8cf26ac5775596ce2e9eac752d56faa8590aa` 在前批8bd242a三项修复之上，保留owner的原503，机械暂忙返回reason=library_busy、ready=false及原owner/round；不跳过任何就绪屏障、不改超时或read_idle阈值。11项软件检查全0，真实B默认300000ms观察已通过；报告新增就绪诊断补验，全部未实现/受限项保持。

@@ -199,4 +199,6 @@ S3/FUSE/FDB数据链路、主要运维动作、通知、正常HA与FDB依赖故�
 
 控制端以monotonic测量探针窗口；CDB耗时单列来自设备进程SG_IO计时，不混算两个时钟域的墙钟。实际journal保留装带时的UNIT ATTENTION及现有位置无关命令重试，不将其删除或冒称每条初始命令均GOOD。三节点新服务PID日志未发现FORMAT/ERASE。A库未访问，L84同卷同池、online/nonblacklisted，L85及其他受保护介质未装载或改写。
 
-新证据 `/work/tmp/tape-readiness-gap-20261108-l6b6og6u`：`physical/COMPLETE.json`、`physical/probes.jsonl`、`physical/all-nodes-same-owner-busy.json`、`mechanical-cdb-summary.json`、`final-fdb-status.json`及逐机进程/journal记录；SHA见JSON的`readiness_detail_v1`。原报告剩余的完整native reclaim、Range读取放大、导入/顺序链路性能和现场受限场景仍未完成，不因就绪诊断修复而扩大验收范围。本批尚未推GitHub。
+新证据 `/work/tmp/tape-readiness-gap-20261108-l6b6og6u`：`physical/COMPLETE.json`、`physical/probes.jsonl`、`physical/all-nodes-same-owner-busy.json`、`mechanical-cdb-summary.json`、`final-fdb-status.json`及逐机进程/journal记录；SHA见JSON的`readiness_detail_v1`。原报告剩余的完整native reclaim、Range读取放大、导入/顺序链路性能和现场受限场景仍未完成，不因就绪诊断修复而扩大验收范围。上述检查完成时尚未推GitHub；发布状态见下方PR。
+
+发布追踪：[GitHub PR #43](https://github.com/JayTsu-sh/tape-rs/pull/43) 包含本轮缺陷修复、实带补验及文档纠正。发布是否合入以该PR实际状态和本地 `MERGED-CLOSEOUT.json` 为准；上文“未推GitHub”描述各次验收完成时的历史状态。现场运行产品仍固定为3bc8cf2，不把仅含发布记录的提交号当作设备运行版本。

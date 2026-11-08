@@ -34,7 +34,7 @@
     "tape-rs": "7f2f1d2c62007118e860f24571e4269332ee79b0fe00db208dbef8a208756602"
   },
   "github_pushed": false,
-  "report_sha256": "de654c2844b1e0c10101a791ecccc9c9a05baaf772a96692a835c4d621af82a1",
+  "report_sha256": "7e9a19247f79b81a75c79ccd4174b029bf64ca438391008a8c000b6c4c50670e",
   "feature_matrix": [
     {
       "feature": "library list/show、pool list/show、tape list/show",
@@ -2414,5 +2414,11 @@
         "sha256": "33c2dea9b80947e7f0eec99538689bd1c34ceede89f5024e3eb6a8dac91bae83"
       }
     ]
+  },
+  "publication_tracking": {
+    "pull_request_url": "https://github.com/JayTsu-sh/tape-rs/pull/43",
+    "reviewed_product_commit": "3bc8cf26ac5775596ce2e9eac752d56faa8590aa",
+    "release_status_source": "GitHub pull request actual state and local MERGED-CLOSEOUT.json",
+    "acceptance_github_fields_are_historical": true
   }
 }
