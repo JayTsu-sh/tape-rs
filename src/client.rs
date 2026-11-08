@@ -1535,10 +1535,28 @@ impl Client {
 
     /// 某个节点的自述（不跟随 Leader）。
     pub fn node_status(&self, addr: &str) -> Result<Value> {
-        Ok(self
-            .request(addr, "GET", "/cluster", None)
-            .map_err(|(_, e)| e)?
-            .json())
+        // /cluster 是物理节点发现入口，不能加库或池前缀。
+        let mut discovery = self.clone();
+        discovery.library = None;
+        discovery.pool = None;
+        let authority = addr
+            .split_once('/')
+            .map_or(addr, |(authority, _)| authority);
+        let response = discovery
+            .request(authority, "GET", "/cluster", None)
+            .map_err(|(_, e)| e)?;
+        if response.status != 200 {
+            return Err(ClientError::Rejected {
+                status: response.status,
+                body: String::from_utf8_lossy(&response.body).into_owned(),
+            });
+        }
+        serde_json::from_slice(&response.body)
+            .ok()
+            .filter(|value: &Value| {
+                value.is_object() && value["id"].as_u64().is_some_and(|id| id > 0)
+            })
+            .ok_or_else(|| ClientError::Verification("节点状态不是有效的 JSON 对象".into()))
     }
 }
 

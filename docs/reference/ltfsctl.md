@@ -4,7 +4,7 @@
 
 本页由 `tools/generate-cli-reference.py` 从实际构建产物递归采集 `--help` 生成，不表示所有服务模式均支持所有命令，也不表示列出的操作均已完成硬件验收。可选命令随构建特性变化，下面的帮助为本次构建内容。
 
-构建产物 SHA256：`78d6dd96c8b24cdfe997025639ddc7092c68cf0b1b98e9515f6d0738594eaff1`。共 83 个帮助入口。
+构建产物 SHA256：`90798e1ea39188c816e0871292134deecbd0995e5ea3713ef57a5b284fe5b406`。共 83 个帮助入口。
 
 ## 目录
 
@@ -97,17 +97,17 @@
 ```text
 ltfsd 客户端
 
-Usage: ltfsctl [OPTIONS] --endpoint <ENDPOINTS> <COMMAND>
+Usage: ltfsctl-init [OPTIONS] --endpoint <ENDPOINTS> <COMMAND>
 
 Commands:
   notify     外部系统通知：持久订阅、SSE 接收和显式确认
   fdb        FDB 服务：查询、校验下载和持久上传
   put        上传本地文件并等到落带（默认替换已有版本）
   copy       把已提交普通文件的内容校验后复制到另一库/池的空路径；后续改写不会自动同步
-  get        读出已提交的文件
+  get        从 FDB 查询并校验下载已提交文件；必须指定 --library 和 --pool UUID，不覆盖本地文件
   delete     删除文件并等墓碑落带（不立即回收介质空间）
-  stat       查询路径状态：已提交 / 上传中 / 已暂存
-  list       列出已提交的全部文件；给出 --dir 时只列该目录的直接子项
+  stat       查询 FDB 中已提交的路径；必须指定 --library 和 --pool UUID，不存在时失败
+  list       分页列出 FDB 中已提交的文件；--dir 只列直接子项，必须指定 --library 和 --pool UUID
   cluster    各节点的自述
   library    带库管理状态
   drive      驱动器管理状态
@@ -131,7 +131,7 @@ Options:
 ```text
 外部系统通知：持久订阅、SSE 接收和显式确认
 
-Usage: ltfsctl --endpoint <ENDPOINTS> notify [OPTIONS] <COMMAND>
+Usage: ltfsctl-init --endpoint <ENDPOINTS> notify [OPTIONS] <COMMAND>
 
 Commands:
   inject  注入有明确标记的测试通知；不修改真实磁带状态、不访问设备
@@ -155,7 +155,7 @@ Options:
 ```text
 注入有明确标记的测试通知；不修改真实磁带状态、不访问设备
 
-Usage: ltfsctl notify inject [OPTIONS] --operation <OPERATION> --event-type <EVENT_TYPE> --data <DATA>
+Usage: ltfsctl-init notify inject [OPTIONS] --operation <OPERATION> --event-type <EVENT_TYPE> --data <DATA>
 
 Options:
       --operation <OPERATION>    同一次注入重试必须保持此 UUID 和内容不变
@@ -171,7 +171,7 @@ Options:
 ```text
 创建持久订阅；重复执行同配置不会重置进度
 
-Usage: ltfsctl notify create [OPTIONS] <ID>
+Usage: ltfsctl-init notify create [OPTIONS] <ID>
 
 Arguments:
   <ID>
@@ -190,7 +190,7 @@ Options:
 ```text
 列出持久消费者
 
-Usage: ltfsctl notify list [OPTIONS]
+Usage: ltfsctl-init notify list [OPTIONS]
 
 Options:
   -l, --library <LIBRARY>  目标带库的真实 changer 序列号；省略时访问默认库
@@ -203,7 +203,7 @@ Options:
 ```text
 查看实例标识、确认位置及积压量
 
-Usage: ltfsctl notify show [OPTIONS] <ID>
+Usage: ltfsctl-init notify show [OPTIONS] <ID>
 
 Arguments:
   <ID>
@@ -219,7 +219,7 @@ Options:
 ```text
 查询当前批次；不自动确认
 
-Usage: ltfsctl notify read [OPTIONS] --generation <GENERATION> <ID>
+Usage: ltfsctl-init notify read [OPTIONS] --generation <GENERATION> <ID>
 
 Arguments:
   <ID>
@@ -236,7 +236,7 @@ Options:
 ```text
 SSE 持续接收并自动重连；输出不代表处理成功，须另行 ACK
 
-Usage: ltfsctl notify watch [OPTIONS] --generation <GENERATION> <ID>
+Usage: ltfsctl-init notify watch [OPTIONS] --generation <GENERATION> <ID>
 
 Arguments:
   <ID>
@@ -255,7 +255,7 @@ Options:
 ```text
 处理并可靠保存完整批次后显式确认
 
-Usage: ltfsctl notify ack [OPTIONS] --generation <GENERATION> --delivery-id <DELIVERY_ID> --through <THROUGH> <ID>
+Usage: ltfsctl-init notify ack [OPTIONS] --generation <GENERATION> --delivery-id <DELIVERY_ID> --through <THROUGH> <ID>
 
 Arguments:
   <ID>
@@ -274,7 +274,7 @@ Options:
 ```text
 删除订阅并明确放弃其未确认通知
 
-Usage: ltfsctl notify delete [OPTIONS] --generation <GENERATION> --abandon-unacknowledged <ID>
+Usage: ltfsctl-init notify delete [OPTIONS] --generation <GENERATION> --abandon-unacknowledged <ID>
 
 Arguments:
   <ID>
@@ -292,7 +292,7 @@ Options:
 ```text
 FDB 服务：查询、校验下载和持久上传
 
-Usage: ltfsctl --endpoint <ENDPOINTS> fdb [OPTIONS] <COMMAND>
+Usage: ltfsctl-init --endpoint <ENDPOINTS> fdb [OPTIONS] <COMMAND>
 
 Commands:
   rename    原双路径重命名；持久准备、运行、查询或取消
@@ -320,7 +320,7 @@ Options:
 ```text
 原双路径重命名；持久准备、运行、查询或取消
 
-Usage: ltfsctl fdb rename [OPTIONS] <COMMAND>
+Usage: ltfsctl-init fdb rename [OPTIONS] <COMMAND>
 
 Commands:
   prepare  保存两端原身份并只读准备，不登记任务或写带
@@ -340,7 +340,7 @@ Options:
 ```text
 保存两端原身份并只读准备，不登记任务或写带
 
-Usage: ltfsctl fdb rename prepare [OPTIONS] --expected-version <EXPECTED_VERSION> --namespace <NAMESPACE> --request <REQUEST> <FROM> <TO>
+Usage: ltfsctl-init fdb rename prepare [OPTIONS] --expected-version <EXPECTED_VERSION> --namespace <NAMESPACE> --request <REQUEST> <FROM> <TO>
 
 Arguments:
   <FROM>
@@ -362,7 +362,7 @@ Options:
 ```text
 提交或恢复保存的原重命名，等待持久终态
 
-Usage: ltfsctl fdb rename run [OPTIONS] <REQUEST>
+Usage: ltfsctl-init fdb rename run [OPTIONS] <REQUEST>
 
 Arguments:
   <REQUEST>
@@ -378,7 +378,7 @@ Options:
 ```text
 查询原重命名；null 表示尚未准备或登记
 
-Usage: ltfsctl fdb rename status [OPTIONS] <REQUEST>
+Usage: ltfsctl-init fdb rename status [OPTIONS] <REQUEST>
 
 Arguments:
   <REQUEST>
@@ -394,7 +394,7 @@ Options:
 ```text
 取消原未写任务；已结束时返回首次终态
 
-Usage: ltfsctl fdb rename cancel [OPTIONS] <REQUEST>
+Usage: ltfsctl-init fdb rename cancel [OPTIONS] <REQUEST>
 
 Arguments:
   <REQUEST>
@@ -410,7 +410,7 @@ Options:
 ```text
 文件、目录和链接变更；先保存逻辑请求，再提交或查询原请求
 
-Usage: ltfsctl fdb fs [OPTIONS] <COMMAND>
+Usage: ltfsctl-init fdb fs [OPTIONS] <COMMAND>
 
 Commands:
   attributes  查询已提交节点的原属性、扩展属性及原生链接目标；不访问磁带
@@ -431,7 +431,7 @@ Options:
 ```text
 查询已提交节点的原属性、扩展属性及原生链接目标；不访问磁带
 
-Usage: ltfsctl fdb fs attributes [OPTIONS] <PATH>
+Usage: ltfsctl-init fdb fs attributes [OPTIONS] <PATH>
 
 Arguments:
   <PATH>
@@ -447,7 +447,7 @@ Options:
 ```text
 先保存原意图目录再只读预检；尚不登记任务或写入磁带
 
-Usage: ltfsctl fdb fs prepare [OPTIONS] --change <CHANGE> --namespace <NAMESPACE> --request <REQUEST> <PATH>
+Usage: ltfsctl-init fdb fs prepare [OPTIONS] --change <CHANGE> --namespace <NAMESPACE> --request <REQUEST> <PATH>
 
 Arguments:
   <PATH>
@@ -467,7 +467,7 @@ Options:
 ```text
 提交或重试保存的原请求，等待持久化终态
 
-Usage: ltfsctl fdb fs run [OPTIONS] <REQUEST>
+Usage: ltfsctl-init fdb fs run [OPTIONS] <REQUEST>
 
 Arguments:
   <REQUEST>
@@ -483,7 +483,7 @@ Options:
 ```text
 查询原请求；null 表示尚未登记
 
-Usage: ltfsctl fdb fs status [OPTIONS] <REQUEST>
+Usage: ltfsctl-init fdb fs status [OPTIONS] <REQUEST>
 
 Arguments:
   <REQUEST>
@@ -499,7 +499,7 @@ Options:
 ```text
 取消尚未写入的原请求；已结束时返回首次终态
 
-Usage: ltfsctl fdb fs cancel [OPTIONS] <REQUEST>
+Usage: ltfsctl-init fdb fs cancel [OPTIONS] <REQUEST>
 
 Arguments:
   <REQUEST>
@@ -515,7 +515,7 @@ Options:
 ```text
 FDB 持久化管理任务：查询、重试及取消原请求
 
-Usage: ltfsctl fdb control [OPTIONS] <COMMAND>
+Usage: ltfsctl-init fdb control [OPTIONS] <COMMAND>
 
 Commands:
   run     提交或重试保存的原请求，等待持久化终态
@@ -535,7 +535,7 @@ Options:
 ```text
 提交或重试保存的原请求，等待持久化终态
 
-Usage: ltfsctl fdb control run [OPTIONS] <REQUEST>
+Usage: ltfsctl-init fdb control run [OPTIONS] <REQUEST>
 
 Arguments:
   <REQUEST>
@@ -551,7 +551,7 @@ Options:
 ```text
 查询保存的原请求；null 表示尚未登记
 
-Usage: ltfsctl fdb control status [OPTIONS] <REQUEST>
+Usage: ltfsctl-init fdb control status [OPTIONS] <REQUEST>
 
 Arguments:
   <REQUEST>
@@ -567,7 +567,7 @@ Options:
 ```text
 原子取消尚未执行的请求；已结束时返回原终态
 
-Usage: ltfsctl fdb control cancel [OPTIONS] <REQUEST>
+Usage: ltfsctl-init fdb control cancel [OPTIONS] <REQUEST>
 
 Arguments:
   <REQUEST>
@@ -581,10 +581,10 @@ Options:
 ## ltfsctl fdb control list
 
 ```text
-Usage: ltfsctl fdb control list [OPTIONS]
+Usage: ltfsctl-init fdb control list [OPTIONS]
 
 Options:
-      --limit <LIMIT>      [default: 100]
+      --limit <LIMIT>      管理任务分页目前固定为 100 条 [default: 100]
       --after <AFTER>
   -l, --library <LIBRARY>  目标带库的真实 changer 序列号；省略时访问默认库
   -p, --pool <POOL>        文件命名空间的池名称或 UUID；库内有多个池时必填
@@ -596,7 +596,7 @@ Options:
 ```text
 FDB 驱动器策略
 
-Usage: ltfsctl fdb drive [OPTIONS] <COMMAND>
+Usage: ltfsctl-init fdb drive [OPTIONS] <COMMAND>
 
 Commands:
   show
@@ -612,7 +612,7 @@ Options:
 ## ltfsctl fdb drive show
 
 ```text
-Usage: ltfsctl fdb drive show [OPTIONS] <SERIAL>
+Usage: ltfsctl-init fdb drive show [OPTIONS] <SERIAL>
 
 Arguments:
   <SERIAL>
@@ -628,7 +628,7 @@ Options:
 ```text
 规范 JSON patch：enabled、role(m/r/g)
 
-Usage: ltfsctl fdb drive set [OPTIONS] --patch <PATCH> --namespace <NAMESPACE> --request <REQUEST> <SERIAL>
+Usage: ltfsctl-init fdb drive set [OPTIONS] --patch <PATCH> --namespace <NAMESPACE> --request <REQUEST> <SERIAL>
 
 Arguments:
   <SERIAL>
@@ -647,7 +647,7 @@ Options:
 ```text
 从三节点冻结屏障初始化全新空目录；需 fdb 特性，不导入旧目录、不操作磁带
 
-Usage: ltfsctl fdb init [OPTIONS] --cluster-file <CLUSTER_FILE> --namespace <NAMESPACE>
+Usage: ltfsctl-init fdb init [OPTIONS] --cluster-file <CLUSTER_FILE> --namespace <NAMESPACE>
 
 Options:
       --cluster-file <CLUSTER_FILE>
@@ -662,7 +662,7 @@ Options:
 ```text
 查询库级命名空间的路径元数据（不读磁带）
 
-Usage: ltfsctl fdb stat [OPTIONS] <PATH>
+Usage: ltfsctl-init fdb stat [OPTIONS] <PATH>
 
 Arguments:
   <PATH>
@@ -678,7 +678,7 @@ Options:
 ```text
 按 S3 ListObjectsV2 规则列举池内对象；完整对象键字典序
 
-Usage: ltfsctl fdb list [OPTIONS]
+Usage: ltfsctl-init fdb list [OPTIONS]
 
 Options:
       --prefix <PREFIX>                          [default: ""]
@@ -696,7 +696,7 @@ Options:
 ```text
 库级目录的一页直接子项；内部诊断用途
 
-Usage: ltfsctl fdb children [OPTIONS] <PATH>
+Usage: ltfsctl-init fdb children [OPTIONS] <PATH>
 
 Arguments:
   <PATH>
@@ -714,7 +714,7 @@ Options:
 ```text
 按显式池读取普通文件，校验后发布本地文件；不覆盖已有输出
 
-Usage: ltfsctl fdb get [OPTIONS] <PATH> <OUTPUT>
+Usage: ltfsctl-init fdb get [OPTIONS] <PATH> <OUTPUT>
 
 Arguments:
   <PATH>
@@ -731,7 +731,7 @@ Options:
 ```text
 准备上传并保存原请求与正文目录；默认只创建，不写磁带、不预留路径
 
-Usage: ltfsctl fdb prepare [OPTIONS] --request <REQUEST> <FILE> <PATH>
+Usage: ltfsctl-init fdb prepare [OPTIONS] --request <REQUEST> <FILE> <PATH>
 
 Arguments:
   <FILE>
@@ -751,7 +751,7 @@ Options:
 ```text
 使用请求目录内的原正文上传；响应不确定时只查询原身份
 
-Usage: ltfsctl fdb upload [OPTIONS] <REQUEST>
+Usage: ltfsctl-init fdb upload [OPTIONS] <REQUEST>
 
 Arguments:
   <REQUEST>
@@ -767,7 +767,7 @@ Options:
 ```text
 查询已保存请求的持久化结果
 
-Usage: ltfsctl fdb status [OPTIONS] <REQUEST>
+Usage: ltfsctl-init fdb status [OPTIONS] <REQUEST>
 
 Arguments:
   <REQUEST>
@@ -784,7 +784,7 @@ Options:
 ```text
 上传本地文件并等到落带（默认替换已有版本）
 
-Usage: ltfsctl --endpoint <ENDPOINTS> put [OPTIONS] <FILE> <PATH>
+Usage: ltfsctl-init --endpoint <ENDPOINTS> put [OPTIONS] <FILE> <PATH>
 
 Arguments:
   <FILE>
@@ -802,7 +802,7 @@ Options:
 ```text
 把已提交普通文件的内容校验后复制到另一库/池的空路径；后续改写不会自动同步
 
-Usage: ltfsctl --endpoint <ENDPOINTS> copy [OPTIONS] --to-library <TO_LIBRARY> --to-pool <TO_POOL> <SOURCE_PATH> <DESTINATION_PATH>
+Usage: ltfsctl-init --endpoint <ENDPOINTS> copy [OPTIONS] --to-library <TO_LIBRARY> --to-pool <TO_POOL> <SOURCE_PATH> <DESTINATION_PATH>
 
 Arguments:
   <SOURCE_PATH>
@@ -820,9 +820,9 @@ Options:
 ## ltfsctl get
 
 ```text
-读出已提交的文件
+从 FDB 查询并校验下载已提交文件；必须指定 --library 和 --pool UUID，不覆盖本地文件
 
-Usage: ltfsctl --endpoint <ENDPOINTS> get [OPTIONS] <PATH> <OUTPUT>
+Usage: ltfsctl-init --endpoint <ENDPOINTS> get [OPTIONS] <PATH> <OUTPUT>
 
 Arguments:
   <PATH>
@@ -839,7 +839,7 @@ Options:
 ```text
 删除文件并等墓碑落带（不立即回收介质空间）
 
-Usage: ltfsctl --endpoint <ENDPOINTS> delete [OPTIONS] <PATH>
+Usage: ltfsctl-init --endpoint <ENDPOINTS> delete [OPTIONS] <PATH>
 
 Arguments:
   <PATH>
@@ -854,9 +854,9 @@ Options:
 ## ltfsctl stat
 
 ```text
-查询路径状态：已提交 / 上传中 / 已暂存
+查询 FDB 中已提交的路径；必须指定 --library 和 --pool UUID，不存在时失败
 
-Usage: ltfsctl --endpoint <ENDPOINTS> stat [OPTIONS] <PATH>
+Usage: ltfsctl-init --endpoint <ENDPOINTS> stat [OPTIONS] <PATH>
 
 Arguments:
   <PATH>
@@ -870,14 +870,13 @@ Options:
 ## ltfsctl list
 
 ```text
-列出已提交的全部文件；给出 --dir 时只列该目录的直接子项
+分页列出 FDB 中已提交的文件；--dir 只列直接子项，必须指定 --library 和 --pool UUID
 
-Usage: ltfsctl --endpoint <ENDPOINTS> list [OPTIONS]
+Usage: ltfsctl-init --endpoint <ENDPOINTS> list [OPTIONS]
 
 Options:
       --dir <DIR>
   -l, --library <LIBRARY>  目标带库的真实 changer 序列号；省略时访问默认库
-      --pending            同时列出尚未落带的在途文件（需要 --dir）
   -p, --pool <POOL>        文件命名空间的池名称或 UUID；库内有多个池时必填
   -h, --help               Print help
 ```
@@ -887,7 +886,7 @@ Options:
 ```text
 各节点的自述
 
-Usage: ltfsctl --endpoint <ENDPOINTS> cluster [OPTIONS]
+Usage: ltfsctl-init --endpoint <ENDPOINTS> cluster [OPTIONS]
 
 Options:
   -l, --library <LIBRARY>  目标带库的真实 changer 序列号；省略时访问默认库
@@ -900,7 +899,7 @@ Options:
 ```text
 带库管理状态
 
-Usage: ltfsctl --endpoint <ENDPOINTS> library [OPTIONS] <COMMAND>
+Usage: ltfsctl-init --endpoint <ENDPOINTS> library [OPTIONS] <COMMAND>
 
 Commands:
   native-barrier  从单一物理节点读取已冻结空目录屏障，不写FDB或磁带
@@ -920,7 +919,7 @@ Options:
 ```text
 从单一物理节点读取已冻结空目录屏障，不写FDB或磁带
 
-Usage: ltfsctl library native-barrier [OPTIONS] --challenge <CHALLENGE>
+Usage: ltfsctl-init library native-barrier [OPTIONS] --challenge <CHALLENGE>
 
 Options:
       --challenge <CHALLENGE>
@@ -934,7 +933,7 @@ Options:
 ```text
 列出集群内所有带库
 
-Usage: ltfsctl library list [OPTIONS]
+Usage: ltfsctl-init library list [OPTIONS]
 
 Options:
       --json
@@ -950,7 +949,7 @@ Options:
 ```text
 查询一台带库；单库可省略，多库须指定此参数或 --library
 
-Usage: ltfsctl library show [OPTIONS] [SERIAL]
+Usage: ltfsctl-init library show [OPTIONS] [SERIAL]
 
 Arguments:
   [SERIAL]
@@ -969,7 +968,7 @@ Options:
 ```text
 显式刷新当前库的设备库存
 
-Usage: ltfsctl library rescan [OPTIONS]
+Usage: ltfsctl-init library rescan [OPTIONS]
 
 Options:
       --request <REQUEST>  原请求文件；多库新扫描时为各库请求的目录
@@ -983,7 +982,7 @@ Options:
 ```text
 驱动器管理状态
 
-Usage: ltfsctl --endpoint <ENDPOINTS> drive [OPTIONS] <COMMAND>
+Usage: ltfsctl-init --endpoint <ENDPOINTS> drive [OPTIONS] <COMMAND>
 
 Commands:
   list
@@ -1002,7 +1001,7 @@ Options:
 ## ltfsctl drive list
 
 ```text
-Usage: ltfsctl drive list [OPTIONS]
+Usage: ltfsctl-init drive list [OPTIONS]
 
 Options:
   -l, --library <LIBRARY>  目标带库的真实 changer 序列号；省略时访问默认库
@@ -1013,7 +1012,7 @@ Options:
 ## ltfsctl drive show
 
 ```text
-Usage: ltfsctl drive show [OPTIONS] <ID>
+Usage: ltfsctl-init drive show [OPTIONS] <ID>
 
 Arguments:
   <ID>
@@ -1027,7 +1026,7 @@ Options:
 ## ltfsctl drive up
 
 ```text
-Usage: ltfsctl drive up [OPTIONS] <ID>
+Usage: ltfsctl-init drive up [OPTIONS] <ID>
 
 Arguments:
   <ID>
@@ -1041,7 +1040,7 @@ Options:
 ## ltfsctl drive down
 
 ```text
-Usage: ltfsctl drive down [OPTIONS] <ID>
+Usage: ltfsctl-init drive down [OPTIONS] <ID>
 
 Arguments:
   <ID>
@@ -1055,7 +1054,7 @@ Options:
 ## ltfsctl drive role
 
 ```text
-Usage: ltfsctl drive role [OPTIONS] <ID> <ROLE>
+Usage: ltfsctl-init drive role [OPTIONS] <ID> <ROLE>
 
 Arguments:
   <ID>
@@ -1072,7 +1071,7 @@ Options:
 ```text
 节点管理状态
 
-Usage: ltfsctl --endpoint <ENDPOINTS> node [OPTIONS] <COMMAND>
+Usage: ltfsctl-init --endpoint <ENDPOINTS> node [OPTIONS] <COMMAND>
 
 Commands:
   list
@@ -1088,7 +1087,7 @@ Options:
 ## ltfsctl node list
 
 ```text
-Usage: ltfsctl node list [OPTIONS]
+Usage: ltfsctl-init node list [OPTIONS]
 
 Options:
   -l, --library <LIBRARY>  目标带库的真实 changer 序列号；省略时访问默认库
@@ -1099,7 +1098,7 @@ Options:
 ## ltfsctl node show
 
 ```text
-Usage: ltfsctl node show [OPTIONS] <ID>
+Usage: ltfsctl-init node show [OPTIONS] <ID>
 
 Arguments:
   <ID>
@@ -1115,7 +1114,7 @@ Options:
 ```text
 集群管理任务
 
-Usage: ltfsctl --endpoint <ENDPOINTS> task [OPTIONS] <COMMAND>
+Usage: ltfsctl-init --endpoint <ENDPOINTS> task [OPTIONS] <COMMAND>
 
 Commands:
   list
@@ -1132,7 +1131,7 @@ Options:
 ## ltfsctl task list
 
 ```text
-Usage: ltfsctl task list [OPTIONS]
+Usage: ltfsctl-init task list [OPTIONS]
 
 Options:
   -l, --library <LIBRARY>  目标带库的真实 changer 序列号；省略时访问默认库
@@ -1143,7 +1142,7 @@ Options:
 ## ltfsctl task show
 
 ```text
-Usage: ltfsctl task show [OPTIONS] <ID>
+Usage: ltfsctl-init task show [OPTIONS] <ID>
 
 Arguments:
   <ID>
@@ -1157,7 +1156,7 @@ Options:
 ## ltfsctl task cancel
 
 ```text
-Usage: ltfsctl task cancel [OPTIONS] <ID>
+Usage: ltfsctl-init task cancel [OPTIONS] <ID>
 
 Arguments:
   <ID>
@@ -1173,7 +1172,7 @@ Options:
 ```text
 查询文件操作任务
 
-Usage: ltfsctl --endpoint <ENDPOINTS> file-task [OPTIONS] <ID>
+Usage: ltfsctl-init --endpoint <ENDPOINTS> file-task [OPTIONS] <ID>
 
 Arguments:
   <ID>
@@ -1189,7 +1188,7 @@ Options:
 ```text
 调用指定带库的 HTTP 管理写入接口；设备任务返回 ID 后须查询终态
 
-Usage: ltfsctl --endpoint <ENDPOINTS> admin [OPTIONS] <METHOD> <ROUTE>
+Usage: ltfsctl-init --endpoint <ENDPOINTS> admin [OPTIONS] <METHOD> <ROUTE>
 
 Arguments:
   <METHOD>  [possible values: post, patch, delete]
@@ -1207,7 +1206,7 @@ Options:
 ```text
 池管理
 
-Usage: ltfsctl --endpoint <ENDPOINTS> pool [OPTIONS] <COMMAND>
+Usage: ltfsctl-init --endpoint <ENDPOINTS> pool [OPTIONS] <COMMAND>
 
 Commands:
   create  原子创建池及其根目录；不分配或格式化磁带
@@ -1228,7 +1227,7 @@ Options:
 ```text
 原子创建池及其根目录；不分配或格式化磁带
 
-Usage: ltfsctl pool create [OPTIONS] <NAME>
+Usage: ltfsctl-init pool create [OPTIONS] <NAME>
 
 Arguments:
   <NAME>
@@ -1246,7 +1245,7 @@ Options:
 ```text
 列出当前带库的全部FDB池
 
-Usage: ltfsctl pool list [OPTIONS]
+Usage: ltfsctl-init pool list [OPTIONS]
 
 Options:
       --json
@@ -1258,7 +1257,7 @@ Options:
 ## ltfsctl pool show
 
 ```text
-Usage: ltfsctl pool show [OPTIONS] <SELECTOR>
+Usage: ltfsctl-init pool show [OPTIONS] <SELECTOR>
 
 Arguments:
   <SELECTOR>
@@ -1274,7 +1273,7 @@ Options:
 ```text
 提交异步策略修改；属性使用HTTP字段名，例如media_restriction L8
 
-Usage: ltfsctl pool set [OPTIONS] <SELECTOR> <ATTRIBUTE> <VALUE>
+Usage: ltfsctl-init pool set [OPTIONS] <SELECTOR> <ATTRIBUTE> <VALUE>
 
 Arguments:
   <SELECTOR>
@@ -1293,7 +1292,7 @@ Options:
 ```text
 提交删除空池任务；目录或磁带归属非空时失败
 
-Usage: ltfsctl pool delete [OPTIONS] <SELECTOR>
+Usage: ltfsctl-init pool delete [OPTIONS] <SELECTOR>
 
 Arguments:
   <SELECTOR>
@@ -1310,7 +1309,7 @@ Options:
 ```text
 磁带归属
 
-Usage: ltfsctl --endpoint <ENDPOINTS> tape [OPTIONS] <COMMAND>
+Usage: ltfsctl-init --endpoint <ENDPOINTS> tape [OPTIONS] <COMMAND>
 
 Commands:
   import    导入已有 LTFS 索引或刷新已分配卷的 FDB 目录；不格式化或擦除
@@ -1337,7 +1336,7 @@ Options:
 ```text
 导入已有 LTFS 索引或刷新已分配卷的 FDB 目录；不格式化或擦除
 
-Usage: ltfsctl tape import [OPTIONS] [BARCODES]...
+Usage: ltfsctl-init tape import [OPTIONS] [BARCODES]...
 
 Arguments:
   [BARCODES]...  要导入的条码；使用 --request 恢复原请求时省略
@@ -1356,7 +1355,7 @@ Options:
 ```text
 列出磁带状态和容量
 
-Usage: ltfsctl tape list [OPTIONS]
+Usage: ltfsctl-init tape list [OPTIONS]
 
 Options:
       --json
@@ -1373,7 +1372,7 @@ Options:
 ```text
 查询磁带详情
 
-Usage: ltfsctl tape show [OPTIONS] <BARCODE>
+Usage: ltfsctl-init tape show [OPTIONS] <BARCODE>
 
 Arguments:
   <BARCODE>
@@ -1392,7 +1391,7 @@ Options:
 ```text
 异步检查/初始化磁带并归入池；格式化须 --yes
 
-Usage: ltfsctl tape assign [OPTIONS] [BARCODES]...
+Usage: ltfsctl-init tape assign [OPTIONS] [BARCODES]...
 
 Arguments:
   [BARCODES]...  目标条码；恢复时省略并指定原请求文件
@@ -1411,7 +1410,7 @@ Options:
 ```text
 异步证明无引用后解除池归属，不擦除介质
 
-Usage: ltfsctl tape unassign [OPTIONS] [BARCODES]...
+Usage: ltfsctl-init tape unassign [OPTIONS] [BARCODES]...
 
 Arguments:
   [BARCODES]...  目标条码；恢复时省略并指定原请求文件
@@ -1428,7 +1427,7 @@ Options:
 ```text
 异步移动介质到 homeslot 或 ieslot
 
-Usage: ltfsctl tape move [OPTIONS] [BARCODES]...
+Usage: ltfsctl-init tape move [OPTIONS] [BARCODES]...
 
 Arguments:
   [BARCODES]...  目标条码；恢复时省略并指定原请求文件
@@ -1446,7 +1445,7 @@ Options:
 ```text
 将已分配磁带设为离线；返回管理任务号
 
-Usage: ltfsctl tape offline [OPTIONS] [BARCODES]...
+Usage: ltfsctl-init tape offline [OPTIONS] [BARCODES]...
 
 Arguments:
   [BARCODES]...  目标条码；恢复时省略并指定原请求文件
@@ -1464,7 +1463,7 @@ Options:
 ```text
 实际装带验证后解除离线；返回管理任务号
 
-Usage: ltfsctl tape online [OPTIONS] [BARCODES]...
+Usage: ltfsctl-init tape online [OPTIONS] [BARCODES]...
 
 Arguments:
   [BARCODES]...  目标条码；恢复时省略并指定原请求文件
@@ -1481,7 +1480,7 @@ Options:
 ```text
 设置黑名单及离线属性；返回管理任务号
 
-Usage: ltfsctl tape set [OPTIONS] [BARCODES]...
+Usage: ltfsctl-init tape set [OPTIONS] [BARCODES]...
 
 Arguments:
   [BARCODES]...  目标条码；恢复时省略并指定原请求文件
@@ -1499,7 +1498,7 @@ Options:
 ```text
 异步核验标签、LTFS 索引和结构；不读取全部文件正文
 
-Usage: ltfsctl tape validate [OPTIONS] [BARCODES]...
+Usage: ltfsctl-init tape validate [OPTIONS] [BARCODES]...
 
 Arguments:
   [BARCODES]...  目标条码；恢复时省略并指定原请求文件
@@ -1516,7 +1515,7 @@ Options:
 ```text
 回收：FDB 原生模式尚未开放，会拒绝此命令。 目录模式需要两台驱动器，后台搬迁有效文件后重新格式化源带
 
-Usage: ltfsctl tape reclaim [OPTIONS] <BARCODE>
+Usage: ltfsctl-init tape reclaim [OPTIONS] <BARCODE>
 
 Arguments:
   <BARCODE>

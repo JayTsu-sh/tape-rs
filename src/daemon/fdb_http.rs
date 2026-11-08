@@ -342,6 +342,19 @@ fn metadata_router(ctx: Arc<Context>) -> Router {
     Router::new()
         .route("/admin/libraries", get(queries::libraries))
         .route("/libraries/{serial}/admin/library", get(queries::library))
+        .route("/libraries/{serial}/admin/drives", get(queries::drives))
+        .route(
+            "/libraries/{serial}/admin/drives/{target}",
+            get(queries::drive),
+        )
+        .route(
+            "/libraries/{serial}/admin/nodes",
+            get(queries::participants),
+        )
+        .route(
+            "/libraries/{serial}/admin/nodes/{target}",
+            get(queries::participant),
+        )
         .route(
             "/libraries/{serial}/admin/library/rescan",
             axum::routing::post(pools::rescan),

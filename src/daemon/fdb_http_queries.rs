@@ -158,6 +158,97 @@ fn pool_selector(request: &Request) -> Result<Option<String>, Box<Response>> {
         .map(|value| value.map(http::percent_decode))
         .map_err(|e| Box::new(invalid(e)))
 }
+
+async fn resources(
+    ctx: Arc<Context>,
+    serial: String,
+    request: Request,
+    drives: bool,
+    target: Option<String>,
+) -> Response {
+    let (_permit, route) = match scoped(&ctx, &serial, &request, &[]) {
+        Ok(value) => value,
+        Err(error) => return *error,
+    };
+    let view = match library_view(&ctx, &serial, route, true).await {
+        Ok(value) => value,
+        Err(error) => return pools::failure(error),
+    };
+    let source = if drives {
+        &view["inventory"]["drives"]
+    } else {
+        &view["nodes"]
+    };
+    let mut items = Vec::new();
+    for item in source.as_array().into_iter().flatten() {
+        let mut item = item.clone();
+        if drives {
+            let Some(id) = item["serial"].as_str() else {
+                return unavailable("驱动器观测缺少序列号");
+            };
+            if target.as_ref().is_some_and(|target| target != id) {
+                continue;
+            }
+            item["policy"] = match ctx
+                .catalog
+                .active_resource_policy(&serial, route, "drive", id)
+                .await
+            {
+                Ok(policy) => policy,
+                Err(error) => return pools::failure(error),
+            };
+        } else {
+            if target.as_ref().is_some_and(|target| {
+                item["id"].as_u64().map(|id| id.to_string()).as_ref() != Some(target)
+            }) {
+                continue;
+            }
+            item["active"] = json!(item["id"] == view["active_node"]);
+        }
+        items.push(item);
+    }
+    if target.is_some() && items.len() != 1 {
+        return reply(StatusCode::NOT_FOUND, json!({"error":"resource_not_found"}));
+    }
+    let mut result = json!({"version":1,"library_serial":serial,"namespace":route.route.namespace.to_string(),
+        "inventory_observation":view["inventory"].as_object().map(|_|json!({"observed_at":view["inventory"]["observed_at"],"owner":view["inventory"]["owner"],"round":view["inventory"]["round"],"owner_current":view["inventory_owner_current"]})),
+        "active_node":view["active_node"]});
+    if target.is_some() {
+        result["item"] = items.remove(0);
+    } else {
+        result["items"] = json!(items);
+    }
+    reply(StatusCode::OK, result)
+}
+
+pub(super) async fn drives(
+    State(ctx): State<Arc<Context>>,
+    Path(serial): Path<String>,
+    request: Request,
+) -> Response {
+    resources(ctx, serial, request, true, None).await
+}
+pub(super) async fn drive(
+    State(ctx): State<Arc<Context>>,
+    Path((serial, target)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    resources(ctx, serial, request, true, Some(target)).await
+}
+pub(super) async fn participants(
+    State(ctx): State<Arc<Context>>,
+    Path(serial): Path<String>,
+    request: Request,
+) -> Response {
+    resources(ctx, serial, request, false, None).await
+}
+pub(super) async fn participant(
+    State(ctx): State<Arc<Context>>,
+    Path((serial, target)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    resources(ctx, serial, request, false, Some(target)).await
+}
 async fn selected_pool(
     ctx: &Context,
     serial: &str,

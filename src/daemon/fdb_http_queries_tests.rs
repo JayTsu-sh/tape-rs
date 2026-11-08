@@ -71,6 +71,12 @@ async fn seed_assignment(
     let tr = db.create_trx().unwrap();
     if let Some(volume) = volume {
         record[44..60].copy_from_slice(volume.as_bytes());
+        let mut attributes = b"tape-rs/catalog/22/@/".to_vec();
+        attributes.extend_from_slice(ns.as_bytes());
+        attributes.push(b'Y');
+        attributes.extend_from_slice(&suffix);
+        attributes.extend_from_slice(volume.as_bytes());
+        tr.set(&attributes, br#"{"offline_message":"device maintenance"}"#);
         let mut placement_key = b"tape-rs/catalog/22/b/".to_vec();
         placement_key.extend_from_slice(volume.as_bytes());
         let mut placement = vec![1];
@@ -193,6 +199,45 @@ async fn run_queries(cluster: &str) {
     .await;
     assert_eq!(code, 200);
     assert_eq!(view["library"]["num_of_volumes"], 105);
+    let (code, drives) =
+        request(&address, &format!("{prefix}/drives"), Some(&ns.to_string())).await;
+    assert_eq!(code, 200, "{drives}");
+    assert_eq!(drives["items"][0]["serial"], "SIMDRV0000");
+    assert_eq!(drives["items"][0]["policy"]["revision"], 0);
+    assert!(drives["inventory_observation"]["observed_at"].is_string());
+    let (code, drive) = request(
+        &address,
+        &format!("{prefix}/drives/SIMDRV0000"),
+        Some(&ns.to_string()),
+    )
+    .await;
+    assert_eq!(code, 200);
+    assert_eq!(drive["item"], drives["items"][0]);
+    let (code, nodes) = request(&address, &format!("{prefix}/nodes"), Some(&ns.to_string())).await;
+    assert_eq!(code, 200);
+    assert_eq!(
+        nodes["items"],
+        json!([]),
+        "metadata-only mode cannot invent nodes"
+    );
+    for resource in ["drives", "nodes"] {
+        assert_eq!(
+            request(&address, &format!("{prefix}/{resource}"), None)
+                .await
+                .0,
+            409
+        );
+        assert_eq!(
+            request(
+                &address,
+                &format!("{prefix}/{resource}/missing"),
+                Some(&ns.to_string())
+            )
+            .await
+            .0,
+            404
+        );
+    }
     assert!(
         view["library"]["inventory_owner_current"]
             .as_bool()
@@ -241,6 +286,14 @@ async fn run_queries(cluster: &str) {
     assert_eq!(items[0]["presence"], "not_observed");
     assert_eq!(items[0]["assignment"]["online"], false);
     assert_eq!(items[0]["assignment"]["blacklisted"], true);
+    assert_eq!(
+        catalog
+            .active_resource_policy(&serial, route, "tape", "AOFFL8")
+            .await
+            .unwrap()["offline_message"],
+        "device maintenance"
+    );
+    assert_eq!(items[0]["offline_message"], "device maintenance");
     assert!(
         items
             .iter()

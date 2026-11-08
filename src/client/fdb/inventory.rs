@@ -28,6 +28,39 @@ impl FdbClient {
     pub fn library_inventory(&self, library: &str) -> Result<Value> {
         self.inventory_get(library, "/library")
     }
+    /// 当前库的驱动器或参与节点；与 HTTP 管理查询共用 namespace 核验。
+    pub fn operational_inventory(
+        &self,
+        library: &str,
+        resource: &str,
+        target: Option<&str>,
+    ) -> Result<Value> {
+        if !matches!(resource, "drives" | "nodes")
+            || target.is_some_and(|id| {
+                id.is_empty()
+                    || id.len() > 128
+                    || id.contains('/')
+                    || id.chars().any(char::is_control)
+            })
+        {
+            return Err(invalid("驱动器或节点查询目标无效"));
+        }
+        let value = self.inventory_get(
+            library,
+            &format!(
+                "/{resource}{}",
+                target
+                    .map(|id| format!("/{}", encode_query(id)))
+                    .unwrap_or_default()
+            ),
+        )?;
+        if target.is_some() && !value["item"].is_object()
+            || target.is_none() && !value["items"].is_array()
+        {
+            return Err(ClientError::Verification("驱动器或节点响应缺少结果".into()));
+        }
+        Ok(value)
+    }
     pub fn tape_inventory_page(
         &self,
         library: &str,

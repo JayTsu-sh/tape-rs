@@ -25,6 +25,8 @@ list 默认输出表格，`--json` 返回完整机器可读清单；show 输出 
 | --- | --- | --- |
 | library list | `/admin/libraries` | 可选 `library=SERIAL` |
 | library show | `/libraries/SERIAL/admin/library` | 无 |
+| drive list / show | `/libraries/SERIAL/admin/drives`、`/libraries/SERIAL/admin/drives/DRIVE_SERIAL` | 无 |
+| node list / show | `/libraries/SERIAL/admin/nodes`、`/libraries/SERIAL/admin/nodes/NODE_ID` | 无 |
 | tape list | `/libraries/SERIAL/admin/tapes` | 可选 `pool`、`limit`、`after` |
 | tape show | `/libraries/SERIAL/admin/tapes/BARCODE` | 可选 `pool` |
 
@@ -42,7 +44,9 @@ active_node 仅在已应用控制状态就绪、冻结点及 FDB epoch 一致时
 
 Tape 清单合并已观测的物理条码与 FDB 分配记录，包含未分配实带（包括清洗带）及已分配但当前库存未观测到的盘。池过滤仅返回该库该池的管理归属。`presence` 区分 `unknown`、`observed`、`not_observed`；后者仅表示那次库存中未发现，不自动推断磁带已导出或丢失。
 
-`assignment` 保留池、volume、online、blacklisted 及修订号，`location` 与 `observation` 保留物理观测及来源。online 是管理策略，不等于介质健康或当前可读；没有单盘采集事实时 health/capacity 为 null，不推断健康、零容量或可写。metadata volume 绑定也不单独证明文件索引已导入或 S3 内容可读。
+驱动器和参与节点查询返回同库、同 namespace 的 `items` 清单，show 返回 `item`。驱动器行包含缓存库存字段及 FDB `policy`；参与节点行包含已配置 endpoint、候选报告和当前投影的 `active` 标记，不主动探测远端或操作设备。响应保留 `inventory_observation`；没有观测时为 null，不能当作驱动器实时健康证明。
+
+`assignment` 保留池、volume、online、blacklisted、offline_message 及修订号，`location` 与 `observation` 保留物理观测及来源。磁带 list/show 的顶层 `offline_message` 与归属中的同名字段来自同一 FDB 查询；上线会按原管理流程清除说明。online 是管理策略，不等于介质健康或当前可读；没有单盘采集事实时 health/capacity 为 null，不推断健康、零容量或可写。metadata volume 绑定也不单独证明文件索引已导入或 S3 内容可读。
 
 查询验证活动路由、缓存/通知证明、所读取的归属索引、池和卷反向绑定。损坏返回 500 且不可重试，临时 FDB 不可用返回 503；不自动补字段、修复记录或从本地状态伪造成功。查询并发沿用有界管理预算。实际设备操作与异步任务仍须单独验收。
 
