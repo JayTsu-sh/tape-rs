@@ -6040,6 +6040,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；关闭后独立catalog/HA仅凭parent恢复唯一后继，Sim"]
+    async fn reclaim_metadata_closed_retry_resumes_from_parent_without_cached_arguments() {
+        Box::pin(native_lifecycle(MetadataCase::Execution(
+            MetadataExecutionCase::ClosedRetryContext,
+        )))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "需要隔离 FDB_TEST_CLUSTER；实际 Sim 空 IP，保持原 Writing/占用且无设备写"]
     async fn reclaim_metadata_unwritten_closure_keeps_missing_ip_indeterminate() {
         Box::pin(native_lifecycle(MetadataCase::Execution(
@@ -6086,6 +6095,7 @@ mod tests {
         Publication,
         UnwrittenClose,
         UnwrittenIpDebt,
+        ClosedRetryContext,
         UnwrittenIpMissing,
         UnwrittenIpAhead,
         AttemptRegistry,
@@ -6100,6 +6110,62 @@ mod tests {
         make: impl FnOnce() -> F,
     ) -> std::pin::Pin<Box<F>> {
         Box::pin(make())
+    }
+
+    // No source UID, attempt ID, file or request enters this helper. All of
+    // those facts must be rediscovered from the original parent in FDB.
+    async fn closed_reclaim_context_from_parent(
+        catalog: &crate::managed_catalog::ManagedCatalog,
+        parent: &crate::managed_catalog::ReclaimReservation,
+        owner: u64,
+    ) -> (
+        crate::managed_catalog::ReclaimMetadataWrite,
+        crate::managed_catalog::ReclaimFile,
+        crate::managed_catalog::ActiveFileRequest,
+    ) {
+        let saved = catalog
+            .reclaim_metadata_checkpoint(parent, owner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(saved.closed());
+        assert!(
+            catalog
+                .pending_reclaim_metadata_write(parent, owner)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        if saved.owner() != owner {
+            assert!(
+                catalog
+                    .reclaim_metadata_retry_context(parent, owner, &saved)
+                    .await
+                    .is_err()
+            );
+        }
+        let claimed = catalog
+            .claim_reclaim_metadata_attempt(parent, owner, &saved)
+            .await
+            .unwrap();
+        assert!(
+            catalog
+                .reclaim_metadata_execution_context(parent, owner, &claimed)
+                .await
+                .is_err()
+        );
+        let (file, request) = catalog
+            .reclaim_metadata_retry_context(parent, owner, &claimed)
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog
+                .reclaim_metadata_checkpoint(parent, owner)
+                .await
+                .unwrap(),
+            Some(claimed.clone())
+        );
+        (claimed, file, request)
     }
 
     fn assert_reclaim_media_unchanged(
@@ -7372,6 +7438,7 @@ mod tests {
             None,
             "失败准备不能留下孤立原尝试"
         );
+        assert_eq!(catalog.reclaim_metadata_checkpoint(&reserved, fixture.owner.round).await.unwrap(),None);
         let (first, duplicate) = tokio::join!(
             Box::pin(catalog.prepare_reclaim_metadata_write(
                 &reserved,
@@ -7565,6 +7632,7 @@ mod tests {
                         assert_eq!(published.id(),third.id());
                         let completed=catalog.reclaim_metadata_attempt(&reserved,fixture.owner.round,source_data_uid,third.id()).await.unwrap();assert!(completed.completed());
                         assert!(observer.reclaim_metadata_execution_context(&reserved,fixture.owner.round,&completed).await.is_err(),"已发布仅查历史，不再执行恢复");
+                        assert!(observer.reclaim_metadata_retry_context(&reserved,fixture.owner.round,&completed).await.is_err(),"已发布不能准备新物理重试");
                         assert_eq!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&first).await.unwrap(),second_closed);
                         assert_eq!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&second_closed).await.unwrap(),completed);
                         let mut rows=Vec::new();let tr=raw_catalog.create_trx().unwrap();
@@ -7587,7 +7655,7 @@ mod tests {
                     }).await;
                     return;
                 }
-                if matches!(mode, MetadataExecutionCase::LostAdmission | MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpDebt | MetadataExecutionCase::UnwrittenIpMissing | MetadataExecutionCase::UnwrittenIpAhead) {
+                if matches!(mode, MetadataExecutionCase::LostAdmission | MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpDebt | MetadataExecutionCase::ClosedRetryContext | MetadataExecutionCase::UnwrittenIpMissing | MetadataExecutionCase::UnwrittenIpAhead) {
                     catalog.admit_reclaim_metadata_write(&reserved, fixture.owner.round, &scanned, &input_request, &metadata_write).await.unwrap();
                 }
                 if mode == MetadataExecutionCase::UnwrittenIpAhead {
@@ -7618,13 +7686,13 @@ mod tests {
                         cartridge.vcr += 1;
                     });
                 }
-                let debt_media = matches!(mode, MetadataExecutionCase::UnwrittenIpDebt | MetadataExecutionCase::UnwrittenIpMissing).then(|| {
+                let debt_media = matches!(mode, MetadataExecutionCase::UnwrittenIpDebt | MetadataExecutionCase::ClosedRetryContext | MetadataExecutionCase::UnwrittenIpMissing).then(|| {
                     let crate::ltfs::recovery::IndexSourceScope::Current { ip_generation: Some(ip), .. } = captured_target.scope() else {panic!("债务夹具必须有已核验完整旧 IP")};
                     assert!(ip < captured_target.construct().generation, "必须保留真实普通写入的IP债务，不能先做checkpoint");
                     fixture.lib.cartridge(&input.destination().placement().barcode).unwrap()
                 });
                 let first = writer.execute(&reserved, &scanned, &input_request, &metadata_write,
-                    if matches!(mode, MetadataExecutionCase::LostAdmission | MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpDebt | MetadataExecutionCase::UnwrittenIpMissing | MetadataExecutionCase::UnwrittenIpAhead) {None} else {Some(&captured)}).await;
+                    if matches!(mode, MetadataExecutionCase::LostAdmission | MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpDebt | MetadataExecutionCase::ClosedRetryContext | MetadataExecutionCase::UnwrittenIpMissing | MetadataExecutionCase::UnwrittenIpAhead) {None} else {Some(&captured)}).await;
                 if mode == MetadataExecutionCase::UnwrittenIpAhead {
                     assert!(matches!(first, Err(TapeError::RecoveryRestricted { ref reason })
                         if reason.contains("IP 索引代数") && reason.contains("领先 FDB 已观察 DP")), "{first:?}");
@@ -7647,7 +7715,7 @@ mod tests {
                     assert!(!fixture.commands.lock().unwrap()[original_commands.len()..].iter().any(|(_,op)|matches!(op,0x04|0x0a|0x10|0x19|0x8d|0xa5)),"空IP保持未知，不能隐式修复");
                     return;
                 }
-                if matches!(mode, MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpDebt) {
+                if matches!(mode, MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpDebt | MetadataExecutionCase::ClosedRetryContext) {
                     boxed_metadata_phase(|| async {
                     let execution = first.unwrap();
                     let task = execution.task();
@@ -7693,6 +7761,33 @@ mod tests {
                     assert_eq!(*fixture.commands.lock().unwrap(),commands,"关闭和终态重试均无设备命令");
                     let next=fixture.owner.round+100;catalog.claim_active_owner_epoch(&serial,next).await.unwrap();
                     let parents=catalog.claim_reclaim_reservations_page(&serial,route,next,None,16).await.unwrap();
+                    if mode == MetadataExecutionCase::ClosedRetryContext {
+                        let restarted=ManagedCatalog::open(Some(&cluster)).unwrap();let parent=&parents.items[0];
+                        let (recovered,restored_file,restored_request)=closed_reclaim_context_from_parent(&restarted,parent,next).await;
+                        assert_eq!(recovered.id(),closed.id());assert_eq!(restored_file,scanned);assert_eq!(restored_request,input_request);
+                        assert!(restarted.reclaim_metadata_checkpoint(&reserved,fixture.owner.round).await.is_err());
+                        assert!(restarted.reclaim_metadata_retry_context(parent,next,&closed).await.is_err(),"旧owner句柄不能自动重绑");
+                        let tr=raw_catalog.create_trx().unwrap();let raw=tr.get(&data_body_key,false).await.unwrap().unwrap().to_vec();tr.clear(&data_body_key);tr.commit().await.unwrap();
+                        let missing=restarted.reclaim_metadata_retry_context(parent,next,&recovered).await;
+                        let tr=raw_catalog.create_trx().unwrap();let untouched=tr.get(&data_body_key,false).await.unwrap().is_none();tr.set(&data_body_key,&raw);tr.commit().await.unwrap();assert!(missing.is_err() && untouched,"Closed恢复缺原证明时不能修复或换请求");
+                        let (one,two)=tokio::join!(Box::pin(restarted.retry_reclaim_metadata_write(parent,next,&restored_file,&restored_request,&recovered)),Box::pin(restarted.retry_reclaim_metadata_write(parent,next,&restored_file,&restored_request,&recovered)));
+                        let successor=one.unwrap();assert_eq!(two.unwrap(),successor);assert_ne!(successor.id(),recovered.id());assert_eq!(successor.previous_attempt(),Some(recovered.id()));assert_eq!(successor.first_attempt(),recovered.first_attempt());
+                        assert!(!successor.closed() && !successor.writing() && !successor.completed());
+                        assert_eq!(restarted.reclaim_metadata_checkpoint(parent,next).await.unwrap(),Some(successor.clone()));
+                        assert_eq!(restarted.pending_reclaim_metadata_write(parent,next).await.unwrap(),Some(successor.clone()));
+                        assert!(restarted.reclaim_metadata_retry_context(parent,next,&successor).await.is_err(),"Prepared不能充当Closed重试参数");
+                        assert_eq!(restarted.reclaim_metadata_execution_context(parent,next,&successor).await.unwrap(),(restored_file.clone(),restored_request.clone()));
+                        let tr=raw_catalog.create_trx().unwrap();let held=tr.get(&metadata_active_key,false).await.unwrap().unwrap().to_vec();let header=tr.get(&metadata_header_key,false).await.unwrap().unwrap().to_vec();
+                        assert_eq!(tr.get(&metadata_volume_key,false).await.unwrap().unwrap().as_ref(),held.as_slice());
+                        assert_eq!(restarted.reclaim_metadata_retry_context(parent,next,&recovered).await.unwrap(),(restored_file.clone(),restored_request.clone()));
+                        assert_eq!(restarted.retry_reclaim_metadata_write(parent,next,&restored_file,&restored_request,&recovered).await.unwrap(),successor,"旧重试不能重复创建后继");
+                        assert!(restarted.close_unwritten_reclaim_metadata_write(parent,next,&restored_file,&restored_request,&recovered,proof).await.is_err(),"旧owner实读证明不能授接任许可");
+                        let tr=raw_catalog.create_trx().unwrap();assert_eq!(tr.get(&metadata_active_key,false).await.unwrap().unwrap().as_ref(),held.as_slice());assert_eq!(tr.get(&metadata_volume_key,false).await.unwrap().unwrap().as_ref(),held.as_slice());assert_eq!(tr.get(&metadata_header_key,false).await.unwrap().unwrap().as_ref(),header.as_slice());
+                        assert_eq!(restarted.reclaim_metadata_attempt(parent,next,recovered.plan().source_uid(),recovered.id()).await.unwrap(),recovered);
+                        assert_eq!(*fixture.commands.lock().unwrap(),commands,"独立catalog只从parent恢复、校验、领取及显式重试不发送CDB");
+                        assert_reclaim_media_unchanged(debt_media.as_ref().unwrap(),&fixture.lib.cartridge(&input.destination().placement().barcode).unwrap());
+                        return;
+                    }
                     let recovered=catalog.claim_reclaim_metadata_write(&parents.items[0],next,source_data_uid).await.unwrap();
                     assert!(recovered.closed());assert_eq!(recovered.id(),task.id());
                     assert!(catalog.close_unwritten_reclaim_metadata_write(&parents.items[0],next,&scanned,&input_request,&recovered,proof).await.is_err(),"旧owner实读证明不能重绑");

@@ -699,23 +699,37 @@ impl ManagedCatalog {
             .await?
     }
 
-    /// Discover the parent's original metadata attempt, without device I/O.
+    /// Read the parent's last retained checkpoint, including a terminal attempt.
+    /// This is a fact query, not pending-work classification or an I/O permit.
+    /// An old owner is retained until explicitly claiming the exact handle.
+    pub fn reclaim_metadata_checkpoint<'a>(
+        &'a self,
+        reservation: &'a ReclaimReservation,
+        owner: u64,
+    ) -> std::pin::Pin<
+        Box<impl std::future::Future<Output = Result<Option<ReclaimMetadataWrite>>> + 'a>,
+    > {
+        Box::pin(async move {
+            let tr = self.db.create_trx()?;
+            parent_at(&tr, reservation, owner).await?;
+            let task = registry::read_at(&tr, reservation).await?;
+            if task.as_ref().is_some_and(|task| task.owner() > owner) {
+                return Err(CatalogError::OwnerFenced);
+            }
+            Ok(task)
+        })
+    }
+
+    /// Discover only an active attempt; a Closed checkpoint is not execution.
     pub async fn pending_reclaim_metadata_write(
         &self,
         reservation: &ReclaimReservation,
         owner: u64,
     ) -> Result<Option<ReclaimMetadataWrite>> {
-        let tr = self.db.create_trx()?;
-        parent_at(&tr, reservation, owner).await?;
-        let task = registry::read_at(&tr, reservation).await?;
-        let Some(task) = task.filter(|task| task.holds_claim()) else {
-            return Ok(None);
-        };
-        if task.owner() > owner {
-            return Err(CatalogError::OwnerFenced);
-        }
-        // Discovery retains the original owner; explicit claiming precedes I/O.
-        Ok(Some(task))
+        Ok(self
+            .reclaim_metadata_checkpoint(reservation, owner)
+            .await?
+            .filter(|task| task.holds_claim()))
     }
 
     /// Read the retained original task. Missing/corrupt slots are never repaired.

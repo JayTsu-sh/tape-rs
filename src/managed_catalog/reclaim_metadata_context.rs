@@ -62,6 +62,60 @@ impl Context {
     }
 }
 
+// Read an already claimed original handle; this never changes ownership.
+async fn claimed_task_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    owner: u64,
+    original: &ReclaimMetadataWrite,
+) -> Result<ReclaimMetadataWrite> {
+    original.encode()?;
+    parent_at(tr, reservation, owner).await?;
+    let task = load_id_at(tr, reservation, original.plan().source_uid(), original.id())
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+    require_phase_history(original, &task)?;
+    if original.plan() != task.plan() {
+        return Err(CatalogError::Invalid("元数据恢复改变原固定计划"));
+    }
+    if task.owner() != owner || original.owner() != owner {
+        return Err(CatalogError::OwnerFenced);
+    }
+    Ok(task)
+}
+
+async fn original_context_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    owner: u64,
+    task: &ReclaimMetadataWrite,
+) -> Result<(ReclaimFile, ActiveFileRequest)> {
+    let context = &task.0.context;
+    context.validate()?;
+    let (intent, _) = children::child_at(
+        tr,
+        reservation.namespace(),
+        reservation.spec().pool,
+        context.epoch,
+        context.file.operation(),
+        owner,
+    )
+    .await?
+    .ok_or(CatalogError::Incomplete)?;
+    let request = intent.request();
+    context.require(reservation, &context.file, &request)?;
+    input_at(
+        tr,
+        reservation,
+        owner,
+        &context.file,
+        &request,
+        &task.plan(),
+    )
+    .await?;
+    Ok((context.file.clone(), request))
+}
+
 impl ManagedCatalog {
     /// Recover only the exact active attempt after explicit owner claiming.
     /// All arguments and retained input proofs are checked at one read version;
@@ -75,50 +129,33 @@ impl ManagedCatalog {
         Box<impl std::future::Future<Output = Result<(ReclaimFile, ActiveFileRequest)>> + 'a>,
     > {
         Box::pin(async move {
-            original.encode()?;
             let tr = self.db.create_trx()?;
-            parent_at(&tr, reservation, owner).await?;
-            let task = load_id_at(
-                &tr,
-                reservation,
-                original.plan().source_uid(),
-                original.id(),
-            )
-            .await?
-            .ok_or(CatalogError::Incomplete)?;
-            require_phase_history(original, &task)?;
-            if original.plan() != task.plan() {
-                return Err(CatalogError::Invalid("元数据恢复改变原固定计划"));
-            }
-            if task.owner() != owner || original.owner() != owner {
-                return Err(CatalogError::OwnerFenced);
-            }
+            let task = claimed_task_at(&tr, reservation, owner, original).await?;
             if !task.holds_claim() {
                 return Err(CatalogError::Invalid("终态元数据尝试不再需要执行恢复"));
             }
-            let context = &task.0.context;
-            let (intent, _) = children::child_at(
-                &tr,
-                reservation.namespace(),
-                reservation.spec().pool,
-                context.epoch,
-                context.file.operation(),
-                owner,
-            )
-            .await?
-            .ok_or(CatalogError::Incomplete)?;
-            let request = intent.request();
-            context.require(reservation, &context.file, &request)?;
-            input_at(
-                &tr,
-                reservation,
-                owner,
-                &context.file,
-                &request,
-                &task.plan(),
-            )
-            .await?;
-            Ok((context.file.clone(), request))
+            original_context_at(&tr, reservation, owner, &task).await
+        })
+    }
+
+    /// Restore a settled Closed attempt's original retry arguments, never I/O
+    /// permission. Only an explicit retry may subsequently prepare a successor.
+    /// Completed publication uses its independent history instead of this path.
+    pub fn reclaim_metadata_retry_context<'a>(
+        &'a self,
+        reservation: &'a ReclaimReservation,
+        owner: u64,
+        original: &'a ReclaimMetadataWrite,
+    ) -> std::pin::Pin<
+        Box<impl std::future::Future<Output = Result<(ReclaimFile, ActiveFileRequest)>> + 'a>,
+    > {
+        Box::pin(async move {
+            let tr = self.db.create_trx()?;
+            let task = claimed_task_at(&tr, reservation, owner, original).await?;
+            if !task.closed() {
+                return Err(CatalogError::Invalid("只有原 Closed 尝试可恢复重试参数"));
+            }
+            original_context_at(&tr, reservation, owner, &task).await
         })
     }
 }
