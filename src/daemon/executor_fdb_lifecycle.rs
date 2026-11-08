@@ -6031,6 +6031,24 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；实际 clean DP/IP债务，无写关闭与原证据/HA，Sim"]
+    async fn reclaim_metadata_unwritten_closure_preserves_verified_ip_debt_without_io() {
+        Box::pin(native_lifecycle(MetadataCase::Execution(
+            MetadataExecutionCase::UnwrittenIpDebt,
+        )))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；实际 Sim 空 IP，保持原 Writing/占用且无设备写"]
+    async fn reclaim_metadata_unwritten_closure_keeps_missing_ip_indeterminate() {
+        Box::pin(native_lifecycle(MetadataCase::Execution(
+            MetadataExecutionCase::UnwrittenIpMissing,
+        )))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "需要隔离 FDB_TEST_CLUSTER；实际 Sim IP ahead，DP 未变也不能授权未写关闭"]
     async fn reclaim_metadata_unwritten_closure_rejects_ip_ahead() {
         Box::pin(native_lifecycle(MetadataCase::Execution(
@@ -6067,6 +6085,8 @@ mod tests {
         PermissionAfterPr,
         Publication,
         UnwrittenClose,
+        UnwrittenIpDebt,
+        UnwrittenIpMissing,
         UnwrittenIpAhead,
         AttemptRegistry,
         AttemptHistory,
@@ -6080,6 +6100,23 @@ mod tests {
         make: impl FnOnce() -> F,
     ) -> std::pin::Pin<Box<F>> {
         Box::pin(make())
+    }
+
+    fn assert_reclaim_media_unchanged(
+        before: &crate::scsi::sim::SimCartridge,
+        after: &crate::scsi::sim::SimCartridge,
+    ) {
+        assert_eq!(before.vcr, after.vcr);
+        assert_eq!(before.mam, after.mam);
+        assert_eq!(before.partitions.len(), after.partitions.len());
+        for (before, after) in before.partitions.iter().zip(&after.partitions) {
+            assert_eq!(
+                before.objects, after.objects,
+                "观察/关闭不能改变 IP/DP 字节或 filemarks"
+            );
+            assert_eq!(before.flushed, after.flushed);
+            assert_eq!(before.capacity, after.capacity);
+        }
     }
 
     fn checkpoint_metadata_fixture(fixture: &Fixture, drive: usize) {
@@ -7550,7 +7587,7 @@ mod tests {
                     }).await;
                     return;
                 }
-                if matches!(mode, MetadataExecutionCase::LostAdmission | MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpAhead) {
+                if matches!(mode, MetadataExecutionCase::LostAdmission | MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpDebt | MetadataExecutionCase::UnwrittenIpMissing | MetadataExecutionCase::UnwrittenIpAhead) {
                     catalog.admit_reclaim_metadata_write(&reserved, fixture.owner.round, &scanned, &input_request, &metadata_write).await.unwrap();
                 }
                 if mode == MetadataExecutionCase::UnwrittenIpAhead {
@@ -7572,8 +7609,22 @@ mod tests {
                     });
                     assert_eq!(changed, 1, "实际只构造 IP 更高代次，DP 不变");
                 }
+                if mode == MetadataExecutionCase::UnwrittenIpMissing {
+                    fixture.lib.with_cartridge_mut(&input.destination().placement().barcode, |cartridge| {
+                        let ip = &mut cartridge.partitions[0];
+                        ip.objects.truncate(crate::ltfs::volume::P1_DATA_START as usize + 1);
+                        assert!(matches!(ip.objects.last(), Some(crate::scsi::sim::LogicalObject::Filemark)));
+                        ip.flushed = ip.objects.len();
+                        cartridge.vcr += 1;
+                    });
+                }
+                let debt_media = matches!(mode, MetadataExecutionCase::UnwrittenIpDebt | MetadataExecutionCase::UnwrittenIpMissing).then(|| {
+                    let crate::ltfs::recovery::IndexSourceScope::Current { ip_generation: Some(ip), .. } = captured_target.scope() else {panic!("债务夹具必须有已核验完整旧 IP")};
+                    assert!(ip < captured_target.construct().generation, "必须保留真实普通写入的IP债务，不能先做checkpoint");
+                    fixture.lib.cartridge(&input.destination().placement().barcode).unwrap()
+                });
                 let first = writer.execute(&reserved, &scanned, &input_request, &metadata_write,
-                    if matches!(mode, MetadataExecutionCase::LostAdmission | MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpAhead) {None} else {Some(&captured)}).await;
+                    if matches!(mode, MetadataExecutionCase::LostAdmission | MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpDebt | MetadataExecutionCase::UnwrittenIpMissing | MetadataExecutionCase::UnwrittenIpAhead) {None} else {Some(&captured)}).await;
                 if mode == MetadataExecutionCase::UnwrittenIpAhead {
                     assert!(matches!(first, Err(TapeError::RecoveryRestricted { ref reason })
                         if reason.contains("IP 索引代数") && reason.contains("领先 FDB 已观察 DP")), "{first:?}");
@@ -7586,7 +7637,17 @@ mod tests {
                     assert!(!fixture.commands.lock().unwrap()[original_commands.len()..].iter().any(|(_,op)|matches!(op,0x04|0x0a|0x10|0x19|0x8d|0xa5)),"IP ahead 只读拒绝，无写/修尾/搬带");
                     return;
                 }
-                if mode == MetadataExecutionCase::UnwrittenClose {
+                if mode == MetadataExecutionCase::UnwrittenIpMissing {
+                    let execution = first.unwrap();
+                    assert!(execution.task().writing() && execution.unwritten_evidence().is_none() && execution.commit_evidence().is_none());
+                    assert_eq!(execution.task().observation().unwrap().unwrap().kind(),ReclaimMetadataObservationKind::Unchanged);
+                    let tr = raw_catalog.create_trx().unwrap();
+                    for key in [&metadata_active_key,&metadata_volume_key] {assert_eq!(tr.get(key,false).await.unwrap().unwrap().as_ref(),active.as_slice());}
+                    assert_reclaim_media_unchanged(debt_media.as_ref().unwrap(),&fixture.lib.cartridge(&input.destination().placement().barcode).unwrap());
+                    assert!(!fixture.commands.lock().unwrap()[original_commands.len()..].iter().any(|(_,op)|matches!(op,0x04|0x0a|0x10|0x19|0x8d|0xa5)),"空IP保持未知，不能隐式修复");
+                    return;
+                }
+                if matches!(mode, MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpDebt) {
                     boxed_metadata_phase(|| async {
                     let execution = first.unwrap();
                     let task = execution.task();
@@ -7596,6 +7657,11 @@ mod tests {
                     let commands = fixture.commands.lock().unwrap().clone();
                     let index = catalog.observed_active_volume_index(&serial, metadata_plan.volume()).await.unwrap();
                     assert_eq!(index, crate::managed_catalog::ActiveIndexIdentity::from(captured_target.construct()));
+                    assert!(execution.unwritten_evidence().is_some(), "本轮完整 DP 精确未变且完整 IP 仅落后，应可关闭原未写尝试而不先写 IP");
+                    let mut count_key=b"tape-rs/catalog/22/r/".to_vec();count_key.extend_from_slice(metadata_plan.volume().as_bytes());count_key.extend_from_slice(&index.generation.to_be_bytes());count_key.push(b'f');
+                    let coverage_keys=[count_key,own_row(b'g'),own_row(b'k'),own_row(b'm')];
+                    let tr=raw_catalog.create_trx().unwrap();let mut coverage_before=Vec::new();
+                    for key in &coverage_keys {coverage_before.push(tr.get(key,false).await.unwrap().map(|raw|raw.to_vec()));}
                     let proof = execution.unwritten_evidence().unwrap();
                     let mut changed_request = input_request.clone();changed_request.operation_id=uuid::Uuid::new_v4();
                     assert!(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&changed_request,task,proof).await.is_err());
@@ -7616,6 +7682,7 @@ mod tests {
                     let (one,two)=tokio::join!(Box::pin(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,task,proof)),Box::pin(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,task,proof)));
                     let closed=one.unwrap();assert_eq!(two.unwrap(),closed);assert!(closed.closed());assert_eq!(closed.id(),task.id());assert_eq!(closed.observation().unwrap().as_ref(),Some(proof.observation()));
                     assert_eq!(catalog.observed_active_volume_index(&serial,metadata_plan.volume()).await.unwrap(),index);
+                    let tr=raw_catalog.create_trx().unwrap();for (key,before) in coverage_keys.iter().zip(&coverage_before) {assert_eq!(&tr.get(key,false).await.unwrap().map(|raw|raw.to_vec()),before,"NoWrite关闭不能增加计数或源覆盖");}
                     let tr=raw_catalog.create_trx().unwrap();assert!(tr.get(&metadata_active_key,false).await.unwrap().is_none());assert!(tr.get(&metadata_volume_key,false).await.unwrap().is_none());
                     for key in [&next_history,&next_count,&next_receipt] {assert!(tr.get(key,false).await.unwrap().is_none());}
                     tr.set(&metadata_active_key,b"later-original-task");tr.set(&metadata_volume_key,b"later-original-task");tr.commit().await.unwrap();
@@ -7630,6 +7697,11 @@ mod tests {
                     assert!(recovered.closed());assert_eq!(recovered.id(),task.id());
                     assert!(catalog.close_unwritten_reclaim_metadata_write(&parents.items[0],next,&scanned,&input_request,&recovered,proof).await.is_err(),"旧owner实读证明不能重绑");
                     assert_eq!(*fixture.commands.lock().unwrap(),commands);
+                    if let Some(before) = debt_media {
+                        let after = fixture.lib.cartridge(&input.destination().placement().barcode).unwrap();
+                        assert_reclaim_media_unchanged(&before,&after);
+                        assert!(!fixture.commands.lock().unwrap()[original_commands.len()..].iter().any(|(_,op)|matches!(op,0x04|0x0a|0x10|0x19|0x8d|0xa5)),"债务观察与关闭全过程无写/检查点/搬带");
+                    }
                     }).await;
                     return;
                 }
@@ -7789,7 +7861,7 @@ mod tests {
                     let result = first.unwrap();
                     assert!(result.task().writing());
                     if mode == MetadataExecutionCase::LostAdmission {
-                        assert!(result.unwritten_evidence().is_none(), "原 DP 未变但 IP 落后，仍不能关闭");
+                        assert!(result.unwritten_evidence().is_some(), "完整旧IP债务不改变当前DP精确未写事实；仅返回证明，不自动关闭");
                     }
                     let expected = if mode == MetadataExecutionCase::LostAdmission {ReclaimMetadataObservationKind::Unchanged} else {ReclaimMetadataObservationKind::Committed};
                     assert_eq!(result.task().observation().unwrap().unwrap().kind(), expected);

@@ -97,8 +97,9 @@ impl ReclaimMetadataCommitEvidence {
     }
 }
 
-/// Fresh guarded evidence of the unchanged clean DP head with an equal IP
-/// generation. An old saved snapshot or a retained commit token cannot close it.
+/// Fresh guarded evidence of the unchanged clean DP head and a verified complete
+/// IP that is not ahead. A normal IP debt is preserved; this never checkpoints it.
+/// An old saved snapshot or a retained commit token cannot close the task.
 ///
 /// ```compile_fail
 /// let _: tape_rs::managed_catalog::ReclaimMetadataUnwrittenEvidence =
@@ -122,7 +123,7 @@ impl ReclaimMetadataUnwrittenEvidence {
         else {
             return Ok(None);
         };
-        if ip != target.construct().generation {
+        if !(1..=target.construct().generation).contains(&ip) {
             return Ok(None);
         }
         CurrentMetadataEvidence::capture(
