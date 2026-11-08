@@ -328,7 +328,11 @@ impl ManagedCatalog {
                             )
                             .await?;
                         if journal.is_none() && gate.is_none() {
-                            return Ok(());
+                            return management::exclusion::LibraryTaskClaim::for_reclaim(
+                                &reservation.token(),
+                            )?
+                            .require_released(&tr)
+                            .await;
                         }
                         let value = record_at(&tr, reservation, owner).await?;
                         if value["owner_epoch"] != owner {

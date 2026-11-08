@@ -3065,6 +3065,81 @@ mod tests {
             .await
             .unwrap();
         }
+        async fn assert_orphaned_release_is_rejected(
+            c: &ManagedCatalog,
+            reservation: &ReclaimReservation,
+        ) {
+            let intent = reservation.intent();
+            let ns = Uuid::parse_str(intent["namespace"].as_str().unwrap()).unwrap();
+            let serial = intent["library"].as_str().unwrap();
+            let mut journal = management::prefix(ns, b'R');
+            journal.push(b'j');
+            journal.extend_from_slice(&intent["epoch"].as_u64().unwrap().to_be_bytes());
+            journal.extend_from_slice(
+                Uuid::parse_str(intent["operation"].as_str().unwrap())
+                    .unwrap()
+                    .as_bytes(),
+            );
+            let mut gate = management::prefix(ns, b'R');
+            gate.push(b'p');
+            gate.extend_from_slice(reservation.spec().pool().as_bytes());
+            let slot = management::exclusion::key(ns, serial);
+            let mut marker = slot[..slot.len() - 1].to_vec();
+            marker.push(b'r');
+            marker.extend_from_slice(&intent["epoch"].as_u64().unwrap().to_be_bytes());
+            marker.extend_from_slice(
+                Uuid::parse_str(intent["operation"].as_str().unwrap())
+                    .unwrap()
+                    .as_bytes(),
+            );
+            let keys = [&journal, &gate, &slot, &marker];
+            let tr = c.db.create_trx().unwrap();
+            let mut original = Vec::new();
+            for key in keys {
+                original.push(tr.get(key, false).await.unwrap().unwrap().to_vec());
+            }
+            for (keep_slot, keep_marker) in [(true, true), (true, false), (false, true)] {
+                let tr = c.db.create_trx().unwrap();
+                tr.clear(&journal);
+                tr.clear(&gate);
+                for (key, keep, value) in [
+                    (&slot, keep_slot, &original[2]),
+                    (&marker, keep_marker, &original[3]),
+                ] {
+                    if keep {
+                        tr.set(key, value);
+                    } else {
+                        tr.clear(key);
+                    }
+                }
+                tr.commit().await.unwrap();
+                assert!(
+                    matches!(
+                        c.release_reserved_reclaim(reservation, 100).await,
+                        Err(CatalogError::Corrupt(_))
+                    ),
+                    "孤立库占用不得误报释放成功"
+                );
+                let tr = c.db.create_trx().unwrap();
+                for (key, keep, value) in [
+                    (&slot, keep_slot, &original[2]),
+                    (&marker, keep_marker, &original[3]),
+                ] {
+                    assert_eq!(
+                        tr.get(key, false).await.unwrap().as_deref(),
+                        keep.then_some(value.as_slice()),
+                        "拒绝时不得清除或补回原库占用"
+                    );
+                }
+                assert!(tr.get(&journal, false).await.unwrap().is_none());
+                assert!(tr.get(&gate, false).await.unwrap().is_none());
+            }
+            let tr = c.db.create_trx().unwrap();
+            for (key, value) in keys.into_iter().zip(&original) {
+                tr.set(key, value);
+            }
+            tr.commit().await.unwrap();
+        }
         let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
         let _network = unsafe { foundationdb::boot() };
         let c = ManagedCatalog::open(Some(&cluster)).unwrap();
@@ -3271,6 +3346,7 @@ mod tests {
                 .map_err(|error| error.domain()),
             Err(CatalogError::PoolBusy)
         ));
+        Box::pin(assert_orphaned_release_is_rejected(&c, &reserved)).await;
         c.claim_active_owner_epoch(&serial, 101).await.unwrap();
         assert!(c.reserved_reclaim_status(&reserved, 100).await.is_err());
         assert!(c.release_reserved_reclaim(&reserved, 100).await.is_err());
@@ -3294,6 +3370,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        c.release_reserved_reclaim(&resumed, 101).await.unwrap();
         assert!(matches!(
             c.reserve_reclaim_pool(&serial, route, 101, 1, Uuid::new_v4(), &spec)
                 .await,
@@ -3330,6 +3407,7 @@ mod tests {
         c.begin_library_rescan(&serial, route, 101, &scan_again)
             .await
             .unwrap();
+        c.release_reserved_reclaim(&resumed, 101).await.unwrap();
         assert_eq!(
             c.finish_native_device_task(
                 &unassign_task,

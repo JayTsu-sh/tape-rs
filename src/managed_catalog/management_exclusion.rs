@@ -91,6 +91,19 @@ impl LibraryTaskClaim {
         }
         Ok(())
     }
+    /// A replay may observe a complete successor, but never an orphaned claim.
+    pub(in crate::managed_catalog::control) async fn require_released(
+        &self,
+        tr: &Transaction,
+    ) -> Result<()> {
+        if tr.get(&self.marker, false).await?.is_some() {
+            return Err(CatalogError::Corrupt("原任务记录缺失但带库互斥占用仍在"));
+        }
+        match require_available_at(tr, self.namespace, &self.serial).await {
+            Err(CatalogError::PoolBusy) => Ok(()),
+            result => result,
+        }
+    }
     /// Caller must prove availability/ownership in this same transaction first.
     /// All encoding is complete, so these mutations cannot partially fail.
     pub(in crate::managed_catalog::control) fn acquire(&self, tr: &Transaction) {
