@@ -88,11 +88,12 @@ fn reclaim_metadata_claim_retains_typed_original_identity_and_rejects_other_payl
     task.extend_from_slice(&u64::MAX.to_be_bytes());
     task.extend_from_slice(Uuid::new_v4().as_bytes());
     task.extend_from_slice(&u64::MAX.to_be_bytes());
-    task.extend_from_slice(&[9; 32]);
+    let attempt = Uuid::new_v4();
+    task.extend_from_slice(attempt.as_bytes());
     let value = ReclaimMetadataVolumeClaim {
         namespace: ns.to_string(),
         volume: Uuid::new_v4().to_string(),
-        attempt: Uuid::new_v4().to_string(),
+        attempt: attempt.to_string(),
         task,
         fingerprint: [9; 32],
     };
@@ -118,8 +119,15 @@ fn reclaim_metadata_claim_retains_typed_original_identity_and_rejects_other_payl
     let mut changed = value.clone();
     changed.task[0] ^= 1;
     assert!(encode(&NodeVolumeClaim::ReclaimMetadata(Box::new(changed))).is_err());
+    // The key binds the attempt; only its original ledger can authorize a plan fingerprint.
+    let mut different_plan = value.clone();
+    different_plan.fingerprint[0] ^= 1;
+    let changed_claim = NodeVolumeClaim::ReclaimMetadata(Box::new(different_plan));
+    let changed_raw = encode(&changed_claim).unwrap();
+    assert_ne!(changed_raw, raw);
+    assert_eq!(decode(&changed_raw).unwrap(), changed_claim);
     let mut changed = value;
-    changed.fingerprint[0] ^= 1;
+    changed.attempt = Uuid::new_v4().to_string();
     assert!(encode(&NodeVolumeClaim::ReclaimMetadata(Box::new(changed))).is_err());
     let mut body: serde_json::Value = serde_json::from_slice(&raw[2..]).unwrap();
     body["unexpected"] = true.into();

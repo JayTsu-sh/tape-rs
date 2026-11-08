@@ -81,15 +81,10 @@ impl ReclaimMetadataWriter<'_> {
         if task.owner() != self.key.round()
             || self
                 .catalog
-                .reclaim_metadata_write_status(
-                    reservation,
-                    self.key.round(),
-                    task.plan().source_uid(),
-                )
+                .reclaim_metadata_attempt_status(reservation, self.key.round(), task)
                 .await
                 .map_err(catalog)?
-                .as_ref()
-                != Some(task)
+                != *task
         {
             return Err(catalog("回收元数据原 Writing 任务或占用改变"));
         }
@@ -117,14 +112,9 @@ impl ReclaimMetadataWriter<'_> {
         {
             let task = self
                 .catalog
-                .reclaim_metadata_write_status(
-                    reservation,
-                    self.key.round(),
-                    original.plan().source_uid(),
-                )
+                .reclaim_metadata_attempt_status(reservation, self.key.round(), original)
                 .await
-                .map_err(catalog)?
-                .ok_or_else(|| catalog("已发布元数据任务缺失"))?;
+                .map_err(catalog)?;
             return Ok(ReclaimMetadataExecution {
                 task,
                 commit: None,
@@ -137,14 +127,10 @@ impl ReclaimMetadataWriter<'_> {
         if !original.writing() && source.is_none() {
             let current = self
                 .catalog
-                .reclaim_metadata_write_status(
-                    reservation,
-                    self.key.round(),
-                    original.plan().source_uid(),
-                )
+                .reclaim_metadata_attempt_status(reservation, self.key.round(), original)
                 .await
                 .map_err(catalog)?;
-            if !current.is_some_and(|task| task.writing() && task.plan() == original.plan()) {
+            if !(current.writing() && current.plan() == original.plan()) {
                 return Err(catalog("首次元数据执行缺少原源节点实读"));
             }
         }

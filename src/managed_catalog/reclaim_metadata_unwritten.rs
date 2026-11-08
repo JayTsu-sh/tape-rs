@@ -26,9 +26,10 @@ impl ManagedCatalog {
                         async {
                             parent_at(&tr, reservation, owner).await?;
                             let plan = original.plan();
-                            let mut task = load_at(&tr, reservation, plan.source_uid())
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
+                            let mut task =
+                                load_id_at(&tr, reservation, plan.source_uid(), original.id())
+                                    .await?
+                                    .ok_or(CatalogError::Incomplete)?;
                             publication::require_original(original, &task, owner)?;
                             input_at(&tr, reservation, owner, file, request, &plan).await?;
                             if task.observation()?.as_ref() != Some(evidence) {
@@ -76,9 +77,11 @@ impl ManagedCatalog {
                             .await?;
                             task.0.phase = Phase::Closed;
                             let raw = task.encode()?;
-                            let key = task_key(reservation, &plan)?;
+                            let header = registry::encode(reservation, &task)?;
+                            let key = task_key(reservation, &task);
                             // load_at proved both exact own claims. All fallible work is done.
                             tr.set(&key, &raw);
+                            tr.set(&registry::key(reservation), &header);
                             tr.clear(&ledger::own_key(reservation, b'A'));
                             tr.clear(&node_attempts::volume_key(plan.volume()));
                             Ok(task)

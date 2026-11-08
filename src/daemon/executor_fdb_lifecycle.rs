@@ -6039,6 +6039,24 @@ mod tests {
         .await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；元数据活跃检查点缺失拒绝及原尝试历史，Sim，无实际设备"]
+    async fn reclaim_metadata_active_registry_rejects_missing_indexes_and_retains_attempts() {
+        Box::pin(native_lifecycle(MetadataCase::Execution(
+            MetadataExecutionCase::AttemptRegistry,
+        )))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；显式多后继保留原句柄与 FDB HA，Sim，无实际设备"]
+    async fn reclaim_metadata_attempt_successors_preserve_original_handles_and_ha() {
+        Box::pin(native_lifecycle(MetadataCase::Execution(
+            MetadataExecutionCase::AttemptHistory,
+        )))
+        .await;
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum MetadataExecutionCase {
         Commit,
@@ -6050,6 +6068,8 @@ mod tests {
         Publication,
         UnwrittenClose,
         UnwrittenIpAhead,
+        AttemptRegistry,
+        AttemptHistory,
     }
 
     fn checkpoint_metadata_fixture(fixture: &Fixture, drive: usize) {
@@ -7164,6 +7184,9 @@ mod tests {
                 .unwrap(),
             data_progress
         );
+        // Poll metadata validation separately from the deep ordinary-write
+        // recovery setup; keep the default test/production stack unchanged.
+        Box::pin(async {
         let input_request = intent.request();
         let input = catalog
             .reclaim_metadata_input(&reserved, fixture.owner.round, &scanned, &input_request)
@@ -7219,9 +7242,9 @@ mod tests {
         );
         let mut latest_metadata_key = own_row(b'T');
         latest_metadata_key.extend_from_slice(&source_data_uid.to_be_bytes());
-        let mut metadata_task_key = own_row(b'W');
-        metadata_task_key.extend_from_slice(&source_data_uid.to_be_bytes());
-        metadata_task_key.extend_from_slice(&metadata_plan.fingerprint().unwrap());
+        let mut metadata_task_prefix = own_row(b'W');
+        metadata_task_prefix.extend_from_slice(&source_data_uid.to_be_bytes());
+        let metadata_header_key = own_row(b'Z');
         let metadata_active_key = own_row(b'A');
         let mut metadata_volume_key = b"tape-rs/catalog/22/@/".to_vec();
         metadata_volume_key.extend_from_slice(uuid::Uuid::nil().as_bytes());
@@ -7283,7 +7306,7 @@ mod tests {
         let tr = raw_catalog.create_trx().unwrap();
         for key in [
             &latest_metadata_key,
-            &metadata_task_key,
+            &metadata_header_key,
             &metadata_active_key,
             &metadata_volume_key,
         ] {
@@ -7294,6 +7317,14 @@ mod tests {
         }
         tr.set(&pool_key, &pool_bytes);
         tr.commit().await.unwrap();
+        assert_eq!(
+            catalog
+                .reclaim_metadata_write_status(&reserved, fixture.owner.round, source_data_uid)
+                .await
+                .unwrap(),
+            None,
+            "失败准备不能留下孤立原尝试"
+        );
         let (first, duplicate) = tokio::join!(
             Box::pin(catalog.prepare_reclaim_metadata_write(
                 &reserved,
@@ -7311,6 +7342,8 @@ mod tests {
             ))
         );
         let metadata_write = first.unwrap();
+        let mut metadata_task_key = metadata_task_prefix;
+        metadata_task_key.extend_from_slice(metadata_write.id().as_bytes());
         assert_eq!(duplicate.unwrap(), metadata_write);
         assert_eq!(metadata_write.plan(), metadata_plan);
         assert!(!metadata_write.closed());
@@ -7366,6 +7399,106 @@ mod tests {
                 assert!(writer.execute(&reserved, &scanned, &input_request, &metadata_write, Some(&captured_target)).await.is_err(), "其他卷不是原源实读");
                 assert_eq!(*fixture.commands.lock().unwrap(), original_commands);
                 assert_eq!(catalog.reclaim_metadata_write_status(&reserved, fixture.owner.round, source_data_uid).await.unwrap(), Some(metadata_write.clone()));
+                if mode == MetadataExecutionCase::AttemptRegistry {
+                    Box::pin(async {
+                        let commands=fixture.commands.lock().unwrap().clone();
+                        assert_eq!(catalog.pending_reclaim_metadata_write(&reserved,fixture.owner.round).await.unwrap(),Some(metadata_write.clone()));
+                        assert!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&metadata_write).await.is_err());
+                        let keys=[&metadata_active_key,&metadata_volume_key,&latest_metadata_key,&metadata_header_key,&metadata_task_key];
+                        for key in keys {
+                            let tr=raw_catalog.create_trx().unwrap();let original=tr.get(key,false).await.unwrap().unwrap().to_vec();tr.clear(key);tr.commit().await.unwrap();
+                            let missing=catalog.pending_reclaim_metadata_write(&reserved,fixture.owner.round).await;
+                            let prepare=catalog.prepare_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&metadata_plan).await;
+                            let tr=raw_catalog.create_trx().unwrap();let untouched=tr.get(key,false).await.unwrap().is_none();tr.set(key,&original);tr.commit().await.unwrap();
+                            assert!(missing.is_err() && prepare.is_err(),"缺失原索引不能报告空闲或准备新任务");
+                            assert!(untouched,"查询与准备拒绝不能修复丢失的索引");
+                        }
+                        let fp=metadata_plan.fingerprint().unwrap();let mut wrong=fp;wrong[0]^=1;
+                        let before=format!("\"fingerprint\":{}",serde_json::to_string(&fp).unwrap());let after=format!("\"fingerprint\":{}",serde_json::to_string(&wrong).unwrap());
+                        let payload=std::str::from_utf8(&active[2..]).unwrap();assert!(payload.contains(&before));let mut corrupt_claim=active[..2].to_vec();corrupt_claim.extend_from_slice(payload.replace(&before,&after).as_bytes());
+                        let tr=raw_catalog.create_trx().unwrap();tr.set(&metadata_active_key,&corrupt_claim);tr.set(&metadata_volume_key,&corrupt_claim);tr.commit().await.unwrap();
+                        let mismatch=catalog.pending_reclaim_metadata_write(&reserved,fixture.owner.round).await;
+                        let tr=raw_catalog.create_trx().unwrap();tr.set(&metadata_active_key,&active);tr.set(&metadata_volume_key,&active);tr.commit().await.unwrap();assert!(mismatch.is_err(),"两索引互相相同仍须绑定原任务计划");
+                        let tr=raw_catalog.create_trx().unwrap();let header=tr.get(&metadata_header_key,false).await.unwrap().unwrap().to_vec();
+                        let mut corrupt=header.clone();corrupt[5]^=1;tr.set(&metadata_header_key,&corrupt);tr.commit().await.unwrap();
+                        let error=catalog.pending_reclaim_metadata_write(&reserved,fixture.owner.round).await;
+                        let tr=raw_catalog.create_trx().unwrap();assert_eq!(tr.get(&metadata_header_key,false).await.unwrap().unwrap().as_ref(),corrupt.as_slice());tr.set(&metadata_header_key,&header);tr.commit().await.unwrap();assert!(error.is_err());
+                        let tr=raw_catalog.create_trx().unwrap();let prepared=tr.get(&metadata_task_key,false).await.unwrap().unwrap().to_vec();
+                        let admitted=catalog.admit_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&metadata_write).await.unwrap();
+                        let tr=raw_catalog.create_trx().unwrap();let writing=tr.get(&metadata_task_key,false).await.unwrap().unwrap().to_vec();tr.set(&metadata_task_key,&prepared);tr.commit().await.unwrap();
+                        let rollback=catalog.pending_reclaim_metadata_write(&reserved,fixture.owner.round).await;
+                        let tr=raw_catalog.create_trx().unwrap();tr.set(&metadata_task_key,&writing);tr.commit().await.unwrap();assert!(rollback.is_err(),"保留检查点不能接受 Writing 回退 Prepared");
+                        let observation=metadata_plan.observe_current(&captured_target,None).unwrap();
+                        let observed=catalog.record_reclaim_metadata_observation(&reserved,fixture.owner.round,admitted.task(),&observation).await.unwrap();
+                        let tr=raw_catalog.create_trx().unwrap();let with_observation=tr.get(&metadata_task_key,false).await.unwrap().unwrap().to_vec();tr.set(&metadata_task_key,&writing);tr.commit().await.unwrap();
+                        let rollback=catalog.pending_reclaim_metadata_write(&reserved,fixture.owner.round).await;
+                        let tr=raw_catalog.create_trx().unwrap();tr.set(&metadata_task_key,&with_observation);tr.commit().await.unwrap();assert!(rollback.is_err(),"保留检查点不能丢失已保存观察");
+                        assert_eq!(catalog.pending_reclaim_metadata_write(&reserved,fixture.owner.round).await.unwrap(),Some(observed.clone()));
+                        let next=fixture.owner.round+100;catalog.claim_active_owner_epoch(&serial,next).await.unwrap();
+                        let parents=catalog.claim_reclaim_reservations_page(&serial,route,next,None,16).await.unwrap();let parent=&parents.items[0];
+                        let claimed=catalog.claim_reclaim_metadata_attempt(parent,next,&observed).await.unwrap();
+                        assert_eq!(claimed.id(),metadata_write.id());assert_eq!(claimed.observation().unwrap(),observed.observation().unwrap());
+                        let tr=raw_catalog.create_trx().unwrap();let claimed_raw=tr.get(&metadata_task_key,false).await.unwrap().unwrap().to_vec();tr.set(&metadata_task_key,&with_observation);tr.commit().await.unwrap();
+                        let rollback=catalog.pending_reclaim_metadata_write(parent,next).await;
+                        let tr=raw_catalog.create_trx().unwrap();tr.set(&metadata_task_key,&claimed_raw);tr.commit().await.unwrap();assert!(rollback.is_err(),"检查点不能接受 owner 回退");
+                        assert_eq!(catalog.reclaim_metadata_attempt(parent,next,source_data_uid,claimed.id()).await.unwrap(),claimed);
+                        assert!(catalog.pending_reclaim_metadata_write(&reserved,fixture.owner.round).await.is_err());
+                        assert!(catalog.retry_reclaim_metadata_write(parent,next,&scanned,&input_request,&claimed).await.is_err(),"Writing 不能发新尝试");
+                        assert_eq!(*fixture.commands.lock().unwrap(),commands,"发现/领取/拒绝均无设备命令");
+                    }).await;
+                    return;
+                }
+                if mode == MetadataExecutionCase::AttemptHistory {
+                    Box::pin(async {
+                        let commands=fixture.commands.lock().unwrap().clone();
+                        let first=catalog.close_prepared_reclaim_metadata_write(&reserved,fixture.owner.round,&metadata_write).await.unwrap();
+                        let tr=raw_catalog.create_trx().unwrap();let first_raw=tr.get(&metadata_task_key,false).await.unwrap().unwrap().to_vec();
+                        let (one,two)=tokio::join!(Box::pin(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&first)),Box::pin(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&first)));
+                        let second=one.unwrap();assert_eq!(two.unwrap(),second);assert_ne!(second.id(),first.id());assert_eq!(second.first_attempt(),first.id());assert_eq!(second.previous_attempt(),Some(first.id()));
+                        assert_eq!(catalog.close_prepared_reclaim_metadata_write(&reserved,fixture.owner.round,&metadata_write).await.unwrap(),first);
+                        assert_eq!(catalog.prepare_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&metadata_plan).await.unwrap(),first,"首次准备重放不能变成最新尝试");
+                        let second_closed=catalog.close_prepared_reclaim_metadata_write(&reserved,fixture.owner.round,&second).await.unwrap();
+                        let third=catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&second_closed).await.unwrap();
+                        assert_ne!(third.id(),second.id());assert_eq!(third.first_attempt(),first.id());assert_eq!(third.previous_attempt(),Some(second.id()));
+                        assert_eq!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&first).await.unwrap(),second_closed,"旧重试始终返回原后继，不返回第三次");
+                        assert_eq!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&second_closed).await.unwrap(),third);
+                        assert_eq!(catalog.reclaim_metadata_attempt(&reserved,fixture.owner.round,source_data_uid,first.id()).await.unwrap(),first);
+                        assert_eq!(catalog.reclaim_metadata_write_status(&reserved,fixture.owner.round,source_data_uid).await.unwrap(),Some(third.clone()));
+                        assert_eq!(catalog.pending_reclaim_metadata_write(&reserved,fixture.owner.round).await.unwrap(),Some(third.clone()));
+                        let tr=raw_catalog.create_trx().unwrap();assert_eq!(tr.get(&metadata_task_key,false).await.unwrap().unwrap().as_ref(),first_raw.as_slice());
+                        let mut edge=own_row(b'U');edge.extend_from_slice(&source_data_uid.to_be_bytes());edge.extend_from_slice(second.id().as_bytes());
+                        let original=tr.get(&edge,false).await.unwrap().unwrap().to_vec();assert_eq!(original,third.id().as_bytes());tr.clear(&edge);tr.commit().await.unwrap();
+                        let missing=catalog.pending_reclaim_metadata_write(&reserved,fixture.owner.round).await;
+                        let retry=catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&second_closed).await;
+                        let tr=raw_catalog.create_trx().unwrap();let untouched=tr.get(&edge,false).await.unwrap().is_none();tr.set(&edge,&original);tr.commit().await.unwrap();assert!(missing.is_err() && retry.is_err() && untouched,"丢失后继边不能重建或另发请求");
+                        assert!(writer.execute(&reserved,&scanned,&input_request,&metadata_write,Some(&captured)).await.is_err(),"旧物理尝试不能解释成新尝试");
+                        assert_eq!(*fixture.commands.lock().unwrap(),commands);
+                        let execution=writer.execute(&reserved,&scanned,&input_request,&third,Some(&captured)).await.unwrap();
+                        let published=catalog.publish_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,execution.task(),execution.commit_evidence().unwrap()).await.unwrap();
+                        assert_eq!(published.id(),third.id());
+                        let completed=catalog.reclaim_metadata_attempt(&reserved,fixture.owner.round,source_data_uid,third.id()).await.unwrap();assert!(completed.completed());
+                        assert_eq!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&first).await.unwrap(),second_closed);
+                        assert_eq!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&second_closed).await.unwrap(),completed);
+                        let mut rows=Vec::new();let tr=raw_catalog.create_trx().unwrap();
+                        for id in [first.id(),second.id(),third.id()] {let mut key=own_row(b'W');key.extend_from_slice(&source_data_uid.to_be_bytes());key.extend_from_slice(id.as_bytes());rows.push((key.clone(),tr.get(&key,false).await.unwrap().unwrap().to_vec()));tr.clear(&key);}
+                        for key in [&latest_metadata_key,&metadata_header_key,&own_row(b'm')] {rows.push((key.clone(),tr.get(key,false).await.unwrap().unwrap().to_vec()));tr.clear(key);}
+                        tr.commit().await.unwrap();
+                        assert_eq!(catalog.observed_active_volume_index(&serial,metadata_plan.volume()).await.unwrap(),published.observation().current(),"后继发布历史不依赖原尝试行/检查点/源清单");
+                        let tr=raw_catalog.create_trx().unwrap();for (key,raw) in &rows {tr.set(key,raw);}tr.commit().await.unwrap();
+                        let commands=fixture.commands.lock().unwrap().clone();let next=fixture.owner.round+100;catalog.claim_active_owner_epoch(&serial,next).await.unwrap();
+                        let parents=catalog.claim_reclaim_reservations_page(&serial,route,next,None,16).await.unwrap();let parent=&parents.items[0];
+                        let current=catalog.claim_reclaim_metadata_attempt(parent,next,&completed).await.unwrap();assert_eq!(current.id(),third.id());
+                        let tr=raw_catalog.create_trx().unwrap();let header=tr.get(&metadata_header_key,false).await.unwrap().unwrap().to_vec();
+                        let old=catalog.claim_reclaim_metadata_attempt(parent,next,&second_closed).await.unwrap();
+                        let tr=raw_catalog.create_trx().unwrap();assert_eq!(tr.get(&metadata_header_key,false).await.unwrap().unwrap().as_ref(),header.as_slice(),"历史领取不能替换当前检查点");
+                        assert_eq!(catalog.retry_reclaim_metadata_write(parent,next,&scanned,&input_request,&first).await.unwrap(),old);
+                        assert_eq!(catalog.retry_reclaim_metadata_write(parent,next,&scanned,&input_request,&old).await.unwrap(),current);
+                        assert_eq!(catalog.reclaim_metadata_publication(parent,next,&scanned,&input_request,&third).await.unwrap(),Some(published));
+                        assert_eq!(catalog.reclaim_metadata_attempt(parent,next,source_data_uid,first.id()).await.unwrap(),first);
+                        assert_eq!(*fixture.commands.lock().unwrap(),commands,"FDB HA 历史查询/领取不发设备命令");
+                    }).await;
+                    return;
+                }
                 if matches!(mode, MetadataExecutionCase::LostAdmission | MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpAhead) {
                     catalog.admit_reclaim_metadata_write(&reserved, fixture.owner.round, &scanned, &input_request, &metadata_write).await.unwrap();
                 }
@@ -9138,5 +9271,6 @@ mod tests {
         );
         assert_eq!(fixture.drive_log(), drive_before_replay);
         assert_eq!(fixture.changer_log(), changer_before_replay);
+        }).await;
     }
 }

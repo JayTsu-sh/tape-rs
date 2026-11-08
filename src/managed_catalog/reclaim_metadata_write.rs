@@ -4,6 +4,10 @@ use super::*;
 use metadata_plan::Plan;
 #[path = "reclaim_metadata_publication.rs"]
 mod publication;
+#[path = "reclaim_metadata_registry.rs"]
+mod registry;
+#[path = "reclaim_metadata_retry.rs"]
+mod retry;
 #[path = "reclaim_metadata_unwritten.rs"]
 mod unwritten;
 pub use publication::ReclaimMetadataPublication;
@@ -23,6 +27,8 @@ enum Phase {
 struct Record {
     version: u8,
     id: String,
+    first: String,
+    previous: Option<String>,
     scan: String,
     plan: Plan,
     owner: u64,
@@ -37,6 +43,15 @@ pub struct ReclaimMetadataWrite(Record);
 impl ReclaimMetadataWrite {
     pub fn id(&self) -> Uuid {
         Uuid::parse_str(&self.0.id).expect("validated metadata attempt")
+    }
+    pub fn first_attempt(&self) -> Uuid {
+        Uuid::parse_str(&self.0.first).expect("validated first attempt")
+    }
+    pub fn previous_attempt(&self) -> Option<Uuid> {
+        self.0
+            .previous
+            .as_deref()
+            .map(|id| Uuid::parse_str(id).expect("validated previous attempt"))
     }
     pub(crate) fn scan_id(&self) -> Uuid {
         Uuid::parse_str(&self.0.scan).expect("validated metadata scan")
@@ -71,6 +86,15 @@ impl ReclaimMetadataWrite {
         self.plan().encode()?;
         node_mutation::id(&self.0.id)?;
         node_mutation::id(&self.0.scan)?;
+        let first = node_mutation::id(&self.0.first)?;
+        if self.0.previous.is_none() != (first == self.id()) {
+            return Err(CatalogError::Corrupt("元数据首次尝试与前身身份不一致"));
+        }
+        if let Some(previous) = &self.0.previous
+            && node_mutation::id(previous)? == self.id()
+        {
+            return Err(CatalogError::Corrupt("元数据尝试不能以前身指向自身"));
+        }
         if let Some(observed) = self.observation()?
             && !(self.writing()
                 || self.completed()
@@ -85,7 +109,7 @@ impl ReclaimMetadataWrite {
         {
             return Err(CatalogError::Corrupt("已发布元数据任务缺少原提交观察"));
         }
-        if self.0.version != 3 || self.0.owner == 0 || self.0.owner > 0xFFFF_FFFF_FFFF {
+        if self.0.version != 4 || self.0.owner == 0 || self.0.owner > 0xFFFF_FFFF_FFFF {
             return Err(CatalogError::Corrupt("回收元数据任务版本或 owner 无效"));
         }
         let raw = serde_json::to_vec(&self.0).map_err(cache)?;
@@ -128,7 +152,11 @@ fn require_phase_history(
 ) -> Result<()> {
     // Prepared branches into unwritten Closed or Writing→Committed.
     // A retained reply must never be reinterpreted as the other branch.
-    if original.id() != current.id() || original.0.scan != current.0.scan {
+    if original.id() != current.id()
+        || original.0.scan != current.0.scan
+        || original.0.previous != current.0.previous
+        || original.0.first != current.0.first
+    {
         return Err(CatalogError::Corrupt(
             "回收元数据任务改变原物理尝试或扫描身份",
         ));
@@ -160,11 +188,15 @@ fn task_prefix(reservation: &ReclaimReservation, uid: u64) -> Vec<u8> {
     key.extend_from_slice(&uid.to_be_bytes());
     key
 }
-fn task_key(reservation: &ReclaimReservation, plan: &ReclaimMetadataPlan) -> Result<Vec<u8>> {
-    let mut key = task_prefix(reservation, plan.0.source.uid);
-    key.extend_from_slice(&plan.fingerprint()?);
-    Ok(key)
+fn attempt_key(reservation: &ReclaimReservation, uid: u64, id: Uuid) -> Vec<u8> {
+    let mut key = task_prefix(reservation, uid);
+    key.extend_from_slice(id.as_bytes());
+    key
 }
+fn task_key(reservation: &ReclaimReservation, task: &ReclaimMetadataWrite) -> Vec<u8> {
+    attempt_key(reservation, task.0.plan.source.uid, task.id())
+}
+
 fn claim(reservation: &ReclaimReservation, task: &ReclaimMetadataWrite) -> Result<Vec<u8>> {
     let plan = task.plan();
     node_claims::encode(&node_claims::NodeVolumeClaim::ReclaimMetadata(Box::new(
@@ -172,7 +204,7 @@ fn claim(reservation: &ReclaimReservation, task: &ReclaimMetadataWrite) -> Resul
             namespace: reservation.namespace().to_string(),
             volume: plan.0.volume.clone(),
             attempt: task.0.id.clone(),
-            task: task_key(reservation, &plan)?,
+            task: task_key(reservation, task),
             fingerprint: plan.fingerprint()?,
         },
     )))
@@ -182,10 +214,9 @@ pub(in super::super) async fn require_idle_at(
     tr: &Transaction,
     reservation: &ReclaimReservation,
 ) -> Result<()> {
-    if tr
-        .get(&ledger::own_key(reservation, b'A'), false)
+    if registry::read_at(tr, reservation)
         .await?
-        .is_some()
+        .is_some_and(|task| task.holds_claim())
     {
         return Err(CatalogError::PoolBusy);
     }
@@ -199,36 +230,22 @@ async fn parent_at(tr: &Transaction, reservation: &ReclaimReservation, owner: u6
     Ok(())
 }
 
-async fn load_at(
+async fn read_body_at(
     tr: &Transaction,
     reservation: &ReclaimReservation,
     uid: u64,
+    id: Uuid,
 ) -> Result<Option<ReclaimMetadataWrite>> {
-    if uid == 0 {
-        return Err(CatalogError::Invalid("回收元数据源 UID 不能为零"));
+    if uid == 0 || id.is_nil() {
+        return Err(CatalogError::Invalid("回收元数据 UID 或尝试身份为空"));
     }
-    let Some(fp) = tr.get(&latest_key(reservation, uid), false).await? else {
-        if requests::prefix_has_rows(tr, &task_prefix(reservation, uid)).await? {
-            return Err(CatalogError::Corrupt("回收元数据任务缺少原身份索引"));
-        }
+    let Some(raw) = tr.get(&attempt_key(reservation, uid, id), false).await? else {
         return Ok(None);
     };
-    if fp.len() != 32 {
-        return Err(CatalogError::Corrupt("回收元数据任务身份长度无效"));
-    }
-    let mut key = task_prefix(reservation, uid);
-    key.extend_from_slice(&fp);
-    let raw = tr
-        .get(&key, false)
-        .await?
-        .ok_or(CatalogError::Corrupt("回收元数据任务缺失"))?;
     let task = ReclaimMetadataWrite::decode(&raw)?;
     let plan = task.plan();
-    if plan.0.parent != reservation.fingerprint()
-        || plan.0.source.uid != uid
-        || plan.fingerprint()?.as_slice() != fp.as_ref()
-    {
-        return Err(CatalogError::Corrupt("回收元数据任务与原父身份不符"));
+    if plan.0.parent != reservation.fingerprint() || plan.0.source.uid != uid || task.id() != id {
+        return Err(CatalogError::Corrupt("回收元数据任务与原父或尝试身份不符"));
     }
     let manifest = ledger::require_complete_at(tr, reservation).await?;
     if plan.0.inventory != manifest.summary.digest
@@ -242,7 +259,29 @@ async fn load_at(
     {
         return Err(CatalogError::Corrupt("回收元数据任务与原始封存清单不同"));
     }
-    let expected = claim(reservation, &task)?;
+    Ok(Some(task))
+}
+
+async fn raw_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    uid: u64,
+    id: Uuid,
+) -> Result<Option<ReclaimMetadataWrite>> {
+    let value = read_body_at(tr, reservation, uid, id).await?;
+    if let Some(task) = &value {
+        registry::require_previous_at(tr, reservation, task).await?;
+    }
+    Ok(value)
+}
+
+async fn require_claims_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    task: &ReclaimMetadataWrite,
+) -> Result<()> {
+    let plan = task.plan();
+    let expected = claim(reservation, task)?;
     let active = tr.get(&ledger::own_key(reservation, b'A'), false).await?;
     let held = tr
         .get(&node_attempts::volume_key(plan.volume()), false)
@@ -265,10 +304,51 @@ async fn load_at(
     {
         return Err(CatalogError::Corrupt("回收元数据原目标扫描身份改变"));
     }
+    Ok(())
+}
+
+async fn load_id_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    uid: u64,
+    id: Uuid,
+) -> Result<Option<ReclaimMetadataWrite>> {
+    let Some(task) = raw_at(tr, reservation, uid, id).await? else {
+        return Ok(None);
+    };
+    require_claims_at(tr, reservation, &task).await?;
+    if task.holds_claim() {
+        registry::require_current_at(tr, reservation, &task).await?;
+    }
     if task.completed() {
         Box::pin(publication::require_task_at(tr, reservation, &task)).await?;
     }
     Ok(Some(task))
+}
+
+async fn load_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    uid: u64,
+) -> Result<Option<ReclaimMetadataWrite>> {
+    if uid == 0 {
+        return Err(CatalogError::Invalid("回收元数据源 UID 不能为零"));
+    }
+    registry::read_at(tr, reservation).await?;
+    let Some(raw) = tr.get(&latest_key(reservation, uid), false).await? else {
+        if requests::prefix_has_rows(tr, &task_prefix(reservation, uid)).await? {
+            return Err(CatalogError::Corrupt("回收元数据任务缺少原身份索引"));
+        }
+        return Ok(None);
+    };
+    let id = uuid_from(&raw)?;
+    if id.is_nil() {
+        return Err(CatalogError::Corrupt("元数据最新尝试身份为空"));
+    }
+    load_id_at(tr, reservation, uid, id)
+        .await?
+        .map(Some)
+        .ok_or(CatalogError::Corrupt("元数据最新尝试缺少原记录"))
 }
 
 async fn input_at(
@@ -364,17 +444,28 @@ impl ManagedCatalog {
                     requests::retry_result(
                         async {
                             parent_at(&tr, reservation, owner).await?;
+                            registry::read_at(&tr, reservation).await?;
                             let input =
                                 input_at(&tr, reservation, owner, file, request, plan).await?;
                             if let Some(saved) =
                                 load_at(&tr, reservation, plan.0.source.uid).await?
                             {
+                                let saved = load_id_at(
+                                    &tr,
+                                    reservation,
+                                    plan.source_uid(),
+                                    saved.first_attempt(),
+                                )
+                                .await?
+                                .ok_or(CatalogError::Corrupt("元数据准备缺少原首次尝试"))?;
                                 if saved.plan() != *plan {
                                     return Err(CatalogError::Invalid(
                                         "回收元数据重试改变固定计划",
                                     ));
                                 }
-                                if saved.owner() != owner {
+                                if saved.owner() > owner
+                                    || saved.holds_claim() && saved.owner() != owner
+                                {
                                     return Err(CatalogError::OwnerFenced);
                                 }
                                 return Ok(saved);
@@ -387,9 +478,12 @@ impl ManagedCatalog {
                                 plan.volume(),
                             )
                             .await?;
+                            let id = Uuid::new_v4().to_string();
                             let task = ReclaimMetadataWrite(Record {
-                                version: 3,
-                                id: Uuid::new_v4().to_string(),
+                                version: 4,
+                                id: id.clone(),
+                                first: id,
+                                previous: None,
                                 scan: scan.to_string(),
                                 plan: plan.0.clone(),
                                 owner,
@@ -397,12 +491,16 @@ impl ManagedCatalog {
                                 observation: None,
                             });
                             let raw = task.encode()?;
-                            let key = task_key(reservation, plan)?;
-                            let fp = plan.fingerprint()?;
+                            let key = task_key(reservation, &task);
                             let held = claim(reservation, &task)?;
+                            let header = registry::encode(reservation, &task)?;
                             // All fallible validation/encoding precedes the first mutation.
                             tr.set(&key, &raw);
-                            tr.set(&latest_key(reservation, plan.0.source.uid), &fp);
+                            tr.set(
+                                &latest_key(reservation, plan.0.source.uid),
+                                task.id().as_bytes(),
+                            );
+                            tr.set(&registry::key(reservation), &header);
                             tr.set(&ledger::own_key(reservation, b'A'), &held);
                             tr.set(&node_attempts::volume_key(plan.volume()), &held);
                             Ok(task)
@@ -438,9 +536,10 @@ impl ManagedCatalog {
                         async {
                             parent_at(&tr, reservation, owner).await?;
                             let plan = original.plan();
-                            let mut task = load_at(&tr, reservation, plan.0.source.uid)
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
+                            let mut task =
+                                load_id_at(&tr, reservation, plan.0.source.uid, original.id())
+                                    .await?
+                                    .ok_or(CatalogError::Incomplete)?;
                             if task.owner() != owner {
                                 return Err(CatalogError::OwnerFenced);
                             }
@@ -476,8 +575,10 @@ impl ManagedCatalog {
                             }
                             task.0.phase = Phase::Writing;
                             let raw = task.encode()?;
-                            let key = task_key(reservation, &plan)?;
+                            let key = task_key(reservation, &task);
+                            let header = registry::encode(reservation, &task)?;
                             tr.set(&key, &raw);
+                            tr.set(&registry::key(reservation), &header);
                             Ok(ReclaimMetadataAdmission {
                                 task,
                                 needs_observation: false,
@@ -505,7 +606,7 @@ impl ManagedCatalog {
         let tr = self.db.create_trx()?;
         parent_at(&tr, reservation, owner).await?;
         let plan = original.plan();
-        let task = load_at(&tr, reservation, plan.source_uid())
+        let task = load_id_at(&tr, reservation, plan.source_uid(), original.id())
             .await?
             .ok_or(CatalogError::Incomplete)?;
         if task.owner() != owner || original.owner() != owner {
@@ -553,9 +654,10 @@ impl ManagedCatalog {
                         async {
                             parent_at(&tr, reservation, owner).await?;
                             let plan = original.plan();
-                            let mut task = load_at(&tr, reservation, plan.0.source.uid)
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
+                            let mut task =
+                                load_id_at(&tr, reservation, plan.0.source.uid, original.id())
+                                    .await?
+                                    .ok_or(CatalogError::Incomplete)?;
                             if task.owner() != owner {
                                 return Err(CatalogError::OwnerFenced);
                             }
@@ -575,7 +677,10 @@ impl ManagedCatalog {
                             }
                             task.0.observation = Some(raw.to_vec());
                             let encoded = task.encode()?;
-                            tr.set(&task_key(reservation, &plan)?, &encoded);
+                            let header = registry::encode(reservation, &task)?;
+                            let key = task_key(reservation, &task);
+                            tr.set(&key, &encoded);
+                            tr.set(&registry::key(reservation), &header);
                             Ok(task)
                         }
                         .await,
@@ -583,6 +688,25 @@ impl ManagedCatalog {
                 })
             })
             .await?
+    }
+
+    /// Discover the parent's original metadata attempt, without device I/O.
+    pub async fn pending_reclaim_metadata_write(
+        &self,
+        reservation: &ReclaimReservation,
+        owner: u64,
+    ) -> Result<Option<ReclaimMetadataWrite>> {
+        let tr = self.db.create_trx()?;
+        parent_at(&tr, reservation, owner).await?;
+        let task = registry::read_at(&tr, reservation).await?;
+        let Some(task) = task.filter(|task| task.holds_claim()) else {
+            return Ok(None);
+        };
+        if task.owner() > owner {
+            return Err(CatalogError::OwnerFenced);
+        }
+        // Discovery retains the original owner; explicit claiming precedes I/O.
+        Ok(Some(task))
     }
 
     /// Read the retained original task. Missing/corrupt slots are never repaired.
@@ -623,7 +747,13 @@ impl ManagedCatalog {
                             }
                             task.0.owner = owner;
                             let raw = task.encode()?;
-                            tr.set(&task_key(reservation, &task.plan())?, &raw);
+                            let header =
+                                registry::encode_if_current_at(&tr, reservation, &task).await?;
+                            let key = task_key(reservation, &task);
+                            tr.set(&key, &raw);
+                            if let Some(header) = header {
+                                tr.set(&registry::key(reservation), &header);
+                            }
                             Ok(task)
                         }
                         .await,
@@ -648,9 +778,14 @@ impl ManagedCatalog {
                     requests::retry_result(
                         async {
                             parent_at(&tr, reservation, owner).await?;
-                            let mut task = load_at(&tr, reservation, original.0.plan.source.uid)
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
+                            let mut task = load_id_at(
+                                &tr,
+                                reservation,
+                                original.0.plan.source.uid,
+                                original.id(),
+                            )
+                            .await?
+                            .ok_or(CatalogError::Incomplete)?;
                             if task.owner() != owner || original.owner() != owner {
                                 return Err(CatalogError::OwnerFenced);
                             }
@@ -669,8 +804,10 @@ impl ManagedCatalog {
                             }
                             task.0.phase = Phase::Closed;
                             let raw = task.encode()?;
-                            let key = task_key(reservation, &task.plan())?;
+                            let key = task_key(reservation, &task);
+                            let header = registry::encode(reservation, &task)?;
                             tr.set(&key, &raw);
+                            tr.set(&registry::key(reservation), &header);
                             tr.clear(&ledger::own_key(reservation, b'A'));
                             tr.clear(&node_attempts::volume_key(task.plan().volume()));
                             Ok(task)

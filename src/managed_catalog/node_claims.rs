@@ -37,12 +37,12 @@ impl ReclaimMetadataVolumeClaim {
     fn encode(&self) -> Result<Vec<u8>> {
         let ns = node_mutation::id(&self.namespace)?;
         node_mutation::id(&self.volume)?;
-        node_mutation::id(&self.attempt)?;
+        let attempt = node_mutation::id(&self.attempt)?;
         let mut prefix = management::prefix(ns, b'R');
         prefix.push(b'W');
         if !self.task.starts_with(&prefix)
-            || self.task.len() != prefix.len() + 64
-            || self.task[self.task.len() - 32..] != self.fingerprint
+            || self.task.len() != prefix.len() + 48
+            || self.task[self.task.len() - 16..] != *attempt.as_bytes()
         {
             return Err(bad());
         }

@@ -206,10 +206,18 @@ impl ManagedCatalog {
         original.encode()?;
         let tr = self.db.create_trx()?;
         parent_at(&tr, reservation, owner).await?;
-        let task = Box::pin(load_at(&tr, reservation, original.plan().source_uid()))
-            .await?
-            .ok_or(CatalogError::Incomplete)?;
-        require_original(original, &task, owner)?;
+        let task = Box::pin(load_id_at(
+            &tr,
+            reservation,
+            original.plan().source_uid(),
+            original.id(),
+        ))
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+        if original.plan() != task.plan() || original.owner() > owner || task.owner() > owner {
+            return Err(CatalogError::Invalid("历史元数据发布改变原计划或 owner"));
+        }
+        require_phase_history(original, &task)?;
         if !task.completed() {
             return Ok(None);
         }
@@ -244,9 +252,14 @@ impl ManagedCatalog {
                         async {
                             parent_at(&tr, reservation, owner).await?;
                             let plan = original.plan();
-                            let mut task = Box::pin(load_at(&tr, reservation, plan.source_uid()))
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
+                            let mut task = Box::pin(load_id_at(
+                                &tr,
+                                reservation,
+                                plan.source_uid(),
+                                original.id(),
+                            ))
+                            .await?
+                            .ok_or(CatalogError::Incomplete)?;
                             require_original(original, &task, owner)?;
                             if task.observation()?.as_ref() != Some(evidence) {
                                 return Err(CatalogError::Invalid("发布改变或绕过原已保存观察"));
@@ -299,7 +312,8 @@ impl ManagedCatalog {
                             })?;
                             let receipt = value.encode()?;
                             let raw = task.encode()?;
-                            let task_key = task_key(reservation, &plan)?;
+                            let header = registry::encode(reservation, &task)?;
+                            let task_key = task_key(reservation, &task);
                             let receipt_key =
                                 receipt_key(reservation.namespace(), evidence.current());
                             // All fallible validation and encoding precedes the first set.
@@ -312,6 +326,7 @@ impl ManagedCatalog {
                                 evidence.physical_files(),
                             );
                             tr.set(&task_key, &raw);
+                            tr.set(&registry::key(reservation), &header);
                             tr.clear(&ledger::own_key(reservation, b'A'));
                             tr.clear(&node_attempts::volume_key(plan.volume()));
                             Ok(value)
