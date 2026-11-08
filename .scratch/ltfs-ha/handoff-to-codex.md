@@ -1,3 +1,15 @@
+# 当前接续：机械暂忙诊断补验通过，四项报告缺陷已收口（2026-11-08）
+
+产品提交 `3bc8cf26ac5775596ce2e9eac752d56faa8590aa` 在前批8bd242a三项修复之上，保留owner的原503，机械暂忙返回reason=library_busy、ready=false及原owner/round；不跳过任何就绪屏障、不改超时或read_idle阈值。11项软件检查全0，真实B默认300000ms观察已通过；报告新增就绪诊断补验，全部未实现/受限项保持。
+
+- 当前207–209目录 `/opt/tape-rs/v1-20261108-3bc8cf26ac57`，同新ltfsd SHA，原45153/c51a94dd.../state/unit不变，普通EL9无故障特性；未改低层/FUSE原产物。源3bc8cf2；246d02f仅修正生成手册argv0及JSON歧义，产品字节不变。两轴初审Standards0/Spec2P3文档，修后复审均0，原报告保留。
+- 证据 `/work/tmp/tape-readiness-gap-20261108-l6b6og6u`，入口 `UPGRADE-COMPLETE.json`、`physical/COMPLETE.json`。L84原4389B正文SHA正确；读后307.072s出现真实默认退带，三入口503正文完全相同，owner1/round1568310保持，53.551s自然恢复200。SG_IO退带24.294s/MOVE28.837s均GOOD，回原1004；原装带UA记录保留。三进程及FDB healthy/double、14类占用空，原权威摘要逐项相同。A未动，无FORMAT/ERASE/手工PR或清锁，L84/L85策略归属保持。
+- 新旧所有controller均已消费，禁止重跑；本批未推GitHub。源码/检查/实带与两轴证据SHA在报告JSON两个补验区，原123份历史及前批84份证据继续保留。
+
+完整native reclaim依然封闭，actual tail actor/独立回执、IP空/截断恢复、新donor/replan、完整源覆盖/父流程/Serving恢复及全流程实带未完成；Range/导入/顺序链路性能和现场受限项仍按报告保留，不能将已修复四项当作全部功能实现。
+
+---
+
 # 当前接续：验收报告三项缺陷已修复并实带通过（2026-11-08）
 
 最新用户要求修复 `docs/physical-acceptance-20261108.md` 指明的缺口。产品提交 `8bd242ac8eb8fb890be4f54102edfaeadabb23d6` 已完成旧drive/node/cluster查询、顶层stat/list/get及offline_message投影三项缺陷修复，附管理分页固定100的解析/帮助手册约束。10项软件检查通过，Clippy仅既有prepare_file参数数量告警；最终diff自查0，不宣称独立双轴审查或已合GitHub。

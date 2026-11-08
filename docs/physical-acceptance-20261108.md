@@ -71,7 +71,7 @@ S3/FUSE/FDB数据链路、主要运维动作、通知、正常HA与FDB依赖故�
 
 退带后再连续观察70秒、三轮查询，三个入口均200；同owner、14类门闩为空，FDB仍available/healthy。原健康快照与退带后稳定证据均保留。
 
-后续优化：探针应区分机械维护暂忙和owner失权，并保留转发owner的具体原因；空闲阈值需按连续批量读取的间隔与驱动占用成本调优。不能通过跳过设备活动屏障或强制切换owner消除503。
+后续补验已修复探针诊断：`3bc8cf2` 区分机械维护暂忙，转发保留owner原503原因，详见文末。空闲阈值仍需按连续批量读取的间隔与驱动占用成本调优；本批保留默认300000毫秒。不能通过跳过设备活动屏障或强制切换owner消除503。
 
 ## 顺序读写与可优化项
 
@@ -180,3 +180,23 @@ S3/FUSE/FDB数据链路、主要运维动作、通知、正常HA与FDB依赖故�
 保留原失败：首次发行构建因交叉链接器缺FDB库搜索路径失败，使用依赖本身支持的`FDB_CLIENT_LIB_PATH`后普通EL9构建成功；两个部署脚本预检错误发生在任何停服或设备动作之前。实带控制器将属性筛选的JSON对象误按标量断言而退出，原正确返回及离线任务均保留；新接续只核对原任务并执行尚未发出的上线步骤，没有重复离线或重跑旧controller。上述脚本问题不改记为产品通过或产品失败。
 
 新证据目录：`/work/tmp/tape-acceptance-gap-fixes-20261108-64uu7mpq`；入口为`UPGRADE-COMPLETE.json`、`physical/COMPLETE.json`、`final-integrity.json`、`checks-results.json`及`artifact.json`。原报告与123份历史证据不覆盖、不删除；本批结果及SHA另列于JSON摘要的`gap_repairs_v1`。原生reclaim、Range读取放大、长历史导入、顺序链路固定成本和其他原报告限制继续保留，不能把三项缺陷收口当作全部功能验收。
+
+## 机械暂忙就绪诊断修复与实带补验（3bc8cf2）
+
+产品提交 `3bc8cf26ac5775596ce2e9eac752d56faa8590aa` 修复原报告“探针误导及转发原因丢失”项。持久机械屏障命中时仍返回503，正文明确 `ready=false`、`reason=library_busy`、`retryable=true` 和该次观测的library/owner/round；转发入口保留owner原503正文。执行资格丢失、FDB或路由不可核实时仍拒绝；没有跳过任何原就绪条件，也没有把 `library_busy` 当作执行许可。非预期owner探测状态及超时分别保留HTTP状态或超时诊断。
+
+隔离FDB回归先复现转发原因丢失，再验证修复；同时验证机械屏障存在、owner就绪丢失的原因区分及屏障解除后恢复。11项软件检查成功，Clippy仅原有参数数量告警。普通EL9构建成功，未启用故障测试特性。两轴初审Standards0、Spec两项P3文档问题（帮助采集的argv0和reclaim状态字段歧义）已修正，复审均0；原始审查保留，未将未实现的native reclaim改成开放或已验收。
+
+207–209已正常升级至该产品提交，目录 `/opt/tape-rs/v1-20261108-3bc8cf26ac57`，原namespace/45153/state/unit及正常配置保持；未改动低层工具和FUSE继续沿用已记录原产物。L84经正常文件API读取原4389B对象，SHA与前批一致；随后仅观察默认300000毫秒空闲退带，没有缩短阈值、发人工退带命令或改变owner。
+
+| 实际观测 | 结果 |
+| --- | --- |
+| 读取结束至首个暂忙观测 | 307.072秒；等待前全部入口持续200 |
+| 三入口机械暂忙 | 均503，正文完全相同，`library_busy`、`ready=false`；owner1 / round1568310保持 |
+| 暂忙至三入口恢复 | 53.551秒；自然恢复200，无重启、强杀或清锁 |
+| 实际CDB日志 | 207的SG_IO记录UNLOAD GOOD约24.294秒、MOVE GOOD约28.837秒，L84回原storage element1004 |
+| 最终状态 | 三进程同新ltfsd SHA、无GPFS挂载；FDB available/healthy/double；14类占用空；原管理/节点/上传回执、归属、池、S3及回收事实摘要保持 |
+
+控制端以monotonic测量探针窗口；CDB耗时单列来自设备进程SG_IO计时，不混算两个时钟域的墙钟。实际journal保留装带时的UNIT ATTENTION及现有位置无关命令重试，不将其删除或冒称每条初始命令均GOOD。三节点新服务PID日志未发现FORMAT/ERASE。A库未访问，L84同卷同池、online/nonblacklisted，L85及其他受保护介质未装载或改写。
+
+新证据 `/work/tmp/tape-readiness-gap-20261108-l6b6og6u`：`physical/COMPLETE.json`、`physical/probes.jsonl`、`physical/all-nodes-same-owner-busy.json`、`mechanical-cdb-summary.json`、`final-fdb-status.json`及逐机进程/journal记录；SHA见JSON的`readiness_detail_v1`。原报告剩余的完整native reclaim、Range读取放大、导入/顺序链路性能和现场受限场景仍未完成，不因就绪诊断修复而扩大验收范围。本批尚未推GitHub。
