@@ -2,7 +2,7 @@
   "schema_version": 1,
   "result": "completed_with_gaps",
   "report_date": "2026-11-08",
-  "generated_at_utc": "2026-11-08T13:58:12.313828+00:00",
+  "generated_at_utc": "2026-11-08T14:09:57.766666+00:00",
   "source_commit": "e0a7625b920cad93d884939f5981c2cafeb4b97f",
   "source_tree": "2b6cd858d2c3dc9a5f1197e0c490afe2fffe22d4",
   "source_path_sha256": {
@@ -34,7 +34,7 @@
     "tape-rs": "7f2f1d2c62007118e860f24571e4269332ee79b0fe00db208dbef8a208756602"
   },
   "github_pushed": false,
-  "report_sha256": "e366c555f16f087ce4ac62e198a538309a80089e307db1cc7061e7e4044f9a12",
+  "report_sha256": "b465017ca571a51c380f761790957fc00ab3492a69959c243bf9a41c55e325d3",
   "feature_matrix": [
     {
       "feature": "library list/show、pool list/show、tape list/show",
@@ -215,6 +215,12 @@
       "entry": "公开CLI/HTTP",
       "result": "未实现/封闭",
       "scope": "内部零子父、组件软件回归和历史SQLite格式化回执不是完整迁移/源覆盖/接管恢复验收"
+    },
+    {
+      "feature": "空闲读挂载自动退带",
+      "entry": "真实UNLOAD/MOVE、管理就绪探针",
+      "result": "通过",
+      "scope": "read_idle_ms默认300000，L84回原槽1004；机械活动期间503，同owner恢复200，无重启/清锁"
     }
   ],
   "software": {
@@ -1607,6 +1613,96 @@
       "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/FUSE14-checkpoint-timing-summary.json",
       "bytes": 2503,
       "sha256": "3731dfcf24529827ee68a43e44d3304e3fc003dc4ac2b6834c41afbbeaade057"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/POST-REPORT-READINESS-CHANGE-v1.json",
+      "bytes": 3807,
+      "sha256": "88119d572e963b5932ee0a4dfe55af7cb661f22d3dd2d767dee19b864749df56"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/post-report-readiness-logs-v1-207.json",
+      "bytes": 144,
+      "sha256": "eefef07bac5e9e3bf9c2da09a47478779ce279ee08fce348dbdf341ceae4e850"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/post-report-readiness-logs-v1-208.json",
+      "bytes": 144,
+      "sha256": "042c08fb7211e22c14cc1f216817438a0d6a41b1136daeb0799d2d327cb857d3"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/post-report-readiness-logs-v1-209.json",
+      "bytes": 144,
+      "sha256": "7d10798827a1d6804228962ceb4e5fa52723130e772e97f3bf6791f495d7864a"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/POST-REPORT-idle-or-pending-v1.json",
+      "bytes": 3179,
+      "sha256": "43dbecb9f8edb7e982a0fb63e5ad63f0024c8f77c40cde66d1a960e50d08cb74"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/POST-REPORT-task-list-v1.json",
+      "bytes": 314223,
+      "sha256": "4016b3a588f4488a51a2e7763d9b731c61318b3ad7d5cd891f7109c6cab508bb"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/post-report-active-IO-v1-208.json",
+      "bytes": 2419,
+      "sha256": "171d93a8785ac0080849a6b43de07c13c11e8c5999d1763ffbe95077743fbd81"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/POST-REPORT-readiness-observation-v2.json",
+      "bytes": 377,
+      "sha256": "6f51f600451d25d27ae45d87f2e5264340e59ecdc310985cfaf06460f8b8d29e"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/POST-REPORT-restored-original-owner-v3.json",
+      "bytes": 859,
+      "sha256": "1a2c8fc0f40e2198a2c63bbd5dca847e555512c79ff1d6f97bc7dd2eea3ba2a8"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/post-report-read-idle-runtime-v1-208.json",
+      "bytes": 252,
+      "sha256": "f7cde7cbf9924bd488ba871a8fe2056830a1fee436c6d3f89c194e582b6016d7"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/POST-REPORT-stable-sample-0.json",
+      "bytes": 971,
+      "sha256": "ad39058519c10b0cb2a01b25088088b6a0596460014751411e9862e45ec911eb"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/POST-REPORT-stable-sample-1.json",
+      "bytes": 971,
+      "sha256": "0414a5d0a4d9b9c1ed0ef63e7e17d0ac1e031e1f73f6043420cd526a769d2169"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/POST-REPORT-stable-sample-2.json",
+      "bytes": 972,
+      "sha256": "bef34800e04ecdd454dd85b79d28c3268a243e9a7843ff37802a3f2326c96176"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/POST-REPORT-final-idle-audit-v2.json",
+      "bytes": 3179,
+      "sha256": "9f69af08936fb78996a050e197f7b11a465502eb045fa59d9369cd1679666f38"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/POST-REPORT-idle-retired-tape84.json",
+      "bytes": 4863,
+      "sha256": "fd0cab892209b19041fcf6c6b5cb8ab763e01b50c41045ed12d348e6cc86eafd"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/POST-REPORT-STABILITY-COMPLETE-v1.json",
+      "bytes": 3465,
+      "sha256": "2ac86b5dd087ad3a741c9037160f1067da0d8c4361aed67b3a2303affbe88031"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/post-report-stability-v1.py",
+      "bytes": 2038,
+      "sha256": "410ae433aea343ec4b8970472a615bf8b305f815214a59a00ce71dd86c2841f9"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/post-report-stability-v1.log",
+      "bytes": 88,
+      "sha256": "97ca66bce755a79037357b8e8f2b71ee58a57e9a2219f79866e98486fde54443"
     }
   ],
   "FUSE_checkpoint_intervals": [
@@ -1630,5 +1726,142 @@
       "to": "/mnt/meta-data/tape-rs/v1-20261106/main1108-fuse-83ef4bb961/final-body-operations-PASS.json",
       "seconds": 59.388948897
     }
-  ]
+  ],
+  "post_report_idle_retirement_and_stability": {
+    "source": "e0a7625b920cad93d884939f5981c2cafeb4b97f",
+    "all3_ready_over_70s_three_observations": true,
+    "all14gates_empty": true,
+    "same_owner_node": 2,
+    "same_owner_round": 1501886,
+    "no_service_restart_mutation_or_clearlock": true,
+    "L84_returned_to_original_home": 1004,
+    "L84_same_volume_pool_online_blacklist": true,
+    "FDB_status": {
+      "available": true,
+      "healthy": true
+    },
+    "original_notification_ACK_delete_not_repeated": true,
+    "sampling": [
+      {
+        "207": {
+          "http": 200,
+          "body": {
+            "mode": "fdb-owner-writable",
+            "ready": true
+          }
+        },
+        "208": {
+          "http": 200,
+          "body": {
+            "mode": "fdb-owner-writable",
+            "ready": true
+          }
+        },
+        "209": {
+          "http": 200,
+          "body": {
+            "mode": "fdb-owner-writable",
+            "ready": true
+          }
+        },
+        "library": {
+          "active_node": 2,
+          "owner_epoch": 1501886,
+          "executor_ready": true,
+          "inventory_age_seconds": 4,
+          "inventory_owner_current": true,
+          "monitor": {
+            "error": null,
+            "interval_seconds": 30,
+            "last_attempt": "2026-11-08T14:07:15.010542634Z",
+            "last_success": "2026-11-08T14:07:15.010542634Z",
+            "library_serial": "55L3A78011W9LL01",
+            "namespace": "c51a94dd-7e84-4167-bd25-7151880eb628",
+            "owner_epoch": 1501886,
+            "version": 1
+          }
+        }
+      },
+      {
+        "207": {
+          "http": 200,
+          "body": {
+            "mode": "fdb-owner-writable",
+            "ready": true
+          }
+        },
+        "208": {
+          "http": 200,
+          "body": {
+            "mode": "fdb-owner-writable",
+            "ready": true
+          }
+        },
+        "209": {
+          "http": 200,
+          "body": {
+            "mode": "fdb-owner-writable",
+            "ready": true
+          }
+        },
+        "library": {
+          "active_node": 2,
+          "owner_epoch": 1501886,
+          "executor_ready": true,
+          "inventory_age_seconds": 9,
+          "inventory_owner_current": true,
+          "monitor": {
+            "error": null,
+            "interval_seconds": 30,
+            "last_attempt": "2026-11-08T14:07:45.190741977Z",
+            "last_success": "2026-11-08T14:07:45.190741977Z",
+            "library_serial": "55L3A78011W9LL01",
+            "namespace": "c51a94dd-7e84-4167-bd25-7151880eb628",
+            "owner_epoch": 1501886,
+            "version": 1
+          }
+        }
+      },
+      {
+        "207": {
+          "http": 200,
+          "body": {
+            "mode": "fdb-owner-writable",
+            "ready": true
+          }
+        },
+        "208": {
+          "http": 200,
+          "body": {
+            "mode": "fdb-owner-writable",
+            "ready": true
+          }
+        },
+        "209": {
+          "http": 200,
+          "body": {
+            "mode": "fdb-owner-writable",
+            "ready": true
+          }
+        },
+        "library": {
+          "active_node": 2,
+          "owner_epoch": 1501886,
+          "executor_ready": true,
+          "inventory_age_seconds": 14,
+          "inventory_owner_current": true,
+          "monitor": {
+            "error": null,
+            "interval_seconds": 30,
+            "last_attempt": "2026-11-08T14:08:15.561919500Z",
+            "last_success": "2026-11-08T14:08:15.561919500Z",
+            "library_serial": "55L3A78011W9LL01",
+            "namespace": "c51a94dd-7e84-4167-bd25-7151880eb628",
+            "owner_epoch": 1501886,
+            "version": 1
+          }
+        }
+      }
+    ]
+  }
 }

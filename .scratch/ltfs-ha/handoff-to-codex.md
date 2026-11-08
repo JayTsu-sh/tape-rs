@@ -1,13 +1,15 @@
 # 最新接续：真实 B 库验收及报告已完成（2026-11-08）
 
-用户要求“在真实带库环境验证所有的功能，并给出验证报告，可优化项也要体现”。本轮已完成可安全执行的现场矩阵及收尾，结论是 **completed_with_gaps，不能称全部功能通过**。正式报告 [docs/physical-acceptance-20261108.md](../../docs/physical-acceptance-20261108.md)，可机读摘要 `docs/physical-acceptance-20261108.json`；30组矩阵中26组通过（含明确拒绝行为验证）、3组入口/字段缺口、1组完整原生reclaim封闭，另列现场受限范围。不要按下面旧“尚未部署/阶段进行中”记录重跑。
+用户要求“在真实带库环境验证所有的功能，并给出验证报告，可优化项也要体现”。本轮已完成可安全执行的现场矩阵及收尾，结论是 **completed_with_gaps，不能称全部功能通过**。正式报告 [docs/physical-acceptance-20261108.md](../../docs/physical-acceptance-20261108.md)，可机读摘要 `docs/physical-acceptance-20261108.json`；31组矩阵中27组通过（含明确拒绝行为验证）、3组入口/字段缺口、1组完整原生reclaim封闭，另列现场受限范围。不要按下面旧“尚未部署/阶段进行中”记录重跑。
 
 - 实际207–209均为普通EL9源码 `e0a7625b920cad93d884939f5981c2cafeb4b97f`，产品tree `2b6cd858d2c3dc9a5f1197e0c490afe2fffe22d4`；ltfsd SHA `ae4e658266e63de03e200e52ce42c32bdd19c6ea5784157568cad229b572d8c2`。独立45153、原namespace/state/unit保持；三服务/FDB available+healthy/double，三个入口ready、14类占用空，所有本轮FUSE正常卸载并退出。应用挂载命名空间无GPFS，宿主其他GPFS未动；本轮未推GitHub。
-- 原始证据 `/work/tmp/tape-main-physical-20261108-h9vn4yhb`；最终候选 `physical-final-e0a7625/physical-COMPLETE-v3.json`、`acceptance/phase13-COMPLETE.json`、`phase14-PASS.json`。报告索引绑定105份本地证据SHA，失败控制器与实际缺口均保留。`run-all`、`run-remaining-final-v1`、`run-final-stages-v2`及其接续都已消费；不可重跑变更脚本。阶段5规范JSON与源槽断言、阶段12固定100分页、收尾缺消费者返回400而非404等脚本问题已按原身份结清，没有替代操作或重复ACK/删除。
+- 原始证据 `/work/tmp/tape-main-physical-20261108-h9vn4yhb`；最终候选 `physical-final-e0a7625/physical-COMPLETE-v3.json`、`acceptance/phase13-COMPLETE.json`、`phase14-PASS.json`。报告索引绑定123份本地证据SHA，失败控制器与实际缺口均保留。`run-all`、`run-remaining-final-v1`、`run-final-stages-v2`及其接续都已消费；不可重跑变更脚本。阶段5规范JSON与源槽断言、阶段12固定100分页、收尾缺消费者返回400而非404等脚本问题已按原身份结清，没有替代操作或重复ACK/删除。
 - 实带通过：CLI/HTTP池管理与异步rescan；S3 1000+5全局字典序分页、读写/条件/校验/扩展RenameObject/Delete；内核FUSE完整读写/属性/链接/目录及冷重挂；L84离线/黑名单/I-E往返/上线/validate；L84 CLI与L85 HTTP已分配import同卷刷新；真实非注入监控通知、扩类重连/显式ACK；同库互斥与正常HA原任务/回执/未ACK保留；原生FDB文件CLI/驱动策略还原；45153单节点及全体停服故障恢复。
 - 三片本地修复为 `a6f987f`（受保护的顺序读会话与持久顺序客户端）、`46515ac`（FUSE根GETATTR恢复入口）、`e0a7625`（当前读证明与独立Full历史审计分开）。最终11项软件检查全0，三片规范/需求两轴审查最终0。原12KiB对象暖读43.273→5.268秒、0 LOCATE/IP定位；两组各连续3×64MiB，总384MiB写/384MiB全量读，实际顺序工具与SHA/ETag通过；6×2KiB并发观察到7 WRITE/3 FILEMARK/2 VCI的共享提交。L85 import1072文件/1080路径688.322秒，146 LOCATE占582.833秒；报告记录Range读放大、FUSE小更新约60秒检查点间隔、空间统计约81秒收敛和后台样本陈旧等优化项，不将端到端速率称裸带宽。
 - 明确缺口：旧drive/node list404、cluster null；旧stat对已知FDB对象exit0打印不存在、list/get报不存在且失败get留下0B新文件；offline -o任务回执有说明而tape show offline_message为null。新fdb stat/get等正常不能替代旧入口通过。完整原生reclaim仍未开放，不能将零子父互斥HA当迁移/格式化全过程。
 - A库保持释放；只写L84/L85且同卷/同池/在线/非黑名单，未FORMAT/ERASE、未手工清门闩/改PR。保护介质未装载/写入，仅另池ee6只读列举元数据验证隔离。无空白未分配scratch，正向assign/unassign、首次import映射及格式化未重跑；双库、现场WP/坏带/满带、断电写中HA、VIP、EE实时互通等未验收。只有两个精确自有MOCK订阅被清理，原旧批次显式ACK后删除；全局outbox/其他消费者/历史未清，测试正文保留供复验。
+
+- **补充空闲退带观测**：文档提交98ed09f后复查曾出现readyz503；不是新owner或残留任务，实际为默认300000ms的空闲读挂载自动退带。owner2/round1501886保持，14:03:44Z UNLOAD GOOD、14:04:13Z MOVE GOOD，L84回原槽1004且同卷/池/策略保持。14类占用空、96管理任务终态，三入口随后自行200，无重启/清锁/人工move。报告新增通过组及探针误导/空闲阈值优化项；原健康、503、恢复证据分别保留，不可将机械暂忙当失权。退带后再三轮/70秒持续观测，三个入口200、同owner、14类占用空、FDB healthy（POST-REPORT-STABILITY-COMPLETE-v1.json），未重启/清锁。
 
 ---
 
