@@ -2215,8 +2215,9 @@
         "sha256": "01f6128871bb4610f9c90ef4fa45be5ae73c6cb8d3f833ef6660f928fcf21d58"
       }
     ],
-    "remaining_native_reclaim_closed": false,
     "all_optimizations_complete": false,
-    "github_pushed": false
+    "github_pushed": false,
+    "native_reclaim_gap_resolved": false,
+    "public_native_reclaim_enabled": false
   }
 }
