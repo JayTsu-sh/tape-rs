@@ -139,6 +139,46 @@ impl<'a> TapeDrive<'a> {
         self.locate(partition, block, true)
     }
 
+    /// Read through a small forward gap (including filemarks) instead of
+    /// stopping streaming with LOCATE. IBM GA32-0928-08 Table 99 counts each
+    /// filemark as one logical object. Unreliable/large/backward positions use
+    /// the original LOCATE path; the final position is always confirmed.
+    #[cfg(feature = "fdb")]
+    pub(crate) fn read_forward_to(
+        &self,
+        partition: u8,
+        block: u64,
+        buffer: &mut [u8],
+    ) -> Result<()> {
+        const MAX_OBJECTS: u64 = 64;
+        const MAX_BYTES: u64 = 32 << 20;
+        if block <= u64::from(u32::MAX) {
+            let position = self.read_position_data()?;
+            if position[0] & 0x06 == 0 && position[1] == partition {
+                let current = u64::from(u32::from_be_bytes(position[4..8].try_into().unwrap()));
+                if current == block {
+                    return Ok(());
+                }
+                if let Some(gap) = block.checked_sub(current)
+                    && gap <= MAX_OBJECTS
+                    && !buffer.is_empty()
+                    && gap
+                        .checked_mul(buffer.len() as u64)
+                        .is_some_and(|n| n <= MAX_BYTES)
+                {
+                    for _ in 0..gap {
+                        self.read_block(buffer)?;
+                    }
+                    if !short_position_matches(&self.read_position_data()?, partition, block) {
+                        return Err(TapeError::Ltfs("顺序读取越过间隔后的实际位置不符".into()));
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        self.locate(partition, block, true)
+    }
+
     /// LOAD: 装载磁带
     pub fn load(&self) -> Result<()> {
         info!("装载磁带...");
@@ -675,6 +715,60 @@ fn short_position_matches(buf: &[u8; 20], partition: u8, block: u64) -> bool {
 #[cfg(test)]
 mod position_tests {
     use super::short_position_matches;
+
+    #[cfg(feature = "fdb")]
+    #[test]
+    fn forward_read_streams_across_filemarks_and_bounds_skip_work() {
+        use super::TapeDrive;
+        use crate::scsi::sim::{SimCartridge, SimLibrary};
+        let library = SimLibrary::new(1, 1, 0);
+        library
+            .insert_cartridge(SimCartridge::blank("FWD00L8", 1 << 20), 0)
+            .unwrap();
+        library.load_into_drive("FWD00L8", 0).unwrap();
+        let raw = library.drive(0);
+        let drive = TapeDrive::new(&raw);
+        assert!(drive.test_unit_ready().unwrap());
+        drive.write_block(b"skip-first").unwrap();
+        drive.write_filemark(1).unwrap();
+        drive.write_block(b"skip-third").unwrap();
+        drive.write_block(b"target").unwrap();
+        for _ in 0..70 {
+            drive.write_block(b"distant").unwrap();
+        }
+        drive.write_filemark(0).unwrap();
+        drive.locate(0, 0, true).unwrap();
+        let before = raw.command_log().len();
+        let mut buffer = [0; 128];
+        drive.read_forward_to(0, 3, &mut buffer).unwrap();
+        assert!(!raw.command_log()[before..].contains(&0x92));
+        let n = drive.read_block(&mut buffer).unwrap();
+        assert_eq!(&buffer[..n], b"target");
+        let before = raw.command_log().len();
+        drive.read_forward_to(0, 70, &mut buffer).unwrap();
+        assert_eq!(
+            raw.command_log()[before..]
+                .iter()
+                .filter(|op| **op == 0x92)
+                .count(),
+            1
+        );
+        assert!(
+            !raw.command_log()[before..].contains(&0x08),
+            "大间隔不逐记录扫描"
+        );
+        let before = raw.command_log().len();
+        drive.read_forward_to(0, 3, &mut buffer).unwrap();
+        assert_eq!(
+            raw.command_log()[before..]
+                .iter()
+                .filter(|op| **op == 0x92)
+                .count(),
+            1
+        );
+        assert_eq!(drive.read_block(&mut buffer).unwrap(), 6);
+        assert_eq!(&buffer[..6], b"target");
+    }
 
     #[test]
     fn short_position_requires_exact_unoverflowed_location_and_partition() {

@@ -340,7 +340,7 @@ mod fdb_lifecycle;
 mod fdb_loading;
 #[cfg(feature = "fdb")]
 #[path = "executor_fdb_monitor.rs"]
-mod fdb_monitor;
+pub(super) mod fdb_monitor;
 #[cfg(feature = "fdb")]
 #[path = "executor_fdb_nodes.rs"]
 mod fdb_nodes;
@@ -387,6 +387,8 @@ struct Active {
     fdb_monitor: fdb_monitor::Schedule,
     #[cfg(feature = "fdb")]
     fdb_reads: std::collections::BTreeMap<usize, fdb_loading::Mount>,
+    #[cfg(feature = "fdb")]
+    fdb_read_session: Option<super::fdb_read::ReadSession>,
     #[cfg(feature = "fdb")]
     fdb_pending_import: std::collections::BTreeSet<String>,
     files: Arc<FileService>,
@@ -1251,6 +1253,13 @@ fn run_fdb_owner_inner(
         {
             owner.write_session = None;
         }
+        if !matches!(
+            request,
+            ExecRequest::Read { .. } | ExecRequest::ReadTo { .. } | ExecRequest::Work
+        ) && let Some(owner) = active.as_mut()
+        {
+            owner.fdb_read_session = None;
+        }
         match request {
             ExecRequest::AttachPermission {
                 permission: attached,
@@ -2068,6 +2077,8 @@ async fn read_fdb(
     path: &str,
     pool: Option<&str>,
 ) -> std::result::Result<std::fs::File, ReadError> {
+    owner.write_session = None;
+    let mut read_session = owner.fdb_read_session.take();
     let lost = |error: TapeError| ReadError::Lost(format!("FDB owner 读取失败: {error}"));
     let permit = permission.ok_or_else(|| ReadError::Lost("FDB owner 缺少多数派许可".into()))?;
     let _activity = permit.begin_device_activity(owner.round).map_err(lost)?;
@@ -2117,11 +2128,12 @@ async fn read_fdb(
         storage: control.storage,
     };
     let result = reader
-        .read_with_cache_scoped(
+        .read_with_session(
             path.as_bytes(),
             pool,
             &owner.files.extent_cache_dir(),
             owner.files.spool_dir(),
+            &mut read_session,
         )
         .await;
     if result.is_err() {
@@ -2183,6 +2195,7 @@ async fn read_fdb(
         false,
     )
     .await?;
+    owner.fdb_read_session = read_session;
     Ok(result.file)
 }
 
@@ -2401,6 +2414,8 @@ fn process_all_uploads(
                 #[cfg(feature = "fdb")]
                 fdb_reads: Default::default(),
                 #[cfg(feature = "fdb")]
+                fdb_read_session: None,
+                #[cfg(feature = "fdb")]
                 fdb_pending_import: Default::default(),
                 #[cfg(feature = "fdb")]
                 fdb_monitor: Default::default(),
@@ -2609,6 +2624,8 @@ fn takeover(
     Ok(Active {
         #[cfg(feature = "fdb")]
         fdb_reads: Default::default(),
+        #[cfg(feature = "fdb")]
+        fdb_read_session: None,
         #[cfg(feature = "fdb")]
         fdb_pending_import: Default::default(),
         #[cfg(feature = "fdb")]

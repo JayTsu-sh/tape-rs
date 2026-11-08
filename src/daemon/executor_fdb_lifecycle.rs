@@ -5434,6 +5434,301 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；原序连续上传/读取的实际 owner 调用链，Sim，无真实设备"]
+    async fn native_sequential_reads_reuse_verified_media_without_repositioning() {
+        use crate::managed_catalog::{ActiveUploadSpec, ContentDigest, ManagedCatalog};
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog = Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());
+        let (mut fixture, control, pool, status) =
+            Box::pin(assigned_batch_fixture(catalog.clone())).await;
+        let mut ordered = Vec::new();
+        for (sequence, name) in ["z-first", "a-second", "m-third"].into_iter().enumerate() {
+            let bytes = vec![sequence as u8 + 31; 4096];
+            let spool = fixture.root.join(format!("sequential-{sequence}"));
+            std::fs::write(&spool, &bytes).unwrap();
+            let path = format!("/{name}");
+            let spec = ActiveUploadSpec {
+                pool_id: pool.id,
+                path: path.as_bytes().to_vec(),
+                operation_id: uuid::Uuid::new_v4(),
+                expected_version: None,
+                size: bytes.len() as u64,
+                digest: ContentDigest::Sha256(Sha256::digest(&bytes).into()),
+            };
+            let intent = Box::pin(fdb_writing::prepare(
+                &fixture.owner,
+                &fixture.permit,
+                &control,
+                &spec,
+                Some("LIFE00L8"),
+            ))
+            .await
+            .unwrap();
+            let results = Box::pin(fdb_writing::write_batch(
+                &mut fixture.owner,
+                &fixture.permit,
+                &control,
+                &status,
+                vec![(intent.request(), std::fs::File::open(&spool).unwrap())],
+            ))
+            .await;
+            assert_eq!(results, vec![Ok(1)]);
+            ordered.push((format!("/{}{path}", pool.id), bytes));
+        }
+        let writes = fixture.writes();
+        for (sequence, (path, expected)) in ordered.iter().enumerate() {
+            let before = fixture.drive_log().len();
+            let mut file = Box::pin(read_fdb(
+                &mut fixture.owner,
+                Some(&fixture.permit),
+                &control,
+                &status,
+                path,
+                Some(&pool.id.to_string()),
+            ))
+            .await
+            .unwrap();
+            let mut actual = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut actual).unwrap();
+            assert_eq!(&actual, expected);
+            if sequence > 0 {
+                let commands = fixture.drive_log();
+                assert_eq!(
+                    commands[before..].iter().filter(|op| **op == 0x92).count(),
+                    0,
+                    "顺序读取相邻已提交对象不得重新挂载、往返索引分区或越过短间隔寻带"
+                );
+                assert!(
+                    !commands[before..]
+                        .iter()
+                        .any(|op| matches!(op, 0x01 | 0x1b | 0x04 | 0x19 | 0x0a | 0x10 | 0x8d))
+                );
+            }
+        }
+        let before = fixture.drive_log().len();
+        let mut reread = Box::pin(read_fdb(
+            &mut fixture.owner,
+            Some(&fixture.permit),
+            &control,
+            &status,
+            &ordered[0].0,
+            Some(&pool.id.to_string()),
+        ))
+        .await
+        .unwrap();
+        let mut actual = Vec::new();
+        std::io::Read::read_to_end(&mut reread, &mut actual).unwrap();
+        assert_eq!(actual, ordered[0].1);
+        assert_eq!(
+            fixture.drive_log()[before..]
+                .iter()
+                .filter(|op| **op == 0x92)
+                .count(),
+            1,
+            "回退读取只定位目标正文，不重复访问索引分区"
+        );
+        assert_eq!(fixture.writes(), writes);
+    }
+
+    async fn sequential_test_upload(
+        fixture: &mut Fixture,
+        control: &FdbOwnerControl,
+        pool: &crate::managed_catalog::PoolRecord,
+        status: &SharedStatus,
+        name: &str,
+        bytes: &[u8],
+    ) -> String {
+        use crate::managed_catalog::{ActiveUploadSpec, ContentDigest};
+        let spool = fixture
+            .root
+            .join(format!("seq-spool-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&spool, bytes).unwrap();
+        let spec = ActiveUploadSpec {
+            pool_id: pool.id,
+            path: name.as_bytes().to_vec(),
+            operation_id: uuid::Uuid::new_v4(),
+            expected_version: None,
+            size: bytes.len() as u64,
+            digest: ContentDigest::Sha256(Sha256::digest(bytes).into()),
+        };
+        let intent = Box::pin(fdb_writing::prepare(
+            &fixture.owner,
+            &fixture.permit,
+            control,
+            &spec,
+            Some("LIFE00L8"),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            Box::pin(fdb_writing::write_batch(
+                &mut fixture.owner,
+                &fixture.permit,
+                control,
+                status,
+                vec![(intent.request(), std::fs::File::open(spool).unwrap())],
+            ))
+            .await,
+            vec![Ok(1)]
+        );
+        format!("/{}{name}", pool.id)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；顺序读证明的状态变更/失权/容量故障失效，Sim"]
+    async fn native_sequential_read_session_invalidates_on_external_changes() {
+        use crate::managed_catalog::{ManagedCatalog, ManagementRequest};
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog = Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());
+        for case in 0..9 {
+            let (mut fixture, mut control, pool, status) =
+                Box::pin(assigned_batch_fixture(catalog.clone())).await;
+            let bytes = b"original sequential body";
+            let path = Box::pin(sequential_test_upload(
+                &mut fixture,
+                &control,
+                &pool,
+                &status,
+                "/body",
+                bytes,
+            ))
+            .await;
+            let mut read = Box::pin(read_fdb(
+                &mut fixture.owner,
+                Some(&fixture.permit),
+                &control,
+                &status,
+                &path,
+                Some(&pool.id.to_string()),
+            ))
+            .await
+            .unwrap();
+            let mut body = Vec::new();
+            std::io::Read::read_to_end(&mut read, &mut body).unwrap();
+            assert_eq!(body, bytes);
+            assert!(fixture.owner.fdb_read_session.is_some());
+            let wrong_permission = Permission::default();
+            wrong_permission.renew(
+                fixture.owner.round,
+                Phase::Serving,
+                Instant::now() + Duration::from_secs(60),
+            );
+            match case {
+                0 => TapeDrive::new(fixture.device()).rewind().unwrap(),
+                1 => {
+                    Box::pin(sequential_test_upload(
+                        &mut fixture,
+                        &control,
+                        &pool,
+                        &status,
+                        "/later",
+                        b"new append",
+                    ))
+                    .await;
+                }
+                2 => {
+                    let assignment = catalog
+                        .tape_assignment(&control.serial, "LIFE00L8")
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let request = ManagementRequest::parse(json!({"version":1,"library":control.serial,
+                        "namespace":control.route.route.namespace.to_string(),"epoch":1,"operation":uuid::Uuid::new_v4().to_string(),
+                        "change":{"kind":"tape","pool":pool.id.to_string(),"barcode":"LIFE00L8",
+                        "volume":assignment.volume_id.unwrap().to_string(),"revision":assignment.revision,"patch":{"blacklisted":true}}})).unwrap();
+                    catalog
+                        .admit_management(
+                            &control.serial,
+                            control.route,
+                            fixture.owner.round,
+                            &request,
+                        )
+                        .await
+                        .unwrap();
+                    let changed = catalog
+                        .apply_management(
+                            &control.serial,
+                            control.route,
+                            fixture.owner.round,
+                            request.epoch(),
+                            request.operation(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(changed["status"], "succeeded", "{changed}");
+                }
+                3 => {
+                    catalog
+                        .claim_active_owner_epoch(&control.serial, fixture.owner.round + 1)
+                        .await
+                        .unwrap();
+                }
+                4 => fixture.permit.close(fixture.owner.round),
+                5 => {
+                    // A separate same-initiator handle changes the actual VCR
+                    // without changing this owner's local transport epoch.
+                    let epoch = fixture.device().session_epoch();
+                    let raw = fixture.lib.drive_as(0, 1);
+                    let drive = TapeDrive::new(&raw);
+                    drive.locate(1, 0, true).unwrap();
+                    drive.space_to_eod().unwrap();
+                    drive.write_block(b"external unindexed data").unwrap();
+                    drive.write_filemark(0).unwrap();
+                    assert_eq!(fixture.device().session_epoch(), epoch);
+                }
+                6 => control.storage.download_bytes = 0,
+                7 => {}
+                8 => fixture.lib.reset_drive(0),
+                _ => unreachable!(),
+            }
+            let before = fixture.drive_log().len();
+            let writes = fixture.writes();
+            let permit = if case == 7 {
+                &wrong_permission
+            } else {
+                fixture.permit.as_ref()
+            };
+            let result = Box::pin(read_fdb(
+                &mut fixture.owner,
+                Some(permit),
+                &control,
+                &status,
+                &path,
+                Some(&pool.id.to_string()),
+            ))
+            .await;
+            if case <= 1 {
+                let mut read = result.unwrap();
+                let mut body = Vec::new();
+                std::io::Read::read_to_end(&mut read, &mut body).unwrap();
+                assert_eq!(body, bytes);
+                assert!(
+                    fixture.drive_log()[before..].contains(&0x92),
+                    "变更后必须重新实读索引"
+                );
+                assert!(fixture.owner.fdb_read_session.is_some());
+            } else {
+                assert!(result.is_err(), "case {case} must refuse stale read proof");
+                assert!(
+                    fixture.owner.fdb_read_session.is_none(),
+                    "case {case} must discard cached proof"
+                );
+                if matches!(case, 2 | 3 | 4 | 6 | 7 | 8) {
+                    assert!(
+                        !fixture.drive_log()[before..]
+                            .iter()
+                            .any(|op| matches!(op, 0x08 | 0x92)),
+                        "case {case} rejects before label/index/body reads"
+                    );
+                }
+            }
+            assert_eq!(fixture.writes(), writes);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "需要隔离 FDB_TEST_CLUSTER；旧 sealed S4 与新邻居按序恢复，不访问实际设备"]
     async fn native_batch_recovers_original_s4_before_preparing_new_neighbour() {
         use crate::daemon::fdb_media::{

@@ -1,4 +1,22 @@
-# 当前交接：代码审查与 GitHub main 集成（2026-11-08）
+# 当前交接：真实 B 库全功能验证与顺序读写优化（2026-11-08）
+
+用户在 PR #41 合入后明确要求“在真实带库环境验证所有的功能”，随后要求按磁带顺序读写特性优化同 pool 的 S3 访问，并明确**读取顺序由客户端保证与实际写入顺序一致**。本轮继续完成验收及该优化，不因下方历史 review 收尾记录而停止；不开发无关功能。S3 ListObjectsV2 保持完整键字典序，实际写/读顺序用客户端独立持久清单保存。省掉重复机械定位不意味着省掉 owner/PR、提交屏障或失权后的重新核验。
+
+- 固定起点为 GitHub/main `d63932586fa4d57d7ab0be5f320003a2eee5ee11`。已用当前树构建正常 EL9/glibc2.34 二进制，真实 207–209 全部升级完成，仍沿用原 FDB45153、namespace、state、unit 和 B-only 设备策略。升级前后原目录/上传/管理回执摘要相同、14类占用为空。实际部署 root `/opt/tape-rs/v1-20261108-d63932586fa4`；SHA 与普通配置逐机证据在新目录 `upgrade-COMPLETE.json`。
+- 新现场总证据目录 `/work/tmp/tape-main-physical-20261108-h9vn4yhb`，接续先读 `CURRENT.json`、各 controller 日志和独立 stage 结果，不能重跑已消费的有状态脚本。新 Python SDK 在该目录 `python/`；运行测试使用相应 PYTHONPATH，FDB 只读审计另需既有 fdb-tools 的 LD_LIBRARY_PATH。
+- 已验证：四类管理查询 CLI/HTTP（三节点）、pool CLI/HTTP CRUD/策略/原请求重放及 S3 bucket 联动、两入口异步 library rescan。发现旧 `drive list`/`node list` 返回404、`cluster`输出null；原生 `fdb drive show` 两驱动均正常，这些旧入口的缺口已分别保留，不冒称通过。
+- S3 当前版本已真实完成旧三份正文冷读及摘要、1000+5字典序分页/跨节点token、V1/start-after/分隔符/编码、PUT/覆盖/空/中文、HEAD/GET/Range/条件、MD5/CRC/错误SHA拒绝、RenameObject原token重放与改参数拒绝。`phase2-PASS.json` 是按原操作结清的结果；第一轮本机旧SDK在发请求前拒IfNoneMatch，隔离安装boto3 1.40.76后续接；末尾multipart实际明确返回405/XML，原脚本误要求501失败，结清脚本保留原失败并验证目标未出现，无重发PUT或改产品迎合脚本。
+- 通知 CLI/HTTP SSE/显式ACK、跨节点断线重连、扩类保留旧批次/旧类型积压且不发新增类型旧事件通过。测试消费者 `phase3-PASS.json` 的原未确认批次特意保留，后续 HA 必须按同 consumer/generation/delivery 验证，不能新建替代。
+- 唯一 `sequential-baseline.py` 已消费，实际3×4KiB按持久原序读写且 SHA 全对；首 PUT120.468s，后两次16.410/15.644s均0 LOCATE/LOAD/MOVE。三个GET44.232/43.192/43.354s，每次12 LOCATE/6 IP，目标性能断言exit101，原红测保留，禁止重跑PUT。随后 exact owner+private FDB/Sim红测left12/right0，修复后顺序/后退/短间隔及9类失效回归全0（sequential-v3-results.json）。新read_session绑定原Permission/PR/epoch/有效VCR/当前head，导入/无SHA/当前同UID正文不同回退旧路径，未削弱逐CDB/FDB及终核；尚未部署新优化。
+- `phase4-fuse.py`、`phase5-tape.py`、`phase6-ha.py` 已准备但**尚未执行**；新无设备 HA helper 已按当前main构建并保存来源，允许原executor在Serving前自动领原零子父，并验证精确release重放。执行HA前须重新采集当前profile/authority、先结清普通数据请求，不能沿用旧fa7轮次/修订号。
+- L84和L85当前均有live/retained数据，不是历史空带；仅这两盘授权scratch可写，不重跑历史格式化/空带脚本。A库保持释放；B changer6070别名不碰，原白名单内两台B drive仍允许。完整native reclaim公开父流程和源格式化继续关闭，相关未接通内核不能算整功能实带验收。双库并行/均衡、现场写保护开关、满带或永久坏带等条件未具备，必须保留未验证边界。
+
+- 用户再次明确要求所有功能真实带库验证并出具含优化项的报告。当前 `phase4-fuse.py` 原 exec60597 正在真实209内核FUSE执行；只读查询和原journal证明已完成初始S3读、目录/文件创建，正在随机写/追加/截断。`run-remaining-physical-v1.py` 原exec45864等待其PASS后按序执行phase5/6/7/8/9，均为one-shot，失败后只结清原身份，不重跑。新HA profiles已采集实际d639三节点；45153专用unit已与45151/45152隔离，double配置可容忍1zone。后续应核各原日志/receipt，不能同时再开相同controller。
+- 本地顺序候选完整7检查software-v4-results.json均0（fmt/default/allfeatures/check/clippy/Python/diff），Clippy只有旧prepare_file8args。独立规范/需求审查v1发现可选客户端新建清单父目录落盘P2，按最小方案改为预先存在的持久父目录；新增实际RED8项1失败后GREEN8项全过，两轴v2均0，Rust未变。工具不新增服务依赖，docs/s3.md说明独立写入顺序及安全恢复；当前硬件仍d639，不能将新优化软件绿色算实带通过。接续需完成物理报告，包含旧入口404/null、原生reclaim关闭及无空scratch/跨库/现场物理状态等未验条件。
+
+- 顺序候选现按本地提交固定来源以构建EL9普通release；尚未推送GitHub或部署。提交前最终Rust三项定向回归v5均0，生产Rust与双轴冻结v1逐字一致，Python仅已复核P2及对应8项GREEN，新增文档只说明已有功能。后续统一升级必须等当前d639原现场流水线结清、重新采集真实profile和14类空占用；不能把本地HEAD前进误作实带版本已变化。
+
+# 此前交接：代码审查与 GitHub main 集成（2026-11-08）
 
 用户最新要求为“review代码，通过后合入github主分支”。本轮只审查、修复阻断问题和集成已有代码，不继续开发新的 reclaim 能力。工作目录仍为 `/work/jay/tape-rs` 的 `main`；GitHub 是否已同步须按接续要求核对远端，不以本文内历史“未推送”记录判断。
 
