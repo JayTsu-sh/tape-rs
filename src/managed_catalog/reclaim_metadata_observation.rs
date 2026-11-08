@@ -9,6 +9,66 @@ pub enum ReclaimMetadataObservationKind {
     Committed,
 }
 
+/// A live, owner/attempt-bound result produced by the guarded device actor.
+/// Unlike a retained observation, this type cannot be restored from FDB.
+///
+/// ```compile_fail
+/// let _: tape_rs::managed_catalog::ReclaimMetadataCommitEvidence =
+///     serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReclaimMetadataCommitEvidence {
+    owner: u64,
+    attempt: Uuid,
+    scan: Uuid,
+    plan: [u8; 32],
+    observation: ReclaimMetadataObservation,
+}
+impl ReclaimMetadataCommitEvidence {
+    pub fn observation(&self) -> &ReclaimMetadataObservation {
+        &self.observation
+    }
+    pub(crate) fn from_current(
+        task: &ReclaimMetadataWrite,
+        owner: u64,
+        target: &CapturedIndexSource,
+        predecessor: Option<&CapturedIndexSource>,
+    ) -> Result<Self> {
+        let observation = task.plan().observe_current(target, predecessor)?;
+        if !task.writing()
+            || task.owner() != owner
+            || observation.kind() != ReclaimMetadataObservationKind::Committed
+            || task.observation()?.as_ref() != Some(&observation)
+        {
+            return Err(CatalogError::Invalid("缺少原任务本轮实读提交证明"));
+        }
+        Ok(Self {
+            owner,
+            attempt: task.id(),
+            scan: task.scan_id(),
+            plan: task.plan().fingerprint()?,
+            observation,
+        })
+    }
+    pub(crate) fn require(
+        &self,
+        task: &ReclaimMetadataWrite,
+        owner: u64,
+    ) -> Result<&ReclaimMetadataObservation> {
+        if self.owner != owner
+            || task.owner() != owner
+            || self.attempt != task.id()
+            || self.scan != task.scan_id()
+            || self.plan != task.plan().fingerprint()?
+        {
+            return Err(CatalogError::Invalid(
+                "元数据实读证明改变原 owner、尝试或计划",
+            ));
+        }
+        Ok(&self.observation)
+    }
+}
+
 #[cfg(test)]
 #[path = "reclaim_metadata_observation_tests.rs"]
 mod tests;

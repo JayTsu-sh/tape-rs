@@ -23,11 +23,16 @@ mod metadata_plan;
 pub use metadata_plan::ReclaimMetadataPlan;
 #[path = "reclaim_metadata_observation.rs"]
 mod metadata_observation;
-pub use metadata_observation::{ReclaimMetadataObservation, ReclaimMetadataObservationKind};
+pub use metadata_observation::{
+    ReclaimMetadataCommitEvidence, ReclaimMetadataObservation, ReclaimMetadataObservationKind,
+};
 #[path = "reclaim_metadata_write.rs"]
 mod metadata_write;
 pub(super) use metadata_write::require_idle_at as require_metadata_idle_at;
-pub use metadata_write::{ReclaimMetadataAdmission, ReclaimMetadataWrite};
+pub(in crate::managed_catalog) use metadata_write::require_publication_at;
+pub use metadata_write::{
+    ReclaimMetadataAdmission, ReclaimMetadataPublication, ReclaimMetadataWrite,
+};
 #[path = "reclaim_file_metadata.rs"]
 mod metadata;
 pub(super) use metadata::require_no_metadata_at;

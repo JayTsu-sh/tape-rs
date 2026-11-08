@@ -92,9 +92,13 @@ fn reclaim_metadata_claim_retains_typed_original_identity_and_rejects_other_payl
     let value = ReclaimMetadataVolumeClaim {
         namespace: ns.to_string(),
         volume: Uuid::new_v4().to_string(),
+        attempt: Uuid::new_v4().to_string(),
         task,
         fingerprint: [9; 32],
     };
+    let mut nil_attempt = value.clone();
+    nil_attempt.attempt = Uuid::nil().to_string();
+    assert!(encode(&NodeVolumeClaim::ReclaimMetadata(Box::new(nil_attempt))).is_err());
     let claim = NodeVolumeClaim::ReclaimMetadata(Box::new(value.clone()));
     let raw = encode(&claim).unwrap();
     assert_eq!(&raw[..2], &[1, 2]);

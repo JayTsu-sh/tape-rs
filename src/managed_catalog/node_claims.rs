@@ -29,6 +29,7 @@ pub(in crate::managed_catalog) enum NodeVolumeClaim {
 pub(in crate::managed_catalog) struct ReclaimMetadataVolumeClaim {
     pub namespace: String,
     pub volume: String,
+    pub attempt: String,
     pub task: Vec<u8>,
     pub fingerprint: [u8; 32],
 }
@@ -36,6 +37,7 @@ impl ReclaimMetadataVolumeClaim {
     fn encode(&self) -> Result<Vec<u8>> {
         let ns = node_mutation::id(&self.namespace)?;
         node_mutation::id(&self.volume)?;
+        node_mutation::id(&self.attempt)?;
         let mut prefix = management::prefix(ns, b'R');
         prefix.push(b'W');
         if !self.task.starts_with(&prefix)

@@ -222,7 +222,6 @@ pub(super) async fn metadata_input_at(
     if assignment.volume_id != Some(destination.copy().volume_id)
         || assignment.namespace != reservation.namespace()
         || assignment.pool_id != reservation.spec().pool
-        || !assignment.allows_io()
     {
         return Err(CatalogError::MediaUnavailable);
     }

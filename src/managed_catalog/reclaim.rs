@@ -21,10 +21,12 @@ mod retirement;
 pub use retirement::ReclaimBodyDestination;
 #[path = "reclaim_source.rs"]
 mod source;
+pub(in crate::managed_catalog) use source::require_publication_at as require_metadata_publication_at;
 pub use source::{
-    ReclaimDataProgress, ReclaimFileMetadata, ReclaimMetadataAdmission, ReclaimMetadataInput,
-    ReclaimMetadataObservation, ReclaimMetadataObservationKind, ReclaimMetadataPlan,
-    ReclaimMetadataProgress, ReclaimMetadataWrite, ReclaimNodeDestination, ReclaimNodeMetadata,
+    ReclaimDataProgress, ReclaimFileMetadata, ReclaimMetadataAdmission,
+    ReclaimMetadataCommitEvidence, ReclaimMetadataInput, ReclaimMetadataObservation,
+    ReclaimMetadataObservationKind, ReclaimMetadataPlan, ReclaimMetadataProgress,
+    ReclaimMetadataPublication, ReclaimMetadataWrite, ReclaimNodeDestination, ReclaimNodeMetadata,
     ReclaimNodeReadRequest, ReclaimReadSource, ReclaimSourceInventory, ReclaimSourceNode,
     ReclaimSourceNodeKind, ReclaimSourceProgress, ReclaimSourceRead,
 };

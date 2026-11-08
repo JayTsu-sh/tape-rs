@@ -10,7 +10,8 @@ use crate::ltfs::recovery::{
 use crate::ltfs::volume::{LtfsVolume, read_label_only};
 use crate::managed_catalog::{
     ActiveFileRequest, ActiveLibraryRoute, ManagedCatalog, ReclaimFile,
-    ReclaimMetadataObservationKind, ReclaimMetadataWrite, ReclaimReservation,
+    ReclaimMetadataCommitEvidence, ReclaimMetadataObservationKind, ReclaimMetadataWrite,
+    ReclaimReservation,
 };
 use crate::scsi::reservation::{ReservationKey, verify_holder};
 use crate::scsi::transport::TapeTransport;
@@ -23,6 +24,20 @@ pub struct ReclaimMetadataWriter<'a> {
     pub key: ReservationKey,
     pub permission: &'a Permission,
     pub budget: &'a RecoveryBudget,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReclaimMetadataExecution {
+    task: ReclaimMetadataWrite,
+    commit: Option<ReclaimMetadataCommitEvidence>,
+}
+impl ReclaimMetadataExecution {
+    pub fn task(&self) -> &ReclaimMetadataWrite {
+        &self.task
+    }
+    pub fn commit_evidence(&self) -> Option<&ReclaimMetadataCommitEvidence> {
+        self.commit.as_ref()
+    }
 }
 
 impl ReclaimMetadataWriter<'_> {
@@ -87,8 +102,27 @@ impl ReclaimMetadataWriter<'_> {
         request: &ActiveFileRequest,
         original: &ReclaimMetadataWrite,
         source: Option<&CapturedIndexSource>,
-    ) -> Result<ReclaimMetadataWrite> {
+    ) -> Result<ReclaimMetadataExecution> {
         self.require_scope(reservation).await?;
+        if self
+            .catalog
+            .reclaim_metadata_publication(reservation, self.key.round(), file, request, original)
+            .await
+            .map_err(catalog)?
+            .is_some()
+        {
+            let task = self
+                .catalog
+                .reclaim_metadata_write_status(
+                    reservation,
+                    self.key.round(),
+                    original.plan().source_uid(),
+                )
+                .await
+                .map_err(catalog)?
+                .ok_or_else(|| catalog("已发布元数据任务缺失"))?;
+            return Ok(ReclaimMetadataExecution { task, commit: None });
+        }
         if let Some(source) = source {
             original.plan().validate_source(source).map_err(catalog)?;
         }
@@ -170,10 +204,25 @@ impl ReclaimMetadataWriter<'_> {
             return Err(catalog("元数据提交后未观察到原固定节点"));
         }
         checked.verify_proof()?;
-        self.catalog
+        let task = self
+            .catalog
             .record_reclaim_metadata_observation(reservation, self.key.round(), writing, &observed)
             .await
-            .map_err(catalog)
+            .map_err(catalog)?;
+        let commit = if observed.kind() == ReclaimMetadataObservationKind::Committed {
+            Some(
+                ReclaimMetadataCommitEvidence::from_current(
+                    &task,
+                    self.key.round(),
+                    &actual,
+                    predecessor.as_ref(),
+                )
+                .map_err(catalog)?,
+            )
+        } else {
+            None
+        };
+        Ok(ReclaimMetadataExecution { task, commit })
     }
 }
 

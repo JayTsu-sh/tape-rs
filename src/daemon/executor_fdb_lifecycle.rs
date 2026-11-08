@@ -6012,6 +6012,15 @@ mod tests {
         .await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；原子发布真实 Sim 提交及原回执/历史/读取，无实际设备"]
+    async fn reclaim_metadata_publication_atomically_advances_index_and_releases_only_own_claims() {
+        Box::pin(native_lifecycle(MetadataCase::Execution(
+            MetadataExecutionCase::Publication,
+        )))
+        .await;
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum MetadataExecutionCase {
         Commit,
@@ -6020,6 +6029,7 @@ mod tests {
         ClosingFailure,
         PermissionAfterWrite,
         PermissionAfterPr,
+        Publication,
     }
 
     struct MetadataFault<'a> {
@@ -7325,6 +7335,130 @@ mod tests {
                     assert_eq!(tr.get(&metadata_volume_key,false).await.unwrap().unwrap().as_ref(), active.as_slice());
                     return;
                 }
+                if mode == MetadataExecutionCase::Publication {
+                    let execution = first.unwrap();
+                    let task = execution.task();
+                    let proof = execution.commit_evidence().unwrap();
+                    assert!(task.writing());
+                    let before = catalog.observed_active_volume_index(&serial, metadata_plan.volume()).await.unwrap();
+                    assert_eq!(before, crate::managed_catalog::ActiveIndexIdentity::from(captured_target.construct()));
+                    let commands = fixture.commands.lock().unwrap().clone();
+                    let tr = raw_catalog.create_trx().unwrap();
+                    let original = tr.get(&metadata_task_key,false).await.unwrap().unwrap().to_vec();
+                    let corrupt = String::from_utf8(original.clone()).unwrap().replace(&task.id().to_string(), &uuid::Uuid::new_v4().to_string()).into_bytes();
+                    assert_ne!(corrupt, original);
+                    tr.set(&metadata_task_key, &corrupt); tr.commit().await.unwrap();
+                    assert!(catalog.publish_reclaim_metadata_write(&reserved, fixture.owner.round, &scanned, &input_request, task, proof).await.is_err());
+                    let tr = raw_catalog.create_trx().unwrap();
+                    assert_eq!(tr.get(&metadata_task_key,false).await.unwrap().unwrap().as_ref(), corrupt.as_slice());
+                    tr.set(&metadata_task_key, &original); tr.commit().await.unwrap();
+                    let mut history_key=b"tape-rs/catalog/22/r/".to_vec();
+                    history_key.extend_from_slice(metadata_plan.volume().as_bytes());
+                    history_key.extend_from_slice(&proof.observation().current().generation.to_be_bytes());
+                    let mut count_key=history_key.clone();count_key.push(b'f');
+                    let mut receipt_key=own_row(b'H');receipt_key.truncate(receipt_key.len()-24);
+                    receipt_key.extend_from_slice(metadata_plan.volume().as_bytes());
+                    receipt_key.extend_from_slice(&proof.observation().current().generation.to_be_bytes());
+                    for key in [&history_key,&count_key,&receipt_key] {
+                        let tr=raw_catalog.create_trx().unwrap();
+                        assert!(tr.get(key,false).await.unwrap().is_none());
+                        tr.set(key,b"unexplained-original-slot");tr.commit().await.unwrap();
+                        assert!(catalog.publish_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,task,proof).await.is_err());
+                        assert_eq!(catalog.observed_active_volume_index(&serial,metadata_plan.volume()).await.unwrap(),before);
+                        assert!(catalog.reclaim_metadata_write_status(&reserved,fixture.owner.round,source_data_uid).await.unwrap().unwrap().writing());
+                        let tr=raw_catalog.create_trx().unwrap();
+                        assert_eq!(tr.get(key,false).await.unwrap().unwrap().as_ref(),b"unexplained-original-slot");
+                        assert_eq!(tr.get(&metadata_active_key,false).await.unwrap().unwrap().as_ref(),active.as_slice());
+                        assert_eq!(tr.get(&metadata_volume_key,false).await.unwrap().unwrap().as_ref(),active.as_slice());
+                        tr.clear(key);tr.commit().await.unwrap();
+                    }
+                    // Recording a physical fact must still work after the pool
+                    // limit falls below the already committed physical count.
+                    let tr = raw_catalog.create_trx().unwrap();
+                    tr.set(&pool_key, &full_pool); tr.commit().await.unwrap();
+                    let (first,concurrent)=tokio::join!(
+                        Box::pin(catalog.publish_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,task,proof)),
+                        Box::pin(catalog.publish_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,task,proof))
+                    );
+                    let published=first.unwrap();
+                    assert_eq!(concurrent.unwrap(),published,"并发发布仅推进一次原代次");
+                    assert_eq!(published.id(), task.id());
+                    assert_eq!(published.observation(), proof.observation());
+                    let completed = catalog.reclaim_metadata_write_status(&reserved, fixture.owner.round, source_data_uid).await.unwrap().unwrap();
+                    assert!(completed.completed() && !completed.writing() && !completed.closed());
+                    assert_eq!(completed.id(), task.id());
+                    assert_eq!(catalog.observed_active_volume_index(&serial, metadata_plan.volume()).await.unwrap(), proof.observation().current());
+                    assert_eq!(catalog.active_volume_file_count(&serial, route, fixture.owner.round, metadata_plan.volume()).await.unwrap(), proof.observation().physical_files());
+                    let tr = raw_catalog.create_trx().unwrap();
+                    assert!(tr.get(&metadata_active_key,false).await.unwrap().is_none());
+                    assert!(tr.get(&metadata_volume_key,false).await.unwrap().is_none());
+                    assert_eq!(catalog.publish_reclaim_metadata_write(&reserved, fixture.owner.round, &scanned, &input_request, task, proof).await.unwrap(), published, "丢失发布回执只重读原发布，不再计数/释放");
+                    let mut changed_request = input_request.clone();
+                    changed_request.operation_id = uuid::Uuid::new_v4();
+                    assert!(catalog.publish_reclaim_metadata_write(&reserved, fixture.owner.round, &scanned, &changed_request, task, proof).await.is_err(), "已发布重试仍须绑定原对象请求");
+                    assert_eq!(catalog.reclaim_metadata_publication(&reserved, fixture.owner.round, &scanned, &input_request, &metadata_write).await.unwrap(), Some(published.clone()));
+                    let replay = writer.execute(&reserved, &scanned, &input_request, &metadata_write, None).await.unwrap();
+                    assert!(replay.task().completed() && replay.commit_evidence().is_none());
+                    assert_eq!(*fixture.commands.lock().unwrap(), commands, "目录发布和已发布重放无设备命令");
+                    let tr = raw_catalog.create_trx().unwrap();
+                    tr.set(&metadata_active_key, b"another-original-task");
+                    tr.set(&metadata_volume_key, b"another-original-task");
+                    tr.commit().await.unwrap();
+                    assert!(catalog.close_prepared_reclaim_metadata_write(&reserved, fixture.owner.round, &metadata_write).await.is_err());
+                    assert_eq!(catalog.publish_reclaim_metadata_write(&reserved, fixture.owner.round, &scanned, &input_request, task, proof).await.unwrap(), published);
+                    let tr = raw_catalog.create_trx().unwrap();
+                    for key in [&metadata_active_key,&metadata_volume_key] {
+                        assert_eq!(tr.get(key,false).await.unwrap().unwrap().as_ref(), b"another-original-task");
+                        tr.clear(key);
+                    }
+                    tr.set(&pool_key, &pool_bytes); tr.commit().await.unwrap();
+                    let tr = raw_catalog.create_trx().unwrap();
+                    let receipt = tr.get(&receipt_key,false).await.unwrap().unwrap().to_vec();
+                    for replacement in [None, Some({let mut b=receipt.clone(); b[5]^=1;b})] {
+                        let tr = raw_catalog.create_trx().unwrap();
+                        if let Some(raw)=&replacement { tr.set(&receipt_key,raw); } else { tr.clear(&receipt_key); }
+                        tr.commit().await.unwrap();
+                        assert!(catalog.observed_active_volume_index(&serial, metadata_plan.volume()).await.is_err());
+                        assert!(catalog.publish_reclaim_metadata_write(&reserved, fixture.owner.round, &scanned, &input_request, task, proof).await.is_err());
+                        let tr = raw_catalog.create_trx().unwrap();
+                        assert_eq!(tr.get(&receipt_key,false).await.unwrap().as_deref(), replacement.as_deref());
+                        tr.set(&receipt_key,&receipt);tr.commit().await.unwrap();
+                    }
+                    let tr=raw_catalog.create_trx().unwrap();
+                    let mut ledger_rows=Vec::new();
+                    for key in [&metadata_task_key,&latest_metadata_key,&own_row(b'm')] {
+                        ledger_rows.push((key.clone(),tr.get(key,false).await.unwrap().unwrap().to_vec()));
+                        tr.clear(key);
+                    }
+                    tr.commit().await.unwrap();
+                    assert_eq!(catalog.observed_active_volume_index(&serial,metadata_plan.volume()).await.unwrap(),proof.observation().current(),"历史读取不依赖可清理的原任务/清单");
+                    let tr=raw_catalog.create_trx().unwrap();
+                    for (key,raw) in &ledger_rows {tr.set(key,raw);}
+                    tr.commit().await.unwrap();
+                    let reader = crate::daemon::fdb_read::ActiveMediaReader {
+                        catalog: &catalog, device: &device, serial: &serial, route,
+                        key: fixture.owner.key, permission: &fixture.permit, storage: fixture.budget(),
+                    };
+                    let mut read = reader.read_with_cache(path.as_bytes(), &fixture.owner.files.extent_cache_dir(), fixture.owner.files.spool_dir()).await.unwrap().unwrap();
+                    let mut body=Vec::new(); std::io::Read::read_to_end(&mut read.file,&mut body).unwrap();
+                    assert_eq!(body,bytes,"活动新索引仍可读取原正文");
+                    let mut volume=LtfsVolume::mount_with_budget(&device,&budget).unwrap();
+                    volume.set_reservation_guard(Some(fixture.owner.key));
+                    let mut raw_body=Vec::new(); volume.read_file_to_writer(metadata_plan.path(),&mut raw_body).unwrap();
+                    assert_eq!(raw_body,bytes,"新 raw 引用读取相同正文"); drop(volume);
+                    let commands=fixture.commands.lock().unwrap().clone();
+                    let next=fixture.owner.round+100;
+                    catalog.claim_active_owner_epoch(&serial,next).await.unwrap();
+                    let parents=catalog.claim_reclaim_reservations_page(&serial,route,next,None,16).await.unwrap();
+                    assert_eq!(parents.items.len(),1);
+                    let recovered=catalog.claim_reclaim_metadata_write(&parents.items[0],next,source_data_uid).await.unwrap();
+                    assert!(recovered.completed());
+                    assert_eq!(recovered.id(),task.id());
+                    assert_eq!(catalog.reclaim_metadata_publication(&parents.items[0],next,&scanned,&input_request,&recovered).await.unwrap(),Some(published));
+                    assert!(catalog.publish_reclaim_metadata_write(&parents.items[0],next,&scanned,&input_request,&recovered,proof).await.is_err(),"旧owner实读token不可重绑新owner");
+                    assert_eq!(*fixture.commands.lock().unwrap(),commands,"接任已发布结果不发设备命令");
+                    return;
+                }
                 let failure = matches!(mode, MetadataExecutionCase::IpFailure | MetadataExecutionCase::ClosingFailure | MetadataExecutionCase::PermissionAfterWrite);
                 if failure {
                     let error = first.unwrap_err();
@@ -7341,9 +7475,9 @@ mod tests {
                     assert!(retained.observation().unwrap().is_none());
                 } else {
                     let result = first.unwrap();
-                    assert!(result.writing());
+                    assert!(result.task().writing());
                     let expected = if mode == MetadataExecutionCase::LostAdmission {ReclaimMetadataObservationKind::Unchanged} else {ReclaimMetadataObservationKind::Committed};
-                    assert_eq!(result.observation().unwrap().unwrap().kind(), expected);
+                    assert_eq!(result.task().observation().unwrap().unwrap().kind(), expected);
                 }
                 let before_retry = fixture.commands.lock().unwrap().len();
                 let replay = writer.execute(&reserved, &scanned, &input_request, &metadata_write, None).await;
@@ -7351,10 +7485,10 @@ mod tests {
                     assert!(replay.is_err(), "截断尾部不能观察为完成或自动修复");
                 } else {
                     let replay = replay.unwrap();
-                    let observed = replay.observation().unwrap().unwrap();
+                    let observed = replay.task().observation().unwrap().unwrap();
                     let expected = if mode == MetadataExecutionCase::LostAdmission {ReclaimMetadataObservationKind::Unchanged} else {ReclaimMetadataObservationKind::Committed};
                     assert_eq!(observed.kind(), expected);
-                    let again = writer.execute(&reserved, &scanned, &input_request, &replay, None).await.unwrap();
+                    let again = writer.execute(&reserved, &scanned, &input_request, replay.task(), None).await.unwrap();
                     assert_eq!(again, replay);
                 }
                 assert!(!fixture.commands.lock().unwrap()[before_retry..].iter().any(|(_,op)|matches!(op,0x04|0x0a|0x10|0x19|0x8d|0xa5)), "任何重试只读，不格式化/重写/MAM/搬带");
