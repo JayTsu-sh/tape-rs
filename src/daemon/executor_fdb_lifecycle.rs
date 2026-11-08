@@ -6072,6 +6072,16 @@ mod tests {
         AttemptHistory,
     }
 
+    // Construct each large async fixture phase in a separate stack frame.
+    // Boxing an already constructed future inside its parent poll is too late:
+    // debug builds still reserve space there for the entire temporary value.
+    #[inline(never)]
+    fn boxed_metadata_phase<F: std::future::Future>(
+        make: impl FnOnce() -> F,
+    ) -> std::pin::Pin<Box<F>> {
+        Box::pin(make())
+    }
+
     fn checkpoint_metadata_fixture(fixture: &Fixture, drive: usize) {
         // The ordinary data path deliberately leaves an IP checkpoint debt.
         // Build this positive fixture before preparing the metadata attempt;
@@ -7186,7 +7196,7 @@ mod tests {
         );
         // Poll metadata validation separately from the deep ordinary-write
         // recovery setup; keep the default test/production stack unchanged.
-        Box::pin(async {
+        boxed_metadata_phase(|| async {
         let input_request = intent.request();
         let input = catalog
             .reclaim_metadata_input(&reserved, fixture.owner.round, &scanned, &input_request)
@@ -7362,7 +7372,7 @@ mod tests {
             .unwrap()
             .to_vec();
         if let MetadataCase::Execution(mode) = metadata_case {
-            Box::pin(async {
+            boxed_metadata_phase(|| async {
                 use crate::daemon::fdb_reclaim_media::ReclaimMetadataWriter;
                 use crate::managed_catalog::ReclaimMetadataObservationKind;
                 fixture.permit.renew(fixture.owner.round, Phase::Serving, Instant::now() + Duration::from_secs(60));
@@ -7400,8 +7410,42 @@ mod tests {
                 assert_eq!(*fixture.commands.lock().unwrap(), original_commands);
                 assert_eq!(catalog.reclaim_metadata_write_status(&reserved, fixture.owner.round, source_data_uid).await.unwrap(), Some(metadata_write.clone()));
                 if mode == MetadataExecutionCase::AttemptRegistry {
-                    Box::pin(async {
+                    boxed_metadata_phase(|| async {
                         let commands=fixture.commands.lock().unwrap().clone();
+                        let recovered=observer.reclaim_metadata_execution_context(&reserved,fixture.owner.round,&metadata_write).await.unwrap();
+                        assert_eq!(recovered,(scanned.clone(),input_request.clone()),"独立目录实例只按原尝试恢复原执行上下文");
+                        let mut child_key=own_row(b'c');child_key.extend_from_slice(input_request.operation_id.as_bytes());
+                        for key in [&child_key,&data_body_key,&data_destination_key,&retired_key] {
+                            let tr=raw_catalog.create_trx().unwrap();let raw=tr.get(key,false).await.unwrap().unwrap().to_vec();tr.clear(key);tr.commit().await.unwrap();
+                            let missing=observer.reclaim_metadata_execution_context(&reserved,fixture.owner.round,&metadata_write).await;
+                            let tr=raw_catalog.create_trx().unwrap();let unchanged=tr.get(key,false).await.unwrap().is_none();tr.set(key,&raw);tr.commit().await.unwrap();
+                            assert!(missing.is_err() && unchanged,"丢失原上下文证明必须拒绝且不修复");
+                        }
+                        let tr=raw_catalog.create_trx().unwrap();let original=tr.get(&metadata_task_key,false).await.unwrap().unwrap().to_vec();
+                        let header=tr.get(&metadata_header_key,false).await.unwrap().unwrap().to_vec();
+                        let saved:Value=serde_json::from_slice(&original).unwrap();assert_eq!(saved["version"],5);assert_eq!(saved["context"]["file"],serde_json::to_value(&scanned).unwrap());
+                        for (field,changed) in [("epoch",json!(0)),("epoch",json!(input_request.request_epoch+1)),("request",json!([3u8;32].to_vec()))] {
+                            let mut corrupt=saved["context"].clone();corrupt[field]=changed;
+                            // Keep the record's canonical field order. Recompute both
+                            // checksums so these are semantic, not codec-only failures.
+                            let context=format!(r#"{{"file":{},"epoch":{},"request":{}}}"#,serde_json::to_string(&scanned).unwrap(),corrupt["epoch"],corrupt["request"]);
+                            let original_text=std::str::from_utf8(&original).unwrap();
+                            let start=original_text.find("\"context\":").unwrap()+"\"context\":".len();let end=original_text.find(",\"owner\":").unwrap();
+                            let raw=format!("{}{}{}",&original_text[..start],context,&original_text[end..]).into_bytes();
+                            let h:Value=serde_json::from_slice(&header[..header.len()-32]).unwrap();
+                            let digest=Sha256::new().chain_update(b"tape-rs/reclaim-metadata-task/5").chain_update(&raw).finalize().to_vec();
+                            let mut h=format!(r#"{{"version":{},"uid":{},"attempt":{},"task_sha256":{}}}"#,h["version"],h["uid"],h["attempt"],json!(digest)).into_bytes();
+                            let parent=format!("{:x}",Sha256::digest(reserved.intent().to_string().as_bytes()));
+                            let hash=Sha256::new().chain_update(b"tape-rs/reclaim-metadata-registry/1").chain_update(parent.as_bytes()).chain_update(&h).finalize();h.extend_from_slice(&hash);
+                            let tr=raw_catalog.create_trx().unwrap();tr.set(&metadata_task_key,&raw);tr.set(&metadata_header_key,&h);tr.commit().await.unwrap();
+                            let discovered=catalog.pending_reclaim_metadata_write(&reserved,fixture.owner.round).await;
+                            let changed=if corrupt["epoch"]==0 {assert!(discovered.is_err());None} else {
+                                let handle=discovered.unwrap().unwrap();
+                                Some(observer.reclaim_metadata_execution_context(&reserved,fixture.owner.round,&handle).await)
+                            };
+                            let tr=raw_catalog.create_trx().unwrap();assert_eq!(tr.get(&metadata_task_key,false).await.unwrap().unwrap().as_ref(),raw.as_slice());tr.set(&metadata_task_key,&original);tr.set(&metadata_header_key,&header);tr.commit().await.unwrap();assert!(changed.is_none_or(|result|result.is_err()),"匹配外层摘要仍不得接受不同封存请求");
+                        }
+                        assert_eq!(*fixture.commands.lock().unwrap(),commands,"恢复或拒绝上下文不执行 CDB");
                         assert_eq!(catalog.pending_reclaim_metadata_write(&reserved,fixture.owner.round).await.unwrap(),Some(metadata_write.clone()));
                         assert!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&metadata_write).await.is_err());
                         let keys=[&metadata_active_key,&metadata_volume_key,&latest_metadata_key,&metadata_header_key,&metadata_task_key];
@@ -7436,7 +7480,11 @@ mod tests {
                         assert_eq!(catalog.pending_reclaim_metadata_write(&reserved,fixture.owner.round).await.unwrap(),Some(observed.clone()));
                         let next=fixture.owner.round+100;catalog.claim_active_owner_epoch(&serial,next).await.unwrap();
                         let parents=catalog.claim_reclaim_reservations_page(&serial,route,next,None,16).await.unwrap();let parent=&parents.items[0];
+                        assert!(catalog.reclaim_metadata_execution_context(parent,next,&observed).await.is_err(),"发现不等于领取执行上下文");
                         let claimed=catalog.claim_reclaim_metadata_attempt(parent,next,&observed).await.unwrap();
+                        assert!(catalog.reclaim_metadata_execution_context(parent,next,&observed).await.is_err(),"原 owner 句柄不能自动变成接任执行上下文");
+                        assert_eq!(observer.reclaim_metadata_execution_context(parent,next,&claimed).await.unwrap(),(scanned.clone(),input_request.clone()));
+                        assert!(observer.reclaim_metadata_execution_context(&reserved,fixture.owner.round,&observed).await.is_err());
                         assert_eq!(claimed.id(),metadata_write.id());assert_eq!(claimed.observation().unwrap(),observed.observation().unwrap());
                         let tr=raw_catalog.create_trx().unwrap();let claimed_raw=tr.get(&metadata_task_key,false).await.unwrap().unwrap().to_vec();tr.set(&metadata_task_key,&with_observation);tr.commit().await.unwrap();
                         let rollback=catalog.pending_reclaim_metadata_write(parent,next).await;
@@ -7449,7 +7497,7 @@ mod tests {
                     return;
                 }
                 if mode == MetadataExecutionCase::AttemptHistory {
-                    Box::pin(async {
+                    boxed_metadata_phase(|| async {
                         let commands=fixture.commands.lock().unwrap().clone();
                         let first=catalog.close_prepared_reclaim_metadata_write(&reserved,fixture.owner.round,&metadata_write).await.unwrap();
                         let tr=raw_catalog.create_trx().unwrap();let first_raw=tr.get(&metadata_task_key,false).await.unwrap().unwrap().to_vec();
@@ -7460,6 +7508,8 @@ mod tests {
                         let second_closed=catalog.close_prepared_reclaim_metadata_write(&reserved,fixture.owner.round,&second).await.unwrap();
                         let third=catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&second_closed).await.unwrap();
                         assert_ne!(third.id(),second.id());assert_eq!(third.first_attempt(),first.id());assert_eq!(third.previous_attempt(),Some(second.id()));
+                        assert_eq!(observer.reclaim_metadata_execution_context(&reserved,fixture.owner.round,&third).await.unwrap(),(scanned.clone(),input_request.clone()),"后继保持原执行上下文");
+                        assert!(observer.reclaim_metadata_execution_context(&reserved,fixture.owner.round,&first).await.is_err(),"旧终态不能恢复成新尝试的执行上下文");
                         assert_eq!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&first).await.unwrap(),second_closed,"旧重试始终返回原后继，不返回第三次");
                         assert_eq!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&second_closed).await.unwrap(),third);
                         assert_eq!(catalog.reclaim_metadata_attempt(&reserved,fixture.owner.round,source_data_uid,first.id()).await.unwrap(),first);
@@ -7477,6 +7527,7 @@ mod tests {
                         let published=catalog.publish_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,execution.task(),execution.commit_evidence().unwrap()).await.unwrap();
                         assert_eq!(published.id(),third.id());
                         let completed=catalog.reclaim_metadata_attempt(&reserved,fixture.owner.round,source_data_uid,third.id()).await.unwrap();assert!(completed.completed());
+                        assert!(observer.reclaim_metadata_execution_context(&reserved,fixture.owner.round,&completed).await.is_err(),"已发布仅查历史，不再执行恢复");
                         assert_eq!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&first).await.unwrap(),second_closed);
                         assert_eq!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&second_closed).await.unwrap(),completed);
                         let mut rows=Vec::new();let tr=raw_catalog.create_trx().unwrap();
@@ -7536,7 +7587,7 @@ mod tests {
                     return;
                 }
                 if mode == MetadataExecutionCase::UnwrittenClose {
-                    Box::pin(async {
+                    boxed_metadata_phase(|| async {
                     let execution = first.unwrap();
                     let task = execution.task();
                     assert!(task.writing() && execution.commit_evidence().is_none());
@@ -7770,7 +7821,7 @@ mod tests {
             return;
         }
         if let MetadataCase::Observation { changed_root } = metadata_case {
-            Box::pin(async {
+            boxed_metadata_phase(|| async {
                 use crate::managed_catalog::ReclaimMetadataObservationKind;
                 let unchanged = metadata_plan
                     .observe_current(&captured_target, None)
@@ -8160,7 +8211,7 @@ mod tests {
             return;
         }
         if metadata_case == MetadataCase::Admission {
-            Box::pin(async {
+            boxed_metadata_phase(|| async {
                 let commands = fixture.commands.lock().unwrap().clone();
                 assert!(!metadata_write.writing());
                 assert!(

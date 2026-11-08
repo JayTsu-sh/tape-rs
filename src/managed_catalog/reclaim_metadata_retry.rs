@@ -128,6 +128,7 @@ impl ManagedCatalog {
                             if !old.closed() || old.plan() != plan || old.owner() > owner {
                                 return Err(CatalogError::Invalid("元数据新尝试改变原关闭事实"));
                             }
+                            old.0.context.require(reservation, file, request)?;
                             let input =
                                 input_at(&tr, reservation, owner, file, request, &plan).await?;
                             let edge = registry::edge_key(reservation, uid, old.id());
@@ -171,12 +172,13 @@ impl ManagedCatalog {
                             )
                             .await?;
                             let task = ReclaimMetadataWrite(Record {
-                                version: 4,
+                                version: 5,
                                 id: Uuid::new_v4().to_string(),
                                 first: old.0.first.clone(),
                                 previous: Some(old.id().to_string()),
                                 scan: old.0.scan.clone(),
                                 plan: plan.0.clone(),
+                                context: old.0.context.clone(),
                                 owner,
                                 phase: Phase::Prepared,
                                 observation: None,

@@ -23,7 +23,7 @@ fn checksum(parent: &str, raw: &[u8]) -> [u8; 32] {
 }
 fn task_digest(task: &ReclaimMetadataWrite) -> Result<[u8; 32]> {
     let mut hash = Sha256::new();
-    hash.update(b"tape-rs/reclaim-metadata-task/4");
+    hash.update(b"tape-rs/reclaim-metadata-task/5");
     hash.update(task.encode()?);
     Ok(hash.finalize().into())
 }
@@ -88,6 +88,7 @@ pub(super) async fn require_previous_at(
     if !old.closed()
         || old.first_attempt() != task.first_attempt()
         || old.plan() != task.plan()
+        || old.0.context != task.0.context
         || old.0.scan != task.0.scan
         || tr
             .get(&edge_key(reservation, uid, previous), false)
@@ -104,6 +105,7 @@ pub(super) async fn require_previous_at(
         if !first.closed()
             || first.first_attempt() != first.id()
             || first.plan() != task.plan()
+            || first.0.context != task.0.context
             || first.0.scan != task.0.scan
         {
             return Err(CatalogError::Corrupt("元数据首次尝试与原后继根身份不同"));

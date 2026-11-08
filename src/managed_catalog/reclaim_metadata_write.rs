@@ -2,6 +2,8 @@
 //! Once admitted, unknown media results retain the original plan and claims.
 use super::*;
 use metadata_plan::Plan;
+#[path = "reclaim_metadata_context.rs"]
+mod context;
 #[path = "reclaim_metadata_publication.rs"]
 mod publication;
 #[path = "reclaim_metadata_registry.rs"]
@@ -31,6 +33,7 @@ struct Record {
     previous: Option<String>,
     scan: String,
     plan: Plan,
+    context: context::Context,
     owner: u64,
     phase: Phase,
     observation: Option<Vec<u8>>,
@@ -84,6 +87,7 @@ impl ReclaimMetadataWrite {
     }
     fn encode(&self) -> Result<Vec<u8>> {
         self.plan().encode()?;
+        self.0.context.validate()?;
         node_mutation::id(&self.0.id)?;
         node_mutation::id(&self.0.scan)?;
         let first = node_mutation::id(&self.0.first)?;
@@ -109,7 +113,7 @@ impl ReclaimMetadataWrite {
         {
             return Err(CatalogError::Corrupt("已发布元数据任务缺少原提交观察"));
         }
-        if self.0.version != 4 || self.0.owner == 0 || self.0.owner > 0xFFFF_FFFF_FFFF {
+        if self.0.version != 5 || self.0.owner == 0 || self.0.owner > 0xFFFF_FFFF_FFFF {
             return Err(CatalogError::Corrupt("回收元数据任务版本或 owner 无效"));
         }
         let raw = serde_json::to_vec(&self.0).map_err(cache)?;
@@ -156,6 +160,7 @@ fn require_phase_history(
         || original.0.scan != current.0.scan
         || original.0.previous != current.0.previous
         || original.0.first != current.0.first
+        || original.0.context != current.0.context
     {
         return Err(CatalogError::Corrupt(
             "回收元数据任务改变原物理尝试或扫描身份",
@@ -458,6 +463,7 @@ impl ManagedCatalog {
                                 )
                                 .await?
                                 .ok_or(CatalogError::Corrupt("元数据准备缺少原首次尝试"))?;
+                                saved.0.context.require(reservation, file, request)?;
                                 if saved.plan() != *plan {
                                     return Err(CatalogError::Invalid(
                                         "回收元数据重试改变固定计划",
@@ -478,14 +484,16 @@ impl ManagedCatalog {
                                 plan.volume(),
                             )
                             .await?;
+                            let context = context::Context::new(reservation, file, request)?;
                             let id = Uuid::new_v4().to_string();
                             let task = ReclaimMetadataWrite(Record {
-                                version: 4,
+                                version: 5,
                                 id: id.clone(),
                                 first: id,
                                 previous: None,
                                 scan: scan.to_string(),
                                 plan: plan.0.clone(),
+                                context,
                                 owner,
                                 phase: Phase::Prepared,
                                 observation: None,
@@ -547,6 +555,7 @@ impl ManagedCatalog {
                                 return Err(CatalogError::Invalid("准入改变原回收元数据计划"));
                             }
                             require_phase_history(original, &task)?;
+                            task.0.context.require(reservation, file, request)?;
                             let needs_observation = match task.0.phase {
                                 Phase::Closed | Phase::Committed => {
                                     return Err(CatalogError::Invalid(
