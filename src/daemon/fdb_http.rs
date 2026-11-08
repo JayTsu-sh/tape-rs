@@ -193,8 +193,20 @@ async fn ready(State(ctx): State<Arc<Context>>, request: Request) -> Response {
                     gateway::forward_request(probe, address, permit, serial),
                 )
                 .await;
-                if !matches!(result, Ok(response) if response.status() == StatusCode::OK) {
-                    return unavailable("带库 owner 未确认可服务");
+                match result {
+                    Ok(response) if response.status() == StatusCode::OK => {}
+                    // 503 仍拒绝就绪；保留 owner 的原诊断及其有界转发正文，
+                    // 不把机械维护暂忙误写成所有权丢失。
+                    Ok(response) if response.status() == StatusCode::SERVICE_UNAVAILABLE => {
+                        return response;
+                    }
+                    Ok(response) => {
+                        return unavailable(&format!(
+                            "带库 owner 就绪探测返回 HTTP {}",
+                            response.status().as_u16()
+                        ));
+                    }
+                    Err(_) => return unavailable("带库 owner 就绪探测超时"),
                 }
             }
             match ctx.catalog.active_library_owner(serial).await {
@@ -206,6 +218,14 @@ async fn ready(State(ctx): State<Arc<Context>>, request: Request) -> Response {
                 .require_active_library_readable(serial, *route, executor.round)
                 .await
             {
+                if matches!(error.domain(), CatalogError::PoolBusy) {
+                    return reply(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        json!({"ready":false,"reason":"library_busy","retryable":true,
+                            "library_serial":serial,"owner":executor.node,"round":executor.round,
+                            "error":format!("带库设备暂不可读：{error}")}),
+                    );
+                }
                 return unavailable(&format!("带库设备暂不可读：{error}"));
             }
         }

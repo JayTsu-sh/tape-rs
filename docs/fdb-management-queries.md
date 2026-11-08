@@ -40,6 +40,8 @@ Tape 管理分页默认及最大 100 条，按条码字节字典序排列；这�
 
 active_node 仅在已应用控制状态就绪、冻结点及 FDB epoch 一致时给出；本入口没有 owner 上下文或无法确认时为 null。它不是设备租约或实时 I/O 可用性的证明，`execution_readiness=unknown` 明确表示该查询未探测数据服务就绪。实际数据操作仍执行原有许可、PR 和 FDB 栅栏核验。
 
+`GET /readyz?library=SERIAL` 是数据服务就绪探针。受管机械操作（包括空闲读挂载自动退带）持有持久屏障时，仍返回503，正文包含 `ready=false`、`reason=library_busy`、`retryable=true` 及原库、owner、round。这表示该次检查被机械操作阻挡，不能据此判定owner失权，也不能据此获得执行许可。参与节点保留owner原503正文；不会把该原因改成笼统的owner不可服务。执行资格、路由或FDB不可核实时仍失败，不能只按 `retryable` 字段认定安全。维护结束后仍核验全部原有前提，满足才返回200。
+
 `library list` 的 inventory 是采样节点/轮次/时间摘要；`library show` 包含完整 volumes/drives。两者都有库存计数和年龄，库存缺失时计数与年龄为 null，不能将未知显示为空库。库存与巡检由不同事务依次发布，合法的中间记录对可以有不同采样时间。
 
 Tape 清单合并已观测的物理条码与 FDB 分配记录，包含未分配实带（包括清洗带）及已分配但当前库存未观测到的盘。池过滤仅返回该库该池的管理归属。`presence` 区分 `unknown`、`observed`、`not_observed`；后者仅表示那次库存中未发现，不自动推断磁带已导出或丢失。
