@@ -5531,6 +5531,87 @@ mod tests {
         assert_eq!(fixture.writes(), writes);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；长 Full 历史后的真实 owner 冷读，不接触设备"]
+    async fn native_sequential_cold_read_avoids_historical_full_audit() {
+        use crate::managed_catalog::ManagedCatalog;
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog = Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());
+        let (mut fixture, control, pool, status) = Box::pin(assigned_batch_fixture(catalog)).await;
+        let expected = b"immutable first body";
+        let first = Box::pin(sequential_test_upload(
+            &mut fixture,
+            &control,
+            &pool,
+            &status,
+            "/first",
+            expected,
+        ))
+        .await;
+        for number in 0..70 {
+            fixture.permit.renew(
+                fixture.owner.round,
+                Phase::Serving,
+                Instant::now() + Duration::from_secs(60),
+            );
+            Box::pin(sequential_test_upload(
+                &mut fixture,
+                &control,
+                &pool,
+                &status,
+                &format!("/later-{number}"),
+                b"later body",
+            ))
+            .await;
+        }
+        fixture.permit.renew(
+            fixture.owner.round,
+            Phase::Serving,
+            Instant::now() + Duration::from_secs(60),
+        );
+        let head = control
+            .catalog
+            .active_loaded_volume_head(
+                &control.serial,
+                "LIFE00L8",
+                control.route,
+                fixture.owner.round,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !head.index.incremental,
+            "夹具必须为独立 Full，而非必要的增量链"
+        );
+        let writes = fixture.writes();
+        let before = fixture.drive_log().len();
+        let mut read = Box::pin(read_fdb(
+            &mut fixture.owner,
+            Some(&fixture.permit),
+            &control,
+            &status,
+            &first,
+            Some(&pool.id.to_string()),
+        ))
+        .await
+        .unwrap();
+        let mut actual = Vec::new();
+        std::io::Read::read_to_end(&mut read, &mut actual).unwrap();
+        assert_eq!(actual, expected);
+        let locates = fixture.drive_log()[before..]
+            .iter()
+            .filter(|op| **op == 0x92)
+            .count();
+        assert!(
+            locates < 32,
+            "冷读不应逐代回扫独立 Full 历史，实际 LOCATE={locates}"
+        );
+        assert!(fixture.owner.fdb_read_session.is_some());
+        assert_eq!(fixture.writes(), writes);
+    }
+
     async fn sequential_test_upload(
         fixture: &mut Fixture,
         control: &FdbOwnerControl,

@@ -2,7 +2,7 @@
 //! The client supplies read order; actual extent positioning remains verified.
 use super::*;
 use crate::ltfs::mam::{Mam, vcr_is_valid, vcr_matches};
-use crate::ltfs::recovery::{CapturedIndexSource, IndexSourceScope};
+use crate::ltfs::recovery::{CapturedReadIndex, capture_current_read_index};
 
 pub(crate) struct ReadSession {
     device: String,
@@ -13,7 +13,7 @@ pub(crate) struct ReadSession {
     vcr: Vec<u8>,
     label: LtfsLabel,
     head: ActiveLoadedVolumeHead,
-    captured: CapturedIndexSource,
+    captured: CapturedReadIndex,
 }
 
 impl ActiveMediaReader<'_> {
@@ -122,26 +122,13 @@ impl ActiveMediaReader<'_> {
                 budget.index_scratch.max_bytes = self.storage.index_bytes;
                 budget.index_scratch.headroom_bytes = self.storage.headroom_bytes;
                 let captured = retry_after_space_reclaim(
-                    || capture_index_source(&TapeDrive::new(self.device), &label, &budget),
+                    || capture_current_read_index(&TapeDrive::new(self.device), &label, &budget),
                     || reclaim_cache_space(cache_dir, self.storage),
                 )?;
                 if ActiveIndexIdentity::from(captured.construct()) != head.index {
                     return Err(TapeError::Catalog(
                         "顺序读实测索引与 FDB 当前卷头不符".into(),
                     ));
-                }
-                if !matches!(
-                    captured.scope(),
-                    IndexSourceScope::Current {
-                        history_truncated: false,
-                        ..
-                    }
-                ) {
-                    drop(captured);
-                    drop(file);
-                    return self
-                        .read_with_cache_scoped(path, pool, cache_dir, spool_dir)
-                        .await;
                 }
                 self.catalog
                     .verify_active_index_predecessors(

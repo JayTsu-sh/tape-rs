@@ -89,35 +89,13 @@ pub fn capture_index_source(
     label: &LtfsLabel,
     budget: &RecoveryBudget,
 ) -> Result<CapturedIndexSource> {
-    let (start, closing, eod) = super::streamed::clean_dp_head_position(drive)?;
-    let replay = IndexReplay::capture(&budget.index_scratch, label.index_partition)?;
-    drive.locate(1, start, true)?;
-    let mut reader = ConstructReader::new(
-        drive,
-        start,
-        label.blocksize as usize,
-        budget.max_index_bytes,
-    )?;
-    let parsed = LtfsIndex::scan_any_reader_to_disk(&mut reader, |entry| replay.stage(0, entry));
-    let head = match parsed {
-        Ok(head) => head,
-        Err(error) => return Err(reader.error.take().unwrap_or(error)),
-    };
-    if !reader.ended || reader.next.checked_sub(1) != Some(closing) || reader.next != eod {
-        return Err(TapeError::RecoveryRestricted {
-            reason: "捕获的 DP 构造没有紧邻 EOD".into(),
-        });
-    }
-    validate_candidate(&head, label, label.data_partition, start)
-        .map_err(|reason| TapeError::RecoveryRestricted { reason })?;
-    let bytes = reader.bytes as u64;
-    let construct = CommittedIndexConstruct {
-        volume_uuid: head.volume_uuid,
-        generation: head.generation,
-        location: head.self_location,
-        sha256: reader.sha.finalize().into(),
-        incremental: head.incremental,
-    };
+    let HeadPayload {
+        construct,
+        head,
+        replay,
+        bytes,
+        eod,
+    } = capture_head_payload(drive, label, budget)?;
     let (header, predecessors, ip_generation, history_depth, history_truncated) =
         if head.incremental {
             let (proof, view) =
@@ -126,8 +104,6 @@ pub fn capture_index_source(
             (view, proof.predecessors, proof.ip_generation, depth, false)
         } else {
             replay.load_full(0, head.highest_file_uid)?;
-            // Reuse the Full historical/DP-IP proof. Its independently captured
-            // raw identity must match the payload-producing read above exactly.
             let mut remaining = budget.clone();
             remaining.index_scratch.max_bytes = budget
                 .index_scratch
@@ -160,6 +136,111 @@ pub fn capture_index_source(
             history_depth,
             history_truncated,
         },
+    })
+}
+
+/// A complete current read view. This type cannot supply historical-source
+/// identity or recovery/write evidence to the intake and reclaim interfaces.
+pub(crate) struct CapturedReadIndex {
+    construct: CommittedIndexConstruct,
+    replay: IndexReplay,
+    predecessors: Vec<CommittedIndexConstruct>,
+}
+
+impl CapturedReadIndex {
+    pub(crate) fn construct(&self) -> CommittedIndexConstruct {
+        self.construct
+    }
+    pub(crate) fn predecessors(&self) -> &[CommittedIndexConstruct] {
+        &self.predecessors
+    }
+    pub(crate) fn entry_by_uid(&self, uid: u64) -> Result<Option<IndexEntry>> {
+        self.replay.payload_by_uid(uid)
+    }
+}
+
+/// Validate the latest complete DP construct, DP/IP consistency and every
+/// required delta through its Full baseline. Independent older Full history
+/// remains the explicit audit source's responsibility.
+pub(crate) fn capture_current_read_index(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    budget: &RecoveryBudget,
+) -> Result<CapturedReadIndex> {
+    let HeadPayload {
+        construct,
+        head,
+        replay,
+        ..
+    } = capture_head_payload(drive, label, budget)?;
+    let predecessors = if head.incremental {
+        verify_incremental_replay(drive, label, construct, budget, &replay, head)?
+            .0
+            .predecessors
+    } else {
+        replay.load_full(0, head.highest_file_uid)?;
+        let mut remaining = budget.clone();
+        remaining.index_scratch.max_bytes = budget
+            .index_scratch
+            .max_bytes
+            .saturating_sub(replay.reserved_bytes());
+        verify_dp_ip_head_with_evidence(drive, label, construct, &remaining)?.predecessors
+    };
+    Ok(CapturedReadIndex {
+        construct,
+        replay,
+        predecessors,
+    })
+}
+
+struct HeadPayload {
+    construct: CommittedIndexConstruct,
+    head: LtfsIndex,
+    replay: IndexReplay,
+    bytes: u64,
+    eod: u64,
+}
+
+fn capture_head_payload(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    budget: &RecoveryBudget,
+) -> Result<HeadPayload> {
+    let (start, closing, eod) = super::streamed::clean_dp_head_position(drive)?;
+    let replay = IndexReplay::capture(&budget.index_scratch, label.index_partition)?;
+    drive.locate(1, start, true)?;
+    let mut reader = ConstructReader::new(
+        drive,
+        start,
+        label.blocksize as usize,
+        budget.max_index_bytes,
+    )?;
+    let parsed = LtfsIndex::scan_any_reader_to_disk(&mut reader, |entry| replay.stage(0, entry));
+    let head = match parsed {
+        Ok(head) => head,
+        Err(error) => return Err(reader.error.take().unwrap_or(error)),
+    };
+    if !reader.ended || reader.next.checked_sub(1) != Some(closing) || reader.next != eod {
+        return Err(TapeError::RecoveryRestricted {
+            reason: "捕获的 DP 构造没有紧邻 EOD".into(),
+        });
+    }
+    validate_candidate(&head, label, label.data_partition, start)
+        .map_err(|reason| TapeError::RecoveryRestricted { reason })?;
+    let bytes = reader.bytes as u64;
+    let construct = CommittedIndexConstruct {
+        volume_uuid: head.volume_uuid,
+        generation: head.generation,
+        location: head.self_location,
+        sha256: reader.sha.finalize().into(),
+        incremental: head.incremental,
+    };
+    Ok(HeadPayload {
+        construct,
+        head,
+        replay,
+        bytes,
+        eod,
     })
 }
 
