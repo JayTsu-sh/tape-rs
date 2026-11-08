@@ -1007,7 +1007,12 @@ impl<B: Backend> TapeFs<B> {
 
     pub fn getattr(&self, ino: u64) -> Res<Attr> {
         let _ns = self.namespace.read().unwrap_or_else(|e| e.into_inner());
-        self.check_namespace()?;
+        // VFS needs root attributes to reach the explicit recovery xattr.
+        // All other namespace access remains frozen; root identity is still
+        // checked by getattr_inner before exposing its directory metadata.
+        if ino != ROOT_INO {
+            self.check_namespace()?;
+        }
         self.getattr_inner(ino)
     }
 
@@ -3051,6 +3056,9 @@ mod tests {
             t.rename(ROOT_INO, "old", ROOT_INO, "new", false),
             Err(libc::EIO)
         );
+        // VFS resolves root attributes before SETXATTR reaches user.ltfs.sync.
+        assert!(t.getattr(ROOT_INO).unwrap().is_dir);
+        assert_eq!(t.getattr(t.ino_of("/old")).err(), Some(libc::EIO));
         assert_eq!(t.write(fh, 0, b"bad!"), Err(libc::EIO));
         assert_eq!(t.fsync(fh), Err(libc::EIO));
         assert_eq!(t.flush(fh), Err(libc::EIO));
@@ -3456,6 +3464,10 @@ mod tests {
         assert!(matches!(fs.readdir(ROOT_INO), Err(libc::ESTALE)));
         assert_eq!(fs.lookup(ROOT_INO, "a"), Err(libc::ESTALE));
         assert_eq!(lock(&fs.inodes).by_fdb_identity.len(), 2);
+        fs.namespace_uncertain
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(fs.getattr(ROOT_INO), Err(libc::ESTALE));
+        assert_eq!(fs.readdir(ROOT_INO).err(), Some(libc::EIO));
         drop(fs);
         std::fs::remove_dir_all(root).unwrap();
     }

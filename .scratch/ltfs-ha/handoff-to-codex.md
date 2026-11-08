@@ -16,6 +16,9 @@
 
 - 顺序候选现按本地提交固定来源以构建EL9普通release；尚未推送GitHub或部署。提交前最终Rust三项定向回归v5均0，生产Rust与双轴冻结v1逐字一致，Python仅已复核P2及对应8项GREEN，新增文档只说明已有功能。后续统一升级必须等当前d639原现场流水线结清、重新采集真实profile和14类空占用；不能把本地HEAD前进误作实带版本已变化。
 
+- **最新现场结清与阻断修复**：本地顺序候选已提交 `a6f987f8a47e16380fd5ef9bf9407796faa7b2e1`，其EL9六产物已构建但**未部署**。d639实带FUSE在属性操作后原rename返回EIO（原controller exit1），服务器原操作 `1/c8b4b1dc-2580-490a-8a34-4b12e0e21d15` 三节点均Completed，客户端未保存回执且namespace_uncertain。真实/dev/fuse抓包证实内核先发root GETATTR(op3,ino1)被-5拒绝，恢复SETXATTR根本不可达；不是根据服务端Completed冒称客户端成功。已最小放行root getattr，仍新鲜验证根namespace/inode/type，其他路径及写屏障不变；实际lostreply回归RED101→GREEN0，uncertain根重建仍ESTALE。software-v6七检查均0，两轴fuse-root-review-v1均0；该修复还未实带GREEN。
+- 旧FUSE已**正常umount退出**，原PID804628消失、transient unit自动回收、mountinfo无挂载；首次结清脚本对已回收unit再stop返回5，是harness生命周期误判，保留原日志。v2只确认已退出，按原journal `.../main1108-fuse-85cf1af9/journal-warm/rename-f13ad87f-70dc-4cb3-acf5-5d6cae90c2c2` 查询/结清同一Completed回执，未新建/重发rename，`acceptance/fuse-original-normal-settled-PASS.json`。旧phase4及remaining-physical-v1均已失败消费，**不能重跑**；phase5/6/7/8/9尚未开始。后续必须正常升级经过完整检查的新候选，按原日志接续FUSE剩余场景，再在同一候选上完成管理/S3/通知/HA/FDB故障/大对象顺序测量并出报告；不要以旧流水线仍运行作判断。原报告需求继续有效，A禁止，L84/L85有数据不格式化。
+
 # 此前交接：代码审查与 GitHub main 集成（2026-11-08）
 
 用户最新要求为“review代码，通过后合入github主分支”。本轮只审查、修复阻断问题和集成已有代码，不继续开发新的 reclaim 能力。工作目录仍为 `/work/jay/tape-rs` 的 `main`；GitHub 是否已同步须按接续要求核对远端，不以本文内历史“未推送”记录判断。
