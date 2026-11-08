@@ -401,13 +401,17 @@ ctl drive list -l LIBRARY_SERIAL
 ctl cluster
 ```
 
-`cluster` 展示各节点自述，执行者状态以当前库的就绪观测为准。磁带运维入口共用 FDB 管理任务；旧顶层 blacklist/clear-blacklist/objects 入口已移除，黑名单使用 `tape set`。`reclaim` 仍待 FDB 原生实现，不能因帮助存在就按已完成处理。`admin` 需要对应接口规定的完整正文，不能用空对象替代持久请求。模式边界见 [FoundationDB](foundationdb.md)。
+`node list/show` 展示库的配置参与节点与已报告候选信息，不据此推断节点实时可达；`drive list/show` 联合当前 FDB 库存和 FDB 驱动策略，保留库存采样时间。两类命令通过相同的 HTTP 管理查询读取，namespace 不匹配时失败。`cluster` 逐物理入口读取节点自述，不跟随 owner 或加库/池前缀；执行者状态以当前库的就绪观测为准。磁带运维入口共用 FDB 管理任务；旧顶层 blacklist/clear-blacklist/objects 入口已移除，黑名单使用 `tape set`。`reclaim` 仍待 FDB 原生实现，不能因帮助存在就按已完成处理。`admin` 需要对应接口规定的完整正文，不能用空对象替代持久请求。模式边界见 [FoundationDB](foundationdb.md)。
 
 ## FDB 文件与对象操作
 
 ### 查询、S3 规则分页与校验下载
 
 ```sh
+ctl stat /dir/file.bin -l LIBRARY_SERIAL -p POOL_UUID
+ctl list -l LIBRARY_SERIAL -p POOL_UUID
+ctl list --dir /dir -l LIBRARY_SERIAL -p POOL_UUID
+ctl get /dir/file.bin ./download.bin -l LIBRARY_SERIAL -p POOL_UUID
 ctl fdb stat /dir/file.bin -l LIBRARY_SERIAL -p POOL_UUID
 ctl fdb list -l LIBRARY_SERIAL -p POOL_UUID --prefix dir/ --max-keys 1000
 ctl fdb list -l LIBRARY_SERIAL -p POOL_UUID --prefix dir/ --delimiter / --max-keys 1000
@@ -416,9 +420,11 @@ ctl fdb children /dir -l LIBRARY_SERIAL -p POOL_UUID --limit 100
 ctl fdb get /dir/file.bin ./download.bin -l LIBRARY_SERIAL -p POOL_UUID
 ```
 
-文件命令的池必须使用 UUID。`fdb list` 按完整 UTF-8 对象键的字节字典序排列后分页，默认/最多 1000 条；公共前缀也占名额。使用返回的 continuation token 时保持 prefix/delimiter 等条件一致；跨页不保证同一快照。`children` 则是目录直接子项查询，不等同于对象列表。
+文件命令必须显式指定库和池 UUID。顶层 `stat/list/get` 直接使用 FDB 客户端，不访问旧 SQLite 目录，也不根据 404 切换存储。`stat` 输出当前元数据，路径不存在时非零退出。顶层 `list` 自动遍历每页最多 1000 条的全局字典序对象列表；`--dir` 自动遍历每页最多 100 条的目录直接子项，并核对节点身份。只列已提交记录，移除旧 `--pending` 选项；在途上传按原请求查询。分页不是跨页快照，遇到节点身份改变或游标循环时失败。
 
-`fdb get` 需要普通文件记录带 SHA-256 或 MD5，校验后才发布本地输出，且不覆盖已有文件。仅从 index 导入但没有摘要的卷，不能据此保证校验下载可用；应读取具体错误。
+`fdb list` 供需要显式控制分页的客户端使用，按完整 UTF-8 对象键的字节字典序排列后分页，默认/最多 1000 条；公共前缀也占名额。使用返回的 continuation token 时保持 prefix/delimiter 等条件一致；跨页不保证同一快照。`children` 则是目录直接子项查询，不等同于对象列表。
+
+`get` 与 `fdb get` 共用校验下载：普通文件记录须带 SHA-256 或 MD5，前后身份、大小和摘要核验通过后才发布本地输出，且不覆盖已有文件或符号链接。失败不会留下新的空文件或部分文件。仅从 index 导入但没有摘要的卷，不能据此保证校验下载可用；应读取具体错误。
 
 ### 持久上传
 
@@ -511,7 +517,7 @@ FDB namespace 模式默认只读；显式提供 `--fdb-journal-dir` 才启用持
 | 没有可信 home、原槽被占或位置冲突 | 保留实际观测，解除冲突后处理原任务，不盲重发 MOVE |
 | validate 成功但 payload_verified=false | 已完成标签/index 检查，不能当作文件正文校验 |
 
-`ltfsctl` 的业务错误退出码为 1；clap 参数解析错误通常为 2，帮助输出为 0。各工具不承诺统一的细分业务退出码。`cluster` 会逐节点输出不可达信息，脚本应检查输出，不能只看其进程退出码。
+`ltfsctl` 的业务错误退出码为 1；clap 参数解析错误通常为 2，帮助输出为 0。各工具不承诺统一的细分业务退出码。`cluster` 会保留成功节点的输出，任一节点查询失败或返回无效状态时整体非零退出，不再把 404、错误正文或 null 当成功。`fdb control list --limit` 目前只接受固定值 100，其他值在参数解析时拒绝。
 
 批量请求可能部分成功。failed 不意味着介质未改变；运行中的取消也不能保证没有副作用。错误报告中的设备、status、sense key、ASC/ASCQ 和阶段应一并保留。
 

@@ -24,7 +24,7 @@ fn inventory_queries_join_fdb_assignments_without_device_io() {
             f.catalog.clone(),
             routes,
             libraries.clone(),
-            HashMap::new(),
+            HashMap::from([(71, "127.0.0.1:1".into()), (72, "127.0.0.1:2".into())]),
             Default::default(),
         )
         .expect("FDB HTTP worker startup")
@@ -166,6 +166,26 @@ fn inventory_queries_join_fdb_assignments_without_device_io() {
         400
     );
     let before = trace.lock().unwrap().len();
+    let drives = client
+        .operational_inventory(&f.serial, "drives", None)
+        .unwrap();
+    assert_eq!(drives["items"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        client
+            .operational_inventory(&f.serial, "drives", Some("DRIVE0"))
+            .unwrap()["item"]["serial"],
+        "DRIVE0"
+    );
+    let nodes = client
+        .operational_inventory(&f.serial, "nodes", None)
+        .unwrap();
+    assert_eq!(nodes["items"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        client
+            .operational_inventory(&f.serial, "nodes", Some("71"))
+            .unwrap()["item"]["id"],
+        71
+    );
     let mut query = tape_rs::client::Client::new([&server.address]);
     let libraries = query.libraries().unwrap();
     assert_eq!(libraries["items"][0]["model"], "TEST-LIBRARY");
@@ -219,6 +239,10 @@ fn inventory_queries_join_fdb_assignments_without_device_io() {
         vec!["library", "show", "-a", "num_of_slots", "--jsonpp"],
         vec!["tape", "list", "--json"],
         vec!["tape", "show", "ASSIGNL8", "-a", "poolname", "--json"],
+        vec!["drive", "list"],
+        vec!["drive", "show", "DRIVE0"],
+        vec!["node", "list"],
+        vec!["node", "show", "71"],
     ] {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_ltfsctl"))
             .args(["-e", &server.address, "-l", &f.serial])
@@ -584,6 +608,28 @@ fn native_tape_policy_online_and_assigned_import_share_http_cli_and_saved_tasks(
         .clone();
     assert_eq!(policy["online"], false);
     assert_eq!(policy["offline_message"], "device maintenance");
+    let shown = client
+        .tape_inventory_entry(&f.serial, None, barcode)
+        .unwrap();
+    assert_eq!(shown["tape"]["offline_message"], "device maintenance");
+    assert_eq!(
+        shown["tape"]["assignment"]["offline_message"],
+        "device maintenance"
+    );
+    let listed = client
+        .tape_inventory_page(&f.serial, Some(f.pools[0]), 100, None)
+        .unwrap();
+    let row = listed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["barcode"] == barcode)
+        .unwrap();
+    assert_eq!(row["offline_message"], "device maintenance");
+    assert_eq!(
+        cli(&["show", barcode, "--json"])["offline_message"],
+        "device maintenance"
+    );
     assert_eq!(policy["volume"], before["volume"]);
     assert!(
         !owner.trace.lock().unwrap()[start..]

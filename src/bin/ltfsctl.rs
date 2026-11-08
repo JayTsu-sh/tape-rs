@@ -13,6 +13,8 @@ mod lifecycle;
 mod notify;
 #[path = "ltfsctl/pool.rs"]
 mod pool;
+#[path = "ltfsctl/reading.rs"]
+mod reading;
 #[path = "ltfsctl/table.rs"]
 mod table;
 #[path = "ltfsctl/tape_import.rs"]
@@ -66,7 +68,7 @@ enum Cmd {
         #[arg(long)]
         spool_dir: Option<std::path::PathBuf>,
     },
-    /// 读出已提交的文件
+    /// 从 FDB 查询并校验下载已提交文件；必须指定 --library 和 --pool UUID，不覆盖本地文件
     Get { path: String, output: String },
     /// 删除文件并等墓碑落带（不立即回收介质空间）
     Delete {
@@ -75,15 +77,12 @@ enum Cmd {
         #[arg(long)]
         if_version: Option<String>,
     },
-    /// 查询路径状态：已提交 / 上传中 / 已暂存
+    /// 查询 FDB 中已提交的路径；必须指定 --library 和 --pool UUID，不存在时失败
     Stat { path: String },
-    /// 列出已提交的全部文件；给出 --dir 时只列该目录的直接子项
+    /// 分页列出 FDB 中已提交的文件；--dir 只列直接子项，必须指定 --library 和 --pool UUID
     List {
         #[arg(long)]
         dir: Option<String>,
-        /// 同时列出尚未落带的在途文件（需要 --dir）
-        #[arg(long)]
-        pending: bool,
     },
     /// 各节点的自述
     Cluster,
@@ -258,7 +257,8 @@ enum FdbControlCmd {
     /// 原子取消尚未执行的请求；已结束时返回原终态
     Cancel { request: std::path::PathBuf },
     List {
-        #[arg(long, default_value_t = 100)]
+        /// 管理任务分页目前固定为 100 条
+        #[arg(long, default_value_t = 100, value_parser = management_page_limit)]
         limit: usize,
         #[arg(long)]
         after: Option<String>,
@@ -278,6 +278,14 @@ enum FdbDriveCmd {
         #[command(flatten)]
         change: FdbChangeArgs,
     },
+}
+
+fn management_page_limit(value: &str) -> Result<usize, String> {
+    if value == "100" {
+        Ok(100)
+    } else {
+        Err("管理任务分页大小固定为100".into())
+    }
 }
 
 fn fdb_change(
@@ -894,9 +902,12 @@ fn main() {
                 );
             }
             Cmd::Get { path, output } => {
-                let mut out = std::fs::File::create(&output)?;
-                let len = c.get_to(&path, &mut out)?;
-                println!("{} -> {} ({} 字节)", path, output, len);
+                let (library, pool) =
+                    reading::scope(args.library.as_deref(), args.pool.as_deref())?;
+                let client = tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?;
+                let size =
+                    client.download_new(library, pool, &path, std::path::Path::new(&output))?;
+                println!("已校验下载 {size} 字节至 {output}");
             }
             Cmd::Delete { path, if_version } => {
                 if let Some(version) = if_version {
@@ -914,62 +925,17 @@ fn main() {
                 }
                 println!("已删除 {}（墓碑已落带）", path);
             }
-            Cmd::Stat { path } => match c.stat_path(&path)? {
-                None => println!("不存在"),
-                Some(p) => {
-                    if p.state != "committed" {
-                        println!(
-                            "{}  已接收 {} 字节",
-                            if p.state == "staged" {
-                                "已暂存，等待落带"
-                            } else {
-                                "上传中"
-                            },
-                            p.length
-                        );
-                    }
-                    match p.current {
-                        Some(s) => println!(
-                            "{}  {} 字节  索引代数 {}  版本 {}  磁带 {}  sha256 {}",
-                            if p.state == "committed" {
-                                "已提交"
-                            } else {
-                                "当前版本"
-                            },
-                            s.length,
-                            s.generation
-                                .map(|g| g.to_string())
-                                .unwrap_or_else(|| "未知".into()),
-                            s.version,
-                            s.barcode,
-                            s.sha256
-                        ),
-                        None => println!("没有已提交的版本"),
-                    }
-                }
-            },
-            Cmd::List { dir: None, .. } => {
-                for (p, n) in c.list()? {
-                    println!("{:>12}  {}", n, p);
-                }
+            Cmd::Stat { path } => {
+                let (library, pool) =
+                    reading::scope(args.library.as_deref(), args.pool.as_deref())?;
+                let client = tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?;
+                print_json(client.stat(library, pool, &path)?.ok_or("路径不存在")?);
             }
-            Cmd::List {
-                dir: Some(d),
-                pending,
-            } => {
-                for e in c.list_dir(&d, pending)? {
-                    if e.is_dir {
-                        println!("{:>12}  {}/", "", e.name);
-                    } else {
-                        let n = e.committed_length.or(e.staged_length).unwrap_or(0);
-                        let st = if e.state == "committed" {
-                            String::new()
-                        } else {
-                            format!("  ({})", e.state)
-                        };
-                        println!("{:>12}  {}{}", n, e.name, st);
-                    }
-                }
+            Cmd::List { dir } => {
+                let (library, pool) =
+                    reading::scope(args.library.as_deref(), args.pool.as_deref())?;
+                let client = tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?;
+                reading::list(&client, library, pool, dir.as_deref())?;
             }
             Cmd::Pool { cmd } => pool::run(
                 &tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?,
@@ -1010,8 +976,20 @@ fn main() {
                 )?;
             }
             Cmd::Drive { cmd } => match cmd {
-                DriveCmd::List => print_json(c.admin_get("/admin/drives")?),
-                DriveCmd::Show { id } => print_json(c.admin_get(&format!("/admin/drives/{id}"))?),
+                DriveCmd::List => {
+                    let library = pool::library_from_client(&mut c, args.library.as_deref())?;
+                    print_json(
+                        tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?
+                            .operational_inventory(&library, "drives", None)?,
+                    );
+                }
+                DriveCmd::Show { id } => {
+                    let library = pool::library_from_client(&mut c, args.library.as_deref())?;
+                    print_json(
+                        tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?
+                            .operational_inventory(&library, "drives", Some(&id))?,
+                    );
+                }
                 DriveCmd::Up { id } => print_json(c.admin_request(
                     "POST",
                     &format!("/admin/drives/{id}/up"),
@@ -1029,8 +1007,20 @@ fn main() {
                 )?),
             },
             Cmd::Node { cmd } => match cmd {
-                NodeCmd::List => print_json(c.admin_get("/admin/nodes")?),
-                NodeCmd::Show { id } => print_json(c.admin_get(&format!("/admin/nodes/{id}"))?),
+                NodeCmd::List => {
+                    let library = pool::library_from_client(&mut c, args.library.as_deref())?;
+                    print_json(
+                        tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?
+                            .operational_inventory(&library, "nodes", None)?,
+                    );
+                }
+                NodeCmd::Show { id } => {
+                    let library = pool::library_from_client(&mut c, args.library.as_deref())?;
+                    print_json(
+                        tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?
+                            .operational_inventory(&library, "nodes", Some(&id))?,
+                    );
+                }
             },
             Cmd::Task { cmd } => {
                 let client = tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?;
@@ -1210,11 +1200,18 @@ fn main() {
                 cmd: TapeCmd::Reclaim { barcode },
             } => println!("{}", c.tape_reclaim(&barcode)?),
             Cmd::Cluster => {
+                let mut failed = false;
                 for e in &args.endpoints {
                     match c.node_status(e) {
                         Ok(j) => println!("{}  {}", e, j),
-                        Err(err) => println!("{}  不可达: {}", e, err),
+                        Err(err) => {
+                            failed = true;
+                            eprintln!("{}  查询失败: {}", e, err);
+                        }
                     }
+                }
+                if failed {
+                    return Err("部分节点的集群状态查询失败".into());
                 }
             }
         }
@@ -1233,6 +1230,39 @@ fn print_json(value: serde_json::Value) {
 #[cfg(test)]
 mod inventory_cli_tests {
     use super::*;
+
+    #[test]
+    fn control_page_size_is_rejected_during_argument_parsing() {
+        assert!(
+            Args::try_parse_from([
+                "ltfsctl",
+                "-e",
+                "localhost:1",
+                "fdb",
+                "control",
+                "list",
+                "--limit",
+                "100"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Args::try_parse_from([
+                "ltfsctl",
+                "-e",
+                "localhost:1",
+                "fdb",
+                "control",
+                "list",
+                "--limit",
+                "10"
+            ])
+            .is_err()
+        );
+        assert!(
+            Args::try_parse_from(["ltfsctl", "-e", "localhost:1", "list", "--pending"]).is_err()
+        );
+    }
 
     #[test]
     fn management_cli_has_one_hierarchy_without_nodegroups_or_sync_import() {

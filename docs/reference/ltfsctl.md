@@ -4,7 +4,7 @@
 
 本页由 `tools/generate-cli-reference.py` 从实际构建产物递归采集 `--help` 生成，不表示所有服务模式均支持所有命令，也不表示列出的操作均已完成硬件验收。可选命令随构建特性变化，下面的帮助为本次构建内容。
 
-构建产物 SHA256：`78d6dd96c8b24cdfe997025639ddc7092c68cf0b1b98e9515f6d0738594eaff1`。共 83 个帮助入口。
+构建产物 SHA256：`90798e1ea39188c816e0871292134deecbd0995e5ea3713ef57a5b284fe5b406`。共 83 个帮助入口。
 
 ## 目录
 
@@ -104,10 +104,10 @@ Commands:
   fdb        FDB 服务：查询、校验下载和持久上传
   put        上传本地文件并等到落带（默认替换已有版本）
   copy       把已提交普通文件的内容校验后复制到另一库/池的空路径；后续改写不会自动同步
-  get        读出已提交的文件
+  get        从 FDB 查询并校验下载已提交文件；必须指定 --library 和 --pool UUID，不覆盖本地文件
   delete     删除文件并等墓碑落带（不立即回收介质空间）
-  stat       查询路径状态：已提交 / 上传中 / 已暂存
-  list       列出已提交的全部文件；给出 --dir 时只列该目录的直接子项
+  stat       查询 FDB 中已提交的路径；必须指定 --library 和 --pool UUID，不存在时失败
+  list       分页列出 FDB 中已提交的文件；--dir 只列直接子项，必须指定 --library 和 --pool UUID
   cluster    各节点的自述
   library    带库管理状态
   drive      驱动器管理状态
@@ -584,7 +584,7 @@ Options:
 Usage: ltfsctl fdb control list [OPTIONS]
 
 Options:
-      --limit <LIMIT>      [default: 100]
+      --limit <LIMIT>      管理任务分页目前固定为 100 条 [default: 100]
       --after <AFTER>
   -l, --library <LIBRARY>  目标带库的真实 changer 序列号；省略时访问默认库
   -p, --pool <POOL>        文件命名空间的池名称或 UUID；库内有多个池时必填
@@ -820,7 +820,7 @@ Options:
 ## ltfsctl get
 
 ```text
-读出已提交的文件
+从 FDB 查询并校验下载已提交文件；必须指定 --library 和 --pool UUID，不覆盖本地文件
 
 Usage: ltfsctl --endpoint <ENDPOINTS> get [OPTIONS] <PATH> <OUTPUT>
 
@@ -854,7 +854,7 @@ Options:
 ## ltfsctl stat
 
 ```text
-查询路径状态：已提交 / 上传中 / 已暂存
+查询 FDB 中已提交的路径；必须指定 --library 和 --pool UUID，不存在时失败
 
 Usage: ltfsctl --endpoint <ENDPOINTS> stat [OPTIONS] <PATH>
 
@@ -870,14 +870,13 @@ Options:
 ## ltfsctl list
 
 ```text
-列出已提交的全部文件；给出 --dir 时只列该目录的直接子项
+分页列出 FDB 中已提交的文件；--dir 只列直接子项，必须指定 --library 和 --pool UUID
 
 Usage: ltfsctl --endpoint <ENDPOINTS> list [OPTIONS]
 
 Options:
       --dir <DIR>
   -l, --library <LIBRARY>  目标带库的真实 changer 序列号；省略时访问默认库
-      --pending            同时列出尚未落带的在途文件（需要 --dir）
   -p, --pool <POOL>        文件命名空间的池名称或 UUID；库内有多个池时必填
   -h, --help               Print help
 ```

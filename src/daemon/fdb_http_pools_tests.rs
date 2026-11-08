@@ -482,6 +482,31 @@ async fn run_pool_api(cluster: &str) {
     // SDK-only recovery facts: readyz yields to mechanical maintenance while
     // management inspection remains usable. No hardware commands run here.
     assert_eq!(request(&b, "GET", "/readyz", None, b"").await.0, 200);
+    let mut follower_status = status.lock().unwrap().clone();
+    follower_status.id = 3;
+    let follower = Arc::new(HttpContext {
+        files: http.files.clone(),
+        status: Arc::new(Mutex::new(follower_status)),
+        exec: Mutex::new(http.exec.lock().unwrap().clone()),
+        node: Mutex::new(http.node.lock().unwrap().clone()),
+        client_addrs: HashMap::new(),
+        wait_timeout: Duration::from_secs(1),
+    });
+    let observer = Arc::new(Context {
+        owner: Some(OwnerRuntime {
+            libraries: BTreeMap::from([(serial.clone(), follower)]),
+            peers: HashMap::from([(2, b.clone())]),
+            requests: Arc::new(Semaphore::new(2)),
+        }),
+        ..(*readonly).clone()
+    });
+    let (observer_address, observer_server) = serve(observer).await;
+    assert_eq!(
+        request(&observer_address, "GET", "/readyz", None, b"")
+            .await
+            .0,
+        200
+    );
     let mut gated = movement.clone();
     gated["operation"] = json!(Uuid::new_v4().to_string());
     let intent = crate::managed_catalog::ManagementRequest::parse(gated.clone()).unwrap();
@@ -520,6 +545,25 @@ async fn run_pool_api(cluster: &str) {
         .await
         .unwrap();
     assert_eq!(request(&b, "GET", "/readyz", None, b"").await.0, 503);
+    let busy = request(&b, "GET", "/readyz", None, b"").await;
+    let forwarded_busy = request(&observer_address, "GET", "/readyz", None, b"").await;
+    assert_eq!(
+        forwarded_busy, busy,
+        "entry must retain the owner's maintenance reason"
+    );
+    assert_eq!(busy.1["reason"], "library_busy");
+    assert_eq!(busy.1["ready"], false);
+    assert_eq!(busy.1["owner"], 2);
+    assert_eq!(busy.1["round"], epoch);
+    status.lock().unwrap().executor_ready = false;
+    let lost = request(&b, "GET", "/readyz", None, b"").await;
+    assert_eq!(lost.0, 503);
+    assert_ne!(lost.1["reason"], "library_busy");
+    assert_eq!(
+        request(&observer_address, "GET", "/readyz", None, b"").await,
+        lost
+    );
+    status.lock().unwrap().executor_ready = true;
     let path = format!("{root}/tasks/1/{}", intent.operation());
     assert_eq!(
         request(&b, "GET", &path, Some(&namespace), b"").await.1["execution"]["phase"],
@@ -552,6 +596,13 @@ async fn run_pool_api(cluster: &str) {
         .await
         .unwrap();
     assert_eq!(request(&b, "GET", "/readyz", None, b"").await.0, 200);
+    assert_eq!(
+        request(&observer_address, "GET", "/readyz", None, b"")
+            .await
+            .0,
+        200
+    );
+    observer_server.abort();
 
     let id = Uuid::new_v4();
     let body=json!({"version":1,"id":id.to_string(),"name":"归档","file_limit":100,"created_at_millis":1_793_405_000_123u64,"policy":{"media_restriction":"none","mount_limit":0,"low_space_warning_enabled":true,"low_space_warning_threshold":0,"no_space_warning_enabled":true}}).to_string();

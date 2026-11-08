@@ -92,7 +92,7 @@ async fn tape(
     Ok(Some(
         json!({"monitor":details["monitor"],"task_id":details["task_id"],"task_progress":details["task_progress"],"barcode":barcode,"library_serial":serial,"namespace":route.route.namespace.to_string(),
         "presence":if view["inventory"].is_null(){"unknown"}else if location.is_some(){"observed"}else{"not_observed"},
-        "location":location,"observation":observation,"assignment":assignment.map(|a|a.to_json()),"pool":pool,
+        "location":location,"observation":observation,"assignment":details["assignment"],"pool":pool,
         "health":null,"capacity":null}),
     ))
 }

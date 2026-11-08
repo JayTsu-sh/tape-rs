@@ -1,3 +1,37 @@
+# 发布接续：报告缺陷修复 PR #43（2026-11-08）
+
+用户此前授权审查通过后合入GitHub主分支，本轮修复按此执行。基线e2380b5，产品8bd242a和3bc8cf2已分别完成真实B补验，当前现场三节点仍3bc8cf2。9c42490之前的5提交全部规范/需求两轴终审0，原两个P3文档问题已修正；发布追踪增量仅文档，不更改产品/测试或扩大验收结论。
+
+PR：https://github.com/JayTsu-sh/tape-rs/pull/43 。本条记录于合入前，最终是否MERGED、主分支SHA/树、临时分支清理，以GitHub实际状态及 `/work/tmp/tape-readiness-gap-20261108-l6b6og6u/MERGED-CLOSEOUT.json` 和本地handoff-history为准，不提前宣称成功。所有源/测试字节仍与已检查/部署候选相同；不重跑任何已消费controller、不额外部署或碰A。完整native reclaim及其余性能/现场限制仍按报告保留。
+
+---
+
+# 当前接续：机械暂忙诊断补验通过，四项报告缺陷已收口（2026-11-08）
+
+产品提交 `3bc8cf26ac5775596ce2e9eac752d56faa8590aa` 在前批8bd242a三项修复之上，保留owner的原503，机械暂忙返回reason=library_busy、ready=false及原owner/round；不跳过任何就绪屏障、不改超时或read_idle阈值。11项软件检查全0，真实B默认300000ms观察已通过；报告新增就绪诊断补验，全部未实现/受限项保持。
+
+- 当前207–209目录 `/opt/tape-rs/v1-20261108-3bc8cf26ac57`，同新ltfsd SHA，原45153/c51a94dd.../state/unit不变，普通EL9无故障特性；未改低层/FUSE原产物。源3bc8cf2；246d02f仅修正生成手册argv0及JSON歧义，产品字节不变。两轴初审Standards0/Spec2P3文档，修后复审均0，原报告保留。
+- 证据 `/work/tmp/tape-readiness-gap-20261108-l6b6og6u`，入口 `UPGRADE-COMPLETE.json`、`physical/COMPLETE.json`。L84原4389B正文SHA正确；读后307.072s出现真实默认退带，三入口503正文完全相同，owner1/round1568310保持，53.551s自然恢复200。SG_IO退带24.294s/MOVE28.837s均GOOD，回原1004；原装带UA记录保留。三进程及FDB healthy/double、14类占用空，原权威摘要逐项相同。A未动，无FORMAT/ERASE/手工PR或清锁，L84/L85策略归属保持。
+- 新旧所有controller均已消费，禁止重跑；本批未推GitHub。源码/检查/实带与两轴证据SHA在报告JSON两个补验区，原123份历史及前批84份证据继续保留。
+
+完整native reclaim依然封闭，actual tail actor/独立回执、IP空/截断恢复、新donor/replan、完整源覆盖/父流程/Serving恢复及全流程实带未完成；Range/导入/顺序链路性能和现场受限项仍按报告保留，不能将已修复四项当作全部功能实现。
+
+---
+
+# 当前接续：验收报告三项缺陷已修复并实带通过（2026-11-08）
+
+最新用户要求修复 `docs/physical-acceptance-20261108.md` 指明的缺口。产品提交 `8bd242ac8eb8fb890be4f54102edfaeadabb23d6` 已完成旧drive/node/cluster查询、顶层stat/list/get及offline_message投影三项缺陷修复，附管理分页固定100的解析/帮助手册约束。10项软件检查通过，Clippy仅既有prepare_file参数数量告警；最终diff自查0，不宣称独立双轴审查或已合GitHub。
+
+- 207–209已正常部署8bd242a的ltfsd/ltfsctl，目录 `/opt/tape-rs/v1-20261108-8bd242ac8eb8`；未改动的低层工具和FUSE继续使用e0a7625原产物，SHA逐项记录。原45153/namespace/state/unit保持，正常停启前后权威摘要一致，无强杀/清锁/手工PR操作。A库继续释放。
+- 新实带证据 `/work/tmp/tape-acceptance-gap-fixes-20261108-64uu7mpq`：`UPGRADE-COMPLETE.json`、`physical/COMPLETE.json`、`final-integrity.json`。三节点HTTP与CLI管理查询及拒绝边界通过；顶层list自动跨页1096项全局有序，目录含中文；4389B原S3对象CLI/S3 SHA一致；下载失败不建输出、不覆盖文件或符号链接。
+- 原L84新增offline/online两个成功任务，三节点list/show和CLI显示离线说明，上线后清空；L84同卷643ea0be...、原native6池02004aa0...、online/nonblacklisted，正文复读正确。14类占用空、三入口ready；S3元数据/上传/节点回执/池/回收摘要未变。没有FORMAT/ERASE。
+- 原accept.py在属性筛选JSON对象与标量的脚本断言处停止，正确返回已保留。只读核对原offline任务后，resume-online-v1.py仅完成原计划尚未发出的online与收尾；均已消费，不可重跑。两次部署预检错误未到副作用点；build原缺链接路径失败、成功v2均留存。
+- 报告原e0矩阵及123份证据保留，补验与84份新文件SHA追加至JSON的gap_repairs_v1；软件源SHA见checked-sources.json，最终发行来源见artifact.json。GitHub尚未发布本批修复。
+
+剩余范围继续按报告和既有设计处理：完整native reclaim仍封闭，实际tail actor/独立结清回执、IP空/截断恢复、新donor/replan、完整源覆盖/父流程/Serving前恢复尚未完成；不能根据三项查询缺陷收口开放源格式化。顺序/Range/导入等性能建议及现场条件受限项没有借此宣称完成。后续新动作前刷新实际服务/库存/原任务，保留已有live/retained数据，不重跑历史controller。
+
+---
+
 # 最新接续：PR #42 顺序读与 FUSE 修复合入批次（2026-11-08）
 
 最新用户要求 review 代码，通过后合入 GitHub 主分支。本批基线为 GitHub/main `d63932586fa4d57d7ab0be5f320003a2eee5ee11`，已对候选 `a4a0e6d12a0cadf59f9214309fdb22e984853615` 的5提交/17文件进行完整规范与需求两轴审查，均0项发现；13份产品源码、123份实带证据和11项成功软件日志SHA已逐项核对，本次复查fmt和Python8项通过。下方报告中的“本轮未推GitHub”属于前一验收轮的历史状态，不能用于判断此次发布结果。
