@@ -213,7 +213,7 @@ impl ReclaimMetadataObservation {
             ReclaimMetadataObservationKind::Committed => {
                 previous.generation.checked_add(1) == Some(current.generation)
                     && current.location.partition == previous.location.partition
-                    && current.location.start_block > previous.location.start_block
+                    && Some(current.location.start_block) == plan.previous_dp_eod().checked_add(1)
                     && plan.0.physical_files.checked_add(1) == Some(files)
             }
         };
@@ -248,7 +248,7 @@ impl ReclaimMetadataPlan {
         predecessor: Option<&CapturedIndexSource>,
     ) -> Result<ReclaimMetadataObservation> {
         self.encode()?;
-        current_proof(target.scope(), target.header())?;
+        let (dp_eod, _, _) = current_proof(target.scope(), target.header())?;
         let current: ActiveIndexIdentity = target.construct().into();
         let previous = active_volume::decode_index(self.volume(), &self.0.previous)?;
         let original = self.previous_source()?;
@@ -263,11 +263,12 @@ impl ReclaimMetadataPlan {
             ));
         }
         let kind = if current == previous {
-            if header.highest_file_uid.checked_add(1) != Some(self.uid())
+            if dp_eod != self.previous_dp_eod()
+                || header.highest_file_uid.checked_add(1) != Some(self.uid())
                 || target.identity().map_err(cache)? != original
             {
                 return Err(CatalogError::Invalid(
-                    "回收元数据未变化卷头的 UID 或来源链与原计划不同",
+                    "回收元数据未变化卷头的 EOD、UID 或来源链与原计划不同",
                 ));
             }
             ReclaimMetadataObservationKind::Unchanged
@@ -292,12 +293,12 @@ impl ReclaimMetadataPlan {
             };
             if previous.generation.checked_add(1) != Some(current.generation)
                 || current.location.partition != previous.location.partition
-                || current.location.start_block <= previous.location.start_block
+                || Some(current.location.start_block) != self.previous_dp_eod().checked_add(1)
                 || header.highest_file_uid != self.uid()
                 || !linked
             {
                 return Err(CatalogError::Invalid(
-                    "回收元数据观察偏离原代次、UID 或索引前驱",
+                    "回收元数据观察偏离原代次、追加边界、UID 或索引前驱",
                 ));
             }
             ReclaimMetadataObservationKind::Committed

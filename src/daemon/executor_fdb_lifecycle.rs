@@ -6049,6 +6049,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；同 XML/SHA/树但 DP 记录边界改变，Sim"]
+    async fn reclaim_metadata_observation_rejects_changed_original_dp_eod() {
+        Box::pin(native_lifecycle(MetadataCase::Execution(
+            MetadataExecutionCase::UnwrittenFraming,
+        )))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "需要隔离 FDB_TEST_CLUSTER；实际 Sim 空 IP，保持原 Writing/占用且无设备写"]
     async fn reclaim_metadata_unwritten_closure_keeps_missing_ip_indeterminate() {
         Box::pin(native_lifecycle(MetadataCase::Execution(
@@ -6097,6 +6106,7 @@ mod tests {
         UnwrittenIpDebt,
         ClosedRetryContext,
         UnwrittenIpMissing,
+        UnwrittenFraming,
         UnwrittenIpAhead,
         AttemptRegistry,
         AttemptHistory,
@@ -6183,6 +6193,83 @@ mod tests {
             assert_eq!(before.flushed, after.flushed);
             assert_eq!(before.capacity, after.capacity);
         }
+    }
+
+    fn resegment_metadata_fixture(
+        fixture: &Fixture,
+        drive: usize,
+        barcode: &str,
+        before: &crate::ltfs::recovery::CapturedIndexSource,
+    ) {
+        fixture.lib.with_cartridge_mut(barcode, |cartridge| {
+            let dp = &mut cartridge.partitions[1];
+            let block = before.construct().location.start_block as usize;
+            let crate::scsi::sim::LogicalObject::Record(raw) = &mut dp.objects[block] else {
+                panic!("原 DP 索引起点必须是 record")
+            };
+            assert!(raw.len() > 2);
+            let remainder = raw.split_off(raw.len() / 2);
+            dp.objects.insert(
+                block + 1,
+                crate::scsi::sim::LogicalObject::Record(remainder),
+            );
+            dp.flushed = dp.objects.len();
+            cartridge.vcr += 1;
+        });
+        let device = fixture.owner.devices[drive].dev.as_ref();
+        let after = crate::ltfs::recovery::capture_index_source(
+            &TapeDrive::new(device),
+            &crate::ltfs::volume::read_label_only(device).unwrap(),
+            &crate::ltfs::recovery::RecoveryBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            after.identity().unwrap(),
+            before.identity().unwrap(),
+            "原 XML SHA/完整索引身份不变"
+        );
+        assert_eq!(
+            after.header().to_xml().unwrap(),
+            before.header().to_xml().unwrap(),
+            "原对象树头不变"
+        );
+        match (before.scope(), after.scope()) {
+            (
+                crate::ltfs::recovery::IndexSourceScope::Current {
+                    dp_eod: old,
+                    ip_generation: old_ip,
+                    ..
+                },
+                crate::ltfs::recovery::IndexSourceScope::Current {
+                    dp_eod: new,
+                    ip_generation: new_ip,
+                    ..
+                },
+            ) => {
+                assert_eq!(new, old + 1);
+                assert_eq!(new_ip, old_ip);
+            }
+            _ => panic!("必须实际捕获干净 Current"),
+        }
+    }
+
+    fn assert_stale_metadata_staging_rejected(
+        fixture: &Fixture,
+        drive: usize,
+        plan: &crate::managed_catalog::ReclaimMetadataPlan,
+        source: &crate::ltfs::recovery::CapturedIndexSource,
+        target: &crate::ltfs::recovery::CapturedIndexSource,
+    ) {
+        let mut volume =
+            crate::ltfs::volume::LtfsVolume::mount(fixture.owner.devices[drive].dev.as_ref())
+                .unwrap();
+        volume.set_reservation_guard(Some(fixture.owner.key));
+        assert_ne!(volume.recovery().dp.eod, plan.previous_dp_eod());
+        assert!(
+            plan.stage_reference(&mut volume, source, target).is_err(),
+            "旧 Current 捕获不能替代重新挂载的实际追加边界"
+        );
+        assert!(volume.pending_files().is_empty());
     }
 
     fn checkpoint_metadata_fixture(fixture: &Fixture, drive: usize) {
@@ -7655,7 +7742,7 @@ mod tests {
                     }).await;
                     return;
                 }
-                if matches!(mode, MetadataExecutionCase::LostAdmission | MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpDebt | MetadataExecutionCase::ClosedRetryContext | MetadataExecutionCase::UnwrittenIpMissing | MetadataExecutionCase::UnwrittenIpAhead) {
+                if matches!(mode, MetadataExecutionCase::LostAdmission | MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpDebt | MetadataExecutionCase::ClosedRetryContext | MetadataExecutionCase::UnwrittenIpMissing | MetadataExecutionCase::UnwrittenFraming | MetadataExecutionCase::UnwrittenIpAhead) {
                     catalog.admit_reclaim_metadata_write(&reserved, fixture.owner.round, &scanned, &input_request, &metadata_write).await.unwrap();
                 }
                 if mode == MetadataExecutionCase::UnwrittenIpAhead {
@@ -7686,13 +7773,16 @@ mod tests {
                         cartridge.vcr += 1;
                     });
                 }
-                let debt_media = matches!(mode, MetadataExecutionCase::UnwrittenIpDebt | MetadataExecutionCase::ClosedRetryContext | MetadataExecutionCase::UnwrittenIpMissing).then(|| {
+                if mode == MetadataExecutionCase::UnwrittenFraming {
+                    resegment_metadata_fixture(&fixture, drive, &input.destination().placement().barcode, &captured_target);
+                }
+                let debt_media = matches!(mode, MetadataExecutionCase::UnwrittenIpDebt | MetadataExecutionCase::ClosedRetryContext | MetadataExecutionCase::UnwrittenIpMissing | MetadataExecutionCase::UnwrittenFraming).then(|| {
                     let crate::ltfs::recovery::IndexSourceScope::Current { ip_generation: Some(ip), .. } = captured_target.scope() else {panic!("债务夹具必须有已核验完整旧 IP")};
                     assert!(ip < captured_target.construct().generation, "必须保留真实普通写入的IP债务，不能先做checkpoint");
                     fixture.lib.cartridge(&input.destination().placement().barcode).unwrap()
                 });
                 let first = writer.execute(&reserved, &scanned, &input_request, &metadata_write,
-                    if matches!(mode, MetadataExecutionCase::LostAdmission | MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpDebt | MetadataExecutionCase::ClosedRetryContext | MetadataExecutionCase::UnwrittenIpMissing | MetadataExecutionCase::UnwrittenIpAhead) {None} else {Some(&captured)}).await;
+                    if matches!(mode, MetadataExecutionCase::LostAdmission | MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpDebt | MetadataExecutionCase::ClosedRetryContext | MetadataExecutionCase::UnwrittenIpMissing | MetadataExecutionCase::UnwrittenFraming | MetadataExecutionCase::UnwrittenIpAhead) {None} else {Some(&captured)}).await;
                 if mode == MetadataExecutionCase::UnwrittenIpAhead {
                     assert!(matches!(first, Err(TapeError::RecoveryRestricted { ref reason })
                         if reason.contains("IP 索引代数") && reason.contains("领先 FDB 已观察 DP")), "{first:?}");
@@ -7703,6 +7793,18 @@ mod tests {
                     assert_eq!(tr.get(&metadata_active_key,false).await.unwrap().unwrap().as_ref(),active.as_slice());
                     assert_eq!(tr.get(&metadata_volume_key,false).await.unwrap().unwrap().as_ref(),active.as_slice());
                     assert!(!fixture.commands.lock().unwrap()[original_commands.len()..].iter().any(|(_,op)|matches!(op,0x04|0x0a|0x10|0x19|0x8d|0xa5)),"IP ahead 只读拒绝，无写/修尾/搬带");
+                    return;
+                }
+                if mode == MetadataExecutionCase::UnwrittenFraming {
+                    assert!(first.is_err(), "原 XML 身份相同但 DP EOD 改变，不能观察为 Unchanged 或生成未写关闭证明: {first:?}");
+                    assert_stale_metadata_staging_rejected(&fixture,drive,&metadata_plan,&captured,&captured_target);
+                    let task = catalog.reclaim_metadata_write_status(&reserved,fixture.owner.round,source_data_uid).await.unwrap().unwrap();
+                    assert!(task.writing() && task.observation().unwrap().is_none());
+                    assert_eq!(catalog.observed_active_volume_index(&serial,metadata_plan.volume()).await.unwrap(),crate::managed_catalog::ActiveIndexIdentity::from(captured_target.construct()));
+                    let tr=raw_catalog.create_trx().unwrap();
+                    for key in [&metadata_active_key,&metadata_volume_key] {assert_eq!(tr.get(key,false).await.unwrap().unwrap().as_ref(),active.as_slice());}
+                    assert_reclaim_media_unchanged(debt_media.as_ref().unwrap(),&fixture.lib.cartridge(&input.destination().placement().barcode).unwrap());
+                    assert!(!fixture.commands.lock().unwrap()[original_commands.len()..].iter().any(|(_,op)|matches!(op,0x04|0x0a|0x10|0x19|0x8d|0xa5)), "物理边界变化只能拒绝，不写/修尾/搬带");
                     return;
                 }
                 if mode == MetadataExecutionCase::UnwrittenIpMissing {

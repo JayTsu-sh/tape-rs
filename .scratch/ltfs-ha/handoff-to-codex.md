@@ -50,3 +50,11 @@
 - 原始记录在本地 `/work/tmp/tape-wip-integration-evidence-20261106`、`/work/tmp/tape-wip-independent-b-20261106`，核心入口为前者 `PR39-MERGED-v1.json`、`PR39-MERGE-ACCEPTANCE-v1.json`。现场脚本和失败日志保留原位，不作为待合入产品源码。
 
 查证历史或恢复现场上下文时，再读本地 `.scratch/ltfs-ha/local/handoff-history.md`。本机 `.git/info/exclude` 排除了现场证据、CodeGraph 索引和 EE 参考输入；它不隐藏 `src/` 或 `tests/` 的产品改动。
+
+## 2026-11-08 原目标 DP EOD 边界片（软件验证完成）
+
+Plan v3 固定原实际 DP EOD 并纳入摘要/边界校验，Unchanged/首次新挂载暂存要求精确原边界，Committed 必须原 EOD+1 起写。实际 Sim 同 XML/SHA/全链但记录重新分段的反例已复现，原 2829 测试 exit101；初次 61738 编译缺 PartialEq 另记，非逻辑红测。候选未部署、未实带验收或推送；T1/T2 修尾、新 donor/replan、全源覆盖和完整父流程仍待完成。19 项隔离 FDB/Sim、11 项观察编码测试及六软件检查全部通过，原管线 46571 exit0；双轴复审0。完整结果及日志 SHA 见 METADATA-EOD-PIPELINE-FINAL-v3.json；Clippy 仅既有 prepare_file 参数数量告警。
+
+本片两轴初审 Standards0 / Spec1：持久观察解码未同步原 EOD+1，正确 checksum/错误位置的三种 Full/delta 红测实际10504 exit101；现同步 codec，原全套 v3 已重验通过。v1管线13324为测试 Vec/整数比较编译错；v2新物理分段回归0后为修P2精确中断自有闭后恢复测试，SDK子进程-2、controller1，原日志保留。codec红测首次56524是Cargo过滤器参数错误，不算逻辑红测。以上不涉及现场。
+
+本片最终只更新本交接的检查事实，生产/测试/管理规范与实际 v3 执行候选逐字相同；最终源码清单 METADATA-EOD-SOURCE-v4.json。下一明确恢复 phase/guard 生命周期、两个 marker/原闭合边界核对和独立恢复回执设计见本地 METADATA-TAIL-IMPLEMENTATION-BOUNDARIES-v2.json（设计未实现），完整父流程和真实 B 验收仍未完成，禁止据此开放原生 reclaim 或格式化。

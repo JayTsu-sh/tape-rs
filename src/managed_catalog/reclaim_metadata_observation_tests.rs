@@ -72,7 +72,7 @@ fn observe(previous_delta: bool, current_delta: bool) {
     let mut previous = Vec::new();
     active_volume::encode_index(&mut previous, before.construct().into());
     let plan = ReclaimMetadataPlan(Plan {
-        version: 2,
+        version: 3,
         parent: "01".repeat(32),
         inventory: [1; 32],
         source: Object::capture(donor_entry.clone()).unwrap(),
@@ -80,6 +80,7 @@ fn observe(previous_delta: bool, current_delta: bool) {
         input: [2; 32],
         volume: label.volume_uuid.to_string(),
         previous,
+        previous_dp_eod: current_proof(before.scope(), before.header()).unwrap().0,
         previous_source: before.identity().unwrap().to_bytes(),
         donor: Object::capture(donor_entry.clone()).unwrap(),
         expected: Object::capture(IndexEntry::File {
@@ -92,6 +93,28 @@ fn observe(previous_delta: bool, current_delta: bool) {
         target_tree: tree.finish(),
     });
     plan.encode().unwrap();
+    for eod in [
+        0,
+        before.construct().location.start_block,
+        before.construct().location.start_block + 1,
+        u64::MAX,
+    ] {
+        let mut invalid = plan.clone();
+        invalid.0.previous_dp_eod = eod;
+        assert!(invalid.encode().is_err(), "越界 EOD 必须拒绝: {eod}");
+    }
+    let mut legacy = plan.clone();
+    legacy.0.version = 2;
+    assert!(legacy.encode().is_err(), "首版计划直接升级，无旧格式兼容");
+    let mut shifted = plan.clone();
+    shifted.0.previous_dp_eod += 1;
+    shifted.encode().unwrap();
+    assert_ne!(
+        shifted.fingerprint().unwrap(),
+        plan.fingerprint().unwrap(),
+        "原 EOD 必须绑定固定计划摘要"
+    );
+    assert!(shifted.observe_current(&before, None).is_err());
     let unchanged = plan.observe_current(&before, None).unwrap();
     assert_eq!(unchanged.kind(), ReclaimMetadataObservationKind::Unchanged);
     check_codec(&plan, &unchanged);
@@ -120,6 +143,12 @@ fn observe(previous_delta: bool, current_delta: bool) {
             .unwrap();
     let commands = device.command_log().len();
     let committed = plan.observe_current(&actual, Some(&predecessor)).unwrap();
+    assert!(
+        shifted
+            .observe_current(&actual, Some(&predecessor))
+            .is_err(),
+        "提交必须恰从原 EOD 追加，不能跳过不明尾部"
+    );
     assert_eq!(committed.kind(), ReclaimMetadataObservationKind::Committed);
     check_codec(&plan, &committed);
     assert_eq!(plan.observe_current(&actual, None).is_ok(), current_delta);
@@ -188,6 +217,21 @@ fn check_codec(plan: &ReclaimMetadataPlan, observation: &ReclaimMetadataObservat
             ReclaimMetadataObservation::decode(plan, &changed).is_err(),
             "完整观测快照损坏必须拒绝，offset={offset}"
         );
+    }
+    if observation.kind() == ReclaimMetadataObservationKind::Committed {
+        let mut wrong = observation.clone();
+        wrong.current.location.start_block += 1;
+        // Keep a valid private checksum so semantic append-boundary validation,
+        // rather than byte-integrity checking, must reject the retained fact.
+        let mut wrong_raw = raw[..34].to_vec();
+        active_volume::encode_index(&mut wrong_raw, wrong.current);
+        wrong_raw.extend_from_slice(&wrong.physical_files.to_be_bytes());
+        wrong_raw.extend_from_slice(&ReclaimMetadataObservation::checksum(&wrong_raw));
+        assert!(
+            ReclaimMetadataObservation::decode(plan, &wrong_raw).is_err(),
+            "正确校验和不能使偏离原 EOD+1 的 Committed 合法"
+        );
+        assert!(wrong.encode(plan).is_err());
     }
     let mut changed = observation.clone();
     changed.current.volume_uuid = Uuid::new_v4();

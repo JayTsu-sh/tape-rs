@@ -14,6 +14,7 @@ pub(super) struct Plan {
     pub input: [u8; 32],
     pub volume: String,
     pub previous: Vec<u8>,
+    pub previous_dp_eod: u64,
     pub previous_source: Vec<u8>,
     pub donor: Object,
     pub expected: Object,
@@ -39,6 +40,10 @@ impl ReclaimMetadataPlan {
     }
     pub fn volume(&self) -> Uuid {
         Uuid::parse_str(&self.0.volume).expect("validated metadata volume")
+    }
+    /// Original audited DP append boundary; the XML SHA alone cannot bind it.
+    pub fn previous_dp_eod(&self) -> u64 {
+        self.0.previous_dp_eod
     }
     /// Descriptor for an explicit verified historical read, never media proof.
     pub fn previous_source(&self) -> Result<IndexSourceIdentity> {
@@ -75,6 +80,7 @@ impl ReclaimMetadataPlan {
         self.validate_source(source)?;
         if self.observe_current(target, None)?.kind() != ReclaimMetadataObservationKind::Unchanged
             || volume.verified_committed_index_construct().map_err(cache)? != target.construct()
+            || volume.recovery().dp.eod != self.previous_dp_eod()
         {
             return Err(CatalogError::Invalid("元数据执行卷头不同于原目标计划"));
         }
@@ -115,7 +121,7 @@ impl ReclaimMetadataPlan {
         p.expected.encode()?;
         let volume = Uuid::parse_str(&p.volume).map_err(cache)?;
         let head = active_volume::decode_index(volume, &p.previous)?;
-        if p.version != 2
+        if p.version != 3
             || volume.is_nil()
             || volume.to_string() != p.volume
             || p.parent.len() != 64
@@ -131,6 +137,12 @@ impl ReclaimMetadataPlan {
             || p.donor.uid == p.expected.uid
             || p.expected.uid <= 1
             || head.generation.checked_add(1).is_none()
+            || head
+                .location
+                .start_block
+                .checked_add(2)
+                .is_none_or(|minimum| p.previous_dp_eod < minimum)
+            || p.previous_dp_eod.checked_add(1).is_none()
             || p.physical_files.checked_add(1).is_none()
             || p.target_objects <= p.physical_files
             || ActiveIndexIdentity::from(self.previous_source()?.head()) != head
@@ -160,7 +172,7 @@ impl ReclaimSourceInventory<'_> {
         if !crate::ltfs::xml_text_valid(path) {
             return Err(CatalogError::Invalid("回收元数据路径包含 XML 非法字符"));
         }
-        current_proof(target.scope(), target.header())?;
+        let (previous_dp_eod, _, _) = current_proof(target.scope(), target.header())?;
         let proof = input.source().byte_proof();
         let destination = input.destination();
         if proof.inventory() != self.summary.digest
@@ -241,7 +253,7 @@ impl ReclaimSourceInventory<'_> {
         let mut previous = Vec::new();
         active_volume::encode_index(&mut previous, destination.index());
         let plan = ReclaimMetadataPlan(Plan {
-            version: 2,
+            version: 3,
             parent,
             inventory: self.summary.digest,
             source,
@@ -249,6 +261,7 @@ impl ReclaimSourceInventory<'_> {
             input: input.fingerprint()?,
             volume: destination.copy().volume_id.to_string(),
             previous,
+            previous_dp_eod,
             previous_source: target.identity().map_err(cache)?.to_bytes(),
             donor: Object::capture(donor_entry)?,
             expected: Object::capture(IndexEntry::File {
