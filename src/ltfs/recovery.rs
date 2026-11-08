@@ -584,6 +584,30 @@ pub(crate) fn with_verified_dp_construct<T>(
     require_latest: bool,
     consume: impl FnOnce(&mut dyn Read) -> Result<T>,
 ) -> Result<T> {
+    with_verified_dp_construct_bounds(
+        drive,
+        label,
+        location,
+        sha256,
+        budget,
+        require_latest,
+        consume,
+    )
+    .map(|(value, _)| value)
+}
+
+/// Return the exclusive end observed by the same SHA-verified construct read.
+/// Historical XML identity alone does not fix physical record segmentation.
+#[cfg(feature = "fdb")]
+pub(crate) fn with_verified_dp_construct_bounds<T>(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    location: IndexLocation,
+    sha256: [u8; 32],
+    budget: &RecoveryBudget,
+    require_latest: bool,
+    consume: impl FnOnce(&mut dyn Read) -> Result<T>,
+) -> Result<(T, u64)> {
     if location.partition != label.data_partition || location.start_block < P1_DATA_START {
         return Err(TapeError::Ltfs("FDB 索引不在数据分区".into()));
     }
@@ -617,7 +641,7 @@ pub(crate) fn with_verified_dp_construct<T>(
             });
         }
     }
-    Ok(value)
+    Ok((value, reader.next))
 }
 
 /// Verify an exact latest DP construct and the current IP view. Equal-generation

@@ -6,6 +6,32 @@ use super::*;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReclaimSourceRead(ReadEvidence);
 
+/// Original physical source and its retained byte proof at one FDB read version.
+/// The lookup is historical evidence, not a fresh physical read or a write permit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReclaimReadSource {
+    source: ActiveReadSource,
+    proof: ReclaimSourceRead,
+}
+
+impl ReclaimReadSource {
+    pub fn source(&self) -> &ActiveReadSource {
+        &self.source
+    }
+    pub fn byte_proof(&self) -> &ReclaimSourceRead {
+        &self.proof
+    }
+    pub(crate) fn into_source(self) -> ActiveReadSource {
+        self.source
+    }
+    pub(in crate::managed_catalog) fn new(
+        source: ActiveReadSource,
+        proof: ReclaimSourceRead,
+    ) -> Self {
+        Self { source, proof }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReadEvidence {
@@ -18,11 +44,22 @@ struct ReadEvidence {
     file_head: Vec<u8>,
     copy_sha256: [u8; 32],
     sha256: [u8; 32],
+    md5: Option<[u8; 16]>,
 }
 
 impl ReclaimSourceRead {
     pub fn sha256(&self) -> [u8; 32] {
         self.0.sha256
+    }
+
+    /// Present only when the original data node records an MD5 and its bytes
+    /// were checked against that value, including when SHA-256 is preferred.
+    pub fn md5(&self) -> Option<[u8; 16]> {
+        self.0.md5
+    }
+
+    pub fn source_node(&self) -> ReclaimSourceNode {
+        ReclaimSourceNode(self.0.object.clone())
     }
 
     pub(super) fn object(&self) -> &Object {
@@ -45,19 +82,21 @@ impl ReclaimSourceRead {
     ) -> Result<Self> {
         let proof: ReadEvidence = serde_json::from_value(value.clone()).map_err(cache)?;
         let index = active_volume::decode_index(copy.volume_id, &proof.source_index)?;
-        if proof.version != 1
+        if proof.version != 2
             || proof.parent != parent
             || serde_json::to_value(&proof).map_err(cache)? != *value
             || value["file"]
                 != json!({"path":intent.ltfs_path()?,"file":intent.file_id.to_string(),
                 "version":intent.expected_version,"size":intent.expected_size,"operation":intent.operation_id.to_string()})
             || proof.file_head != encode_head(head)
-            || proof.object.kind != Kind::File
+            || proof.object.kind != ReclaimSourceNodeKind::File
             || proof.object.uid != copy.ltfs_file_uid
             || proof.object.length != Some(copy.size)
             || proof.copy_sha256
                 != <[u8; 32]>::from(Sha256::digest(copy_records::encode_physical_copy(copy)?))
             || intent.expected_digest != ContentDigest::Sha256(proof.sha256)
+            || matches!(copy.content_digest, ContentDigest::Sha256(v) if v != proof.sha256)
+            || matches!(copy.content_digest, ContentDigest::Md5(v) if Some(v) != proof.md5)
             || index.generation < copy.volume_generation
             || copy.media.as_ref().is_some_and(|m| m.native_symlink)
         {
@@ -74,7 +113,25 @@ impl ReclaimSourceRead {
     }
 }
 
+fn expected_md5(node: &crate::ltfs::index::FileNode) -> Result<Option<[u8; 16]>> {
+    // Validate both algorithms and reject duplicate/malformed attributes even
+    // though the preferred digest may mask the secondary one.
+    ContentDigest::from_ltfs_xattrs(&node.xattrs)?;
+    node.xattrs
+        .iter()
+        .find(|attr| attr.key == crate::ltfs::index::XATTR_MD5)
+        .map(crate::managed_catalog::parse_ltfs_hex::<16>)
+        .transpose()
+}
+
 impl ReclaimSourceInventory<'_> {
+    pub(crate) fn expected_read_md5(&self, uid: u64) -> Result<Option<[u8; 16]>> {
+        match self.source.entry_by_uid(uid).map_err(cache)? {
+            Some(IndexEntry::File { node, .. }) if node.symlink.is_none() => expected_md5(&node),
+            _ => Err(CatalogError::Invalid("回收数据 UID 不是普通文件")),
+        }
+    }
+
     pub(crate) fn bind_verified_read(
         &self,
         reservation: &ReclaimReservation,
@@ -82,6 +139,7 @@ impl ReclaimSourceInventory<'_> {
         read: &ResolvedRead,
         verified_head: ActiveIndexIdentity,
         sha256: [u8; 32],
+        md5: Option<[u8; 16]>,
     ) -> Result<ReclaimSourceRead> {
         let mut index = Vec::new();
         active_volume::encode_index(&mut index, verified_head);
@@ -129,8 +187,19 @@ impl ReclaimSourceInventory<'_> {
                 "当前源对象的正文 extent 与实读来源不同",
             ));
         }
+        if expected_md5(node)? != md5
+            || matches!(read.copy.content_digest, ContentDigest::Md5(v) if Some(v) != md5)
+        {
+            return Err(CatalogError::Invalid("回收源实读 MD5 与原始数据节点不一致"));
+        }
+        if matches!(ContentDigest::from_ltfs_xattrs(&node.xattrs)?, ContentDigest::Sha256(v) if v != sha256)
+        {
+            return Err(CatalogError::Invalid(
+                "回收源实读 SHA-256 与原始数据节点不一致",
+            ));
+        }
         Ok(ReclaimSourceRead(ReadEvidence {
-            version: 1,
+            version: 2,
             parent: reservation.fingerprint(),
             file: file.clone(),
             inventory: self.summary.digest,
@@ -139,6 +208,7 @@ impl ReclaimSourceInventory<'_> {
             file_head: encode_head(&read.head),
             copy_sha256: Sha256::digest(copy_records::encode_physical_copy(&read.copy)?).into(),
             sha256,
+            md5,
         }))
     }
 }

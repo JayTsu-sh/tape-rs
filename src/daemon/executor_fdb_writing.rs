@@ -39,6 +39,17 @@ pub(super) async fn prepare(
     if spec.size > control.storage.download_bytes {
         return Err(ReadError::Failed("上传超过单文件暂存上限".into()));
     }
+    control
+        .catalog
+        .check_active_pool_gate(&control.serial, control.route, owner.round, spec.pool_id)
+        .await
+        .map_err(|error| match error.domain() {
+            CatalogError::PoolBusy | CatalogError::PoolImporting => {
+                ReadError::Busy(error.to_string())
+            }
+            CatalogError::Invalid(reason) => ReadError::Failed((*reason).into()),
+            _ => lost(error),
+        })?;
     fdb_loading::guard(owner, permit, control).await?;
     let inventory = inventory_inner(&owner.devices, true).map_err(lost)?;
     let management = fdb_loading::policy(owner, control, &[spec.pool_id], None).await?;
@@ -119,12 +130,15 @@ pub(super) async fn prepare(
                 fdb_loading::guard(owner, permit, control).await?;
                 return Ok(intent);
             }
-            Err(
-                CatalogError::Incomplete
-                | CatalogError::PoolImporting
-                | CatalogError::PoolBusy
-                | CatalogError::MediaUnavailable,
-            ) => continue,
+            Err(error)
+                if matches!(
+                    error.domain(),
+                    CatalogError::PoolBusy | CatalogError::PoolImporting
+                ) =>
+            {
+                return Err(ReadError::Busy(error.to_string()));
+            }
+            Err(CatalogError::Incomplete | CatalogError::MediaUnavailable) => continue,
             Err(CatalogError::Invalid(reason)) => return Err(ReadError::Failed(reason.into())),
             Err(error) => return Err(lost(error)),
         }

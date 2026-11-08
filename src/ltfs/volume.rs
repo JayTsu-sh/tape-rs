@@ -857,6 +857,34 @@ impl<'a> LtfsVolume<'a> {
             .map_err(|error| TapeError::Catalog(error.to_string()))
     }
 
+    /// Read-only precondition for journaling this exact metadata attempt's tail
+    /// Discard. Requires a fresh full-budget mount and current PR; callers still
+    /// enforce the original FDB task and Permission on every device command
+    /// from the serialized device executor. Positioning may settle already
+    /// buffered writes; this method appends no data, index or filemarks.
+    #[cfg(feature = "fdb")]
+    pub fn reclaim_metadata_tail_evidence(
+        &mut self,
+        task: &crate::managed_catalog::ReclaimMetadataWrite,
+        original: &crate::ltfs::recovery::CapturedIndexSource,
+    ) -> Result<crate::managed_catalog::ReclaimMetadataTailEvidence> {
+        if self.dirty {
+            return Err(TapeError::Catalog(
+                "元数据修尾前提要求重新挂载，不能使用工作树".into(),
+            ));
+        }
+        let current = self.verified_recovery_index_construct()?;
+        let round = self.reservation_guard.expect("verified guard").round();
+        crate::managed_catalog::ReclaimMetadataTailEvidence::from_report(
+            task,
+            round,
+            original,
+            &self.recovery,
+            current,
+        )
+        .map_err(|error| TapeError::Catalog(error.to_string()))
+    }
+
     /// Explicitly append a Discard index for this original node attempt's T1/T2
     /// tail. The original committed source is checked before any tail write.
     /// The caller still enforces current FDB ownership, policy and execution.
@@ -1461,6 +1489,48 @@ impl<'a> LtfsVolume<'a> {
         self.ensure_writable()?;
         self.working.change_node_metadata(path, change)?;
         self.dirty |= !change.is_empty();
+        Ok(())
+    }
+
+    /// Stage exact attributes of an already created reclaim directory/link.
+    /// The managed actor must persist its intent and serialize this volume
+    /// before calling. No node is created, no content is copied, and nothing
+    /// is published or written until the ordinary guarded commit succeeds.
+    /// This is not destination readback or permission to erase the source.
+    pub fn preserve_reclaimed_metadata(
+        &mut self,
+        path: &str,
+        source: &super::index::IndexEntry,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        self.working.preserve_reclaimed_metadata(path, source)?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// 为原始 EE 数据节点保留独立属性，正文复用本卷已提交的文件 extent。
+    /// 调用方须先持久化原回收计划并实读核验正文；本方法不授予 FDB 覆盖或擦除权限。
+    #[cfg(feature = "fdb")]
+    pub fn reference_reclaimed_body(
+        &mut self,
+        path: &str,
+        uid: u64,
+        body_path: &str,
+        body_uid: u64,
+        source: &super::index::IndexEntry,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        let body = self
+            .index
+            .find_file(body_path)
+            .filter(|node| node.meta.file_uid == body_uid)
+            .ok_or_else(|| TapeError::Ltfs("回收引用的已提交正文身份不符".into()))?;
+        if self.working.find_file(body_path) != Some(body) {
+            return Err(TapeError::Ltfs("回收引用的正文有未提交修改".into()));
+        }
+        self.working
+            .reference_reclaimed_body(path, uid, body, source)?;
+        self.dirty = true;
         Ok(())
     }
 

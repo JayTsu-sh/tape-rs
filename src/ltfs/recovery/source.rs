@@ -14,6 +14,7 @@ pub struct CapturedIndexSource {
     replay: IndexReplay,
     predecessors: Vec<CommittedIndexConstruct>,
     source_bytes: u64,
+    construct_end: u64,
     scope: IndexSourceScope,
 }
 
@@ -31,6 +32,11 @@ pub enum IndexSourceScope {
 impl CapturedIndexSource {
     pub fn scope(&self) -> IndexSourceScope {
         self.scope
+    }
+    /// Exclusive logical block immediately after this head's closing filemark,
+    /// observed by the same verified read. Recorded heads may precede DP EOD.
+    pub fn construct_end(&self) -> u64 {
+        self.construct_end
     }
     pub fn source_bytes(&self) -> u64 {
         self.source_bytes
@@ -147,6 +153,7 @@ pub fn capture_index_source(
         replay,
         predecessors,
         source_bytes: bytes,
+        construct_end: eod,
         scope: IndexSourceScope::Current {
             dp_eod: eod,
             ip_generation,
@@ -173,7 +180,7 @@ pub fn capture_recorded_index_source(
     }
     let replay = IndexReplay::capture(&budget.index_scratch, label.index_partition)?;
     let mut source_bytes = 0;
-    let head = with_verified_dp_construct(
+    let (head, construct_end) = with_verified_dp_construct_bounds(
         drive,
         label,
         target.location,
@@ -220,6 +227,7 @@ pub fn capture_recorded_index_source(
         replay,
         predecessors,
         source_bytes,
+        construct_end,
         scope: IndexSourceScope::Recorded,
     })
 }

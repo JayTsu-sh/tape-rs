@@ -6,6 +6,8 @@ use serde_json::{Value, json};
 #[path = "management_pools.rs"]
 mod pools;
 
+#[path = "management_exclusion.rs"]
+pub(super) mod exclusion;
 #[path = "management_rescan.rs"]
 mod rescan;
 

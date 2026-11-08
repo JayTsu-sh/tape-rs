@@ -4519,19 +4519,45 @@ fn s3_anonymous_objects_survive_owner_failover_and_share_file_namespace() {
 #[test]
 fn s3_buckets_follow_http_pool_management_without_media() {
     let c = Cluster::start_s3_fixture("s3-pools");
-    let (owner, round) = c.wait_serving(None, 0);
+    c.wait_serving(None, 0);
     let s3 = c.start_s3();
     let management = c.start_http();
-    let result = s3_http(
-        &management[owner as usize - 1],
-        "POST",
-        "/admin/pools/S3EMPTY",
-        "",
-        b"",
-    );
-    assert_eq!(result.0, 200, "{}", String::from_utf8_lossy(&result.2));
+    let created = std::cell::RefCell::new(None);
+    c.wait("向当前 Leader 创建 S3 空池", || {
+        for node in 1..=3 {
+            if c.st(node).role != "Leader" {
+                continue;
+            }
+            let result = s3_http(
+                &management[node as usize - 1],
+                "POST",
+                "/admin/pools/S3EMPTY",
+                "",
+                b"",
+            );
+            match result.0 {
+                200 => {
+                    created.replace(Some(result));
+                    return true;
+                }
+                503 => {
+                    // 与下方 DELETE 一样，仅明确未受理才重新找 Leader。
+                    // 超时、响应丢失或其他错误不能重放创建池操作。
+                    let rejected: serde_json::Value = serde_json::from_slice(&result.2).unwrap();
+                    assert_eq!(rejected["error"], "not_leader", "{rejected}");
+                }
+                code => panic!(
+                    "创建空池失败 {code}: {}",
+                    String::from_utf8_lossy(&result.2)
+                ),
+            }
+        }
+        false
+    });
+    let result = created.into_inner().unwrap();
     let result: serde_json::Value = serde_json::from_slice(&result.2).unwrap();
     let uuid = result["result"].as_str().unwrap();
+    let (owner, round) = c.wait_serving(None, 0);
     let bucket = tape_rs::daemon::s3::bucket_name("TEST-S3", uuid);
     c.wait("S3 pool 复制", || {
         c.st(owner).pools.iter().any(|p| p.uuid == uuid)

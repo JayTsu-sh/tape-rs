@@ -21,6 +21,15 @@ pub struct ReclaimFile {
     operation: String,
 }
 impl ReclaimFile {
+    pub(super) fn validate(&self) -> Result<()> {
+        uuid(&self.file)?;
+        uuid(&self.operation)?;
+        lookup::path_components(self.path.as_bytes())?;
+        if self.version == 0 || self.path == "/" || self.path.len() > MAX_POOL_PATH_BYTES {
+            return Err(CatalogError::Corrupt("回收当前文件身份或路径无效"));
+        }
+        Ok(())
+    }
     pub fn path(&self) -> &str {
         &self.path
     }
@@ -215,11 +224,10 @@ async fn state_at(tr: &Transaction, reservation: &ReclaimReservation) -> Result<
     }
     pool_catalog_path(reservation.spec().pool, path(&state.stack).as_bytes())?;
     if let Some(file) = &state.current {
-        uuid(&file.file)?;
-        uuid(&file.operation)?;
+        file.validate()?;
         let full = pool_catalog_path(reservation.spec().pool, file.path.as_bytes())?;
         lookup::path_components(&full)?;
-        if file.version == 0 || state.stack.is_empty() || file.path == "/" {
+        if state.stack.is_empty() {
             return Err(CatalogError::Corrupt("回收当前文件"));
         }
     }
@@ -344,7 +352,7 @@ impl ManagedCatalog {
         self.db.run(|tr,_| async move {requests::retry_result(async {
             let parent=record_at(&tr,reservation,owner).await?;
             if parent["owner_epoch"]!=owner {return Err(CatalogError::OwnerFenced);}
-            children::require_request_at(&tr,request,owner).await?;
+            children::require_request_identity_at(&tr,request,owner).await?;
             if file.operation()!=request.operation_id || file.file_id()!=request.file_id
                 || Some(file.version)!=request.expected_version || file.path!=request.ltfs_path()?
                 || file.size!=request.expected_size {

@@ -18,11 +18,18 @@ pub use walk::{ReclaimFile, ReclaimWalk};
 mod recovery;
 #[path = "reclaim_retirement.rs"]
 mod retirement;
+pub use retirement::ReclaimBodyDestination;
 #[path = "reclaim_source.rs"]
 mod source;
+pub(in crate::managed_catalog) use source::require_publication_at as require_metadata_publication_at;
 pub use source::{
-    ReclaimDataProgress, ReclaimFileMetadata, ReclaimMetadataProgress, ReclaimSourceInventory,
-    ReclaimSourceProgress, ReclaimSourceRead,
+    ReclaimDataProgress, ReclaimFileMetadata, ReclaimMetadataAdmission,
+    ReclaimMetadataCommitEvidence, ReclaimMetadataDiscardObservation, ReclaimMetadataInput,
+    ReclaimMetadataObservation, ReclaimMetadataObservationKind, ReclaimMetadataPlan,
+    ReclaimMetadataProgress, ReclaimMetadataPublication, ReclaimMetadataTailEvidence,
+    ReclaimMetadataUnwrittenEvidence, ReclaimMetadataWrite, ReclaimNodeDestination,
+    ReclaimNodeMetadata, ReclaimNodeReadRequest, ReclaimReadSource, ReclaimSourceInventory,
+    ReclaimSourceNode, ReclaimSourceNodeKind, ReclaimSourceProgress, ReclaimSourceRead,
 };
 
 fn domain(ns: Uuid, kind: u8) -> Vec<u8> {
@@ -51,10 +58,10 @@ impl ReclaimReservation {
     pub fn spec(&self) -> ReclaimSpec {
         ReclaimSpec::parse(&self.intent["change"]).expect("validated reclaim identity")
     }
-    fn namespace(&self) -> Uuid {
+    pub(crate) fn namespace(&self) -> Uuid {
         self.route.route.namespace
     }
-    fn serial(&self) -> &str {
+    pub(crate) fn serial(&self) -> &str {
         self.intent["library"].as_str().expect("validated library")
     }
     fn fingerprint(&self) -> String {
@@ -132,6 +139,27 @@ async fn pool_gate_at(tr: &Transaction, ns: Uuid, pool: Uuid) -> Result<Option<V
     Ok(Some(token))
 }
 
+async fn require_metadata_copy_idle_at(tr: &Transaction, ns: Uuid, pool: Uuid) -> Result<()> {
+    if let Some(token) = pool_gate_at(tr, ns, pool).await? {
+        let mut key = domain(ns, b'A');
+        key.extend_from_slice(
+            &token["epoch"]
+                .as_u64()
+                .expect("validated epoch")
+                .to_be_bytes(),
+        );
+        key.extend_from_slice(
+            Uuid::parse_str(token["operation"].as_str().expect("validated operation"))
+                .expect("validated UUID")
+                .as_bytes(),
+        );
+        if tr.get(&key, false).await?.is_some() {
+            return Err(CatalogError::PoolBusy);
+        }
+    }
+    Ok(())
+}
+
 pub(super) async fn require_pool_write_at(tr: &Transaction, ns: Uuid, pool: Uuid) -> Result<()> {
     if pool_gate_at(tr, ns, pool).await?.is_some() {
         return Err(CatalogError::PoolBusy);
@@ -181,6 +209,9 @@ async fn record_at(
     {
         return Err(CatalogError::Corrupt("回收预留与池屏障不一致"));
     }
+    management::exclusion::LibraryTaskClaim::for_reclaim(&reservation.token())?
+        .require_owned(tr)
+        .await?;
     Ok(value)
 }
 
@@ -244,12 +275,15 @@ impl ManagedCatalog {
                 let window=management::window(&tr,ns).await?;
                 if epoch!=window.accepting {return Err(CatalogError::Invalid("回收管理请求代次已关闭"));}
                 require_pool_writable_at(&tr,ns,spec.pool).await?;
+                management::exclusion::require_available_at(&tr,ns,serial).await?;
+                let claim=management::exclusion::LibraryTaskClaim::for_reclaim(&reservation.token())?;
                 if requests::has_namespace_holds(&tr,ns).await? || active_volume::recovery_active(&tr,spec.volume).await? {
                     return Err(CatalogError::PoolBusy);
                 }
                 let value=json!({"version":1,"intent":reservation.intent,"fingerprint":reservation.fingerprint(),"owner_epoch":owner,"phase":"reserved","children":0});
                 tr.set(&reservation.journal_key(),value.to_string().as_bytes());
                 tr.set(&gate_key(ns,spec.pool),reservation.token().to_string().as_bytes());
+                claim.acquire(&tr);
                 Ok(reservation)
             }.await) }
         }).await?
@@ -294,7 +328,11 @@ impl ManagedCatalog {
                             )
                             .await?;
                         if journal.is_none() && gate.is_none() {
-                            return Ok(());
+                            return management::exclusion::LibraryTaskClaim::for_reclaim(
+                                &reservation.token(),
+                            )?
+                            .require_released(&tr)
+                            .await;
                         }
                         let value = record_at(&tr, reservation, owner).await?;
                         if value["owner_epoch"] != owner {
@@ -303,10 +341,15 @@ impl ManagedCatalog {
                         if value["phase"] != "reserved" || value["children"] != 0 {
                             return Err(CatalogError::PoolBusy);
                         }
+                        source::require_metadata_idle_at(&tr, reservation).await?;
+                        let claim = management::exclusion::LibraryTaskClaim::for_reclaim(
+                            &reservation.token(),
+                        )?;
                         walk::clear_reserved_at(&tr, reservation).await?;
                         source::clear_reserved_at(&tr, reservation);
                         tr.clear(&gate_key(reservation.namespace(), reservation.spec().pool));
                         tr.clear(&reservation.journal_key());
+                        claim.release(&tr);
                         Ok(())
                     }
                     .await,

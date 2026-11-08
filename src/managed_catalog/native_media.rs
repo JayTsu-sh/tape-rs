@@ -3043,6 +3043,103 @@ mod tests {
     #[tokio::test]
     #[ignore = "需要隔离 FDB_TEST_CLUSTER；回收池写屏障/原请求重放/owner接任，不操作真实设备"]
     async fn reclaim_reservation_fences_pool_writes_and_survives_new_owner() {
+        async fn finish_scan(
+            c: &ManagedCatalog,
+            serial: &str,
+            route: ActiveLibraryRoute,
+            owner: u64,
+            request: &ManagementRequest,
+        ) {
+            let time = "2026-11-07T00:00:00Z";
+            c.record_library_monitor(serial, route, owner, time, Some("test sample failed"))
+                .await
+                .unwrap();
+            c.complete_library_rescan(
+                serial,
+                route,
+                owner,
+                request,
+                time,
+                Some("test sample failed"),
+            )
+            .await
+            .unwrap();
+        }
+        async fn assert_orphaned_release_is_rejected(
+            c: &ManagedCatalog,
+            reservation: &ReclaimReservation,
+        ) {
+            let intent = reservation.intent();
+            let ns = Uuid::parse_str(intent["namespace"].as_str().unwrap()).unwrap();
+            let serial = intent["library"].as_str().unwrap();
+            let mut journal = management::prefix(ns, b'R');
+            journal.push(b'j');
+            journal.extend_from_slice(&intent["epoch"].as_u64().unwrap().to_be_bytes());
+            journal.extend_from_slice(
+                Uuid::parse_str(intent["operation"].as_str().unwrap())
+                    .unwrap()
+                    .as_bytes(),
+            );
+            let mut gate = management::prefix(ns, b'R');
+            gate.push(b'p');
+            gate.extend_from_slice(reservation.spec().pool().as_bytes());
+            let slot = management::exclusion::key(ns, serial);
+            let mut marker = slot[..slot.len() - 1].to_vec();
+            marker.push(b'r');
+            marker.extend_from_slice(&intent["epoch"].as_u64().unwrap().to_be_bytes());
+            marker.extend_from_slice(
+                Uuid::parse_str(intent["operation"].as_str().unwrap())
+                    .unwrap()
+                    .as_bytes(),
+            );
+            let keys = [&journal, &gate, &slot, &marker];
+            let tr = c.db.create_trx().unwrap();
+            let mut original = Vec::new();
+            for key in keys {
+                original.push(tr.get(key, false).await.unwrap().unwrap().to_vec());
+            }
+            for (keep_slot, keep_marker) in [(true, true), (true, false), (false, true)] {
+                let tr = c.db.create_trx().unwrap();
+                tr.clear(&journal);
+                tr.clear(&gate);
+                for (key, keep, value) in [
+                    (&slot, keep_slot, &original[2]),
+                    (&marker, keep_marker, &original[3]),
+                ] {
+                    if keep {
+                        tr.set(key, value);
+                    } else {
+                        tr.clear(key);
+                    }
+                }
+                tr.commit().await.unwrap();
+                assert!(
+                    matches!(
+                        c.release_reserved_reclaim(reservation, 100).await,
+                        Err(CatalogError::Corrupt(_))
+                    ),
+                    "孤立库占用不得误报释放成功"
+                );
+                let tr = c.db.create_trx().unwrap();
+                for (key, keep, value) in [
+                    (&slot, keep_slot, &original[2]),
+                    (&marker, keep_marker, &original[3]),
+                ] {
+                    assert_eq!(
+                        tr.get(key, false).await.unwrap().as_deref(),
+                        keep.then_some(value.as_slice()),
+                        "拒绝时不得清除或补回原库占用"
+                    );
+                }
+                assert!(tr.get(&journal, false).await.unwrap().is_none());
+                assert!(tr.get(&gate, false).await.unwrap().is_none());
+            }
+            let tr = c.db.create_trx().unwrap();
+            for (key, value) in keys.into_iter().zip(&original) {
+                tr.set(key, value);
+            }
+            tr.commit().await.unwrap();
+        }
         let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
         let _network = unsafe { foundationdb::boot() };
         let c = ManagedCatalog::open(Some(&cluster)).unwrap();
@@ -3063,6 +3160,26 @@ mod tests {
             .unwrap();
         let spec = ReclaimSpec::parse(&json!({"kind":"media-reclaim","pool":pool.id.to_string(),"barcode":assignment.barcode,"volume":assignment.volume_id.unwrap().to_string(),"revision":assignment.revision,"confirm_format":true,"unassign":false})).unwrap();
         let operation = Uuid::new_v4();
+        let scan = ManagementRequest::parse(
+            json!({"version":1,"library":serial,"namespace":route.route.namespace.to_string(),
+            "epoch":1,"operation":Uuid::new_v4().to_string(),"change":{"kind":"library-rescan"}}),
+        )
+        .unwrap();
+        c.admit_management(&serial, route, 100, &scan)
+            .await
+            .unwrap();
+        c.begin_library_rescan(&serial, route, 100, &scan)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                c.reserve_reclaim_pool(&serial, route, 100, 1, operation, &spec)
+                    .await,
+                Err(CatalogError::PoolBusy)
+            ),
+            "同库 rescan 运行时不能取得 reclaim 父任务"
+        );
+        finish_scan(&c, &serial, route, 100, &scan).await;
         let reserved = c
             .reserve_reclaim_pool(&serial, route, 100, 1, operation, &spec)
             .await
@@ -3072,6 +3189,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reserved.intent(), retried.intent());
+        let scan_again = ManagementRequest::parse(
+            json!({"version":1,"library":serial,"namespace":route.route.namespace.to_string(),
+            "epoch":1,"operation":Uuid::new_v4().to_string(),"change":{"kind":"library-rescan"}}),
+        )
+        .unwrap();
+        c.admit_management(&serial, route, 100, &scan_again)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                c.begin_library_rescan(&serial, route, 100, &scan_again)
+                    .await,
+                Err(CatalogError::PoolBusy)
+            ),
+            "reclaim 也阻止同库 rescan，排队不能视为已开始"
+        );
         assert!(
             c.step_reclaim_walk(&reserved, 100)
                 .await
@@ -3116,13 +3249,17 @@ mod tests {
             "回收写屏障不关闭读取"
         );
         let disabled=ManagementRequest::parse(json!({"version":1,"library":serial,"namespace":route.route.namespace.to_string(),"epoch":1,"operation":Uuid::new_v4().to_string(),"change":{"kind":"tape","pool":pool.id.to_string(),"volume":spec.volume().to_string(),"barcode":spec.barcode(),"revision":spec.revision(),"patch":{"online":false}}})).unwrap();
-        assert!(matches!(
-            c.admit_management(&serial, route, 100, &disabled)
-                .await
-                .as_ref()
-                .map_err(|error| error.domain()),
-            Err(CatalogError::PoolBusy)
-        ));
+        c.admit_management(&serial, route, 100, &disabled)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                c.apply_management(&serial, route, 100, disabled.epoch(), disabled.operation())
+                    .await,
+                Err(CatalogError::PoolBusy)
+            ),
+            "可排队，但同库 reclaim 期间不能执行 tape set"
+        );
         assert_eq!(
             c.tape_assignment(&serial, spec.barcode())
                 .await
@@ -3141,6 +3278,67 @@ mod tests {
         c.check_active_pool_gate(&serial, route, 100, other.id)
             .await
             .unwrap();
+        let (other_spool, other_proof) = target_source(&root, 0);
+        let intake = start_target(&c, &serial, route, other.id, 100, "OTHRECL8", ("/", true)).await;
+        c.bind_native_media_source(&intake, 100, &other_proof)
+            .await
+            .unwrap();
+        c.begin_native_media_projection(&intake, 100).await.unwrap();
+        c.finish_native_media(&intake, 100, &other_proof)
+            .await
+            .unwrap();
+        let assignment_b = c
+            .tape_assignment(&serial, "OTHRECL8")
+            .await
+            .unwrap()
+            .unwrap();
+        let spec_b = ReclaimSpec::parse(&json!({"kind":"media-reclaim","pool":other.id.to_string(),
+            "barcode":assignment_b.barcode,"volume":assignment_b.volume_id.unwrap().to_string(),"revision":assignment_b.revision,
+            "confirm_format":true,"unassign":false})).unwrap();
+        assert!(
+            matches!(
+                c.reserve_reclaim_pool(&serial, route, 100, 1, Uuid::new_v4(), &spec_b)
+                    .await,
+                Err(CatalogError::PoolBusy)
+            ),
+            "同库跨池 reclaim 也互斥"
+        );
+        let set_b = ManagementRequest::parse(json!({"version":1,"library":serial,"namespace":route.route.namespace.to_string(),
+            "epoch":1,"operation":Uuid::new_v4().to_string(),"change":{"kind":"tape","pool":other.id.to_string(),"barcode":assignment_b.barcode,
+            "volume":assignment_b.volume_id.unwrap().to_string(),"revision":assignment_b.revision,"patch":{"blacklisted":true}}})).unwrap();
+        c.admit_management(&serial, route, 100, &set_b)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                c.apply_management(&serial, route, 100, set_b.epoch(), set_b.operation())
+                    .await,
+                Err(CatalogError::PoolBusy)
+            ),
+            "reclaim 阻止同库另一池的 tape set"
+        );
+        let unassign = ManagementRequest::parse(json!({"version":1,"library":serial,"namespace":route.route.namespace.to_string(),
+            "epoch":1,"operation":Uuid::new_v4().to_string(),"change":{"kind":"media-unassign","pool":other.id.to_string(),"barcode":assignment_b.barcode,
+            "volume":assignment_b.volume_id.unwrap().to_string(),"revision":assignment_b.revision}})).unwrap();
+        c.admit_management(&serial, route, 100, &unassign)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                c.start_native_device_task(
+                    &serial,
+                    route,
+                    100,
+                    unassign.epoch(),
+                    unassign.operation()
+                )
+                .await
+                .as_ref()
+                .map_err(|e| e.domain()),
+                Err(CatalogError::PoolBusy)
+            ),
+            "reclaim 阻止同库另一池的 unassign"
+        );
         assert!(matches!(
             c.reserve_reclaim_pool(&serial, route, 100, 1, Uuid::new_v4(), &spec)
                 .await
@@ -3148,6 +3346,7 @@ mod tests {
                 .map_err(|error| error.domain()),
             Err(CatalogError::PoolBusy)
         ));
+        Box::pin(assert_orphaned_release_is_rejected(&c, &reserved)).await;
         c.claim_active_owner_epoch(&serial, 101).await.unwrap();
         assert!(c.reserved_reclaim_status(&reserved, 100).await.is_err());
         assert!(c.release_reserved_reclaim(&reserved, 100).await.is_err());
@@ -3166,6 +3365,74 @@ mod tests {
         );
         c.release_reserved_reclaim(&resumed, 101).await.unwrap();
         c.release_reserved_reclaim(&resumed, 101).await.unwrap();
+        let unassign_task = c
+            .start_native_device_task(&serial, route, 101, unassign.epoch(), unassign.operation())
+            .await
+            .unwrap()
+            .unwrap();
+        c.release_reserved_reclaim(&resumed, 101).await.unwrap();
+        assert!(matches!(
+            c.reserve_reclaim_pool(&serial, route, 101, 1, Uuid::new_v4(), &spec)
+                .await,
+            Err(CatalogError::PoolBusy)
+        ));
+        assert!(matches!(
+            c.begin_library_rescan(&serial, route, 101, &scan_again)
+                .await,
+            Err(CatalogError::PoolBusy)
+        ));
+        assert!(matches!(
+            c.apply_management(&serial, route, 101, set_b.epoch(), set_b.operation())
+                .await,
+            Err(CatalogError::PoolBusy)
+        ));
+        // No CDB has been admitted; the original Ready task may fail safely.
+        let failed_unassign = c
+            .finish_native_device_task(
+                &unassign_task,
+                101,
+                &json!({}),
+                Some("test stopped before device work"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed_unassign["status"], "failed");
+        assert_eq!(
+            c.tape_assignment(&serial, "OTHRECL8")
+                .await
+                .unwrap()
+                .unwrap(),
+            assignment_b
+        );
+        c.begin_library_rescan(&serial, route, 101, &scan_again)
+            .await
+            .unwrap();
+        c.release_reserved_reclaim(&resumed, 101).await.unwrap();
+        assert_eq!(
+            c.finish_native_device_task(
+                &unassign_task,
+                101,
+                &json!({}),
+                Some("test stopped before device work")
+            )
+            .await
+            .unwrap(),
+            failed_unassign,
+            "终态重放不能清理后续 rescan 的占用"
+        );
+        assert!(matches!(
+            c.apply_management(&serial, route, 101, set_b.epoch(), set_b.operation())
+                .await,
+            Err(CatalogError::PoolBusy)
+        ));
+        finish_scan(&c, &serial, route, 101, &scan_again).await;
+        assert_eq!(
+            c.apply_management(&serial, route, 101, set_b.epoch(), set_b.operation())
+                .await
+                .unwrap()["status"],
+            "succeeded"
+        );
+        drop(other_spool);
         let mut scan_prefix = management::prefix(route.route.namespace, b'R');
         scan_prefix.push(b's');
         assert!(
@@ -3387,6 +3654,7 @@ mod tests {
                 &original_read.read,
                 source_head,
                 Sha256::digest([]).into(),
+                None,
             )
             .unwrap();
         let original_read_metadata = original_read.read.clone();
@@ -3414,7 +3682,8 @@ mod tests {
                         &scanned,
                         &wrong,
                         observed,
-                        Sha256::digest([]).into()
+                        Sha256::digest([]).into(),
+                        None
                     )
                     .is_err()
             );

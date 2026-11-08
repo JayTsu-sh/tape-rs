@@ -155,6 +155,7 @@ pub(super) enum IndexKind {
     NodeDiscard(Uuid),
     NodeRename(Uuid),
     NodeRenameDiscard(Uuid),
+    ReclaimMetadata(Uuid),
 }
 
 fn encode_history(kind: IndexKind, index: ActiveIndexIdentity) -> Vec<u8> {
@@ -166,6 +167,7 @@ fn encode_history(kind: IndexKind, index: ActiveIndexIdentity) -> Vec<u8> {
         IndexKind::NodeDiscard(id) => (4, id),
         IndexKind::NodeRename(id) => (5, id),
         IndexKind::NodeRenameDiscard(id) => (6, id),
+        IndexKind::ReclaimMetadata(id) => (7, id),
     };
     out.push(tag);
     out.extend_from_slice(id.as_bytes());
@@ -174,7 +176,7 @@ fn encode_history(kind: IndexKind, index: ActiveIndexIdentity) -> Vec<u8> {
 }
 
 fn decode_history(volume: Uuid, bytes: &[u8]) -> Result<(IndexKind, ActiveIndexIdentity)> {
-    if bytes.len() != HISTORY_LEN || !matches!(bytes[0], 1..=6) {
+    if bytes.len() != HISTORY_LEN || !matches!(bytes[0], 1..=7) {
         return Err(CatalogError::Corrupt("活动卷历史批次版本或长度"));
     }
     let id = uuid_from(&bytes[1..17])?;
@@ -188,6 +190,7 @@ fn decode_history(volume: Uuid, bytes: &[u8]) -> Result<(IndexKind, ActiveIndexI
         4 => IndexKind::NodeDiscard(id),
         5 => IndexKind::NodeRename(id),
         6 => IndexKind::NodeRenameDiscard(id),
+        7 => IndexKind::ReclaimMetadata(id),
         _ => unreachable!("validated tag"),
     };
     Ok((kind, decode_index(volume, &bytes[17..])?))
@@ -218,6 +221,9 @@ pub(super) async fn history_at(
     }
     if let IndexKind::NodeRenameDiscard(intent) = kind {
         control::require_rename_discard_at(tr, serial, intent, index).await?;
+    }
+    if let IndexKind::ReclaimMetadata(attempt) = kind {
+        control::require_reclaim_metadata_publication_at(tr, serial, attempt, index).await?;
     }
     Ok((kind, index))
 }
@@ -413,7 +419,10 @@ pub(super) async fn observed_copy_index_at(
     Ok(
         match observed_history_at(tr, serial, volume, generation).await? {
             Some((
-                IndexKind::FileBatch(_) | IndexKind::NodeMutation(_) | IndexKind::NodeRename(_),
+                IndexKind::FileBatch(_)
+                | IndexKind::NodeMutation(_)
+                | IndexKind::NodeRename(_)
+                | IndexKind::ReclaimMetadata(_),
                 index,
             )) => Some(index),
             _ => None,
@@ -438,8 +447,45 @@ async fn observed_history_at(
     Ok(Some((kind, index)))
 }
 
-/// Only the node observer calls this after validating opaque media evidence
-/// and all reads/encodings. These sets must have no fallible work afterward.
+/// The reclaim publisher calls this after validating live media evidence and
+/// all reads/encodings. These sets must have no fallible work afterward.
+pub(super) fn set_reclaim_observation_at(
+    tr: &Transaction,
+    previous: ActiveIndexIdentity,
+    current: ActiveIndexIdentity,
+    attempt: Uuid,
+    file_count: u64,
+) {
+    set_node_index_at(
+        tr,
+        previous,
+        current,
+        IndexKind::ReclaimMetadata(attempt),
+        file_count,
+    );
+}
+
+pub(super) async fn require_empty_generation(
+    tr: &Transaction,
+    volume: Uuid,
+    generation: u64,
+) -> Result<()> {
+    if tr
+        .get(&generation_key(volume, generation), false)
+        .await?
+        .is_some()
+        || tr
+            .get(&file_count_key(volume, generation), false)
+            .await?
+            .is_some()
+    {
+        return Err(CatalogError::Corrupt(
+            "新活动卷代次已有索引或计数，不得覆盖",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn set_node_observation_at(
     tr: &Transaction,
     previous: ActiveIndexIdentity,
@@ -1171,6 +1217,17 @@ mod tests {
         invalid[25] = 0;
         assert!(decode_history(volume, &invalid).is_err());
 
+        let metadata = encode_history(IndexKind::ReclaimMetadata(batch_id), current);
+        assert_eq!(
+            decode_history(volume, &metadata).unwrap(),
+            (IndexKind::ReclaimMetadata(batch_id), current)
+        );
+        let mut unknown = metadata.clone();
+        unknown[0] = 8;
+        assert!(decode_history(volume, &unknown).is_err());
+        let mut nil = metadata;
+        nil[1..17].fill(0);
+        assert!(decode_history(volume, &nil).is_err());
         let node = encode_history(IndexKind::NodeMutation(batch_id), current);
         assert_ne!(
             node,
@@ -1205,7 +1262,7 @@ mod tests {
             (IndexKind::NodeRenameDiscard(batch_id), current)
         );
         let mut invalid = renamed.clone();
-        invalid[0] = 7;
+        invalid[0] = 8;
         assert!(decode_history(volume, &invalid).is_err());
         invalid = renamed;
         invalid[1..17].fill(0);

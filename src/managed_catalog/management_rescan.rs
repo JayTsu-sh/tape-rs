@@ -60,6 +60,12 @@ impl ManagedCatalog {
                         if task["owner_epoch"].as_u64().is_some_and(|old| old > owner) {
                             return Err(CatalogError::Corrupt("rescan执行轮次超过当前owner"));
                         }
+                        let claim = exclusion::LibraryTaskClaim::for_request(request)?;
+                        if task["status"] == "queued" {
+                            exclusion::require_available_at(&tr, ns, serial).await?;
+                        } else {
+                            claim.require_owned(&tr).await?;
+                        }
                         native_device::require_library_available(&tr, ns, serial).await?;
                         if task["status"] == "running" && task["owner_epoch"] == owner {
                             return Ok(task);
@@ -67,6 +73,7 @@ impl ManagedCatalog {
                         task["status"] = json!("running");
                         task["owner_epoch"] = json!(owner);
                         write_task(&tr, request, &task).await?;
+                        claim.acquire(&tr);
                         Ok(task)
                     }
                     .await,
@@ -102,6 +109,8 @@ impl ManagedCatalog {
                         if task["status"] != "running" || task["owner_epoch"] != owner {
                             return Err(CatalogError::OwnerFenced);
                         }
+                        let claim = exclusion::LibraryTaskClaim::for_request(request)?;
+                        claim.require_owned(&tr).await?;
                         let result = library_observations::rescan_result_at(
                             &tr,
                             ns,
@@ -128,6 +137,7 @@ impl ManagedCatalog {
                             request.epoch(),
                             request.operation(),
                         ));
+                        claim.release(&tr);
                         Ok(task)
                     }
                     .await,

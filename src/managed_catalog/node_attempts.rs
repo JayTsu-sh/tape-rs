@@ -327,6 +327,7 @@ async fn pending_at(
     };
     let value = match node_claims::decode(&raw)? {
         node_claims::NodeVolumeClaim::Single(value) => *value,
+        node_claims::NodeVolumeClaim::ReclaimMetadata(_) => return Err(CatalogError::PoolBusy),
         node_claims::NodeVolumeClaim::Rename(value) => {
             Box::pin(node_rename::require_prepared_volume_claim_at(
                 tr, placement, &value,

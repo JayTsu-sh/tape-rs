@@ -47,10 +47,16 @@ mod write_guard;
 pub use automatic_media::{AutomaticMediaAction, AutomaticMediaCommand, AutomaticMediaPlan};
 #[path = "reclaim.rs"]
 pub(super) mod reclaim;
+pub(super) use reclaim::require_metadata_publication_at as require_reclaim_metadata_publication_at;
 pub use reclaim::{
-    ReclaimDataProgress, ReclaimFile, ReclaimFileMetadata, ReclaimMetadataProgress,
-    ReclaimReservation, ReclaimSourceInventory, ReclaimSourceProgress, ReclaimSourceRead,
-    ReclaimSpec, ReclaimWalk,
+    ReclaimBodyDestination, ReclaimDataProgress, ReclaimFile, ReclaimFileMetadata,
+    ReclaimMetadataAdmission, ReclaimMetadataCommitEvidence, ReclaimMetadataDiscardObservation,
+    ReclaimMetadataInput, ReclaimMetadataObservation, ReclaimMetadataObservationKind,
+    ReclaimMetadataPlan, ReclaimMetadataProgress, ReclaimMetadataPublication,
+    ReclaimMetadataTailEvidence, ReclaimMetadataUnwrittenEvidence, ReclaimMetadataWrite,
+    ReclaimNodeDestination, ReclaimNodeMetadata, ReclaimNodeReadRequest, ReclaimReadSource,
+    ReclaimReservation, ReclaimSourceInventory, ReclaimSourceNode, ReclaimSourceNodeKind,
+    ReclaimSourceProgress, ReclaimSourceRead, ReclaimSpec, ReclaimWalk,
 };
 #[path = "node_baseline.rs"]
 mod node_baseline;
