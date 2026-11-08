@@ -1,0 +1,1867 @@
+{
+  "schema_version": 1,
+  "result": "completed_with_gaps",
+  "report_date": "2026-11-08",
+  "generated_at_utc": "2026-11-08T14:09:57.766666+00:00",
+  "source_commit": "e0a7625b920cad93d884939f5981c2cafeb4b97f",
+  "source_tree": "2b6cd858d2c3dc9a5f1197e0c490afe2fffe22d4",
+  "source_path_sha256": {
+    "src/daemon/executor.rs": "c037355653e811248ddbdb0cc54fda024c27c3451a43bb92bd10fb432b753b1f",
+    "src/daemon/executor_fdb_lifecycle.rs": "1a298d7a25dbe118e4c67d7750245308a54868665838b8fd9357c7735032cd4a",
+    "src/daemon/executor_fdb_monitor.rs": "e09a77f26dd70850f51935cf3fd60203e1d40ae9487b081fede6ef509f5a0b99",
+    "src/daemon/fdb_read.rs": "fda2c18d7b6d76ddb7e034e0b3bd3412bf258332c14c393b7d7476be0b5765f3",
+    "src/daemon/fdb_read_session.rs": "ea39958e17e82b002a52510479956eec226cb78c27690557738586830d20f33c",
+    "src/ltfs/recovery.rs": "b4e922a5e4309133ab482cd8c38e45c53f9af91338b9ce52eac2d8cbe24481f2",
+    "src/ltfs/recovery/source.rs": "c0e3d9badcf16cbac6544b69cfe859a0c2626d51937c1a8c88e652877ce7eee5",
+    "src/ltfs/volume.rs": "1e4f22ba03c788a0b7218e5d16bd658b7292919d4e36f29f3ba5ef602c0fafe4",
+    "src/managed_catalog/lookup.rs": "977c7446737a5e73bcd1dcbe6edec15f240bb6d23cebfebf09cd70b240ba4b54",
+    "src/tape/commands.rs": "650575d615aaecea7f482f58d266e41a6d8d6c6194c3425fea012633241e6db0",
+    "src/tapefs.rs": "9cd40d83d3757107c1ad1d9a1b919aa1750b00a8932b4214c12f98f0eba15f58",
+    "tools/s3-sequential-io.py": "27b43d94cb9a6ba9bc2f3ba99082147193ae08dd2020b1a96cf0a97ff0def6c1",
+    "tools/test_s3_sequential_io.py": "30083418193bb612e84175d2d83c37056ed3e7727fdb43244e8f5fcbc822415e"
+  },
+  "hardware": "IBM TS4300 B 55L3A78011W9LL01, 10.131.7.207-209",
+  "FDB_port": 45153,
+  "namespace": "c51a94dd-7e84-4167-bd25-7151880eb628",
+  "A_library_released_and_untouched": true,
+  "no_FORMAT_ERASE_or_manual_lock_PR_cleanup": true,
+  "deployed_binary_SHA256": {
+    "ltfsctl": "cdbd154977f549ec75cf0bcd0d0cdc87b52150129e4c72395bfa17730c70f5eb",
+    "ltfsctl-init": "13201c247b804169df1a7259575b6a56f5e5b7b91788cda82b5edb1a4531a92a",
+    "ltfsd": "ae4e658266e63de03e200e52ce42c32bdd19c6ea5784157568cad229b572d8c2",
+    "tape-fuse": "28fa3dee2758666f6172aa96cf10820b4aafd6b2037dbcc491c6956851650675",
+    "tape-library": "03fa38d3d4b50f66c7d626308cdf7e18ac65f8b577620bb0ed2f8ac691b91e79",
+    "tape-rs": "7f2f1d2c62007118e860f24571e4269332ee79b0fe00db208dbef8a208756602"
+  },
+  "github_pushed": false,
+  "report_sha256": "b465017ca571a51c380f761790957fc00ab3492a69959c243bf9a41c55e325d3",
+  "feature_matrix": [
+    {
+      "feature": "library list/show、pool list/show、tape list/show",
+      "entry": "CLI、HTTP三节点",
+      "result": "通过",
+      "scope": "共享FDB投影；nodes/active_node及真实库存"
+    },
+    {
+      "feature": "pool create/set/delete",
+      "entry": "CLI、显式HTTP",
+      "result": "通过",
+      "scope": "空池CRUD、策略原请求重放、S3 bucket联动；测试空池已删除"
+    },
+    {
+      "feature": "library rescan、task list/show",
+      "entry": "CLI、显式HTTP",
+      "result": "通过",
+      "scope": "真实库存；异步原任务终态，不把202当完成"
+    },
+    {
+      "feature": "S3列举",
+      "entry": "S3",
+      "result": "通过",
+      "scope": "全局UTF-8字典序/1000+5分页/跨节点token/V1 marker/start-after/delimiter/encoding/非法token"
+    },
+    {
+      "feature": "S3普通对象读写",
+      "entry": "S3",
+      "result": "通过",
+      "scope": "PUT/覆盖/空/中文/元数据，GET/HEAD/Range/ETag与时间条件优先级；错误MD5/SHA/CRC未发布"
+    },
+    {
+      "feature": "RenameObject",
+      "entry": "S3",
+      "result": "通过",
+      "scope": "目标条件、原ClientToken跨节点重放、改参数拒绝；该入口是本项目S3扩展"
+    },
+    {
+      "feature": "不支持的S3请求",
+      "entry": "S3",
+      "result": "通过",
+      "scope": "Multipart明确405/XML；CopyObject、ACL、IfRange等明确拒绝，不能记为功能支持"
+    },
+    {
+      "feature": "通知订阅、扩类重连、显式ACK",
+      "entry": "CLI、HTTP SSE",
+      "result": "通过",
+      "scope": "原类型积压保留，新类型只收扩类后的事件；断线/跨节点保持同一pending，CLI watch不自动ACK；本组mock事件显式injected"
+    },
+    {
+      "feature": "真实内核FUSE与S3互读",
+      "entry": "tape-fuse、S3",
+      "result": "通过",
+      "scope": "阶段14在最终e0独立新文件复验创建/读写/fsync/mmap/随机覆盖/append/truncate/多句柄及属性；阶段4在同e0完成文件/目录改名、unlink/recreate、symlink、hardlink拒绝；两阶段均空缓存新journal重挂"
+    },
+    {
+      "feature": "FUSE未确认改名恢复",
+      "entry": "真实内核FUSE",
+      "result": "通过",
+      "scope": "真实EIO后root user.ltfs.sync可达，原intent/prepared身份保持，结清同一请求，无第二次rename"
+    },
+    {
+      "feature": "tape offline/online/set/validate/move",
+      "entry": "CLI、HTTP管理链路",
+      "result": "通过",
+      "scope": "L84策略还原，实际标签/索引校验、I/E往返原槽；validate不等于全部正文校验"
+    },
+    {
+      "feature": "已分配磁带再次import",
+      "entry": "L84 CLI、L85显式HTTP",
+      "result": "通过",
+      "scope": "刷新FDB索引、原池及卷UUID保持，已有S3/FUSE内容仍可读；首次导入的目录映射分支本轮未重验"
+    },
+    {
+      "feature": "分配/解除分配的引用保护",
+      "entry": "CLI",
+      "result": "通过",
+      "scope": "已有引用unassign失败，已分配assign拒绝；不把拒绝用例算成正向初始化/解除分配"
+    },
+    {
+      "feature": "import期间池间元数据隔离",
+      "entry": "HTTP S3",
+      "result": "通过",
+      "scope": "native6 HEAD/List 503；ee6 List200。仅查元数据，不装载或读取受保护介质"
+    },
+    {
+      "feature": "磁带原生监控与真实事件",
+      "entry": "管理查询、notify",
+      "result": "通过",
+      "scope": "真实策略/机械位置变化产生非注入state/location事件；MAM容量/WP和TapeAlert正常采样，不调用EE"
+    },
+    {
+      "feature": "同库管理互斥与正常HA",
+      "entry": "CLI、HTTP、真实服务",
+      "result": "通过",
+      "scope": "原零子父占用跨owner保持，原请求排队/取消，旧owner被拒；原handle关闭后按原身份完成；未开放reclaim完整流程"
+    },
+    {
+      "feature": "未ACK通知跨HA",
+      "entry": "HTTP通知",
+      "result": "通过",
+      "scope": "同consumer/generation/delivery/pending保留，接管后按原批次ACK"
+    },
+    {
+      "feature": "原生FDB文件CLI",
+      "entry": "ltfsctl fdb",
+      "result": "通过",
+      "scope": "prepare/upload/status/details/原回执重放；stat/list/children/get/不覆盖本地输出/attributes；rename/fs原请求run/status/终态cancel"
+    },
+    {
+      "feature": "S3 DeleteObject",
+      "entry": "S3",
+      "result": "通过",
+      "scope": "正确IfMatch删除204、HEAD404、重复删除不存在对象204；目录/历史介质空间不据此立即回收"
+    },
+    {
+      "feature": "驱动策略",
+      "entry": "ltfsctl fdb drive",
+      "result": "通过",
+      "scope": "两驱动查询，HH8 role mrg→mr→原值；enabled=false及硬件故障分支未覆盖"
+    },
+    {
+      "feature": "FDB单节点故障",
+      "entry": "45153专用服务",
+      "result": "通过",
+      "scope": "真实停止209专用FDB，剩余多数派仍可实际PUT/GET；恢复同unit/原数据"
+    },
+    {
+      "feature": "FDB全体故障及恢复",
+      "entry": "45153专用服务",
+      "result": "通过",
+      "scope": "停止三个专用unit，新数据请求不虚报成功；恢复后原被拒key404，旧正文及同一未ACK通知保持，14类占用空"
+    },
+    {
+      "feature": "大对象顺序S3",
+      "entry": "S3",
+      "result": "通过",
+      "scope": "3×64MiB随机正文（os.urandom生成同一64MiB文件，按三个对象写入；未用零块/稀疏文件，未测硬件压缩比），按持久实际写入序读取，独立SHA，另测反向1MiB Range"
+    },
+    {
+      "feature": "官方可选顺序客户端工具",
+      "entry": "tools/s3-sequential-io.py",
+      "result": "通过",
+      "scope": "另3×64MiB，持久intent/commit/footer清单，跨入口读取按原顺序，ETag和完整SHA核验，无自动重试"
+    },
+    {
+      "feature": "并发小对象与合批观测",
+      "entry": "S3",
+      "result": "通过",
+      "scope": "6×2KiB并发PUT并独立读回；是否同批提交按实际CDB观测单独判断"
+    },
+    {
+      "feature": "CLI表格和监控连续观察",
+      "entry": "CLI、HTTP",
+      "result": "通过",
+      "scope": "真实输出保留；额外旧入口只读观察与正常采样快照，帮助文本不算硬件功能通过"
+    },
+    {
+      "feature": "旧drive list/node list/cluster",
+      "entry": "旧CLI入口",
+      "result": "未通过",
+      "scope": "drive list、node list为404；cluster退出0但输出null；原生fdb drive show不能替代这些入口通过"
+    },
+    {
+      "feature": "旧stat/list/get文件入口",
+      "entry": "旧CLI入口",
+      "result": "未通过",
+      "scope": "已知存在的最终S3对象：stat退出0却打印不存在，list/get报不存在；失败get在新输出路径留下0B文件。当前fdb stat/get已独立通过"
+    },
+    {
+      "feature": "offline -o说明的查询展示",
+      "entry": "CLI、HTTP tape show",
+      "result": "未通过",
+      "scope": "离线任务回执含main1108 acceptance，但同轮tape show的offline_message为null；离线状态本身正确。需修复查询投影，不能宣称说明字段已展示"
+    },
+    {
+      "feature": "完整原生reclaim",
+      "entry": "公开CLI/HTTP",
+      "result": "未实现/封闭",
+      "scope": "内部零子父、组件软件回归和历史SQLite格式化回执不是完整迁移/源覆盖/接管恢复验收"
+    },
+    {
+      "feature": "空闲读挂载自动退带",
+      "entry": "真实UNLOAD/MOVE、管理就绪探针",
+      "result": "通过",
+      "scope": "read_idle_ms默认300000，L84回原槽1004；机械活动期间503，同owner恢复200，无重启/清锁"
+    }
+  ],
+  "software": {
+    "results": [
+      {
+        "label": "fmt",
+        "command": [
+          "cargo",
+          "fmt",
+          "--all",
+          "--",
+          "--check"
+        ],
+        "exit_code": 0,
+        "log": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/software-fmt-v8.log",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "label": "private-forward",
+        "command": [
+          "cargo",
+          "test",
+          "--features",
+          "fdb",
+          "--lib",
+          "-j6",
+          "forward_read_streams_across_filemarks_and_bounds_skip_work",
+          "--",
+          "--nocapture"
+        ],
+        "exit_code": 0,
+        "log": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/software-private-forward-v8.log",
+        "sha256": "6360b0cd7ef24f2cc84a10d2716d9027ada2f445f6b8e21263df3873931d999b"
+      },
+      {
+        "label": "private-ordered",
+        "command": [
+          "cargo",
+          "test",
+          "--features",
+          "fdb",
+          "--lib",
+          "-j6",
+          "native_sequential_reads_reuse_verified_media_without_repositioning",
+          "--",
+          "--ignored",
+          "--nocapture"
+        ],
+        "exit_code": 0,
+        "log": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/software-private-ordered-v8.log",
+        "sha256": "fe0850df2f6f67f3b44d3ea178544e13e031ec0da7c204c0e51c3498aca11ff4"
+      },
+      {
+        "label": "private-invalidations",
+        "command": [
+          "cargo",
+          "test",
+          "--features",
+          "fdb",
+          "--lib",
+          "-j6",
+          "native_sequential_read_session_invalidates_on_external_changes",
+          "--",
+          "--ignored",
+          "--nocapture"
+        ],
+        "exit_code": 0,
+        "log": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/software-private-invalidations-v8.log",
+        "sha256": "7767d4c19c26d176eea58167339746eb8d8f98cd60f128332c11f0c4b4c48d6e"
+      },
+      {
+        "label": "private-long-full",
+        "command": [
+          "cargo",
+          "test",
+          "--features",
+          "fdb",
+          "--lib",
+          "-j6",
+          "native_sequential_cold_read_avoids_historical_full_audit",
+          "--",
+          "--ignored",
+          "--nocapture"
+        ],
+        "exit_code": 0,
+        "log": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/software-private-long-full-v8.log",
+        "sha256": "779982bd08320b7837f81995523af66704c204133b4f33d0bd84cbcf1086323b"
+      },
+      {
+        "label": "default",
+        "command": [
+          "cargo",
+          "test",
+          "-j6"
+        ],
+        "exit_code": 0,
+        "log": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/software-default-v8.log",
+        "sha256": "36caa37702fb8f7bd58e0b9e01f73b27b031e8709c4cdbf467b21472348528e7"
+      },
+      {
+        "label": "all-features",
+        "command": [
+          "cargo",
+          "test",
+          "--all-features",
+          "-j6"
+        ],
+        "exit_code": 0,
+        "log": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/software-all-features-v8.log",
+        "sha256": "b0043dfd323b60f0ad0dcf01275911c4871b05733e28ea24804cb7df83162326"
+      },
+      {
+        "label": "check",
+        "command": [
+          "cargo",
+          "check",
+          "--all-targets",
+          "-j6"
+        ],
+        "exit_code": 0,
+        "log": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/software-check-v8.log",
+        "sha256": "a04afe6c5789e2865da8957affcf1c8aa296a92f7383c64f92d0f00ff3bd5188"
+      },
+      {
+        "label": "clippy",
+        "command": [
+          "cargo",
+          "clippy",
+          "--all-targets",
+          "--all-features",
+          "-j6"
+        ],
+        "exit_code": 0,
+        "log": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/software-clippy-v8.log",
+        "sha256": "faef09ebaec30016078665d29f5e0d1bb206ed7669402ce78dc52c7c2d72b3d8"
+      },
+      {
+        "label": "python",
+        "command": [
+          "python3",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "tools",
+          "-p",
+          "test_s3_sequential_io.py",
+          "-v"
+        ],
+        "exit_code": 0,
+        "log": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/software-python-v8.log",
+        "sha256": "11c551d2a2c7b24386a577d89ec37510d272d6f0a1239ab0d3094583ba4d4661"
+      },
+      {
+        "label": "diff",
+        "command": [
+          "git",
+          "diff",
+          "--check"
+        ],
+        "exit_code": 0,
+        "log": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/software-diff-v8.log",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ],
+    "all_passed": true
+  },
+  "receipts": {
+    "phase1-COMPLETE": {
+      "source": "e0a7625b920cad93d884939f5981c2cafeb4b97f",
+      "queries_cli": [
+        "library-list",
+        "library-show",
+        "tape-list",
+        "tape-show84",
+        "tape-show85",
+        "pool-list",
+        "pool-show",
+        "drive-list",
+        "node-list",
+        "cluster",
+        "task-list"
+      ],
+      "failed_or_unwired_CLI": {
+        "drive-list": {
+          "exit": 1,
+          "stdout": "",
+          "stderr": "错误: 服务端拒绝 (404): \n",
+          "elapsed": 0.002635988872498274
+        },
+        "node-list": {
+          "exit": 1,
+          "stdout": "",
+          "stderr": "错误: 服务端拒绝 (404): \n",
+          "elapsed": 0.002599515952169895
+        },
+        "cluster": {
+          "exit": 0,
+          "stdout": "10.131.7.207:7431  null\n10.131.7.208:7431  null\n10.131.7.209:7431  null\n",
+          "stderr": "",
+          "elapsed": 0.003493362106382847
+        }
+      },
+      "queries_http_all3": true,
+      "pool_CRUD_CLI_HTTP": true,
+      "policy_set_and_original_replay": true,
+      "bucket_projection_create_delete": true,
+      "rescan_CLI_HTTP_async_original_tasks": true,
+      "no_format_erase": true
+    },
+    "phase2-PASS": {
+      "source": "e0a7625b920cad93d884939f5981c2cafeb4b97f",
+      "bucket": "pool-05d181f22f7c7e2159dd594168f2867be28a19f4c0b91ff8ef1a5b70",
+      "prefix": "accept1108-b7d11937/",
+      "renamed_key": "accept1108-b7d11937/renamed.bin",
+      "body_sha256": "36321bfa047935e1fd16e2336435b7c408a803f3d56d49a3e2244025d61e9c31",
+      "crc32": "jwh9xw==",
+      "empty_key": "accept1108-b7d11937/empty",
+      "unicode_key": "accept1108-b7d11937/目录/中文 +%25.bin",
+      "renamed_etag": "\"fdb-c51a94dd7e844167bd257151880eb628-9283664d878fbdae2fa9ca37b6d7f3ef-3\"",
+      "renameargs": {
+        "Bucket": "pool-05d181f22f7c7e2159dd594168f2867be28a19f4c0b91ff8ef1a5b70",
+        "Key": "accept1108-b7d11937/renamed.bin",
+        "RenameSource": "accept1108-b7d11937/source.bin",
+        "DestinationIfNoneMatch": "*",
+        "ClientToken": "accept1108-268a3f4a-c262-4aef-ad65-0c0eaeb8136a"
+      },
+      "baseline_keys": 1078,
+      "baseline_old_files_verified": [
+        "native-renamed.bin",
+        "fuse-v4/renamed.bin",
+        "crc32-v7.bin"
+      ],
+      "list1000_global_UTF8_order_and_cross_node_tokens": true,
+      "paging1005": true,
+      "v1_marker_startafter_delimiter_encoding_owner": true,
+      "PUT_overwrite_empty_unicode_metadata_checksums": true,
+      "GET_HEAD_ranges_and_conditions": true,
+      "rename_original_token_replay": true,
+      "unsupported_multipart_rejected": true,
+      "time_and_ETag_precedence_and_HEAD_conditions": true,
+      "MD5_SHA256_CRC32_bad_uploads_not_published": true,
+      "bad_tokens_and_wrong_scope_rejected": true,
+      "Copy_ACL_IfRange_write_time_explicit_rejection": true
+    },
+    "phase3-PASS": {
+      "source": "e0a7625b920cad93d884939f5981c2cafeb4b97f",
+      "consumer": "physical1108_3781155a",
+      "generation": "edd8d517-af9f-44ed-b5b8-73808a0d6e79",
+      "pending": {
+        "created_at_millis": 1794141980712,
+        "delivery_id": "3eda0082-2b8c-4bfd-9c3b-0dbf5a833d37",
+        "events": [
+          {
+            "data": {
+              "acceptance": "unacked-survives-HA",
+              "barcode": "MOCKL8"
+            },
+            "event_id": "c51a94dd-7e84-4167-bd25-7151880eb628:55L3A78011W9LL01:581",
+            "event_type": "tape.state.changed",
+            "injected": true,
+            "injection_id": "14104c76-13b4-45a0-a6b9-874bf8185050",
+            "library": "55L3A78011W9LL01",
+            "namespace": "c51a94dd-7e84-4167-bd25-7151880eb628",
+            "observed_at": "2026-11-08T12:46:20.704579521Z",
+            "origin": "injected",
+            "sequence": 581,
+            "version": 1
+          }
+        ],
+        "fingerprint": "0b3da01c28220b3732f96cd250f15a38aa56d1f2bc496822c381b2d23033da95",
+        "from": 580,
+        "generation": "edd8d517-af9f-44ed-b5b8-73808a0d6e79",
+        "through": 581
+      },
+      "CLI_and_HTTP_SSE": true,
+      "disconnect_and_cross_node_same_pending": true,
+      "type_expansion_old_backlog_new_types_only_from_expansion": true,
+      "injection_explicit_mock": true,
+      "ACK_progress_and_no_automatic_ack": true,
+      "pending_retained_for_HA": true
+    },
+    "phase4-PASS": {
+      "source": "e0a7625b920cad93d884939f5981c2cafeb4b97f",
+      "source_server": "e0a7625b920cad93d884939f5981c2cafeb4b97f",
+      "source_client": "e0a7625b920cad93d884939f5981c2cafeb4b97f",
+      "kernel_FUSE": true,
+      "old_failed_controller_preserved": true,
+      "original_completed_rename_settled_without_repeat": true,
+      "create_read_fsync_random_append_truncate_multi_handles_mmap": "original real subset plus fixed-candidate append/truncate/readback",
+      "directories_file_and_directory_rename": true,
+      "binary_xattr_remove_readonly_chown_and_times_LE_semantics": "original real subset, xattr/mtime independently rechecked",
+      "symlink_and_hardlink_reject": true,
+      "unlink_recreate_then_rename": true,
+      "S3_FUSE_interoperation_and_stale_CRC_rejection": true,
+      "fresh_cache_and_journal_remount_verified": true,
+      "normal_unmount": true,
+      "recovery_cases": [
+        {
+          "label": "rename-directory",
+          "same_request_headers": true,
+          "receipts_after": [
+            "1d1db067-642b-4818-b52e-bc1811bfb9b8/receipt.json",
+            "870f5493-9d17-4962-87f3-007959a3e667/receipt.json",
+            "43d1df2a-8780-4eaa-a67f-0fa0dc00becb/receipt.json",
+            "node-8507b204-45bc-4429-804e-7e453a424d99/receipt.json",
+            "rename-f13ad87f-70dc-4cb3-acf5-5d6cae90c2c2/receipt.json",
+            "node-a80d3463-914a-4268-8390-46f5ddd9f0cf/receipt.json",
+            "node-ef699346-4814-4f54-ac90-ff349dc68426/receipt.json",
+            "node-354cd94d-f54c-45ec-8aa9-2c11ee91a74a/receipt.json",
+            "b88853fa-24fe-4d35-9b65-d5b8789a7c8c/receipt.json",
+            "node-d4b31858-3414-4fa1-9b09-2312fe619e08/receipt.json",
+            "node-141b644c-f002-4b6c-b235-b22cc403f045/receipt.json",
+            "node-9a59011d-17e3-4ab8-b58c-57d72c9ab34b/receipt.json",
+            "node-cd98b453-6b23-4b1d-8686-e2f92ea832ef/receipt.json",
+            "node-194796be-55fc-4cd0-b70d-5e708b672fa8/receipt.json",
+            "rename-9fad4613-5487-46d8-ad18-e152b53859e1/receipt.json",
+            "node-bdba7aa1-6365-4def-91d0-80369f4cecec/receipt.json",
+            "48340a99-22d5-4e4a-8c55-0f194c4a2382/receipt.json"
+          ],
+          "root_GETATTR_and_SETXATTR_reached": true,
+          "errors_during_bounded_recovery": [
+            {
+              "errno": 5,
+              "message": "[Errno 5] Input/output error: '/mnt/meta-data/tape-rs/v1-20261106/main1108-fuse-85cf1af9/mount'"
+            }
+          ],
+          "no_repeat_original_syscall": true
+        }
+      ],
+      "root_control_recovery_physically_triggered": true,
+      "final_key": "accept1108-85cf1af9/fuse-renamed-s3.bin",
+      "file_key": "accept1108-85cf1af9/fuse-renamed/body-renamed.bin",
+      "file_sha256": "4df920e903c7a887368b3e01b0dcb7ef74431ff5fd056f9458f3c2814d6c2650",
+      "remote_evidence": "/mnt/meta-data/tape-rs/v1-20261106/main1108-fuse-85cf1af9",
+      "FUSE_unit": "tape-rs-main1108-fuse-85cf1af9-cold-e0a7625.service"
+    },
+    "phase5-COMPLETE": {
+      "source": "e0a7625b920cad93d884939f5981c2cafeb4b97f",
+      "offline_blacklist_restore_online_actual_validation": true,
+      "assigned_IE_home_moves": true,
+      "assigned_import_refresh_CLI_HTTP_same_UUID": true,
+      "referenced_unassign_and_assigned_assign_rejected": true,
+      "native_reclaim_closed": true,
+      "existing_data_and_1005_list_preserved": true,
+      "no_format_erase": true,
+      "positive_assign_and_unassign": "not rerun: both authorized scratch tapes have authoritative live/retained references; no empty unassigned scratch available",
+      "unassigned_move": "not rerun: no empty unassigned authorized scratch",
+      "full_native_reclaim": "unimplemented public flow; cannot count as passed"
+    },
+    "phase7-PASS": {
+      "source": "e0a7625b920cad93d884939f5981c2cafeb4b97f",
+      "cli_FDB_stat_list_children_get_and_attributes": true,
+      "durable_upload_original_replay": true,
+      "native_rename_run_status_terminal_cancel": true,
+      "native_node_run_status_terminal_cancel_draft_cancel_rejection": true,
+      "S3_delete_condition_repeat_absent": true,
+      "drive_role_policy_changed_and_restored": true,
+      "prefix": "cli1108-dfd3cc3e",
+      "no_format_erase": true
+    },
+    "phase8-PASS": {
+      "source": "e0a7625b920cad93d884939f5981c2cafeb4b97f",
+      "single_FDB_node_loss_real_PUT_GET": true,
+      "total_FDB_outage_reject_new_data_requests": true,
+      "original_blocked_key_absent_after_restore": true,
+      "same_unacked_notification_survived_outage": true,
+      "all3_FDB_units_normally_restored": true,
+      "all3_app_nodes_ready": true,
+      "all14gates_empty": true,
+      "no_45151_45152_changes": true,
+      "key": "dependency1108-cc541620-7d9d-44af-acae-ae7834e723c4.bin",
+      "bytes": 4000,
+      "results": {
+        "ready_207": [
+          503,
+          {
+            "error": "FDB 路由不可用：FDB 客户端初始化失败: Operation aborted because the transaction timed out"
+          }
+        ],
+        "ready_208": [
+          503,
+          {
+            "error": "FDB 路由不可用：FDB 客户端初始化失败: Operation aborted because the transaction timed out"
+          }
+        ],
+        "ready_209": [
+          503,
+          {
+            "error": "FDB 路由不可用：FDB 客户端初始化失败: Operation aborted because the transaction timed out"
+          }
+        ],
+        "list": {
+          "status": 503,
+          "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>ServiceUnavailable</Code><Message>FDB 目录暂不可用：FDB 客户端初始化失败: Operation aborted because the transaction timed out</Message></Error>",
+          "elapsed": 5.00109520368278
+        },
+        "put": {
+          "status": 503,
+          "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>ServiceUnavailable</Code><Message>FDB 目录暂不可用：FDB 客户端初始化失败: Operation aborted because the transaction timed out</Message></Error>",
+          "elapsed": 5.001062269788235
+        }
+      }
+    },
+    "phase9-PASS": {
+      "source": "e0a7625b920cad93d884939f5981c2cafeb4b97f",
+      "owner_node": 208,
+      "owner_round": 1501886,
+      "client_manifest": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/large-sequential/manifest.jsonl",
+      "same_write_read_sequence": true,
+      "keys_not_lexical_order": true,
+      "bytes_per_object": 67108864,
+      "total_written_bytes": 201326592,
+      "total_read_bytes": 201326592,
+      "range_response_bytes": 1048576,
+      "range_requested_object_bytes": 67108864,
+      "data_integrity_all_passed": true,
+      "no_auto_retries": true,
+      "summary": [
+        {
+          "kind": "put",
+          "sequence": 0,
+          "key": "large1108-46a6b590/z-first.bin",
+          "seconds": 56.238053696230054,
+          "MiB_per_s_end_to_end": 1.1380194689114975,
+          "opcode_counts": {
+            "5e": 1376,
+            "12": 170,
+            "5a": 11,
+            "b8": 7,
+            "44": 6,
+            "00": 4,
+            "4d": 4,
+            "8c": 24,
+            "92": 12,
+            "08": 10,
+            "34": 9,
+            "10": 6,
+            "0a": 130,
+            "8d": 4
+          },
+          "index_partition_locates": 6,
+          "data_write_devices": [
+            "/dev/sg4"
+          ],
+          "READ6_requests": 10
+        },
+        {
+          "kind": "put",
+          "sequence": 1,
+          "key": "large1108-46a6b590/a-second.bin",
+          "seconds": 19.05826975638047,
+          "MiB_per_s_end_to_end": 3.358122264932975,
+          "opcode_counts": {
+            "5e": 954,
+            "00": 4,
+            "4d": 3,
+            "5a": 6,
+            "8c": 13,
+            "12": 57,
+            "b8": 3,
+            "44": 5,
+            "34": 2,
+            "0a": 129,
+            "10": 3,
+            "8d": 2
+          },
+          "index_partition_locates": 0,
+          "data_write_devices": [
+            "/dev/sg4"
+          ],
+          "READ6_requests": 0
+        },
+        {
+          "kind": "put",
+          "sequence": 2,
+          "key": "large1108-46a6b590/m-third.bin",
+          "seconds": 19.32700546598062,
+          "MiB_per_s_end_to_end": 3.3114286697260344,
+          "opcode_counts": {
+            "12": 61,
+            "5e": 912,
+            "5a": 6,
+            "b8": 4,
+            "44": 5,
+            "00": 3,
+            "4d": 2,
+            "8c": 9,
+            "34": 2,
+            "0a": 129,
+            "10": 3,
+            "8d": 2
+          },
+          "index_partition_locates": 0,
+          "data_write_devices": [
+            "/dev/sg4"
+          ],
+          "READ6_requests": 0
+        },
+        {
+          "kind": "get",
+          "sequence": 0,
+          "key": "large1108-46a6b590/z-first.bin",
+          "seconds": 26.898723613936454,
+          "MiB_per_s_end_to_end": 2.3792950520091245,
+          "opcode_counts": {
+            "8c": 5,
+            "5e": 622,
+            "12": 81,
+            "5a": 1,
+            "b8": 1,
+            "92": 8,
+            "08": 135,
+            "34": 8,
+            "11": 4
+          },
+          "index_partition_locates": 3,
+          "data_write_devices": [],
+          "READ6_requests": 135
+        },
+        {
+          "kind": "get",
+          "sequence": 1,
+          "key": "large1108-46a6b590/a-second.bin",
+          "seconds": 7.73437343724072,
+          "MiB_per_s_end_to_end": 8.274749146691365,
+          "opcode_counts": {
+            "5e": 656,
+            "5a": 3,
+            "b8": 2,
+            "00": 2,
+            "8c": 6,
+            "34": 2,
+            "12": 25,
+            "08": 131,
+            "4d": 1
+          },
+          "index_partition_locates": 0,
+          "data_write_devices": [],
+          "READ6_requests": 131
+        },
+        {
+          "kind": "get",
+          "sequence": 2,
+          "key": "large1108-46a6b590/m-third.bin",
+          "seconds": 9.760028386022896,
+          "MiB_per_s_end_to_end": 6.557357977734253,
+          "opcode_counts": {
+            "5e": 626,
+            "5a": 1,
+            "12": 30,
+            "b8": 1,
+            "00": 1,
+            "8c": 2,
+            "34": 2,
+            "08": 131
+          },
+          "index_partition_locates": 0,
+          "data_write_devices": [],
+          "READ6_requests": 131
+        },
+        {
+          "kind": "range-backward",
+          "sequence": 0,
+          "key": "large1108-46a6b590/z-first.bin",
+          "seconds": 6.573363788891584,
+          "MiB_per_s_end_to_end": 0.15212911259984022,
+          "opcode_counts": {
+            "5e": 602,
+            "5a": 1,
+            "12": 21,
+            "b8": 1,
+            "00": 1,
+            "8c": 2,
+            "34": 1,
+            "92": 1,
+            "08": 128
+          },
+          "index_partition_locates": 0,
+          "data_write_devices": [],
+          "READ6_requests": 128
+        }
+      ],
+      "throughput_scope": "end-to-end S3 acknowledgement including per-object index/flush/MAM; not bare-drive streaming speed"
+    },
+    "phase10-PASS": {
+      "source": "e0a7625b920cad93d884939f5981c2cafeb4b97f",
+      "tool_sha256": "27b43d94cb9a6ba9bc2f3ba99082147193ae08dd2020b1a96cf0a97ff0def6c1",
+      "actual_PUT_commit_order_equals_GET_order": true,
+      "not_lexical_order": true,
+      "condition_ETag_and_full_SHA_verified": true,
+      "manifest": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/official-client/write-order.jsonl",
+      "manifest_sha256": "51f7a94dc7187808ad124a7efb87e076119d7c6d09bbefa90492766be8234fb2",
+      "bytes_per_object": 67108864,
+      "total_written_bytes": 201326592,
+      "total_read_bytes": 201326592,
+      "separate_entry_nodes_same_pool": true,
+      "write_seconds": 102.22028369409963,
+      "read_seconds": 52.90238408604637,
+      "no_auto_retries": true,
+      "prefix": "ordered-tool1108-7bcb82fd/"
+    },
+    "phase11-PASS": {
+      "source": "e0a7625b920cad93d884939f5981c2cafeb4b97f",
+      "concurrent_six_PUT_and_S3_read_SHA": true,
+      "objects": 6,
+      "total_written_bytes": 12288,
+      "seconds": 36.275025167968124,
+      "opcode_counts": {
+        "12": 112,
+        "5e": 788,
+        "5a": 17,
+        "b8": 14,
+        "44": 25,
+        "00": 3,
+        "4d": 3,
+        "8c": 16,
+        "92": 6,
+        "08": 5,
+        "34": 10,
+        "0a": 7,
+        "10": 3,
+        "8d": 2
+      },
+      "WRITE6_lengths": [
+        2048,
+        2048,
+        2048,
+        2048,
+        2048,
+        2048,
+        41264
+      ],
+      "observed_one_shared_commit_from_CDB_pattern": true,
+      "batch_inference": "six one-record payload WRITEs plus one index WRITE, three FILEMARK CDBs, two VCI writes; otherwise no batching claim",
+      "no_auto_retries": true,
+      "prefix": "concurrent1108-e2ec15d9-"
+    },
+    "phase14-PASS": {
+      "source": "e0a7625b920cad93d884939f5981c2cafeb4b97f",
+      "kernel_FUSE": true,
+      "all_body_attribute_subsets_repeated_on_final_candidate": true,
+      "create_fsync_mmap_random_append_smaller_larger_truncate_multi_handle": true,
+      "binary_xattr_list_remove": true,
+      "LE_readonly_mode_mapping_chown_ignored_and_nanosecond_time": true,
+      "S3_readbody_SHA_verified": true,
+      "new_empty_cache_journal_cold_remount": true,
+      "normal_unmount_and_process_exit": true,
+      "key": "fuse14-83ef4bb961.bin",
+      "bytes": 5279,
+      "sha256": "4df920e903c7a887368b3e01b0dcb7ef74431ff5fd056f9458f3c2814d6c2650",
+      "base": "/mnt/meta-data/tape-rs/v1-20261106/main1108-fuse-83ef4bb961",
+      "last_FUSE_unit": "tape-rs-main1108-fuse-83ef4bb961-final-repeat-cold-e0a7625.service",
+      "recovery_cases": []
+    },
+    "phase13-COMPLETE": {
+      "source": "e0a7625b920cad93d884939f5981c2cafeb4b97f",
+      "original_old_unACKed_batch_survived_upgrade_HA_total_FDB_outage": true,
+      "original_old_batch_explicitly_ACKed": true,
+      "only_two_exact_test_owned_mock_subscriptions_deleted": true,
+      "global_outbox_and_other_consumers_not_purged": true,
+      "all3_app_and_FDB_units_active": true,
+      "all3_exact_source_ELF_verified": true,
+      "all3_app_mount_namespace_no_GPFS": true,
+      "all14gates_empty": true,
+      "all_our_FUSE_mounts_and_processes_exited": true,
+      "no_EE_LTFS_named_controllers": true,
+      "scratch_assignment_UUID_pool_online_blacklist_preserved": true,
+      "original_two_pools_only": true,
+      "verified_bodies": [
+        {
+          "key": "accept1108-b7d11937/renamed.bin",
+          "bytes": 4389,
+          "sha256": "36321bfa047935e1fd16e2336435b7c408a803f3d56d49a3e2244025d61e9c31",
+          "seconds": 26.042256365995854,
+          "response": {
+            "ResponseMetadata": {
+              "RequestId": "070b955de57943549467f616d9d74dec",
+              "HostId": "",
+              "HTTPStatusCode": 200,
+              "HTTPHeaders": {
+                "content-type": "application/octet-stream",
+                "content-length": "4389",
+                "date": "Sun, 08 Nov 2026 13:57:47 GMT",
+                "last-modified": "Sun, 08 Nov 2026 12:43:18 GMT",
+                "accept-ranges": "bytes",
+                "etag": "\"fdb-c51a94dd7e844167bd257151880eb628-9283664d878fbdae2fa9ca37b6d7f3ef-4\"",
+                "x-amz-request-id": "070b955de57943549467f616d9d74dec",
+                "x-amz-meta-replaced": "true",
+                "x-amz-checksum-crc32": "jwh9xw==",
+                "connection": "close"
+              },
+              "ChecksumAlgorithm": "crc32",
+              "RetryAttempts": 0
+            },
+            "AcceptRanges": "bytes",
+            "LastModified": "2026-11-08T12:43:18+00:00",
+            "ContentLength": 4389,
+            "ETag": "\"fdb-c51a94dd7e844167bd257151880eb628-9283664d878fbdae2fa9ca37b6d7f3ef-4\"",
+            "ChecksumCRC32": "jwh9xw==",
+            "ContentType": "application/octet-stream",
+            "Metadata": {
+              "replaced": "true"
+            }
+          }
+        },
+        {
+          "key": "accept1108-85cf1af9/fuse-renamed-s3.bin",
+          "bytes": 4423,
+          "sha256": "a0d5d19d17739124977503ce3ef6d02260a361618b991d5425ed0ba84de49f49",
+          "seconds": 26.145385876763612,
+          "response": {
+            "ResponseMetadata": {
+              "RequestId": "4e2f742f5b84446aa072d230079a3e94",
+              "HostId": "",
+              "HTTPStatusCode": 200,
+              "HTTPHeaders": {
+                "content-type": "application/octet-stream",
+                "content-length": "4423",
+                "date": "Sun, 08 Nov 2026 13:58:13 GMT",
+                "last-modified": "Sun, 08 Nov 2026 13:02:35 GMT",
+                "accept-ranges": "bytes",
+                "etag": "\"fdb-c51a94dd7e844167bd257151880eb628-da8ac3d89c44a833293e8b9f668bcd20-6\"",
+                "x-amz-request-id": "4e2f742f5b84446aa072d230079a3e94",
+                "x-amz-meta-replaced": "true",
+                "x-amz-checksum-sha256": "oNXRnRdzkSSXdQPOPvbQImCjYWGLmR1UJe0LqE3kn0k=",
+                "connection": "close"
+              },
+              "ChecksumAlgorithm": "sha256",
+              "RetryAttempts": 0
+            },
+            "AcceptRanges": "bytes",
+            "LastModified": "2026-11-08T13:02:35+00:00",
+            "ContentLength": 4423,
+            "ETag": "\"fdb-c51a94dd7e844167bd257151880eb628-da8ac3d89c44a833293e8b9f668bcd20-6\"",
+            "ChecksumSHA256": "oNXRnRdzkSSXdQPOPvbQImCjYWGLmR1UJe0LqE3kn0k=",
+            "ContentType": "application/octet-stream",
+            "Metadata": {
+              "replaced": "true"
+            }
+          }
+        }
+      ],
+      "test_objects_retained_for_reproduction": true,
+      "FDB_status": {
+        "client_database_status": {
+          "available": true,
+          "healthy": true
+        },
+        "data_state": {
+          "healthy": true,
+          "min_replicas_remaining": 2,
+          "name": "healthy"
+        },
+        "redundancy_mode": "double",
+        "fault_tolerance": {
+          "max_zone_failures_without_losing_availability": 1,
+          "max_zone_failures_without_losing_data": 1
+        }
+      },
+      "no_format_erase_clearlocks_raw_PR_or_history_purge": true
+    },
+    "phase6-HA": {
+      "source_commit": "e0a7625b920cad93d884939f5981c2cafeb4b97f",
+      "same_library_original_claim_survived_normal_HA": true,
+      "old_node": 207,
+      "old_round": 1464403,
+      "new_node": 208,
+      "new_round": 1498477,
+      "stale_owner_status_and_release_fenced": true,
+      "new_owner_claimed_original_identity_only": true,
+      "queued_requests_unchanged_until_release": true,
+      "all_original_tasks_terminal_on_new_owner": true,
+      "original_receipts_replayed_unchanged": true,
+      "old_node_normally_rejoined": true,
+      "new_owner_S3_read_and_explicit_busy_write_verified": true,
+      "new4097_and_old41B_preserved": true,
+      "notification_same_pending_survived_HA_and_ACK": true,
+      "queued_management_cancel": true,
+      "current_main_release_replay": true,
+      "blocked_key_HEAD_status": 404,
+      "all14gates_empty": true,
+      "no_format_erase_or_raw_PR_mutation": true,
+      "full_native_reclaim_not_enabled": true,
+      "cross_library_and_power_loss_not_tested": true
+    },
+    "phase12-observation": {
+      "receipt": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/phase12-COMPLETE.json",
+      "complete": true,
+      "legacy_file_gaps": [
+        {
+          "command": "legacy-stat",
+          "result": {
+            "command": [
+              "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/release/ltfsctl",
+              "-e",
+              "10.131.7.207:7431",
+              "-e",
+              "10.131.7.208:7431",
+              "-e",
+              "10.131.7.209:7431",
+              "-l",
+              "55L3A78011W9LL01",
+              "-p",
+              "02004aa0-c2f6-40a5-9849-40f4fc78d196",
+              "stat",
+              "/accept1108-b7d11937/renamed.bin"
+            ],
+            "exit": 0,
+            "stdout": "不存在\n",
+            "stderr": "",
+            "elapsed": 0.003031596075743437
+          }
+        },
+        {
+          "command": "legacy-list",
+          "result": {
+            "command": [
+              "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/release/ltfsctl",
+              "-e",
+              "10.131.7.207:7431",
+              "-e",
+              "10.131.7.208:7431",
+              "-e",
+              "10.131.7.209:7431",
+              "-l",
+              "55L3A78011W9LL01",
+              "-p",
+              "02004aa0-c2f6-40a5-9849-40f4fc78d196",
+              "list",
+              "--dir",
+              "accept1108-b7d11937/"
+            ],
+            "exit": 1,
+            "stdout": "",
+            "stderr": "错误: 不存在\n",
+            "elapsed": 0.0029413201846182346
+          }
+        },
+        {
+          "command": "legacy-get-known-object",
+          "result": {
+            "command": [
+              "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/release/ltfsctl",
+              "-e",
+              "10.131.7.207:7431",
+              "-e",
+              "10.131.7.208:7431",
+              "-e",
+              "10.131.7.209:7431",
+              "-l",
+              "55L3A78011W9LL01",
+              "-p",
+              "02004aa0-c2f6-40a5-9849-40f4fc78d196",
+              "get",
+              "/accept1108-b7d11937/renamed.bin",
+              "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/legacy-known-object-readback.bin"
+            ],
+            "exit": 1,
+            "stdout": "",
+            "stderr": "错误: 不存在\n",
+            "elapsed": 0.0025260020047426224
+          }
+        }
+      ]
+    }
+  },
+  "evidence_files": [
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/CURRENT-READ-COMMITTED-v1.json",
+      "bytes": 1837,
+      "sha256": "e556a306815d34ecb019968882e657c120055efede9b5cc193ffaf28b47e308f"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/fuse-root-review-spec-v1.md",
+      "bytes": 1665,
+      "sha256": "7c5aa2c9dca6d6aeb6e02cc1a90bb2643a492a31b0eb21b8d19be1b922a5b193"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/fuse-root-review-standards-v1.md",
+      "bytes": 1371,
+      "sha256": "7137ec4b2d36853919c4e86d7a8b443f2bd465606d00dd8b64c3a3e046f44834"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/long-full-review-spec-v2.md",
+      "bytes": 1711,
+      "sha256": "3a057bd6c81d6107511ebd531c2bd40f4bb5736f97f861866a3e56a4dc1e3d15"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/long-full-review-standards-v2.md",
+      "bytes": 1799,
+      "sha256": "8180f19d971e63264d4a34b914853dc999fc21775db7c76093853726ae5d0590"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/ordered-baseline.jsonl",
+      "bytes": 1038,
+      "sha256": "592d54df6b9ba9ee0905deb49c05844c8ec92cd20e71f8c8a2f638e0307a962b"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/clock-physical-observation.json",
+      "bytes": 683,
+      "sha256": "c302070c2848ae787e78050d19e9b3d8ee823a96ac09ca111804e22d1c251f3c"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/final-FDB-status-summary.json",
+      "bytes": 341,
+      "sha256": "652308d8445606ee15d780d452ce17c8336e1b1e8a950bb03b3546722a3c4cf0"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/final-authoritative-idle-snapshot.json",
+      "bytes": 3179,
+      "sha256": "15a4ce12fe5ec02775eaa279b436a92ea8a89a48049b3c42ce32fdf33f1f2a13"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/monitor-real-PASS.json",
+      "bytes": 48687,
+      "sha256": "dd508b4260928dfd6342b2b12a6cb06bcb6d1375b61db2714411fe2a4d1b07f1"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/offline-message-projection-gap.json",
+      "bytes": 408,
+      "sha256": "bb6d48b76dfd004b400d76e4ec08033caa526be10fd94d684f50807654f2b024"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/phase1-COMPLETE.json",
+      "bytes": 2001,
+      "sha256": "0635d42b6f104b914c0229d2382ee08d0b517259a6d609fca6835dfd4d0b6b91"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/phase10-PASS.json",
+      "bytes": 770,
+      "sha256": "eb9788f667646ee83fa04e7042f6bbc8d78743bbc0730cda91425fb065d9722e"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/phase11-PASS.json",
+      "bytes": 761,
+      "sha256": "7467fcc9367f92aac76904b4e84337727e6303bd987e711ad3506cc1b7f0fd88"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/phase12-COMPLETE.json",
+      "bytes": 369272,
+      "sha256": "ff55fc62a65ec8aed1c722645c19038d7dc0e84f2df7f5c4e8563b5d75867479"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/phase13-COMPLETE.json",
+      "bytes": 7559,
+      "sha256": "ab022187d2310708e7f39fc8295182e946b746f5de899b274fa4eab841c175f9"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/phase14-PASS.json",
+      "bytes": 778,
+      "sha256": "61324ed9263c6e023ebd2ebfac444eb61e2fe86bd771a1be9a4a424264a4295b"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/phase2-PASS.json",
+      "bytes": 10310,
+      "sha256": "b5fe924966b35fd955e1cf5801657ba8a5fb58c4d6edd2fb32567dcb31c9853e"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/phase3-PASS.json",
+      "bytes": 1307,
+      "sha256": "835c6af2a1ee12c4773a7549f37aa6482897783fa0a650d253b8fe0d9ba4f846"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/phase4-PASS.json",
+      "bytes": 54857,
+      "sha256": "2abe0b1eb8e07649e8a86a9852178cd0285e98af1e83aad5fef2140f55643b13"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/phase5-COMPLETE.json",
+      "bytes": 690,
+      "sha256": "142b8f9b9846a80f0af242f8a6b8174f04e61b3f2d70d49cf571827af68631ee"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/phase7-PASS.json",
+      "bytes": 436,
+      "sha256": "325774fd684abd2c3d84124ff3e605f953ab7ff2a228607a235e2d191de77ce7"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/phase8-PASS.json",
+      "bytes": 1646,
+      "sha256": "ff9a57957305986dd45e36e93398328ed71899c86066ef6b6100c247282d04ec"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/phase9-PASS.json",
+      "bytes": 4275,
+      "sha256": "af4f9dc8efee18cc9946f91e7bbac0c98bdad3bd6edfc6f4cc22eeb1e336cc41"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/tape84-refreshed-statistics-observed.json",
+      "bytes": 4408,
+      "sha256": "9f7dbd4d650a9f9dd49000fe5d05508fd90f12823c5ee5631a8af017f56194ca"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/tape85-import-complete-CDB-summary.json",
+      "bytes": 2961,
+      "sha256": "82a27ef863049aaf93374d1a77d6d58c1aa98a3e20365b7c669f533127f4c3aa"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/tape85-import-other-pool-metadata-isolation.json",
+      "bytes": 1208,
+      "sha256": "faabfe8e997c86d7ae72a7b5cd0341870116e8865a3d0f391c247ccddda10189"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/all-controller.log",
+      "bytes": 1682,
+      "sha256": "91fd2593171e0452a881f053024a0c110e168d7dd838b1ccc5b97c84b25993e8"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/artifact.json",
+      "bytes": 3288,
+      "sha256": "a45a34a2b2fcdb10f6688d595386853ec1e77b455da29aa0b5fcfd80a57c996d"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/build-clients.log",
+      "bytes": 369,
+      "sha256": "2cae136e1c10d1256034420af32767ceaa7deef848d5ede08fb62513bb8b6a9e"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/build-controller.log",
+      "bytes": 46,
+      "sha256": "338235fedd053441a39bb443a5db2139b50e11521b60fe582d852c329bca85af"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/build-ha-helper.py",
+      "bytes": 1615,
+      "sha256": "1707137595154f5095e7a3a57cd3b6a555e62516339f90215a806d95e41bd723"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/build-normal.log",
+      "bytes": 508,
+      "sha256": "c533c60f11210227f5ace6a5daaa6260f7bd126772511bab610e1d5947592619"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/build.py",
+      "bytes": 2338,
+      "sha256": "932b419406eed8526f1b0a1316ccfa4f38e3554f13f1b0e18150d160c7c04988"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/capture-before-upgrade.log",
+      "bytes": 1617,
+      "sha256": "c389b675cc54ae4079ddeb06e8477141ddf083a335dd897ff2dc61e090937495"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/capture-before-upgrade.py",
+      "bytes": 4561,
+      "sha256": "9466e830af099614c287551f0bfc90b116bcd69ffd266b93bba5ff799696f15d"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/capture-live.log",
+      "bytes": 61,
+      "sha256": "4c2c43b55f01b62b404f8265e14f5bb6a1a80f402cc41c75aff52e05386e8945"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/capture-live.py",
+      "bytes": 4459,
+      "sha256": "5403b85b2d6780c6a6087cf3a8009fe1e0dcee3980dabc572014d1d9a1b7013b"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/closeout-controller-v1.log",
+      "bytes": 588,
+      "sha256": "89ca7a21b6b3c1c78582686a6a3fddda6c9cc7d43ddc00771d598e1ef83bb0d9"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/closeout-controller-v3.log",
+      "bytes": 259,
+      "sha256": "3f008ffd508963fbf2bdfd7131be91492e8c919b56c5a2f1d20ca3e29459ed0d"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/compare-original-sequential.log",
+      "bytes": 1238,
+      "sha256": "e0e07e542e60cac4c594a2db3d45651aad80400ddd786a850be99a7b45f2f212"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/compare-original-sequential.py",
+      "bytes": 3505,
+      "sha256": "9df0a77d066a83b5ab8df799e82db93f04e010aaf5d33b3939f7e10f19d4f258"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/final-controller-v2.log",
+      "bytes": 1231,
+      "sha256": "d099b58fd1ac9b2536035053f7095909ac77019842bd9cd6435f2508bc790a15"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/final-upgrade-COMPLETE.json",
+      "bytes": 9704,
+      "sha256": "a22e8ab9b5930ed32929be85345ea3c1d21d8b406d0c3dcabc7a94038003d85f"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/ha-build-controller.log",
+      "bytes": 51,
+      "sha256": "8bbfd226187c11aac814120651f525e6e1f705f54b43806b7073109749c63103"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/ha-build.log",
+      "bytes": 431,
+      "sha256": "97012b16a187b50a5855e7ef36cdfa976385febd855f6eb61485936629322fc2"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/ha-current-profiles.json",
+      "bytes": 40334,
+      "sha256": "1e2684ce7fc53f7869e2912f0f48148b3c23595e118fcd4e696b5f72ad65937a"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/ha-helper.json",
+      "bytes": 688,
+      "sha256": "cb9675fe959feff8b94077768d82ab06985bb6713fc01d7b7be8922595e44da5"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/ha-run/COMPLETE.json",
+      "bytes": 936,
+      "sha256": "dc4d93f21369c6e525281712306d80f655f2c36c79229dd249ca7b756f302578"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/helpers-before-canonical-v1.py",
+      "bytes": 4428,
+      "sha256": "ed6d576fc82e69acb8f936051eadbf9d7c8f73d3bb257a93eaa99201b6ef428e"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/helpers.py",
+      "bytes": 4483,
+      "sha256": "c5617c443619c765b130423f785bc1f08f6fa4fc267458139834c21a66a7ed88"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase1-control.log",
+      "bytes": 57,
+      "sha256": "17123cf18e0fc9d57113f1701bd0b60f4e7f4c13ab48d138b9a810e8fb3df7a8"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase1-control.py",
+      "bytes": 4452,
+      "sha256": "640883815e9b773606972889e744e1065be2b08df55c12898805c7bb41d73457"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase10-official-client.log",
+      "bytes": 60,
+      "sha256": "ca82636551ec629a724a39a8a82f57e7259b2a11c72e3b98528acabc2df8fca7"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase10-official-client.py",
+      "bytes": 2808,
+      "sha256": "2b03f0b24e49af843dca94aefa5278d4175ed1655b2792e5f2083ef8bbfe9007"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase11-concurrent-s3.log",
+      "bytes": 270,
+      "sha256": "3fcb487e8737488cc954bc2528ae8299ae2bbc4062e0f8c98e3091f9036c2881"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase11-concurrent-s3.py",
+      "bytes": 4317,
+      "sha256": "8ca5909c4bdcef71a6907ed0d94e2baf385f8b3770a2195cfabdd6c9c826c55c"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase12-readonly-continuation-v1.log",
+      "bytes": 58,
+      "sha256": "6019dbb14e27f8877074d3fe072f6b87052ae4a84577c71e308d4ed60eeb6719"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase12-readonly-continuation-v1.py",
+      "bytes": 2716,
+      "sha256": "681c4e1ce7c3c6c11478ffff97f50dddab53eae152b72652ddfdc76848e28c8a"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase12-readonly-surface.log",
+      "bytes": 947,
+      "sha256": "b2d5a9f30ac4195613417eb89941987def696544ae7e464b0a4359bef39bab99"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase12-readonly-surface.py",
+      "bytes": 2638,
+      "sha256": "ee4fe9ded485ce78ce35bd00ae3b3b99b2647d3bfc61815c911f607128349286"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase13-closeout-continuation-v1.log",
+      "bytes": 61,
+      "sha256": "914c952f4bb6a19b22f91c6aeb0b3254727a99710a0493f81e6166aa074d7a91"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase13-closeout-continuation-v1.py",
+      "bytes": 6961,
+      "sha256": "e16aa6716e68351cb8aaf40974c32a01229990cb236665deed3145ee7051107b"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase13-closeout-v1.log",
+      "bytes": 488,
+      "sha256": "7956f667324f427f4ad0d0fd90140ef0b2798d3cb0dcbfa0fc9babbde6cc174f"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase13-closeout-v1.py",
+      "bytes": 7211,
+      "sha256": "4119e9fef1b33a0c826d500aab60734f11d423373ac5bb0d5a62b1aa584b524a"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase14-final-fuse-subsets.log",
+      "bytes": 74,
+      "sha256": "4cacf54c7ff257afd31fc09a559163139345c2f4f1867296e10e9cd0fff32065"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase14-final-fuse-subsets.py",
+      "bytes": 9215,
+      "sha256": "9ec628fec64776f3dd6098857893955119e7ecea12253d1825464e969bc190f7"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase2-s3.log",
+      "bytes": 152,
+      "sha256": "af1e9a026a608c4027885cc3662bbf2416e96a11fda1377814c72432b292840e"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase2-s3.py",
+      "bytes": 11348,
+      "sha256": "21ff10dca13d146c38619a83ede26a7b5591dc8224663c9115cad3a675850321"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase3-notify.log",
+      "bytes": 61,
+      "sha256": "d78528a06bf96d18797214eeb575311c985670bc39d9970f7a8638155023e022"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase3-notify.py",
+      "bytes": 3479,
+      "sha256": "4c2debc068fc145a74fd79210735796bac1dccc3013649b9b9fb6e0a3611ab82"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase4-fuse-resume.log",
+      "bytes": 65,
+      "sha256": "facd85b3d471ceca7bb26ea497c6b7f8e9301fdd215231bb809eb260dd03f77b"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase4-fuse-resume.py",
+      "bytes": 11238,
+      "sha256": "58b4cc14d2a50402c835429ad8aad9ad1b8a16a854850a8f5b445b2cc7cc8aed"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase5-tape-continuation-v1.log",
+      "bytes": 691,
+      "sha256": "c31b9c2e20fa03da64f5541f66cfec2713758409b2c107f4e87a3a5faa9a3075"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase5-tape-continuation-v1.py",
+      "bytes": 7997,
+      "sha256": "75033b1b586a2910d0443c28e8874b812ddd5185749eb1c1a52a60a6adb1361e"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase5-tape-continuation-v2.log",
+      "bytes": 77,
+      "sha256": "a1a985bc8cd43681f73e3640d0111b3cd29136744ca7b5f2e4d21d3438b530c7"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase5-tape-continuation-v2.py",
+      "bytes": 8090,
+      "sha256": "b86006740f0186818722e032249619e212e1520417385631fd4350bb52c417b9"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase5-tape.log",
+      "bytes": 907,
+      "sha256": "804a54258781613ba4663e377655b6824c00702effd03923cf330312099f23de"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase5-tape.py",
+      "bytes": 7700,
+      "sha256": "b7a5c81244fa52dab6def5b4c4605c65a3c5e382f86845611acb293d06758f4a"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase6-ha.log",
+      "bytes": 117,
+      "sha256": "731822d42ad26145b019d8e255a6b75241538ce298f10935832ce0ef39fc5122"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase6-ha.py",
+      "bytes": 24507,
+      "sha256": "3a6b74f5a5e3bb86db7915928220f4383318eb563db57c8be4fc1b43d7f91aef"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase7-native-cli.log",
+      "bytes": 48,
+      "sha256": "dc45c04ce4e7eb1babe6c9ecb67885bdb67855b8eda9cdedd4b1b926dc54ae54"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase7-native-cli.py",
+      "bytes": 6369,
+      "sha256": "bbd1906b809e424d18071c2b7504bd94153caf06abfd6281403c31328acd20d8"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase8-fdb-dependency.log",
+      "bytes": 63,
+      "sha256": "ef59002d058cd5def5daf860b81125af6559a47eb986d31227bdc02e62d6055f"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase8-fdb-dependency.py",
+      "bytes": 7726,
+      "sha256": "5957dadba1f478c1e634e8c19e3c670ef5f90284be31860d5df4071e44597b21"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase9-large-sequential.log",
+      "bytes": 397,
+      "sha256": "c2f93e88543162e10e9757fa2f5a91ce0c79dabdb0bb8403466c61300a307a3c"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/phase9-large-sequential.py",
+      "bytes": 6090,
+      "sha256": "045e78a7dcf7222d576dfec7d73ab3435d80c75c4059806eec03dc6469aece11"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/physical-COMPLETE-v3.json",
+      "bytes": 268,
+      "sha256": "15cfed89d1efd3aa600e2b68ddf9b5b6c19c157e6ece91227e9d2d2024f7e9db"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/plan.json",
+      "bytes": 846,
+      "sha256": "43e55add0e5e3d563b5d52a91a5c39358b94b66a6b045ab21e2644bbd3e1275b"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/prepare-final-fuse-repeat.py",
+      "bytes": 4567,
+      "sha256": "6811889cb70651796ff6efa90ad846ba7e34d26ed4d953ee28a8714df605edd6"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/publish-report.py",
+      "bytes": 6167,
+      "sha256": "9dddf8c8c6a55f089a0bfba7c08ef57a9578ba63447ae83b72a524e3281c0fbc"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/remaining-controller-v1.log",
+      "bytes": 2531,
+      "sha256": "7fb251977189271869af03636a9abd1b593c576a9243e4fce1393eba3b7f1647"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/render-report.py",
+      "bytes": 20912,
+      "sha256": "d45e722e279dab91592a45d2ef4107f22f42db4033cdac291c69dca2f33c2bd3"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/run-all.py",
+      "bytes": 2079,
+      "sha256": "1604bf563f6ab37f942f70a72a1a1a5ffb99e0264207a58b687d7517bc70f4b9"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/run-closeout-after-remaining-v1.py",
+      "bytes": 1536,
+      "sha256": "352d1739aec3a5b14af08810e79a9f3c73b9f76848b39fb768d3452b289a0a12"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/run-final-closeout-v3.py",
+      "bytes": 830,
+      "sha256": "0cc5435beb27f9a24c7ef6ba467efa1cc0a024b601f56735ca44dd134bfebdc6"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/run-final-stages-v2.py",
+      "bytes": 1596,
+      "sha256": "c79e030b5f43a7df54b09be967a12a95f371f2386722ac854b7aff7e8ee0b1f1"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/run-remaining-final-v1.py",
+      "bytes": 1696,
+      "sha256": "520b85e369b407e5a532f01896cebe2cc121e0f834ded793d0705b9dcfdddf34"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/upgrade-controller.log",
+      "bytes": 73,
+      "sha256": "b25056b5aa1f82a2253bc2a8a0e64e00f40a97864afb8ced7d61e2f2d09e23e3"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/upgrade.py",
+      "bytes": 7775,
+      "sha256": "77056d43166e525eb09785c206f4262eb666baaabfed6960bf7bc7299067e0ae"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/sequential-baseline.log",
+      "bytes": 693,
+      "sha256": "ea6fb31e2a20d102862d76e18cb0c2df7104a5f64a0300139c67f521f8853db7"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/sequential-review-spec-result-v2.md",
+      "bytes": 1252,
+      "sha256": "c818edf4d277e6b9ccef79c818d530dbae2472304a481a1f2e76026ed2cec1ca"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/sequential-review-standards-v2.md",
+      "bytes": 876,
+      "sha256": "d34222763b1bb00c2d8746c33338fbfaeb8359f38873f69579b1f3eb9d35cf83"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/software-v8-results.json",
+      "bytes": 4455,
+      "sha256": "8ff24495586ff0b87ad98dd3e84120d8316f2159374b0df49b62d568dae48833"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/FUSE14-checkpoint-timing-summary.json",
+      "bytes": 2503,
+      "sha256": "3731dfcf24529827ee68a43e44d3304e3fc003dc4ac2b6834c41afbbeaade057"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/POST-REPORT-READINESS-CHANGE-v1.json",
+      "bytes": 3807,
+      "sha256": "88119d572e963b5932ee0a4dfe55af7cb661f22d3dd2d767dee19b864749df56"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/post-report-readiness-logs-v1-207.json",
+      "bytes": 144,
+      "sha256": "eefef07bac5e9e3bf9c2da09a47478779ce279ee08fce348dbdf341ceae4e850"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/post-report-readiness-logs-v1-208.json",
+      "bytes": 144,
+      "sha256": "042c08fb7211e22c14cc1f216817438a0d6a41b1136daeb0799d2d327cb857d3"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/post-report-readiness-logs-v1-209.json",
+      "bytes": 144,
+      "sha256": "7d10798827a1d6804228962ceb4e5fa52723130e772e97f3bf6791f495d7864a"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/POST-REPORT-idle-or-pending-v1.json",
+      "bytes": 3179,
+      "sha256": "43dbecb9f8edb7e982a0fb63e5ad63f0024c8f77c40cde66d1a960e50d08cb74"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/POST-REPORT-task-list-v1.json",
+      "bytes": 314223,
+      "sha256": "4016b3a588f4488a51a2e7763d9b731c61318b3ad7d5cd891f7109c6cab508bb"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/post-report-active-IO-v1-208.json",
+      "bytes": 2419,
+      "sha256": "171d93a8785ac0080849a6b43de07c13c11e8c5999d1763ffbe95077743fbd81"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/POST-REPORT-readiness-observation-v2.json",
+      "bytes": 377,
+      "sha256": "6f51f600451d25d27ae45d87f2e5264340e59ecdc310985cfaf06460f8b8d29e"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/POST-REPORT-restored-original-owner-v3.json",
+      "bytes": 859,
+      "sha256": "1a2c8fc0f40e2198a2c63bbd5dca847e555512c79ff1d6f97bc7dd2eea3ba2a8"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/post-report-read-idle-runtime-v1-208.json",
+      "bytes": 252,
+      "sha256": "f7cde7cbf9924bd488ba871a8fe2056830a1fee436c6d3f89c194e582b6016d7"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/POST-REPORT-stable-sample-0.json",
+      "bytes": 971,
+      "sha256": "ad39058519c10b0cb2a01b25088088b6a0596460014751411e9862e45ec911eb"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/POST-REPORT-stable-sample-1.json",
+      "bytes": 971,
+      "sha256": "0414a5d0a4d9b9c1ed0ef63e7e17d0ac1e031e1f73f6043420cd526a769d2169"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/POST-REPORT-stable-sample-2.json",
+      "bytes": 972,
+      "sha256": "bef34800e04ecdd454dd85b79d28c3268a243e9a7843ff37802a3f2326c96176"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/POST-REPORT-final-idle-audit-v2.json",
+      "bytes": 3179,
+      "sha256": "9f69af08936fb78996a050e197f7b11a465502eb045fa59d9369cd1679666f38"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/POST-REPORT-idle-retired-tape84.json",
+      "bytes": 4863,
+      "sha256": "fd0cab892209b19041fcf6c6b5cb8ab763e01b50c41045ed12d348e6cc86eafd"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/acceptance/POST-REPORT-STABILITY-COMPLETE-v1.json",
+      "bytes": 3465,
+      "sha256": "2ac86b5dd087ad3a741c9037160f1067da0d8c4361aed67b3a2303affbe88031"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/post-report-stability-v1.py",
+      "bytes": 2038,
+      "sha256": "410ae433aea343ec4b8970472a615bf8b305f815214a59a00ce71dd86c2841f9"
+    },
+    {
+      "path": "/work/tmp/tape-main-physical-20261108-h9vn4yhb/physical-final-e0a7625/post-report-stability-v1.log",
+      "bytes": 88,
+      "sha256": "97ca66bce755a79037357b8e8f2b71ee58a57e9a2219f79866e98486fde54443"
+    }
+  ],
+  "FUSE_checkpoint_intervals": [
+    {
+      "from": "/mnt/meta-data/tape-rs/v1-20261106/main1108-fuse-83ef4bb961/final-random-append-fsync-ISSUED.json",
+      "to": "/mnt/meta-data/tape-rs/v1-20261106/main1108-fuse-83ef4bb961/final-truncate-smaller-fsync-ISSUED.json",
+      "seconds": 59.021955394
+    },
+    {
+      "from": "/mnt/meta-data/tape-rs/v1-20261106/main1108-fuse-83ef4bb961/final-truncate-smaller-fsync-ISSUED.json",
+      "to": "/mnt/meta-data/tape-rs/v1-20261106/main1108-fuse-83ef4bb961/final-truncate-larger-fsync-ISSUED.json",
+      "seconds": 60.461929903
+    },
+    {
+      "from": "/mnt/meta-data/tape-rs/v1-20261106/main1108-fuse-83ef4bb961/final-truncate-larger-fsync-ISSUED.json",
+      "to": "/mnt/meta-data/tape-rs/v1-20261106/main1108-fuse-83ef4bb961/final-multi-handle-fsync-ISSUED.json",
+      "seconds": 60.253933587
+    },
+    {
+      "from": "/mnt/meta-data/tape-rs/v1-20261106/main1108-fuse-83ef4bb961/final-multi-handle-fsync-ISSUED.json",
+      "to": "/mnt/meta-data/tape-rs/v1-20261106/main1108-fuse-83ef4bb961/final-body-operations-PASS.json",
+      "seconds": 59.388948897
+    }
+  ],
+  "post_report_idle_retirement_and_stability": {
+    "source": "e0a7625b920cad93d884939f5981c2cafeb4b97f",
+    "all3_ready_over_70s_three_observations": true,
+    "all14gates_empty": true,
+    "same_owner_node": 2,
+    "same_owner_round": 1501886,
+    "no_service_restart_mutation_or_clearlock": true,
+    "L84_returned_to_original_home": 1004,
+    "L84_same_volume_pool_online_blacklist": true,
+    "FDB_status": {
+      "available": true,
+      "healthy": true
+    },
+    "original_notification_ACK_delete_not_repeated": true,
+    "sampling": [
+      {
+        "207": {
+          "http": 200,
+          "body": {
+            "mode": "fdb-owner-writable",
+            "ready": true
+          }
+        },
+        "208": {
+          "http": 200,
+          "body": {
+            "mode": "fdb-owner-writable",
+            "ready": true
+          }
+        },
+        "209": {
+          "http": 200,
+          "body": {
+            "mode": "fdb-owner-writable",
+            "ready": true
+          }
+        },
+        "library": {
+          "active_node": 2,
+          "owner_epoch": 1501886,
+          "executor_ready": true,
+          "inventory_age_seconds": 4,
+          "inventory_owner_current": true,
+          "monitor": {
+            "error": null,
+            "interval_seconds": 30,
+            "last_attempt": "2026-11-08T14:07:15.010542634Z",
+            "last_success": "2026-11-08T14:07:15.010542634Z",
+            "library_serial": "55L3A78011W9LL01",
+            "namespace": "c51a94dd-7e84-4167-bd25-7151880eb628",
+            "owner_epoch": 1501886,
+            "version": 1
+          }
+        }
+      },
+      {
+        "207": {
+          "http": 200,
+          "body": {
+            "mode": "fdb-owner-writable",
+            "ready": true
+          }
+        },
+        "208": {
+          "http": 200,
+          "body": {
+            "mode": "fdb-owner-writable",
+            "ready": true
+          }
+        },
+        "209": {
+          "http": 200,
+          "body": {
+            "mode": "fdb-owner-writable",
+            "ready": true
+          }
+        },
+        "library": {
+          "active_node": 2,
+          "owner_epoch": 1501886,
+          "executor_ready": true,
+          "inventory_age_seconds": 9,
+          "inventory_owner_current": true,
+          "monitor": {
+            "error": null,
+            "interval_seconds": 30,
+            "last_attempt": "2026-11-08T14:07:45.190741977Z",
+            "last_success": "2026-11-08T14:07:45.190741977Z",
+            "library_serial": "55L3A78011W9LL01",
+            "namespace": "c51a94dd-7e84-4167-bd25-7151880eb628",
+            "owner_epoch": 1501886,
+            "version": 1
+          }
+        }
+      },
+      {
+        "207": {
+          "http": 200,
+          "body": {
+            "mode": "fdb-owner-writable",
+            "ready": true
+          }
+        },
+        "208": {
+          "http": 200,
+          "body": {
+            "mode": "fdb-owner-writable",
+            "ready": true
+          }
+        },
+        "209": {
+          "http": 200,
+          "body": {
+            "mode": "fdb-owner-writable",
+            "ready": true
+          }
+        },
+        "library": {
+          "active_node": 2,
+          "owner_epoch": 1501886,
+          "executor_ready": true,
+          "inventory_age_seconds": 14,
+          "inventory_owner_current": true,
+          "monitor": {
+            "error": null,
+            "interval_seconds": 30,
+            "last_attempt": "2026-11-08T14:08:15.561919500Z",
+            "last_success": "2026-11-08T14:08:15.561919500Z",
+            "library_serial": "55L3A78011W9LL01",
+            "namespace": "c51a94dd-7e84-4167-bd25-7151880eb628",
+            "owner_epoch": 1501886,
+            "version": 1
+          }
+        }
+      }
+    ]
+  }
+}

@@ -337,6 +337,34 @@ pub(crate) fn read_cached_file_to_writer<W: Write>(
     )
 }
 
+#[cfg(feature = "fdb")]
+pub(crate) fn read_cached_file_sequential_to_writer<W: Write>(
+    device: &dyn crate::scsi::transport::TapeTransport,
+    label: &LtfsLabel,
+    file: &crate::catalog::volume_extents::CachedFile,
+    w: &mut W,
+) -> Result<u64> {
+    if file.symlink.is_some() {
+        return Err(TapeError::Ltfs("顺序读取计划不能指向符号链接".into()));
+    }
+    read_extents_positioned(
+        &TapeDrive::new(device),
+        label.blocksize,
+        [label.index_partition, label.data_partition],
+        (&file.path, file.length, &file.extents),
+        w,
+        &std::cell::RefCell::new(None),
+        ReadPositioning::Forward,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ReadPositioning {
+    Locate,
+    #[cfg(feature = "fdb")]
+    Forward,
+}
+
 fn read_extents_to_writer<W: Write>(
     drive: &TapeDrive<'_>,
     block_size: u32,
@@ -344,6 +372,26 @@ fn read_extents_to_writer<W: Write>(
     file: (&str, u64, &[Extent]),
     w: &mut W,
     read_buffer: &std::cell::RefCell<Option<crate::scsi::buffer::TransferBuffer>>,
+) -> Result<u64> {
+    read_extents_positioned(
+        drive,
+        block_size,
+        partitions,
+        file,
+        w,
+        read_buffer,
+        ReadPositioning::Locate,
+    )
+}
+
+fn read_extents_positioned<W: Write>(
+    drive: &TapeDrive<'_>,
+    block_size: u32,
+    partitions: [char; 2],
+    file: (&str, u64, &[Extent]),
+    w: &mut W,
+    read_buffer: &std::cell::RefCell<Option<crate::scsi::buffer::TransferBuffer>>,
+    positioning: ReadPositioning,
 ) -> Result<u64> {
     let (path, length, extents) = file;
     if extents.is_empty() {
@@ -393,7 +441,11 @@ fn read_extents_to_writer<W: Write>(
 
     for ext in extents {
         let partition = partition_char_to_num(ext.partition, partitions)?;
-        drive.locate_if_needed(partition, ext.start_block)?;
+        match positioning {
+            ReadPositioning::Locate => drive.locate_if_needed(partition, ext.start_block)?,
+            #[cfg(feature = "fdb")]
+            ReadPositioning::Forward => drive.read_forward_to(partition, ext.start_block, buf)?,
+        }
 
         // 从 extent 起始块读起，按 byte_offset / byte_count 精确裁剪。
         let mut remaining = ext.byte_count;

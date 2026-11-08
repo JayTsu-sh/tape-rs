@@ -67,6 +67,66 @@ impl ActiveReadSource {
         }
     }
 
+    /// An ordinary immutable body may also be proved by the currently verified
+    /// index. Imported aliases and hashless/changed historical bodies retain
+    /// their exact original-source read path. This never grants device access.
+    pub(crate) fn plan_current_body(
+        &self,
+        entry: crate::ltfs::index::IndexEntry,
+    ) -> Option<ResolvedRead> {
+        let ResolvedPath::File {
+            id,
+            head,
+            copy,
+            placement,
+            attributes,
+            ..
+        } = self.resolved.clone()
+        else {
+            return None;
+        };
+        let ContentDigest::Sha256(expected) = copy.content_digest else {
+            return None;
+        };
+        if copy.media.is_some() {
+            return None;
+        }
+        let crate::ltfs::index::IndexEntry::File { path, node } = entry else {
+            return None;
+        };
+        let mut hashes = node
+            .xattrs
+            .iter()
+            .filter(|x| x.key == crate::ltfs::index::XATTR_SHA256);
+        let hash = hashes.next()?;
+        if node.meta.file_uid != copy.ltfs_file_uid
+            || node.length != copy.size
+            || node.symlink.is_some()
+            || hash.base64
+            || hash.value
+                != expected
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            || hashes.next().is_some()
+        {
+            return None;
+        }
+        Some(ResolvedRead {
+            id,
+            head,
+            copy: *copy,
+            placement,
+            physical: CachedFile {
+                path,
+                length: node.length,
+                symlink: None,
+                extents: node.extents,
+            },
+            attributes,
+        })
+    }
+
     pub fn plan_read(self, cache_path: &Path) -> Result<ResolvedActiveRead> {
         let expected = ExpectedIndex {
             volume_uuid: self.source.volume_uuid,

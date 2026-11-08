@@ -40,10 +40,12 @@ pub use streamed::{StreamedFullRecovery, capture_full_recovery};
 #[cfg(feature = "fdb")]
 mod source;
 #[cfg(feature = "fdb")]
-pub(crate) use source::verify_recorded_source_constructs;
-#[cfg(feature = "fdb")]
 pub use source::{
     CapturedIndexSource, IndexSourceScope, capture_index_source, capture_recorded_index_source,
+};
+#[cfg(feature = "fdb")]
+pub(crate) use source::{
+    CapturedReadIndex, capture_current_read_index, verify_recorded_source_constructs,
 };
 #[cfg(feature = "fdb")]
 mod identity;

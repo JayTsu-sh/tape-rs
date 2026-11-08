@@ -34,6 +34,10 @@ use crate::local_read_storage::{
     CacheBuild, CachePin, download_file, reclaim_cache_space, retry_after_space_reclaim,
 };
 
+#[path = "fdb_read_session.rs"]
+mod session;
+pub(crate) use session::ReadSession;
+
 pub struct ActiveMediaRead {
     pub metadata: ResolvedRead,
     /// Exact current medium head proved by this read. The file's historical

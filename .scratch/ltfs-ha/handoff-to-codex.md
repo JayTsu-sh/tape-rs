@@ -1,4 +1,54 @@
-# 当前交接：代码审查与 GitHub main 集成（2026-11-08）
+# 最新接续：PR #42 顺序读与 FUSE 修复合入批次（2026-11-08）
+
+最新用户要求 review 代码，通过后合入 GitHub 主分支。本批基线为 GitHub/main `d63932586fa4d57d7ab0be5f320003a2eee5ee11`，已对候选 `a4a0e6d12a0cadf59f9214309fdb22e984853615` 的5提交/17文件进行完整规范与需求两轴审查，均0项发现；13份产品源码、123份实带证据和11项成功软件日志SHA已逐项核对，本次复查fmt和Python8项通过。下方报告中的“本轮未推GitHub”属于前一验收轮的历史状态，不能用于判断此次发布结果。
+
+PR：https://github.com/JayTsu-sh/tape-rs/pull/42 。本条是合入前的交接记录；最终是否MERGED、主分支提交/树及临时分支清理，应以GitHub PR状态与本地 `/work/tmp/tape-sequential-merge-review-20261108-99tdzs_r/MERGED-CLOSEOUT-v1.json`、`.scratch/ltfs-ha/local/handoff-history.md` 的收尾证据为准，不凭本条预先宣称合入成功。审查原报告为 `/work/tmp/tape-main-physical-20261108-h9vn4yhb/merge-review-{standards,spec}-final-v1.md`。
+
+本批可执行源码仍与真实207–209已验收的 `e0a7625` 相同；本交接新增内容只记录发布状态，不重跑已消费的实带controller，不重新部署或触碰A库。既有旧CLI/离线说明、完整native reclaim及未具备现场条件的边界继续按实带报告保留，不借review扩展新功能。日常目录/分支仍是唯一工作树 `/work/jay/tape-rs` 的main。
+
+---
+
+# 最新接续：真实 B 库验收及报告已完成（2026-11-08）
+
+用户要求“在真实带库环境验证所有的功能，并给出验证报告，可优化项也要体现”。本轮已完成可安全执行的现场矩阵及收尾，结论是 **completed_with_gaps，不能称全部功能通过**。正式报告 [docs/physical-acceptance-20261108.md](../../docs/physical-acceptance-20261108.md)，可机读摘要 `docs/physical-acceptance-20261108.json`；31组矩阵中27组通过（含明确拒绝行为验证）、3组入口/字段缺口、1组完整原生reclaim封闭，另列现场受限范围。不要按下面旧“尚未部署/阶段进行中”记录重跑。
+
+- 实际207–209均为普通EL9源码 `e0a7625b920cad93d884939f5981c2cafeb4b97f`，产品tree `2b6cd858d2c3dc9a5f1197e0c490afe2fffe22d4`；ltfsd SHA `ae4e658266e63de03e200e52ce42c32bdd19c6ea5784157568cad229b572d8c2`。独立45153、原namespace/state/unit保持；三服务/FDB available+healthy/double，三个入口ready、14类占用空，所有本轮FUSE正常卸载并退出。应用挂载命名空间无GPFS，宿主其他GPFS未动；本轮未推GitHub。
+- 原始证据 `/work/tmp/tape-main-physical-20261108-h9vn4yhb`；最终候选 `physical-final-e0a7625/physical-COMPLETE-v3.json`、`acceptance/phase13-COMPLETE.json`、`phase14-PASS.json`。报告索引绑定123份本地证据SHA，失败控制器与实际缺口均保留。`run-all`、`run-remaining-final-v1`、`run-final-stages-v2`及其接续都已消费；不可重跑变更脚本。阶段5规范JSON与源槽断言、阶段12固定100分页、收尾缺消费者返回400而非404等脚本问题已按原身份结清，没有替代操作或重复ACK/删除。
+- 实带通过：CLI/HTTP池管理与异步rescan；S3 1000+5全局字典序分页、读写/条件/校验/扩展RenameObject/Delete；内核FUSE完整读写/属性/链接/目录及冷重挂；L84离线/黑名单/I-E往返/上线/validate；L84 CLI与L85 HTTP已分配import同卷刷新；真实非注入监控通知、扩类重连/显式ACK；同库互斥与正常HA原任务/回执/未ACK保留；原生FDB文件CLI/驱动策略还原；45153单节点及全体停服故障恢复。
+- 三片本地修复为 `a6f987f`（受保护的顺序读会话与持久顺序客户端）、`46515ac`（FUSE根GETATTR恢复入口）、`e0a7625`（当前读证明与独立Full历史审计分开）。最终11项软件检查全0，三片规范/需求两轴审查最终0。原12KiB对象暖读43.273→5.268秒、0 LOCATE/IP定位；两组各连续3×64MiB，总384MiB写/384MiB全量读，实际顺序工具与SHA/ETag通过；6×2KiB并发观察到7 WRITE/3 FILEMARK/2 VCI的共享提交。L85 import1072文件/1080路径688.322秒，146 LOCATE占582.833秒；报告记录Range读放大、FUSE小更新约60秒检查点间隔、空间统计约81秒收敛和后台样本陈旧等优化项，不将端到端速率称裸带宽。
+- 明确缺口：旧drive/node list404、cluster null；旧stat对已知FDB对象exit0打印不存在、list/get报不存在且失败get留下0B新文件；offline -o任务回执有说明而tape show offline_message为null。新fdb stat/get等正常不能替代旧入口通过。完整原生reclaim仍未开放，不能将零子父互斥HA当迁移/格式化全过程。
+- A库保持释放；只写L84/L85且同卷/同池/在线/非黑名单，未FORMAT/ERASE、未手工清门闩/改PR。保护介质未装载/写入，仅另池ee6只读列举元数据验证隔离。无空白未分配scratch，正向assign/unassign、首次import映射及格式化未重跑；双库、现场WP/坏带/满带、断电写中HA、VIP、EE实时互通等未验收。只有两个精确自有MOCK订阅被清理，原旧批次显式ACK后删除；全局outbox/其他消费者/历史未清，测试正文保留供复验。
+
+- **补充空闲退带观测**：文档提交98ed09f后复查曾出现readyz503；不是新owner或残留任务，实际为默认300000ms的空闲读挂载自动退带。owner2/round1501886保持，14:03:44Z UNLOAD GOOD、14:04:13Z MOVE GOOD，L84回原槽1004且同卷/池/策略保持。14类占用空、96管理任务终态，三入口随后自行200，无重启/清锁/人工move。报告新增通过组及探针误导/空闲阈值优化项；原健康、503、恢复证据分别保留，不可将机械暂忙当失权。退带后再三轮/70秒持续观测，三个入口200、同owner、14类占用空、FDB healthy（POST-REPORT-STABILITY-COMPLETE-v1.json），未重启/清锁。
+
+---
+
+# 当前交接：真实 B 库全功能验证与顺序读写优化（2026-11-08）
+
+用户在 PR #41 合入后明确要求“在真实带库环境验证所有的功能”，随后要求按磁带顺序读写特性优化同 pool 的 S3 访问，并明确**读取顺序由客户端保证与实际写入顺序一致**。本轮继续完成验收及该优化，不因下方历史 review 收尾记录而停止；不开发无关功能。S3 ListObjectsV2 保持完整键字典序，实际写/读顺序用客户端独立持久清单保存。省掉重复机械定位不意味着省掉 owner/PR、提交屏障或失权后的重新核验。
+
+- 固定起点为 GitHub/main `d63932586fa4d57d7ab0be5f320003a2eee5ee11`。已用当前树构建正常 EL9/glibc2.34 二进制，真实 207–209 全部升级完成，仍沿用原 FDB45153、namespace、state、unit 和 B-only 设备策略。升级前后原目录/上传/管理回执摘要相同、14类占用为空。实际部署 root `/opt/tape-rs/v1-20261108-d63932586fa4`；SHA 与普通配置逐机证据在新目录 `upgrade-COMPLETE.json`。
+- 新现场总证据目录 `/work/tmp/tape-main-physical-20261108-h9vn4yhb`，接续先读 `CURRENT.json`、各 controller 日志和独立 stage 结果，不能重跑已消费的有状态脚本。新 Python SDK 在该目录 `python/`；运行测试使用相应 PYTHONPATH，FDB 只读审计另需既有 fdb-tools 的 LD_LIBRARY_PATH。
+- 已验证：四类管理查询 CLI/HTTP（三节点）、pool CLI/HTTP CRUD/策略/原请求重放及 S3 bucket 联动、两入口异步 library rescan。发现旧 `drive list`/`node list` 返回404、`cluster`输出null；原生 `fdb drive show` 两驱动均正常，这些旧入口的缺口已分别保留，不冒称通过。
+- S3 当前版本已真实完成旧三份正文冷读及摘要、1000+5字典序分页/跨节点token、V1/start-after/分隔符/编码、PUT/覆盖/空/中文、HEAD/GET/Range/条件、MD5/CRC/错误SHA拒绝、RenameObject原token重放与改参数拒绝。`phase2-PASS.json` 是按原操作结清的结果；第一轮本机旧SDK在发请求前拒IfNoneMatch，隔离安装boto3 1.40.76后续接；末尾multipart实际明确返回405/XML，原脚本误要求501失败，结清脚本保留原失败并验证目标未出现，无重发PUT或改产品迎合脚本。
+- 通知 CLI/HTTP SSE/显式ACK、跨节点断线重连、扩类保留旧批次/旧类型积压且不发新增类型旧事件通过。测试消费者 `phase3-PASS.json` 的原未确认批次特意保留，后续 HA 必须按同 consumer/generation/delivery 验证，不能新建替代。
+- 唯一 `sequential-baseline.py` 已消费，实际3×4KiB按持久原序读写且 SHA 全对；首 PUT120.468s，后两次16.410/15.644s均0 LOCATE/LOAD/MOVE。三个GET44.232/43.192/43.354s，每次12 LOCATE/6 IP，目标性能断言exit101，原红测保留，禁止重跑PUT。随后 exact owner+private FDB/Sim红测left12/right0，修复后顺序/后退/短间隔及9类失效回归全0（sequential-v3-results.json）。新read_session绑定原Permission/PR/epoch/有效VCR/当前head，导入/无SHA/当前同UID正文不同回退旧路径，未削弱逐CDB/FDB及终核；尚未部署新优化。
+- `phase4-fuse.py`、`phase5-tape.py`、`phase6-ha.py` 已准备但**尚未执行**；新无设备 HA helper 已按当前main构建并保存来源，允许原executor在Serving前自动领原零子父，并验证精确release重放。执行HA前须重新采集当前profile/authority、先结清普通数据请求，不能沿用旧fa7轮次/修订号。
+- L84和L85当前均有live/retained数据，不是历史空带；仅这两盘授权scratch可写，不重跑历史格式化/空带脚本。A库保持释放；B changer6070别名不碰，原白名单内两台B drive仍允许。完整native reclaim公开父流程和源格式化继续关闭，相关未接通内核不能算整功能实带验收。双库并行/均衡、现场写保护开关、满带或永久坏带等条件未具备，必须保留未验证边界。
+
+- 用户再次明确要求所有功能真实带库验证并出具含优化项的报告。当前 `phase4-fuse.py` 原 exec60597 正在真实209内核FUSE执行；只读查询和原journal证明已完成初始S3读、目录/文件创建，正在随机写/追加/截断。`run-remaining-physical-v1.py` 原exec45864等待其PASS后按序执行phase5/6/7/8/9，均为one-shot，失败后只结清原身份，不重跑。新HA profiles已采集实际d639三节点；45153专用unit已与45151/45152隔离，double配置可容忍1zone。后续应核各原日志/receipt，不能同时再开相同controller。
+- 本地顺序候选完整7检查software-v4-results.json均0（fmt/default/allfeatures/check/clippy/Python/diff），Clippy只有旧prepare_file8args。独立规范/需求审查v1发现可选客户端新建清单父目录落盘P2，按最小方案改为预先存在的持久父目录；新增实际RED8项1失败后GREEN8项全过，两轴v2均0，Rust未变。工具不新增服务依赖，docs/s3.md说明独立写入顺序及安全恢复；当前硬件仍d639，不能将新优化软件绿色算实带通过。接续需完成物理报告，包含旧入口404/null、原生reclaim关闭及无空scratch/跨库/现场物理状态等未验条件。
+
+- 顺序候选现按本地提交固定来源以构建EL9普通release；尚未推送GitHub或部署。提交前最终Rust三项定向回归v5均0，生产Rust与双轴冻结v1逐字一致，Python仅已复核P2及对应8项GREEN，新增文档只说明已有功能。后续统一升级必须等当前d639原现场流水线结清、重新采集真实profile和14类空占用；不能把本地HEAD前进误作实带版本已变化。
+
+- **最新现场结清与阻断修复**：本地顺序候选已提交 `a6f987f8a47e16380fd5ef9bf9407796faa7b2e1`，其EL9六产物已构建但**未部署**。d639实带FUSE在属性操作后原rename返回EIO（原controller exit1），服务器原操作 `1/c8b4b1dc-2580-490a-8a34-4b12e0e21d15` 三节点均Completed，客户端未保存回执且namespace_uncertain。真实/dev/fuse抓包证实内核先发root GETATTR(op3,ino1)被-5拒绝，恢复SETXATTR根本不可达；不是根据服务端Completed冒称客户端成功。已最小放行root getattr，仍新鲜验证根namespace/inode/type，其他路径及写屏障不变；实际lostreply回归RED101→GREEN0，uncertain根重建仍ESTALE。software-v6七检查均0，两轴fuse-root-review-v1均0；该修复还未实带GREEN。
+- 旧FUSE已**正常umount退出**，原PID804628消失、transient unit自动回收、mountinfo无挂载；首次结清脚本对已回收unit再stop返回5，是harness生命周期误判，保留原日志。v2只确认已退出，按原journal `.../main1108-fuse-85cf1af9/journal-warm/rename-f13ad87f-70dc-4cb3-acf5-5d6cae90c2c2` 查询/结清同一Completed回执，未新建/重发rename，`acceptance/fuse-original-normal-settled-PASS.json`。旧phase4及remaining-physical-v1均已失败消费，**不能重跑**；phase5/6/7/8/9尚未开始。后续必须正常升级经过完整检查的新候选，按原日志接续FUSE剩余场景，再在同一候选上完成管理/S3/通知/HA/FDB故障/大对象顺序测量并出报告；不要以旧流水线仍运行作判断。原报告需求继续有效，A禁止，L84/L85有数据不格式化。
+
+- **最新统一465现场及冷读修复**：46515ac普通EL9已正常整组升级207–209，`physical-final-46515ac/final-upgrade-COMPLETE.json`证明原FDB全部stable摘要保持/14类占用空、停服后PR-IN空。原12KiB清单同3对象实读SHA全对，暖GET5.287/5.138s且0 LOCATE/0 IP（旧43.192/43.354s、各12/6）；首读56.824s含MOVE/LOAD，不能作同条件加速比较。该候选phase1控制/池CRUD/两入口rescan重跑通过；phase2在首个历史GET发现首次cache捕获误用完整Full历史审计，实际逐代LOCATE十余分钟。已仅SIGTERM精确本地**只读**phase2 controller（无PUT/rename/delete ISSUED），未信号应用/设备；原all-controller已消费退出，不能重跑。新candidate的phase3–10/FUSE修复接续仍未执行。当前现场465而非d639，旧originalFUSE已正常卸载、原rename同身份结清。
+- 冷读修复新增仅用于当前读的 `CapturedReadIndex`（完整DP/EOD/原SHA、DP/IP、全部必要Delta重放），保留公开 `CapturedIndexSource`完整历史审计和在用UID接口，原历史来源/回收/写入许可不变。70个独立Full后的实际owner私有FDB/Sim旧代码RED-v2 LOCATE85，修后GREEN-v2和最终software-v8私有long-full均0；原RED-v1是fixture60s许可过期（用同轮次正常续租纠正），GREEN-v1是误删在用方法编译失败（已逐字恢复），分别保留，不冒称产品红测。最终v8=7软件检查+4逐进程定向回归全部0，两轴long-full-review-v2均0；Clippy仅既有prepare_file8args。新修复待提交/EL9构建/从实际465升级并统一重验。不要部署已知冷读回退的旧a6或465产物当作最终通过。
+- 现场最新预检发现207/208宿主有mmfsd，但应用进程mount namespace无GPFS，EE/ltfs进程0；不停止其他用户GPFS。进度报告 `/work/tmp/tape-main-physical-20261108-h9vn4yhb/validation-report-progress.md`明确进行中，最终报告须含优化/失败/未实现及物理条件不足项目。当前源/controller状态以同目录CURRENT.json、final-target.json及每stage原receipt为准。
+
+# 此前交接：代码审查与 GitHub main 集成（2026-11-08）
 
 用户最新要求为“review代码，通过后合入github主分支”。本轮只审查、修复阻断问题和集成已有代码，不继续开发新的 reclaim 能力。工作目录仍为 `/work/jay/tape-rs` 的 `main`；GitHub 是否已同步须按接续要求核对远端，不以本文内历史“未推送”记录判断。
 

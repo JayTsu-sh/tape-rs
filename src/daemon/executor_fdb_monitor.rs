@@ -15,7 +15,7 @@ pub(super) struct Schedule {
 
 /// Captures the actual failing opcode, rather than guessing from an outer
 /// upload/read label (mount and commit also issue MAM and positioning CDBs).
-pub(super) struct Tracked<'a> {
+pub(in crate::daemon) struct Tracked<'a> {
     device: &'a dyn TapeTransport,
     operation: &'a str,
     error: Mutex<Option<TapeMonitorError>>,
