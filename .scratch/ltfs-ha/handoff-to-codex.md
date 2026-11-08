@@ -58,3 +58,9 @@ Plan v3 固定原实际 DP EOD 并纳入摘要/边界校验，Unchanged/首次�
 本片两轴初审 Standards0 / Spec1：持久观察解码未同步原 EOD+1，正确 checksum/错误位置的三种 Full/delta 红测实际10504 exit101；现同步 codec，原全套 v3 已重验通过。v1管线13324为测试 Vec/整数比较编译错；v2新物理分段回归0后为修P2精确中断自有闭后恢复测试，SDK子进程-2、controller1，原日志保留。codec红测首次56524是Cargo过滤器参数错误，不算逻辑红测。以上不涉及现场。
 
 本片最终只更新本交接的检查事实，生产/测试/管理规范与实际 v3 执行候选逐字相同；最终源码清单 METADATA-EOD-SOURCE-v4.json。下一明确恢复 phase/guard 生命周期、两个 marker/原闭合边界核对和独立恢复回执设计见本地 METADATA-TAIL-IMPLEMENTATION-BOUNDARIES-v2.json（设计未实现），完整父流程和真实 B 验收仍未完成，禁止据此开放原生 reclaim 或格式化。
+
+## 2026-11-08 修尾结果只读识别片（软件验证完成）
+
+8be83c2 后新增独立 Discard fact：完整 Current 新Full +原 Recorded/完整链及实际构造结束块，原EOD到新Full起点-2的范围、原前缀和emptyRecovery双标记、原树/UID/count/donor/关键header均核对。原根属性与单对象流式核对，不发CDB、不修改持久任务、不授IO，不自动close_tail或发布/释放；显式Recovering/Recovered、独立回执及完整父流程仍待实现。历史捕获从原SHA验证读取额外返回exclusive construct end，共享底层读取不增加CDB、不改变原value-only调用方语义。实际历史索引重分段+已放弃记录删除保持新/旧XML身份和新Full位置不变，原33451测试子进程三测中边界负例exit101，修后4666测试子进程三测exit0；首轮34820夹具使用绝对链接被既有卷根约束拒绝，已改为相对链接，不算逻辑红测。实际执行的 19 项 SDK、14 项观察单测和六软件检查全部通过，双轴静态审查0；原48449管线0与77828补测controller0。管线v1过滤器误将dp_eod改为dp_discard，原exit0/0tests行明确排除，补跑正确framing一次0；METADATA-DISCARD-PIPELINE-FINAL-v2.json逐项绑定26份成功日志，原错误行另列。Clippy仅旧prepare_file参数数量告警。未部署/实带/推送，现场仍normalfa7，A禁止。
+
+本片最终仅本交接检查事实晚于实际v1执行，生产/测试/管理规范逐字相同，源码清单METADATA-DISCARD-SOURCE-v3.json；读取核心字节保持证明READ-CORE-PROOF-v1。下一片显式原T1/T2前提与恢复阶段/actor/独立回执，另有IP空/截断的受控checkpoint边界必须补齐，详见本地METADATA-TAIL-IMPLEMENTATION-BOUNDARIES-v4.json（设计未实现）。严格Current证明不放宽，完整native/源覆盖/父流程/真实B验收仍未完成。

@@ -24,12 +24,12 @@ mod source;
 pub(in crate::managed_catalog) use source::require_publication_at as require_metadata_publication_at;
 pub use source::{
     ReclaimDataProgress, ReclaimFileMetadata, ReclaimMetadataAdmission,
-    ReclaimMetadataCommitEvidence, ReclaimMetadataInput, ReclaimMetadataObservation,
-    ReclaimMetadataObservationKind, ReclaimMetadataPlan, ReclaimMetadataProgress,
-    ReclaimMetadataPublication, ReclaimMetadataUnwrittenEvidence, ReclaimMetadataWrite,
-    ReclaimNodeDestination, ReclaimNodeMetadata, ReclaimNodeReadRequest, ReclaimReadSource,
-    ReclaimSourceInventory, ReclaimSourceNode, ReclaimSourceNodeKind, ReclaimSourceProgress,
-    ReclaimSourceRead,
+    ReclaimMetadataCommitEvidence, ReclaimMetadataDiscardObservation, ReclaimMetadataInput,
+    ReclaimMetadataObservation, ReclaimMetadataObservationKind, ReclaimMetadataPlan,
+    ReclaimMetadataProgress, ReclaimMetadataPublication, ReclaimMetadataUnwrittenEvidence,
+    ReclaimMetadataWrite, ReclaimNodeDestination, ReclaimNodeMetadata, ReclaimNodeReadRequest,
+    ReclaimReadSource, ReclaimSourceInventory, ReclaimSourceNode, ReclaimSourceNodeKind,
+    ReclaimSourceProgress, ReclaimSourceRead,
 };
 
 fn domain(ns: Uuid, kind: u8) -> Vec<u8> {

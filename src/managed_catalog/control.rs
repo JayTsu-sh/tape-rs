@@ -50,12 +50,13 @@ pub(super) mod reclaim;
 pub(super) use reclaim::require_metadata_publication_at as require_reclaim_metadata_publication_at;
 pub use reclaim::{
     ReclaimBodyDestination, ReclaimDataProgress, ReclaimFile, ReclaimFileMetadata,
-    ReclaimMetadataAdmission, ReclaimMetadataCommitEvidence, ReclaimMetadataInput,
-    ReclaimMetadataObservation, ReclaimMetadataObservationKind, ReclaimMetadataPlan,
-    ReclaimMetadataProgress, ReclaimMetadataPublication, ReclaimMetadataUnwrittenEvidence,
-    ReclaimMetadataWrite, ReclaimNodeDestination, ReclaimNodeMetadata, ReclaimNodeReadRequest,
-    ReclaimReadSource, ReclaimReservation, ReclaimSourceInventory, ReclaimSourceNode,
-    ReclaimSourceNodeKind, ReclaimSourceProgress, ReclaimSourceRead, ReclaimSpec, ReclaimWalk,
+    ReclaimMetadataAdmission, ReclaimMetadataCommitEvidence, ReclaimMetadataDiscardObservation,
+    ReclaimMetadataInput, ReclaimMetadataObservation, ReclaimMetadataObservationKind,
+    ReclaimMetadataPlan, ReclaimMetadataProgress, ReclaimMetadataPublication,
+    ReclaimMetadataUnwrittenEvidence, ReclaimMetadataWrite, ReclaimNodeDestination,
+    ReclaimNodeMetadata, ReclaimNodeReadRequest, ReclaimReadSource, ReclaimReservation,
+    ReclaimSourceInventory, ReclaimSourceNode, ReclaimSourceNodeKind, ReclaimSourceProgress,
+    ReclaimSourceRead, ReclaimSpec, ReclaimWalk,
 };
 #[path = "node_baseline.rs"]
 mod node_baseline;

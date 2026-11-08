@@ -21,6 +21,9 @@ pub use relocation::{ReclaimDataProgress, ReclaimMetadataInput};
 #[path = "reclaim_metadata_plan.rs"]
 mod metadata_plan;
 pub use metadata_plan::ReclaimMetadataPlan;
+#[path = "reclaim_metadata_discard.rs"]
+mod metadata_discard;
+pub use metadata_discard::ReclaimMetadataDiscardObservation;
 #[path = "reclaim_metadata_observation.rs"]
 mod metadata_observation;
 pub use metadata_observation::{
