@@ -1,3 +1,13 @@
+# 最新接续：PR #42 顺序读与 FUSE 修复合入批次（2026-11-08）
+
+最新用户要求 review 代码，通过后合入 GitHub 主分支。本批基线为 GitHub/main `d63932586fa4d57d7ab0be5f320003a2eee5ee11`，已对候选 `a4a0e6d12a0cadf59f9214309fdb22e984853615` 的5提交/17文件进行完整规范与需求两轴审查，均0项发现；13份产品源码、123份实带证据和11项成功软件日志SHA已逐项核对，本次复查fmt和Python8项通过。下方报告中的“本轮未推GitHub”属于前一验收轮的历史状态，不能用于判断此次发布结果。
+
+PR：https://github.com/JayTsu-sh/tape-rs/pull/42 。本条是合入前的交接记录；最终是否MERGED、主分支提交/树及临时分支清理，应以GitHub PR状态与本地 `/work/tmp/tape-sequential-merge-review-20261108-99tdzs_r/MERGED-CLOSEOUT-v1.json`、`.scratch/ltfs-ha/local/handoff-history.md` 的收尾证据为准，不凭本条预先宣称合入成功。审查原报告为 `/work/tmp/tape-main-physical-20261108-h9vn4yhb/merge-review-{standards,spec}-final-v1.md`。
+
+本批可执行源码仍与真实207–209已验收的 `e0a7625` 相同；本交接新增内容只记录发布状态，不重跑已消费的实带controller，不重新部署或触碰A库。既有旧CLI/离线说明、完整native reclaim及未具备现场条件的边界继续按实带报告保留，不借review扩展新功能。日常目录/分支仍是唯一工作树 `/work/jay/tape-rs` 的main。
+
+---
+
 # 最新接续：真实 B 库验收及报告已完成（2026-11-08）
 
 用户要求“在真实带库环境验证所有的功能，并给出验证报告，可优化项也要体现”。本轮已完成可安全执行的现场矩阵及收尾，结论是 **completed_with_gaps，不能称全部功能通过**。正式报告 [docs/physical-acceptance-20261108.md](../../docs/physical-acceptance-20261108.md)，可机读摘要 `docs/physical-acceptance-20261108.json`；31组矩阵中27组通过（含明确拒绝行为验证）、3组入口/字段缺口、1组完整原生reclaim封闭，另列现场受限范围。不要按下面旧“尚未部署/阶段进行中”记录重跑。
