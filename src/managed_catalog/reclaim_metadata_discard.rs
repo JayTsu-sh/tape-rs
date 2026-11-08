@@ -44,66 +44,25 @@ fn recovery_attr(attr: &&Xattr) -> bool {
 }
 
 impl ReclaimMetadataPlan {
-    /// Compare actual Current/Recorded reads without issuing any device command.
-    /// Only the two precisely validated system attributes may differ from the
-    /// original complete tree; source blocks, file counts and UIDs stay exact.
-    pub fn observe_discarded(
+    /// Shared original-media validation before repair and when recognizing it.
+    /// It never grants I/O authority, mutates the source, or materializes a tree.
+    pub(crate) fn require_discard_source(
         &self,
-        target: &CapturedIndexSource,
         original: &CapturedIndexSource,
-    ) -> Result<ReclaimMetadataDiscardObservation> {
+    ) -> Result<Vec<Xattr>> {
         self.encode()?;
-        current_proof(target.scope(), target.header())?;
         let previous = self.previous_source()?;
         let old = previous.head();
-        let head = target.header();
-        let current = target.construct();
-        let before = original.header();
-        let expected_full = if old.incremental {
-            before.previous_location
-        } else {
-            Some(old.location)
-        };
-        let expected_delta = old.incremental.then_some(old.location);
         if original.scope() != IndexSourceScope::Recorded
             || original.construct_end() != self.previous_dp_eod()
             || original.identity().map_err(cache)? != previous
-            || !before.unknown_elements.is_empty()
-            || before.highest_file_uid.checked_add(1) != Some(self.uid())
-            || current.volume_uuid != self.volume()
-            || current.location.partition != old.location.partition
-            || current.incremental
-            || head.incremental
-            || old.generation.checked_add(1) != Some(current.generation)
-            || head.generation != current.generation
-            || head.volume_uuid != current.volume_uuid
-            || head.self_location != current.location
-            || head.previous_location != expected_full
-            || head.previous_incremental_location != expected_delta
-            || head.highest_file_uid != before.highest_file_uid
-            || head.creator != before.creator
-            || head.comment != before.comment
-            || head.allow_policy_update != before.allow_policy_update
-            || head.volume_lock_state != before.volume_lock_state
-            || head.version
-                != if old.incremental {
-                    "2.5.0"
-                } else {
-                    &before.version
-                }
+            || !original.header().unknown_elements.is_empty()
+            || original.header().highest_file_uid.checked_add(1) != Some(self.uid())
         {
             return Err(CatalogError::Invalid(
-                "元数据修尾结果改变原卷头、UID 或完整历史来源",
+                "修尾来源不是原 Recorded 构造、闭合边界或完整链",
             ));
         }
-        let end = current
-            .location
-            .start_block
-            .checked_sub(2)
-            .filter(|end| self.previous_dp_eod() <= *end)
-            .ok_or(CatalogError::Invalid(
-                "元数据修尾范围不在原 EOD 与新索引之间",
-            ))?;
         let donor = original
             .entry_by_uid(self.0.donor.uid)
             .map_err(cache)?
@@ -149,7 +108,67 @@ impl ReclaimMetadataPlan {
         {
             return Err(CatalogError::Invalid("元数据修尾历史来源不是原固定完整树"));
         }
-        let original_attrs = root.ok_or(CatalogError::Incomplete)?;
+        let attrs = root.ok_or(CatalogError::Incomplete)?;
+        single(&attrs, XATTR_ABANDONED)?;
+        single(&attrs, XATTR_EMPTY_RECOVERY)?;
+        Ok(attrs)
+    }
+
+    /// Compare actual Current/Recorded reads without issuing any device command.
+    /// Only the two precisely validated system attributes may differ from the
+    /// original complete tree; source blocks, file counts and UIDs stay exact.
+    pub fn observe_discarded(
+        &self,
+        target: &CapturedIndexSource,
+        original: &CapturedIndexSource,
+    ) -> Result<ReclaimMetadataDiscardObservation> {
+        let original_attrs = self.require_discard_source(original)?;
+        current_proof(target.scope(), target.header())?;
+        let previous = self.previous_source()?;
+        let old = previous.head();
+        let head = target.header();
+        let current = target.construct();
+        let before = original.header();
+        let expected_full = if old.incremental {
+            before.previous_location
+        } else {
+            Some(old.location)
+        };
+        let expected_delta = old.incremental.then_some(old.location);
+        if current.volume_uuid != self.volume()
+            || current.location.partition != old.location.partition
+            || current.incremental
+            || head.incremental
+            || old.generation.checked_add(1) != Some(current.generation)
+            || head.generation != current.generation
+            || head.volume_uuid != current.volume_uuid
+            || head.self_location != current.location
+            || head.previous_location != expected_full
+            || head.previous_incremental_location != expected_delta
+            || head.highest_file_uid != before.highest_file_uid
+            || head.creator != before.creator
+            || head.comment != before.comment
+            || head.allow_policy_update != before.allow_policy_update
+            || head.volume_lock_state != before.volume_lock_state
+            || head.version
+                != if old.incremental {
+                    "2.5.0"
+                } else {
+                    &before.version
+                }
+        {
+            return Err(CatalogError::Invalid(
+                "元数据修尾结果改变原卷头、UID 或完整历史来源",
+            ));
+        }
+        let end = current
+            .location
+            .start_block
+            .checked_sub(2)
+            .filter(|end| self.previous_dp_eod() <= *end)
+            .ok_or(CatalogError::Invalid(
+                "元数据修尾范围不在原 EOD 与新索引之间",
+            ))?;
         let prefix = single(&original_attrs, XATTR_ABANDONED)?
             .map(|old| format!("{old};"))
             .unwrap_or_default();
@@ -199,6 +218,95 @@ impl ReclaimMetadataPlan {
             first: self.previous_dp_eod(),
             end,
         })
+    }
+}
+
+/// Fresh task-bound T1/T2 precondition. This authorizes only persisting the
+/// explicit Discard goal; execution must re-mount under its new phase guard.
+///
+/// ```compile_fail
+/// let _: tape_rs::managed_catalog::ReclaimMetadataTailEvidence =
+///     serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReclaimMetadataTailEvidence {
+    task: ReclaimMetadataWrite,
+    tail_eod: u64,
+}
+impl ReclaimMetadataTailEvidence {
+    pub fn tail_eod(&self) -> u64 {
+        self.tail_eod
+    }
+    pub(crate) fn from_report(
+        task: &ReclaimMetadataWrite,
+        owner: u64,
+        original: &CapturedIndexSource,
+        report: &crate::ltfs::recovery::RecoveryReport,
+        current: crate::ltfs::volume::CommittedIndexConstruct,
+    ) -> Result<Self> {
+        use crate::ltfs::recovery::TailKind;
+        let plan = task.plan();
+        if task.owner() != owner
+            || !(task.writing() || task.discarding())
+            || task
+                .observation()?
+                .is_some_and(|value| value.kind() == ReclaimMetadataObservationKind::Committed)
+        {
+            return Err(CatalogError::Invalid("修尾前提不属于当前未决原尝试"));
+        }
+        plan.require_discard_source(original)?;
+        let last = report
+            .dp
+            .last_index
+            .as_ref()
+            .ok_or(CatalogError::Incomplete)?;
+        if current != plan.previous_source()?.head()
+            || last.index.volume_uuid != current.volume_uuid
+            || last.index.generation != current.generation
+            || last.index.self_location != current.location
+            || last.construct_sha256 != current.sha256
+            || last.index.incremental != current.incremental
+            || last.end_block.checked_add(1) != Some(plan.previous_dp_eod())
+            || report.dp.eod <= plan.previous_dp_eod()
+            || report.dp.eod.checked_add(3).is_none()
+            || !matches!(
+                report.dp.tail,
+                TailKind::UnindexedData | TailKind::TruncatedIndex
+            )
+            || !report.chain_ok
+            || !report.history_checked
+            || report.chain_truncated_by_budget
+            || report.ip_ahead()
+            || report.restricted_reason().is_some()
+            || original
+                .header()
+                .volume_lock_state
+                .as_deref()
+                .is_some_and(|lock| lock != "unlocked")
+        {
+            return Err(CatalogError::Invalid(
+                "修尾前提要求原实际卷头/闭合边界及完整 T1/T2 恢复视图",
+            ));
+        }
+        Ok(Self {
+            task: task.clone(),
+            tail_eod: report.dp.eod,
+        })
+    }
+    pub(in crate::managed_catalog) fn require(
+        &self,
+        task: &ReclaimMetadataWrite,
+        owner: u64,
+    ) -> Result<()> {
+        if self.task != *task
+            || task.owner() != owner
+            || self.tail_eod <= task.plan().previous_dp_eod()
+        {
+            return Err(CatalogError::Invalid(
+                "修尾前提改变原 owner、尝试或持久快照",
+            ));
+        }
+        Ok(())
     }
 }
 

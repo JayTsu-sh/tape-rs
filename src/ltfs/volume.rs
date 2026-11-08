@@ -857,6 +857,34 @@ impl<'a> LtfsVolume<'a> {
             .map_err(|error| TapeError::Catalog(error.to_string()))
     }
 
+    /// Read-only precondition for journaling this exact metadata attempt's tail
+    /// Discard. Requires a fresh full-budget mount and current PR; callers still
+    /// enforce the original FDB task and Permission on every device command
+    /// from the serialized device executor. Positioning may settle already
+    /// buffered writes; this method appends no data, index or filemarks.
+    #[cfg(feature = "fdb")]
+    pub fn reclaim_metadata_tail_evidence(
+        &mut self,
+        task: &crate::managed_catalog::ReclaimMetadataWrite,
+        original: &crate::ltfs::recovery::CapturedIndexSource,
+    ) -> Result<crate::managed_catalog::ReclaimMetadataTailEvidence> {
+        if self.dirty {
+            return Err(TapeError::Catalog(
+                "元数据修尾前提要求重新挂载，不能使用工作树".into(),
+            ));
+        }
+        let current = self.verified_recovery_index_construct()?;
+        let round = self.reservation_guard.expect("verified guard").round();
+        crate::managed_catalog::ReclaimMetadataTailEvidence::from_report(
+            task,
+            round,
+            original,
+            &self.recovery,
+            current,
+        )
+        .map_err(|error| TapeError::Catalog(error.to_string()))
+    }
+
     /// Explicitly append a Discard index for this original node attempt's T1/T2
     /// tail. The original committed source is checked before any tail write.
     /// The caller still enforces current FDB ownership, policy and execution.

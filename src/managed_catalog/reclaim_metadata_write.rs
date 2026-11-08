@@ -4,6 +4,8 @@ use super::*;
 use metadata_plan::Plan;
 #[path = "reclaim_metadata_context.rs"]
 mod context;
+#[path = "reclaim_metadata_discard_intent.rs"]
+mod discard_intent;
 #[path = "reclaim_metadata_publication.rs"]
 mod publication;
 #[path = "reclaim_metadata_registry.rs"]
@@ -20,6 +22,7 @@ pub(in crate::managed_catalog) use publication::require_history_at as require_pu
 enum Phase {
     Prepared,
     Writing,
+    Discarding,
     Closed,
     Committed,
 }
@@ -68,6 +71,9 @@ impl ReclaimMetadataWrite {
     pub fn writing(&self) -> bool {
         self.0.phase == Phase::Writing
     }
+    pub fn discarding(&self) -> bool {
+        self.0.phase == Phase::Discarding
+    }
     pub fn closed(&self) -> bool {
         self.0.phase == Phase::Closed
     }
@@ -75,7 +81,10 @@ impl ReclaimMetadataWrite {
         self.0.phase == Phase::Committed
     }
     fn holds_claim(&self) -> bool {
-        matches!(self.0.phase, Phase::Prepared | Phase::Writing)
+        matches!(
+            self.0.phase,
+            Phase::Prepared | Phase::Writing | Phase::Discarding
+        )
     }
     /// Retained snapshot evidence, never permission to replay or release claims.
     pub fn observation(&self) -> Result<Option<ReclaimMetadataObservation>> {
@@ -102,7 +111,8 @@ impl ReclaimMetadataWrite {
         if let Some(observed) = self.observation()?
             && !(self.writing()
                 || self.completed()
-                || self.closed() && observed.kind() == ReclaimMetadataObservationKind::Unchanged)
+                || (self.closed() || self.discarding())
+                    && observed.kind() == ReclaimMetadataObservationKind::Unchanged)
         {
             return Err(CatalogError::Corrupt("未开写任务不能保留介质结果观察"));
         }
@@ -168,7 +178,8 @@ fn require_phase_history(
     }
     if original.0.phase != Phase::Prepared
         && original.0.phase != current.0.phase
-        && !(original.writing() && (current.completed() || current.closed()))
+        && !(original.writing()
+            && (current.completed() || current.closed() || current.discarding()))
     {
         return Err(CatalogError::Corrupt("回收元数据阶段与原回执冲突"));
     }
@@ -386,6 +397,18 @@ async fn target_at(
     plan: &ReclaimMetadataPlan,
     input: &ReclaimMetadataInput,
 ) -> Result<Uuid> {
+    target_policy_at(tr, reservation, plan, input, true).await
+}
+
+// A cleanup Discard adds no file; it must still pass the same current media,
+// original scan/head/count/input and pool checks without reserving another slot.
+async fn target_policy_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    plan: &ReclaimMetadataPlan,
+    input: &ReclaimMetadataInput,
+    new_file: bool,
+) -> Result<Uuid> {
     require_pool_without_reclaim_at(tr, reservation.namespace(), reservation.spec().pool).await?;
     let (scan, index) = active_volume::observed_at(tr, reservation.serial(), plan.volume()).await?;
     let mut encoded = Vec::new();
@@ -404,7 +427,7 @@ async fn target_at(
         .await?
         .ok_or(CatalogError::Incomplete)?;
     let pool = decode_pool(reservation.spec().pool, &pool_raw)?;
-    if count.checked_add(1).is_none_or(|n| n > pool.file_limit) {
+    if new_file && count.checked_add(1).is_none_or(|n| n > pool.file_limit) {
         return Err(CatalogError::Incomplete);
     }
     let assignment = ManagedCatalog::verified_assignment(
@@ -557,9 +580,9 @@ impl ManagedCatalog {
                             require_phase_history(original, &task)?;
                             task.0.context.require(reservation, file, request)?;
                             let needs_observation = match task.0.phase {
-                                Phase::Closed | Phase::Committed => {
+                                Phase::Closed | Phase::Committed | Phase::Discarding => {
                                     return Err(CatalogError::Invalid(
-                                        "已关闭或已发布的元数据任务不能重新准入",
+                                        "已关闭、已发布或已转入修尾的元数据任务不能重新准入",
                                     ));
                                 }
                                 Phase::Writing => true,
@@ -674,6 +697,11 @@ impl ManagedCatalog {
                                 return Err(CatalogError::Invalid("观察改变原回收元数据计划"));
                             }
                             require_phase_history(original, &task)?;
+                            if task.discarding() {
+                                return Err(CatalogError::Invalid(
+                                    "原任务已转入修尾，不能再记录普通写入观察",
+                                ));
+                            }
                             if task.0.observation.as_deref() == Some(raw) {
                                 return Ok(task);
                             }
@@ -822,7 +850,7 @@ impl ManagedCatalog {
                             if task.completed() {
                                 return Err(CatalogError::Invalid("已发布任务不能改成未写关闭"));
                             }
-                            if task.writing() {
+                            if task.0.phase != Phase::Prepared {
                                 return Err(CatalogError::PoolBusy);
                             }
                             task.0.phase = Phase::Closed;

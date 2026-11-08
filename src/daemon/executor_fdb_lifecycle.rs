@@ -6093,12 +6093,42 @@ mod tests {
         .await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；实际 Sim T2 前提/持久修尾意图/HA，无修尾写"]
+    async fn reclaim_metadata_discard_intent_keeps_truncated_attempt_claims_across_ha() {
+        Box::pin(native_lifecycle(MetadataCase::Execution(
+            MetadataExecutionCase::DiscardIntent,
+        )))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；实际 Sim T1 前提/持久修尾意图/HA，无修尾写"]
+    async fn reclaim_metadata_discard_intent_requires_actual_unindexed_original_tail() {
+        Box::pin(native_lifecycle(MetadataCase::Execution(
+            MetadataExecutionCase::DiscardIntentT1,
+        )))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；旧未写token不可跨入Discarding释放占用，Sim"]
+    async fn reclaim_metadata_discard_intent_fences_an_earlier_unwritten_token() {
+        Box::pin(native_lifecycle(MetadataCase::Execution(
+            MetadataExecutionCase::DiscardIntentFromUnchanged,
+        )))
+        .await;
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum MetadataExecutionCase {
         Commit,
         LostAdmission,
         IpFailure,
         ClosingFailure,
+        DiscardIntent,
+        DiscardIntentT1,
+        DiscardIntentFromUnchanged,
         PermissionAfterWrite,
         PermissionAfterPr,
         Publication,
@@ -6272,6 +6302,90 @@ mod tests {
         assert!(volume.pending_files().is_empty());
     }
 
+    fn metadata_tail_precondition(
+        fixture: &Fixture,
+        drive: usize,
+        task: &crate::managed_catalog::ReclaimMetadataWrite,
+        prepared: &crate::managed_catalog::ReclaimMetadataWrite,
+        cached: &crate::ltfs::recovery::CapturedIndexSource,
+        expected: crate::ltfs::recovery::TailKind,
+    ) -> crate::managed_catalog::ReclaimMetadataTailEvidence {
+        use crate::managed_catalog::ReclaimMetadataTailEvidence;
+        let device = fixture.owner.devices[drive].dev.as_ref();
+        let original = crate::ltfs::recovery::capture_recorded_index_source(
+            &TapeDrive::new(device),
+            &crate::ltfs::volume::read_label_only(device).unwrap(),
+            &task.plan().previous_source().unwrap(),
+            &crate::ltfs::recovery::RecoveryBudget::default(),
+        )
+        .unwrap();
+        let mut volume = LtfsVolume::mount_with_budget(
+            device,
+            &crate::ltfs::recovery::RecoveryBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(volume.recovery().dp.tail, expected);
+        assert!(
+            volume
+                .reclaim_metadata_tail_evidence(task, &original)
+                .is_err(),
+            "没有PR守卫不能生成前提"
+        );
+        volume.set_reservation_guard(Some(fixture.owner.key));
+        assert!(
+            volume
+                .reclaim_metadata_tail_evidence(prepared, &original)
+                .is_err(),
+            "Prepared不是原未决写入"
+        );
+        assert!(
+            volume.reclaim_metadata_tail_evidence(task, cached).is_err(),
+            "缓存Current不能替代Recorded实读"
+        );
+        let current = volume.verified_recovery_index_construct().unwrap();
+        let mut bad = volume.recovery().clone();
+        bad.dp.tail = crate::ltfs::recovery::TailKind::Complete;
+        assert!(
+            ReclaimMetadataTailEvidence::from_report(
+                task,
+                fixture.owner.round,
+                &original,
+                &bad,
+                current
+            )
+            .is_err()
+        );
+        let mut bad = volume.recovery().clone();
+        bad.dp.eod = u64::MAX;
+        assert!(
+            ReclaimMetadataTailEvidence::from_report(
+                task,
+                fixture.owner.round,
+                &original,
+                &bad,
+                current
+            )
+            .is_err()
+        );
+        let mut bad = volume.recovery().clone();
+        bad.history_checked = false;
+        assert!(
+            ReclaimMetadataTailEvidence::from_report(
+                task,
+                fixture.owner.round,
+                &original,
+                &bad,
+                current
+            )
+            .is_err()
+        );
+        let proof = volume
+            .reclaim_metadata_tail_evidence(task, &original)
+            .unwrap();
+        assert!(proof.tail_eod() > task.plan().previous_dp_eod());
+        proof
+    }
+
     fn checkpoint_metadata_fixture(fixture: &Fixture, drive: usize) {
         // The ordinary data path deliberately leaves an IP checkpoint debt.
         // Build this positive fixture before preparing the metadata attempt;
@@ -6306,7 +6420,9 @@ mod tests {
         fn before(&self, opcode: u8) -> Result<()> {
             let selected = match self.mode {
                 MetadataExecutionCase::IpFailure => Some(0x0a),
-                MetadataExecutionCase::ClosingFailure => Some(0x10),
+                MetadataExecutionCase::ClosingFailure
+                | MetadataExecutionCase::DiscardIntent
+                | MetadataExecutionCase::DiscardIntentT1 => Some(0x10),
                 _ => None,
             };
             if selected == Some(opcode)
@@ -7742,7 +7858,7 @@ mod tests {
                     }).await;
                     return;
                 }
-                if matches!(mode, MetadataExecutionCase::LostAdmission | MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpDebt | MetadataExecutionCase::ClosedRetryContext | MetadataExecutionCase::UnwrittenIpMissing | MetadataExecutionCase::UnwrittenFraming | MetadataExecutionCase::UnwrittenIpAhead) {
+                if matches!(mode, MetadataExecutionCase::LostAdmission | MetadataExecutionCase::DiscardIntentFromUnchanged | MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpDebt | MetadataExecutionCase::ClosedRetryContext | MetadataExecutionCase::UnwrittenIpMissing | MetadataExecutionCase::UnwrittenFraming | MetadataExecutionCase::UnwrittenIpAhead) {
                     catalog.admit_reclaim_metadata_write(&reserved, fixture.owner.round, &scanned, &input_request, &metadata_write).await.unwrap();
                 }
                 if mode == MetadataExecutionCase::UnwrittenIpAhead {
@@ -7782,7 +7898,7 @@ mod tests {
                     fixture.lib.cartridge(&input.destination().placement().barcode).unwrap()
                 });
                 let first = writer.execute(&reserved, &scanned, &input_request, &metadata_write,
-                    if matches!(mode, MetadataExecutionCase::LostAdmission | MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpDebt | MetadataExecutionCase::ClosedRetryContext | MetadataExecutionCase::UnwrittenIpMissing | MetadataExecutionCase::UnwrittenFraming | MetadataExecutionCase::UnwrittenIpAhead) {None} else {Some(&captured)}).await;
+                    if matches!(mode, MetadataExecutionCase::LostAdmission | MetadataExecutionCase::DiscardIntentFromUnchanged | MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpDebt | MetadataExecutionCase::ClosedRetryContext | MetadataExecutionCase::UnwrittenIpMissing | MetadataExecutionCase::UnwrittenFraming | MetadataExecutionCase::UnwrittenIpAhead) {None} else {Some(&captured)}).await;
                 if mode == MetadataExecutionCase::UnwrittenIpAhead {
                     assert!(matches!(first, Err(TapeError::RecoveryRestricted { ref reason })
                         if reason.contains("IP 索引代数") && reason.contains("领先 FDB 已观察 DP")), "{first:?}");
@@ -8039,6 +8155,86 @@ mod tests {
                     assert!(catalog.publish_reclaim_metadata_write(&parents.items[0],next,&scanned,&input_request,&recovered,proof).await.is_err(),"旧owner实读token不可重绑新owner");
                     assert_eq!(*fixture.commands.lock().unwrap(),commands,"接任已发布结果不发设备命令");
                     return;
+                }
+                if matches!(mode, MetadataExecutionCase::DiscardIntent | MetadataExecutionCase::DiscardIntentT1 | MetadataExecutionCase::DiscardIntentFromUnchanged) {
+                    boxed_metadata_phase(|| async {
+                        let earlier = match first {
+                            Ok(execution) if mode==MetadataExecutionCase::DiscardIntentFromUnchanged => {
+                                assert!(execution.unwritten_evidence().is_some());Some(execution)
+                            }
+                            Err(error) if mode!=MetadataExecutionCase::DiscardIntentFromUnchanged => {
+                                assert!(matches!(&error,TapeError::CommitFailed {stage,..} if stage == "closing_fm"),"{error}");None
+                            }
+                            other => panic!("unexpected metadata result: {other:?}"),
+                        };
+                        let task=catalog.reclaim_metadata_write_status(&reserved,fixture.owner.round,source_data_uid).await.unwrap().unwrap();
+                        assert!(task.writing());
+                        if earlier.is_some() {assert_eq!(task.observation().unwrap().unwrap().kind(),ReclaimMetadataObservationKind::Unchanged);}
+                        else {assert!(task.observation().unwrap().is_none());}
+                        let expected=if matches!(mode,MetadataExecutionCase::DiscardIntentT1 | MetadataExecutionCase::DiscardIntentFromUnchanged) {
+                            // Explicitly construct T1 after the retained failed attempt.
+                            // Only this Sim's uncommitted tail is replaced; old DP bytes stay.
+                            fixture.lib.with_cartridge_mut(&input.destination().placement().barcode,|cartridge| {
+                                let dp=&mut cartridge.partitions[1];dp.objects.truncate(metadata_plan.previous_dp_eod() as usize);
+                                dp.objects.push(crate::scsi::sim::LogicalObject::Record(b"unindexed-metadata-prefix".to_vec()));dp.flushed=dp.objects.len();cartridge.vcr+=1;
+                            });crate::ltfs::recovery::TailKind::UnindexedData
+                        } else {crate::ltfs::recovery::TailKind::TruncatedIndex};
+                        // Exercise a persistent T1/T2 tail. LOCATE may settle
+                        // previously buffered writes; that is not a new repair
+                        // append. Keep the original v2 flush-only failure log.
+                        fixture.lib.with_cartridge_mut(&input.destination().placement().barcode,|cartridge| {
+                            for partition in &mut cartridge.partitions {partition.flushed=partition.objects.len();}
+                        });
+                        let media=fixture.lib.cartridge(&input.destination().placement().barcode).unwrap();
+                        let proof=metadata_tail_precondition(&fixture,drive,&task,&metadata_write,&captured_target,expected);
+                        let commands=fixture.commands.lock().unwrap().clone();
+                        let mut wrong_request=input_request.clone();wrong_request.operation_id=uuid::Uuid::new_v4();
+                        assert!(catalog.begin_reclaim_metadata_discard(&reserved,fixture.owner.round,&scanned,&wrong_request,&task,&proof).await.is_err());
+                        for key in [&metadata_active_key,&metadata_volume_key,&data_body_key] {
+                            let tr=raw_catalog.create_trx().unwrap();let raw=tr.get(key,false).await.unwrap().unwrap().to_vec();tr.clear(key);tr.commit().await.unwrap();
+                            let missing=catalog.begin_reclaim_metadata_discard(&reserved,fixture.owner.round,&scanned,&input_request,&task,&proof).await;
+                            let tr=raw_catalog.create_trx().unwrap();let untouched=tr.get(key,false).await.unwrap().is_none();tr.set(key,&raw);tr.commit().await.unwrap();
+                            assert!(missing.is_err() && untouched,"丢原占用/输入不补建或另发意图");
+                        }
+                        let index=catalog.observed_active_volume_index(&serial,metadata_plan.volume()).await.unwrap();
+                        let count=catalog.active_volume_file_count(&serial,route,fixture.owner.round,metadata_plan.volume()).await.unwrap();
+                        let mut next_key=b"tape-rs/catalog/22/r/".to_vec();next_key.extend_from_slice(metadata_plan.volume().as_bytes());next_key.extend_from_slice(&(index.generation+1).to_be_bytes());
+                        let tr=raw_catalog.create_trx().unwrap();tr.set(&next_key,b"unknown-result");tr.commit().await.unwrap();
+                        assert!(catalog.begin_reclaim_metadata_discard(&reserved,fixture.owner.round,&scanned,&input_request,&task,&proof).await.is_err());
+                        let tr=raw_catalog.create_trx().unwrap();assert_eq!(tr.get(&next_key,false).await.unwrap().unwrap().as_ref(),b"unknown-result");tr.clear(&next_key);tr.set(&pool_key,&full_pool);tr.commit().await.unwrap();
+                        let (one,two)=tokio::join!(Box::pin(catalog.begin_reclaim_metadata_discard(&reserved,fixture.owner.round,&scanned,&input_request,&task,&proof)),Box::pin(catalog.begin_reclaim_metadata_discard(&reserved,fixture.owner.round,&scanned,&input_request,&task,&proof)));
+                        let discarding=one.unwrap();assert_eq!(two.unwrap(),discarding,"并发只保存一个原修尾意图");
+                        assert!(discarding.discarding() && !discarding.writing() && !discarding.closed() && !discarding.completed());
+                        assert_eq!(discarding.id(),task.id());assert_eq!(discarding.plan(),task.plan());
+                        assert_eq!(catalog.begin_reclaim_metadata_discard(&reserved,fixture.owner.round,&scanned,&input_request,&task,&proof).await.unwrap(),discarding,"未知准入结果保留同一phase/attempt");
+                        assert!(catalog.admit_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&task).await.is_err());
+                        assert!(catalog.close_prepared_reclaim_metadata_write(&reserved,fixture.owner.round,&metadata_write).await.is_err(),"Prepared旧回执不能关闭Discarding");
+                        assert!(catalog.close_prepared_reclaim_metadata_write(&reserved,fixture.owner.round,&discarding).await.is_err());
+                        if let Some(earlier)=&earlier {
+                            assert!(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,earlier.task(),earlier.unwritten_evidence().unwrap()).await.is_err(),"旧Writing阶段未写token不能释放Discarding占用");
+                        }
+                        assert!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&discarding).await.is_err());
+                        assert!(catalog.reclaim_metadata_retry_context(&reserved,fixture.owner.round,&discarding).await.is_err());
+                        let observation=metadata_plan.observe_current(&captured_target,None).unwrap();
+                        assert!(catalog.record_reclaim_metadata_observation(&reserved,fixture.owner.round,&task,&observation).await.is_err());
+                        assert_eq!(catalog.reclaim_metadata_execution_context(&reserved,fixture.owner.round,&discarding).await.unwrap(),(scanned.clone(),input_request.clone()));
+                        assert_eq!(catalog.pending_reclaim_metadata_write(&reserved,fixture.owner.round).await.unwrap(),Some(discarding.clone()));
+                        assert_eq!(catalog.observed_active_volume_index(&serial,metadata_plan.volume()).await.unwrap(),index);
+                        assert_eq!(catalog.active_volume_file_count(&serial,route,fixture.owner.round,metadata_plan.volume()).await.unwrap(),count);
+                        let tr=raw_catalog.create_trx().unwrap();for key in [&metadata_active_key,&metadata_volume_key] {assert_eq!(tr.get(key,false).await.unwrap().unwrap().as_ref(),active.as_slice());}tr.set(&pool_key,&pool_bytes);tr.commit().await.unwrap();
+                        assert!(writer.execute(&reserved,&scanned,&input_request,&task,None).await.is_err(),"普通writer不能接续Discarding");
+                        let next=fixture.owner.round+100;catalog.claim_active_owner_epoch(&serial,next).await.unwrap();
+                        let parents=catalog.claim_reclaim_reservations_page(&serial,route,next,None,16).await.unwrap();
+                        let saved=observer.reclaim_metadata_checkpoint(&parents.items[0],next).await.unwrap().unwrap();assert_eq!(saved,discarding);
+                        let recovered=catalog.claim_reclaim_metadata_attempt(&parents.items[0],next,&saved).await.unwrap();assert!(recovered.discarding());assert_eq!(recovered.id(),task.id());
+                        assert_eq!(observer.reclaim_metadata_execution_context(&parents.items[0],next,&recovered).await.unwrap(),(scanned.clone(),input_request.clone()));
+                        assert!(catalog.begin_reclaim_metadata_discard(&reserved,fixture.owner.round,&scanned,&input_request,&task,&proof).await.is_err());
+                        assert!(catalog.begin_reclaim_metadata_discard(&parents.items[0],next,&scanned,&input_request,&recovered,&proof).await.is_err(),"旧owner前提不能重绑接任");
+                        assert!(catalog.close_prepared_reclaim_metadata_write(&parents.items[0],next,&recovered).await.is_err());
+                        assert_eq!(catalog.pending_reclaim_metadata_write(&parents.items[0],next).await.unwrap(),Some(recovered));
+                        assert_eq!(*fixture.commands.lock().unwrap(),commands,"FDB意图/上下文/HA均无设备命令");
+                        assert_reclaim_media_unchanged(&media,&fixture.lib.cartridge(&input.destination().placement().barcode).unwrap());
+                    }).await;return;
                 }
                 let failure = matches!(mode, MetadataExecutionCase::IpFailure | MetadataExecutionCase::ClosingFailure | MetadataExecutionCase::PermissionAfterWrite);
                 if failure {

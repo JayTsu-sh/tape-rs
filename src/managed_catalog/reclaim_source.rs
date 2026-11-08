@@ -23,7 +23,7 @@ mod metadata_plan;
 pub use metadata_plan::ReclaimMetadataPlan;
 #[path = "reclaim_metadata_discard.rs"]
 mod metadata_discard;
-pub use metadata_discard::ReclaimMetadataDiscardObservation;
+pub use metadata_discard::{ReclaimMetadataDiscardObservation, ReclaimMetadataTailEvidence};
 #[path = "reclaim_metadata_observation.rs"]
 mod metadata_observation;
 pub use metadata_observation::{

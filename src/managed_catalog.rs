@@ -106,10 +106,11 @@ pub use control::{
     ReclaimMetadataAdmission, ReclaimMetadataCommitEvidence, ReclaimMetadataDiscardObservation,
     ReclaimMetadataInput, ReclaimMetadataObservation, ReclaimMetadataObservationKind,
     ReclaimMetadataPlan, ReclaimMetadataProgress, ReclaimMetadataPublication,
-    ReclaimMetadataUnwrittenEvidence, ReclaimMetadataWrite, ReclaimNodeDestination,
-    ReclaimNodeMetadata, ReclaimNodeReadRequest, ReclaimReadSource, ReclaimReservation,
-    ReclaimSourceInventory, ReclaimSourceNode, ReclaimSourceNodeKind, ReclaimSourceProgress,
-    ReclaimSourceRead, ReclaimSpec, ReclaimWalk, TapeAssignment, VolumePlacement,
+    ReclaimMetadataTailEvidence, ReclaimMetadataUnwrittenEvidence, ReclaimMetadataWrite,
+    ReclaimNodeDestination, ReclaimNodeMetadata, ReclaimNodeReadRequest, ReclaimReadSource,
+    ReclaimReservation, ReclaimSourceInventory, ReclaimSourceNode, ReclaimSourceNodeKind,
+    ReclaimSourceProgress, ReclaimSourceRead, ReclaimSpec, ReclaimWalk, TapeAssignment,
+    VolumePlacement,
 };
 pub use cutover::{
     FrozenSnapshotIdentity, VerifiedNodeExport, inspect_frozen_snapshot, verify_node_export,

@@ -53,10 +53,10 @@ pub use reclaim::{
     ReclaimMetadataAdmission, ReclaimMetadataCommitEvidence, ReclaimMetadataDiscardObservation,
     ReclaimMetadataInput, ReclaimMetadataObservation, ReclaimMetadataObservationKind,
     ReclaimMetadataPlan, ReclaimMetadataProgress, ReclaimMetadataPublication,
-    ReclaimMetadataUnwrittenEvidence, ReclaimMetadataWrite, ReclaimNodeDestination,
-    ReclaimNodeMetadata, ReclaimNodeReadRequest, ReclaimReadSource, ReclaimReservation,
-    ReclaimSourceInventory, ReclaimSourceNode, ReclaimSourceNodeKind, ReclaimSourceProgress,
-    ReclaimSourceRead, ReclaimSpec, ReclaimWalk,
+    ReclaimMetadataTailEvidence, ReclaimMetadataUnwrittenEvidence, ReclaimMetadataWrite,
+    ReclaimNodeDestination, ReclaimNodeMetadata, ReclaimNodeReadRequest, ReclaimReadSource,
+    ReclaimReservation, ReclaimSourceInventory, ReclaimSourceNode, ReclaimSourceNodeKind,
+    ReclaimSourceProgress, ReclaimSourceRead, ReclaimSpec, ReclaimWalk,
 };
 #[path = "node_baseline.rs"]
 mod node_baseline;

@@ -26,10 +26,10 @@ pub use source::{
     ReclaimDataProgress, ReclaimFileMetadata, ReclaimMetadataAdmission,
     ReclaimMetadataCommitEvidence, ReclaimMetadataDiscardObservation, ReclaimMetadataInput,
     ReclaimMetadataObservation, ReclaimMetadataObservationKind, ReclaimMetadataPlan,
-    ReclaimMetadataProgress, ReclaimMetadataPublication, ReclaimMetadataUnwrittenEvidence,
-    ReclaimMetadataWrite, ReclaimNodeDestination, ReclaimNodeMetadata, ReclaimNodeReadRequest,
-    ReclaimReadSource, ReclaimSourceInventory, ReclaimSourceNode, ReclaimSourceNodeKind,
-    ReclaimSourceProgress, ReclaimSourceRead,
+    ReclaimMetadataProgress, ReclaimMetadataPublication, ReclaimMetadataTailEvidence,
+    ReclaimMetadataUnwrittenEvidence, ReclaimMetadataWrite, ReclaimNodeDestination,
+    ReclaimNodeMetadata, ReclaimNodeReadRequest, ReclaimReadSource, ReclaimSourceInventory,
+    ReclaimSourceNode, ReclaimSourceNodeKind, ReclaimSourceProgress, ReclaimSourceRead,
 };
 
 fn domain(ns: Uuid, kind: u8) -> Vec<u8> {

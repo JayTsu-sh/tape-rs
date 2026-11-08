@@ -64,3 +64,15 @@ Plan v3 固定原实际 DP EOD 并纳入摘要/边界校验，Unchanged/首次�
 8be83c2 后新增独立 Discard fact：完整 Current 新Full +原 Recorded/完整链及实际构造结束块，原EOD到新Full起点-2的范围、原前缀和emptyRecovery双标记、原树/UID/count/donor/关键header均核对。原根属性与单对象流式核对，不发CDB、不修改持久任务、不授IO，不自动close_tail或发布/释放；显式Recovering/Recovered、独立回执及完整父流程仍待实现。历史捕获从原SHA验证读取额外返回exclusive construct end，共享底层读取不增加CDB、不改变原value-only调用方语义。实际历史索引重分段+已放弃记录删除保持新/旧XML身份和新Full位置不变，原33451测试子进程三测中边界负例exit101，修后4666测试子进程三测exit0；首轮34820夹具使用绝对链接被既有卷根约束拒绝，已改为相对链接，不算逻辑红测。实际执行的 19 项 SDK、14 项观察单测和六软件检查全部通过，双轴静态审查0；原48449管线0与77828补测controller0。管线v1过滤器误将dp_eod改为dp_discard，原exit0/0tests行明确排除，补跑正确framing一次0；METADATA-DISCARD-PIPELINE-FINAL-v2.json逐项绑定26份成功日志，原错误行另列。Clippy仅旧prepare_file参数数量告警。未部署/实带/推送，现场仍normalfa7，A禁止。
 
 本片最终仅本交接检查事实晚于实际v1执行，生产/测试/管理规范逐字相同，源码清单METADATA-DISCARD-SOURCE-v3.json；读取核心字节保持证明READ-CORE-PROOF-v1。下一片显式原T1/T2前提与恢复阶段/actor/独立回执，另有IP空/截断的受控checkpoint边界必须补齐，详见本地METADATA-TAIL-IMPLEMENTATION-BOUNDARIES-v4.json（设计未实现）。严格Current证明不放宽，完整native/源覆盖/父流程/真实B验收仍未完成。
+
+## 2026-11-08 显式 Discarding 前提与意图（历史预验记录，见下方正式结果）
+
+HEAD ffe86417327a07c3dd0f7cae66fb9dddeb1aafcf。九个Rust路径未提交：共享原Recorded/end/chain/tree核对、fresh PR/full-budget T1/T2前提Token、Discarding phase以及原RW/RZ原子意图；RA/Qv保持，不执行close_tail，不授写入或释放。普通metadata准入/观察/准备关闭/重试拒绝Discarding，当前持有者可恢复原context；cleanup不再占新file quota但原目标head/count/scan/media/pool/input仍检查。生产check0；新单测及T2/T1预验原75718正在跑，先wait，禁止重复启动或改其冻结Rust路径。详情 METADATA-DISCARD-INTENT-WORKING-STATE-v1.json；尚未全检查/审查/部署/实带/push。原56981编译String模式错误与9892的T2定位结清旧buffer引起flushed11->13原失败保留；v3明确稳定持久T1/T2夹具，定位可让已在设备中的缓冲落盘，非新append；不隐瞒该潜在副作用。下一全套21SDK/14观察/六软件与双轴后才提交；actual repair actor/独立回执、IP空/截断checkpoint和fullparent仍未实现。
+
+上述75718预验最终unit3/T2/T1均0，尚未全套。新增真实旧NoWrite token跨Discarding拒绝回归后，当前17967在跑v4四项预验（old-token/unit3/T2/T1）；先wait别重复，冻结Rust源见PRECHECK-SOURCE-v4。下一完整矩阵为22SDK/14观察单测/六软件，状态见METADATA-DISCARD-INTENT-WORKING-STATE-v2.json。代码还未提交/部署/实带，actual修尾actor/回执仍待。
+
+## 2026-11-08 Discarding 正式候选（软件验证完成）
+
+前述17967 v4预验 old-token/unit3/T2/T1 四子进程全0。已冻结正式11路径候选 METADATA-DISCARD-INTENT-CANDIDATE-v1.json，基线ffe8641；原4652管线实际22SDK、14观察单测与六软件全部exit0，29份成功日志与源码SHA绑定见METADATA-DISCARD-INTENT-PIPELINE-FINAL-v1.json；无零用例或复用旧候选。新增phase不变更Task字段或增兼容分支；token仅授权保存意图，非IO许可；同phase RW/RZ原子更新/原RAQv保持，oldNoWrite token跨phase释放被拒绝。原编译错误与T2读定位结清旧buffer的flushed差异保留，稳定持久tail夹具不是生产修复，也非新逻辑红测。双轴静态审查0；最终复核与提交结果查METADATA-DISCARD-INTENT-REVIEWS-v2.json及COMMITTED-v2.json；尚未部署/实带/push。actual修尾actor、结果回执与正常结果恢复(不能放宽旧token用途)、IP空/截断checkpoint、fullparent仍缺，设计见METADATA-TAIL-IMPLEMENTATION-BOUNDARIES-v5.json。
+
+本片仅此交接事实收尾晚于实际执行候选，全部Rust/测试/管理规范逐字相同，最终源码清单METADATA-DISCARD-INTENT-SOURCE-v2.json。全部预验与正式controller均已退出，不重复启动。Clippy仅旧prepare_file参数数量告警；正常target策略原body保持证明TARGET-POLICY-PROOF-v1。原编译/稳定夹具失败日志保留，不冒称产品红测；旧未写证明跨phase的真实拒绝已在22SDK矩阵中验证。下一修尾执行器、用途/phase绑定的新鲜结果证明与独立恢复回执，必须先辨实际正常Commit/NoWrite/Discard结果再决定IO；IP空/损坏checkpoint及fullparent仍待，不能放宽旧NoWrite token的关闭门槛。设计METADATA-TAIL-IMPLEMENTATION-BOUNDARIES-v5.json未实现，public native/源format继续关闭，真实B验收未完成。
