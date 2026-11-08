@@ -6021,6 +6021,24 @@ mod tests {
         .await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；重新实读未开写任务后精确关闭，Sim，无实际设备"]
+    async fn reclaim_metadata_unwritten_closure_requires_fresh_original_evidence() {
+        Box::pin(native_lifecycle(MetadataCase::Execution(
+            MetadataExecutionCase::UnwrittenClose,
+        )))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；实际 Sim IP ahead，DP 未变也不能授权未写关闭"]
+    async fn reclaim_metadata_unwritten_closure_rejects_ip_ahead() {
+        Box::pin(native_lifecycle(MetadataCase::Execution(
+            MetadataExecutionCase::UnwrittenIpAhead,
+        )))
+        .await;
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum MetadataExecutionCase {
         Commit,
@@ -6030,6 +6048,30 @@ mod tests {
         PermissionAfterWrite,
         PermissionAfterPr,
         Publication,
+        UnwrittenClose,
+        UnwrittenIpAhead,
+    }
+
+    fn checkpoint_metadata_fixture(fixture: &Fixture, drive: usize) {
+        // The ordinary data path deliberately leaves an IP checkpoint debt.
+        // Build this positive fixture before preparing the metadata attempt;
+        // only IP is checkpointed, and the exact DP head must stay unchanged.
+        let mut volume =
+            crate::ltfs::volume::LtfsVolume::mount(fixture.owner.devices[drive].dev.as_ref())
+                .unwrap();
+        volume.set_reservation_guard(Some(fixture.owner.key));
+        let before = volume.verified_committed_index_construct().unwrap();
+        assert!(
+            !before.incremental && volume.needs_checkpoint(),
+            "普通正文写入夹具应保留 IP 债务"
+        );
+        volume.commit().unwrap();
+        assert_eq!(
+            volume.verified_committed_index_construct().unwrap(),
+            before,
+            "准备前 IP checkpoint 不得推进 DP"
+        );
+        assert!(!volume.needs_checkpoint());
     }
 
     struct MetadataFault<'a> {
@@ -6672,6 +6714,14 @@ mod tests {
             )
             .await
             .unwrap();
+        if matches!(
+            metadata_case,
+            MetadataCase::Execution(
+                MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpAhead
+            )
+        ) {
+            checkpoint_metadata_fixture(&fixture, drive);
+        }
         let captured_target = crate::ltfs::recovery::capture_index_source(
             &TapeDrive::new(fixture.owner.devices[drive].dev.as_ref()),
             &crate::ltfs::volume::read_label_only(fixture.owner.devices[drive].dev.as_ref())
@@ -7316,11 +7366,89 @@ mod tests {
                 assert!(writer.execute(&reserved, &scanned, &input_request, &metadata_write, Some(&captured_target)).await.is_err(), "其他卷不是原源实读");
                 assert_eq!(*fixture.commands.lock().unwrap(), original_commands);
                 assert_eq!(catalog.reclaim_metadata_write_status(&reserved, fixture.owner.round, source_data_uid).await.unwrap(), Some(metadata_write.clone()));
-                if mode == MetadataExecutionCase::LostAdmission {
+                if matches!(mode, MetadataExecutionCase::LostAdmission | MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpAhead) {
                     catalog.admit_reclaim_metadata_write(&reserved, fixture.owner.round, &scanned, &input_request, &metadata_write).await.unwrap();
                 }
+                if mode == MetadataExecutionCase::UnwrittenIpAhead {
+                    let old = format!("<generationnumber>{}</generationnumber>", captured_target.construct().generation);
+                    let new = format!("<generationnumber>{}</generationnumber>", captured_target.construct().generation + 1);
+                    let mut changed = 0;
+                    fixture.lib.with_cartridge_mut(&input.destination().placement().barcode, |cartridge| {
+                        for object in &mut cartridge.partitions[0].objects {
+                            if let crate::scsi::sim::LogicalObject::Record(raw) = object
+                                && let Ok(text) = std::str::from_utf8(raw)
+                                && text.contains("<ltfsindex")
+                            {
+                                assert!(text.contains(&old));
+                                *raw = text.replace(&old, &new).into_bytes();
+                                changed += 1;
+                            }
+                        }
+                        cartridge.vcr += 1;
+                    });
+                    assert_eq!(changed, 1, "实际只构造 IP 更高代次，DP 不变");
+                }
                 let first = writer.execute(&reserved, &scanned, &input_request, &metadata_write,
-                    if mode == MetadataExecutionCase::LostAdmission {None} else {Some(&captured)}).await;
+                    if matches!(mode, MetadataExecutionCase::LostAdmission | MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpAhead) {None} else {Some(&captured)}).await;
+                if mode == MetadataExecutionCase::UnwrittenIpAhead {
+                    assert!(matches!(first, Err(TapeError::RecoveryRestricted { ref reason })
+                        if reason.contains("IP 索引代数") && reason.contains("领先 FDB 已观察 DP")), "{first:?}");
+                    let task = catalog.reclaim_metadata_write_status(&reserved,fixture.owner.round,source_data_uid).await.unwrap().unwrap();
+                    assert!(task.writing() && task.observation().unwrap().is_none());
+                    assert_eq!(catalog.observed_active_volume_index(&serial,metadata_plan.volume()).await.unwrap(),crate::managed_catalog::ActiveIndexIdentity::from(captured_target.construct()));
+                    let tr=raw_catalog.create_trx().unwrap();
+                    assert_eq!(tr.get(&metadata_active_key,false).await.unwrap().unwrap().as_ref(),active.as_slice());
+                    assert_eq!(tr.get(&metadata_volume_key,false).await.unwrap().unwrap().as_ref(),active.as_slice());
+                    assert!(!fixture.commands.lock().unwrap()[original_commands.len()..].iter().any(|(_,op)|matches!(op,0x04|0x0a|0x10|0x19|0x8d|0xa5)),"IP ahead 只读拒绝，无写/修尾/搬带");
+                    return;
+                }
+                if mode == MetadataExecutionCase::UnwrittenClose {
+                    Box::pin(async {
+                    let execution = first.unwrap();
+                    let task = execution.task();
+                    assert!(task.writing() && execution.commit_evidence().is_none());
+                    assert_eq!(task.observation().unwrap().unwrap().kind(), ReclaimMetadataObservationKind::Unchanged);
+                    assert!(catalog.close_prepared_reclaim_metadata_write(&reserved, fixture.owner.round, task).await.is_err());
+                    let commands = fixture.commands.lock().unwrap().clone();
+                    let index = catalog.observed_active_volume_index(&serial, metadata_plan.volume()).await.unwrap();
+                    assert_eq!(index, crate::managed_catalog::ActiveIndexIdentity::from(captured_target.construct()));
+                    let proof = execution.unwritten_evidence().unwrap();
+                    let mut changed_request = input_request.clone();changed_request.operation_id=uuid::Uuid::new_v4();
+                    assert!(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&changed_request,task,proof).await.is_err());
+                    for key in [&metadata_active_key,&metadata_volume_key] {
+                        let tr=raw_catalog.create_trx().unwrap();tr.clear(key);tr.commit().await.unwrap();
+                        assert!(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,task,proof).await.is_err());
+                        let tr=raw_catalog.create_trx().unwrap();assert!(tr.get(key,false).await.unwrap().is_none());
+                        tr.set(key,&active);tr.commit().await.unwrap();
+                    }
+                    let mut next_history=b"tape-rs/catalog/22/r/".to_vec();next_history.extend_from_slice(metadata_plan.volume().as_bytes());next_history.extend_from_slice(&(index.generation+1).to_be_bytes());
+                    let mut next_count=next_history.clone();next_count.push(b'f');
+                    let mut next_receipt=own_row(b'H');next_receipt.truncate(next_receipt.len()-24);next_receipt.extend_from_slice(metadata_plan.volume().as_bytes());next_receipt.extend_from_slice(&(index.generation+1).to_be_bytes());
+                    for key in [&next_history,&next_count,&next_receipt] {
+                        let tr=raw_catalog.create_trx().unwrap();tr.set(key,b"unknown-original-result");tr.commit().await.unwrap();
+                        assert!(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,task,proof).await.is_err());
+                        let tr=raw_catalog.create_trx().unwrap();assert_eq!(tr.get(key,false).await.unwrap().unwrap().as_ref(),b"unknown-original-result");tr.clear(key);tr.commit().await.unwrap();
+                    }
+                    let (one,two)=tokio::join!(Box::pin(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,task,proof)),Box::pin(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,task,proof)));
+                    let closed=one.unwrap();assert_eq!(two.unwrap(),closed);assert!(closed.closed());assert_eq!(closed.id(),task.id());assert_eq!(closed.observation().unwrap().as_ref(),Some(proof.observation()));
+                    assert_eq!(catalog.observed_active_volume_index(&serial,metadata_plan.volume()).await.unwrap(),index);
+                    let tr=raw_catalog.create_trx().unwrap();assert!(tr.get(&metadata_active_key,false).await.unwrap().is_none());assert!(tr.get(&metadata_volume_key,false).await.unwrap().is_none());
+                    for key in [&next_history,&next_count,&next_receipt] {assert!(tr.get(key,false).await.unwrap().is_none());}
+                    tr.set(&metadata_active_key,b"later-original-task");tr.set(&metadata_volume_key,b"later-original-task");tr.commit().await.unwrap();
+                    assert_eq!(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,task,proof).await.unwrap(),closed);
+                    assert!(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&changed_request,task,proof).await.is_err());
+                    let tr=raw_catalog.create_trx().unwrap();for key in [&metadata_active_key,&metadata_volume_key] {assert_eq!(tr.get(key,false).await.unwrap().unwrap().as_ref(),b"later-original-task");tr.clear(key);}tr.commit().await.unwrap();
+                    assert!(writer.execute(&reserved,&scanned,&input_request,&closed,None).await.is_err());
+                    assert_eq!(*fixture.commands.lock().unwrap(),commands,"关闭和终态重试均无设备命令");
+                    let next=fixture.owner.round+100;catalog.claim_active_owner_epoch(&serial,next).await.unwrap();
+                    let parents=catalog.claim_reclaim_reservations_page(&serial,route,next,None,16).await.unwrap();
+                    let recovered=catalog.claim_reclaim_metadata_write(&parents.items[0],next,source_data_uid).await.unwrap();
+                    assert!(recovered.closed());assert_eq!(recovered.id(),task.id());
+                    assert!(catalog.close_unwritten_reclaim_metadata_write(&parents.items[0],next,&scanned,&input_request,&recovered,proof).await.is_err(),"旧owner实读证明不能重绑");
+                    assert_eq!(*fixture.commands.lock().unwrap(),commands);
+                    }).await;
+                    return;
+                }
                 if mode == MetadataExecutionCase::PermissionAfterPr {
                     assert!(first.is_err());
                     assert!(device.fired.load(std::sync::atomic::Ordering::SeqCst));
@@ -7476,6 +7604,9 @@ mod tests {
                 } else {
                     let result = first.unwrap();
                     assert!(result.task().writing());
+                    if mode == MetadataExecutionCase::LostAdmission {
+                        assert!(result.unwritten_evidence().is_none(), "原 DP 未变但 IP 落后，仍不能关闭");
+                    }
                     let expected = if mode == MetadataExecutionCase::LostAdmission {ReclaimMetadataObservationKind::Unchanged} else {ReclaimMetadataObservationKind::Committed};
                     assert_eq!(result.task().observation().unwrap().unwrap().kind(), expected);
                 }

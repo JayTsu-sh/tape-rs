@@ -4,6 +4,8 @@ use super::*;
 use metadata_plan::Plan;
 #[path = "reclaim_metadata_publication.rs"]
 mod publication;
+#[path = "reclaim_metadata_unwritten.rs"]
+mod unwritten;
 pub use publication::ReclaimMetadataPublication;
 pub(in crate::managed_catalog) use publication::require_history_at as require_publication_at;
 
@@ -69,7 +71,11 @@ impl ReclaimMetadataWrite {
         self.plan().encode()?;
         node_mutation::id(&self.0.id)?;
         node_mutation::id(&self.0.scan)?;
-        if self.observation()?.is_some() && !(self.writing() || self.completed()) {
+        if let Some(observed) = self.observation()?
+            && !(self.writing()
+                || self.completed()
+                || self.closed() && observed.kind() == ReclaimMetadataObservationKind::Unchanged)
+        {
             return Err(CatalogError::Corrupt("未开写任务不能保留介质结果观察"));
         }
         if self.completed()
@@ -129,7 +135,7 @@ fn require_phase_history(
     }
     if original.0.phase != Phase::Prepared
         && original.0.phase != current.0.phase
-        && !(original.writing() && current.completed())
+        && !(original.writing() && (current.completed() || current.closed()))
     {
         return Err(CatalogError::Corrupt("回收元数据阶段与原回执冲突"));
     }

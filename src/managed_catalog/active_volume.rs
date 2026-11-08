@@ -467,14 +467,15 @@ pub(super) fn set_reclaim_observation_at(
 
 pub(super) async fn require_empty_generation(
     tr: &Transaction,
-    index: ActiveIndexIdentity,
+    volume: Uuid,
+    generation: u64,
 ) -> Result<()> {
     if tr
-        .get(&generation_key(index.volume_uuid, index.generation), false)
+        .get(&generation_key(volume, generation), false)
         .await?
         .is_some()
         || tr
-            .get(&file_count_key(index.volume_uuid, index.generation), false)
+            .get(&file_count_key(volume, generation), false)
             .await?
             .is_some()
     {

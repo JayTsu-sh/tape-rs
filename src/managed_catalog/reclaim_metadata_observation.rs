@@ -9,38 +9,29 @@ pub enum ReclaimMetadataObservationKind {
     Committed,
 }
 
-/// A live, owner/attempt-bound result produced by the guarded device actor.
-/// Unlike a retained observation, this type cannot be restored from FDB.
-///
-/// ```compile_fail
-/// let _: tape_rs::managed_catalog::ReclaimMetadataCommitEvidence =
-///     serde_json::from_str("{}").unwrap();
-/// ```
 #[derive(Debug, PartialEq, Eq)]
-pub struct ReclaimMetadataCommitEvidence {
+struct CurrentMetadataEvidence {
     owner: u64,
     attempt: Uuid,
     scan: Uuid,
     plan: [u8; 32],
     observation: ReclaimMetadataObservation,
 }
-impl ReclaimMetadataCommitEvidence {
-    pub fn observation(&self) -> &ReclaimMetadataObservation {
-        &self.observation
-    }
-    pub(crate) fn from_current(
+impl CurrentMetadataEvidence {
+    fn capture(
         task: &ReclaimMetadataWrite,
         owner: u64,
         target: &CapturedIndexSource,
         predecessor: Option<&CapturedIndexSource>,
+        kind: ReclaimMetadataObservationKind,
     ) -> Result<Self> {
         let observation = task.plan().observe_current(target, predecessor)?;
         if !task.writing()
             || task.owner() != owner
-            || observation.kind() != ReclaimMetadataObservationKind::Committed
+            || observation.kind() != kind
             || task.observation()?.as_ref() != Some(&observation)
         {
-            return Err(CatalogError::Invalid("缺少原任务本轮实读提交证明"));
+            return Err(CatalogError::Invalid("缺少原任务本轮实读结果证明"));
         }
         Ok(Self {
             owner,
@@ -50,7 +41,7 @@ impl ReclaimMetadataCommitEvidence {
             observation,
         })
     }
-    pub(crate) fn require(
+    fn require(
         &self,
         task: &ReclaimMetadataWrite,
         owner: u64,
@@ -66,6 +57,89 @@ impl ReclaimMetadataCommitEvidence {
             ));
         }
         Ok(&self.observation)
+    }
+}
+
+/// A live, owner/attempt-bound result produced by the guarded device actor.
+/// Unlike a retained observation, this type cannot be restored from FDB.
+///
+/// ```compile_fail
+/// let _: tape_rs::managed_catalog::ReclaimMetadataCommitEvidence =
+///     serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReclaimMetadataCommitEvidence(CurrentMetadataEvidence);
+impl ReclaimMetadataCommitEvidence {
+    pub fn observation(&self) -> &ReclaimMetadataObservation {
+        &self.0.observation
+    }
+    pub(crate) fn from_current(
+        task: &ReclaimMetadataWrite,
+        owner: u64,
+        target: &CapturedIndexSource,
+        predecessor: Option<&CapturedIndexSource>,
+    ) -> Result<Self> {
+        CurrentMetadataEvidence::capture(
+            task,
+            owner,
+            target,
+            predecessor,
+            ReclaimMetadataObservationKind::Committed,
+        )
+        .map(Self)
+    }
+    pub(crate) fn require(
+        &self,
+        task: &ReclaimMetadataWrite,
+        owner: u64,
+    ) -> Result<&ReclaimMetadataObservation> {
+        self.0.require(task, owner)
+    }
+}
+
+/// Fresh guarded evidence of the unchanged clean DP head with an equal IP
+/// generation. An old saved snapshot or a retained commit token cannot close it.
+///
+/// ```compile_fail
+/// let _: tape_rs::managed_catalog::ReclaimMetadataUnwrittenEvidence =
+///     serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReclaimMetadataUnwrittenEvidence(CurrentMetadataEvidence);
+impl ReclaimMetadataUnwrittenEvidence {
+    pub fn observation(&self) -> &ReclaimMetadataObservation {
+        &self.0.observation
+    }
+    pub(crate) fn from_clean_current(
+        task: &ReclaimMetadataWrite,
+        owner: u64,
+        target: &CapturedIndexSource,
+    ) -> Result<Option<Self>> {
+        let IndexSourceScope::Current {
+            ip_generation: Some(ip),
+            ..
+        } = target.scope()
+        else {
+            return Ok(None);
+        };
+        if ip != target.construct().generation {
+            return Ok(None);
+        }
+        CurrentMetadataEvidence::capture(
+            task,
+            owner,
+            target,
+            None,
+            ReclaimMetadataObservationKind::Unchanged,
+        )
+        .map(|proof| Some(Self(proof)))
+    }
+    pub(crate) fn require(
+        &self,
+        task: &ReclaimMetadataWrite,
+        owner: u64,
+    ) -> Result<&ReclaimMetadataObservation> {
+        self.0.require(task, owner)
     }
 }
 

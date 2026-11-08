@@ -92,6 +92,23 @@ async fn at(
         .transpose()
 }
 
+pub(super) async fn require_empty_result_at(
+    tr: &Transaction,
+    namespace: Uuid,
+    volume: Uuid,
+    generation: u64,
+) -> Result<()> {
+    let mut key = domain(namespace, b'H');
+    key.extend_from_slice(volume.as_bytes());
+    key.extend_from_slice(&generation.to_be_bytes());
+    if tr.get(&key, false).await?.is_some() {
+        return Err(CatalogError::Corrupt(
+            "新元数据代次已有结果回执，不得覆盖或关闭",
+        ));
+    }
+    active_volume::require_empty_generation(tr, volume, generation).await
+}
+
 /// A retained physical history must not depend on the current parent/ledger.
 pub(in crate::managed_catalog) async fn require_history_at(
     tr: &Transaction,
@@ -160,7 +177,7 @@ pub(super) async fn require_task_at(
     Ok(value)
 }
 
-fn require_original(
+pub(super) fn require_original(
     original: &ReclaimMetadataWrite,
     current: &ReclaimMetadataWrite,
     owner: u64,
@@ -260,16 +277,18 @@ impl ManagedCatalog {
                                 .await?
                                     != plan.0.physical_files
                                 || active_volume::recovery_active(&tr, plan.volume()).await?
-                                || at(&tr, reservation.namespace(), evidence.current())
-                                    .await?
-                                    .is_some()
                             {
                                 return Err(CatalogError::Corrupt(
                                     "发布时原目标卷头、计数、扫描或结果槽改变",
                                 ));
                             }
-                            active_volume::require_empty_generation(&tr, evidence.current())
-                                .await?;
+                            require_empty_result_at(
+                                &tr,
+                                reservation.namespace(),
+                                plan.volume(),
+                                evidence.current().generation,
+                            )
+                            .await?;
                             task.0.phase = Phase::Committed;
                             let value = ReclaimMetadataPublication::from_wire(Wire {
                                 version: 1,

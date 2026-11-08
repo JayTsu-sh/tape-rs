@@ -25,6 +25,7 @@ pub use metadata_plan::ReclaimMetadataPlan;
 mod metadata_observation;
 pub use metadata_observation::{
     ReclaimMetadataCommitEvidence, ReclaimMetadataObservation, ReclaimMetadataObservationKind,
+    ReclaimMetadataUnwrittenEvidence,
 };
 #[path = "reclaim_metadata_write.rs"]
 mod metadata_write;

@@ -10,8 +10,8 @@ use crate::ltfs::recovery::{
 use crate::ltfs::volume::{LtfsVolume, read_label_only};
 use crate::managed_catalog::{
     ActiveFileRequest, ActiveLibraryRoute, ManagedCatalog, ReclaimFile,
-    ReclaimMetadataCommitEvidence, ReclaimMetadataObservationKind, ReclaimMetadataWrite,
-    ReclaimReservation,
+    ReclaimMetadataCommitEvidence, ReclaimMetadataObservationKind,
+    ReclaimMetadataUnwrittenEvidence, ReclaimMetadataWrite, ReclaimReservation,
 };
 use crate::scsi::reservation::{ReservationKey, verify_holder};
 use crate::scsi::transport::TapeTransport;
@@ -30,10 +30,14 @@ pub struct ReclaimMetadataWriter<'a> {
 pub struct ReclaimMetadataExecution {
     task: ReclaimMetadataWrite,
     commit: Option<ReclaimMetadataCommitEvidence>,
+    unwritten: Option<ReclaimMetadataUnwrittenEvidence>,
 }
 impl ReclaimMetadataExecution {
     pub fn task(&self) -> &ReclaimMetadataWrite {
         &self.task
+    }
+    pub fn unwritten_evidence(&self) -> Option<&ReclaimMetadataUnwrittenEvidence> {
+        self.unwritten.as_ref()
     }
     pub fn commit_evidence(&self) -> Option<&ReclaimMetadataCommitEvidence> {
         self.commit.as_ref()
@@ -121,7 +125,11 @@ impl ReclaimMetadataWriter<'_> {
                 .await
                 .map_err(catalog)?
                 .ok_or_else(|| catalog("已发布元数据任务缺失"))?;
-            return Ok(ReclaimMetadataExecution { task, commit: None });
+            return Ok(ReclaimMetadataExecution {
+                task,
+                commit: None,
+                unwritten: None,
+            });
         }
         if let Some(source) = source {
             original.plan().validate_source(source).map_err(catalog)?;
@@ -222,7 +230,17 @@ impl ReclaimMetadataWriter<'_> {
         } else {
             None
         };
-        Ok(ReclaimMetadataExecution { task, commit })
+        let unwritten = if observed.kind() == ReclaimMetadataObservationKind::Unchanged {
+            ReclaimMetadataUnwrittenEvidence::from_clean_current(&task, self.key.round(), &actual)
+                .map_err(catalog)?
+        } else {
+            None
+        };
+        Ok(ReclaimMetadataExecution {
+            task,
+            commit,
+            unwritten,
+        })
     }
 }
 
