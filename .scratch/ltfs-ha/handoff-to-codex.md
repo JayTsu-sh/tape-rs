@@ -1,3 +1,17 @@
+# 当前接续：验收报告三项缺陷已修复并实带通过（2026-11-08）
+
+最新用户要求修复 `docs/physical-acceptance-20261108.md` 指明的缺口。产品提交 `8bd242ac8eb8fb890be4f54102edfaeadabb23d6` 已完成旧drive/node/cluster查询、顶层stat/list/get及offline_message投影三项缺陷修复，附管理分页固定100的解析/帮助手册约束。10项软件检查通过，Clippy仅既有prepare_file参数数量告警；最终diff自查0，不宣称独立双轴审查或已合GitHub。
+
+- 207–209已正常部署8bd242a的ltfsd/ltfsctl，目录 `/opt/tape-rs/v1-20261108-8bd242ac8eb8`；未改动的低层工具和FUSE继续使用e0a7625原产物，SHA逐项记录。原45153/namespace/state/unit保持，正常停启前后权威摘要一致，无强杀/清锁/手工PR操作。A库继续释放。
+- 新实带证据 `/work/tmp/tape-acceptance-gap-fixes-20261108-64uu7mpq`：`UPGRADE-COMPLETE.json`、`physical/COMPLETE.json`、`final-integrity.json`。三节点HTTP与CLI管理查询及拒绝边界通过；顶层list自动跨页1096项全局有序，目录含中文；4389B原S3对象CLI/S3 SHA一致；下载失败不建输出、不覆盖文件或符号链接。
+- 原L84新增offline/online两个成功任务，三节点list/show和CLI显示离线说明，上线后清空；L84同卷643ea0be...、原native6池02004aa0...、online/nonblacklisted，正文复读正确。14类占用空、三入口ready；S3元数据/上传/节点回执/池/回收摘要未变。没有FORMAT/ERASE。
+- 原accept.py在属性筛选JSON对象与标量的脚本断言处停止，正确返回已保留。只读核对原offline任务后，resume-online-v1.py仅完成原计划尚未发出的online与收尾；均已消费，不可重跑。两次部署预检错误未到副作用点；build原缺链接路径失败、成功v2均留存。
+- 报告原e0矩阵及123份证据保留，补验与84份新文件SHA追加至JSON的gap_repairs_v1；软件源SHA见checked-sources.json，最终发行来源见artifact.json。GitHub尚未发布本批修复。
+
+剩余范围继续按报告和既有设计处理：完整native reclaim仍封闭，实际tail actor/独立结清回执、IP空/截断恢复、新donor/replan、完整源覆盖/父流程/Serving前恢复尚未完成；不能根据三项查询缺陷收口开放源格式化。顺序/Range/导入等性能建议及现场条件受限项没有借此宣称完成。后续新动作前刷新实际服务/库存/原任务，保留已有live/retained数据，不重跑历史controller。
+
+---
+
 # 最新接续：PR #42 顺序读与 FUSE 修复合入批次（2026-11-08）
 
 最新用户要求 review 代码，通过后合入 GitHub 主分支。本批基线为 GitHub/main `d63932586fa4d57d7ab0be5f320003a2eee5ee11`，已对候选 `a4a0e6d12a0cadf59f9214309fdb22e984853615` 的5提交/17文件进行完整规范与需求两轴审查，均0项发现；13份产品源码、123份实带证据和11项成功软件日志SHA已逐项核对，本次复查fmt和Python8项通过。下方报告中的“本轮未推GitHub”属于前一验收轮的历史状态，不能用于判断此次发布结果。
