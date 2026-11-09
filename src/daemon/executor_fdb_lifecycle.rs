@@ -5,6 +5,9 @@ use crate::changer::element::{ElementAddressMap, ElementStatus};
 use crate::managed_catalog::{CatalogError, NativeDeviceTask};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(test)]
+#[path = "executor_fdb_reclaim_tests.rs"]
+mod parent_recovery;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1206,6 +1209,3419 @@ mod tests {
     use crate::scsi::sim::{SimCartridge, SimLibrary};
 
     type Commands = Arc<std::sync::Mutex<Vec<(DeviceKind, u8)>>>;
+
+    async fn verify_node_coverage(
+        catalog: &crate::managed_catalog::ManagedCatalog,
+        parent: &crate::managed_catalog::ReclaimReservation,
+        owner: u64,
+        inventory: &crate::managed_catalog::ReclaimSourceInventory<'_>,
+        observations: &[crate::managed_catalog::ReclaimNodeMetadata],
+        db: &foundationdb::Database,
+    ) {
+        let mut prefix = b"tape-rs/catalog/22/@/".to_vec();
+        prefix.extend_from_slice(parent.namespace().as_bytes());
+        prefix.extend_from_slice(b"Rq");
+        prefix.extend_from_slice(&parent.intent()["epoch"].as_u64().unwrap().to_be_bytes());
+        prefix.extend_from_slice(
+            uuid::Uuid::parse_str(parent.intent()["operation"].as_str().unwrap())
+                .unwrap()
+                .as_bytes(),
+        );
+        let mut progress_key = prefix.clone();
+        let kind = progress_key.len() - 25;
+        progress_key[kind] = b'y';
+        assert!(
+            catalog
+                .step_reclaim_source_coverage(parent, owner, inventory)
+                .await
+                .is_err(),
+            "实际源索引和观察清单本身不是完整覆盖"
+        );
+        for observation in observations {
+            assert!(
+                catalog
+                    .seal_reclaim_node_coverage(parent, owner + 1, observation)
+                    .await
+                    .is_err()
+            );
+            if observation.target_path().is_empty() {
+                assert!(
+                    catalog
+                        .seal_reclaim_node_coverage(parent, owner, observation)
+                        .await
+                        .is_err(),
+                    "目的卷根仍由恢复机制修改，不能代替独立归档节点"
+                );
+                continue;
+            }
+            catalog
+                .seal_reclaim_node_coverage(parent, owner, observation)
+                .await
+                .unwrap();
+            catalog
+                .seal_reclaim_node_coverage(parent, owner, observation)
+                .await
+                .unwrap();
+        }
+        for observation in observations
+            .iter()
+            .filter(|proof| !proof.target_path().is_empty())
+        {
+            let mut key = prefix.clone();
+            key.extend_from_slice(&observation.source_uid().to_be_bytes());
+            let tr = db.create_trx().unwrap();
+            let raw = tr.get(&key, false).await.unwrap().unwrap().to_vec();
+            tr.clear(&key);
+            tr.commit().await.unwrap();
+            assert!(
+                catalog
+                    .step_reclaim_source_coverage(parent, owner, inventory)
+                    .await
+                    .is_err(),
+                "根目录、空目录或链接任一缺失都阻止覆盖结清"
+            );
+            let tr = db.create_trx().unwrap();
+            assert!(
+                tr.get(&progress_key, false).await.unwrap().is_none(),
+                "失败页不能部分推进"
+            );
+            tr.set(&key, &raw);
+            tr.commit().await.unwrap();
+        }
+        assert!(
+            catalog
+                .step_reclaim_source_coverage(parent, owner, inventory)
+                .await
+                .is_err(),
+            "缺少独立源根节点不得结清覆盖"
+        );
+        assert!(
+            catalog
+                .check_reclaim_source_unreferenced(parent, owner)
+                .await
+                .is_err(),
+            "完整物理节点覆盖仍不能代替零 catalog 引用门槛"
+        );
+    }
+    async fn verify_node_metadata_actor(
+        catalog: &crate::managed_catalog::ManagedCatalog,
+        fixture: &Fixture,
+        control: &FdbOwnerControl,
+        parent: &crate::managed_catalog::ReclaimReservation,
+        source: &crate::ltfs::recovery::CapturedIndexSource,
+        repair: bool,
+        relocate: bool,
+    ) {
+        use crate::ltfs::recovery::{RecoveryBudget, capture_index_source};
+        use crate::managed_catalog::{
+            ReclaimNodeDestination, ReclaimNodeReadRequest, ReclaimSourceInventory,
+        };
+        let inventory = ReclaimSourceInventory::from_captured(source).unwrap();
+        let root = catalog
+            .reclaim_source_nodes(parent, fixture.owner.round, &inventory, &[1])
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let device = fixture.device();
+        let budget = RecoveryBudget::default();
+        let target = capture_index_source(
+            &TapeDrive::new(device),
+            &crate::ltfs::volume::read_label_only(device).unwrap(),
+            &budget,
+        )
+        .unwrap();
+        let mut plan = inventory
+            .plan_reclaimed_node(parent, &root, &target, "reclaimed-source-root")
+            .unwrap();
+        let original_files = catalog
+            .active_volume_file_count(
+                &control.serial,
+                control.route,
+                fixture.owner.round,
+                plan.volume(),
+            )
+            .await
+            .unwrap();
+        let mut task = catalog
+            .prepare_reclaim_metadata_node(parent, fixture.owner.round, &plan)
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog
+                .prepare_reclaim_metadata_node(parent, fixture.owner.round, &plan)
+                .await
+                .unwrap(),
+            task
+        );
+        assert_eq!(
+            catalog
+                .reserved_reclaim_status(parent, fixture.owner.round)
+                .await
+                .unwrap()["phase"],
+            "copying"
+        );
+        assert_eq!(
+            catalog
+                .reserved_reclaim_status(parent, fixture.owner.round)
+                .await
+                .unwrap()["children"],
+            0
+        );
+        assert!(
+            catalog
+                .release_reserved_reclaim(parent, fixture.owner.round)
+                .await
+                .is_err(),
+            "节点写入不能按只读空预留释放父任务"
+        );
+        assert!(
+            catalog
+                .reclaim_metadata_execution_context(parent, fixture.owner.round, &task)
+                .await
+                .is_err(),
+            "节点任务不伪造文件子请求"
+        );
+        assert!(
+            catalog
+                .step_reclaim_source_coverage(parent, fixture.owner.round, &inventory)
+                .await
+                .is_err(),
+            "未决元数据写入不能结清覆盖"
+        );
+        let fault = MetadataFault {
+            inner: device,
+            mode: if repair {
+                MetadataExecutionCase::DiscardIntent
+            } else {
+                MetadataExecutionCase::Commit
+            },
+            matching: std::sync::atomic::AtomicUsize::new(0),
+            fired: std::sync::atomic::AtomicBool::new(false),
+            permission: &fixture.permit,
+            round: fixture.owner.round,
+        };
+        let mut actor = crate::daemon::fdb_reclaim_media::ReclaimMetadataWriter {
+            catalog,
+            device: &fault,
+            route: control.route,
+            key: fixture.owner.key,
+            permission: &fixture.permit,
+            budget: &budget,
+        };
+        if repair {
+            assert!(
+                matches!(actor.execute(parent,&task,Some(source)).await,Err(TapeError::CommitFailed {ref stage,..}) if stage=="closing_fm")
+            );
+            // Make the simulated partial construct durable explicitly.
+            fixture.lib.with_cartridge_mut("NODES1L8", |cartridge| {
+                for partition in &mut cartridge.partitions {
+                    partition.flushed = partition.objects.len();
+                }
+            });
+            let writing = catalog
+                .reclaim_metadata_write_status(parent, fixture.owner.round, plan.source_uid())
+                .await
+                .unwrap()
+                .unwrap();
+            let goal = actor.begin_discard(parent, &writing).await.unwrap();
+            let crate::daemon::fdb_reclaim_media::ReclaimMetadataRecovery::Observed(proof) =
+                actor.recover(parent, &goal).await.unwrap()
+            else {
+                panic!("fresh recovery")
+            };
+            let resolved = catalog
+                .resolve_reclaim_metadata_recovery(parent, fixture.owner.round, &goal, &proof)
+                .await
+                .unwrap();
+            assert_eq!(
+                resolved.kind(),
+                crate::managed_catalog::ReclaimMetadataRecoveryKind::Discarded
+            );
+            let old = catalog
+                .reclaim_metadata_write_status(parent, fixture.owner.round, plan.source_uid())
+                .await
+                .unwrap()
+                .unwrap();
+            let live = actor
+                .read_source_replan(parent, &old, source)
+                .await
+                .unwrap();
+            plan = live.plan().clone();
+            let operation = uuid::Uuid::new_v4();
+            let (one, two) = tokio::join!(
+                catalog.replan_reclaim_metadata_source(
+                    parent,
+                    fixture.owner.round,
+                    &old,
+                    operation,
+                    &live
+                ),
+                catalog.replan_reclaim_metadata_source(
+                    parent,
+                    fixture.owner.round,
+                    &old,
+                    operation,
+                    &live
+                )
+            );
+            task = one.unwrap();
+            assert_eq!(two.unwrap(), task);
+            assert_eq!(
+                catalog
+                    .reclaim_metadata_successor(parent, fixture.owner.round, &old, operation)
+                    .await
+                    .unwrap(),
+                Some(task.clone())
+            );
+            assert!(
+                catalog
+                    .replan_reclaim_metadata_source(
+                        parent,
+                        fixture.owner.round,
+                        &old,
+                        uuid::Uuid::new_v4(),
+                        &live
+                    )
+                    .await
+                    .is_err()
+            );
+            let closed = catalog
+                .close_prepared_reclaim_metadata_write(parent, fixture.owner.round, &task)
+                .await
+                .unwrap();
+            task = catalog
+                .retry_reclaim_metadata_write(parent, fixture.owner.round, &closed)
+                .await
+                .unwrap();
+            let mut key = b"tape-rs/catalog/22/@/".to_vec();
+            key.extend_from_slice(parent.namespace().as_bytes());
+            key.extend_from_slice(b"RV");
+            key.extend_from_slice(&parent.intent()["epoch"].as_u64().unwrap().to_be_bytes());
+            key.extend_from_slice(
+                uuid::Uuid::parse_str(parent.intent()["operation"].as_str().unwrap())
+                    .unwrap()
+                    .as_bytes(),
+            );
+            key.extend_from_slice(&plan.source_uid().to_be_bytes());
+            key.extend_from_slice(old.id().as_bytes());
+            let db = foundationdb::Database::from_path(&std::env::var("FDB_TEST_CLUSTER").unwrap())
+                .unwrap();
+            let tr = db.create_trx().unwrap();
+            let edge = tr.get(&key, false).await.unwrap().unwrap().to_vec();
+            tr.clear(&key);
+            tr.commit().await.unwrap();
+            assert!(
+                catalog
+                    .reclaim_metadata_checkpoint(parent, fixture.owner.round)
+                    .await
+                    .is_err(),
+                "节点同计划重试不能绕过原重新规划来源"
+            );
+            assert_eq!(
+                catalog
+                    .observed_active_volume_index(&control.serial, plan.volume())
+                    .await
+                    .unwrap(),
+                crate::managed_catalog::ActiveIndexIdentity::from(
+                    plan.previous_source().unwrap().head()
+                ),
+                "独立恢复历史不依赖父任务的后继边"
+            );
+            let tr = db.create_trx().unwrap();
+            tr.set(&key, &edge);
+            tr.commit().await.unwrap();
+        }
+        let result = actor.execute(parent, &task, Some(source)).await.unwrap();
+        let proof = result.commit_evidence().unwrap();
+        assert_eq!(proof.observation().physical_files(), original_files);
+        let published = catalog
+            .publish_reclaim_metadata_write(parent, fixture.owner.round, result.task(), proof)
+            .await
+            .unwrap();
+        let commands = fixture.drive_log();
+        let replay = actor.execute(parent, &task, None).await.unwrap();
+        assert!(replay.task().completed() && replay.commit_evidence().is_none());
+        assert_eq!(
+            fixture.drive_log(),
+            commands,
+            "原节点发布重放不能再次写索引"
+        );
+        let reader = crate::daemon::fdb_read::ActiveMediaReader {
+            catalog,
+            device,
+            serial: &control.serial,
+            route: control.route,
+            key: fixture.owner.key,
+            permission: &fixture.permit,
+            storage: fixture.budget(),
+        };
+        let observations = reader
+            .read_reclaim_node_metadata(
+                parent,
+                &inventory,
+                &[ReclaimNodeReadRequest {
+                    original: root,
+                    destination: ReclaimNodeDestination {
+                        volume: plan.volume(),
+                        uid: plan.uid(),
+                    },
+                }],
+                &fixture.owner.files.extent_cache_dir(),
+                fixture.owner.files.spool_dir(),
+            )
+            .await
+            .unwrap();
+        catalog
+            .record_reclaim_node_observations(parent, fixture.owner.round, &observations)
+            .await
+            .unwrap();
+        catalog
+            .seal_reclaim_node_coverage(parent, fixture.owner.round, &observations[0])
+            .await
+            .unwrap();
+        let complete = catalog
+            .step_reclaim_source_coverage(parent, fixture.owner.round, &inventory)
+            .await
+            .unwrap();
+        assert!(complete.complete());
+        assert_eq!(complete.objects(), 3);
+        assert_eq!(complete.total_objects(), 3);
+        assert_eq!(
+            catalog
+                .step_reclaim_source_coverage(parent, fixture.owner.round, &inventory)
+                .await
+                .unwrap(),
+            complete
+        );
+        assert!(
+            catalog
+                .check_reclaim_source_unreferenced(parent, fixture.owner.round)
+                .await
+                .is_err(),
+            "完整覆盖不是零引用门槛或 FORMAT 权限"
+        );
+        if relocate {
+            Box::pin(verify_native_link_relocation(
+                catalog, fixture, control, parent, source,
+            ))
+            .await;
+            return;
+        }
+        let before = fixture.drive_log();
+        let next = fixture.owner.round + 100;
+        catalog
+            .claim_active_owner_epoch(&control.serial, next)
+            .await
+            .unwrap();
+        let parents = catalog
+            .claim_reclaim_reservations_page(&control.serial, control.route, next, None, 16)
+            .await
+            .unwrap();
+        assert_eq!(parents.items.len(), 1);
+        let claimed = catalog
+            .claim_reclaim_metadata_write(&parents.items[0], next, plan.source_uid())
+            .await
+            .unwrap();
+        assert!(claimed.completed());
+        assert_eq!(
+            catalog
+                .reclaim_metadata_publication(&parents.items[0], next, &claimed)
+                .await
+                .unwrap(),
+            Some(published)
+        );
+        assert_eq!(
+            catalog
+                .step_reclaim_source_coverage(&parents.items[0], next, &inventory)
+                .await
+                .unwrap(),
+            complete
+        );
+        assert!(
+            catalog
+                .publish_reclaim_metadata_write(&parents.items[0], next, &claimed, proof)
+                .await
+                .is_err(),
+            "旧 owner 的实读凭证不能跨接管复用"
+        );
+        assert_eq!(fixture.drive_log(), before);
+        assert_eq!(fixture.formats(), 2, "只有源/目的两个预格式化夹具");
+    }
+
+    async fn verify_native_link_relocation(
+        catalog: &crate::managed_catalog::ManagedCatalog,
+        fixture: &Fixture,
+        control: &FdbOwnerControl,
+        parent: &crate::managed_catalog::ReclaimReservation,
+        source: &crate::ltfs::recovery::CapturedIndexSource,
+    ) {
+        use crate::ltfs::recovery::{RecoveryBudget, capture_index_source};
+        use crate::managed_catalog::{ReclaimSourceInventory, ResolvedPath};
+        let file = loop {
+            let walk = catalog
+                .step_reclaim_walk(parent, fixture.owner.round)
+                .await
+                .unwrap();
+            assert!(!walk.complete());
+            if let Some(file) = walk.current() {
+                break file.clone();
+            }
+        };
+        assert_eq!(file.path(), "/link");
+        let full = format!("/{}/link", parent.spec().pool());
+        let before = catalog
+            .resolve_active_path(&control.serial, full.as_bytes())
+            .await
+            .unwrap()
+            .unwrap();
+        let ResolvedPath::File {
+            head: old_head,
+            copy: old_copy,
+            attributes: old_attrs,
+            ..
+        } = before
+        else {
+            panic!("file")
+        };
+        assert!(old_copy.media.as_ref().unwrap().native_symlink);
+        let inventory = ReclaimSourceInventory::from_captured(source).unwrap();
+        let original = catalog
+            .reclaim_source_nodes(
+                parent,
+                fixture.owner.round,
+                &inventory,
+                &[old_copy.ltfs_file_uid],
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let device = fixture.device();
+        let budget = RecoveryBudget::default();
+        let label = crate::ltfs::volume::read_label_only(device).unwrap();
+        let current = capture_index_source(&TapeDrive::new(device), &label, &budget).unwrap();
+        let plan = inventory
+            .plan_reclaimed_node(parent, &original, &current, "reclaimed-source-root/link")
+            .unwrap();
+        let task = catalog
+            .prepare_reclaim_metadata_node(parent, fixture.owner.round, &plan)
+            .await
+            .unwrap();
+        let log = fixture.drive_log();
+        assert!(
+            catalog
+                .relocate_reclaim_native_link(parent, fixture.owner.round, &file, &task, source)
+                .await
+                .is_err(),
+            "Prepared 不能迁移逻辑副本"
+        );
+        assert_eq!(fixture.drive_log(), log);
+        let mut writer = crate::daemon::fdb_reclaim_media::ReclaimMetadataWriter {
+            catalog,
+            device,
+            route: control.route,
+            key: fixture.owner.key,
+            permission: &fixture.permit,
+            budget: &budget,
+        };
+        let result = writer.execute(parent, &task, Some(source)).await.unwrap();
+        catalog
+            .publish_reclaim_metadata_write(
+                parent,
+                fixture.owner.round,
+                result.task(),
+                result.commit_evidence().unwrap(),
+            )
+            .await
+            .unwrap();
+        let log = fixture.drive_log();
+        let (one, two) = tokio::join!(
+            catalog.relocate_reclaim_native_link(parent, fixture.owner.round, &file, &task, source),
+            catalog.relocate_reclaim_native_link(parent, fixture.owner.round, &file, &task, source)
+        );
+        let progress = one.unwrap();
+        assert_eq!(two.unwrap(), progress);
+        assert!(progress.current().is_none());
+        assert_eq!(progress.copied_files(), 1);
+        assert_eq!(progress.copied_bytes(), 0);
+        let after = catalog
+            .resolve_active_path(&control.serial, full.as_bytes())
+            .await
+            .unwrap()
+            .unwrap();
+        let ResolvedPath::File {
+            head,
+            copy,
+            attributes,
+            ..
+        } = after
+        else {
+            panic!("file")
+        };
+        assert_eq!(head.version, old_head.version + 1);
+        assert_ne!(head.copy_id, old_head.copy_id);
+        assert_eq!(copy.origin, old_copy.origin);
+        assert_eq!(copy.volume_id, plan.volume());
+        assert_eq!(copy.ltfs_file_uid, plan.uid());
+        assert_eq!(copy.media.as_ref().unwrap().physical_path, plan.path());
+        assert_eq!(attributes, old_attrs, "链接目标和所有逻辑属性保持原值");
+        assert_eq!(
+            catalog
+                .relocate_reclaim_native_link(parent, fixture.owner.round, &file, &task, source)
+                .await
+                .unwrap(),
+            progress
+        );
+        catalog
+            .check_reclaim_source_unreferenced(parent, fixture.owner.round)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.drive_log(),
+            log,
+            "逻辑提交、精确退休和回执重入不发 CDB"
+        );
+        let next = fixture.owner.round + 100;
+        catalog
+            .claim_active_owner_epoch(&control.serial, next)
+            .await
+            .unwrap();
+        let parents = catalog
+            .claim_reclaim_reservations_page(&control.serial, control.route, next, None, 16)
+            .await
+            .unwrap();
+        let recovered = catalog
+            .claim_reclaim_metadata_write(&parents.items[0], next, plan.source_uid())
+            .await
+            .unwrap();
+        assert!(
+            catalog
+                .relocate_reclaim_native_link(parent, fixture.owner.round, &file, &task, source)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            catalog
+                .relocate_reclaim_native_link(&parents.items[0], next, &file, &recovered, source)
+                .await
+                .unwrap(),
+            progress
+        );
+        catalog
+            .check_reclaim_source_unreferenced(&parents.items[0], next)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.drive_log(),
+            log,
+            "接管已完成迁移没有 CDB 或新空上传"
+        );
+        // Both gates are required even though the native link is already safe.
+        // Catalog-only fixture: original immutable manufacturer facts. The
+        // device producer separately verifies these via guarded READ ATTRIBUTE.
+        let cart = fixture.lib.cartridge("LIFE00L8").unwrap();
+        let medium = serde_json::from_value(
+            json!({"manufacturer":cart.mam[&(0,0x0400)].1,"serial":cart.mam[&(0,0x0401)].1}),
+        )
+        .unwrap();
+        let crate::scsi::sim::LogicalObject::Record(label_bytes) =
+            &cart.partitions[0].objects[crate::ltfs::volume::LABEL_BLOCK as usize]
+        else {
+            panic!("label")
+        };
+        let label = crate::ltfs::label::LtfsLabel::parse(label_bytes).unwrap();
+        let source_evidence = crate::managed_catalog::ReclaimFormatSourceEvidence::from_read(
+            &parents.items[0],
+            next,
+            source,
+            medium,
+            &label,
+        )
+        .unwrap();
+        let output = uuid::Uuid::new_v4();
+        assert!(
+            catalog
+                .prepare_reclaim_format(&parents.items[0], next, output, &source_evidence)
+                .await
+                .is_err(),
+            "扫描尚未结清，不能仅依赖零 V 引用"
+        );
+        assert!(
+            catalog
+                .reclaim_format_plan(&parents.items[0], next)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        loop {
+            if catalog
+                .step_reclaim_walk(&parents.items[0], next)
+                .await
+                .unwrap()
+                .complete()
+            {
+                break;
+            }
+        }
+        let format = catalog
+            .prepare_reclaim_format(&parents.items[0], next, output, &source_evidence)
+            .await
+            .unwrap();
+        assert!(!format.issued());
+        assert_eq!(format.owner(), next);
+        assert_eq!(format.output(), output);
+        assert_eq!(
+            catalog
+                .prepare_reclaim_format(&parents.items[0], next, output, &source_evidence)
+                .await
+                .unwrap(),
+            format
+        );
+        assert!(
+            catalog
+                .prepare_reclaim_format(
+                    &parents.items[0],
+                    next,
+                    uuid::Uuid::new_v4(),
+                    &source_evidence
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            catalog
+                .prepare_reclaim_metadata_node(&parents.items[0], next, &plan)
+                .await
+                .is_err(),
+            "格式化阶段不能再启动元数据迁移"
+        );
+        let db =
+            foundationdb::Database::from_path(&std::env::var("FDB_TEST_CLUSTER").unwrap()).unwrap();
+        let mut foreign = b"tape-rs/catalog/22/V/".to_vec();
+        foreign.extend_from_slice(parent.spec().volume().as_bytes());
+        for _ in 0..4 {
+            foreign.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+        }
+        let tr = db.create_trx().unwrap();
+        tr.set(&foreign, &[0; 40]);
+        tr.commit().await.unwrap();
+        assert!(
+            catalog
+                .admit_reclaim_format(&parents.items[0], next, &format)
+                .await
+                .is_err(),
+            "其他命名空间或扫描的保留引用阻止格式化"
+        );
+        assert_eq!(
+            catalog
+                .reclaim_format_plan(&parents.items[0], next)
+                .await
+                .unwrap(),
+            Some(format.clone())
+        );
+        let tr = db.create_trx().unwrap();
+        tr.clear(&foreign);
+        tr.commit().await.unwrap();
+        let (one, two) = tokio::join!(
+            catalog.admit_reclaim_format(&parents.items[0], next, &format),
+            catalog.admit_reclaim_format(&parents.items[0], next, &format)
+        );
+        let one = one.unwrap();
+        let two = two.unwrap();
+        assert_ne!(
+            one.needs_observation(),
+            two.needs_observation(),
+            "并发只有一个首次格式化准入"
+        );
+        assert_eq!(one.plan(), two.plan());
+        let issued = one.plan().clone();
+        assert!(issued.issued());
+        catalog
+            .verify_reclaim_format(&parents.items[0], next, &issued)
+            .await
+            .unwrap();
+        assert!(
+            catalog
+                .admit_reclaim_format(&parents.items[0], next, &format)
+                .await
+                .unwrap()
+                .needs_observation(),
+            "丢失准入回执只能核实原结果"
+        );
+        assert!(
+            catalog
+                .release_reserved_reclaim(&parents.items[0], next)
+                .await
+                .is_err()
+        );
+        let mut claim_key = b"tape-rs/catalog/22/@/".to_vec();
+        claim_key.extend_from_slice(uuid::Uuid::nil().as_bytes());
+        claim_key.extend_from_slice(b"Qv");
+        claim_key.extend_from_slice(parent.spec().volume().as_bytes());
+        let tr = db.create_trx().unwrap();
+        let claim = tr.get(&claim_key, false).await.unwrap().unwrap().to_vec();
+        tr.set(&claim_key, b"another-original-format");
+        tr.commit().await.unwrap();
+        assert!(
+            catalog
+                .verify_reclaim_format(&parents.items[0], next, &issued)
+                .await
+                .is_err(),
+            "不能覆盖或忽略另一个原始卷占用"
+        );
+        let tr = db.create_trx().unwrap();
+        tr.set(&claim_key, &claim);
+        tr.commit().await.unwrap();
+        let successor = next + 100;
+        catalog
+            .claim_active_owner_epoch(&control.serial, successor)
+            .await
+            .unwrap();
+        let again = catalog
+            .claim_reclaim_reservations_page(&control.serial, control.route, successor, None, 16)
+            .await
+            .unwrap();
+        let adopted = catalog
+            .reclaim_format_plan(&again.items[0], successor)
+            .await
+            .unwrap()
+            .unwrap();
+        let managed = catalog
+            .start_reclaim_management(
+                &control.serial,
+                control.route,
+                successor,
+                parent.intent()["epoch"].as_u64().unwrap(),
+                uuid::Uuid::parse_str(parent.intent()["operation"].as_str().unwrap()).unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(managed.intent(), again.items[0].intent());
+        assert_eq!(adopted.output(), output);
+        assert_eq!(adopted.scan(), format.scan());
+        assert!(adopted.issued());
+        assert!(
+            catalog
+                .verify_reclaim_format(&parents.items[0], next, &issued)
+                .await
+                .is_err()
+        );
+        assert!(
+            catalog
+                .admit_reclaim_format(&again.items[0], successor, &issued)
+                .await
+                .is_err(),
+            "旧 owner 的格式化快照不能变成新写许可"
+        );
+        assert!(
+            catalog
+                .admit_reclaim_format(&again.items[0], successor, &adopted)
+                .await
+                .unwrap()
+                .needs_observation()
+        );
+        catalog
+            .verify_reclaim_format(&again.items[0], successor, &adopted)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.drive_log(),
+            log,
+            "格式化意图、双门槛、并发与 HA 检查均不发 CDB"
+        );
+        Box::pin(verify_reclaim_formatter(
+            catalog,
+            fixture,
+            control,
+            &again.items[0],
+            &adopted,
+        ))
+        .await;
+        let target = catalog
+            .volume_placement(plan.volume())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            catalog
+                .active_loaded_volume_head(
+                    &control.serial,
+                    &target.barcode,
+                    control.route,
+                    successor,
+                )
+                .await
+                .unwrap()
+                .is_some(),
+            "清理临时账本后目的历史仍由独立回执验证"
+        );
+    }
+
+    async fn verify_reclaim_formatter(
+        catalog: &crate::managed_catalog::ManagedCatalog,
+        fixture: &Fixture,
+        control: &FdbOwnerControl,
+        parent: &crate::managed_catalog::ReclaimReservation,
+        plan: &crate::managed_catalog::ReclaimFormatPlan,
+    ) {
+        use crate::daemon::fdb_reclaim_format::{ReclaimFormatOutcome, ReclaimFormatter};
+        use crate::daemon::permission::GuardedTransport;
+        use crate::ltfs::recovery::RecoveryBudget;
+        let round = plan.owner();
+        let permit = Arc::new(Permission::default());
+        permit.renew(
+            round,
+            Phase::Fencing,
+            Instant::now() + Duration::from_secs(60),
+        );
+        let key = ReservationKey::new(1, round);
+        let drive = GuardedTransport::new(
+            Box::new(Recorded {
+                inner: Box::new(fixture.lib.drive_as(0, 1)),
+                kind: DeviceKind::Drive,
+                commands: fixture.commands.clone(),
+            }),
+            permit.clone(),
+            round,
+        );
+        let changer = GuardedTransport::new(
+            Box::new(Recorded {
+                inner: Box::new(fixture.lib.changer_as(1)),
+                kind: DeviceKind::Changer,
+                commands: fixture.commands.clone(),
+            }),
+            permit.clone(),
+            round,
+        );
+        reservation::fence(&drive, key).unwrap();
+        reservation::fence(&changer, key).unwrap();
+        permit.renew(
+            round,
+            Phase::Execution,
+            Instant::now() + Duration::from_secs(60),
+        );
+        // Test precondition: restore the covered source to the only drive.
+        // Production movement is a separate durable mechanical controller.
+        let mut robot = MediumChanger::new(&changer);
+        let map = robot.load_address_map().unwrap().clone();
+        let inventory = robot.read_all_status().unwrap();
+        let loaded = inventory
+            .iter()
+            .find(|e| e.address == map.dt_start)
+            .unwrap();
+        if loaded.volume_tag.as_deref() != Some(parent.spec().barcode()) {
+            TapeDrive::new(&drive).unload().unwrap();
+            let home = inventory
+                .iter()
+                .find(|e| {
+                    e.address >= map.storage_start
+                        && e.address < map.storage_start + map.storage_count
+                        && !e.full
+                })
+                .unwrap()
+                .address;
+            robot.move_medium(map.dt_start, home).unwrap();
+            let source = inventory
+                .iter()
+                .find(|e| e.volume_tag.as_deref() == Some(parent.spec().barcode()))
+                .unwrap()
+                .address;
+            robot.move_medium(source, map.dt_start).unwrap();
+            TapeDrive::new(&drive).load().unwrap();
+        }
+        let budget = RecoveryBudget::default();
+        let mut formatter = ReclaimFormatter {
+            catalog,
+            device: &drive,
+            route: control.route,
+            key,
+            permission: &permit,
+            budget: &budget,
+        };
+        let log = fixture.drive_log();
+        let replay = catalog
+            .admit_reclaim_format(parent, round, plan)
+            .await
+            .unwrap();
+        let ReclaimFormatOutcome::Retry(observed) =
+            formatter.execute(parent, replay).await.unwrap()
+        else {
+            panic!("unwritten source")
+        };
+        assert!(
+            !fixture.drive_log()[log.len()..]
+                .iter()
+                .any(|op| matches!(op, 0x04 | 0x0a | 0x10 | 0x55 | 0x8d))
+        );
+        let next = catalog
+            .rearm_reclaim_format(parent, round, plan, &observed)
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog
+                .rearm_reclaim_format(parent, round, plan, &observed)
+                .await
+                .unwrap(),
+            next
+        );
+        let ticket = catalog
+            .admit_reclaim_format(parent, round, &next)
+            .await
+            .unwrap();
+        assert!(!ticket.needs_observation());
+        let issued = ticket.plan().clone();
+        assert_eq!(issued.attempt(), 2);
+        // A write failure after VOL1 and its filemark leaves a genuine partial
+        // IP, while the original DP must still match the sealed source.
+        let boundary = MetadataFault {
+            inner: &drive,
+            mode: MetadataExecutionCase::IpFailure,
+            matching: std::sync::atomic::AtomicUsize::new(0),
+            fired: std::sync::atomic::AtomicBool::new(false),
+            permission: &permit,
+            round,
+        };
+        let mut faulty = ReclaimFormatter {
+            device: &boundary,
+            ..formatter
+        };
+        assert!(faulty.execute(parent, ticket).await.is_err());
+        assert!(boundary.fired.load(std::sync::atomic::Ordering::SeqCst));
+        fixture.lib.power_cut();
+        permit.renew(
+            round,
+            Phase::Execution,
+            Instant::now() + Duration::from_secs(60),
+        );
+        let ReclaimFormatOutcome::Retry(partial) =
+            formatter.observe(parent, &issued).await.unwrap()
+        else {
+            panic!("partial initialization")
+        };
+        let next = catalog
+            .rearm_reclaim_format(parent, round, &issued, &partial)
+            .await
+            .unwrap();
+        let ticket = catalog
+            .admit_reclaim_format(parent, round, &next)
+            .await
+            .unwrap();
+        let final_plan = ticket.plan().clone();
+        assert_eq!(final_plan.attempt(), 3);
+        let ReclaimFormatOutcome::Committed(proof) =
+            formatter.execute(parent, ticket).await.unwrap()
+        else {
+            panic!("fixed empty baseline")
+        };
+        let after = fixture.drive_log();
+        assert!(
+            !after[log.len()..]
+                .iter()
+                .any(|op| matches!(op, 0x04 | 0x55)),
+            "quick reset never repartitions"
+        );
+        let replay = catalog
+            .admit_reclaim_format(parent, round, &final_plan)
+            .await
+            .unwrap();
+        let ReclaimFormatOutcome::Committed(again) =
+            formatter.execute(parent, replay).await.unwrap()
+        else {
+            panic!("completed reset")
+        };
+        assert_eq!(again, proof);
+        assert!(
+            !fixture.drive_log()[after.len()..]
+                .iter()
+                .any(|op| matches!(op, 0x0a | 0x10 | 0x8d)),
+            "lost completion only reads"
+        );
+        let home = if parent.spec().unassign() {
+            use crate::daemon::fdb_reclaim_mechanics::ReclaimMechanics;
+            use crate::managed_catalog::{ReclaimMediaAction, ReclaimMediaPlan};
+            assert!(
+                catalog
+                    .complete_reclaim_format(parent, round, &final_plan, &proof, None)
+                    .await
+                    .is_err(),
+                "空卷证明不能单独解除分配"
+            );
+            let rows = robot.read_all_status().unwrap();
+            let source = rows.iter().find(|e| e.address == map.dt_start).unwrap();
+            let home = source.source_address.unwrap();
+            let unload = ReclaimMediaPlan {
+                action: ReclaimMediaAction::Unload,
+                barcode: parent.spec().barcode().into(),
+                volume: parent.spec().volume(),
+                drive_serial: "SIMDRV0000".into(),
+                source: map.dt_start,
+                destination: map.dt_start,
+                home,
+                map: map.clone(),
+            };
+            let mechanics = ReclaimMechanics {
+                catalog,
+                changer: &changer,
+                drive: &drive,
+                route: control.route,
+                key,
+                permission: &permit,
+            };
+            mechanics.execute(parent, &unload).await.unwrap();
+            assert!(
+                mechanics
+                    .formatted_source_home(parent, &final_plan, &proof)
+                    .await
+                    .is_err(),
+                "仅退带不能充当归位证明"
+            );
+            let movement = ReclaimMediaPlan {
+                action: ReclaimMediaAction::Move,
+                destination: home,
+                ..unload
+            };
+            mechanics.execute(parent, &movement).await.unwrap();
+            Some(
+                mechanics
+                    .formatted_source_home(parent, &final_plan, &proof)
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let result = catalog
+            .complete_reclaim_format(parent, round, &final_plan, &proof, home.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog
+                .complete_reclaim_format(parent, round, &final_plan, &proof, home.as_ref())
+                .await
+                .unwrap(),
+            result
+        );
+        assert_eq!(
+            catalog.reclaim_format_result(parent, round).await.unwrap(),
+            Some(result.clone())
+        );
+        assert_eq!(
+            catalog
+                .reserved_reclaim_status(parent, round)
+                .await
+                .unwrap(),
+            result.value()
+        );
+        let assignment = catalog
+            .tape_assignment(&control.serial, parent.spec().barcode())
+            .await
+            .unwrap();
+        if parent.spec().unassign() {
+            assert!(assignment.is_none());
+            assert!(
+                catalog
+                    .volume_placement(final_plan.output())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            let assignment = assignment.unwrap();
+            assert_eq!(assignment.volume_id, Some(final_plan.output()));
+            assert_ne!(assignment.volume_id, Some(parent.spec().volume()));
+        }
+        let task = catalog
+            .management_task(
+                &control.serial,
+                control.route,
+                parent.intent()["epoch"].as_u64().unwrap(),
+                uuid::Uuid::parse_str(parent.intent()["operation"].as_str().unwrap()).unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task["status"], "succeeded");
+        assert_eq!(task["result"], result.value());
+        assert!(
+            catalog.reclaim_format_plan(parent, round).await.is_err(),
+            "released parent cannot authorize more I/O"
+        );
+        let page = catalog
+            .reclaim_cleanup_page(&control.serial, control.route, round, None, 16)
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].intent(), parent.intent());
+        let mut complete = false;
+        for _ in 0..64 {
+            if catalog.step_reclaim_cleanup(parent, round).await.unwrap() {
+                complete = true;
+                break;
+            }
+        }
+        assert!(complete, "有界清理最终完成");
+        assert!(catalog.step_reclaim_cleanup(parent, round).await.unwrap());
+        assert!(
+            catalog
+                .reclaim_cleanup_page(&control.serial, control.route, round, None, 16)
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        assert_eq!(
+            catalog.reclaim_format_result(parent, round).await.unwrap(),
+            Some(result.clone())
+        );
+        assert_eq!(
+            catalog
+                .reserved_reclaim_status(parent, round)
+                .await
+                .unwrap(),
+            result.value()
+        );
+        permit.close(round);
+        let before = fixture.drive_log();
+        assert!(formatter.observe(parent, &final_plan).await.is_err());
+        assert_eq!(
+            fixture.drive_log(),
+            before,
+            "closed permission sends no CDB"
+        );
+    }
+
+    struct ReclaimMoveReplyLost<'a> {
+        inner: &'a dyn TapeTransport,
+        fired: std::sync::atomic::AtomicBool,
+    }
+    impl TapeTransport for ReclaimMoveReplyLost<'_> {
+        fn identity(&self) -> &str {
+            self.inner.identity()
+        }
+        fn execution_guard(&self) -> Option<(u64, usize)> {
+            self.inner.execution_guard()
+        }
+        fn session_epoch(&self) -> Option<u64> {
+            self.inner.session_epoch()
+        }
+        fn execute_no_data(
+            &self,
+            cdb: &[u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            let result = self.inner.execute_no_data(cdb, timeout)?;
+            if cdb[0] == 0xa5 && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return Err(TapeError::ScsiHost(3));
+            }
+            Ok(result)
+        }
+        fn execute_read(
+            &self,
+            cdb: &[u8],
+            bytes: &mut [u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            self.inner.execute_read(cdb, bytes, timeout)
+        }
+        fn execute_write(
+            &self,
+            cdb: &[u8],
+            bytes: &[u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            self.inner.execute_write(cdb, bytes, timeout)
+        }
+    }
+    async fn verify_reclaim_mechanical_actor(
+        catalog: &crate::managed_catalog::ManagedCatalog,
+        fixture: &Fixture,
+        control: &FdbOwnerControl,
+        parent: &crate::managed_catalog::ReclaimReservation,
+    ) {
+        use crate::daemon::fdb_reclaim_mechanics::ReclaimMechanics;
+        use crate::managed_catalog::{ReclaimMediaAction, ReclaimMediaPlan};
+        let changer = fixture
+            .owner
+            .devices
+            .iter()
+            .find(|d| d.kind == DeviceKind::Changer)
+            .unwrap()
+            .dev
+            .as_ref();
+        let mut robot = MediumChanger::new(changer);
+        let map = robot.load_address_map().unwrap().clone();
+        let rows = robot.read_all_status().unwrap();
+        let row = rows.iter().find(|e| e.address == map.dt_start).unwrap();
+        let home = row.source_address.unwrap();
+        let base = ReclaimMediaPlan {
+            action: ReclaimMediaAction::Unload,
+            barcode: parent.spec().barcode().into(),
+            volume: parent.spec().volume(),
+            drive_serial: fixture.owner.devices[0].serial.clone(),
+            source: row.address,
+            destination: row.address,
+            home,
+            map,
+        };
+        let actor = ReclaimMechanics {
+            catalog,
+            changer,
+            drive: fixture.device(),
+            route: control.route,
+            key: fixture.owner.key,
+            permission: &fixture.permit,
+        };
+        let log = fixture.drive_log();
+        actor.execute(parent, &base).await.unwrap();
+        let unloaded = fixture.drive_log();
+        assert_eq!(
+            unloaded[log.len()..]
+                .iter()
+                .filter(|op| **op == 0x1b)
+                .count(),
+            1
+        );
+        actor.execute(parent, &base).await.unwrap();
+        assert!(
+            !fixture.drive_log()[unloaded.len()..].contains(&0x1b),
+            "已退带不重复 UNLOAD"
+        );
+        let to_home = ReclaimMediaPlan {
+            action: ReclaimMediaAction::Move,
+            destination: home,
+            ..base.clone()
+        };
+        let fault = ReclaimMoveReplyLost {
+            inner: changer,
+            fired: std::sync::atomic::AtomicBool::new(false),
+        };
+        let faulty = ReclaimMechanics {
+            changer: &fault,
+            ..actor
+        };
+        assert!(matches!(
+            faulty.execute(parent, &to_home).await,
+            Err(TapeError::ScsiHost(3))
+        ));
+        assert!(fault.fired.load(std::sync::atomic::Ordering::SeqCst));
+        let pending = catalog
+            .reclaim_media_pending(parent, fixture.owner.round)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.plan(), &to_home);
+        let task = catalog
+            .management_task(
+                &control.serial,
+                control.route,
+                parent.intent()["epoch"].as_u64().unwrap(),
+                uuid::Uuid::parse_str(parent.intent()["operation"].as_str().unwrap()).unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task["status"], "running");
+        assert_eq!(task["progress"]["mechanical"]["phase"], "result_unknown");
+        assert!(
+            catalog
+                .require_active_library_readable(
+                    &control.serial,
+                    control.route,
+                    fixture.owner.round
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            catalog
+                .cancel_management(
+                    &control.serial,
+                    control.route,
+                    fixture.owner.round,
+                    parent.intent()["epoch"].as_u64().unwrap(),
+                    uuid::Uuid::parse_str(parent.intent()["operation"].as_str().unwrap()).unwrap()
+                )
+                .await
+                .is_err(),
+            "未知机械命令不能借未开写取消丢掉"
+        );
+        let to_drive = ReclaimMediaPlan {
+            action: ReclaimMediaAction::Move,
+            source: home,
+            destination: base.source,
+            ..base.clone()
+        };
+        assert!(
+            actor.execute(parent, &to_drive).await.is_err(),
+            "不能用新装载替换原未知 MOVE"
+        );
+        let after_unknown = fixture.changer_log();
+        actor.execute(parent, &to_home).await.unwrap();
+        assert!(
+            !fixture.changer_log()[after_unknown.len()..].contains(&0xa5),
+            "丢失 MOVE 回执只观察，不再移动"
+        );
+        assert!(
+            catalog
+                .reclaim_media_pending(parent, fixture.owner.round)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        catalog
+            .require_active_library_readable(&control.serial, control.route, fixture.owner.round)
+            .await
+            .unwrap();
+        actor.execute(parent, &to_drive).await.unwrap();
+        let load = ReclaimMediaPlan {
+            action: ReclaimMediaAction::Load,
+            ..base
+        };
+        actor.execute(parent, &load).await.unwrap();
+        let loaded = fixture.drive_log();
+        actor.execute(parent, &load).await.unwrap();
+        assert!(
+            !fixture.drive_log()[loaded.len()..].contains(&0x1b),
+            "已装载不重复 LOAD"
+        );
+        assert!(
+            !fixture.drive_log()[log.len()..]
+                .iter()
+                .any(|op| matches!(op, 0x04 | 0x0a | 0x10 | 0x8d)),
+            "机械控制不初始化或改写正文/索引/MAM"
+        );
+        let other = Permission::default();
+        other.renew(
+            fixture.owner.round,
+            Phase::Serving,
+            Instant::now() + Duration::from_secs(60),
+        );
+        let wrong = ReclaimMechanics {
+            permission: &other,
+            ..actor
+        };
+        let log = fixture.drive_log();
+        let changer_log = fixture.changer_log();
+        assert!(wrong.execute(parent, &load).await.is_err());
+        assert_eq!(fixture.drive_log(), log);
+        assert_eq!(fixture.changer_log(), changer_log, "错误许可实例不发 CDB");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 完整原生回收父任务、默认分配、清理及冷读"]
+    async fn native_reclaim_parent_drives_copy_coverage_and_initialization() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::Default,
+        ))
+        .await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 原生父任务、HA、未映射正文、归槽解绑及冷读"]
+    async fn native_reclaim_parent_recovers_and_unassigns_with_unmapped_raw_file() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::Unassign,
+        ))
+        .await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 原复制 Q/I、带上提交后回执未知、HA 恢复及父完成"]
+    async fn native_reclaim_parent_recovers_original_child_before_writing() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::ChildHa,
+        ))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 原终态已保存而监控收尾未保存，再次 HA 接续"]
+    async fn native_reclaim_parent_retries_monitor_finish_after_original_terminal() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::FinishHa,
+        ))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 原 Q/I 未写入正文、HA 取消及唯一新尝试完成"]
+    async fn native_reclaim_parent_retries_cancelled_original_child() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::CancelledHa,
+        ))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 原生链接缺失父目录、独立源覆盖及冷读"]
+    async fn native_reclaim_parent_preserves_native_link_with_missing_target_parents() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::NativeLinks,
+        ))
+        .await;
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum NativeParentCase {
+        Default,
+        Unassign,
+        ChildHa,
+        FinishHa,
+        CancelledHa,
+        NativeLinks,
+        ObsoleteVersions,
+        DeletedObject,
+        EeAlias,
+        MountLimit,
+        StaleQueued,
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 失效 queued 回收保留原失败回执，不击落 owner 或发送设备命令"]
+    async fn native_reclaim_rejects_stale_queued_request_without_losing_owner() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::StaleQueued,
+        ))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 回收遵守实际池挂载上限，等待时零机械/写入副作用且可安全取消"]
+    async fn native_reclaim_layout_waits_for_pool_mount_limit_before_loading() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::MountLimit,
+        ))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim EE 别名不带摘要、数据节点同时带 SHA/MD5 的完整回收"]
+    async fn native_reclaim_parent_preserves_ee_alias_body_hashes() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::EeAlias,
+        ))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 两个已发布版本、合法旧引用回收及原回执保留"]
+    async fn native_reclaim_parent_retires_superseded_active_copies_without_losing_receipts() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::ObsoleteVersions,
+        ))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 已发布删除、合法清理旧引用、原删除结果及墓碑保留"]
+    async fn native_reclaim_parent_retires_deleted_inode_copies_without_resurrection() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::DeletedObject,
+        ))
+        .await;
+    }
+
+    fn delete_native_parent_fixture<'a>(
+        fixture: &'a mut Fixture,
+        control: &'a FdbOwnerControl,
+        status: &'a SharedStatus,
+        pool: uuid::Uuid,
+        cluster: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            impl std::future::Future<Output = (crate::managed_catalog::NodeMutationDeletion, Vec<u8>)>
+            + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            use crate::managed_catalog::{
+                NodeMutation, NodeMutationSpec, NodeMutationTaskState, ResolvedPath,
+            };
+            let full = crate::managed_catalog::pool_catalog_path(pool, b"/removed").unwrap();
+            let Some(ResolvedPath::File { head, .. }) = control
+                .catalog
+                .resolve_active_path_for_route(&control.serial, &full, control.route)
+                .await
+                .unwrap()
+            else {
+                panic!("removed source")
+            };
+            let spec = NodeMutationSpec {
+                pool,
+                operation: uuid::Uuid::new_v4(),
+                path: "/removed".into(),
+                expected_version: Some(head.version),
+                mutation: NodeMutation::Unlink,
+            };
+            let request = control
+                .catalog
+                .prepare_node_mutation_request(
+                    &control.serial,
+                    control.route,
+                    fixture.owner.round,
+                    &spec,
+                    &crate::ltfs::label::ltfs_time_now(),
+                )
+                .await
+                .unwrap();
+            control
+                .catalog
+                .queue_node_mutation_request(
+                    control.route,
+                    fixture.owner.round,
+                    &request,
+                    control.storage.index_bytes as usize,
+                )
+                .await
+                .unwrap();
+            let mut after = None;
+            for _ in 0..16 {
+                renew_native_parent_permit(fixture);
+                Box::pin(fdb_nodes::advance(
+                    &mut fixture.owner,
+                    &fixture.permit,
+                    control,
+                    status,
+                    &mut after,
+                ))
+                .await
+                .unwrap();
+                let state = control
+                    .catalog
+                    .node_mutation_task_status(
+                        &control.serial,
+                        control.route,
+                        request.context().request_epoch,
+                        spec.operation,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if state.task.state == NodeMutationTaskState::Completed {
+                    assert!(state.outcome.unwrap().deleted);
+                    let result = control
+                        .catalog
+                        .node_mutation_deletion(
+                            &control.serial,
+                            control.route,
+                            fixture.owner.round,
+                            request.context().request_epoch,
+                            spec.operation,
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let db = foundationdb::Database::from_path(cluster).unwrap();
+                    let tr = db.create_trx().unwrap();
+                    let mut key = b"tape-rs/catalog/22/N/".to_vec();
+                    key.extend_from_slice(control.route.route.namespace.as_bytes());
+                    key.extend_from_slice(result.node().as_bytes());
+                    let bytes = tr.get(&key, false).await.unwrap().unwrap().to_vec();
+                    return (result, bytes);
+                }
+                assert!(!matches!(
+                    state.task.state,
+                    NodeMutationTaskState::Cancelled | NodeMutationTaskState::Rejected
+                ));
+            }
+            panic!("原删除未完成");
+        })
+    }
+
+    fn verify_deleted_reclaim_fault<'a>(
+        fixture: &'a mut Fixture,
+        control: &'a FdbOwnerControl,
+        status: &'a SharedStatus,
+        parent: &'a crate::managed_catalog::ReclaimReservation,
+        source: uuid::Uuid,
+        deleted: &'a (crate::managed_catalog::NodeMutationDeletion, Vec<u8>),
+        cluster: &'a str,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = ()> + 'a>> {
+        Box::pin(async move {
+            let db = foundationdb::Database::from_path(cluster).unwrap();
+            let mut key = b"tape-rs/catalog/22/N/".to_vec();
+            key.extend_from_slice(control.route.route.namespace.as_bytes());
+            key.extend_from_slice(deleted.0.node().as_bytes());
+            let mut prefix = b"tape-rs/catalog/22/V/".to_vec();
+            prefix.extend_from_slice(source.as_bytes());
+            let mut end = prefix.clone();
+            while end.last() == Some(&255) {
+                end.pop();
+            }
+            *end.last_mut().unwrap() += 1;
+            let range = foundationdb::RangeOption {
+                begin: foundationdb::KeySelector::first_greater_or_equal(prefix.clone()),
+                end: foundationdb::KeySelector::first_greater_or_equal(end),
+                limit: Some(16),
+                ..Default::default()
+            };
+            let tr = db.create_trx().unwrap();
+            let before: Vec<_> = tr
+                .get_range(&range, 1, false)
+                .await
+                .unwrap()
+                .iter()
+                .map(|v| (v.key().to_vec(), v.value().to_vec()))
+                .collect();
+            assert_eq!(before.len(), 1, "此夹具应只剩已删除文件的源引用");
+            let mut copies = Vec::new();
+            for (reverse, _) in &before {
+                let mut copy = b"tape-rs/catalog/22/R/".to_vec();
+                copy.extend_from_slice(&reverse[prefix.len() + 16..]);
+                let bytes = tr.get(&copy, false).await.unwrap().unwrap().to_vec();
+                copies.push((copy, bytes));
+            }
+            assert_eq!(
+                tr.get(&key, false).await.unwrap().unwrap().as_ref(),
+                deleted.1
+            );
+            let mut bad = deleted.1.clone();
+            *bad.last_mut().unwrap() ^= 1;
+            tr.set(&key, &bad);
+            tr.commit().await.unwrap();
+            let commands = fixture.commands.lock().unwrap().len();
+            let result =
+                fdb_reclaim::advance(&mut fixture.owner, &fixture.permit, control, status).await;
+            assert!(
+                matches!(result,Err(ReadError::Lost(ref e)) if e.contains("删除")),
+                "{result:?}"
+            );
+            assert!(
+                fixture.commands.lock().unwrap()[commands..]
+                    .iter()
+                    .all(|(_, op)| !matches!(*op, 0x04 | 0x0a | 0x10 | 0x55 | 0x8d)),
+                "删除证据损坏只能观察，不能写介质"
+            );
+            let tr = db.create_trx().unwrap();
+            let after: Vec<_> = tr
+                .get_range(&range, 1, false)
+                .await
+                .unwrap()
+                .iter()
+                .map(|v| (v.key().to_vec(), v.value().to_vec()))
+                .collect();
+            assert_eq!(after, before, "出错不能清除源 V");
+            for (key, bytes) in copies {
+                assert_eq!(
+                    tr.get(&key, false).await.unwrap().unwrap().as_ref(),
+                    bytes,
+                    "出错不能改写原 C"
+                );
+            }
+            assert_eq!(
+                tr.get(&key, false).await.unwrap().unwrap().as_ref(),
+                bad,
+                "损坏证据不能自动补齐"
+            );
+            assert!(
+                control
+                    .catalog
+                    .reclaim_format_plan(parent, fixture.owner.round)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            tr.set(&key, &deleted.1);
+            tr.commit().await.unwrap();
+        })
+    }
+
+    fn renew_native_parent_permit(fixture: &Fixture) {
+        let phase = if fixture.permit.allows(fixture.owner.round, Phase::Serving) {
+            Phase::Serving
+        } else {
+            Phase::Execution
+        };
+        assert!(
+            fixture.permit.renew(
+                fixture.owner.round,
+                phase,
+                Instant::now() + Duration::from_secs(60)
+            ),
+            "父流程夹具按当前阶段续租，不能降级或复活失效许可"
+        );
+    }
+
+    fn verify_destination_reclaim_fault<'a>(
+        fixture: &'a mut Fixture,
+        control: &'a FdbOwnerControl,
+        status: &'a SharedStatus,
+        parent: &'a crate::managed_catalog::ReclaimReservation,
+        barcode: &'a str,
+        cluster: &'a str,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = ()> + 'a>> {
+        Box::pin(async move {
+            let db = foundationdb::Database::from_path(cluster).unwrap();
+            let mut key = b"tape-rs/catalog/22/O/".to_vec();
+            key.extend_from_slice(control.serial.as_bytes());
+            key.extend_from_slice(b"\0\0/tape-monitor/");
+            key.extend_from_slice(control.route.route.namespace.as_bytes());
+            key.extend_from_slice(barcode.as_bytes());
+            key.extend_from_slice(b"\0\0");
+            let tr = db.create_trx().unwrap();
+            let original = tr.get(&key, false).await.unwrap().unwrap().to_vec();
+            let mut bad: Value = serde_json::from_slice(&original).unwrap();
+            bad["requires_validation"] = json!(true);
+            tr.set(&key, bad.to_string().as_bytes());
+            tr.commit().await.unwrap();
+            let commands = fixture.commands.lock().unwrap().len();
+            let result =
+                fdb_reclaim::advance(&mut fixture.owner, &fixture.permit, control, status).await;
+            assert!(matches!(result, Err(ReadError::Busy(_))), "{result:?}");
+            assert!(
+                fixture.commands.lock().unwrap()[commands..]
+                    .iter()
+                    .all(|(_, op)| !matches!(*op, 0x04 | 0x0a | 0x10 | 0x55 | 0x8d)),
+                "目的带待验证时不能初始化源带"
+            );
+            assert!(
+                control
+                    .catalog
+                    .reclaim_format_plan(parent, fixture.owner.round)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let task = control
+                .catalog
+                .management_task(
+                    &control.serial,
+                    control.route,
+                    parent.intent()["epoch"].as_u64().unwrap(),
+                    parent.intent()["operation"]
+                        .as_str()
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(task["status"], "running");
+            assert!(
+                task["progress"]["dependency"]["reason"]
+                    .as_str()
+                    .is_some_and(|v| !v.is_empty())
+            );
+            let tr = db.create_trx().unwrap();
+            assert_eq!(
+                tr.get(&key, false).await.unwrap().unwrap().as_ref(),
+                bad.to_string().as_bytes(),
+                "父任务不能清除目的带故障"
+            );
+            tr.set(&key, &original); // Restore only this test's injected monitor fault.
+            tr.commit().await.unwrap();
+        })
+    }
+
+    fn set_native_parent_mount_limit<'a>(
+        fixture: &'a Fixture,
+        control: &'a FdbOwnerControl,
+        policy: &'a crate::managed_catalog::ManagementRequest,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = ()> + 'a>> {
+        Box::pin(async move {
+            let catalog = &control.catalog;
+            catalog
+                .admit_management(&control.serial, control.route, fixture.owner.round, policy)
+                .await
+                .unwrap();
+            assert_eq!(
+                catalog
+                    .apply_management(
+                        &control.serial,
+                        control.route,
+                        fixture.owner.round,
+                        policy.epoch(),
+                        policy.operation()
+                    )
+                    .await
+                    .unwrap()["status"],
+                "succeeded"
+            );
+        })
+    }
+    fn verify_native_parent_mount_wait<'a>(
+        fixture: &'a mut Fixture,
+        control: &'a FdbOwnerControl,
+        status: &'a SharedStatus,
+        parent: &'a crate::managed_catalog::ReclaimReservation,
+        original: &'a crate::managed_catalog::ManagementRequest,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = ()> + 'a>> {
+        Box::pin(async move {
+            let catalog = &control.catalog;
+            let commands = fixture.commands.lock().unwrap().len();
+            assert!(matches!(
+                fdb_reclaim::advance(&mut fixture.owner, &fixture.permit, control, status).await,
+                Err(ReadError::Busy(_))
+            ));
+            assert!(
+                fixture.commands.lock().unwrap()[commands..]
+                    .iter()
+                    .all(|(_, op)| !matches!(*op, 0x1b | 0xa5 | 0x04 | 0x0a | 0x10 | 0x55 | 0x8d))
+            );
+            assert!(
+                catalog
+                    .reclaim_layout(parent, fixture.owner.round)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let task = catalog
+                .management_task(
+                    &control.serial,
+                    control.route,
+                    original.epoch(),
+                    original.operation(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(task["status"], "running");
+            assert!(
+                task["progress"]["dependency"]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("挂载上限")
+            );
+            assert_eq!(
+                catalog
+                    .cancel_management(
+                        &control.serial,
+                        control.route,
+                        fixture.owner.round,
+                        original.epoch(),
+                        original.operation()
+                    )
+                    .await
+                    .unwrap()["status"],
+                "cancelled"
+            );
+        })
+    }
+
+    fn verify_stale_queued_reclaim<'a>(
+        fixture: &'a Fixture,
+        control: &'a FdbOwnerControl,
+        original: &'a crate::managed_catalog::ManagementRequest,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = ()> + 'a>> {
+        Box::pin(async move {
+            let catalog = &control.catalog;
+            let commands = fixture.commands.lock().unwrap().len();
+            let db = foundationdb::Database::from_path(&std::env::var("FDB_TEST_CLUSTER").unwrap())
+                .unwrap();
+            for kind in *b"jf" {
+                let mut key = b"tape-rs/catalog/22/@/".to_vec();
+                key.extend_from_slice(control.route.route.namespace.as_bytes());
+                key.extend_from_slice(&[b'R', kind]);
+                key.extend_from_slice(&original.epoch().to_be_bytes());
+                key.extend_from_slice(original.operation().as_bytes());
+                let tr = db.create_trx().unwrap();
+                assert!(tr.get(&key, false).await.unwrap().is_none());
+                tr.set(&key, b"isolated-original-state-marker");
+                tr.commit().await.unwrap();
+                assert!(
+                    catalog
+                        .start_reclaim_management(
+                            &control.serial,
+                            control.route,
+                            fixture.owner.round,
+                            original.epoch(),
+                            original.operation()
+                        )
+                        .await
+                        .is_err(),
+                    "已有原父/结果不能按未执行失败"
+                );
+                assert_eq!(
+                    catalog
+                        .admit_management(
+                            &control.serial,
+                            control.route,
+                            fixture.owner.round,
+                            original
+                        )
+                        .await
+                        .unwrap()["status"],
+                    "queued"
+                );
+                let tr = db.create_trx().unwrap();
+                assert_eq!(
+                    tr.get(&key, false).await.unwrap().unwrap().as_ref(),
+                    b"isolated-original-state-marker"
+                );
+                tr.clear(&key); // Restore only this private-FDB fault injection.
+                tr.commit().await.unwrap();
+            }
+            assert!(
+                catalog
+                    .start_reclaim_management(
+                        &control.serial,
+                        control.route,
+                        fixture.owner.round,
+                        original.epoch(),
+                        original.operation()
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let task = catalog
+                .management_task(
+                    &control.serial,
+                    control.route,
+                    original.epoch(),
+                    original.operation(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(task["status"], "failed");
+            assert_eq!(task["request"], *original.value());
+            assert_eq!(task["result"]["source_unchanged"], true);
+            assert!(
+                catalog
+                    .start_reclaim_management(
+                        &control.serial,
+                        control.route,
+                        fixture.owner.round,
+                        original.epoch(),
+                        original.operation()
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                catalog
+                    .claim_reclaim_reservations_page(
+                        &control.serial,
+                        control.route,
+                        fixture.owner.round,
+                        None,
+                        16
+                    )
+                    .await
+                    .unwrap()
+                    .items
+                    .is_empty()
+            );
+            assert!(
+                catalog
+                    .require_active_library_readable(
+                        &control.serial,
+                        control.route,
+                        fixture.owner.round
+                    )
+                    .await
+                    .is_ok()
+            );
+            assert!(
+                fixture.permit.allows(fixture.owner.round, Phase::Serving)
+                    || fixture.permit.allows(fixture.owner.round, Phase::Execution)
+            );
+            assert_eq!(fixture.commands.lock().unwrap().len(), commands);
+        })
+    }
+
+    async fn native_reclaim_parent_case(
+        catalog: Arc<crate::managed_catalog::ManagedCatalog>,
+        cluster: &str,
+        case: NativeParentCase,
+    ) {
+        let unassign = case == NativeParentCase::Unassign;
+        let interrupt_child = matches!(
+            case,
+            NativeParentCase::ChildHa | NativeParentCase::FinishHa | NativeParentCase::CancelledHa
+        );
+        let interrupt_finish = case == NativeParentCase::FinishHa;
+        let cancel_child = case == NativeParentCase::CancelledHa;
+        let native_links = case == NativeParentCase::NativeLinks;
+        use crate::managed_catalog::{ManagementRequest, ReclaimSpec};
+        let (mut fixture, control, pool, status) = Box::pin(native_fixture_from(
+            catalog.clone(),
+            None,
+            Fixture::with_drives(2),
+        ))
+        .await;
+        fixture.format(uuid::Uuid::new_v4());
+        let mut volume = LtfsVolume::mount(fixture.device()).unwrap();
+        if case == NativeParentCase::EeAlias {
+            volume.set_hash_policy(crate::ltfs::volume::HashPolicy {
+                sha256: true,
+                md5: true,
+            });
+            volume
+                .append_bytes("/.LTFSEE_DATA/body", b"layout-source")
+                .unwrap();
+            volume.add_symlink("/data", ".LTFSEE_DATA/body").unwrap();
+        } else {
+            volume
+                .append_file("/data", &mut std::io::Cursor::new(b"layout-source"))
+                .unwrap();
+        }
+        if case == NativeParentCase::DeletedObject {
+            volume
+                .append_bytes("/removed", b"deliberately removed original body")
+                .unwrap();
+        }
+        if native_links {
+            volume.create_directory("/links").unwrap();
+            volume.create_directory("/links/empty").unwrap();
+            volume
+                .add_symlink("/links/empty/native", "../../data")
+                .unwrap();
+        }
+        if unassign {
+            volume
+                .append_bytes("/.LTFSEE_DATA/orphan", b"unmapped original bytes")
+                .unwrap();
+            volume
+                .set_node_xattr(
+                    "/.LTFSEE_DATA",
+                    crate::ltfs::index::Xattr {
+                        key: "tapers.fdb.eeInternalDirectory".into(),
+                        value: "1".into(),
+                        base64: false,
+                    },
+                    true,
+                    false,
+                )
+                .unwrap();
+        }
+        volume.commit().unwrap();
+        let orphan = volume
+            .index()
+            .find_file(".LTFSEE_DATA/orphan")
+            .map(|f| f.meta.file_uid);
+        drop(volume);
+        let request = |change: Value| {
+            ManagementRequest::parse(json!({"version":1,"library":control.serial,"namespace":control.route.route.namespace.to_string(),"epoch":1,"operation":uuid::Uuid::new_v4().to_string(),"change":change})).unwrap()
+        };
+        let home = request(
+            json!({"kind":"media-move","pool":null,"barcode":"LIFE00L8","volume":null,"revision":null,"destination":"homeslot"}),
+        );
+        assert_eq!(
+            execute(&mut fixture, &control, &status, &home).await["status"],
+            "succeeded"
+        );
+        let import = request(
+            json!({"kind":"media-import","pool":pool.id.to_string(),"barcode":"LIFE00L8","volume":null,"path":"/","merge_tapes":true}),
+        );
+        assert_eq!(
+            execute(&mut fixture, &control, &status, &import).await["status"],
+            "succeeded"
+        );
+        fixture
+            .lib
+            .insert_cartridge(SimCartridge::blank("LAYOUTL8", 128 << 20), 1)
+            .unwrap();
+        let assign = request(
+            json!({"kind":"media-assign","pool":pool.id.to_string(),"barcode":"LAYOUTL8","volume":uuid::Uuid::new_v4().to_string(),"confirm_format":true,"force_format":false}),
+        );
+        let assigned = execute(&mut fixture, &control, &status, &assign).await;
+        assert_eq!(assigned["status"], "succeeded", "{assigned}");
+        let source = catalog
+            .tape_assignment(&control.serial, "LIFE00L8")
+            .await
+            .unwrap()
+            .unwrap();
+        let target = catalog
+            .tape_assignment(&control.serial, "LAYOUTL8")
+            .await
+            .unwrap()
+            .unwrap();
+        let deleted = if case == NativeParentCase::DeletedObject {
+            Some(
+                delete_native_parent_fixture(&mut fixture, &control, &status, pool.id, cluster)
+                    .await,
+            )
+        } else {
+            None
+        };
+        let old_history = if case == NativeParentCase::ObsoleteVersions {
+            let full = crate::managed_catalog::pool_catalog_path(pool.id, b"/data").unwrap();
+            let Some(crate::managed_catalog::ResolvedPath::File { id, head, .. }) = catalog
+                .resolve_active_path_for_route(&control.serial, &full, control.route)
+                .await
+                .unwrap()
+            else {
+                panic!("source")
+            };
+            let spec = crate::managed_catalog::ActiveUploadSpec {
+                pool_id: pool.id,
+                path: b"/data".to_vec(),
+                operation_id: uuid::Uuid::new_v4(),
+                expected_version: Some(head.version),
+                size: b"layout-source".len() as u64,
+                digest: crate::managed_catalog::ContentDigest::Sha256(
+                    sha2::Sha256::digest(b"layout-source").into(),
+                ),
+            };
+            let intent = catalog
+                .prepare_active_upload(
+                    &control.serial,
+                    control.route,
+                    fixture.owner.round,
+                    &source.barcode,
+                    &spec,
+                )
+                .await
+                .unwrap();
+            let mut file = crate::local_read_storage::download_file(
+                fixture.owner.files.spool_dir(),
+                spec.size,
+                control.storage,
+            )
+            .unwrap();
+            std::io::Write::write_all(&mut file, b"layout-source").unwrap();
+            std::io::Seek::rewind(&mut file).unwrap();
+            assert_eq!(
+                fdb_writing::write(
+                    &mut fixture.owner,
+                    &fixture.permit,
+                    &control,
+                    &status,
+                    intent.request(),
+                    file
+                )
+                .await
+                .unwrap(),
+                head.version + 1
+            );
+            Some((id, head.copy_id, intent.request()))
+        } else {
+            None
+        };
+        if case == NativeParentCase::MountLimit {
+            let policy = request(
+                json!({"kind":"pool","id":pool.id.to_string(),"revision":pool.revision,"patch":{"mount_limit":1}}),
+            );
+            set_native_parent_mount_limit(&fixture, &control, &policy).await;
+        }
+        let spec=ReclaimSpec::parse(&json!({"kind":"media-reclaim","pool":pool.id.to_string(),"barcode":source.barcode,"volume":source.volume_id.unwrap().to_string(),"revision":source.revision,"confirm_format":true,"unassign":unassign})).unwrap();
+        let mut change = spec.to_json();
+        if case == NativeParentCase::StaleQueued {
+            change["revision"] = json!(source.revision + 1);
+        }
+        let original = request(change);
+        catalog
+            .admit_management(
+                &control.serial,
+                control.route,
+                fixture.owner.round,
+                &original,
+            )
+            .await
+            .unwrap();
+        if case == NativeParentCase::StaleQueued {
+            verify_stale_queued_reclaim(&fixture, &control, &original).await;
+            for field in ["barcode", "volume"] {
+                let mut value = original.value().clone();
+                value["operation"] = json!(uuid::Uuid::new_v4().to_string());
+                value["change"]["revision"] = json!(source.revision);
+                value["change"][field] = if field == "barcode" {
+                    json!("MISSINGL8")
+                } else {
+                    json!(uuid::Uuid::new_v4().to_string())
+                };
+                let invalid = ManagementRequest::parse(value).unwrap();
+                catalog
+                    .admit_management(
+                        &control.serial,
+                        control.route,
+                        fixture.owner.round,
+                        &invalid,
+                    )
+                    .await
+                    .unwrap();
+                verify_stale_queued_reclaim(&fixture, &control, &invalid).await;
+            }
+            return;
+        }
+        let parent = catalog
+            .start_reclaim_management(
+                &control.serial,
+                control.route,
+                fixture.owner.round,
+                original.epoch(),
+                original.operation(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if case == NativeParentCase::MountLimit {
+            verify_native_parent_mount_wait(&mut fixture, &control, &status, &parent, &original)
+                .await;
+            return;
+        }
+        if interrupt_child {
+            for index in 0..fixture.lib.drive_count() {
+                let inner = std::mem::replace(
+                    &mut fixture.owner.devices[index].dev,
+                    Box::new(fixture.lib.drive_as(index, 1)),
+                );
+                let boundary = if cancel_child {
+                    parent_recovery::AfterChildBarrier::before_body
+                } else {
+                    parent_recovery::AfterChildBarrier::new
+                };
+                fixture.owner.devices[index].dev = Box::new(boundary(
+                    inner,
+                    catalog.clone(),
+                    parent.clone(),
+                    fixture.owner.round,
+                    control.route,
+                    interrupted.clone(),
+                ));
+            }
+        }
+        let finish_interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut deleted_reference_waits = 0;
+        let mut deleted_fault_checked = false;
+        for step in 0..64 {
+            if ((unassign || interrupt_child) && step == 1) || (interrupt_finish && step == 2) {
+                let round = fixture.owner.round + 100;
+                let permit = Arc::new(Permission::default());
+                permit.renew(
+                    round,
+                    Phase::Fencing,
+                    Instant::now() + Duration::from_secs(60),
+                );
+                let adopted = takeover(
+                    &Provider {
+                        lib: fixture.lib.clone(),
+                        commands: fixture.commands.clone(),
+                    },
+                    &fixture.opts,
+                    round,
+                    Some(&permit),
+                    fixture.owner.files.clone(),
+                )
+                .unwrap();
+                permit.renew(
+                    round,
+                    Phase::Execution,
+                    Instant::now() + Duration::from_secs(60),
+                );
+                catalog
+                    .claim_active_owner_epoch(&control.serial, round)
+                    .await
+                    .unwrap();
+                let before = fixture.commands.lock().unwrap().clone();
+                assert!(
+                    Box::pin(fdb_reclaim::advance(
+                        &mut fixture.owner,
+                        &fixture.permit,
+                        &control,
+                        &status
+                    ))
+                    .await
+                    .is_err()
+                );
+                assert_eq!(
+                    *fixture.commands.lock().unwrap(),
+                    before,
+                    "旧 owner 被拒绝时不能发 CDB"
+                );
+                fixture.owner = adopted;
+                fixture.permit = permit;
+                if interrupt_child && step == 1 {
+                    catalog
+                        .claim_reclaim_reservations_page(
+                            &control.serial,
+                            control.route,
+                            round,
+                            None,
+                            16,
+                        )
+                        .await
+                        .unwrap();
+                    let requests = catalog
+                        .reclaim_uploads_page(&parent, round, None, 16)
+                        .await
+                        .unwrap();
+                    let request = &requests.items[0];
+                    let mut attempt = catalog
+                        .active_file_attempt(request, control.route)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(attempt.owner_epoch < round);
+                    attempt.owner_epoch = round;
+                    let before = fixture.commands.lock().unwrap().clone();
+                    assert!(
+                        catalog
+                            .check_active_write_group(
+                                &control.serial,
+                                control.route,
+                                round,
+                                &[attempt]
+                            )
+                            .await
+                            .unwrap_err()
+                            .to_string()
+                            .contains("上传原物理尝试已改变"),
+                        "普通写守卫不能接纳未结清的旧 owner 尝试"
+                    );
+                    let mut foreign = request.clone();
+                    foreign.expected_version = Some(foreign.expected_version.unwrap() + 1);
+                    assert!(
+                        catalog
+                            .require_reclaim_upload_recovery_lane(&parent, round, &foreign)
+                            .await
+                            .is_err()
+                    );
+                    assert_eq!(
+                        *fixture.commands.lock().unwrap(),
+                        before,
+                        "拒绝改动的原请求不发 CDB"
+                    );
+                    if interrupt_finish && step == 1 {
+                        for index in 0..fixture.lib.drive_count() {
+                            let inner = std::mem::replace(
+                                &mut fixture.owner.devices[index].dev,
+                                Box::new(fixture.lib.drive_as(index, 1)),
+                            );
+                            fixture.owner.devices[index].dev =
+                                Box::new(parent_recovery::AfterChildBarrier::after_terminal(
+                                    inner,
+                                    catalog.clone(),
+                                    parent.clone(),
+                                    round,
+                                    control.route,
+                                    finish_interrupted.clone(),
+                                    (request.clone(), target.barcode.clone()),
+                                ));
+                        }
+                    }
+                }
+            }
+            renew_native_parent_permit(&fixture);
+            if let Some(deleted) = &deleted
+                && deleted_reference_waits == 1
+                && !deleted_fault_checked
+            {
+                verify_deleted_reclaim_fault(
+                    &mut fixture,
+                    &control,
+                    &status,
+                    &parent,
+                    source.volume_id.unwrap(),
+                    deleted,
+                    cluster,
+                )
+                .await;
+                deleted_fault_checked = true;
+            }
+            if matches!(
+                case,
+                NativeParentCase::Default | NativeParentCase::ObsoleteVersions
+            ) && step == 1
+            {
+                // Deliberate isolated-FDB fault: even an unclassified retained
+                // V must block initialization. Restore only this injected row;
+                // unknown or still-retained references cannot be reclaimed.
+                let db = foundationdb::Database::from_path(cluster).unwrap();
+                let mut key = b"tape-rs/catalog/22/V/".to_vec();
+                key.extend_from_slice(source.volume_id.unwrap().as_bytes());
+                key.extend_from_slice(b"isolated-reclaim-reference-fault");
+                let tr = db.create_trx().unwrap();
+                assert!(tr.get(&key, false).await.unwrap().is_none());
+                tr.set(&key, b"isolated-test-only");
+                tr.commit().await.unwrap();
+                let before = fixture.commands.lock().unwrap().len();
+                for _ in 0..2 {
+                    renew_native_parent_permit(&fixture);
+                    Box::pin(fdb_reclaim::advance(
+                        &mut fixture.owner,
+                        &fixture.permit,
+                        &control,
+                        &status,
+                    ))
+                    .await
+                    .unwrap();
+                    assert!(
+                        catalog
+                            .reclaim_format_plan(&parent, fixture.owner.round)
+                            .await
+                            .unwrap()
+                            .is_none()
+                    );
+                    let waiting = catalog
+                        .management_task(
+                            &control.serial,
+                            control.route,
+                            original.epoch(),
+                            original.operation(),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(waiting["status"], "running");
+                    assert!(
+                        waiting["progress"]["dependency"]["reason"]
+                            .as_str()
+                            .unwrap()
+                            .contains("历史版本")
+                    );
+                }
+                assert!(
+                    fixture.commands.lock().unwrap()[before..]
+                        .iter()
+                        .all(|(_, op)| !matches!(*op, 0x04 | 0x0a | 0x10 | 0x55 | 0x8d)),
+                    "引用等待只能观察，不能写介质或初始化"
+                );
+                let tr = db.create_trx().unwrap();
+                assert_eq!(
+                    tr.get(&key, false).await.unwrap().as_deref(),
+                    Some(b"isolated-test-only".as_slice())
+                );
+                tr.clear(&key);
+                tr.commit().await.unwrap();
+                if case == NativeParentCase::Default {
+                    renew_native_parent_permit(&fixture);
+                    verify_destination_reclaim_fault(
+                        &mut fixture,
+                        &control,
+                        &status,
+                        &parent,
+                        &target.barcode,
+                        cluster,
+                    )
+                    .await;
+                }
+            }
+            renew_native_parent_permit(&fixture);
+            let result = Box::pin(fdb_reclaim::advance(
+                &mut fixture.owner,
+                &fixture.permit,
+                &control,
+                &status,
+            ))
+            .await;
+            if interrupt_child && step == 0 {
+                assert!(matches!(result, Err(ReadError::Lost(_))), "{result:?}");
+                assert!(interrupted.load(std::sync::atomic::Ordering::SeqCst));
+                let requests = catalog
+                    .reclaim_uploads_page(&parent, fixture.owner.round, None, 16)
+                    .await
+                    .unwrap();
+                assert_eq!(requests.items.len(), 1);
+                let request = &requests.items[0];
+                assert!(
+                    catalog
+                        .active_upload_result(request, control.route)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    catalog
+                        .active_file_attempt(request, control.route)
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                fixture.permit.close(fixture.owner.round);
+                continue;
+            }
+            if interrupt_finish && step == 1 {
+                assert!(matches!(result, Err(ReadError::Lost(_))), "{result:?}");
+                assert!(finish_interrupted.load(std::sync::atomic::Ordering::SeqCst));
+                let requests = catalog
+                    .reclaim_uploads_page(&parent, fixture.owner.round, None, 16)
+                    .await
+                    .unwrap();
+                assert!(
+                    catalog
+                        .reclaim_upload_recovery_pending(
+                            &parent,
+                            fixture.owner.round,
+                            &requests.items[0]
+                        )
+                        .await
+                        .unwrap()
+                );
+                catalog
+                    .begin_reclaim_upload_recovery(&parent, fixture.owner.round, &requests.items[0])
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(
+                        catalog
+                            .seal_reclaim_upload_cancellation(
+                                &parent,
+                                fixture.owner.round,
+                                &requests.items[0]
+                            )
+                            .await,
+                        Err(crate::managed_catalog::CatalogError::PoolBusy)
+                    ),
+                    "恢复收尾前不得提前释放原历史保留引用"
+                );
+                assert!(matches!(
+                    catalog
+                        .active_upload_result(&requests.items[0], control.route)
+                        .await
+                        .unwrap(),
+                    Some(crate::managed_catalog::PublishOutcome::AlreadyApplied(_))
+                ));
+                assert!(
+                    catalog
+                        .active_tape_monitor(&control.serial, control.route, &target.barcode)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .requires_validation
+                );
+                fixture.permit.close(fixture.owner.round);
+                continue;
+            }
+            assert!(result.is_ok(), "parent step {step}: {result:?}");
+            let task = catalog
+                .management_task(
+                    &control.serial,
+                    control.route,
+                    original.epoch(),
+                    original.operation(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            if deleted.is_some()
+                && task["progress"]["dependency"]["reason"]
+                    .as_str()
+                    .is_some_and(|v| v.contains("历史版本"))
+            {
+                deleted_reference_waits += 1;
+                assert!(
+                    deleted_reference_waits < 2,
+                    "已发布的删除必须合法结清其旧引用，不能永久阻塞原父任务"
+                );
+            }
+            if task["status"] == "succeeded" {
+                assert!(step > 0);
+                let done = catalog
+                    .reclaim_format_result(&parent, fixture.owner.round)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_ne!(done.output(), source.volume_id.unwrap());
+                if let Some((deletion, original_node)) = &deleted {
+                    assert!(deleted_fault_checked, "删除损坏故障边界必须实际执行");
+                    let current = catalog
+                        .node_mutation_deletion(
+                            &control.serial,
+                            control.route,
+                            fixture.owner.round,
+                            deletion.attempt().request_identity().0,
+                            deletion.attempt().request_identity().1,
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(&current, deletion);
+                    let db = foundationdb::Database::from_path(cluster).unwrap();
+                    let tr = db.create_trx().unwrap();
+                    let mut key = b"tape-rs/catalog/22/N/".to_vec();
+                    key.extend_from_slice(control.route.route.namespace.as_bytes());
+                    key.extend_from_slice(deletion.node().as_bytes());
+                    assert_eq!(
+                        tr.get(&key, false).await.unwrap().unwrap().as_ref(),
+                        original_node
+                    );
+                    assert!(
+                        catalog
+                            .file_head(control.route.route.namespace, deletion.node())
+                            .await
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert!(
+                        catalog
+                            .physical_copy(
+                                control.route.route.namespace,
+                                deletion.node(),
+                                deletion.previous_copy().unwrap().0
+                            )
+                            .await
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+
+                if let Some((id, old, request)) = &old_history {
+                    assert!(
+                        catalog
+                            .physical_copy(control.route.route.namespace, *id, *old)
+                            .await
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert_eq!(
+                        catalog
+                            .active_upload_result(request, control.route)
+                            .await
+                            .unwrap(),
+                        Some(crate::managed_catalog::PublishOutcome::AlreadyApplied(
+                            request.expected_version.unwrap() + 1
+                        ))
+                    );
+                }
+                assert_eq!(
+                    done.value()["migrated_logical_files"],
+                    if native_links { 2 } else { 1 }
+                );
+                assert_eq!(done.value()["unassigned"], unassign);
+                let source_after = catalog
+                    .tape_assignment(&control.serial, &source.barcode)
+                    .await
+                    .unwrap();
+                assert_eq!(source_after.is_none(), unassign);
+                if unassign {
+                    let changer = fixture
+                        .owner
+                        .devices
+                        .iter()
+                        .find(|d| d.kind == DeviceKind::Changer)
+                        .unwrap();
+                    let mut robot = MediumChanger::new(changer.dev.as_ref());
+                    robot.load_address_map().unwrap();
+                    let rows = robot.read_all_status().unwrap();
+                    assert!(rows.iter().any(|r| r.full
+                        && r.element_type == ElementType::Storage
+                        && r.volume_tag.as_deref() == Some(source.barcode.as_str())));
+                    assert!(!rows.iter().any(|r| r.full
+                        && r.element_type == ElementType::DataTransfer
+                        && r.volume_tag.as_deref() == Some(source.barcode.as_str())));
+                }
+                if native_links {
+                    let full =
+                        crate::managed_catalog::pool_catalog_path(pool.id, b"/links/empty/native")
+                            .unwrap();
+                    let Some(crate::managed_catalog::ResolvedPath::File {
+                        copy,
+                        attributes: Some(attributes),
+                        ..
+                    }) = catalog
+                        .resolve_active_path_for_route(&control.serial, &full, control.route)
+                        .await
+                        .unwrap()
+                    else {
+                        panic!("native link")
+                    };
+                    assert_eq!(attributes.symlink(), Some("../../data"));
+                    assert!(copy.media.as_ref().unwrap().native_symlink);
+                    assert_eq!(
+                        copy.media.as_ref().unwrap().physical_path,
+                        "links/empty/native"
+                    );
+                    assert_eq!(copy.volume_id, target.volume_id.unwrap());
+                    let inventory = inventory_inner(&fixture.owner.devices, true).unwrap();
+                    let drive = inventory
+                        .drives
+                        .iter()
+                        .find(|d| d.loaded.as_ref().is_some_and(|(b, _)| b == &target.barcode))
+                        .unwrap()
+                        .dev;
+                    let volume =
+                        LtfsVolume::mount(fixture.owner.devices[drive].dev.as_ref()).unwrap();
+                    assert_eq!(
+                        volume
+                            .index()
+                            .find_file("links/empty/native")
+                            .unwrap()
+                            .symlink
+                            .as_deref(),
+                        Some("../../data")
+                    );
+                    let mut bytes = Vec::new();
+                    volume
+                        .read_file_to_writer("links/empty/native", &mut bytes)
+                        .unwrap();
+                    assert_eq!(bytes, b"layout-source");
+                }
+                if let Some(uid) = orphan {
+                    let inventory = inventory_inner(&fixture.owner.devices, true).unwrap();
+                    let drive = inventory
+                        .drives
+                        .iter()
+                        .find(|d| d.loaded.as_ref().is_some_and(|(b, _)| b == &target.barcode))
+                        .unwrap()
+                        .dev;
+                    let checked = fdb_loading::operation_guard(
+                        &fixture.owner,
+                        &fixture.permit,
+                        fixture.owner.devices[drive].dev.as_ref(),
+                        || {
+                            futures_executor::block_on(catalog.require_active_library_readable(
+                                &control.serial,
+                                control.route,
+                                fixture.owner.round,
+                            ))
+                            .map_err(|e| TapeError::Catalog(e.to_string()))
+                        },
+                    );
+                    let volume = LtfsVolume::mount(&checked).unwrap();
+                    let mut bytes = Vec::new();
+                    volume
+                        .read_file_to_writer(
+                            &format!("_reclaim_{}/node-{uid}", original.operation()),
+                            &mut bytes,
+                        )
+                        .unwrap();
+                    assert_eq!(bytes, b"unmapped original bytes");
+                    checked.verify_proof().unwrap();
+                }
+                let db = foundationdb::Database::from_path(cluster).unwrap();
+                let tr = db.create_trx().unwrap();
+                let mut prefix = b"tape-rs/catalog/22/V/".to_vec();
+                prefix.extend_from_slice(source.volume_id.unwrap().as_bytes());
+                let mut end = prefix.clone();
+                while end.last() == Some(&255) {
+                    end.pop();
+                }
+                *end.last_mut().unwrap() += 1;
+                let range = foundationdb::RangeOption {
+                    begin: foundationdb::KeySelector::first_greater_or_equal(prefix),
+                    end: foundationdb::KeySelector::first_greater_or_equal(end),
+                    limit: Some(1),
+                    ..Default::default()
+                };
+                assert!(
+                    tr.get_range(&range, 1, false).await.unwrap().is_empty(),
+                    "旧卷的所有命名空间/代次 V 必须确实为空"
+                );
+                catalog
+                    .require_active_library_readable(
+                        &control.serial,
+                        control.route,
+                        fixture.owner.round,
+                    )
+                    .await
+                    .unwrap();
+                fdb_reclaim::cleanup(&fixture.owner, &fixture.permit, &control, true)
+                    .await
+                    .unwrap();
+                fixture.permit.renew(
+                    fixture.owner.round,
+                    Phase::Serving,
+                    Instant::now() + Duration::from_secs(60),
+                );
+                fixture.owner.fdb_reads.clear();
+                fixture.owner.fdb_read_session = None;
+                fixture.owner.write_session = None;
+                let mut file = Box::pin(read_fdb(
+                    &mut fixture.owner,
+                    Some(&fixture.permit),
+                    &control,
+                    &status,
+                    &format!("/{}/data", pool.id),
+                    Some(&pool.id.to_string()),
+                ))
+                .await
+                .unwrap();
+                let mut body = Vec::new();
+                std::io::Read::read_to_end(&mut file, &mut body).unwrap();
+                assert_eq!(body, b"layout-source");
+                return;
+            }
+        }
+        panic!("原生 reclaim 父任务没有在有界步数内结清");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 双驱动布局固定、接管、机械授权及安全取消"]
+    async fn reclaim_layout_fixes_two_drives_and_homes_across_takeover() {
+        use crate::daemon::fdb_reclaim_mechanics::ReclaimMechanics;
+        use crate::managed_catalog::{
+            ManagedCatalog, ManagementRequest, ReclaimDriveBinding, ReclaimSpec,
+        };
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog = Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());
+        let (mut fixture, control, pool, status) = Box::pin(native_fixture_from(
+            catalog.clone(),
+            None,
+            Fixture::with_drives(2),
+        ))
+        .await;
+        fixture.format(uuid::Uuid::new_v4());
+        let mut volume = LtfsVolume::mount(fixture.device()).unwrap();
+        volume
+            .append_file("/data", &mut std::io::Cursor::new(b"layout-source"))
+            .unwrap();
+        volume.commit().unwrap();
+        drop(volume);
+        let request = |change: Value| {
+            ManagementRequest::parse(json!({"version":1,"library":control.serial,"namespace":control.route.route.namespace.to_string(),"epoch":1,"operation":uuid::Uuid::new_v4().to_string(),"change":change})).unwrap()
+        };
+        let home = request(
+            json!({"kind":"media-move","pool":null,"barcode":"LIFE00L8","volume":null,"revision":null,"destination":"homeslot"}),
+        );
+        assert_eq!(
+            execute(&mut fixture, &control, &status, &home).await["status"],
+            "succeeded"
+        );
+        let import = request(
+            json!({"kind":"media-import","pool":pool.id.to_string(),"barcode":"LIFE00L8","volume":null,"path":"/","merge_tapes":true}),
+        );
+        assert_eq!(
+            execute(&mut fixture, &control, &status, &import).await["status"],
+            "succeeded"
+        );
+        fixture
+            .lib
+            .insert_cartridge(SimCartridge::blank("LAYOUTL8", 128 << 20), 1)
+            .unwrap();
+        let assign = request(
+            json!({"kind":"media-assign","pool":pool.id.to_string(),"barcode":"LAYOUTL8","volume":uuid::Uuid::new_v4().to_string(),"confirm_format":true,"force_format":false}),
+        );
+        let assigned = execute(&mut fixture, &control, &status, &assign).await;
+        assert_eq!(assigned["status"], "succeeded", "{assigned}");
+        let source = catalog
+            .tape_assignment(&control.serial, "LIFE00L8")
+            .await
+            .unwrap()
+            .unwrap();
+        let target = catalog
+            .tape_assignment(&control.serial, "LAYOUTL8")
+            .await
+            .unwrap()
+            .unwrap();
+        let spec=ReclaimSpec::parse(&json!({"kind":"media-reclaim","pool":pool.id.to_string(),"barcode":source.barcode,"volume":source.volume_id.unwrap().to_string(),"revision":source.revision,"confirm_format":true,"unassign":false})).unwrap();
+        let original = request(spec.to_json());
+        catalog
+            .admit_management(
+                &control.serial,
+                control.route,
+                fixture.owner.round,
+                &original,
+            )
+            .await
+            .unwrap();
+        let parent = catalog
+            .start_reclaim_management(
+                &control.serial,
+                control.route,
+                fixture.owner.round,
+                original.epoch(),
+                original.operation(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let changer = fixture
+            .owner
+            .devices
+            .iter()
+            .find(|d| d.kind == DeviceKind::Changer)
+            .unwrap()
+            .dev
+            .as_ref();
+        let mut robot = MediumChanger::new(changer);
+        let map = robot.load_address_map().unwrap().clone();
+        let rows = robot.read_all_status().unwrap();
+        let source_media = rows
+            .iter()
+            .find(|r| r.full && r.volume_tag.as_deref() == Some(source.barcode.as_str()))
+            .unwrap();
+        let target_media = rows
+            .iter()
+            .find(|r| r.full && r.volume_tag.as_deref() == Some(target.barcode.as_str()))
+            .unwrap();
+        let binding = |assignment: &crate::managed_catalog::TapeAssignment,
+                       media: &ElementStatus,
+                       avoid: Option<u16>| {
+            let drive = if media.element_type == ElementType::DataTransfer {
+                media
+            } else {
+                rows.iter()
+                    .find(|r| {
+                        r.element_type == ElementType::DataTransfer
+                            && !r.full
+                            && Some(r.address) != avoid
+                            && (target_media.element_type != ElementType::DataTransfer
+                                || r.address != target_media.address)
+                    })
+                    .unwrap()
+            };
+            ReclaimDriveBinding {
+                barcode: assignment.barcode.clone(),
+                volume: assignment.volume_id.unwrap(),
+                revision: assignment.revision,
+                drive_serial: drive.drive_id.clone().unwrap(),
+                address: drive.address,
+                home: if media.element_type == ElementType::Storage {
+                    media.address
+                } else {
+                    media.source_address.unwrap()
+                },
+            }
+        };
+        let source_binding = binding(&source, source_media, None);
+        let destination_binding = binding(&target, target_media, Some(source_binding.address));
+        let source_index = fixture
+            .owner
+            .devices
+            .iter()
+            .position(|d| d.serial == source_binding.drive_serial)
+            .unwrap();
+        let actor = ReclaimMechanics {
+            catalog: &catalog,
+            changer,
+            drive: fixture.owner.devices[source_index].dev.as_ref(),
+            route: control.route,
+            key: fixture.owner.key,
+            permission: &fixture.permit,
+        };
+        let log = fixture.commands.lock().unwrap().clone();
+        let layout = actor
+            .prepare_layout(&parent, source_binding.clone(), destination_binding.clone())
+            .await
+            .unwrap();
+        assert_eq!(layout.source, source_binding);
+        assert_eq!(layout.destination, destination_binding);
+        assert_eq!(layout.map, map);
+        assert!(
+            !fixture.commands.lock().unwrap()[log.len()..]
+                .iter()
+                .any(|(_, op)| matches!(op, 0x04 | 0x0a | 0x10 | 0x1b | 0x55 | 0x8d | 0xa5))
+        );
+        assert!(
+            catalog
+                .require_active_library_readable(
+                    &control.serial,
+                    control.route,
+                    fixture.owner.round
+                )
+                .await
+                .is_err()
+        );
+        let reopened = ManagedCatalog::open(Some(&cluster)).unwrap();
+        assert_eq!(
+            reopened
+                .reclaim_layout(&parent, fixture.owner.round)
+                .await
+                .unwrap(),
+            Some(layout.clone())
+        );
+        let round = fixture.owner.round + 100;
+        let permit = Arc::new(Permission::default());
+        permit.renew(
+            round,
+            Phase::Fencing,
+            Instant::now() + Duration::from_secs(60),
+        );
+        let mut adopted = takeover(
+            &Provider {
+                lib: fixture.lib.clone(),
+                commands: fixture.commands.clone(),
+            },
+            &fixture.opts,
+            round,
+            Some(&permit),
+            fixture.owner.files.clone(),
+        )
+        .unwrap();
+        permit.renew(
+            round,
+            Phase::Execution,
+            Instant::now() + Duration::from_secs(60),
+        );
+        catalog
+            .claim_active_owner_epoch(&control.serial, round)
+            .await
+            .unwrap();
+        let parents = catalog
+            .claim_reclaim_reservations_page(&control.serial, control.route, round, None, 16)
+            .await
+            .unwrap();
+        let parent = &parents.items[0];
+        catalog
+            .start_reclaim_management(
+                &control.serial,
+                control.route,
+                round,
+                original.epoch(),
+                original.operation(),
+            )
+            .await
+            .unwrap();
+        let log = fixture.commands.lock().unwrap().clone();
+        assert!(
+            actor
+                .execute(
+                    parent,
+                    &layout.plan(
+                        &layout.source,
+                        crate::managed_catalog::ReclaimMediaAction::Load
+                    )
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            *fixture.commands.lock().unwrap(),
+            log,
+            "旧 owner 在原布局接管后不发 CDB"
+        );
+        assert_eq!(
+            catalog.reclaim_layout(parent, round).await.unwrap(),
+            Some(layout.clone())
+        );
+        let actor = ReclaimMechanics {
+            catalog: &catalog,
+            changer: adopted
+                .devices
+                .iter()
+                .find(|d| d.kind == DeviceKind::Changer)
+                .unwrap()
+                .dev
+                .as_ref(),
+            drive: adopted.devices[source_index].dev.as_ref(),
+            route: control.route,
+            key: adopted.key,
+            permission: &permit,
+        };
+        if source_media.element_type == ElementType::Storage {
+            let mut movement = layout.plan(
+                &layout.source,
+                crate::managed_catalog::ReclaimMediaAction::Move,
+            );
+            movement.source = layout.source.home;
+            movement.destination = layout.source.address;
+            actor.execute(parent, &movement).await.unwrap();
+        }
+        let load = layout.plan(
+            &layout.source,
+            crate::managed_catalog::ReclaimMediaAction::Load,
+        );
+        actor.execute(parent, &load).await.unwrap();
+        let unload = layout.plan(
+            &layout.source,
+            crate::managed_catalog::ReclaimMediaAction::Unload,
+        );
+        actor.execute(parent, &unload).await.unwrap();
+        actor.execute(parent, &load).await.unwrap();
+        let cancelled = catalog
+            .cancel_management(
+                &control.serial,
+                control.route,
+                round,
+                original.epoch(),
+                original.operation(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancelled["status"], "cancelled");
+        catalog
+            .require_active_library_readable(&control.serial, control.route, round)
+            .await
+            .unwrap();
+        assert!(catalog.reclaim_layout(parent, round).await.is_err());
+        // A fresh parent may claim the released layout. Only its sealed
+        // original child can use the otherwise closed data lane.
+        let original = request(spec.to_json());
+        catalog
+            .admit_management(&control.serial, control.route, round, &original)
+            .await
+            .unwrap();
+        let parent = catalog
+            .start_reclaim_management(
+                &control.serial,
+                control.route,
+                round,
+                original.epoch(),
+                original.operation(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        actor
+            .prepare_layout(&parent, layout.source.clone(), layout.destination.clone())
+            .await
+            .unwrap();
+        let reader = crate::daemon::fdb_read::ActiveMediaReader {
+            catalog: &catalog,
+            device: adopted.devices[source_index].dev.as_ref(),
+            serial: &control.serial,
+            route: control.route,
+            key: adopted.key,
+            permission: &permit,
+            storage: control.storage,
+        };
+        let cache = fixture.owner.files.extent_cache_dir();
+        let spool = fixture.owner.files.spool_dir();
+        let captured = reader.capture_reclaim_source(&parent, spool).await.unwrap();
+        let inventory =
+            crate::managed_catalog::ReclaimSourceInventory::from_captured(&captured).unwrap();
+        loop {
+            if catalog
+                .seal_reclaim_source_inventory_page(&parent, round, &inventory)
+                .await
+                .unwrap()
+                .complete()
+            {
+                break;
+            }
+        }
+        let file = loop {
+            let walk = catalog.step_reclaim_walk(&parent, round).await.unwrap();
+            if let Some(file) = walk.current() {
+                break file.clone();
+            }
+            assert!(!walk.complete());
+        };
+        let (read, evidence) = reader
+            .read_reclaim_file_with_cache(&parent, &file, &inventory, &cache, spool)
+            .await
+            .unwrap();
+        let upload = crate::managed_catalog::ActiveUploadSpec {
+            pool_id: pool.id,
+            path: file.path().as_bytes().to_vec(),
+            operation_id: file.operation(),
+            expected_version: Some(file.version()),
+            size: file.size(),
+            digest: crate::managed_catalog::ContentDigest::Sha256(evidence.sha256()),
+        };
+        let baseline = catalog
+            .maintenance_status(control.route.route.namespace)
+            .await
+            .unwrap()
+            .pending;
+        let intent = catalog
+            .prepare_reclaim_upload(&parent, round, &target.barcode, &upload, &evidence)
+            .await
+            .unwrap();
+        let request = intent.request();
+        assert_eq!(
+            catalog
+                .reclaim_upload_parent(&request, round)
+                .await
+                .unwrap()
+                .unwrap()
+                .intent(),
+            parent.intent()
+        );
+        catalog
+            .require_reclaim_upload_lane(&parent, round, &request)
+            .await
+            .unwrap();
+        let log = fixture.commands.lock().unwrap().clone();
+        assert_eq!(
+            catalog
+                .check_active_write_group(
+                    &control.serial,
+                    control.route,
+                    round,
+                    std::slice::from_ref(&intent)
+                )
+                .await
+                .unwrap(),
+            vec![false]
+        );
+        let mut foreign = intent.clone();
+        foreign.operation_id = uuid::Uuid::new_v4();
+        assert!(
+            catalog
+                .check_active_write_group(
+                    &control.serial,
+                    control.route,
+                    round,
+                    &[intent.clone(), foreign]
+                )
+                .await
+                .is_err()
+        );
+        let mut changed = request.clone();
+        changed.expected_version = Some(file.version() + 1);
+        assert!(
+            catalog
+                .reclaim_upload_parent(&changed, round)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            *fixture.commands.lock().unwrap(),
+            log,
+            "恢复原写入上下文及拒绝混入请求均不发 CDB"
+        );
+        let destination_index = adopted
+            .devices
+            .iter()
+            .position(|d| d.serial == layout.destination.drive_serial)
+            .unwrap();
+        let actor = ReclaimMechanics {
+            catalog: &catalog,
+            changer: adopted
+                .devices
+                .iter()
+                .find(|d| d.kind == DeviceKind::Changer)
+                .unwrap()
+                .dev
+                .as_ref(),
+            drive: adopted.devices[destination_index].dev.as_ref(),
+            route: control.route,
+            key: adopted.key,
+            permission: &permit,
+        };
+        if target_media.element_type == ElementType::Storage {
+            let mut movement = layout.plan(
+                &layout.destination,
+                crate::managed_catalog::ReclaimMediaAction::Move,
+            );
+            movement.source = layout.destination.home;
+            movement.destination = layout.destination.address;
+            actor.execute(&parent, &movement).await.unwrap();
+        }
+        actor
+            .execute(
+                &parent,
+                &layout.plan(
+                    &layout.destination,
+                    crate::managed_catalog::ReclaimMediaAction::Load,
+                ),
+            )
+            .await
+            .unwrap();
+        permit.renew(
+            round,
+            Phase::Execution,
+            Instant::now() + Duration::from_secs(60),
+        );
+        let copied = Box::pin(fdb_writing::write(
+            &mut adopted,
+            &permit,
+            &control,
+            &status,
+            request.clone(),
+            read.file,
+        ))
+        .await
+        .unwrap();
+        let reader = crate::daemon::fdb_read::ActiveMediaReader {
+            catalog: &catalog,
+            device: adopted.devices[destination_index].dev.as_ref(),
+            serial: &control.serial,
+            route: control.route,
+            key: adopted.key,
+            permission: &permit,
+            storage: control.storage,
+        };
+        let (mut verified, _) = reader
+            .read_reclaim_metadata_with_cache(&parent, &request, &inventory, &cache, spool)
+            .await
+            .unwrap();
+        let mut actual = Vec::new();
+        std::io::Read::read_to_end(&mut verified.file, &mut actual).unwrap();
+        assert_eq!(actual, b"layout-source");
+        assert_eq!(copied, verified.metadata.head.version);
+        catalog
+            .verify_reclaim_file(
+                &parent,
+                round,
+                &file,
+                &request,
+                &verified.metadata,
+                verified.verified_head,
+            )
+            .await
+            .unwrap();
+        catalog
+            .retire_reclaim_file_source(&parent, round, &file, &request)
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog
+                .maintenance_status(control.route.route.namespace)
+                .await
+                .unwrap()
+                .pending,
+            baseline
+        );
+        assert!(
+            catalog
+                .cancel_management(
+                    &control.serial,
+                    control.route,
+                    round,
+                    original.epoch(),
+                    original.operation()
+                )
+                .await
+                .is_err(),
+            "取消子请求不能删除已进入复制阶段的父检查点"
+        );
+    }
+
     struct Recorded {
         inner: Box<dyn TapeTransport + Send>,
         kind: DeviceKind,
@@ -1251,28 +4667,33 @@ mod tests {
     }
     impl DeviceProvider for Provider {
         fn open_all(&self) -> Result<Vec<ManagedDevice>> {
-            Ok(vec![
-                ManagedDevice {
-                    name: "drive".into(),
-                    serial: "SIMDRV0000".into(),
+            let mut devices = (0..self.lib.drive_count())
+                .map(|index| ManagedDevice {
+                    name: if index == 0 {
+                        "drive".into()
+                    } else {
+                        format!("drive-{index}")
+                    },
+                    serial: format!("SIMDRV{index:04}"),
                     kind: DeviceKind::Drive,
                     dev: Box::new(Recorded {
-                        inner: Box::new(self.lib.drive_as(0, 1)),
+                        inner: Box::new(self.lib.drive_as(index, 1)),
                         kind: DeviceKind::Drive,
                         commands: self.commands.clone(),
                     }),
-                },
-                ManagedDevice {
-                    name: "changer".into(),
-                    serial: "SIMLIB0000000001".into(),
+                })
+                .collect::<Vec<_>>();
+            devices.push(ManagedDevice {
+                name: "changer".into(),
+                serial: "SIMLIB0000000001".into(),
+                kind: DeviceKind::Changer,
+                dev: Box::new(Recorded {
+                    inner: Box::new(self.lib.changer_as(1)),
                     kind: DeviceKind::Changer,
-                    dev: Box::new(Recorded {
-                        inner: Box::new(self.lib.changer_as(1)),
-                        kind: DeviceKind::Changer,
-                        commands: self.commands.clone(),
-                    }),
-                },
-            ])
+                    commands: self.commands.clone(),
+                }),
+            });
+            Ok(devices)
         }
     }
     struct Fixture {
@@ -1285,10 +4706,13 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
+            Self::with_drives(1)
+        }
+        fn with_drives(drives: usize) -> Self {
             let root =
                 std::env::temp_dir().join(format!("native-lifecycle-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir(&root).unwrap();
-            let lib = SimLibrary::new(1, 3, 1);
+            let lib = SimLibrary::new(drives, 3, 1);
             lib.enable_changer_pr();
             lib.insert_cartridge(SimCartridge::blank("LIFE00L8", 128 << 20), 0)
                 .unwrap();
@@ -2591,8 +6015,24 @@ mod tests {
         crate::managed_catalog::PoolRecord,
         SharedStatus,
     ) {
+        Box::pin(native_fixture_from(
+            catalog,
+            physical_serial,
+            Fixture::new(),
+        ))
+        .await
+    }
+    async fn native_fixture_from(
+        catalog: Arc<crate::managed_catalog::ManagedCatalog>,
+        physical_serial: Option<&str>,
+        mut fixture: Fixture,
+    ) -> (
+        Fixture,
+        FdbOwnerControl,
+        crate::managed_catalog::PoolRecord,
+        SharedStatus,
+    ) {
         use crate::managed_catalog::{PoolPolicy, PoolRecord, verify_native_barriers};
-        let mut fixture = Fixture::new();
         let namespace = uuid::Uuid::new_v4();
         let serial = physical_serial
             .map(str::to_owned)
@@ -2826,6 +6266,955 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "需要隔离 FDB_TEST_CLUSTER；真实Sim owner/PR目录与链接实读，不访问真实设备"]
     async fn reclaim_node_metadata_reader_requires_original_fences_and_actual_destination() {
+        Box::pin(reclaim_node_metadata_case(false, false, false, false)).await;
+    }
+
+    async fn prepare_raw_body_target(
+        fixture: &mut Fixture,
+        control: &FdbOwnerControl,
+        pool: &crate::managed_catalog::PoolRecord,
+        status: &SharedStatus,
+    ) -> uuid::Uuid {
+        let request = |change: Value| {
+            crate::managed_catalog::ManagementRequest::parse(json!({"version":1,"library":control.serial,
+            "namespace":control.route.route.namespace.to_string(),"epoch":1,"operation":uuid::Uuid::new_v4().to_string(),"change":change})).unwrap()
+        };
+        fixture
+            .lib
+            .insert_cartridge(SimCartridge::blank("RAW001L8", 128 << 20), 1)
+            .unwrap();
+        let changer = fixture
+            .owner
+            .devices
+            .iter()
+            .find(|d| d.kind == DeviceKind::Changer)
+            .unwrap()
+            .dev
+            .as_ref();
+        let mut robot = MediumChanger::new(changer);
+        let map = robot.load_address_map().unwrap().clone();
+        robot
+            .move_medium(map.storage_start + 1, map.dt_start)
+            .unwrap();
+        let id = uuid::Uuid::new_v4();
+        mkltfs(
+            fixture.device(),
+            &MkltfsOptions {
+                volume_id: "RAW001".into(),
+                volume_uuid: Some(id),
+                block_size: fixture.opts.block_size,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut volume = LtfsVolume::mount(fixture.device()).unwrap();
+        volume.create_directory("/archive").unwrap();
+        volume.commit().unwrap();
+        drop(volume);
+        assert_eq!(execute(fixture, control, status, &request(json!({"kind":"media-move","pool":null,"barcode":"RAW001L8","volume":null,"revision":null,"destination":"homeslot"}))).await["status"], "succeeded");
+        let imported = execute(fixture, control, status, &request(json!({"kind":"media-import","pool":pool.id.to_string(),"barcode":"RAW001L8","volume":null,"path":"/target","merge_tapes":true}))).await;
+        assert_eq!(imported["status"], "succeeded", "{imported}");
+        id
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn verify_raw_body_actor(
+        catalog: &crate::managed_catalog::ManagedCatalog,
+        fixture: &mut Fixture,
+        control: &FdbOwnerControl,
+        status: &SharedStatus,
+        parent: &crate::managed_catalog::ReclaimReservation,
+        source: &crate::ltfs::recovery::CapturedIndexSource,
+        proof: &crate::managed_catalog::ReclaimRawSourceRead,
+        bytes: &[u8],
+        target_uuid: uuid::Uuid,
+        repair: bool,
+    ) {
+        use crate::ltfs::recovery::{RecoveryBudget, capture_index_source};
+        use crate::managed_catalog::ReclaimSourceInventory;
+        let placement = catalog
+            .volume_placement(target_uuid)
+            .await
+            .unwrap()
+            .unwrap();
+        let head = catalog
+            .active_loaded_volume_head(
+                &control.serial,
+                &placement.barcode,
+                control.route,
+                fixture.owner.round,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        fdb_loading::select_write(
+            &mut fixture.owner,
+            &fixture.permit,
+            control,
+            status,
+            &placement,
+            head.index,
+        )
+        .await
+        .unwrap();
+        let device = fixture.device();
+        let label = crate::ltfs::volume::read_label_only(device).unwrap();
+        let budget = RecoveryBudget::default();
+        let target = capture_index_source(&TapeDrive::new(device), &label, &budget).unwrap();
+        let inventory = ReclaimSourceInventory::from_captured(source).unwrap();
+        let mut plan = inventory
+            .plan_reclaimed_raw_body(parent, proof, &target, &label, "archive/raw")
+            .unwrap();
+        let mut task = catalog
+            .prepare_reclaim_raw_body(parent, fixture.owner.round, &plan, proof)
+            .await
+            .unwrap();
+        assert!(
+            catalog
+                .cancel_management(
+                    &control.serial,
+                    control.route,
+                    fixture.owner.round,
+                    parent.intent()["epoch"].as_u64().unwrap(),
+                    uuid::Uuid::parse_str(parent.intent()["operation"].as_str().unwrap()).unwrap(),
+                )
+                .await
+                .is_err(),
+            "已准备原迁移任务，取消不能单独释放父屏障"
+        );
+        assert_eq!(
+            catalog
+                .prepare_reclaim_raw_body(parent, fixture.owner.round, &plan, proof)
+                .await
+                .unwrap(),
+            task
+        );
+        assert!(
+            catalog
+                .prepare_reclaim_metadata_node(parent, fixture.owner.round, &plan)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            catalog
+                .reserved_reclaim_status(parent, fixture.owner.round)
+                .await
+                .unwrap()["phase"],
+            "copying"
+        );
+        assert!(
+            catalog
+                .release_reserved_reclaim(parent, fixture.owner.round)
+                .await
+                .is_err()
+        );
+        assert!(
+            catalog
+                .seal_reclaim_raw_file_coverage(
+                    parent,
+                    fixture.owner.round,
+                    proof.source_node().uid(),
+                    task.id()
+                )
+                .await
+                .is_err()
+        );
+        let fault = MetadataFault {
+            inner: device,
+            mode: if repair {
+                MetadataExecutionCase::DiscardIntent
+            } else {
+                MetadataExecutionCase::Commit
+            },
+            matching: std::sync::atomic::AtomicUsize::new(0),
+            fired: std::sync::atomic::AtomicBool::new(false),
+            permission: &fixture.permit,
+            round: fixture.owner.round,
+        };
+        let mut writer = crate::daemon::fdb_reclaim_media::ReclaimMetadataWriter {
+            catalog,
+            device: &fault,
+            route: control.route,
+            key: fixture.owner.key,
+            permission: &fixture.permit,
+            budget: &budget,
+        };
+        let before = fixture.drive_log();
+        assert!(writer.execute(parent, &task, Some(source)).await.is_err());
+        assert_eq!(
+            fixture.drive_log(),
+            before,
+            "缺少正文不能进入 Writing 或发送 CDB"
+        );
+        if repair {
+            let error = writer
+                .execute_raw_body(
+                    parent,
+                    &task,
+                    Some(source),
+                    &mut std::io::Cursor::new(bytes),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, TapeError::CommitFailed { ref stage, .. } if stage == "closing_fm"),
+                "{error}"
+            );
+            fixture.lib.with_cartridge_mut("RAW001L8", |cartridge| {
+                for partition in &mut cartridge.partitions {
+                    partition.flushed = partition.objects.len();
+                }
+            });
+            let writing = catalog
+                .reclaim_metadata_write_status(parent, fixture.owner.round, plan.source_uid())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(writing.writing());
+            assert!(
+                writer.execute(parent, &writing, None).await.is_err(),
+                "残缺尾部不能重写正文或伪报成功"
+            );
+            assert!(
+                catalog
+                    .seal_reclaim_raw_file_coverage(
+                        parent,
+                        fixture.owner.round,
+                        plan.source_uid(),
+                        writing.id()
+                    )
+                    .await
+                    .is_err()
+            );
+            fixture.permit.renew(
+                fixture.owner.round,
+                Phase::Serving,
+                Instant::now() + Duration::from_secs(60),
+            );
+            let goal = writer.begin_discard(parent, &writing).await.unwrap();
+            let crate::daemon::fdb_reclaim_media::ReclaimMetadataRecovery::Observed(observed) =
+                writer.recover(parent, &goal).await.unwrap()
+            else {
+                panic!("fresh recovery")
+            };
+            let resolution = catalog
+                .resolve_reclaim_metadata_recovery(parent, fixture.owner.round, &goal, &observed)
+                .await
+                .unwrap();
+            assert_eq!(
+                resolution.kind(),
+                crate::managed_catalog::ReclaimMetadataRecoveryKind::Discarded
+            );
+            assert!(
+                catalog
+                    .seal_reclaim_raw_file_coverage(
+                        parent,
+                        fixture.owner.round,
+                        plan.source_uid(),
+                        writing.id()
+                    )
+                    .await
+                    .is_err()
+            );
+            let old = catalog
+                .reclaim_metadata_write_status(parent, fixture.owner.round, plan.source_uid())
+                .await
+                .unwrap()
+                .unwrap();
+            let live = writer
+                .read_source_replan(parent, &old, source)
+                .await
+                .unwrap();
+            plan = live.plan().clone();
+            let operation = uuid::Uuid::new_v4();
+            let (one, two) = tokio::join!(
+                catalog.replan_reclaim_metadata_source(
+                    parent,
+                    fixture.owner.round,
+                    &old,
+                    operation,
+                    &live
+                ),
+                catalog.replan_reclaim_metadata_source(
+                    parent,
+                    fixture.owner.round,
+                    &old,
+                    operation,
+                    &live
+                )
+            );
+            task = one.unwrap();
+            assert_eq!(two.unwrap(), task);
+            assert_eq!(
+                catalog
+                    .reclaim_metadata_successor(parent, fixture.owner.round, &old, operation)
+                    .await
+                    .unwrap(),
+                Some(task.clone())
+            );
+            assert!(
+                catalog
+                    .replan_reclaim_metadata_source(
+                        parent,
+                        fixture.owner.round,
+                        &old,
+                        uuid::Uuid::new_v4(),
+                        &live
+                    )
+                    .await
+                    .is_err()
+            );
+            let closed = catalog
+                .close_prepared_reclaim_metadata_write(parent, fixture.owner.round, &task)
+                .await
+                .unwrap();
+            task = catalog
+                .retry_reclaim_metadata_write(parent, fixture.owner.round, &closed)
+                .await
+                .unwrap();
+        }
+        fixture.permit.renew(
+            fixture.owner.round,
+            Phase::Serving,
+            Instant::now() + Duration::from_secs(60),
+        );
+        let result = writer
+            .execute_raw_body(
+                parent,
+                &task,
+                Some(source),
+                &mut std::io::Cursor::new(bytes),
+            )
+            .await
+            .unwrap();
+        let proof_commit = result.commit_evidence().unwrap();
+        assert_eq!(
+            proof_commit.observation().current().location.start_block,
+            plan.previous_dp_eod() + (bytes.len() as u64).div_ceil(u64::from(label.blocksize)) + 1
+        );
+        let before = fixture.drive_log();
+        fixture.permit.renew(
+            fixture.owner.round,
+            Phase::Serving,
+            Instant::now() + Duration::from_secs(60),
+        );
+        let replay = writer.execute(parent, result.task(), None).await.unwrap();
+        assert!(replay.commit_evidence().is_some());
+        assert!(
+            !fixture.drive_log()[before.len()..]
+                .iter()
+                .any(|op| matches!(*op, 0x04 | 0x0a | 0x10 | 0x19 | 0x8d)),
+            "结果重入只读"
+        );
+        // Damage only the actual destination body while keeping the XML and FDB
+        // intact. A replay must refuse a fresh publication capability.
+        fixture.lib.with_cartridge_mut("RAW001L8", |cartridge| {
+            let crate::scsi::sim::LogicalObject::Record(record) =
+                &mut cartridge.partitions[1].objects[plan.previous_dp_eod() as usize]
+            else {
+                panic!("record")
+            };
+            record[0] ^= 1;
+            cartridge.vcr += 1;
+        });
+        fixture.permit.renew(
+            fixture.owner.round,
+            Phase::Serving,
+            Instant::now() + Duration::from_secs(60),
+        );
+        assert!(
+            writer.execute(parent, replay.task(), None).await.is_err(),
+            "索引匹配而正文损坏不能产生提交证明"
+        );
+        assert!(
+            catalog
+                .seal_reclaim_raw_file_coverage(
+                    parent,
+                    fixture.owner.round,
+                    plan.source_uid(),
+                    task.id()
+                )
+                .await
+                .is_err()
+        );
+        fixture.lib.with_cartridge_mut("RAW001L8", |cartridge| {
+            let crate::scsi::sim::LogicalObject::Record(record) =
+                &mut cartridge.partitions[1].objects[plan.previous_dp_eod() as usize]
+            else {
+                panic!("record")
+            };
+            record[0] ^= 1;
+            cartridge.vcr += 1;
+        });
+        fixture.permit.renew(
+            fixture.owner.round,
+            Phase::Serving,
+            Instant::now() + Duration::from_secs(60),
+        );
+        let final_read = writer.execute(parent, replay.task(), None).await.unwrap();
+        let published = catalog
+            .publish_reclaim_metadata_write(
+                parent,
+                fixture.owner.round,
+                final_read.task(),
+                final_read.commit_evidence().unwrap(),
+            )
+            .await
+            .unwrap();
+        catalog
+            .seal_reclaim_raw_file_coverage(
+                parent,
+                fixture.owner.round,
+                plan.source_uid(),
+                task.id(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog
+                .active_volume_file_count(
+                    &control.serial,
+                    control.route,
+                    fixture.owner.round,
+                    target_uuid
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            catalog
+                .step_reclaim_source_coverage(parent, fixture.owner.round, &inventory)
+                .await
+                .is_err(),
+            "只复制一个原始文件不能跳过其他源节点"
+        );
+        let before = fixture.drive_log();
+        assert!(
+            writer
+                .execute(parent, &task, None)
+                .await
+                .unwrap()
+                .task()
+                .completed()
+        );
+        assert_eq!(fixture.drive_log(), before, "独立发布回执不再读带或写带");
+        let next = fixture.owner.round + 100;
+        catalog
+            .claim_active_owner_epoch(&control.serial, next)
+            .await
+            .unwrap();
+        let parents = catalog
+            .claim_reclaim_reservations_page(&control.serial, control.route, next, None, 16)
+            .await
+            .unwrap();
+        let recovered = catalog
+            .claim_reclaim_metadata_write(&parents.items[0], next, plan.source_uid())
+            .await
+            .unwrap();
+        assert!(recovered.completed());
+        catalog
+            .seal_reclaim_raw_file_coverage(&parents.items[0], next, plan.source_uid(), task.id())
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog
+                .reclaim_metadata_publication(&parents.items[0], next, &recovered)
+                .await
+                .unwrap(),
+            Some(published)
+        );
+        assert_eq!(fixture.drive_log(), before, "HA 读取独立结果没有 CDB");
+        assert_eq!(fixture.formats(), 2, "只有两个预格式化测试介质");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 原始未映射正文实读、摘要和失权边界"]
+    async fn reclaim_raw_source_reads_unmapped_ee_bytes_without_logical_publication() {
+        Box::pin(reclaim_raw_body_case(false, false)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 未映射原始正文追加、实读、发布、覆盖与接管"]
+    async fn reclaim_raw_body_actor_streams_unmapped_data_and_reads_back_before_publication() {
+        Box::pin(reclaim_raw_body_case(true, false)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 原始正文残缺索引、原目标修尾、实际重新规划与接管"]
+    async fn reclaim_raw_body_recovery_replans_and_preserves_original_source_bytes() {
+        Box::pin(reclaim_raw_body_case(true, true)).await;
+    }
+
+    async fn reclaim_raw_body_case(append: bool, repair: bool) {
+        use crate::ltfs::index::IndexEntry;
+        use crate::ltfs::recovery::{RecoveryBudget, capture_index_source};
+        use crate::ltfs::volume::HashPolicy;
+        use crate::managed_catalog::{
+            ManagedCatalog, ManagementRequest, ReclaimSourceInventory, ReclaimSpec,
+        };
+        use sha2::{Digest, Sha256};
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog = Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());
+        let (mut fixture, control, pool, status) = Box::pin(native_fixture(catalog.clone())).await;
+        fixture.format(uuid::Uuid::new_v4());
+        let bytes = b"unmapped-EE-body".repeat(10_000);
+        let mut volume = LtfsVolume::mount(fixture.device()).unwrap();
+        volume.set_hash_policy(HashPolicy {
+            sha256: false,
+            md5: false,
+        });
+        volume.append_bytes("/.LTFSEE_DATA/orphan", &bytes).unwrap();
+        volume.set_hash_policy(HashPolicy {
+            sha256: true,
+            md5: true,
+        });
+        volume
+            .append_bytes("/.LTFSEE_DATA/known-body", b"known body")
+            .unwrap();
+        volume
+            .add_symlink("/known", ".LTFSEE_DATA/known-body")
+            .unwrap();
+        volume.commit().unwrap();
+        drop(volume);
+        let captured = capture_index_source(
+            &TapeDrive::new(fixture.device()),
+            &crate::ltfs::volume::read_label_only(fixture.device()).unwrap(),
+            &RecoveryBudget::default(),
+        )
+        .unwrap();
+        let mut raw_uid = None;
+        let mut known = None;
+        captured
+            .for_each_entry(|entry| {
+                if let IndexEntry::File { path, node } = entry {
+                    if path == ".LTFSEE_DATA/orphan" {
+                        raw_uid = Some(node.meta.file_uid);
+                    } else if path == ".LTFSEE_DATA/known-body" {
+                        known = Some((node.meta.file_uid, node.extents[0].start_block));
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        let uid = raw_uid.unwrap();
+        let home=ManagementRequest::parse(json!({"version":1,"library":control.serial,
+            "namespace":control.route.route.namespace.to_string(),"epoch":1,"operation":uuid::Uuid::new_v4().to_string(),
+            "change":{"kind":"media-move","pool":null,"barcode":"LIFE00L8","volume":null,"revision":null,"destination":"homeslot"}})).unwrap();
+        let moved = execute(&mut fixture, &control, &status, &home).await;
+        assert_eq!(moved["status"], "succeeded", "{moved}");
+        let target_uuid = if append {
+            Some(
+                Box::pin(prepare_raw_body_target(
+                    &mut fixture,
+                    &control,
+                    &pool,
+                    &status,
+                ))
+                .await,
+            )
+        } else {
+            None
+        };
+        let import=ManagementRequest::parse(json!({"version":1,"library":control.serial,
+            "namespace":control.route.route.namespace.to_string(),"epoch":1,"operation":uuid::Uuid::new_v4().to_string(),
+            "change":{"kind":"media-import","pool":pool.id.to_string(),"barcode":"LIFE00L8","volume":null,"path":"/","merge_tapes":true}})).unwrap();
+        let imported = execute(&mut fixture, &control, &status, &import).await;
+        assert_eq!(imported["status"], "succeeded", "{imported}");
+        let assignment = catalog
+            .tape_assignment(&control.serial, "LIFE00L8")
+            .await
+            .unwrap()
+            .unwrap();
+        let spec=ReclaimSpec::parse(&json!({"kind":"media-reclaim","pool":pool.id.to_string(),"barcode":assignment.barcode,
+            "volume":assignment.volume_id.unwrap().to_string(),"revision":assignment.revision,"confirm_format":true,"unassign":false})).unwrap();
+        let parent = if append {
+            let cancelled_request=ManagementRequest::parse(json!({"version":1,"library":control.serial,
+                "namespace":control.route.route.namespace.to_string(),"epoch":1,"operation":uuid::Uuid::new_v4().to_string(),"change":spec.to_json()})).unwrap();
+            let commands = fixture.drive_log();
+            catalog
+                .admit_management(
+                    &control.serial,
+                    control.route,
+                    fixture.owner.round,
+                    &cancelled_request,
+                )
+                .await
+                .unwrap();
+            let cancelled_parent = catalog
+                .start_reclaim_management(
+                    &control.serial,
+                    control.route,
+                    fixture.owner.round,
+                    cancelled_request.epoch(),
+                    cancelled_request.operation(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                catalog
+                    .cancel_management(
+                        &control.serial,
+                        control.route,
+                        fixture.owner.round + 1,
+                        cancelled_request.epoch(),
+                        cancelled_request.operation()
+                    )
+                    .await
+                    .is_err()
+            );
+            let cancelled = catalog
+                .cancel_management(
+                    &control.serial,
+                    control.route,
+                    fixture.owner.round,
+                    cancelled_request.epoch(),
+                    cancelled_request.operation(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(cancelled["status"], "cancelled");
+            assert_eq!(cancelled["result"]["source_unchanged"], true);
+            assert_eq!(
+                catalog
+                    .cancel_management(
+                        &control.serial,
+                        control.route,
+                        fixture.owner.round,
+                        cancelled_request.epoch(),
+                        cancelled_request.operation()
+                    )
+                    .await
+                    .unwrap(),
+                cancelled
+            );
+            assert!(
+                catalog
+                    .start_reclaim_management(
+                        &control.serial,
+                        control.route,
+                        fixture.owner.round,
+                        cancelled_request.epoch(),
+                        cancelled_request.operation()
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                catalog
+                    .reserved_reclaim_status(&cancelled_parent, fixture.owner.round)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                fixture.drive_log(),
+                commands,
+                "未开写取消、重复查询及错误 owner 均不发 CDB"
+            );
+            let original=ManagementRequest::parse(json!({"version":1,"library":control.serial,
+                "namespace":control.route.route.namespace.to_string(),"epoch":1,"operation":uuid::Uuid::new_v4().to_string(),"change":spec.to_json()})).unwrap();
+            let queued = catalog
+                .admit_management(
+                    &control.serial,
+                    control.route,
+                    fixture.owner.round,
+                    &original,
+                )
+                .await
+                .unwrap();
+            assert_eq!(queued["status"], "queued");
+            let before = fixture.drive_log();
+            let reservation = catalog
+                .start_reclaim_management(
+                    &control.serial,
+                    control.route,
+                    fixture.owner.round,
+                    original.epoch(),
+                    original.operation(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                catalog
+                    .start_reclaim_management(
+                        &control.serial,
+                        control.route,
+                        fixture.owner.round,
+                        original.epoch(),
+                        original.operation()
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .intent(),
+                reservation.intent()
+            );
+            let task = catalog
+                .management_task(
+                    &control.serial,
+                    control.route,
+                    original.epoch(),
+                    original.operation(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(task["status"], "running");
+            assert_eq!(task["progress"]["phase"], "reserved");
+            assert!(
+                catalog
+                    .release_reserved_reclaim(&reservation, fixture.owner.round)
+                    .await
+                    .is_err(),
+                "不能单独清除运行中的异步父任务"
+            );
+            assert_eq!(
+                fixture.drive_log(),
+                before,
+                "异步父回执与互斥占用原子绑定，没有设备命令"
+            );
+            reservation
+        } else {
+            catalog
+                .reserve_reclaim_pool(
+                    &control.serial,
+                    control.route,
+                    fixture.owner.round,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    &spec,
+                )
+                .await
+                .unwrap()
+        };
+        let inventory = ReclaimSourceInventory::from_captured(&captured).unwrap();
+        assert!(
+            catalog
+                .seal_reclaim_source_inventory_page(&parent, fixture.owner.round, &inventory)
+                .await
+                .unwrap()
+                .complete()
+        );
+        if append {
+            Box::pin(verify_reclaim_mechanical_actor(
+                &catalog, &fixture, &control, &parent,
+            ))
+            .await;
+        }
+        let path = format!("/{}/.LTFSEE_DATA/orphan", pool.id);
+        assert!(
+            catalog
+                .resolve_active_read_source_for_owner(
+                    &control.serial,
+                    path.as_bytes(),
+                    control.route,
+                    fixture.owner.round
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "未映射数据对象不是一个用户文件"
+        );
+        let reader = crate::daemon::fdb_read::ActiveMediaReader {
+            catalog: &catalog,
+            device: fixture.device(),
+            serial: &control.serial,
+            route: control.route,
+            key: fixture.owner.key,
+            permission: &fixture.permit,
+            storage: fixture.budget(),
+        };
+        struct Count {
+            sha: Sha256,
+            length: u64,
+            max: usize,
+        }
+        impl std::io::Write for Count {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.sha.update(bytes);
+                self.length += bytes.len() as u64;
+                self.max = self.max.max(bytes.len());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let before = fixture.drive_log().len();
+        let mut sink = Count {
+            sha: Sha256::new(),
+            length: 0,
+            max: 0,
+        };
+        let proof = reader
+            .read_reclaim_raw_source_to(&parent, uid, fixture.owner.files.spool_dir(), &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(proof.source_node().uid(), uid);
+        assert_eq!(proof.source_node().path(), ".LTFSEE_DATA/orphan");
+        assert_eq!(proof.observed_owner(), fixture.owner.round);
+        assert_eq!(sink.length, bytes.len() as u64);
+        assert_eq!(proof.sha256(), <[u8; 32]>::from(Sha256::digest(&bytes)));
+        assert_eq!(proof.md5(), None);
+        assert!(
+            sink.max < bytes.len(),
+            "多记录正文必须分段输出，不能整体暂存在内存"
+        );
+        assert!(
+            !fixture.drive_log()[before..]
+                .iter()
+                .any(|op| matches!(*op, 0x04 | 0x0a | 0x10 | 0x19 | 0x8d))
+        );
+        assert!(
+            catalog
+                .resolve_active_read_source_for_owner(
+                    &control.serial,
+                    path.as_bytes(),
+                    control.route,
+                    fixture.owner.round
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "原始读取不能补建或发布用户路径"
+        );
+        assert!(
+            catalog
+                .step_reclaim_source_coverage(&parent, fixture.owner.round, &inventory)
+                .await
+                .is_err(),
+            "源正文实读不是迁移/覆盖证明"
+        );
+        if let Some(target) = target_uuid {
+            Box::pin(verify_raw_body_actor(
+                &catalog,
+                &mut fixture,
+                &control,
+                &status,
+                &parent,
+                &captured,
+                &proof,
+                &bytes,
+                target,
+                repair,
+            ))
+            .await;
+            return;
+        }
+        let before = fixture.drive_log();
+        assert!(
+            reader
+                .read_reclaim_raw_source_to(
+                    &parent,
+                    1,
+                    fixture.owner.files.spool_dir(),
+                    &mut std::io::sink()
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fixture.drive_log(),
+            before,
+            "目录 UID 在 FDB 预检阶段拒绝，不发送 CDB"
+        );
+        let (known_uid, block) = known.unwrap();
+        fixture.lib.with_cartridge_mut("LIFE00L8", |cartridge| {
+            let crate::scsi::sim::LogicalObject::Record(record) =
+                &mut cartridge.partitions[1].objects[block as usize]
+            else {
+                panic!("record")
+            };
+            record[0] ^= 1;
+            cartridge.vcr += 1;
+        });
+        assert!(
+            reader
+                .read_reclaim_raw_source_to(
+                    &parent,
+                    known_uid,
+                    fixture.owner.files.spool_dir(),
+                    &mut std::io::sink()
+                )
+                .await
+                .is_err(),
+            "FDB/索引仍保留原摘要，实际正文损坏必须拒绝证据"
+        );
+        fixture.lib.with_cartridge_mut("LIFE00L8", |cartridge| {
+            let crate::scsi::sim::LogicalObject::Record(record) =
+                &mut cartridge.partitions[1].objects[block as usize]
+            else {
+                panic!("record")
+            };
+            record[0] ^= 1;
+            cartridge.vcr += 1;
+        });
+        let close = || -> Result<()> {
+            fixture.permit.close(fixture.owner.round);
+            Ok(())
+        };
+        let boundary = MetadataReadBoundary {
+            inner: fixture.device(),
+            after: &close,
+            triggered: std::sync::atomic::AtomicBool::new(false),
+        };
+        let stopped = crate::daemon::fdb_read::ActiveMediaReader {
+            device: &boundary,
+            ..reader
+        };
+        assert!(
+            stopped
+                .read_reclaim_raw_source_to(
+                    &parent,
+                    uid,
+                    fixture.owner.files.spool_dir(),
+                    &mut std::io::sink()
+                )
+                .await
+                .is_err()
+        );
+        assert!(boundary.triggered.load(std::sync::atomic::Ordering::SeqCst));
+        catalog
+            .release_reserved_reclaim(&parent, fixture.owner.round)
+            .await
+            .unwrap();
+        assert_eq!(fixture.formats(), 1, "只有最初模拟源卷预格式化");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 原生节点写入/发布/接管，无真实设备"]
+    async fn reclaim_node_metadata_actor_preserves_a_separate_root_and_survives_takeover() {
+        Box::pin(reclaim_node_metadata_case(true, false, false, false)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 节点 T2 修尾、实读重规划及接管"]
+    async fn reclaim_node_metadata_recovery_replans_after_actual_index_read() {
+        Box::pin(reclaim_node_metadata_case(true, true, false, false)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 原生链接元数据提交、逻辑迁移、精确退休与接管"]
+    async fn reclaim_native_link_relocates_current_copy_without_empty_upload() {
+        Box::pin(reclaim_node_metadata_case(true, false, true, false)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 原生回收初始化、实际归位和原子解绑"]
+    async fn reclaim_format_unassign_requires_empty_baseline_and_confirmed_original_home() {
+        Box::pin(reclaim_node_metadata_case(true, false, true, true)).await;
+    }
+
+    async fn reclaim_node_metadata_case(
+        execute_node: bool,
+        repair: bool,
+        relocate: bool,
+        unassign: bool,
+    ) {
         use crate::ltfs::index::IndexEntry;
         use crate::ltfs::recovery::{RecoveryBudget, capture_index_source};
         use crate::managed_catalog::{
@@ -2989,18 +7378,42 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let spec=ReclaimSpec::parse(&json!({"kind":"media-reclaim","pool":pool.id.to_string(),"barcode":"LIFE00L8","volume":assignment.volume_id.unwrap().to_string(),"revision":assignment.revision,"confirm_format":true,"unassign":false})).unwrap();
-        let reserved = catalog
-            .reserve_reclaim_pool(
-                &control.serial,
-                control.route,
-                fixture.owner.round,
-                1,
-                uuid::Uuid::new_v4(),
-                &spec,
-            )
-            .await
-            .unwrap();
+        let spec=ReclaimSpec::parse(&json!({"kind":"media-reclaim","pool":pool.id.to_string(),"barcode":"LIFE00L8","volume":assignment.volume_id.unwrap().to_string(),"revision":assignment.revision,"confirm_format":true,"unassign":unassign})).unwrap();
+        let reserved = if relocate {
+            let original = request(spec.to_json());
+            catalog
+                .admit_management(
+                    &control.serial,
+                    control.route,
+                    fixture.owner.round,
+                    &original,
+                )
+                .await
+                .unwrap();
+            catalog
+                .start_reclaim_management(
+                    &control.serial,
+                    control.route,
+                    fixture.owner.round,
+                    original.epoch(),
+                    original.operation(),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+        } else {
+            catalog
+                .reserve_reclaim_pool(
+                    &control.serial,
+                    control.route,
+                    fixture.owner.round,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    &spec,
+                )
+                .await
+                .unwrap()
+        };
         let inventory = ReclaimSourceInventory::from_captured(&captured).unwrap();
         assert!(
             catalog
@@ -3505,6 +7918,22 @@ mod tests {
             original
         );
 
+        Box::pin(verify_node_coverage(
+            &catalog,
+            &reserved,
+            fixture.owner.round,
+            &inventory,
+            &batch,
+            &db_meta,
+        ))
+        .await;
+        if execute_node {
+            Box::pin(verify_node_metadata_actor(
+                &catalog, &fixture, &control, &reserved, &captured, repair, relocate,
+            ))
+            .await;
+            return;
+        }
         let close_permission = || -> Result<()> {
             fixture.permit.close(fixture.owner.round);
             Ok(())
@@ -4901,6 +9330,32 @@ mod tests {
             assert_eq!(
                 (metadata_progress.files(), metadata_progress.aliases()),
                 (0, at + 1)
+            );
+            Box::pin(catalog.seal_reclaim_alias_coverage(
+                &reserved,
+                fixture.owner.round,
+                &file,
+                &intent.request(),
+            ))
+            .await
+            .unwrap();
+            Box::pin(catalog.seal_reclaim_alias_coverage(
+                &reserved,
+                fixture.owner.round,
+                &file,
+                &intent.request(),
+            ))
+            .await
+            .unwrap();
+            assert!(
+                Box::pin(catalog.step_reclaim_source_coverage(
+                    &reserved,
+                    fixture.owner.round,
+                    &inventory
+                ))
+                .await
+                .is_err(),
+                "EE 别名已迁移不能跳过原数据对象及目录"
             );
             let observer = ManagedCatalog::open(Some(&cluster)).unwrap();
             assert_eq!(
@@ -6470,7 +10925,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "需要隔离 FDB_TEST_CLUSTER；实际 Sim T2 前提/持久修尾意图/HA，无修尾写"]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；实际 Sim T2 前提/修尾/独立回执/未知结果与HA"]
     async fn reclaim_metadata_discard_intent_keeps_truncated_attempt_claims_across_ha() {
         Box::pin(native_lifecycle(MetadataCase::Execution(
             MetadataExecutionCase::DiscardIntent,
@@ -6479,7 +10934,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "需要隔离 FDB_TEST_CLUSTER；实际 Sim T1 前提/持久修尾意图/HA，无修尾写"]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；实际 Sim T1 前提/修尾/独立回执/未知结果与HA"]
     async fn reclaim_metadata_discard_intent_requires_actual_unindexed_original_tail() {
         Box::pin(native_lifecycle(MetadataCase::Execution(
             MetadataExecutionCase::DiscardIntentT1,
@@ -6496,6 +10951,62 @@ mod tests {
         .await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Discarding 重入只读识别原正常提交，Sim"]
+    async fn reclaim_metadata_discard_goal_recognizes_a_completed_original_commit() {
+        Box::pin(native_lifecycle(MetadataCase::Execution(
+            MetadataExecutionCase::DiscardIntentCommitted,
+        )))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；原持久检查点目标、HA与IP恢复，Sim"]
+    async fn reclaim_metadata_checkpoint_recovers_empty_ip_through_the_original_fdb_goal() {
+        Box::pin(native_lifecycle(MetadataCase::Execution(
+            MetadataExecutionCase::CheckpointEmpty,
+        )))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；原持久检查点目标、HA与IP恢复，Sim"]
+    async fn reclaim_metadata_checkpoint_recovers_opening_ip_through_the_original_fdb_goal() {
+        Box::pin(native_lifecycle(MetadataCase::Execution(
+            MetadataExecutionCase::CheckpointOpening,
+        )))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；原持久检查点目标、HA与IP恢复，Sim"]
+    async fn reclaim_metadata_checkpoint_recovers_truncated_ip_through_the_original_fdb_goal() {
+        Box::pin(native_lifecycle(MetadataCase::Execution(
+            MetadataExecutionCase::CheckpointPrefix,
+        )))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；原持久检查点目标、HA与IP恢复，Sim"]
+    async fn reclaim_metadata_checkpoint_recovers_committed_dp_with_incomplete_ip_through_the_original_fdb_goal()
+     {
+        Box::pin(native_lifecycle(MetadataCase::Execution(
+            MetadataExecutionCase::CheckpointCommitted,
+        )))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；原持久检查点目标、HA与IP恢复，Sim"]
+    async fn reclaim_metadata_checkpoint_recovers_another_checkpoint_failure_through_the_original_fdb_goal()
+     {
+        Box::pin(native_lifecycle(MetadataCase::Execution(
+            MetadataExecutionCase::CheckpointFault,
+        )))
+        .await;
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum MetadataExecutionCase {
         Commit,
@@ -6504,6 +11015,12 @@ mod tests {
         ClosingFailure,
         DiscardIntent,
         DiscardIntentT1,
+        DiscardIntentCommitted,
+        CheckpointEmpty,
+        CheckpointOpening,
+        CheckpointPrefix,
+        CheckpointCommitted,
+        CheckpointFault,
         DiscardIntentFromUnchanged,
         PermissionAfterWrite,
         PermissionAfterPr,
@@ -6516,6 +11033,32 @@ mod tests {
         UnwrittenIpAhead,
         AttemptRegistry,
         AttemptHistory,
+    }
+
+    impl MetadataExecutionCase {
+        fn checkpoint(self) -> bool {
+            matches!(
+                self,
+                Self::CheckpointEmpty
+                    | Self::CheckpointOpening
+                    | Self::CheckpointPrefix
+                    | Self::CheckpointCommitted
+                    | Self::CheckpointFault
+            )
+        }
+        fn observes_admitted(self) -> bool {
+            matches!(
+                self,
+                Self::LostAdmission
+                    | Self::DiscardIntentFromUnchanged
+                    | Self::UnwrittenClose
+                    | Self::UnwrittenIpDebt
+                    | Self::ClosedRetryContext
+                    | Self::UnwrittenIpMissing
+                    | Self::UnwrittenFraming
+                    | Self::UnwrittenIpAhead
+            ) || self.checkpoint() && self != Self::CheckpointCommitted
+        }
     }
 
     // Construct each large async fixture phase in a separate stack frame.
@@ -6795,10 +11338,13 @@ mod tests {
     impl MetadataFault<'_> {
         fn before(&self, opcode: u8) -> Result<()> {
             let selected = match self.mode {
-                MetadataExecutionCase::IpFailure => Some(0x0a),
+                MetadataExecutionCase::IpFailure | MetadataExecutionCase::CheckpointCommitted => {
+                    Some(0x0a)
+                }
                 MetadataExecutionCase::ClosingFailure
                 | MetadataExecutionCase::DiscardIntent
-                | MetadataExecutionCase::DiscardIntentT1 => Some(0x10),
+                | MetadataExecutionCase::DiscardIntentT1
+                | MetadataExecutionCase::DiscardIntentCommitted => Some(0x10),
                 _ => None,
             };
             if selected == Some(opcode)
@@ -6876,10 +11422,861 @@ mod tests {
         Execution(MetadataExecutionCase),
     }
 
+    // Poll each owned phase only after its predecessor has returned. Keeping
+    // the setup/metadata/actor frames nested exhausted the default test stack.
+    type LifecyclePhase = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
+    type LifecyclePhases =
+        std::rc::Rc<std::cell::RefCell<std::collections::VecDeque<LifecyclePhase>>>;
+
     async fn native_lifecycle(metadata_case: MetadataCase) {
+        let _network = unsafe { foundationdb::boot() };
+        let phases = LifecyclePhases::default();
+        Box::pin(native_lifecycle_setup(metadata_case, phases.clone())).await;
+        loop {
+            let phase = { phases.borrow_mut().pop_front() };
+            let Some(phase) = phase else {
+                break;
+            };
+            phase.await;
+        }
+    }
+
+    struct ReclaimRecoveryScenario {
+        cluster: String,
+        catalog: Arc<crate::managed_catalog::ManagedCatalog>,
+        lib: SimLibrary,
+        permit: Arc<Permission>,
+        commands: Commands,
+        old_round: u64,
+        next: u64,
+        namespace: uuid::Uuid,
+        route: crate::managed_catalog::ActiveLibraryRoute,
+        serial: String,
+        parent: crate::managed_catalog::ReclaimReservation,
+        previous_owner_task: crate::managed_catalog::ReclaimMetadataWrite,
+        recovered: crate::managed_catalog::ReclaimMetadataWrite,
+        scanned: crate::managed_catalog::ReclaimFile,
+        input_request: crate::managed_catalog::ActiveFileRequest,
+        metadata_plan: crate::managed_catalog::ReclaimMetadataPlan,
+        index: crate::managed_catalog::ActiveIndexIdentity,
+        count: u64,
+        barcode: String,
+        mode: MetadataExecutionCase,
+        metadata_task_key: Vec<u8>,
+        metadata_active_key: Vec<u8>,
+        metadata_volume_key: Vec<u8>,
+        original_source: crate::ltfs::recovery::CapturedIndexSource,
+    }
+    impl ReclaimRecoveryScenario {
+        fn run(
+            self,
+            phases: LifecyclePhases,
+        ) -> std::pin::Pin<Box<impl std::future::Future<Output = ()>>> {
+            Box::pin(async move {
+                use crate::daemon::fdb_reclaim_media::ReclaimMetadataWriter;
+                let Self {
+                    cluster,
+                    catalog,
+                    lib,
+                    permit,
+                    commands,
+                    old_round,
+                    next,
+                    namespace,
+                    route,
+                    serial,
+                    parent,
+                    previous_owner_task,
+                    recovered,
+                    scanned,
+                    input_request,
+                    metadata_plan,
+                    index,
+                    count,
+                    barcode,
+                    mode,
+                    metadata_task_key,
+                    metadata_active_key,
+                    metadata_volume_key,
+                    original_source,
+                } = self;
+                let observer =
+                    crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap();
+                let raw_catalog = foundationdb::Database::from_path(&cluster).unwrap();
+                let budget = crate::ltfs::recovery::RecoveryBudget::default();
+                let checkpoint = mode.checkpoint();
+                let (parent, recovered) = if checkpoint {
+                    permit.renew(
+                        old_round,
+                        Phase::Serving,
+                        Instant::now() + Duration::from_secs(60),
+                    );
+                    let device = GuardedTransport::new(
+                        Box::new(Recorded {
+                            inner: Box::new(lib.drive_as(0, 1)),
+                            kind: DeviceKind::Drive,
+                            commands: commands.clone(),
+                        }),
+                        permit.clone(),
+                        old_round,
+                    );
+                    let actor = ReclaimMetadataWriter {
+                        catalog: &catalog,
+                        device: &device,
+                        route,
+                        key: ReservationKey::new(1, old_round),
+                        permission: &permit,
+                        budget: &budget,
+                    };
+                    let before = commands.lock().unwrap().len();
+                    let prepared = actor.begin_checkpoint(&parent, &recovered).await.unwrap();
+                    assert!(prepared.checkpointing());
+                    assert_eq!(prepared.recovery_epoch(), 1);
+                    assert_eq!(prepared.id(), recovered.id());
+                    assert!(
+                        !commands.lock().unwrap()[before..]
+                            .iter()
+                            .any(|(_, op)| matches!(op, 0x0a | 0x10 | 0x8d | 0x04 | 0x19 | 0xa5)),
+                        "检查点意图准入无写命令"
+                    );
+                    assert_eq!(
+                        observer
+                            .pending_reclaim_metadata_write(&parent, old_round)
+                            .await
+                            .unwrap(),
+                        Some(prepared.clone())
+                    );
+                    catalog
+                        .claim_active_owner_epoch(&serial, next)
+                        .await
+                        .unwrap();
+                    let parents = catalog
+                        .claim_reclaim_reservations_page(&serial, route, next, None, 16)
+                        .await
+                        .unwrap();
+                    let saved = observer
+                        .reclaim_metadata_checkpoint(&parents.items[0], next)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let claimed = catalog
+                        .claim_reclaim_metadata_attempt(&parents.items[0], next, &saved)
+                        .await
+                        .unwrap();
+                    assert!(claimed.checkpointing());
+                    assert_eq!(claimed.recovery_epoch(), 1);
+                    (parents.items[0].clone(), claimed)
+                } else {
+                    (parent, recovered)
+                };
+                use crate::daemon::fdb_reclaim_media::ReclaimMetadataRecovery;
+                use crate::managed_catalog::ReclaimMetadataRecoveryKind;
+                // Simulate a lost buffered tail after journaling. Recovery
+                // must observe NoWrite instead of appending a Discard.
+                let unwritten = mode == MetadataExecutionCase::DiscardIntentFromUnchanged
+                    || checkpoint && mode != MetadataExecutionCase::CheckpointCommitted;
+                let committed = mode == MetadataExecutionCase::DiscardIntentCommitted
+                    || mode == MetadataExecutionCase::CheckpointCommitted;
+                if mode == MetadataExecutionCase::DiscardIntentCommitted {
+                    // Settle an ambiguous original closing FM. This is the
+                    // original planned Full, not a recovery-created node.
+                    lib.with_cartridge_mut(&barcode, |cartridge| {
+                        let dp = &mut cartridge.partitions[1];
+                        dp.objects.push(crate::scsi::sim::LogicalObject::Filemark);
+                        dp.flushed = dp.objects.len();
+                        cartridge.vcr += 1;
+                    });
+                }
+                if mode == MetadataExecutionCase::DiscardIntentFromUnchanged {
+                    lib.with_cartridge_mut(&barcode, |cartridge| {
+                        cartridge.partitions[1].flushed = metadata_plan.previous_dp_eod() as usize;
+                    });
+                    lib.power_cut();
+                }
+                permit.close(old_round);
+                permit.renew(
+                    next,
+                    Phase::Execution,
+                    Instant::now() + Duration::from_secs(60),
+                );
+                let raw = lib.drive_as(0, 1);
+                let key = ReservationKey::new(1, next);
+                crate::scsi::reservation::fence(&raw, key).unwrap();
+                if matches!(
+                    mode,
+                    MetadataExecutionCase::DiscardIntentT1 | MetadataExecutionCase::CheckpointFault
+                ) {
+                    raw.inject(crate::scsi::sim::Fault {
+                        opcode: 0x10,
+                        action: crate::scsi::sim::FaultAction::HostError(3),
+                        after: 1,
+                        remaining: 1,
+                    });
+                }
+                let checked = GuardedTransport::new(
+                    Box::new(Recorded {
+                        inner: Box::new(raw),
+                        kind: DeviceKind::Drive,
+                        commands: commands.clone(),
+                    }),
+                    permit.clone(),
+                    next,
+                );
+                let recovery = ReclaimMetadataWriter {
+                    catalog: &catalog,
+                    device: &checked,
+                    route,
+                    key,
+                    permission: &permit,
+                    budget: &budget,
+                };
+                assert!(
+                    recovery
+                        .recover(&parent, &previous_owner_task)
+                        .await
+                        .is_err(),
+                    "旧owner句柄不能执行新owner修尾"
+                );
+                if matches!(
+                    mode,
+                    MetadataExecutionCase::DiscardIntentT1 | MetadataExecutionCase::CheckpointFault
+                ) {
+                    let error = recovery.recover(&parent, &recovered).await.unwrap_err();
+                    assert!(
+                        matches!(error,TapeError::CommitFailed { ref stage, .. } if stage == if checkpoint {"index_partition"} else {"closing_fm"})
+                    );
+                    assert_eq!(
+                        catalog
+                            .pending_reclaim_metadata_write(&parent, next)
+                            .await
+                            .unwrap(),
+                        Some(recovered.clone())
+                    );
+                    assert_eq!(
+                        catalog
+                            .observed_active_volume_index(&serial, metadata_plan.volume())
+                            .await
+                            .unwrap(),
+                        index
+                    );
+                }
+                let before = commands.lock().unwrap().len();
+                let first = boxed_metadata_phase(|| recovery.recover(&parent, &recovered))
+                    .await
+                    .unwrap();
+                let ReclaimMetadataRecovery::Observed(proof) = first else {
+                    panic!("first recovery must read actual media")
+                };
+                let expected = if unwritten {
+                    ReclaimMetadataRecoveryKind::Unwritten
+                } else if committed {
+                    ReclaimMetadataRecoveryKind::Committed
+                } else {
+                    ReclaimMetadataRecoveryKind::Discarded
+                };
+                assert_eq!(proof.kind(), expected);
+                assert!(
+                    !commands.lock().unwrap()[before..]
+                        .iter()
+                        .any(|(_, c)| matches!(*c, 0x04 | 0x19 | 0xa5)),
+                    "修尾不格式化、擦除或搬带"
+                );
+                // Lose the actual recovery result before FDB publication.
+                // The second invocation must recognize the completed index.
+                let media = lib.cartridge(&barcode).unwrap();
+                let before = commands.lock().unwrap().len();
+                let again = boxed_metadata_phase(|| recovery.recover(&parent, &recovered))
+                    .await
+                    .unwrap();
+                let ReclaimMetadataRecovery::Observed(again) = again else {
+                    panic!("unpublished proof must be freshly observed")
+                };
+                assert_eq!(again, proof);
+                assert!(
+                    !commands.lock().unwrap()[before..]
+                        .iter()
+                        .any(|(_, c)| matches!(*c, 0x04 | 0x0a | 0x10 | 0x19 | 0x8d | 0xa5)),
+                    "修尾未知结果只读观察，不重复追加"
+                );
+                assert_reclaim_media_unchanged(&media, &lib.cartridge(&barcode).unwrap());
+                let mut receipt_key = b"tape-rs/catalog/22/@/".to_vec();
+                receipt_key.extend_from_slice(namespace.as_bytes());
+                receipt_key.extend_from_slice(b"RJ");
+                receipt_key.extend_from_slice(recovered.id().as_bytes());
+                let before = commands.lock().unwrap().len();
+                let (a, b) = tokio::join!(
+                    Box::pin(
+                        catalog
+                            .resolve_reclaim_metadata_recovery(&parent, next, &recovered, &proof)
+                    ),
+                    Box::pin(
+                        observer
+                            .resolve_reclaim_metadata_recovery(&parent, next, &recovered, &again)
+                    )
+                );
+                let result = a.unwrap();
+                assert_eq!(b.unwrap(), result);
+                assert_eq!(result.kind(), expected);
+                assert_eq!(result.physical_files(), count + u64::from(committed));
+                assert_eq!(
+                    result.current().generation,
+                    index.generation + u64::from(!unwritten)
+                );
+                assert_eq!(
+                    catalog
+                        .observed_active_volume_index(&serial, metadata_plan.volume())
+                        .await
+                        .unwrap(),
+                    result.current()
+                );
+                assert!(
+                    catalog
+                        .pending_reclaim_metadata_write(&parent, next)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                let resolved = catalog
+                    .reclaim_metadata_checkpoint(&parent, next)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(resolved.resolved() && !resolved.closed() && !resolved.completed());
+                assert_eq!(
+                    recovery.recover(&parent, &recovered).await.unwrap(),
+                    ReclaimMetadataRecovery::Resolved(result.clone())
+                );
+                let mut wrong_request = input_request.clone();
+                wrong_request.operation_id = uuid::Uuid::new_v4();
+                assert!(
+                    catalog
+                        .prepare_reclaim_metadata_write(
+                            &parent,
+                            next,
+                            &scanned,
+                            &wrong_request,
+                            &recovered.plan()
+                        )
+                        .await
+                        .is_err(),
+                    "不能用另一个请求重建已结清原任务"
+                );
+                assert_eq!(
+                    commands.lock().unwrap().len(),
+                    before,
+                    "结清/已结清读取不执行CDB"
+                );
+                let tr = raw_catalog.create_trx().unwrap();
+                for key in [&metadata_active_key, &metadata_volume_key] {
+                    assert!(tr.get(key, false).await.unwrap().is_none());
+                }
+                let saved = tr.get(&receipt_key, false).await.unwrap().unwrap().to_vec();
+                tr.clear(&receipt_key);
+                tr.commit().await.unwrap();
+                assert!(
+                    observer
+                        .reclaim_metadata_checkpoint(&parent, next)
+                        .await
+                        .is_err(),
+                    "终态缺回执不能变成可重试状态"
+                );
+                if !unwritten {
+                    assert!(
+                        observer
+                            .observed_active_volume_index(&serial, metadata_plan.volume())
+                            .await
+                            .is_err(),
+                        "历史缺独立回执必须拒绝"
+                    );
+                }
+                let tr = raw_catalog.create_trx().unwrap();
+                tr.set(&receipt_key, &saved);
+                tr.commit().await.unwrap();
+                let tr = raw_catalog.create_trx().unwrap();
+                let task_raw = tr
+                    .get(&metadata_task_key, false)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .to_vec();
+                tr.clear(&metadata_task_key);
+                tr.commit().await.unwrap();
+                assert_eq!(
+                    observer
+                        .observed_active_volume_index(&serial, metadata_plan.volume())
+                        .await
+                        .unwrap(),
+                    result.current(),
+                    "历史不依赖可清理的原任务行"
+                );
+                let tr = raw_catalog.create_trx().unwrap();
+                tr.set(&metadata_task_key, &task_raw);
+                tr.commit().await.unwrap();
+                assert!(
+                    catalog
+                        .retry_reclaim_metadata_write(&parent, next, &resolved)
+                        .await
+                        .is_err(),
+                    "修尾终态不能套用旧计划Closed重试"
+                );
+                let newer = next + 100;
+                catalog
+                    .claim_active_owner_epoch(&serial, newer)
+                    .await
+                    .unwrap();
+                let parents = catalog
+                    .claim_reclaim_reservations_page(&serial, route, newer, None, 16)
+                    .await
+                    .unwrap();
+                let claimed = catalog
+                    .claim_reclaim_metadata_attempt(&parents.items[0], newer, &resolved)
+                    .await
+                    .unwrap();
+                assert!(claimed.resolved());
+                assert_eq!(claimed.owner(), newer);
+                assert_eq!(
+                    observer
+                        .reclaim_metadata_resolution(&parents.items[0], newer, &claimed)
+                        .await
+                        .unwrap(),
+                    Some(result.clone())
+                );
+                assert!(
+                    catalog
+                        .resolve_reclaim_metadata_recovery(
+                            &parents.items[0],
+                            newer,
+                            &claimed,
+                            &proof
+                        )
+                        .await
+                        .is_err(),
+                    "旧owner实读token不能跨接任结清"
+                );
+                let tr = raw_catalog.create_trx().unwrap();
+                assert_eq!(
+                    tr.get(&receipt_key, false).await.unwrap().unwrap().as_ref(),
+                    saved.as_slice(),
+                    "接任不重写独立回执"
+                );
+                assert_eq!(
+                    commands.lock().unwrap().len(),
+                    before,
+                    "接任终态与拒绝旧token不执行CDB"
+                );
+                phases.borrow_mut().push_back(
+                    (ReclaimDonorScenario {
+                        cluster,
+                        catalog,
+                        lib,
+                        permit,
+                        commands,
+                        owner: newer,
+                        namespace,
+                        route,
+                        serial,
+                        parent: parents.items[0].clone(),
+                        task: claimed,
+                        file: scanned,
+                        request: input_request,
+                        original_source,
+                        committed: result.kind() == ReclaimMetadataRecoveryKind::Committed,
+                    })
+                    .run(),
+                );
+            })
+        }
+    }
+
+    struct ReclaimDonorScenario {
+        cluster: String,
+        catalog: Arc<crate::managed_catalog::ManagedCatalog>,
+        lib: SimLibrary,
+        permit: Arc<Permission>,
+        commands: Commands,
+        owner: u64,
+        namespace: uuid::Uuid,
+        route: crate::managed_catalog::ActiveLibraryRoute,
+        serial: String,
+        parent: crate::managed_catalog::ReclaimReservation,
+        task: crate::managed_catalog::ReclaimMetadataWrite,
+        file: crate::managed_catalog::ReclaimFile,
+        request: crate::managed_catalog::ActiveFileRequest,
+        original_source: crate::ltfs::recovery::CapturedIndexSource,
+        committed: bool,
+    }
+    impl ReclaimDonorScenario {
+        fn run(self) -> std::pin::Pin<Box<impl std::future::Future<Output = ()>>> {
+            Box::pin(async move {
+                use crate::daemon::fdb_reclaim_media::ReclaimMetadataWriter;
+                let Self {
+                    cluster,
+                    catalog,
+                    lib,
+                    permit,
+                    commands,
+                    owner,
+                    namespace,
+                    route,
+                    serial,
+                    parent,
+                    task,
+                    file,
+                    request,
+                    original_source,
+                    committed,
+                } = self;
+                let observer =
+                    crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap();
+                let raw_catalog = foundationdb::Database::from_path(&cluster).unwrap();
+                permit.close(owner - 100);
+                permit.renew(
+                    owner,
+                    Phase::Execution,
+                    Instant::now() + Duration::from_secs(60),
+                );
+                let raw = lib.drive_as(0, 1);
+                let key = ReservationKey::new(1, owner);
+                crate::scsi::reservation::fence(&raw, key).unwrap();
+                let checked = GuardedTransport::new(
+                    Box::new(Recorded {
+                        inner: Box::new(raw),
+                        kind: DeviceKind::Drive,
+                        commands: commands.clone(),
+                    }),
+                    permit.clone(),
+                    owner,
+                );
+                let budget = crate::ltfs::recovery::RecoveryBudget::default();
+                let mut actor = ReclaimMetadataWriter {
+                    catalog: &catalog,
+                    device: &checked,
+                    route,
+                    key,
+                    permission: &permit,
+                    budget: &budget,
+                };
+                let before = commands.lock().unwrap().len();
+                if committed {
+                    catalog
+                        .seal_reclaim_raw_file_coverage(
+                            &parent,
+                            owner,
+                            task.plan().source_uid(),
+                            task.id(),
+                        )
+                        .await
+                        .unwrap();
+                    assert!(
+                        catalog
+                            .reclaim_metadata_replan_context(&parent, owner, &task)
+                            .await
+                            .is_err()
+                    );
+                    assert!(
+                        actor
+                            .read_donor(&parent, &file, &request, &task)
+                            .await
+                            .is_err()
+                    );
+                    assert_eq!(
+                        commands.lock().unwrap().len(),
+                        before,
+                        "已提交元数据不能另建 donor/后继"
+                    );
+                    return;
+                }
+                assert_eq!(
+                    catalog
+                        .reclaim_metadata_replan_context(&parent, owner, &task)
+                        .await
+                        .unwrap(),
+                    (file.clone(), request.clone())
+                );
+                let input = catalog
+                    .reclaim_metadata_input(&parent, owner, &file, &request)
+                    .await
+                    .unwrap();
+                let context = catalog
+                    .reclaim_metadata_donor_context(&parent, owner, &file, &request, &task)
+                    .await
+                    .unwrap();
+                let label = crate::ltfs::volume::read_label_only(&checked).unwrap();
+                let captured = crate::ltfs::recovery::capture_index_source(
+                    &TapeDrive::new(&checked),
+                    &label,
+                    &budget,
+                )
+                .unwrap();
+                let node = context.require_donor(&captured).unwrap();
+                let block = node.extents[0].start_block as usize;
+                let barcode = input.destination().placement().barcode.clone();
+                // Preserve every old FDB proof and raw index while changing a
+                // body record. The uncached donor read must still detect it.
+                let original =
+                    lib.cartridge(&barcode).unwrap().partitions[1].objects[block].clone();
+                lib.with_cartridge_mut(&barcode, |cartridge| {
+                    let crate::scsi::sim::LogicalObject::Record(bytes) =
+                        &mut cartridge.partitions[1].objects[block]
+                    else {
+                        panic!("donor record")
+                    };
+                    bytes[0] ^= 1;
+                    cartridge.vcr += 1;
+                });
+                let before = commands.lock().unwrap().len();
+                assert!(
+                    actor
+                        .read_donor(&parent, &file, &request, &task)
+                        .await
+                        .is_err(),
+                    "保留旧摘要不能遮盖实际正文损坏"
+                );
+                assert!(
+                    !commands.lock().unwrap()[before..]
+                        .iter()
+                        .any(|(_, op)| matches!(op, 0x0a | 0x10 | 0x8d | 0x04 | 0x19 | 0xa5))
+                );
+                lib.with_cartridge_mut(&barcode, |cartridge| {
+                    cartridge.partitions[1].objects[block] = original;
+                    cartridge.vcr += 1;
+                });
+                let donor = actor
+                    .read_donor(&parent, &file, &request, &task)
+                    .await
+                    .unwrap();
+                let inventory =
+                    crate::managed_catalog::ReclaimSourceInventory::from_captured(&original_source)
+                        .unwrap();
+                if crate::managed_catalog::ActiveIndexIdentity::from(donor.target().construct())
+                    != input.destination().index()
+                {
+                    assert!(
+                        inventory
+                            .plan_reclaimed_body(&input, donor.target(), task.plan().path())
+                            .is_err(),
+                        "首次计划接口不放宽到新头"
+                    );
+                }
+                let plan = inventory
+                    .plan_reclaimed_body_after_recovery(
+                        &input,
+                        donor.target(),
+                        task.plan().path(),
+                        donor.evidence(),
+                    )
+                    .unwrap();
+                assert_eq!(plan.source_uid(), task.plan().source_uid());
+                assert_eq!(
+                    plan.previous_source().unwrap(),
+                    donor.target().identity().unwrap()
+                );
+                let operation = uuid::Uuid::new_v4();
+                assert!(
+                    observer
+                        .reclaim_metadata_successor(&parent, owner, &task, operation)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                let wrong = inventory
+                    .plan_reclaimed_body_after_recovery(
+                        &input,
+                        donor.target(),
+                        "different-raw-request",
+                        donor.evidence(),
+                    )
+                    .unwrap();
+                assert!(
+                    catalog
+                        .replan_reclaim_metadata_write(
+                            &parent,
+                            owner,
+                            &file,
+                            &request,
+                            &task,
+                            operation,
+                            &wrong,
+                            donor.evidence()
+                        )
+                        .await
+                        .is_err()
+                );
+                let before = commands.lock().unwrap().len();
+                let (one, two) = tokio::join!(
+                    catalog.replan_reclaim_metadata_write(
+                        &parent,
+                        owner,
+                        &file,
+                        &request,
+                        &task,
+                        operation,
+                        &plan,
+                        donor.evidence()
+                    ),
+                    observer.replan_reclaim_metadata_write(
+                        &parent,
+                        owner,
+                        &file,
+                        &request,
+                        &task,
+                        operation,
+                        &plan,
+                        donor.evidence()
+                    )
+                );
+                let mut successor = one.unwrap();
+                assert_eq!(two.unwrap(), successor);
+                assert_eq!(successor.id(), operation);
+                assert_eq!(successor.previous_attempt(), Some(task.id()));
+                assert_eq!(successor.first_attempt(), task.first_attempt());
+                assert_eq!(successor.recovery_epoch(), 0);
+                assert_eq!(
+                    observer
+                        .reclaim_metadata_successor(&parent, owner, &task, operation)
+                        .await
+                        .unwrap(),
+                    Some(successor.clone())
+                );
+                assert!(
+                    catalog
+                        .replan_reclaim_metadata_write(
+                            &parent,
+                            owner,
+                            &file,
+                            &request,
+                            &task,
+                            uuid::Uuid::new_v4(),
+                            &plan,
+                            donor.evidence()
+                        )
+                        .await
+                        .is_err(),
+                    "同一原尝试不得创建第二后继请求"
+                );
+                assert_eq!(
+                    commands.lock().unwrap().len(),
+                    before,
+                    "登记、重放与拒绝只访问原 FDB"
+                );
+                assert_eq!(
+                    catalog
+                        .reclaim_metadata_input(&parent, owner, &file, &request)
+                        .await
+                        .unwrap(),
+                    input,
+                    "原正文/退休事实不重写"
+                );
+                let closed = catalog
+                    .close_prepared_reclaim_metadata_write(&parent, owner, &successor)
+                    .await
+                    .unwrap();
+                successor = catalog
+                    .retry_reclaim_metadata_write(&parent, owner, &closed)
+                    .await
+                    .unwrap();
+                let mut origin_edge = b"tape-rs/catalog/22/@/".to_vec();
+                origin_edge.extend_from_slice(namespace.as_bytes());
+                origin_edge.extend_from_slice(b"RV");
+                origin_edge
+                    .extend_from_slice(&parent.intent()["epoch"].as_u64().unwrap().to_be_bytes());
+                origin_edge.extend_from_slice(
+                    uuid::Uuid::parse_str(parent.intent()["operation"].as_str().unwrap())
+                        .unwrap()
+                        .as_bytes(),
+                );
+                origin_edge.extend_from_slice(&plan.source_uid().to_be_bytes());
+                origin_edge.extend_from_slice(task.id().as_bytes());
+                let tr = raw_catalog.create_trx().unwrap();
+                let origin_raw = tr.get(&origin_edge, false).await.unwrap().unwrap().to_vec();
+                tr.clear(&origin_edge);
+                tr.commit().await.unwrap();
+                assert!(
+                    catalog
+                        .reclaim_metadata_checkpoint(&parent, owner)
+                        .await
+                        .is_err(),
+                    "同计划重试仍须核实最初的独立 donor 后继证明"
+                );
+                let tr = raw_catalog.create_trx().unwrap();
+                tr.set(&origin_edge, &origin_raw);
+                tr.commit().await.unwrap();
+                permit.renew(
+                    owner,
+                    Phase::Execution,
+                    Instant::now() + Duration::from_secs(60),
+                );
+                let execution = actor
+                    .execute(&parent, &successor, Some(&original_source))
+                    .await
+                    .unwrap();
+                let publication = catalog
+                    .publish_reclaim_metadata_write(
+                        &parent,
+                        owner,
+                        execution.task(),
+                        execution.commit_evidence().unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(publication.plan(), plan);
+                assert!(
+                    catalog
+                        .pending_reclaim_metadata_write(&parent, owner)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    catalog
+                        .reclaim_metadata_input(&parent, owner, &file, &request)
+                        .await
+                        .unwrap(),
+                    input
+                );
+                let mut edge = b"tape-rs/catalog/22/@/".to_vec();
+                edge.extend_from_slice(namespace.as_bytes());
+                edge.extend_from_slice(b"RV");
+                edge.extend_from_slice(&parent.intent()["epoch"].as_u64().unwrap().to_be_bytes());
+                edge.extend_from_slice(
+                    uuid::Uuid::parse_str(parent.intent()["operation"].as_str().unwrap())
+                        .unwrap()
+                        .as_bytes(),
+                );
+                edge.extend_from_slice(&plan.source_uid().to_be_bytes());
+                edge.extend_from_slice(task.id().as_bytes());
+                let tr = raw_catalog.create_trx().unwrap();
+                let saved = tr.get(&edge, false).await.unwrap().unwrap().to_vec();
+                tr.clear(&edge);
+                tr.commit().await.unwrap();
+                assert!(
+                    catalog
+                        .reclaim_metadata_checkpoint(&parent, owner)
+                        .await
+                        .is_err(),
+                    "缺后继边不能重建或另发请求"
+                );
+                assert_eq!(
+                    observer
+                        .observed_active_volume_index(&serial, plan.volume())
+                        .await
+                        .unwrap(),
+                    publication.observation().current(),
+                    "新物理历史独立于可清理的后继边"
+                );
+                let tr = raw_catalog.create_trx().unwrap();
+                tr.set(&edge, &saved);
+                tr.commit().await.unwrap();
+            })
+        }
+    }
+
+    async fn native_lifecycle_setup(
+        metadata_case: MetadataCase,
+        recovery_scenario: LifecyclePhases,
+    ) {
         use crate::managed_catalog::{ManagedCatalog, ManagementRequest};
         let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
-        let _network = unsafe { foundationdb::boot() };
         let catalog = Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());
         let (mut fixture, control, pool, status) = Box::pin(native_fixture(catalog.clone())).await;
         let namespace = control.route.route.namespace;
@@ -7510,13 +12907,19 @@ mod tests {
             "没有目标实读不能封存数据迁移账本"
         );
         let raw_catalog = foundationdb::Database::from_path(&cluster).unwrap();
-        let own_row = |kind: u8| {
+        let row_reservation = reserved.clone();
+        let own_row = move |kind: u8| {
             let mut key = b"tape-rs/catalog/22/@/".to_vec();
             key.extend_from_slice(namespace.as_bytes());
             key.extend_from_slice(&[b'R', kind]);
-            key.extend_from_slice(&reserved.intent()["epoch"].as_u64().unwrap().to_be_bytes());
             key.extend_from_slice(
-                uuid::Uuid::parse_str(reserved.intent()["operation"].as_str().unwrap())
+                &row_reservation.intent()["epoch"]
+                    .as_u64()
+                    .unwrap()
+                    .to_be_bytes(),
+            );
+            key.extend_from_slice(
+                uuid::Uuid::parse_str(row_reservation.intent()["operation"].as_str().unwrap())
                     .unwrap()
                     .as_bytes(),
             );
@@ -7876,10 +13279,14 @@ mod tests {
                 .unwrap(),
             data_progress
         );
-        // Poll metadata validation separately from the deep ordinary-write
-        // recovery setup; keep the default test/production stack unchanged.
-        boxed_metadata_phase(|| async {
-        let input_request = intent.request();
+        let next_phases = recovery_scenario.clone();
+        // Keep the existing long fixture layout while moving phase ownership.
+        #[rustfmt::skip]
+        let phase = boxed_metadata_phase(move || async move {
+            let recovery_scenario = next_phases;
+            let inventory =
+                crate::managed_catalog::ReclaimSourceInventory::from_captured(&captured).unwrap();
+            let input_request = intent.request();
         let input = catalog
             .reclaim_metadata_input(&reserved, fixture.owner.round, &scanned, &input_request)
             .await
@@ -8055,10 +13462,13 @@ mod tests {
             .unwrap()
             .to_vec();
         if let MetadataCase::Execution(mode) = metadata_case {
-            boxed_metadata_phase(|| async {
-                use crate::daemon::fdb_reclaim_media::ReclaimMetadataWriter;
+                let next_phases = recovery_scenario.clone();
+                let phase = boxed_metadata_phase(move || async move {
+                    let recovery_scenario = next_phases;
+                    use crate::daemon::fdb_reclaim_media::ReclaimMetadataWriter;
                 use crate::managed_catalog::ReclaimMetadataObservationKind;
-                fixture.permit.renew(fixture.owner.round, Phase::Serving, Instant::now() + Duration::from_secs(60));
+                fixture.permit.renew(fixture.owner.round, Phase::Serving, Instant::now() + Duration::from_secs(60),
+                    );
                 let budget = crate::ltfs::recovery::RecoveryBudget::default();
                 if mode == MetadataExecutionCase::Commit {
                     let raw = fixture.lib.drive_as(0, 1);
@@ -8066,7 +13476,7 @@ mod tests {
                         catalog: &catalog, device: &raw, route, key: fixture.owner.key,
                         permission: &fixture.permit, budget: &budget,
                     };
-                    assert!(unchecked.execute(&reserved, &scanned, &input_request, &metadata_write, Some(&captured)).await.is_err(), "raw transport 必须在准入和设备访问前拒绝");
+                    assert!(unchecked.execute(&reserved, &metadata_write, Some(&captured)).await.is_err(), "raw transport 必须在准入和设备访问前拒绝");
                     assert!(raw.command_log().is_empty(), "raw transport 拒绝必须零 I/O");
                 }
                 let device = MetadataFault {
@@ -8082,32 +13492,37 @@ mod tests {
                 };
                 let original_commands = fixture.commands.lock().unwrap().clone();
                 let foreign = Permission::default();
-                foreign.renew(fixture.owner.round, Phase::Serving, Instant::now() + Duration::from_secs(60));
+                foreign.renew(fixture.owner.round, Phase::Serving, Instant::now() + Duration::from_secs(60),
+                    );
                 let mut mismatched = ReclaimMetadataWriter {
                     catalog: &catalog, device: &device, route, key: fixture.owner.key,
                     permission: &foreign, budget: &budget,
                 };
-                assert!(mismatched.execute(&reserved, &scanned, &input_request, &metadata_write, Some(&captured)).await.is_err());
+                assert!(mismatched.execute(&reserved, &metadata_write, Some(&captured)).await.is_err());
                 assert_eq!(*fixture.commands.lock().unwrap(), original_commands, "异许可实例必须零设备 I/O");
-                assert!(writer.execute(&reserved, &scanned, &input_request, &metadata_write, Some(&captured_target)).await.is_err(), "其他卷不是原源实读");
+                assert!(writer.execute(&reserved, &metadata_write, Some(&captured_target)).await.is_err(), "其他卷不是原源实读");
                 assert_eq!(*fixture.commands.lock().unwrap(), original_commands);
                 assert_eq!(catalog.reclaim_metadata_write_status(&reserved, fixture.owner.round, source_data_uid).await.unwrap(), Some(metadata_write.clone()));
                 if mode == MetadataExecutionCase::AttemptRegistry {
                     boxed_metadata_phase(|| async {
                         let commands=fixture.commands.lock().unwrap().clone();
-                        let recovered=observer.reclaim_metadata_execution_context(&reserved,fixture.owner.round,&metadata_write).await.unwrap();
+                        let recovered=observer.reclaim_metadata_execution_context(&reserved,fixture.owner.round,&metadata_write,
+                                ).await.unwrap();
                         assert_eq!(recovered,(scanned.clone(),input_request.clone()),"独立目录实例只按原尝试恢复原执行上下文");
                         let mut child_key=own_row(b'c');child_key.extend_from_slice(input_request.operation_id.as_bytes());
-                        for key in [&child_key,&data_body_key,&data_destination_key,&retired_key] {
+                        for key in [&child_key,&data_body_key,&data_destination_key,&retired_key,
+                            ] {
                             let tr=raw_catalog.create_trx().unwrap();let raw=tr.get(key,false).await.unwrap().unwrap().to_vec();tr.clear(key);tr.commit().await.unwrap();
-                            let missing=observer.reclaim_metadata_execution_context(&reserved,fixture.owner.round,&metadata_write).await;
+                            let missing=observer.reclaim_metadata_execution_context(&reserved,fixture.owner.round,&metadata_write,
+                                    ).await;
                             let tr=raw_catalog.create_trx().unwrap();let unchanged=tr.get(key,false).await.unwrap().is_none();tr.set(key,&raw);tr.commit().await.unwrap();
                             assert!(missing.is_err() && unchanged,"丢失原上下文证明必须拒绝且不修复");
                         }
                         let tr=raw_catalog.create_trx().unwrap();let original=tr.get(&metadata_task_key,false).await.unwrap().unwrap().to_vec();
                         let header=tr.get(&metadata_header_key,false).await.unwrap().unwrap().to_vec();
-                        let saved:Value=serde_json::from_slice(&original).unwrap();assert_eq!(saved["version"],5);assert_eq!(saved["context"]["file"],serde_json::to_value(&scanned).unwrap());
-                        for (field,changed) in [("epoch",json!(0)),("epoch",json!(input_request.request_epoch+1)),("request",json!([3u8;32].to_vec()))] {
+                        let saved:Value=serde_json::from_slice(&original).unwrap();assert_eq!(saved["version"], 6);assert_eq!(saved["context"]["file"],serde_json::to_value(&scanned).unwrap());
+                        for (field,changed) in [("epoch",json!(0)),("epoch",json!(input_request.request_epoch+1)),("request",json!([3u8;32].to_vec())),
+                            ] {
                             let mut corrupt=saved["context"].clone();corrupt[field]=changed;
                             // Keep the record's canonical field order. Recompute both
                             // checksums so these are semantic, not codec-only failures.
@@ -8116,7 +13531,7 @@ mod tests {
                             let start=original_text.find("\"context\":").unwrap()+"\"context\":".len();let end=original_text.find(",\"owner\":").unwrap();
                             let raw=format!("{}{}{}",&original_text[..start],context,&original_text[end..]).into_bytes();
                             let h:Value=serde_json::from_slice(&header[..header.len()-32]).unwrap();
-                            let digest=Sha256::new().chain_update(b"tape-rs/reclaim-metadata-task/5").chain_update(&raw).finalize().to_vec();
+                            let digest=Sha256::new().chain_update(b"tape-rs/reclaim-metadata-task/7").chain_update(&raw).finalize().to_vec();
                             let mut h=format!(r#"{{"version":{},"uid":{},"attempt":{},"task_sha256":{}}}"#,h["version"],h["uid"],h["attempt"],json!(digest)).into_bytes();
                             let parent=format!("{:x}",Sha256::digest(reserved.intent().to_string().as_bytes()));
                             let hash=Sha256::new().chain_update(b"tape-rs/reclaim-metadata-registry/1").chain_update(parent.as_bytes()).chain_update(&h).finalize();h.extend_from_slice(&hash);
@@ -8124,18 +13539,22 @@ mod tests {
                             let discovered=catalog.pending_reclaim_metadata_write(&reserved,fixture.owner.round).await;
                             let changed=if corrupt["epoch"]==0 {assert!(discovered.is_err());None} else {
                                 let handle=discovered.unwrap().unwrap();
-                                Some(observer.reclaim_metadata_execution_context(&reserved,fixture.owner.round,&handle).await)
+                                Some(observer.reclaim_metadata_execution_context(&reserved,fixture.owner.round,&handle,
+                                            ).await,
+                                    )
                             };
                             let tr=raw_catalog.create_trx().unwrap();assert_eq!(tr.get(&metadata_task_key,false).await.unwrap().unwrap().as_ref(),raw.as_slice());tr.set(&metadata_task_key,&original);tr.set(&metadata_header_key,&header);tr.commit().await.unwrap();assert!(changed.is_none_or(|result|result.is_err()),"匹配外层摘要仍不得接受不同封存请求");
                         }
                         assert_eq!(*fixture.commands.lock().unwrap(),commands,"恢复或拒绝上下文不执行 CDB");
                         assert_eq!(catalog.pending_reclaim_metadata_write(&reserved,fixture.owner.round).await.unwrap(),Some(metadata_write.clone()));
-                        assert!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&metadata_write).await.is_err());
-                        let keys=[&metadata_active_key,&metadata_volume_key,&latest_metadata_key,&metadata_header_key,&metadata_task_key];
+                        assert!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&metadata_write).await.is_err());
+                        let keys=[&metadata_active_key,&metadata_volume_key,&latest_metadata_key,&metadata_header_key,&metadata_task_key,
+                            ];
                         for key in keys {
                             let tr=raw_catalog.create_trx().unwrap();let original=tr.get(key,false).await.unwrap().unwrap().to_vec();tr.clear(key);tr.commit().await.unwrap();
                             let missing=catalog.pending_reclaim_metadata_write(&reserved,fixture.owner.round).await;
-                            let prepare=catalog.prepare_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&metadata_plan).await;
+                            let prepare=catalog.prepare_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&metadata_plan,
+                                    ).await;
                             let tr=raw_catalog.create_trx().unwrap();let untouched=tr.get(key,false).await.unwrap().is_none();tr.set(key,&original);tr.commit().await.unwrap();
                             assert!(missing.is_err() && prepare.is_err(),"缺失原索引不能报告空闲或准备新任务");
                             assert!(untouched,"查询与准备拒绝不能修复丢失的索引");
@@ -8151,12 +13570,14 @@ mod tests {
                         let error=catalog.pending_reclaim_metadata_write(&reserved,fixture.owner.round).await;
                         let tr=raw_catalog.create_trx().unwrap();assert_eq!(tr.get(&metadata_header_key,false).await.unwrap().unwrap().as_ref(),corrupt.as_slice());tr.set(&metadata_header_key,&header);tr.commit().await.unwrap();assert!(error.is_err());
                         let tr=raw_catalog.create_trx().unwrap();let prepared=tr.get(&metadata_task_key,false).await.unwrap().unwrap().to_vec();
-                        let admitted=catalog.admit_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&metadata_write).await.unwrap();
+                        let admitted=catalog.admit_reclaim_metadata_write(&reserved,fixture.owner.round,&metadata_write,
+                                ).await.unwrap();
                         let tr=raw_catalog.create_trx().unwrap();let writing=tr.get(&metadata_task_key,false).await.unwrap().unwrap().to_vec();tr.set(&metadata_task_key,&prepared);tr.commit().await.unwrap();
                         let rollback=catalog.pending_reclaim_metadata_write(&reserved,fixture.owner.round).await;
                         let tr=raw_catalog.create_trx().unwrap();tr.set(&metadata_task_key,&writing);tr.commit().await.unwrap();assert!(rollback.is_err(),"保留检查点不能接受 Writing 回退 Prepared");
                         let observation=metadata_plan.observe_current(&captured_target,None).unwrap();
-                        let observed=catalog.record_reclaim_metadata_observation(&reserved,fixture.owner.round,admitted.task(),&observation).await.unwrap();
+                        let observed=catalog.record_reclaim_metadata_observation(&reserved,fixture.owner.round,admitted.task(),&observation,
+                                ).await.unwrap();
                         let tr=raw_catalog.create_trx().unwrap();let with_observation=tr.get(&metadata_task_key,false).await.unwrap().unwrap().to_vec();tr.set(&metadata_task_key,&writing);tr.commit().await.unwrap();
                         let rollback=catalog.pending_reclaim_metadata_write(&reserved,fixture.owner.round).await;
                         let tr=raw_catalog.create_trx().unwrap();tr.set(&metadata_task_key,&with_observation);tr.commit().await.unwrap();assert!(rollback.is_err(),"保留检查点不能丢失已保存观察");
@@ -8174,7 +13595,7 @@ mod tests {
                         let tr=raw_catalog.create_trx().unwrap();tr.set(&metadata_task_key,&claimed_raw);tr.commit().await.unwrap();assert!(rollback.is_err(),"检查点不能接受 owner 回退");
                         assert_eq!(catalog.reclaim_metadata_attempt(parent,next,source_data_uid,claimed.id()).await.unwrap(),claimed);
                         assert!(catalog.pending_reclaim_metadata_write(&reserved,fixture.owner.round).await.is_err());
-                        assert!(catalog.retry_reclaim_metadata_write(parent,next,&scanned,&input_request,&claimed).await.is_err(),"Writing 不能发新尝试");
+                        assert!(catalog.retry_reclaim_metadata_write(parent,next,&claimed).await.is_err(),"Writing 不能发新尝试");
                         assert_eq!(*fixture.commands.lock().unwrap(),commands,"发现/领取/拒绝均无设备命令");
                     }).await;
                     return;
@@ -8182,19 +13603,22 @@ mod tests {
                 if mode == MetadataExecutionCase::AttemptHistory {
                     boxed_metadata_phase(|| async {
                         let commands=fixture.commands.lock().unwrap().clone();
-                        let first=catalog.close_prepared_reclaim_metadata_write(&reserved,fixture.owner.round,&metadata_write).await.unwrap();
+                        let first=catalog.close_prepared_reclaim_metadata_write(&reserved,fixture.owner.round,&metadata_write,
+                                ).await.unwrap();
                         let tr=raw_catalog.create_trx().unwrap();let first_raw=tr.get(&metadata_task_key,false).await.unwrap().unwrap().to_vec();
-                        let (one,two)=tokio::join!(Box::pin(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&first)),Box::pin(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&first)));
+                        let (one,two)=tokio::join!(Box::pin(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&first)),Box::pin(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&first)));
                         let second=one.unwrap();assert_eq!(two.unwrap(),second);assert_ne!(second.id(),first.id());assert_eq!(second.first_attempt(),first.id());assert_eq!(second.previous_attempt(),Some(first.id()));
                         assert_eq!(catalog.close_prepared_reclaim_metadata_write(&reserved,fixture.owner.round,&metadata_write).await.unwrap(),first);
                         assert_eq!(catalog.prepare_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&metadata_plan).await.unwrap(),first,"首次准备重放不能变成最新尝试");
-                        let second_closed=catalog.close_prepared_reclaim_metadata_write(&reserved,fixture.owner.round,&second).await.unwrap();
-                        let third=catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&second_closed).await.unwrap();
+                        let second_closed=catalog.close_prepared_reclaim_metadata_write(&reserved,fixture.owner.round,&second,
+                                ).await.unwrap();
+                        let third=catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&second_closed,
+                                ).await.unwrap();
                         assert_ne!(third.id(),second.id());assert_eq!(third.first_attempt(),first.id());assert_eq!(third.previous_attempt(),Some(second.id()));
                         assert_eq!(observer.reclaim_metadata_execution_context(&reserved,fixture.owner.round,&third).await.unwrap(),(scanned.clone(),input_request.clone()),"后继保持原执行上下文");
                         assert!(observer.reclaim_metadata_execution_context(&reserved,fixture.owner.round,&first).await.is_err(),"旧终态不能恢复成新尝试的执行上下文");
-                        assert_eq!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&first).await.unwrap(),second_closed,"旧重试始终返回原后继，不返回第三次");
-                        assert_eq!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&second_closed).await.unwrap(),third);
+                        assert_eq!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&first).await.unwrap(),second_closed,"旧重试始终返回原后继，不返回第三次");
+                        assert_eq!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&second_closed).await.unwrap(),third);
                         assert_eq!(catalog.reclaim_metadata_attempt(&reserved,fixture.owner.round,source_data_uid,first.id()).await.unwrap(),first);
                         assert_eq!(catalog.reclaim_metadata_write_status(&reserved,fixture.owner.round,source_data_uid).await.unwrap(),Some(third.clone()));
                         assert_eq!(catalog.pending_reclaim_metadata_write(&reserved,fixture.owner.round).await.unwrap(),Some(third.clone()));
@@ -8202,21 +13626,27 @@ mod tests {
                         let mut edge=own_row(b'U');edge.extend_from_slice(&source_data_uid.to_be_bytes());edge.extend_from_slice(second.id().as_bytes());
                         let original=tr.get(&edge,false).await.unwrap().unwrap().to_vec();assert_eq!(original,third.id().as_bytes());tr.clear(&edge);tr.commit().await.unwrap();
                         let missing=catalog.pending_reclaim_metadata_write(&reserved,fixture.owner.round).await;
-                        let retry=catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&second_closed).await;
+                        let retry=catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&second_closed,
+                                ).await;
                         let tr=raw_catalog.create_trx().unwrap();let untouched=tr.get(&edge,false).await.unwrap().is_none();tr.set(&edge,&original);tr.commit().await.unwrap();assert!(missing.is_err() && retry.is_err() && untouched,"丢失后继边不能重建或另发请求");
-                        assert!(writer.execute(&reserved,&scanned,&input_request,&metadata_write,Some(&captured)).await.is_err(),"旧物理尝试不能解释成新尝试");
+                        assert!(writer.execute(&reserved,&metadata_write,Some(&captured)).await.is_err(),"旧物理尝试不能解释成新尝试");
                         assert_eq!(*fixture.commands.lock().unwrap(),commands);
-                        let execution=writer.execute(&reserved,&scanned,&input_request,&third,Some(&captured)).await.unwrap();
-                        let published=catalog.publish_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,execution.task(),execution.commit_evidence().unwrap()).await.unwrap();
+                        let execution=writer.execute(&reserved,&third,Some(&captured),
+                                ).await.unwrap();
+                        let published=catalog.publish_reclaim_metadata_write(&reserved,fixture.owner.round,execution.task(),execution.commit_evidence().unwrap(),
+                                ).await.unwrap();
                         assert_eq!(published.id(),third.id());
-                        let completed=catalog.reclaim_metadata_attempt(&reserved,fixture.owner.round,source_data_uid,third.id()).await.unwrap();assert!(completed.completed());
+                        let completed=catalog.reclaim_metadata_attempt(&reserved,fixture.owner.round,source_data_uid,third.id(),
+                                ).await.unwrap();assert!(completed.completed());
                         assert!(observer.reclaim_metadata_execution_context(&reserved,fixture.owner.round,&completed).await.is_err(),"已发布仅查历史，不再执行恢复");
                         assert!(observer.reclaim_metadata_retry_context(&reserved,fixture.owner.round,&completed).await.is_err(),"已发布不能准备新物理重试");
-                        assert_eq!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&first).await.unwrap(),second_closed);
-                        assert_eq!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&second_closed).await.unwrap(),completed);
+                        assert_eq!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&first).await.unwrap(),second_closed);
+                        assert_eq!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&second_closed).await.unwrap(),completed);
                         let mut rows=Vec::new();let tr=raw_catalog.create_trx().unwrap();
-                        for id in [first.id(),second.id(),third.id()] {let mut key=own_row(b'W');key.extend_from_slice(&source_data_uid.to_be_bytes());key.extend_from_slice(id.as_bytes());rows.push((key.clone(),tr.get(&key,false).await.unwrap().unwrap().to_vec()));tr.clear(&key);}
-                        for key in [&latest_metadata_key,&metadata_header_key,&own_row(b'm')] {rows.push((key.clone(),tr.get(key,false).await.unwrap().unwrap().to_vec()));tr.clear(key);}
+                        for id in [first.id(),second.id(),third.id()] {let mut key=own_row(b'W');key.extend_from_slice(&source_data_uid.to_be_bytes());key.extend_from_slice(id.as_bytes());rows.push((key.clone(),tr.get(&key,false).await.unwrap().unwrap().to_vec(),
+                                ));tr.clear(&key);}
+                        for key in [&latest_metadata_key,&metadata_header_key,&own_row(b'm')] {rows.push((key.clone(),tr.get(key,false).await.unwrap().unwrap().to_vec(),
+                                ));tr.clear(key);}
                         tr.commit().await.unwrap();
                         assert_eq!(catalog.observed_active_volume_index(&serial,metadata_plan.volume()).await.unwrap(),published.observation().current(),"后继发布历史不依赖原尝试行/检查点/源清单");
                         let tr=raw_catalog.create_trx().unwrap();for (key,raw) in &rows {tr.set(key,raw);}tr.commit().await.unwrap();
@@ -8226,16 +13656,17 @@ mod tests {
                         let tr=raw_catalog.create_trx().unwrap();let header=tr.get(&metadata_header_key,false).await.unwrap().unwrap().to_vec();
                         let old=catalog.claim_reclaim_metadata_attempt(parent,next,&second_closed).await.unwrap();
                         let tr=raw_catalog.create_trx().unwrap();assert_eq!(tr.get(&metadata_header_key,false).await.unwrap().unwrap().as_ref(),header.as_slice(),"历史领取不能替换当前检查点");
-                        assert_eq!(catalog.retry_reclaim_metadata_write(parent,next,&scanned,&input_request,&first).await.unwrap(),old);
-                        assert_eq!(catalog.retry_reclaim_metadata_write(parent,next,&scanned,&input_request,&old).await.unwrap(),current);
-                        assert_eq!(catalog.reclaim_metadata_publication(parent,next,&scanned,&input_request,&third).await.unwrap(),Some(published));
+                        assert_eq!(catalog.retry_reclaim_metadata_write(parent,next,&first).await.unwrap(),old);
+                        assert_eq!(catalog.retry_reclaim_metadata_write(parent,next,&old).await.unwrap(),current);
+                        assert_eq!(catalog.reclaim_metadata_publication(parent,next,&third).await.unwrap(),Some(published));
                         assert_eq!(catalog.reclaim_metadata_attempt(parent,next,source_data_uid,first.id()).await.unwrap(),first);
                         assert_eq!(*fixture.commands.lock().unwrap(),commands,"FDB HA 历史查询/领取不发设备命令");
                     }).await;
                     return;
                 }
-                if matches!(mode, MetadataExecutionCase::LostAdmission | MetadataExecutionCase::DiscardIntentFromUnchanged | MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpDebt | MetadataExecutionCase::ClosedRetryContext | MetadataExecutionCase::UnwrittenIpMissing | MetadataExecutionCase::UnwrittenFraming | MetadataExecutionCase::UnwrittenIpAhead) {
-                    catalog.admit_reclaim_metadata_write(&reserved, fixture.owner.round, &scanned, &input_request, &metadata_write).await.unwrap();
+                if mode.observes_admitted() {
+                    catalog.admit_reclaim_metadata_write(&reserved, fixture.owner.round, &metadata_write,
+                            ).await.unwrap();
                 }
                 if mode == MetadataExecutionCase::UnwrittenIpAhead {
                     let old = format!("<generationnumber>{}</generationnumber>", captured_target.construct().generation);
@@ -8253,8 +13684,29 @@ mod tests {
                             }
                         }
                         cartridge.vcr += 1;
-                    });
+                    },
+                        );
                     assert_eq!(changed, 1, "实际只构造 IP 更高代次，DP 不变");
+                    }
+                    if mode.checkpoint() && mode != MetadataExecutionCase::CheckpointCommitted {
+                        fixture.lib.with_cartridge_mut(
+                            &input.destination().placement().barcode,
+                            |cartridge| {
+                                let ip = &mut cartridge.partitions[0];
+                                ip.objects
+                                    .truncate(crate::ltfs::volume::P1_DATA_START as usize);
+                                if mode != MetadataExecutionCase::CheckpointEmpty {
+                                    ip.objects.push(crate::scsi::sim::LogicalObject::Filemark);
+                                }
+                                if mode == MetadataExecutionCase::CheckpointPrefix {
+                                    ip.objects.push(crate::scsi::sim::LogicalObject::Record(
+                                        b"<ltfsindex version=\"2.5.0\">".to_vec(),
+                                    ));
+                                }
+                                ip.flushed = ip.objects.len();
+                                cartridge.vcr += 1;
+                            },
+                        );
                 }
                 if mode == MetadataExecutionCase::UnwrittenIpMissing {
                     fixture.lib.with_cartridge_mut(&input.destination().placement().barcode, |cartridge| {
@@ -8263,22 +13715,92 @@ mod tests {
                         assert!(matches!(ip.objects.last(), Some(crate::scsi::sim::LogicalObject::Filemark)));
                         ip.flushed = ip.objects.len();
                         cartridge.vcr += 1;
-                    });
+                    },
+                        );
                 }
                 if mode == MetadataExecutionCase::UnwrittenFraming {
-                    resegment_metadata_fixture(&fixture, drive, &input.destination().placement().barcode, &captured_target);
+                    resegment_metadata_fixture(&fixture, drive, &input.destination().placement().barcode, &captured_target,
+                        );
                 }
                 let debt_media = matches!(mode, MetadataExecutionCase::UnwrittenIpDebt | MetadataExecutionCase::ClosedRetryContext | MetadataExecutionCase::UnwrittenIpMissing | MetadataExecutionCase::UnwrittenFraming).then(|| {
                     let crate::ltfs::recovery::IndexSourceScope::Current { ip_generation: Some(ip), .. } = captured_target.scope() else {panic!("债务夹具必须有已核验完整旧 IP")};
                     assert!(ip < captured_target.construct().generation, "必须保留真实普通写入的IP债务，不能先做checkpoint");
                     fixture.lib.cartridge(&input.destination().placement().barcode).unwrap()
                 });
-                let first = writer.execute(&reserved, &scanned, &input_request, &metadata_write,
-                    if matches!(mode, MetadataExecutionCase::LostAdmission | MetadataExecutionCase::DiscardIntentFromUnchanged | MetadataExecutionCase::UnwrittenClose | MetadataExecutionCase::UnwrittenIpDebt | MetadataExecutionCase::ClosedRetryContext | MetadataExecutionCase::UnwrittenIpMissing | MetadataExecutionCase::UnwrittenFraming | MetadataExecutionCase::UnwrittenIpAhead) {None} else {Some(&captured)}).await;
-                if mode == MetadataExecutionCase::UnwrittenIpAhead {
+                assert!(Box::pin(catalog.seal_reclaim_raw_file_coverage(&reserved, fixture.owner.round, source_data_uid, metadata_write.id())).await.is_err(),"未提交原始元数据不能覆盖源文件");
+                let first = writer.execute(&reserved, &metadata_write,
+                    if mode.observes_admitted() {None} else {Some(&captured)},
+                        ).await;
+                    if mode.checkpoint() {
+                        if mode == MetadataExecutionCase::CheckpointCommitted {
+                            assert!(
+                                matches!(first,Err(TapeError::CommitFailed {ref stage,..}) if stage=="index_partition")
+                            );
+                        } else if let Ok(result) = first {
+                            assert!(result.needs_checkpoint());
+                            assert!(
+                                result.commit_evidence().is_none()
+                                    && result.unwritten_evidence().is_none()
+                            );
+                        }
+                        let task = catalog
+                            .reclaim_metadata_write_status(
+                                &reserved,
+                                fixture.owner.round,
+                                source_data_uid,
+                            )
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        let index = catalog
+                            .observed_active_volume_index(&serial, metadata_plan.volume())
+                            .await
+                            .unwrap();
+                        let count = catalog
+                            .active_volume_file_count(
+                                &serial,
+                                route,
+                                fixture.owner.round,
+                                metadata_plan.volume(),
+                            )
+                            .await
+                            .unwrap();
+                        recovery_scenario.borrow_mut().push_back(
+                            (ReclaimRecoveryScenario {
+                                cluster: cluster.clone(),
+                                catalog: catalog.clone(),
+                                lib: fixture.lib.clone(),
+                                permit: fixture.permit.clone(),
+                                commands: fixture.commands.clone(),
+                                old_round: fixture.owner.round,
+                                next: fixture.owner.round + 100,
+                                namespace,
+                                route,
+                                serial: serial.clone(),
+                                parent: reserved.clone(),
+                                previous_owner_task: task.clone(),
+                                recovered: task,
+                                scanned: scanned.clone(),
+                                input_request: input_request.clone(),
+                                metadata_plan: metadata_plan.clone(),
+                                index,
+                                count,
+                                barcode: input.destination().placement().barcode.clone(),
+                                mode,
+                                metadata_task_key: metadata_task_key.clone(),
+                                metadata_active_key: metadata_active_key.clone(),
+                                metadata_volume_key: metadata_volume_key.clone(),
+                                original_source:captured,
+                            })
+                            .run(recovery_scenario.clone()),
+                        );
+                        return;
+                    }
+                    if mode == MetadataExecutionCase::UnwrittenIpAhead {
                     assert!(matches!(first, Err(TapeError::RecoveryRestricted { ref reason })
                         if reason.contains("IP 索引代数") && reason.contains("领先 FDB 已观察 DP")), "{first:?}");
-                    let task = catalog.reclaim_metadata_write_status(&reserved,fixture.owner.round,source_data_uid).await.unwrap().unwrap();
+                    let task = catalog.reclaim_metadata_write_status(&reserved,fixture.owner.round,source_data_uid,
+                            ).await.unwrap().unwrap();
                     assert!(task.writing() && task.observation().unwrap().is_none());
                     assert_eq!(catalog.observed_active_volume_index(&serial,metadata_plan.volume()).await.unwrap(),crate::managed_catalog::ActiveIndexIdentity::from(captured_target.construct()));
                     let tr=raw_catalog.create_trx().unwrap();
@@ -8289,13 +13811,16 @@ mod tests {
                 }
                 if mode == MetadataExecutionCase::UnwrittenFraming {
                     assert!(first.is_err(), "原 XML 身份相同但 DP EOD 改变，不能观察为 Unchanged 或生成未写关闭证明: {first:?}");
-                    assert_stale_metadata_staging_rejected(&fixture,drive,&metadata_plan,&captured,&captured_target);
-                    let task = catalog.reclaim_metadata_write_status(&reserved,fixture.owner.round,source_data_uid).await.unwrap().unwrap();
+                    assert_stale_metadata_staging_rejected(&fixture,drive,&metadata_plan,&captured,&captured_target,
+                        );
+                    let task = catalog.reclaim_metadata_write_status(&reserved,fixture.owner.round,source_data_uid,
+                            ).await.unwrap().unwrap();
                     assert!(task.writing() && task.observation().unwrap().is_none());
                     assert_eq!(catalog.observed_active_volume_index(&serial,metadata_plan.volume()).await.unwrap(),crate::managed_catalog::ActiveIndexIdentity::from(captured_target.construct()));
                     let tr=raw_catalog.create_trx().unwrap();
                     for key in [&metadata_active_key,&metadata_volume_key] {assert_eq!(tr.get(key,false).await.unwrap().unwrap().as_ref(),active.as_slice());}
-                    assert_reclaim_media_unchanged(debt_media.as_ref().unwrap(),&fixture.lib.cartridge(&input.destination().placement().barcode).unwrap());
+                    assert_reclaim_media_unchanged(debt_media.as_ref().unwrap(),&fixture.lib.cartridge(&input.destination().placement().barcode).unwrap(),
+                        );
                     assert!(!fixture.commands.lock().unwrap()[original_commands.len()..].iter().any(|(_,op)|matches!(op,0x04|0x0a|0x10|0x19|0x8d|0xa5)), "物理边界变化只能拒绝，不写/修尾/搬带");
                     return;
                 }
@@ -8305,7 +13830,8 @@ mod tests {
                     assert_eq!(execution.task().observation().unwrap().unwrap().kind(),ReclaimMetadataObservationKind::Unchanged);
                     let tr = raw_catalog.create_trx().unwrap();
                     for key in [&metadata_active_key,&metadata_volume_key] {assert_eq!(tr.get(key,false).await.unwrap().unwrap().as_ref(),active.as_slice());}
-                    assert_reclaim_media_unchanged(debt_media.as_ref().unwrap(),&fixture.lib.cartridge(&input.destination().placement().barcode).unwrap());
+                    assert_reclaim_media_unchanged(debt_media.as_ref().unwrap(),&fixture.lib.cartridge(&input.destination().placement().barcode).unwrap(),
+                        );
                     assert!(!fixture.commands.lock().unwrap()[original_commands.len()..].iter().any(|(_,op)|matches!(op,0x04|0x0a|0x10|0x19|0x8d|0xa5)),"空IP保持未知，不能隐式修复");
                     return;
                 }
@@ -8326,10 +13852,10 @@ mod tests {
                     for key in &coverage_keys {coverage_before.push(tr.get(key,false).await.unwrap().map(|raw|raw.to_vec()));}
                     let proof = execution.unwritten_evidence().unwrap();
                     let mut changed_request = input_request.clone();changed_request.operation_id=uuid::Uuid::new_v4();
-                    assert!(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&changed_request,task,proof).await.is_err());
+                    assert!(catalog.prepare_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&changed_request,&task.plan()).await.is_err());
                     for key in [&metadata_active_key,&metadata_volume_key] {
                         let tr=raw_catalog.create_trx().unwrap();tr.clear(key);tr.commit().await.unwrap();
-                        assert!(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,task,proof).await.is_err());
+                        assert!(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,task,proof).await.is_err());
                         let tr=raw_catalog.create_trx().unwrap();assert!(tr.get(key,false).await.unwrap().is_none());
                         tr.set(key,&active);tr.commit().await.unwrap();
                     }
@@ -8338,20 +13864,20 @@ mod tests {
                     let mut next_receipt=own_row(b'H');next_receipt.truncate(next_receipt.len()-24);next_receipt.extend_from_slice(metadata_plan.volume().as_bytes());next_receipt.extend_from_slice(&(index.generation+1).to_be_bytes());
                     for key in [&next_history,&next_count,&next_receipt] {
                         let tr=raw_catalog.create_trx().unwrap();tr.set(key,b"unknown-original-result");tr.commit().await.unwrap();
-                        assert!(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,task,proof).await.is_err());
+                        assert!(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,task,proof).await.is_err());
                         let tr=raw_catalog.create_trx().unwrap();assert_eq!(tr.get(key,false).await.unwrap().unwrap().as_ref(),b"unknown-original-result");tr.clear(key);tr.commit().await.unwrap();
                     }
-                    let (one,two)=tokio::join!(Box::pin(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,task,proof)),Box::pin(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,task,proof)));
+                    let (one,two)=tokio::join!(Box::pin(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,task,proof)),Box::pin(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,task,proof)));
                     let closed=one.unwrap();assert_eq!(two.unwrap(),closed);assert!(closed.closed());assert_eq!(closed.id(),task.id());assert_eq!(closed.observation().unwrap().as_ref(),Some(proof.observation()));
                     assert_eq!(catalog.observed_active_volume_index(&serial,metadata_plan.volume()).await.unwrap(),index);
                     let tr=raw_catalog.create_trx().unwrap();for (key,before) in coverage_keys.iter().zip(&coverage_before) {assert_eq!(&tr.get(key,false).await.unwrap().map(|raw|raw.to_vec()),before,"NoWrite关闭不能增加计数或源覆盖");}
                     let tr=raw_catalog.create_trx().unwrap();assert!(tr.get(&metadata_active_key,false).await.unwrap().is_none());assert!(tr.get(&metadata_volume_key,false).await.unwrap().is_none());
                     for key in [&next_history,&next_count,&next_receipt] {assert!(tr.get(key,false).await.unwrap().is_none());}
                     tr.set(&metadata_active_key,b"later-original-task");tr.set(&metadata_volume_key,b"later-original-task");tr.commit().await.unwrap();
-                    assert_eq!(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,task,proof).await.unwrap(),closed);
-                    assert!(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&changed_request,task,proof).await.is_err());
+                    assert_eq!(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,task,proof).await.unwrap(),closed);
+                    assert!(catalog.prepare_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&changed_request,&task.plan()).await.is_err());
                     let tr=raw_catalog.create_trx().unwrap();for key in [&metadata_active_key,&metadata_volume_key] {assert_eq!(tr.get(key,false).await.unwrap().unwrap().as_ref(),b"later-original-task");tr.clear(key);}tr.commit().await.unwrap();
-                    assert!(writer.execute(&reserved,&scanned,&input_request,&closed,None).await.is_err());
+                    assert!(writer.execute(&reserved,&closed,None).await.is_err());
                     assert_eq!(*fixture.commands.lock().unwrap(),commands,"关闭和终态重试均无设备命令");
                     let next=fixture.owner.round+100;catalog.claim_active_owner_epoch(&serial,next).await.unwrap();
                     let parents=catalog.claim_reclaim_reservations_page(&serial,route,next,None,16).await.unwrap();
@@ -8364,7 +13890,7 @@ mod tests {
                         let tr=raw_catalog.create_trx().unwrap();let raw=tr.get(&data_body_key,false).await.unwrap().unwrap().to_vec();tr.clear(&data_body_key);tr.commit().await.unwrap();
                         let missing=restarted.reclaim_metadata_retry_context(parent,next,&recovered).await;
                         let tr=raw_catalog.create_trx().unwrap();let untouched=tr.get(&data_body_key,false).await.unwrap().is_none();tr.set(&data_body_key,&raw);tr.commit().await.unwrap();assert!(missing.is_err() && untouched,"Closed恢复缺原证明时不能修复或换请求");
-                        let (one,two)=tokio::join!(Box::pin(restarted.retry_reclaim_metadata_write(parent,next,&restored_file,&restored_request,&recovered)),Box::pin(restarted.retry_reclaim_metadata_write(parent,next,&restored_file,&restored_request,&recovered)));
+                        let (one,two)=tokio::join!(Box::pin(restarted.retry_reclaim_metadata_write(parent,next,&recovered)),Box::pin(restarted.retry_reclaim_metadata_write(parent,next,&recovered)));
                         let successor=one.unwrap();assert_eq!(two.unwrap(),successor);assert_ne!(successor.id(),recovered.id());assert_eq!(successor.previous_attempt(),Some(recovered.id()));assert_eq!(successor.first_attempt(),recovered.first_attempt());
                         assert!(!successor.closed() && !successor.writing() && !successor.completed());
                         assert_eq!(restarted.reclaim_metadata_checkpoint(parent,next).await.unwrap(),Some(successor.clone()));
@@ -8374,8 +13900,8 @@ mod tests {
                         let tr=raw_catalog.create_trx().unwrap();let held=tr.get(&metadata_active_key,false).await.unwrap().unwrap().to_vec();let header=tr.get(&metadata_header_key,false).await.unwrap().unwrap().to_vec();
                         assert_eq!(tr.get(&metadata_volume_key,false).await.unwrap().unwrap().as_ref(),held.as_slice());
                         assert_eq!(restarted.reclaim_metadata_retry_context(parent,next,&recovered).await.unwrap(),(restored_file.clone(),restored_request.clone()));
-                        assert_eq!(restarted.retry_reclaim_metadata_write(parent,next,&restored_file,&restored_request,&recovered).await.unwrap(),successor,"旧重试不能重复创建后继");
-                        assert!(restarted.close_unwritten_reclaim_metadata_write(parent,next,&restored_file,&restored_request,&recovered,proof).await.is_err(),"旧owner实读证明不能授接任许可");
+                        assert_eq!(restarted.retry_reclaim_metadata_write(parent,next,&recovered).await.unwrap(),successor,"旧重试不能重复创建后继");
+                        assert!(restarted.close_unwritten_reclaim_metadata_write(parent,next,&recovered,proof).await.is_err(),"旧owner实读证明不能授接任许可");
                         let tr=raw_catalog.create_trx().unwrap();assert_eq!(tr.get(&metadata_active_key,false).await.unwrap().unwrap().as_ref(),held.as_slice());assert_eq!(tr.get(&metadata_volume_key,false).await.unwrap().unwrap().as_ref(),held.as_slice());assert_eq!(tr.get(&metadata_header_key,false).await.unwrap().unwrap().as_ref(),header.as_slice());
                         assert_eq!(restarted.reclaim_metadata_attempt(parent,next,recovered.plan().source_uid(),recovered.id()).await.unwrap(),recovered);
                         assert_eq!(*fixture.commands.lock().unwrap(),commands,"独立catalog只从parent恢复、校验、领取及显式重试不发送CDB");
@@ -8384,7 +13910,7 @@ mod tests {
                     }
                     let recovered=catalog.claim_reclaim_metadata_write(&parents.items[0],next,source_data_uid).await.unwrap();
                     assert!(recovered.closed());assert_eq!(recovered.id(),task.id());
-                    assert!(catalog.close_unwritten_reclaim_metadata_write(&parents.items[0],next,&scanned,&input_request,&recovered,proof).await.is_err(),"旧owner实读证明不能重绑");
+                    assert!(catalog.close_unwritten_reclaim_metadata_write(&parents.items[0],next,&recovered,proof).await.is_err(),"旧owner实读证明不能重绑");
                     assert_eq!(*fixture.commands.lock().unwrap(),commands);
                     if let Some(before) = debt_media {
                         let after = fixture.lib.cartridge(&input.destination().placement().barcode).unwrap();
@@ -8399,9 +13925,10 @@ mod tests {
                     assert!(device.fired.load(std::sync::atomic::Ordering::SeqCst));
                     let commands = fixture.commands.lock().unwrap().clone();
                     assert!(commands[original_commands.len()..].iter().all(|(_, op)| *op == 0x5e), "最后 PR 核对之后撤权，内层拒绝第一条媒体 CDB");
-                    let task = catalog.reclaim_metadata_write_status(&reserved, fixture.owner.round, source_data_uid).await.unwrap().unwrap();
+                    let task = catalog.reclaim_metadata_write_status(&reserved, fixture.owner.round, source_data_uid,
+                            ).await.unwrap().unwrap();
                     assert!(task.writing() && task.observation().unwrap().is_none());
-                    assert!(writer.execute(&reserved, &scanned, &input_request, &task, None).await.is_err());
+                    assert!(writer.execute(&reserved, &task, None).await.is_err());
                     assert_eq!(*fixture.commands.lock().unwrap(), commands);
                     let tr = raw_catalog.create_trx().unwrap();
                     assert_eq!(tr.get(&metadata_active_key,false).await.unwrap().unwrap().as_ref(), active.as_slice());
@@ -8421,22 +13948,24 @@ mod tests {
                     let corrupt = String::from_utf8(original.clone()).unwrap().replace(&task.id().to_string(), &uuid::Uuid::new_v4().to_string()).into_bytes();
                     assert_ne!(corrupt, original);
                     tr.set(&metadata_task_key, &corrupt); tr.commit().await.unwrap();
-                    assert!(catalog.publish_reclaim_metadata_write(&reserved, fixture.owner.round, &scanned, &input_request, task, proof).await.is_err());
+                    assert!(catalog.publish_reclaim_metadata_write(&reserved, fixture.owner.round, task, proof).await.is_err());
                     let tr = raw_catalog.create_trx().unwrap();
                     assert_eq!(tr.get(&metadata_task_key,false).await.unwrap().unwrap().as_ref(), corrupt.as_slice());
                     tr.set(&metadata_task_key, &original); tr.commit().await.unwrap();
                     let mut history_key=b"tape-rs/catalog/22/r/".to_vec();
                     history_key.extend_from_slice(metadata_plan.volume().as_bytes());
-                    history_key.extend_from_slice(&proof.observation().current().generation.to_be_bytes());
+                    history_key.extend_from_slice(&proof.observation().current().generation.to_be_bytes(),
+                        );
                     let mut count_key=history_key.clone();count_key.push(b'f');
                     let mut receipt_key=own_row(b'H');receipt_key.truncate(receipt_key.len()-24);
                     receipt_key.extend_from_slice(metadata_plan.volume().as_bytes());
-                    receipt_key.extend_from_slice(&proof.observation().current().generation.to_be_bytes());
+                    receipt_key.extend_from_slice(&proof.observation().current().generation.to_be_bytes(),
+                        );
                     for key in [&history_key,&count_key,&receipt_key] {
                         let tr=raw_catalog.create_trx().unwrap();
                         assert!(tr.get(key,false).await.unwrap().is_none());
                         tr.set(key,b"unexplained-original-slot");tr.commit().await.unwrap();
-                        assert!(catalog.publish_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,task,proof).await.is_err());
+                        assert!(catalog.publish_reclaim_metadata_write(&reserved,fixture.owner.round,task,proof).await.is_err());
                         assert_eq!(catalog.observed_active_volume_index(&serial,metadata_plan.volume()).await.unwrap(),before);
                         assert!(catalog.reclaim_metadata_write_status(&reserved,fixture.owner.round,source_data_uid).await.unwrap().unwrap().writing());
                         let tr=raw_catalog.create_trx().unwrap();
@@ -8450,27 +13979,31 @@ mod tests {
                     let tr = raw_catalog.create_trx().unwrap();
                     tr.set(&pool_key, &full_pool); tr.commit().await.unwrap();
                     let (first,concurrent)=tokio::join!(
-                        Box::pin(catalog.publish_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,task,proof)),
-                        Box::pin(catalog.publish_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,task,proof))
+                        Box::pin(catalog.publish_reclaim_metadata_write(&reserved,fixture.owner.round,task,proof)),
+                        Box::pin(catalog.publish_reclaim_metadata_write(&reserved,fixture.owner.round,task,proof))
                     );
                     let published=first.unwrap();
                     assert_eq!(concurrent.unwrap(),published,"并发发布仅推进一次原代次");
                     assert_eq!(published.id(), task.id());
                     assert_eq!(published.observation(), proof.observation());
-                    let completed = catalog.reclaim_metadata_write_status(&reserved, fixture.owner.round, source_data_uid).await.unwrap().unwrap();
+                    let completed = catalog.reclaim_metadata_write_status(&reserved, fixture.owner.round, source_data_uid,
+                            ).await.unwrap().unwrap();
                     assert!(completed.completed() && !completed.writing() && !completed.closed());
+                    Box::pin(catalog.seal_reclaim_raw_file_coverage(&reserved, fixture.owner.round, source_data_uid, completed.id())).await.unwrap();
+                    Box::pin(catalog.seal_reclaim_raw_file_coverage(&reserved, fixture.owner.round, source_data_uid, completed.id())).await.unwrap();
+                    assert!(Box::pin(catalog.step_reclaim_source_coverage(&reserved, fixture.owner.round, &crate::managed_catalog::ReclaimSourceInventory::from_captured(&captured).unwrap())).await.is_err(),"一个原始文件提交不能跳过目录及其他未覆盖节点");
                     assert_eq!(completed.id(), task.id());
                     assert_eq!(catalog.observed_active_volume_index(&serial, metadata_plan.volume()).await.unwrap(), proof.observation().current());
                     assert_eq!(catalog.active_volume_file_count(&serial, route, fixture.owner.round, metadata_plan.volume()).await.unwrap(), proof.observation().physical_files());
                     let tr = raw_catalog.create_trx().unwrap();
                     assert!(tr.get(&metadata_active_key,false).await.unwrap().is_none());
                     assert!(tr.get(&metadata_volume_key,false).await.unwrap().is_none());
-                    assert_eq!(catalog.publish_reclaim_metadata_write(&reserved, fixture.owner.round, &scanned, &input_request, task, proof).await.unwrap(), published, "丢失发布回执只重读原发布，不再计数/释放");
+                    assert_eq!(catalog.publish_reclaim_metadata_write(&reserved, fixture.owner.round, task, proof).await.unwrap(), published, "丢失发布回执只重读原发布，不再计数/释放");
                     let mut changed_request = input_request.clone();
                     changed_request.operation_id = uuid::Uuid::new_v4();
-                    assert!(catalog.publish_reclaim_metadata_write(&reserved, fixture.owner.round, &scanned, &changed_request, task, proof).await.is_err(), "已发布重试仍须绑定原对象请求");
-                    assert_eq!(catalog.reclaim_metadata_publication(&reserved, fixture.owner.round, &scanned, &input_request, &metadata_write).await.unwrap(), Some(published.clone()));
-                    let replay = writer.execute(&reserved, &scanned, &input_request, &metadata_write, None).await.unwrap();
+                    assert!(catalog.prepare_reclaim_metadata_write(&reserved, fixture.owner.round, &scanned,&changed_request,&task.plan()).await.is_err(), "不能用另一个子请求重建已发布任务");
+                    assert_eq!(catalog.reclaim_metadata_publication(&reserved, fixture.owner.round, &metadata_write).await.unwrap(), Some(published.clone()));
+                    let replay = writer.execute(&reserved, &metadata_write, None).await.unwrap();
                     assert!(replay.task().completed() && replay.commit_evidence().is_none());
                     assert_eq!(*fixture.commands.lock().unwrap(), commands, "目录发布和已发布重放无设备命令");
                     let tr = raw_catalog.create_trx().unwrap();
@@ -8478,7 +14011,7 @@ mod tests {
                     tr.set(&metadata_volume_key, b"another-original-task");
                     tr.commit().await.unwrap();
                     assert!(catalog.close_prepared_reclaim_metadata_write(&reserved, fixture.owner.round, &metadata_write).await.is_err());
-                    assert_eq!(catalog.publish_reclaim_metadata_write(&reserved, fixture.owner.round, &scanned, &input_request, task, proof).await.unwrap(), published);
+                    assert_eq!(catalog.publish_reclaim_metadata_write(&reserved, fixture.owner.round, task, proof).await.unwrap(), published);
                     let tr = raw_catalog.create_trx().unwrap();
                     for key in [&metadata_active_key,&metadata_volume_key] {
                         assert_eq!(tr.get(key,false).await.unwrap().unwrap().as_ref(), b"another-original-task");
@@ -8487,12 +14020,13 @@ mod tests {
                     tr.set(&pool_key, &pool_bytes); tr.commit().await.unwrap();
                     let tr = raw_catalog.create_trx().unwrap();
                     let receipt = tr.get(&receipt_key,false).await.unwrap().unwrap().to_vec();
-                    for replacement in [None, Some({let mut b=receipt.clone(); b[5]^=1;b})] {
+                    for replacement in [None, Some({let mut b=receipt.clone(); b[5]^=1;b}),
+                        ] {
                         let tr = raw_catalog.create_trx().unwrap();
                         if let Some(raw)=&replacement { tr.set(&receipt_key,raw); } else { tr.clear(&receipt_key); }
                         tr.commit().await.unwrap();
                         assert!(catalog.observed_active_volume_index(&serial, metadata_plan.volume()).await.is_err());
-                        assert!(catalog.publish_reclaim_metadata_write(&reserved, fixture.owner.round, &scanned, &input_request, task, proof).await.is_err());
+                        assert!(catalog.publish_reclaim_metadata_write(&reserved, fixture.owner.round, task, proof).await.is_err());
                         let tr = raw_catalog.create_trx().unwrap();
                         assert_eq!(tr.get(&receipt_key,false).await.unwrap().as_deref(), replacement.as_deref());
                         tr.set(&receipt_key,&receipt);tr.commit().await.unwrap();
@@ -8500,7 +14034,8 @@ mod tests {
                     let tr=raw_catalog.create_trx().unwrap();
                     let mut ledger_rows=Vec::new();
                     for key in [&metadata_task_key,&latest_metadata_key,&own_row(b'm')] {
-                        ledger_rows.push((key.clone(),tr.get(key,false).await.unwrap().unwrap().to_vec()));
+                        ledger_rows.push((key.clone(),tr.get(key,false).await.unwrap().unwrap().to_vec(),
+                            ));
                         tr.clear(key);
                     }
                     tr.commit().await.unwrap();
@@ -8512,7 +14047,8 @@ mod tests {
                         catalog: &catalog, device: &device, serial: &serial, route,
                         key: fixture.owner.key, permission: &fixture.permit, storage: fixture.budget(),
                     };
-                    let mut read = reader.read_with_cache(path.as_bytes(), &fixture.owner.files.extent_cache_dir(), fixture.owner.files.spool_dir()).await.unwrap().unwrap();
+                    let mut read = reader.read_with_cache(path.as_bytes(), &fixture.owner.files.extent_cache_dir(), fixture.owner.files.spool_dir(),
+                            ).await.unwrap().unwrap();
                     let mut body=Vec::new(); std::io::Read::read_to_end(&mut read.file,&mut body).unwrap();
                     assert_eq!(body,bytes,"活动新索引仍可读取原正文");
                     let mut volume=LtfsVolume::mount_with_budget(&device,&budget).unwrap();
@@ -8527,12 +14063,15 @@ mod tests {
                     let recovered=catalog.claim_reclaim_metadata_write(&parents.items[0],next,source_data_uid).await.unwrap();
                     assert!(recovered.completed());
                     assert_eq!(recovered.id(),task.id());
-                    assert_eq!(catalog.reclaim_metadata_publication(&parents.items[0],next,&scanned,&input_request,&recovered).await.unwrap(),Some(published));
-                    assert!(catalog.publish_reclaim_metadata_write(&parents.items[0],next,&scanned,&input_request,&recovered,proof).await.is_err(),"旧owner实读token不可重绑新owner");
+                    Box::pin(catalog.seal_reclaim_raw_file_coverage(&parents.items[0],next,source_data_uid,recovered.id())).await.unwrap();
+                    assert_eq!(catalog.reclaim_metadata_publication(&parents.items[0],next,&recovered).await.unwrap(),Some(published));
+                    assert!(catalog.publish_reclaim_metadata_write(&parents.items[0],next,&recovered,proof).await.is_err(),"旧owner实读token不可重绑新owner");
                     assert_eq!(*fixture.commands.lock().unwrap(),commands,"接任已发布结果不发设备命令");
                     return;
                 }
-                if matches!(mode, MetadataExecutionCase::DiscardIntent | MetadataExecutionCase::DiscardIntentT1 | MetadataExecutionCase::DiscardIntentFromUnchanged) {
+                if matches!(mode, MetadataExecutionCase::DiscardIntent | MetadataExecutionCase::DiscardIntentT1 | MetadataExecutionCase::DiscardIntentFromUnchanged
+                            | MetadataExecutionCase::DiscardIntentCommitted
+                    ) {
                     boxed_metadata_phase(|| async {
                         let earlier = match first {
                             Ok(execution) if mode==MetadataExecutionCase::DiscardIntentFromUnchanged => {
@@ -8565,10 +14104,10 @@ mod tests {
                         let proof=metadata_tail_precondition(&fixture,drive,&task,&metadata_write,&captured_target,expected);
                         let commands=fixture.commands.lock().unwrap().clone();
                         let mut wrong_request=input_request.clone();wrong_request.operation_id=uuid::Uuid::new_v4();
-                        assert!(catalog.begin_reclaim_metadata_discard(&reserved,fixture.owner.round,&scanned,&wrong_request,&task,&proof).await.is_err());
+                        assert!(catalog.prepare_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&wrong_request,&task.plan()).await.is_err());
                         for key in [&metadata_active_key,&metadata_volume_key,&data_body_key] {
                             let tr=raw_catalog.create_trx().unwrap();let raw=tr.get(key,false).await.unwrap().unwrap().to_vec();tr.clear(key);tr.commit().await.unwrap();
-                            let missing=catalog.begin_reclaim_metadata_discard(&reserved,fixture.owner.round,&scanned,&input_request,&task,&proof).await;
+                            let missing=catalog.begin_reclaim_metadata_discard(&reserved,fixture.owner.round,&task,&proof).await;
                             let tr=raw_catalog.create_trx().unwrap();let untouched=tr.get(key,false).await.unwrap().is_none();tr.set(key,&raw);tr.commit().await.unwrap();
                             assert!(missing.is_err() && untouched,"丢原占用/输入不补建或另发意图");
                         }
@@ -8576,20 +14115,20 @@ mod tests {
                         let count=catalog.active_volume_file_count(&serial,route,fixture.owner.round,metadata_plan.volume()).await.unwrap();
                         let mut next_key=b"tape-rs/catalog/22/r/".to_vec();next_key.extend_from_slice(metadata_plan.volume().as_bytes());next_key.extend_from_slice(&(index.generation+1).to_be_bytes());
                         let tr=raw_catalog.create_trx().unwrap();tr.set(&next_key,b"unknown-result");tr.commit().await.unwrap();
-                        assert!(catalog.begin_reclaim_metadata_discard(&reserved,fixture.owner.round,&scanned,&input_request,&task,&proof).await.is_err());
+                        assert!(catalog.begin_reclaim_metadata_discard(&reserved,fixture.owner.round,&task,&proof).await.is_err());
                         let tr=raw_catalog.create_trx().unwrap();assert_eq!(tr.get(&next_key,false).await.unwrap().unwrap().as_ref(),b"unknown-result");tr.clear(&next_key);tr.set(&pool_key,&full_pool);tr.commit().await.unwrap();
-                        let (one,two)=tokio::join!(Box::pin(catalog.begin_reclaim_metadata_discard(&reserved,fixture.owner.round,&scanned,&input_request,&task,&proof)),Box::pin(catalog.begin_reclaim_metadata_discard(&reserved,fixture.owner.round,&scanned,&input_request,&task,&proof)));
+                        let (one,two)=tokio::join!(Box::pin(catalog.begin_reclaim_metadata_discard(&reserved,fixture.owner.round,&task,&proof)),Box::pin(catalog.begin_reclaim_metadata_discard(&reserved,fixture.owner.round,&task,&proof)));
                         let discarding=one.unwrap();assert_eq!(two.unwrap(),discarding,"并发只保存一个原修尾意图");
                         assert!(discarding.discarding() && !discarding.writing() && !discarding.closed() && !discarding.completed());
                         assert_eq!(discarding.id(),task.id());assert_eq!(discarding.plan(),task.plan());
-                        assert_eq!(catalog.begin_reclaim_metadata_discard(&reserved,fixture.owner.round,&scanned,&input_request,&task,&proof).await.unwrap(),discarding,"未知准入结果保留同一phase/attempt");
-                        assert!(catalog.admit_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&task).await.is_err());
+                        assert_eq!(catalog.begin_reclaim_metadata_discard(&reserved,fixture.owner.round,&task,&proof).await.unwrap(),discarding,"未知准入结果保留同一phase/attempt");
+                        assert!(catalog.admit_reclaim_metadata_write(&reserved,fixture.owner.round,&task).await.is_err());
                         assert!(catalog.close_prepared_reclaim_metadata_write(&reserved,fixture.owner.round,&metadata_write).await.is_err(),"Prepared旧回执不能关闭Discarding");
                         assert!(catalog.close_prepared_reclaim_metadata_write(&reserved,fixture.owner.round,&discarding).await.is_err());
                         if let Some(earlier)=&earlier {
-                            assert!(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,earlier.task(),earlier.unwritten_evidence().unwrap()).await.is_err(),"旧Writing阶段未写token不能释放Discarding占用");
+                            assert!(catalog.close_unwritten_reclaim_metadata_write(&reserved,fixture.owner.round,earlier.task(),earlier.unwritten_evidence().unwrap()).await.is_err(),"旧Writing阶段未写token不能释放Discarding占用");
                         }
-                        assert!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&scanned,&input_request,&discarding).await.is_err());
+                        assert!(catalog.retry_reclaim_metadata_write(&reserved,fixture.owner.round,&discarding).await.is_err());
                         assert!(catalog.reclaim_metadata_retry_context(&reserved,fixture.owner.round,&discarding).await.is_err());
                         let observation=metadata_plan.observe_current(&captured_target,None).unwrap();
                         assert!(catalog.record_reclaim_metadata_observation(&reserved,fixture.owner.round,&task,&observation).await.is_err());
@@ -8598,18 +14137,28 @@ mod tests {
                         assert_eq!(catalog.observed_active_volume_index(&serial,metadata_plan.volume()).await.unwrap(),index);
                         assert_eq!(catalog.active_volume_file_count(&serial,route,fixture.owner.round,metadata_plan.volume()).await.unwrap(),count);
                         let tr=raw_catalog.create_trx().unwrap();for key in [&metadata_active_key,&metadata_volume_key] {assert_eq!(tr.get(key,false).await.unwrap().unwrap().as_ref(),active.as_slice());}tr.set(&pool_key,&pool_bytes);tr.commit().await.unwrap();
-                        assert!(writer.execute(&reserved,&scanned,&input_request,&task,None).await.is_err(),"普通writer不能接续Discarding");
+                        assert!(writer.execute(&reserved,&task,None).await.is_err(),"普通writer不能接续Discarding");
                         let next=fixture.owner.round+100;catalog.claim_active_owner_epoch(&serial,next).await.unwrap();
                         let parents=catalog.claim_reclaim_reservations_page(&serial,route,next,None,16).await.unwrap();
                         let saved=observer.reclaim_metadata_checkpoint(&parents.items[0],next).await.unwrap().unwrap();assert_eq!(saved,discarding);
                         let recovered=catalog.claim_reclaim_metadata_attempt(&parents.items[0],next,&saved).await.unwrap();assert!(recovered.discarding());assert_eq!(recovered.id(),task.id());
                         assert_eq!(observer.reclaim_metadata_execution_context(&parents.items[0],next,&recovered).await.unwrap(),(scanned.clone(),input_request.clone()));
-                        assert!(catalog.begin_reclaim_metadata_discard(&reserved,fixture.owner.round,&scanned,&input_request,&task,&proof).await.is_err());
-                        assert!(catalog.begin_reclaim_metadata_discard(&parents.items[0],next,&scanned,&input_request,&recovered,&proof).await.is_err(),"旧owner前提不能重绑接任");
+                        assert!(catalog.begin_reclaim_metadata_discard(&reserved,fixture.owner.round,&task,&proof).await.is_err());
+                        assert!(catalog.begin_reclaim_metadata_discard(&parents.items[0],next,&recovered,&proof).await.is_err(),"旧owner前提不能重绑接任");
                         assert!(catalog.close_prepared_reclaim_metadata_write(&parents.items[0],next,&recovered).await.is_err());
-                        assert_eq!(catalog.pending_reclaim_metadata_write(&parents.items[0],next).await.unwrap(),Some(recovered));
+                        assert_eq!(catalog.pending_reclaim_metadata_write(&parents.items[0],next).await.unwrap(),Some(recovered.clone()));
                         assert_eq!(*fixture.commands.lock().unwrap(),commands,"FDB意图/上下文/HA均无设备命令");
                         assert_reclaim_media_unchanged(&media,&fixture.lib.cartridge(&input.destination().placement().barcode).unwrap());
+                        recovery_scenario.borrow_mut().push_back((ReclaimRecoveryScenario {
+                            cluster: cluster.clone(), catalog: catalog.clone(), lib: fixture.lib.clone(),
+                            permit: fixture.permit.clone(), commands: fixture.commands.clone(),
+                            old_round: fixture.owner.round, next, namespace, route, serial: serial.clone(),
+                            parent: parents.items[0].clone(), previous_owner_task: discarding, recovered, scanned: scanned.clone(),
+                            input_request: input_request.clone(), metadata_plan: metadata_plan.clone(), index, count,
+                            barcode: input.destination().placement().barcode.clone(), mode,
+                            metadata_task_key: metadata_task_key.clone(), metadata_active_key: metadata_active_key.clone(),
+                            metadata_volume_key: metadata_volume_key.clone(), original_source:captured,
+                        }).run(recovery_scenario.clone()));
                     }).await;return;
                 }
                 let failure = matches!(mode, MetadataExecutionCase::IpFailure | MetadataExecutionCase::ClosingFailure | MetadataExecutionCase::PermissionAfterWrite);
@@ -8623,7 +14172,8 @@ mod tests {
                     };
                     assert!(matches!(error, TapeError::CommitFailed { stage: ref actual, .. } if actual == stage), "{error}");
                     assert!(device.fired.load(std::sync::atomic::Ordering::SeqCst));
-                    let retained = catalog.reclaim_metadata_write_status(&reserved, fixture.owner.round, source_data_uid).await.unwrap().unwrap();
+                    let retained = catalog.reclaim_metadata_write_status(&reserved, fixture.owner.round, source_data_uid,
+                            ).await.unwrap().unwrap();
                     assert!(retained.writing());
                     assert!(retained.observation().unwrap().is_none());
                 } else {
@@ -8636,7 +14186,7 @@ mod tests {
                     assert_eq!(result.task().observation().unwrap().unwrap().kind(), expected);
                 }
                 let before_retry = fixture.commands.lock().unwrap().len();
-                let replay = writer.execute(&reserved, &scanned, &input_request, &metadata_write, None).await;
+                let replay = writer.execute(&reserved, &metadata_write, None).await;
                 if matches!(mode, MetadataExecutionCase::ClosingFailure | MetadataExecutionCase::PermissionAfterWrite) {
                     assert!(replay.is_err(), "截断尾部不能观察为完成或自动修复");
                 } else {
@@ -8644,11 +14194,12 @@ mod tests {
                     let observed = replay.task().observation().unwrap().unwrap();
                     let expected = if mode == MetadataExecutionCase::LostAdmission {ReclaimMetadataObservationKind::Unchanged} else {ReclaimMetadataObservationKind::Committed};
                     assert_eq!(observed.kind(), expected);
-                    let again = writer.execute(&reserved, &scanned, &input_request, replay.task(), None).await.unwrap();
+                    let again = writer.execute(&reserved, replay.task(), None).await.unwrap();
                     assert_eq!(again, replay);
                 }
                 assert!(!fixture.commands.lock().unwrap()[before_retry..].iter().any(|(_,op)|matches!(op,0x04|0x0a|0x10|0x19|0x8d|0xa5)), "任何重试只读，不格式化/重写/MAM/搬带");
-                let task = catalog.reclaim_metadata_write_status(&reserved, fixture.owner.round, source_data_uid).await.unwrap().unwrap();
+                let task = catalog.reclaim_metadata_write_status(&reserved, fixture.owner.round, source_data_uid,
+                        ).await.unwrap().unwrap();
                 assert!(task.writing());
                 assert!(catalog.close_prepared_reclaim_metadata_write(&reserved, fixture.owner.round, &task).await.is_err());
                 let tr = raw_catalog.create_trx().unwrap();
@@ -8656,9 +14207,10 @@ mod tests {
                 assert_eq!(tr.get(&metadata_volume_key,false).await.unwrap().unwrap().as_ref(), active.as_slice());
                 let before_fence = fixture.commands.lock().unwrap().clone();
                 fixture.permit.close(fixture.owner.round);
-                assert!(writer.execute(&reserved, &scanned, &input_request, &task, None).await.is_err());
+                assert!(writer.execute(&reserved, &task, None).await.is_err());
                 assert_eq!(*fixture.commands.lock().unwrap(), before_fence, "许可失效不再发送设备命令");
-            }).await;
+            });
+                recovery_scenario.borrow_mut().push_back(phase);
             return;
         }
         if let MetadataCase::Observation { changed_root } = metadata_case {
@@ -8691,8 +14243,6 @@ mod tests {
                 let admitted = Box::pin(catalog.admit_reclaim_metadata_write(
                     &reserved,
                     fixture.owner.round,
-                    &scanned,
-                    &input_request,
                     &metadata_write,
                 ))
                 .await
@@ -8748,7 +14298,8 @@ mod tests {
                                 .await
                                 .map_err(|e| TapeError::Catalog(e.to_string()))?;
                             if current.as_ref() != Some(&writing) || !writing.writing() {
-                                return Err(TapeError::Catalog("Sim 元数据观察原任务改变".into()));
+                                return Err(TapeError::Catalog("Sim 元数据观察原任务改变".into(),
+                                    ));
                             }
                             Ok(())
                         })
@@ -9060,8 +14611,6 @@ mod tests {
                         .admit_reclaim_metadata_write(
                             &reserved,
                             fixture.owner.round + 1,
-                            &scanned,
-                            &input_request,
                             &metadata_write
                         )
                         .await
@@ -9076,8 +14625,6 @@ mod tests {
                         .admit_reclaim_metadata_write(
                             &reserved,
                             fixture.owner.round,
-                            &scanned,
-                            &input_request,
                             &metadata_write
                         )
                         .await
@@ -9104,8 +14651,6 @@ mod tests {
                     Box::pin(offline.admit_reclaim_metadata_write(
                         &reserved,
                         fixture.owner.round,
-                        &scanned,
-                        &input_request,
                         &metadata_write,
                     )),
                 )
@@ -9116,15 +14661,11 @@ mod tests {
                     Box::pin(catalog.admit_reclaim_metadata_write(
                         &reserved,
                         fixture.owner.round,
-                        &scanned,
-                        &input_request,
                         &metadata_write
                     )),
                     Box::pin(observer.admit_reclaim_metadata_write(
                         &reserved,
                         fixture.owner.round,
-                        &scanned,
-                        &input_request,
                         &metadata_write
                     ))
                 );
@@ -9170,8 +14711,6 @@ mod tests {
                         .admit_reclaim_metadata_write(
                             &reserved,
                             fixture.owner.round,
-                            &scanned,
-                            &input_request,
                             &metadata_write
                         )
                         .await
@@ -9182,16 +14721,16 @@ mod tests {
                 changed_request.operation_id = uuid::Uuid::new_v4();
                 assert!(
                     catalog
-                        .admit_reclaim_metadata_write(
+                        .prepare_reclaim_metadata_write(
                             &reserved,
                             fixture.owner.round,
                             &scanned,
                             &changed_request,
-                            &writing
+                            &writing.plan()
                         )
                         .await
                         .is_err(),
-                    "观察原结果也不能接受另一个子请求"
+                    "新请求不能重新构造原 Writing 任务"
                 );
                 let keys = [
                     &latest_metadata_key,
@@ -9234,8 +14773,6 @@ mod tests {
                         .admit_reclaim_metadata_write(
                             &reserved,
                             fixture.owner.round,
-                            &scanned,
-                            &input_request,
                             &writing
                         )
                         .await
@@ -9283,8 +14820,6 @@ mod tests {
                             .admit_reclaim_metadata_write(
                                 &reserved,
                                 fixture.owner.round,
-                                &scanned,
-                                &input_request,
                                 &writing
                             )
                             .await
@@ -9319,8 +14854,6 @@ mod tests {
                         .admit_reclaim_metadata_write(
                             &reserved,
                             old,
-                            &scanned,
-                            &input_request,
                             &writing
                         )
                         .await
@@ -9350,8 +14883,6 @@ mod tests {
                         .admit_reclaim_metadata_write(
                             &parents.items[0],
                             next,
-                            &scanned,
-                            &input_request,
                             &recovered
                         )
                         .await
@@ -10066,7 +15597,8 @@ mod tests {
                 .is_err()
         );
         let closed = catalog
-            .close_prepared_reclaim_metadata_write(&claimed.items[0], next_round, &claimed_write)
+            .close_prepared_reclaim_metadata_write(&claimed.items[0], next_round, &claimed_write,
+                )
             .await
             .unwrap();
         assert!(closed.closed());
@@ -10163,6 +15695,7 @@ mod tests {
         );
         assert_eq!(fixture.drive_log(), drive_before_replay);
         assert_eq!(fixture.changer_log(), changer_before_replay);
-        }).await;
+        });
+        recovery_scenario.borrow_mut().push_back(phase);
     }
 }

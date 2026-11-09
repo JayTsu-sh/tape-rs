@@ -117,6 +117,37 @@ async fn require_target_at(
     Ok(())
 }
 
+pub(in super::super) async fn coverage_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    manifest: &ReclaimSourceProgress,
+    uid: u64,
+    fingerprint: [u8; 32],
+) -> Result<Object> {
+    let raw = tr
+        .get(&key(reservation, uid, fingerprint), false)
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+    let evidence: NodeEvidence = serde_json::from_slice(&raw).map_err(cache)?;
+    if encode_observation(&evidence)?.as_slice() != raw.as_ref()
+        || observation_fingerprint(&raw) != fingerprint
+        || evidence.source.uid != uid
+    {
+        return Err(CatalogError::Corrupt("原始节点覆盖的读回证明损坏"));
+    }
+    // close_tail owns the destination volume root's recovery attributes. A
+    // source node preserved only there could lose its raw metadata during a
+    // later recovery, so format coverage needs an independent non-root node.
+    if evidence.target.path.is_empty() {
+        return Err(CatalogError::Invalid(
+            "源节点覆盖须保存在目的卷的独立非根节点",
+        ));
+    }
+    require_source_at(tr, reservation, manifest, &evidence).await?;
+    require_target_at(tr, reservation, &evidence).await?;
+    Ok(evidence.source)
+}
+
 impl ManagedCatalog {
     /// Record 1..32 observations from one target capture. This is idempotent
     /// by content fingerprint and does not publish nodes, retire references,

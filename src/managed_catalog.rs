@@ -102,15 +102,22 @@ pub use control::{
     NodeRenameVolumeGuardStats, NodeRenameVolumeIntent, NodeRenameVolumePlan,
     NodeRenameVolumeProjection, NodeRenameVolumeProjectionStats, NotifyConnectionAction,
     NotifyFilter, PoolPolicy, PoolRecord, PreparedNodeMutationInputs, PreparedNodeRenameInputs,
-    ReclaimBodyDestination, ReclaimDataProgress, ReclaimFile, ReclaimFileMetadata,
-    ReclaimMetadataAdmission, ReclaimMetadataCommitEvidence, ReclaimMetadataDiscardObservation,
+    ReclaimBodyDestination, ReclaimCoverageProgress, ReclaimDataProgress, ReclaimDriveBinding,
+    ReclaimFile, ReclaimFileMetadata, ReclaimFormatAdmission, ReclaimFormatCommitEvidence,
+    ReclaimFormatHomeEvidence, ReclaimFormatPlan, ReclaimFormatResult, ReclaimFormatRetryEvidence,
+    ReclaimFormatSourceEvidence, ReclaimLayout, ReclaimLayoutEvidence, ReclaimMediaAction,
+    ReclaimMediaCommand, ReclaimMediaObservation, ReclaimMediaPlan, ReclaimMediaPreparation,
+    ReclaimMetadataAdmission, ReclaimMetadataCheckpointEvidence, ReclaimMetadataCommitEvidence,
+    ReclaimMetadataDiscardObservation, ReclaimMetadataDonorContext, ReclaimMetadataDonorEvidence,
     ReclaimMetadataInput, ReclaimMetadataObservation, ReclaimMetadataObservationKind,
     ReclaimMetadataPlan, ReclaimMetadataProgress, ReclaimMetadataPublication,
+    ReclaimMetadataRecoveryEvidence, ReclaimMetadataRecoveryKind, ReclaimMetadataResolution,
+    ReclaimMetadataSourceReplanContext, ReclaimMetadataSourceReplanEvidence,
     ReclaimMetadataTailEvidence, ReclaimMetadataUnwrittenEvidence, ReclaimMetadataWrite,
-    ReclaimNodeDestination, ReclaimNodeMetadata, ReclaimNodeReadRequest, ReclaimReadSource,
-    ReclaimReservation, ReclaimSourceInventory, ReclaimSourceNode, ReclaimSourceNodeKind,
-    ReclaimSourceProgress, ReclaimSourceRead, ReclaimSpec, ReclaimWalk, TapeAssignment,
-    VolumePlacement,
+    ReclaimNodeDestination, ReclaimNodeMetadata, ReclaimNodeReadRequest, ReclaimObsoleteProgress,
+    ReclaimRawReadContext, ReclaimRawSourceRead, ReclaimReadSource, ReclaimReservation,
+    ReclaimSourceInventory, ReclaimSourceNode, ReclaimSourceNodeKind, ReclaimSourceProgress,
+    ReclaimSourceRead, ReclaimSpec, ReclaimWalk, TapeAssignment, VolumePlacement,
 };
 pub use cutover::{
     FrozenSnapshotIdentity, VerifiedNodeExport, inspect_frozen_snapshot, verify_node_export,
@@ -1727,6 +1734,8 @@ impl ManagedCatalog {
 
     /// Reclaimed historical descriptions return None; the file's current head
     /// and every current-version description remain intact.
+    /// For a permanently deleted inode, its retained H is historical and must
+    /// still match the original deletion before a reclaimed copy returns None.
     pub async fn physical_copy(
         &self,
         namespace: Uuid,
@@ -1753,7 +1762,11 @@ impl ManagedCatalog {
                     head.as_deref()
                         .ok_or(CatalogError::Corrupt("回收副本的文件 head 缺失"))?,
                 )?;
-                if head.copy_id == copy_id || head.version <= version {
+                if (head.copy_id == copy_id || head.version <= version)
+                    && retired_nodes::deleted_copy_at(&tr, namespace, file_id, copy_id, version)
+                        .await?
+                        .is_none()
+                {
                     return Err(CatalogError::Corrupt("当前副本或版本被错误回收"));
                 }
                 None

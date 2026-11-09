@@ -286,6 +286,16 @@ ctl tape validate TAPE001L8 -l LIBRARY_SERIAL -p archive \
 
 异步核验标签、volume UUID、LTFS 索引及结构一致性，保存真实诊断。结果中的 `scope=label_and_index`、`payload_verified=false` 表示没有读取全部文件正文。没有 `--full-read`；该命令不自动格式化、修复尾部或重建用户命名空间。
 
+### tape reclaim
+
+```sh
+ctl tape reclaim BARCODE -l LIBRARY_SERIAL -p POOL --yes --request /var/lib/tape-client/reclaim.json
+ctl tape reclaim BARCODE -l LIBRARY_SERIAL -p POOL --yes -u --request /var/lib/tape-client/reclaim-unassign.json
+ctl tape reclaim --request /var/lib/tape-client/reclaim.json
+```
+
+返回异步任务号；新请求必须 `--yes` 明确同意在迁移、实读校验、完整源覆盖和全局零引用证明后重新初始化源带。默认仍归原池；`-u` 要求完成后实际归槽并解绑。恢复只带原请求文件，不重新指定操作参数。当前固定同池单盘目的带、两台独立驱动器；资源不足或结果未知保留原任务。详情见[原生回收与恢复边界](native-reclaim.md)。HTTP 使用 `POST /libraries/{serial}/admin/pools/{pool}/tapes/{barcode}/reclaim`，提交同一规范管理请求，明确固定 `confirm_format=true` 和 `unassign`。
+
 ### tape offline / online / set
 
 ```sh
@@ -321,7 +331,7 @@ ctl -l LIBRARY_SERIAL notify delete ops-platform --generation GENERATION_UUID --
 
 ### 受理与完成
 
-rescan、import、assign、move、unassign、validate 先保存原请求，再持久登记任务，返回后后台执行。典型输出身份为：
+rescan、import、assign、move、unassign、validate、reclaim 先保存原请求，再持久登记任务，返回后后台执行。典型输出身份为：
 
 ```text
 task_id: NAMESPACE_UUID:LIBRARY_SERIAL:EPOCH:OPERATION_UUID
@@ -359,6 +369,7 @@ ctl tape assign --request /var/lib/tape-client/assign-empty.json
 ctl tape move --request /var/lib/tape-client/move-home.json
 ctl tape unassign --request /var/lib/tape-client/unassign.json
 ctl tape validate --request /var/lib/tape-client/validate.json
+ctl tape reclaim --request /var/lib/tape-client/reclaim.json
 ctl library rescan --request /var/lib/tape-client/rescan.json
 ctl pool create archive -l LIBRARY_SERIAL --request /var/lib/tape-client/create-pool.json
 ctl pool delete POOL_UUID -l LIBRARY_SERIAL --request /var/lib/tape-client/delete-pool.json
@@ -401,7 +412,7 @@ ctl drive list -l LIBRARY_SERIAL
 ctl cluster
 ```
 
-`node list/show` 展示库的配置参与节点与已报告候选信息，不据此推断节点实时可达；`drive list/show` 联合当前 FDB 库存和 FDB 驱动策略，保留库存采样时间。两类命令通过相同的 HTTP 管理查询读取，namespace 不匹配时失败。`cluster` 逐物理入口读取节点自述，不跟随 owner 或加库/池前缀；执行者状态以当前库的就绪观测为准。磁带运维入口共用 FDB 管理任务；旧顶层 blacklist/clear-blacklist/objects 入口已移除，黑名单使用 `tape set`。`reclaim` 仍待 FDB 原生实现，不能因帮助存在就按已完成处理。`admin` 需要对应接口规定的完整正文，不能用空对象替代持久请求。模式边界见 [FoundationDB](foundationdb.md)。
+`node list/show` 展示库的配置参与节点与已报告候选信息，不据此推断节点实时可达；`drive list/show` 联合当前 FDB 库存和 FDB 驱动策略，保留库存采样时间。两类命令通过相同的 HTTP 管理查询读取，namespace 不匹配时失败。`cluster` 逐物理入口读取节点自述，不跟随 owner 或加库/池前缀；执行者状态以当前库的就绪观测为准。磁带运维入口共用 FDB 管理任务；旧顶层 blacklist/clear-blacklist/objects 入口已移除，黑名单使用 `tape set`。`tape reclaim` 使用 FDB 原生异步父任务；迁移、实读验证、源带重新初始化和故障边界见[原生回收](native-reclaim.md)。`admin` 需要对应接口规定的完整正文，不能用空对象替代持久请求。模式边界见 [FoundationDB](foundationdb.md)。
 
 ## FDB 文件与对象操作
 

@@ -49,14 +49,26 @@ pub use automatic_media::{AutomaticMediaAction, AutomaticMediaCommand, Automatic
 pub(super) mod reclaim;
 pub(super) use reclaim::require_metadata_publication_at as require_reclaim_metadata_publication_at;
 pub use reclaim::{
-    ReclaimBodyDestination, ReclaimDataProgress, ReclaimFile, ReclaimFileMetadata,
-    ReclaimMetadataAdmission, ReclaimMetadataCommitEvidence, ReclaimMetadataDiscardObservation,
+    ReclaimBodyDestination, ReclaimCoverageProgress, ReclaimDataProgress, ReclaimDriveBinding,
+    ReclaimFile, ReclaimFileMetadata, ReclaimFormatAdmission, ReclaimFormatCommitEvidence,
+    ReclaimFormatHomeEvidence, ReclaimFormatPlan, ReclaimFormatResult, ReclaimFormatRetryEvidence,
+    ReclaimFormatSourceEvidence, ReclaimLayout, ReclaimLayoutEvidence, ReclaimMediaAction,
+    ReclaimMediaCommand, ReclaimMediaObservation, ReclaimMediaPlan, ReclaimMediaPreparation,
+    ReclaimMetadataAdmission, ReclaimMetadataCheckpointEvidence, ReclaimMetadataCommitEvidence,
+    ReclaimMetadataDiscardObservation, ReclaimMetadataDonorContext, ReclaimMetadataDonorEvidence,
     ReclaimMetadataInput, ReclaimMetadataObservation, ReclaimMetadataObservationKind,
     ReclaimMetadataPlan, ReclaimMetadataProgress, ReclaimMetadataPublication,
+    ReclaimMetadataRecoveryEvidence, ReclaimMetadataRecoveryKind, ReclaimMetadataResolution,
+    ReclaimMetadataSourceReplanContext, ReclaimMetadataSourceReplanEvidence,
     ReclaimMetadataTailEvidence, ReclaimMetadataUnwrittenEvidence, ReclaimMetadataWrite,
-    ReclaimNodeDestination, ReclaimNodeMetadata, ReclaimNodeReadRequest, ReclaimReadSource,
-    ReclaimReservation, ReclaimSourceInventory, ReclaimSourceNode, ReclaimSourceNodeKind,
-    ReclaimSourceProgress, ReclaimSourceRead, ReclaimSpec, ReclaimWalk,
+    ReclaimNodeDestination, ReclaimNodeMetadata, ReclaimNodeReadRequest, ReclaimObsoleteProgress,
+    ReclaimRawReadContext, ReclaimRawSourceRead, ReclaimReadSource, ReclaimReservation,
+    ReclaimSourceInventory, ReclaimSourceNode, ReclaimSourceNodeKind, ReclaimSourceProgress,
+    ReclaimSourceRead, ReclaimSpec, ReclaimWalk,
+};
+pub(super) use reclaim::{
+    require_metadata_resolution_at as require_reclaim_metadata_resolution_at,
+    require_metadata_resolution_commit_at as require_reclaim_metadata_resolution_commit_at,
 };
 #[path = "node_baseline.rs"]
 mod node_baseline;
@@ -89,9 +101,7 @@ pub use node_tasks::{
     NodeMutationTask, NodeMutationTaskKind, NodeMutationTaskOutcome, NodeMutationTaskState,
     NodeMutationTaskStatus,
 };
-pub(super) use node_tasks::{
-    node_hold_prefix, require_pool_without_reclaim_at, require_pool_writable_at,
-};
+pub(super) use node_tasks::{node_hold_prefix, require_pool_writable_at};
 #[path = "node_attempts.rs"]
 pub(super) mod node_attempts;
 #[path = "node_claims.rs"]

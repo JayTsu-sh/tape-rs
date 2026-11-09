@@ -15,6 +15,62 @@ fn key(reservation: &ReclaimReservation, operation: Uuid) -> Vec<u8> {
     key
 }
 
+pub(super) async fn cancelled_at(
+    tr: &Transaction,
+    parent: &ReclaimReservation,
+    owner: u64,
+    request: &ActiveFileRequest,
+) -> Result<Option<[u8; 32]>> {
+    let Some(raw) = tr.get(&key(parent, request.operation_id), false).await? else {
+        return Ok(None);
+    };
+    let (intent, permit) = children::child_at(
+        tr,
+        request.namespace,
+        parent.spec().pool(),
+        request.request_epoch,
+        request.operation_id,
+        owner,
+    )
+    .await?
+    .ok_or(CatalogError::Incomplete)?;
+    if intent.request() != *request {
+        return Err(CatalogError::Invalid("取消后继改变原封存请求"));
+    }
+    let child = tr
+        .get(
+            &children::child_key(request.namespace, &parent.token(), request.operation_id)?,
+            false,
+        )
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+    let terminal = requests::terminal_value(&reservation::cancellation_fingerprint(&intent), None);
+    let expected = json!({"version":1,"parent":parent.fingerprint(),"request":request.fingerprint(),
+        "child_sha256":Sha256::digest(&child).to_vec(),"permit":permit,"terminal":terminal});
+    let live = tr
+        .get(
+            &op_key(
+                request.namespace,
+                request.request_epoch,
+                request.operation_id,
+            ),
+            false,
+        )
+        .await?;
+    if decode(&raw)? != expected
+        || live.as_ref().is_some_and(|v| v.as_ref() != terminal)
+        || tr
+            .get(&children::history_pin_key(request), false)
+            .await?
+            .is_some()
+    {
+        return Err(CatalogError::Corrupt("取消后继缺少确切原取消回执"));
+    }
+    reservation::require_no_attempt_at(tr, &intent).await?;
+    upload_recovery::require_child_idle_at(tr, parent, request).await?;
+    Ok(Some(Sha256::digest(&raw).into()))
+}
+
 pub(super) async fn require_no_cancellations_at(
     tr: &Transaction,
     reservation: &ReclaimReservation,
@@ -79,6 +135,7 @@ impl ManagedCatalog {
             let (intent,permit)=children::child_at(&tr,request.namespace,reservation.spec().pool,
                 request.request_epoch,request.operation_id,owner).await?.ok_or(CatalogError::Incomplete)?;
             if intent.request()!=*request {return Err(CatalogError::Invalid("取消不能改变封存的回收子请求"));}
+            upload_recovery::require_child_idle_at(&tr,reservation,request).await?;
             let child_raw=tr.get(&children::child_key(request.namespace,&reservation.token(),request.operation_id)?,false)
                 .await?.ok_or(CatalogError::Incomplete)?;
             let terminal=requests::terminal_value(&reservation::cancellation_fingerprint(&intent),None);

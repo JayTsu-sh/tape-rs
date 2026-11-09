@@ -118,6 +118,9 @@ fn home_key(ns: Uuid, serial: &str, barcode: &str) -> Vec<u8> {
     append_component(&mut out, barcode.as_bytes());
     out
 }
+pub(super) fn clear_home_at(tr: &Transaction, ns: Uuid, serial: &str, barcode: &str) {
+    tr.clear(&home_key(ns, serial, barcode));
+}
 fn intake_home_key(import: &NativeMediaImport) -> Vec<u8> {
     let mut key = domain(import.request().namespace(), b'i');
     append_component(
@@ -436,6 +439,8 @@ pub(super) async fn require_library_available(
     ns: Uuid,
     serial: &str,
 ) -> Result<()> {
+    reclaim::require_media_idle_at(tr, ns, serial).await?;
+    reclaim::require_layout_idle_at(tr, ns, serial).await?;
     if tr.get(&library_gate(ns, serial), false).await?.is_some()
         || super::automatic_media::pending_at(tr, ns, serial)
             .await?
@@ -547,6 +552,15 @@ pub(in crate::managed_catalog) async fn require_volume_quiescent_at(
     namespace: Uuid,
     volume: Uuid,
 ) -> Result<()> {
+    require_volume_quiescent_with_claim_at(tr, namespace, volume, None).await
+}
+
+pub(in crate::managed_catalog) async fn require_volume_quiescent_with_claim_at(
+    tr: &Transaction,
+    namespace: Uuid,
+    volume: Uuid,
+    claim: Option<&[u8]>,
+) -> Result<()> {
     for kind in *b"24" {
         let mut prefix = key(kind);
         prefix.extend_from_slice(volume.as_bytes());
@@ -567,7 +581,8 @@ pub(in crate::managed_catalog) async fn require_volume_quiescent_at(
         || tr
             .get(&node_attempts::volume_key(volume), false)
             .await?
-            .is_some()
+            .as_deref()
+            != claim
         || requests::has_namespace_holds(tr, namespace).await?
     {
         return Err(CatalogError::PoolBusy);

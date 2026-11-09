@@ -45,6 +45,37 @@ pub(super) fn attributes(meta: &NodeMeta, xattrs: &[Xattr]) -> Result<()> {
 }
 
 impl IndexEntry {
+    /// Pure fixed-UID recipe for a newly created reclaim metadata node. The
+    /// caller separately proves source capture, destination and write intent.
+    pub(crate) fn reclaimed_metadata_node(&self, path: &str, uid: u64) -> Result<Self> {
+        self.validate_reclaimed_metadata()?;
+        let relative = path.strip_prefix('/').unwrap_or(path);
+        let p = parts(path)?;
+        let name = p.last().ok_or_else(|| error("回收新节点不能覆盖卷根"))?;
+        if uid <= 1 || !super::super::xml_text_valid(path) || p.join("/") != relative {
+            return Err(error("回收新节点的 UID 或规范路径无效"));
+        }
+        Ok(match self {
+            Self::Directory { node, .. } => {
+                let mut node = node.clone();
+                node.name = (*name).into();
+                node.meta.file_uid = uid;
+                Self::Directory {
+                    path: relative.into(),
+                    node,
+                }
+            }
+            Self::File { node, .. } => {
+                let mut node = node.clone();
+                node.name = (*name).into();
+                node.meta.file_uid = uid;
+                Self::File {
+                    path: relative.into(),
+                    node,
+                }
+            }
+        })
+    }
     /// Shared staging/readback validation for a complete raw metadata node.
     pub(crate) fn validate_reclaimed_metadata(&self) -> Result<()> {
         match self {
@@ -72,6 +103,72 @@ impl IndexEntry {
 }
 
 impl LtfsIndex {
+    /// Preserve a colliding target file under one fixed root name. Only its
+    /// name changes; UID, extents, link text and every attribute remain exact.
+    #[cfg(feature = "fdb")]
+    pub(in crate::ltfs) fn displace_reclaimed_file(
+        &mut self,
+        path: &str,
+        uid: u64,
+        archive: &str,
+    ) -> Result<()> {
+        let src = parts(path)?;
+        let dst = parts(archive)?;
+        let (name, parents) = src.split_last().ok_or_else(|| error("不能移动卷根"))?;
+        if dst.len() != 1
+            || archive != dst[0]
+            || self.root.files.iter().any(|n| n.name == archive)
+            || self.root.subdirs.iter().any(|n| n.name == archive)
+        {
+            return Err(error("同名节点保留路径必须为未占用的固定根路径"));
+        }
+        let parent = dir_mut(&mut self.root, parents)?;
+        let at = parent
+            .files
+            .iter()
+            .position(|n| {
+                n.name == *name
+                    && n.meta.file_uid == uid
+                    && n.delta_fields.is_none()
+                    && n.open_for_write != Some(true)
+            })
+            .ok_or_else(|| error("同名节点的原文件身份不符"))?;
+        let mut node = parent.files.remove(at);
+        node.name = archive.into();
+        self.root.files.push(node);
+        Ok(())
+    }
+
+    /// Add exactly one fixed raw directory/link. Unlike a user mkdir/symlink,
+    /// this preserves both source attributes and every existing parent field.
+    pub(in crate::ltfs) fn reference_reclaimed_node(
+        &mut self,
+        path: &str,
+        uid: u64,
+        source: &IndexEntry,
+    ) -> Result<()> {
+        let node = source.reclaimed_metadata_node(path, uid)?;
+        if self.highest_file_uid.checked_add(1) != Some(uid) {
+            return Err(error("回收新节点 UID 与原固定计划不符"));
+        }
+        let p = parts(path)?;
+        let (name, parents) = p
+            .split_last()
+            .ok_or_else(|| error("回收新节点不能覆盖卷根"))?;
+        let parent = dir_mut(&mut self.root, parents)?;
+        if parent.files.iter().any(|node| node.name == *name)
+            || parent.subdirs.iter().any(|node| node.name == *name)
+        {
+            return Err(error("回收新节点路径已存在"));
+        }
+        // No fallible work follows the first mutation.
+        match node {
+            IndexEntry::Directory { node, .. } => parent.subdirs.push(node),
+            IndexEntry::File { node, .. } => parent.files.push(node),
+        }
+        self.highest_file_uid = uid;
+        Ok(())
+    }
     /// Metadata only: target existence/type and the whole source are checked
     /// before mutation. Source UID and subtree/data extents are never copied.
     pub(in crate::ltfs) fn preserve_reclaimed_metadata(

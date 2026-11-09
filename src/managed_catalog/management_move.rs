@@ -230,6 +230,8 @@ pub(in crate::managed_catalog) async fn require_readable_at(
     ns: Uuid,
     serial: &str,
 ) -> Result<()> {
+    reclaim::require_media_idle_at(tr, ns, serial).await?;
+    reclaim::require_layout_idle_at(tr, ns, serial).await?;
     if pending_at(tr, ns, serial).await?.is_some()
         || super::automatic_media::pending_at(tr, ns, serial)
             .await?

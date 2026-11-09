@@ -6,11 +6,17 @@ use sha2::{Digest, Sha256};
 
 #[path = "reclaim_children.rs"]
 mod children;
+#[path = "reclaim_obsolete_copies.rs"]
+mod obsolete_copies;
 #[path = "reclaim_prepared_cancel.rs"]
 mod prepared_cancel;
+#[path = "reclaim_upload_retry.rs"]
+mod upload_retry;
+pub(super) use children::require_write_group_lane_at;
 pub(in crate::managed_catalog) use children::{
     require_intent_at, require_receipt_at, require_request_at,
 };
+pub use obsolete_copies::ReclaimObsoleteProgress;
 #[path = "reclaim_walk.rs"]
 mod walk;
 pub use walk::{ReclaimFile, ReclaimWalk};
@@ -23,13 +29,46 @@ pub use retirement::ReclaimBodyDestination;
 mod source;
 pub(in crate::managed_catalog) use source::require_publication_at as require_metadata_publication_at;
 pub use source::{
-    ReclaimDataProgress, ReclaimFileMetadata, ReclaimMetadataAdmission,
-    ReclaimMetadataCommitEvidence, ReclaimMetadataDiscardObservation, ReclaimMetadataInput,
-    ReclaimMetadataObservation, ReclaimMetadataObservationKind, ReclaimMetadataPlan,
-    ReclaimMetadataProgress, ReclaimMetadataPublication, ReclaimMetadataTailEvidence,
-    ReclaimMetadataUnwrittenEvidence, ReclaimMetadataWrite, ReclaimNodeDestination,
-    ReclaimNodeMetadata, ReclaimNodeReadRequest, ReclaimReadSource, ReclaimSourceInventory,
-    ReclaimSourceNode, ReclaimSourceNodeKind, ReclaimSourceProgress, ReclaimSourceRead,
+    ReclaimCoverageProgress, ReclaimDataProgress, ReclaimFileMetadata, ReclaimFormatSourceEvidence,
+    ReclaimMetadataAdmission, ReclaimMetadataCheckpointEvidence, ReclaimMetadataCommitEvidence,
+    ReclaimMetadataDiscardObservation, ReclaimMetadataDonorContext, ReclaimMetadataDonorEvidence,
+    ReclaimMetadataInput, ReclaimMetadataObservation, ReclaimMetadataObservationKind,
+    ReclaimMetadataPlan, ReclaimMetadataProgress, ReclaimMetadataPublication,
+    ReclaimMetadataRecoveryEvidence, ReclaimMetadataRecoveryKind, ReclaimMetadataResolution,
+    ReclaimMetadataSourceReplanContext, ReclaimMetadataSourceReplanEvidence,
+    ReclaimMetadataTailEvidence, ReclaimMetadataUnwrittenEvidence, ReclaimMetadataWrite,
+    ReclaimNodeDestination, ReclaimNodeMetadata, ReclaimNodeReadRequest, ReclaimRawReadContext,
+    ReclaimRawSourceRead, ReclaimReadSource, ReclaimSourceInventory, ReclaimSourceNode,
+    ReclaimSourceNodeKind, ReclaimSourceProgress, ReclaimSourceRead,
+};
+pub(in crate::managed_catalog) use source::{
+    require_resolution_at as require_metadata_resolution_at,
+    require_resolution_commit_at as require_metadata_resolution_commit_at,
+};
+
+#[path = "reclaim_management.rs"]
+mod managed_task;
+#[path = "reclaim_upload_recovery.rs"]
+mod upload_recovery;
+
+pub(super) use managed_task::{cancel_reserved_management_at, management_progress_at};
+
+#[path = "reclaim_format.rs"]
+mod format;
+#[path = "reclaim_layout.rs"]
+mod layout;
+#[path = "reclaim_mechanics.rs"]
+mod mechanics;
+pub use format::{
+    ReclaimFormatAdmission, ReclaimFormatCommitEvidence, ReclaimFormatHomeEvidence,
+    ReclaimFormatPlan, ReclaimFormatResult, ReclaimFormatRetryEvidence,
+};
+pub(super) use layout::require_idle_at as require_layout_idle_at;
+pub use layout::{ReclaimDriveBinding, ReclaimLayout, ReclaimLayoutEvidence};
+pub(super) use mechanics::require_idle_at as require_media_idle_at;
+pub use mechanics::{
+    ReclaimMediaAction, ReclaimMediaCommand, ReclaimMediaObservation, ReclaimMediaPlan,
+    ReclaimMediaPreparation,
 };
 
 fn domain(ns: Uuid, kind: u8) -> Vec<u8> {
@@ -156,6 +195,47 @@ async fn require_metadata_copy_idle_at(tr: &Transaction, ns: Uuid, pool: Uuid) -
         if tr.get(&key, false).await?.is_some() {
             return Err(CatalogError::PoolBusy);
         }
+        // Sealed child inputs remain readable while the original format goal
+        // is verified. They must never authorize another data write then.
+        key[domain(ns, b'A').len() - 1] = b'j';
+        let parent = decode(
+            &tr.get(&key, false)
+                .await?
+                .ok_or(CatalogError::Corrupt("回收池屏障缺少原父任务"))?,
+        )?;
+        if parent["fingerprint"] != token["fingerprint"] {
+            return Err(CatalogError::Corrupt("回收写屏障与原父任务不同"));
+        }
+        if parent["phase"] == "reformatting" {
+            return Err(CatalogError::PoolBusy);
+        }
+    }
+    Ok(())
+}
+
+/// Preserve all unrelated pool/device interlocks while allowing this exact
+/// parent's own fixed layout. This never grants a new write or erase attempt.
+async fn require_parent_pool_at(tr: &Transaction, reservation: &ReclaimReservation) -> Result<()> {
+    let ns = reservation.namespace();
+    let pool = reservation.spec().pool();
+    native_media::require_pool_readable(tr, ns, pool).await?;
+    if node_tasks::held_task_at(tr, ns, pool).await?.is_some() {
+        return Err(CatalogError::PoolBusy);
+    }
+    mechanics::require_parent_idle_at(tr, reservation).await?;
+    layout::at(tr, reservation).await?;
+    if tr
+        .get(
+            &native_device::library_gate(ns, reservation.serial()),
+            false,
+        )
+        .await?
+        .is_some()
+        || automatic_media::pending_at(tr, ns, reservation.serial())
+            .await?
+            .is_some()
+    {
+        return Err(CatalogError::PoolBusy);
     }
     Ok(())
 }
@@ -192,7 +272,7 @@ async fn record_at(
         || value["fingerprint"] != reservation.fingerprint()
         || !matches!(
             (value["phase"].as_str(), value["children"].as_u64()),
-            (Some("reserved"), Some(0)) | (Some("copying"), Some(1..))
+            (Some("reserved"), Some(0)) | (Some("copying" | "reformatting"), Some(_))
         )
         || !value.as_object().is_some_and(|map| {
             map.len() == fields.len() && map.keys().all(|k| fields.contains(&k.as_str()))
@@ -236,6 +316,62 @@ async fn source_state_at(
     Ok((scan, index))
 }
 
+async fn reserve_at(
+    tr: &Transaction,
+    serial: &str,
+    route: ActiveLibraryRoute,
+    owner: u64,
+    epoch: u64,
+    operation: Uuid,
+    spec: &ReclaimSpec,
+) -> Result<ReclaimReservation> {
+    let ns = routing::require_runtime_active_owner(tr, serial, route, owner).await?;
+    require_pool_library(tr, ns, spec.pool, serial).await?;
+    let assignment = ManagedCatalog::verified_assignment(tr, serial, &spec.barcode)
+        .await?
+        .ok_or(CatalogError::Invalid("回收源磁带已无池归属"))?;
+    spec.require_assignment(&assignment, ns, serial)?;
+    let (scan, index) = active_volume::observed_at(tr, serial, spec.volume).await?;
+    let mut index_bytes = Vec::new();
+    active_volume::encode_index(&mut index_bytes, index);
+    let reservation = ReclaimReservation {
+        route,
+        intent: json!({"version":1,"library":serial,"namespace":ns.to_string(),"epoch":epoch,"operation":operation.to_string(),"change":spec.to_json(),"scan":scan.id.to_string(),"scan_generation":scan.generation,"index":index_bytes}),
+    };
+    if tr.get(&reservation.journal_key(), false).await?.is_some() {
+        let mut value = record_at(tr, &reservation, owner).await?;
+        if value["owner_epoch"]
+            .as_u64()
+            .is_none_or(|saved| saved > owner)
+        {
+            return Err(CatalogError::OwnerFenced);
+        }
+        value["owner_epoch"] = json!(owner);
+        tr.set(&reservation.journal_key(), value.to_string().as_bytes());
+        return Ok(reservation);
+    }
+    let window = management::window(tr, ns).await?;
+    if epoch != window.accepting {
+        return Err(CatalogError::Invalid("回收管理请求代次已关闭"));
+    }
+    require_pool_writable_at(tr, ns, spec.pool).await?;
+    management::exclusion::require_available_at(tr, ns, serial).await?;
+    let claim = management::exclusion::LibraryTaskClaim::for_reclaim(&reservation.token())?;
+    if requests::has_namespace_holds(tr, ns).await?
+        || active_volume::recovery_active(tr, spec.volume).await?
+    {
+        return Err(CatalogError::PoolBusy);
+    }
+    let value = json!({"version":1,"intent":reservation.intent,"fingerprint":reservation.fingerprint(),"owner_epoch":owner,"phase":"reserved","children":0});
+    tr.set(&reservation.journal_key(), value.to_string().as_bytes());
+    tr.set(
+        &gate_key(ns, spec.pool),
+        reservation.token().to_string().as_bytes(),
+    );
+    claim.acquire(tr);
+    Ok(reservation)
+}
+
 impl ManagedCatalog {
     /// Reserve only after current ownership, the original assignment and every
     /// older namespace hold have been proved. The source index is captured in
@@ -255,38 +391,16 @@ impl ManagedCatalog {
         if epoch == 0 || operation.is_nil() {
             return Err(CatalogError::Invalid("回收预留请求身份无效"));
         }
-        self.db.run(|tr,_| {
-            let spec=spec.clone();
-            async move { requests::retry_result(async {
-                let ns=routing::require_runtime_active_owner(&tr,serial,route,owner).await?;
-                require_pool_library(&tr,ns,spec.pool,serial).await?;
-                let assignment=Self::verified_assignment(&tr,serial,&spec.barcode).await?.ok_or(CatalogError::Incomplete)?;
-                spec.require_assignment(&assignment,ns,serial)?;
-                let (scan,index)=active_volume::observed_at(&tr,serial,spec.volume).await?;
-                let mut index_bytes=Vec::new();active_volume::encode_index(&mut index_bytes,index);
-                let reservation=ReclaimReservation { route, intent:json!({"version":1,"library":serial,"namespace":ns.to_string(),"epoch":epoch,"operation":operation.to_string(),"change":spec.to_json(),"scan":scan.id.to_string(),"scan_generation":scan.generation,"index":index_bytes}) };
-                if tr.get(&reservation.journal_key(),false).await?.is_some() {
-                    let mut value=record_at(&tr,&reservation,owner).await?;
-                    if value["owner_epoch"].as_u64().is_none_or(|saved| saved>owner) {return Err(CatalogError::OwnerFenced);}
-                    value["owner_epoch"]=json!(owner);
-                    tr.set(&reservation.journal_key(),value.to_string().as_bytes());
-                    return Ok(reservation);
-                }
-                let window=management::window(&tr,ns).await?;
-                if epoch!=window.accepting {return Err(CatalogError::Invalid("回收管理请求代次已关闭"));}
-                require_pool_writable_at(&tr,ns,spec.pool).await?;
-                management::exclusion::require_available_at(&tr,ns,serial).await?;
-                let claim=management::exclusion::LibraryTaskClaim::for_reclaim(&reservation.token())?;
-                if requests::has_namespace_holds(&tr,ns).await? || active_volume::recovery_active(&tr,spec.volume).await? {
-                    return Err(CatalogError::PoolBusy);
-                }
-                let value=json!({"version":1,"intent":reservation.intent,"fingerprint":reservation.fingerprint(),"owner_epoch":owner,"phase":"reserved","children":0});
-                tr.set(&reservation.journal_key(),value.to_string().as_bytes());
-                tr.set(&gate_key(ns,spec.pool),reservation.token().to_string().as_bytes());
-                claim.acquire(&tr);
-                Ok(reservation)
-            }.await) }
-        }).await?
+        self.db
+            .run(|tr, _| {
+                let spec = &spec;
+                Box::pin(async move {
+                    requests::retry_result(
+                        reserve_at(&tr, serial, route, owner, epoch, operation, spec).await,
+                    )
+                })
+            })
+            .await?
     }
 
     pub async fn reserved_reclaim_status(
@@ -295,6 +409,11 @@ impl ManagedCatalog {
         owner: u64,
     ) -> Result<Value> {
         let tr = self.db.create_trx()?;
+        routing::require_runtime_active_owner(&tr, reservation.serial(), reservation.route, owner)
+            .await?;
+        if let Some(result) = format::result_at(&tr, reservation).await? {
+            return Ok(result.value());
+        }
         let value = record_at(&tr, reservation, owner).await?;
         if value["owner_epoch"] != owner {
             return Err(CatalogError::OwnerFenced);
@@ -320,6 +439,26 @@ impl ManagedCatalog {
                             owner,
                         )
                         .await?;
+                        if management::has_task_at(
+                            &tr,
+                            reservation.namespace(),
+                            reservation.serial(),
+                            reservation.intent["epoch"]
+                                .as_u64()
+                                .expect("validated epoch"),
+                            Uuid::parse_str(
+                                reservation.intent["operation"]
+                                    .as_str()
+                                    .expect("validated operation"),
+                            )
+                            .expect("validated operation"),
+                        )
+                        .await?
+                        {
+                            return Err(CatalogError::Invalid(
+                                "管理 reclaim 的父检查点须与原异步回执一起结清",
+                            ));
+                        }
                         let journal = tr.get(&reservation.journal_key(), false).await?;
                         let gate = tr
                             .get(
@@ -342,11 +481,16 @@ impl ManagedCatalog {
                             return Err(CatalogError::PoolBusy);
                         }
                         source::require_metadata_idle_at(&tr, reservation).await?;
+                        mechanics::require_parent_idle_at(&tr, reservation).await?;
+                        layout::at(&tr, reservation).await?;
                         let claim = management::exclusion::LibraryTaskClaim::for_reclaim(
                             &reservation.token(),
                         )?;
                         walk::clear_reserved_at(&tr, reservation).await?;
                         source::clear_reserved_at(&tr, reservation);
+                        mechanics::clear_finished_at(&tr, reservation);
+                        layout::clear_at(&tr, reservation);
+                        managed_task::clear_dependency_at(&tr, reservation);
                         tr.clear(&gate_key(reservation.namespace(), reservation.spec().pool));
                         tr.clear(&reservation.journal_key());
                         claim.release(&tr);

@@ -237,3 +237,27 @@ pub(super) async fn policy(
         Err(e) => catalog_error(e),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn native_reclaim_requires_complete_original_request_and_explicit_consent() {
+        let value = json!({"version":1,"namespace":uuid::Uuid::new_v4().to_string(),"library":"HTTP-RECLAIM-LIB","epoch":1,
+            "operation":uuid::Uuid::new_v4().to_string(),"change":{"kind":"media-reclaim","pool":uuid::Uuid::new_v4().to_string(),
+            "barcode":"TEST00L8","volume":uuid::Uuid::new_v4().to_string(),"revision":1,"confirm_format":true,"unassign":false}});
+        let request = body(Request::new(axum::body::Body::from(value.to_string())))
+            .await
+            .unwrap();
+        assert_eq!(request.value(), &value);
+        for invalid_consent in [json!(false), json!("true"), Value::Null] {
+            let mut invalid = value.clone();
+            invalid["change"]["confirm_format"] = invalid_consent;
+            assert!(
+                body(Request::new(axum::body::Body::from(invalid.to_string())))
+                    .await
+                    .is_err()
+            );
+        }
+    }
+}

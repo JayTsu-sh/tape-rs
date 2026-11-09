@@ -205,7 +205,16 @@ pub(super) async fn sample(
     barcode: &str,
     volume: uuid::Uuid,
 ) -> std::result::Result<(), ReadError> {
-    sample_inner(owner, permit, control, drive, barcode, volume, None).await
+    sample_inner(
+        owner,
+        permit,
+        control,
+        drive,
+        barcode,
+        volume,
+        SampleScope::Normal,
+    )
+    .await
 }
 
 pub(super) async fn sample_for_maintenance(
@@ -217,9 +226,49 @@ pub(super) async fn sample_for_maintenance(
     volume: uuid::Uuid,
     task: &crate::managed_catalog::NativeDeviceTask,
 ) -> std::result::Result<(), ReadError> {
-    sample_inner(owner, permit, control, drive, barcode, volume, Some(task)).await
+    sample_inner(
+        owner,
+        permit,
+        control,
+        drive,
+        barcode,
+        volume,
+        SampleScope::Maintenance(task),
+    )
+    .await
 }
 
+enum SampleScope<'a> {
+    Normal,
+    Maintenance(&'a crate::managed_catalog::NativeDeviceTask),
+    Reclaim(
+        &'a crate::managed_catalog::ReclaimReservation,
+        &'a crate::managed_catalog::ActiveFileRequest,
+    ),
+}
+pub(super) async fn sample_for_reclaim(
+    owner: &Active,
+    permit: &Permission,
+    control: &FdbOwnerControl,
+    drive: usize,
+    barcode: &str,
+    volume: uuid::Uuid,
+    original: (
+        &crate::managed_catalog::ReclaimReservation,
+        &crate::managed_catalog::ActiveFileRequest,
+    ),
+) -> std::result::Result<(), ReadError> {
+    sample_inner(
+        owner,
+        permit,
+        control,
+        drive,
+        barcode,
+        volume,
+        SampleScope::Reclaim(original.0, original.1),
+    )
+    .await
+}
 async fn sample_inner(
     owner: &Active,
     permit: &Permission,
@@ -227,13 +276,13 @@ async fn sample_inner(
     drive: usize,
     barcode: &str,
     volume: uuid::Uuid,
-    maintenance: Option<&crate::managed_catalog::NativeDeviceTask>,
+    scope: SampleScope<'_>,
 ) -> std::result::Result<(), ReadError> {
     let _activity = permit.begin_device_activity(owner.round).map_err(lost)?;
     fdb_loading::authority_guard(owner, permit, control).await?;
     let original = || -> Result<()> {
         futures_executor::block_on(async {
-            if let Some(task) = maintenance {
+            if let SampleScope::Maintenance(task) = scope {
                 let state = control
                     .catalog
                     .native_device_status(task, owner.round)
@@ -252,6 +301,17 @@ async fn sample_inner(
                 {
                     return Err(crate::managed_catalog::CatalogError::OwnerFenced);
                 }
+            } else if let SampleScope::Reclaim(parent, request) = scope {
+                fdb_loading::reclaim_write_binding(
+                    owner,
+                    control,
+                    (parent, request),
+                    volume,
+                    barcode,
+                    drive,
+                )
+                .await
+                .map_err(|e| crate::managed_catalog::CatalogError::Cache(e.to_string()))?;
             } else {
                 control
                     .catalog
@@ -353,6 +413,22 @@ pub(super) async fn tick(
     control: &FdbOwnerControl,
     _opts: &ExecOptions,
 ) -> std::result::Result<(), ReadError> {
+    match control
+        .catalog
+        .require_active_library_readable(&control.serial, control.route, owner.round)
+        .await
+    {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.domain(),
+                crate::managed_catalog::CatalogError::PoolBusy
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(lost(error)),
+    }
     if control
         .catalog
         .active_library_mechanical_task(&control.serial, control.route, owner.round)

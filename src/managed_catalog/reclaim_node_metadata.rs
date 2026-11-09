@@ -4,6 +4,7 @@ use super::*;
 
 #[path = "reclaim_node_observations.rs"]
 mod observations;
+pub(super) use observations::coverage_at;
 
 fn encode_observation(evidence: &NodeEvidence) -> Result<Vec<u8>> {
     let raw = serde_json::to_vec(evidence).map_err(cache)?;
@@ -54,6 +55,9 @@ struct NodeEvidence {
 }
 
 impl ReclaimNodeMetadata {
+    pub(super) fn source_object(&self) -> &Object {
+        &self.0.source
+    }
     pub fn source_uid(&self) -> u64 {
         self.0.source.uid
     }
@@ -71,7 +75,7 @@ impl ReclaimNodeMetadata {
     }
 }
 
-fn attributes_of(entry: &IndexEntry) -> Result<NodeAttributes> {
+pub(super) fn attributes_of(entry: &IndexEntry) -> Result<NodeAttributes> {
     // Shared with the raw LTFS staging kernel: reject invalid copied values
     // and incomplete/non-metadata nodes even if both sides compare equal.
     entry.validate_reclaimed_metadata().map_err(cache)?;
@@ -90,8 +94,35 @@ fn attributes_of(entry: &IndexEntry) -> Result<NodeAttributes> {
     }
 }
 
+/// The EE internal-directory marker is physical location ownership, not a
+/// user attribute. Only the physical root data directory owns it; creating
+/// that archive root stamps it, nesting an old one drops it. All other
+/// attributes remain exact.
+pub(super) fn relocation_source(entry: &IndexEntry, destination: &str) -> Result<IndexEntry> {
+    attributes_of(entry)?;
+    let mut relocated = entry.clone();
+    let destination = destination.strip_prefix('/').unwrap_or(destination);
+    match &mut relocated {
+        IndexEntry::Directory { path, node } => {
+            let owned = ee_internal::require_location(&node.xattrs, path, NodeKind::Directory)?;
+            if destination == ee_internal::DIRECTORY {
+                node.xattrs = ee_internal::stamp(&node.xattrs)?;
+            } else if owned {
+                node.xattrs.retain(|attr| attr.key != ee_internal::MARKER);
+            }
+            *path = destination.into();
+        }
+        IndexEntry::File { path, .. } => *path = destination.into(),
+    }
+    Ok(relocated)
+}
+
 fn require_metadata(before: &IndexEntry, after: &IndexEntry) -> Result<[u8; 32]> {
-    let source = attributes_of(before)?;
+    let destination = match after {
+        IndexEntry::Directory { path, .. } | IndexEntry::File { path, .. } => path,
+    };
+    let relocated = relocation_source(before, destination)?;
+    let source = attributes_of(&relocated)?;
     let target = attributes_of(after)?;
     match (before, after) {
         (IndexEntry::Directory { .. }, IndexEntry::Directory { .. }) => {}

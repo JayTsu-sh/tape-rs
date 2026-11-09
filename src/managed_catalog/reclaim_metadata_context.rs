@@ -3,28 +3,58 @@
 use super::*;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct Context {
-    file: ReclaimFile,
-    epoch: u64,
-    request: [u8; 32],
+#[serde(untagged, deny_unknown_fields)]
+pub(super) enum Context {
+    File {
+        file: ReclaimFile,
+        epoch: u64,
+        request: [u8; 32],
+    },
+    Raw {
+        raw: Box<raw_read::ReadFact>,
+    },
+    Node {
+        node: bool,
+    },
 }
 
+/* Original file context remains an immutable child binding. Raw directory/link
+ * work binds its sealed source node directly through the plan instead. */
 impl Context {
-    pub(super) fn validate(&self) -> Result<()> {
-        self.file.validate()?;
-        if self.epoch == 0 {
-            return Err(CatalogError::Corrupt("元数据恢复缺少原子请求 epoch"));
-        }
-        Ok(())
+    pub(super) fn is_node(&self) -> bool {
+        matches!(self, Self::Node { .. })
     }
-
+    pub(super) fn is_source_based(&self) -> bool {
+        matches!(self, Self::Node { .. } | Self::Raw { .. })
+    }
+    pub(super) fn require_plan(&self, plan: &ReclaimMetadataPlan) -> Result<()> {
+        self.validate()?;
+        match self {
+            Self::Raw { raw } => raw.require_plan(plan),
+            Self::Node { .. } if plan.is_node_metadata() && !plan.is_raw_body() => Ok(()),
+            Self::File { .. } if !plan.is_source_based() => Ok(()),
+            _ => Err(CatalogError::Corrupt("原始元数据上下文与计划种类不同")),
+        }
+    }
+    pub(super) fn node() -> Self {
+        Self::Node { node: true }
+    }
+    pub(super) fn validate(&self) -> Result<()> {
+        match self {
+            Self::Node { node: true } => Ok(()),
+            Self::Raw { raw } => raw.validate(),
+            Self::File { file, epoch, .. } if *epoch > 0 => file.validate(),
+            _ => Err(CatalogError::Corrupt(
+                "原始元数据上下文类型或子请求代次无效",
+            )),
+        }
+    }
     pub(super) fn new(
         reservation: &ReclaimReservation,
         file: &ReclaimFile,
         request: &ActiveFileRequest,
     ) -> Result<Self> {
-        let value = Self {
+        let value = Self::File {
             file: file.clone(),
             epoch: request.request_epoch,
             request: request.fingerprint(),
@@ -32,7 +62,6 @@ impl Context {
         value.require(reservation, file, request)?;
         Ok(value)
     }
-
     pub(super) fn require(
         &self,
         reservation: &ReclaimReservation,
@@ -42,9 +71,17 @@ impl Context {
         self.validate()?;
         file.validate()?;
         request.validate()?;
-        if self.file != *file
-            || self.epoch != request.request_epoch
-            || self.request != request.fingerprint()
+        let Self::File {
+            file: original,
+            epoch,
+            request: fingerprint,
+        } = self
+        else {
+            return Err(CatalogError::Invalid("原始节点任务没有文件子请求上下文"));
+        };
+        if original != file
+            || *epoch != request.request_epoch
+            || *fingerprint != request.fingerprint()
             || request.namespace != reservation.namespace()
             || request.library_serial != reservation.serial()
             || request.pool_id != Some(reservation.spec().pool)
@@ -56,14 +93,13 @@ impl Context {
         {
             return Err(CatalogError::Invalid("元数据恢复改变原文件或封存子请求"));
         }
-        // Apply the same pool-relative path limits as the original request.
         pool_catalog_path(reservation.spec().pool, file.path().as_bytes())?;
         Ok(())
     }
 }
 
 // Read an already claimed original handle; this never changes ownership.
-async fn claimed_task_at(
+pub(super) async fn claimed_task_at(
     tr: &Transaction,
     reservation: &ReclaimReservation,
     owner: u64,
@@ -84,7 +120,7 @@ async fn claimed_task_at(
     Ok(task)
 }
 
-async fn original_context_at(
+pub(super) async fn original_context_at(
     tr: &Transaction,
     reservation: &ReclaimReservation,
     owner: u64,
@@ -92,31 +128,103 @@ async fn original_context_at(
 ) -> Result<(ReclaimFile, ActiveFileRequest)> {
     let context = &task.0.context;
     context.validate()?;
+    let Context::File { file, epoch, .. } = context else {
+        return Err(CatalogError::Invalid("原始节点任务没有正文子请求"));
+    };
     let (intent, _) = children::child_at(
         tr,
         reservation.namespace(),
         reservation.spec().pool,
-        context.epoch,
-        context.file.operation(),
+        *epoch,
+        file.operation(),
         owner,
     )
     .await?
     .ok_or(CatalogError::Incomplete)?;
     let request = intent.request();
-    context.require(reservation, &context.file, &request)?;
-    input_at(
+    context.require(reservation, file, &request)?;
+    input_at(tr, reservation, owner, file, &request, &task.plan()).await?;
+    Ok((file.clone(), request))
+}
+
+pub(super) async fn input_for_task_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    owner: u64,
+    task: &ReclaimMetadataWrite,
+) -> Result<Option<ReclaimMetadataInput>> {
+    input_for_plan_at(tr, reservation, owner, &task.0.context, &task.plan()).await
+}
+
+pub(super) async fn input_for_plan_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    owner: u64,
+    context: &Context,
+    plan: &ReclaimMetadataPlan,
+) -> Result<Option<ReclaimMetadataInput>> {
+    context.require_plan(plan)?;
+    if let Context::Raw { raw } = context {
+        raw.require_at(tr, reservation, plan).await?;
+        return Ok(None);
+    }
+    if context.is_node() {
+        let (_, index) = source_state_at(tr, reservation).await?;
+        let mut head = Vec::new();
+        active_volume::encode_index(&mut head, index);
+        let manifest = ledger::require_complete_at(tr, reservation).await?;
+        if !plan.is_node_metadata()
+            || head != plan.0.source_index
+            || plan.0.inventory != manifest.summary.digest
+            || tr
+                .get(&ledger::object_key(reservation, plan.source_uid()), false)
+                .await?
+                .as_deref()
+                != Some(plan.0.source.encode()?.as_slice())
+        {
+            return Err(CatalogError::Corrupt("原始节点任务与封存来源或类型不同"));
+        }
+        return Ok(None);
+    }
+    let Context::File { file, epoch, .. } = context else {
+        unreachable!()
+    };
+    let (intent, _) = children::child_at(
         tr,
-        reservation,
+        reservation.namespace(),
+        reservation.spec().pool,
+        *epoch,
+        file.operation(),
         owner,
-        &context.file,
-        &request,
-        &task.plan(),
     )
-    .await?;
-    Ok((context.file.clone(), request))
+    .await?
+    .ok_or(CatalogError::Incomplete)?;
+    let request = intent.request();
+    context.require(reservation, file, &request)?;
+    input_at(tr, reservation, owner, file, &request, plan)
+        .await
+        .map(Some)
 }
 
 impl ManagedCatalog {
+    /// Original file inputs for parent scheduling, including a retained
+    /// resolution. Restoring facts does not admit or retry any device command.
+    pub async fn reclaim_metadata_file_context(
+        &self,
+        reservation: &ReclaimReservation,
+        owner: u64,
+        original: &ReclaimMetadataWrite,
+    ) -> Result<Option<(ReclaimFile, ActiveFileRequest)>> {
+        let tr = self.db.create_trx()?;
+        let task = claimed_task_at(&tr, reservation, owner, original).await?;
+        if task.0.context.is_source_based() {
+            return Ok(None);
+        }
+        original_context_at(&tr, reservation, owner, &task)
+            .await
+            .map(Some)
+    }
+
     /// Recover only the exact active attempt after explicit owner claiming.
     /// All arguments and retained input proofs are checked at one read version;
     /// no namespace walk, checkpoint mutation, request admission or CDB occurs.

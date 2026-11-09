@@ -21,6 +21,22 @@ pub struct ReclaimFile {
     operation: String,
 }
 impl ReclaimFile {
+    pub(super) fn successor(&self, operation: Uuid) -> Self {
+        let mut next = self.clone();
+        next.operation = operation.to_string();
+        next
+    }
+    pub(super) fn from_request(request: &ActiveFileRequest) -> Result<Self> {
+        let file = Self {
+            path: request.ltfs_path()?,
+            file: request.file_id.to_string(),
+            version: request.expected_version.ok_or(CatalogError::Incomplete)?,
+            size: request.expected_size,
+            operation: request.operation_id.to_string(),
+        };
+        file.validate()?;
+        Ok(file)
+    }
     pub(super) fn validate(&self) -> Result<()> {
         uuid(&self.file)?;
         uuid(&self.operation)?;
@@ -79,7 +95,7 @@ fn uuid(text: &str) -> Result<Uuid> {
         .filter(|id| !id.is_nil() && id.to_string() == text)
         .ok_or(CatalogError::Corrupt("回收扫描 UUID"))
 }
-fn state_key(reservation: &ReclaimReservation) -> Vec<u8> {
+pub(super) fn state_key(reservation: &ReclaimReservation) -> Vec<u8> {
     let mut key = reservation.journal_key();
     // Separate row, sharing the immutable parent operation suffix.
     let kind = domain(reservation.namespace(), b'j').len() - 1;
@@ -154,6 +170,7 @@ pub(super) async fn clear_reserved_at(
         return Err(CatalogError::PoolBusy);
     }
     children::require_no_children_at(tr, reservation).await?;
+    upload_retry::clear_reserved_at(tr, reservation, state.current()).await?;
     tr.clear(&state_key(reservation));
     Ok(())
 }
@@ -170,7 +187,7 @@ fn path(stack: &[Frame]) -> String {
             .join("/")
     )
 }
-fn encode(state: &ReclaimWalk) -> Result<Vec<u8>> {
+pub(super) fn encode(state: &ReclaimWalk) -> Result<Vec<u8>> {
     let raw = serde_json::to_vec(state).map_err(|_| CatalogError::Corrupt("回收扫描编码"))?;
     if raw.len() > 90_000 {
         return Err(CatalogError::Invalid("回收扫描检查点过大"));
@@ -234,6 +251,55 @@ async fn state_at(tr: &Transaction, reservation: &ReclaimReservation) -> Result<
     Ok(state)
 }
 
+/// Prepare the same logical-walk checkpoint for a zero-data native link.
+/// The caller atomically publishes/retire its exact copies with these bytes.
+pub(super) async fn finish_native_link_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    file: &ReclaimFile,
+) -> Result<(ReclaimWalk, Vec<u8>, Vec<u8>)> {
+    let mut state = state_at(tr, reservation).await?;
+    upload_retry::identity_at(tr, reservation, file).await?;
+    if file.size() != 0 || state.current.as_ref() != Some(file) {
+        return Err(CatalogError::Invalid("原生链接迁移不是原扫描检查点"));
+    }
+    state.copied_files = state
+        .copied_files
+        .checked_add(1)
+        .ok_or(CatalogError::Invalid("回收文件计数溢出"))?;
+    state.current = None;
+    let raw = encode(&state)?;
+    Ok((state, state_key(reservation), raw))
+}
+pub(super) async fn current_state_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+) -> Result<ReclaimWalk> {
+    state_at(tr, reservation).await
+}
+
+pub(super) async fn replace_cancelled_at(
+    tr: &Transaction,
+    parent: &ReclaimReservation,
+    original: &ReclaimFile,
+    successor: &ReclaimFile,
+) -> Result<Vec<u8>> {
+    let mut state = state_at(tr, parent).await?;
+    if state.current.as_ref() != Some(original)
+        || original.successor(successor.operation()) != *successor
+        || tr
+            .get(&verification_key(parent, original), false)
+            .await?
+            .is_some()
+    {
+        return Err(CatalogError::Invalid(
+            "取消后继必须替换尚未验证的原扫描文件",
+        ));
+    }
+    state.current = Some(successor.clone());
+    encode(&state)
+}
+
 impl ManagedCatalog {
     /// Advance at most one merged directory row or one stack-pop per call.
     /// A selected source remains current until its verified child is recorded.
@@ -253,6 +319,9 @@ impl ManagedCatalog {
                         }
                         let mut state = state_at(&tr, reservation).await?;
                         if state.current.is_some() || state.complete {
+                            if let Some(file) = state.current() {
+                                upload_retry::identity_at(&tr, reservation, file).await?;
+                            }
                             return Ok(state);
                         }
                         let frame = state.stack.last().expect("nonempty unfinished stack");
@@ -329,6 +398,14 @@ impl ManagedCatalog {
                             }
                         }
                         let raw = encode(&state)?;
+                        let root = if let Some(file) = state.current() {
+                            Some(upload_retry::prepare_root_at(&tr, reservation, file).await?)
+                        } else {
+                            None
+                        };
+                        if let Some((key, value)) = root {
+                            tr.set(&key, &value);
+                        }
                         tr.set(&state_key(reservation), &raw);
                         Ok(state)
                     }
@@ -336,6 +413,35 @@ impl ManagedCatalog {
                 )
             })
             .await?
+    }
+
+    /// Restore an original child after its walk cursor advanced. Never resolve
+    /// a current namespace path to reconstruct historical recovery arguments.
+    pub async fn reclaim_original_file(
+        &self,
+        reservation: &ReclaimReservation,
+        owner: u64,
+        request: &ActiveFileRequest,
+    ) -> Result<ReclaimFile> {
+        let tr = self.db.create_trx()?;
+        let parent = record_at(&tr, reservation, owner).await?;
+        if parent["owner_epoch"] != owner {
+            return Err(CatalogError::OwnerFenced);
+        }
+        let (intent, _) = children::child_at(
+            &tr,
+            reservation.namespace(),
+            reservation.spec().pool(),
+            request.request_epoch,
+            request.operation_id,
+            owner,
+        )
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+        if intent.request() != *request {
+            return Err(CatalogError::Invalid("恢复文件必须复用完整原子请求"));
+        }
+        ReclaimFile::from_request(request)
     }
 
     /// Record the exact destination returned by a checked physical read. This
@@ -353,6 +459,7 @@ impl ManagedCatalog {
             let parent=record_at(&tr,reservation,owner).await?;
             if parent["owner_epoch"]!=owner {return Err(CatalogError::OwnerFenced);}
             children::require_request_identity_at(&tr,request,owner).await?;
+            upload_recovery::require_child_idle_at(&tr,reservation,request).await?;
             if file.operation()!=request.operation_id || file.file_id()!=request.file_id
                 || Some(file.version)!=request.expected_version || file.path!=request.ltfs_path()?
                 || file.size!=request.expected_size {

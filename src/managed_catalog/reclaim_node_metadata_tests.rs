@@ -370,3 +370,81 @@ fn node_metadata_rejects_changed_attributes_type_and_ee_alias_as_a_native_link()
         );
     }
 }
+
+#[test]
+fn relocated_ee_directory_normalizes_only_its_location_ownership_marker() {
+    let meta = crate::ltfs::index::LtfsIndex::empty(Uuid::new_v4(), "reclaim-test".into(), 'b')
+        .root
+        .meta;
+    let mut source = IndexEntry::Directory {
+        path: ee_internal::DIRECTORY.into(),
+        node: DirectoryNode {
+            name: ee_internal::DIRECTORY.into(),
+            meta: crate::ltfs::index::NodeMeta {
+                file_uid: 9,
+                readonly: true,
+                ..meta.clone()
+            },
+            xattrs: ee_internal::stamp(&[attr()]).unwrap(),
+            ..Default::default()
+        },
+    };
+    for destination in [
+        "archive/old-data",
+        "/archive/old-data",
+        ".LTFSEE_DATA",
+        "/.LTFSEE_DATA",
+    ] {
+        let relocated = relocation_source(&source, destination).unwrap();
+        let actual = relocated.reclaimed_metadata_node(destination, 20).unwrap();
+        require_metadata(&source, &actual).unwrap();
+        let IndexEntry::Directory { node, .. } = &actual else {
+            panic!("directory")
+        };
+        assert_eq!(
+            node.xattrs
+                .iter()
+                .filter(|a| a.key != ee_internal::MARKER)
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![attr()]
+        );
+        assert_eq!(
+            ee_internal::declared(&node.xattrs).unwrap(),
+            destination.trim_start_matches('/') == ee_internal::DIRECTORY
+        );
+        let mut wrong = actual.clone();
+        let IndexEntry::Directory { node, .. } = &mut wrong else {
+            unreachable!()
+        };
+        node.xattrs.retain(|a| a.key != "user.binary");
+        assert!(
+            require_metadata(&source, &wrong).is_err(),
+            "用户属性不能因内部标记规范化被丢失"
+        );
+    }
+    let IndexEntry::Directory { path, .. } = &mut source else {
+        unreachable!()
+    };
+    *path = "other/.LTFSEE_DATA".into();
+    assert!(
+        relocation_source(&source, "archive/old-data").is_err(),
+        "原始错误位置标记不能借迁移洗白"
+    );
+    let root = IndexEntry::Directory {
+        path: "".into(),
+        node: DirectoryNode {
+            meta: crate::ltfs::index::NodeMeta {
+                file_uid: 1,
+                ..meta
+            },
+            xattrs: vec![attr()],
+            ..Default::default()
+        },
+    };
+    let relocated = relocation_source(&root, ".LTFSEE_DATA").unwrap();
+    let actual = relocated
+        .reclaimed_metadata_node(".LTFSEE_DATA", 21)
+        .unwrap();
+    require_metadata(&root, &actual).unwrap();
+}

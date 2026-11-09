@@ -57,7 +57,7 @@ impl ReclaimDataProgress {
     }
 }
 
-fn body_key(reservation: &ReclaimReservation, uid: u64) -> Vec<u8> {
+pub(super) fn body_key(reservation: &ReclaimReservation, uid: u64) -> Vec<u8> {
     let mut key = ledger::own_key(reservation, b'b');
     key.extend_from_slice(&uid.to_be_bytes());
     key

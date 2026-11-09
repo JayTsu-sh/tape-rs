@@ -117,6 +117,45 @@ fn retirement(
     })
 }
 
+pub(in crate::managed_catalog) async fn require_retirement_at(
+    tr: &Transaction,
+    serial: &str,
+    retired: &retired_nodes::NodeRetirement,
+    copy_id: Uuid,
+    copy: &PhysicalCopy,
+) -> Result<()> {
+    let window = management::window(tr, retired.namespace).await?;
+    if retired.management_epoch > window.accepting {
+        return Err(CatalogError::Corrupt("删除历史超前于已开放的管理代次"));
+    }
+    if let Some(raw) = tr
+        .get(
+            &key(
+                retired.namespace,
+                serial,
+                retired.management_epoch,
+                retired.operation,
+            ),
+            false,
+        )
+        .await?
+    {
+        let value = decode(&raw)?;
+        if value.attempt.library != serial || retirement(&value, digest(&raw))? != *retired {
+            return Err(CatalogError::Corrupt("删除历史与原独立发布结果不符"));
+        }
+        let (original_id, original) = value.previous_copy().ok_or(CatalogError::Incomplete)?;
+        if (copy_id == original_id && copy != original)
+            || (copy.version == original.version && copy.size != original.size)
+        {
+            return Err(CatalogError::Corrupt("删除旧副本与原发布的物理输入不符"));
+        }
+    } else if retired.management_epoch >= window.first_retained {
+        return Err(CatalogError::Corrupt("保留代次内的删除历史缺少原发布结果"));
+    }
+    Ok(())
+}
+
 fn encode(value: &NodeMutationDeletion) -> Result<Vec<u8>> {
     let before = value.attempt.previous;
     if value.current.volume_uuid != before.volume_uuid

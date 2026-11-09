@@ -2,14 +2,34 @@
 //! Once admitted, unknown media results retain the original plan and claims.
 use super::*;
 use metadata_plan::Plan;
+#[path = "reclaim_metadata_checkpoint.rs"]
+mod checkpoint;
 #[path = "reclaim_metadata_context.rs"]
 mod context;
 #[path = "reclaim_metadata_discard_intent.rs"]
 mod discard_intent;
+#[path = "reclaim_metadata_donor.rs"]
+mod donor;
+pub use checkpoint::ReclaimMetadataCheckpointEvidence;
+pub use donor::{ReclaimMetadataDonorContext, ReclaimMetadataDonorEvidence};
+#[path = "reclaim_metadata_resolution.rs"]
+mod resolution;
+pub use resolution::{
+    ReclaimMetadataRecoveryEvidence, ReclaimMetadataRecoveryKind, ReclaimMetadataResolution,
+};
+pub(in crate::managed_catalog) use resolution::{
+    require_committed_history_at as require_resolution_commit_at,
+    require_history_at as require_resolution_at,
+};
 #[path = "reclaim_metadata_publication.rs"]
 mod publication;
 #[path = "reclaim_metadata_registry.rs"]
 mod registry;
+#[path = "reclaim_metadata_replan.rs"]
+mod replan;
+#[path = "reclaim_metadata_source_replan.rs"]
+mod source_replan;
+pub use source_replan::{ReclaimMetadataSourceReplanContext, ReclaimMetadataSourceReplanEvidence};
 #[path = "reclaim_metadata_retry.rs"]
 mod retry;
 #[path = "reclaim_metadata_unwritten.rs"]
@@ -23,6 +43,8 @@ enum Phase {
     Prepared,
     Writing,
     Discarding,
+    Checkpointing,
+    Resolved,
     Closed,
     Committed,
 }
@@ -33,12 +55,14 @@ struct Record {
     version: u8,
     id: String,
     first: String,
+    plan_origin: String,
     previous: Option<String>,
     scan: String,
     plan: Plan,
     context: context::Context,
     owner: u64,
     phase: Phase,
+    recovery_epoch: u64,
     observation: Option<Vec<u8>>,
 }
 
@@ -53,6 +77,9 @@ impl ReclaimMetadataWrite {
     pub fn first_attempt(&self) -> Uuid {
         Uuid::parse_str(&self.0.first).expect("validated first attempt")
     }
+    pub fn plan_origin(&self) -> Uuid {
+        Uuid::parse_str(&self.0.plan_origin).expect("validated plan origin")
+    }
     pub fn previous_attempt(&self) -> Option<Uuid> {
         self.0
             .previous
@@ -65,6 +92,32 @@ impl ReclaimMetadataWrite {
     pub fn plan(&self) -> ReclaimMetadataPlan {
         ReclaimMetadataPlan(self.0.plan.clone())
     }
+    pub(crate) fn replan_source(
+        &self,
+        reservation: &ReclaimReservation,
+        inventory: &ReclaimSourceInventory<'_>,
+        target: &CapturedIndexSource,
+        label: &crate::ltfs::label::LtfsLabel,
+    ) -> Result<ReclaimMetadataPlan> {
+        self.0.context.require_plan(&self.plan())?;
+        match &self.0.context {
+            context::Context::Raw { raw } => {
+                inventory.plan_raw_body_at(reservation, raw, target, label, self.plan().path())
+            }
+            context::Context::Node { .. } => inventory.plan_reclaimed_node(
+                reservation,
+                &ReclaimSourceNode(self.plan().0.source),
+                target,
+                self.plan().path(),
+            ),
+            _ => Err(CatalogError::Invalid(
+                "正文 donor 计划需要实际 donor 重新规划",
+            )),
+        }
+    }
+    pub fn recovery_epoch(&self) -> u64 {
+        self.0.recovery_epoch
+    }
     pub fn owner(&self) -> u64 {
         self.0.owner
     }
@@ -73,6 +126,15 @@ impl ReclaimMetadataWrite {
     }
     pub fn discarding(&self) -> bool {
         self.0.phase == Phase::Discarding
+    }
+    pub fn checkpointing(&self) -> bool {
+        self.0.phase == Phase::Checkpointing
+    }
+    pub(crate) fn recovering(&self) -> bool {
+        self.discarding() || self.checkpointing()
+    }
+    pub fn resolved(&self) -> bool {
+        self.0.phase == Phase::Resolved
     }
     pub fn closed(&self) -> bool {
         self.0.phase == Phase::Closed
@@ -83,7 +145,7 @@ impl ReclaimMetadataWrite {
     fn holds_claim(&self) -> bool {
         matches!(
             self.0.phase,
-            Phase::Prepared | Phase::Writing | Phase::Discarding
+            Phase::Prepared | Phase::Writing | Phase::Discarding | Phase::Checkpointing
         )
     }
     /// Retained snapshot evidence, never permission to replay or release claims.
@@ -97,9 +159,14 @@ impl ReclaimMetadataWrite {
     fn encode(&self) -> Result<Vec<u8>> {
         self.plan().encode()?;
         self.0.context.validate()?;
+        self.0.context.require_plan(&self.plan())?;
         node_mutation::id(&self.0.id)?;
         node_mutation::id(&self.0.scan)?;
         let first = node_mutation::id(&self.0.first)?;
+        let origin = node_mutation::id(&self.0.plan_origin)?;
+        if self.0.previous.is_none() && origin != self.id() {
+            return Err(CatalogError::Corrupt("首次元数据尝试的计划来源不同"));
+        }
         if self.0.previous.is_none() != (first == self.id()) {
             return Err(CatalogError::Corrupt("元数据首次尝试与前身身份不一致"));
         }
@@ -111,7 +178,8 @@ impl ReclaimMetadataWrite {
         if let Some(observed) = self.observation()?
             && !(self.writing()
                 || self.completed()
-                || (self.closed() || self.discarding())
+                || self.resolved()
+                || (self.closed() || self.recovering())
                     && observed.kind() == ReclaimMetadataObservationKind::Unchanged)
         {
             return Err(CatalogError::Corrupt("未开写任务不能保留介质结果观察"));
@@ -123,7 +191,11 @@ impl ReclaimMetadataWrite {
         {
             return Err(CatalogError::Corrupt("已发布元数据任务缺少原提交观察"));
         }
-        if self.0.version != 5 || self.0.owner == 0 || self.0.owner > 0xFFFF_FFFF_FFFF {
+        if self.0.version != 7
+            || (self.recovering() || self.resolved()) != (self.0.recovery_epoch > 0)
+            || self.0.owner == 0
+            || self.0.owner > 0xFFFF_FFFF_FFFF
+        {
             return Err(CatalogError::Corrupt("回收元数据任务版本或 owner 无效"));
         }
         let raw = serde_json::to_vec(&self.0).map_err(cache)?;
@@ -170,7 +242,9 @@ fn require_phase_history(
         || original.0.scan != current.0.scan
         || original.0.previous != current.0.previous
         || original.0.first != current.0.first
+        || original.0.plan_origin != current.0.plan_origin
         || original.0.context != current.0.context
+        || original.0.recovery_epoch > current.0.recovery_epoch
     {
         return Err(CatalogError::Corrupt(
             "回收元数据任务改变原物理尝试或扫描身份",
@@ -179,7 +253,13 @@ fn require_phase_history(
     if original.0.phase != Phase::Prepared
         && original.0.phase != current.0.phase
         && !(original.writing()
-            && (current.completed() || current.closed() || current.discarding()))
+            && (current.completed()
+                || current.closed()
+                || current.recovering()
+                || current.resolved()))
+        && !(original.recovering()
+            && (current.resolved()
+                || current.recovering() && original.recovery_epoch() < current.recovery_epoch()))
     {
         return Err(CatalogError::Corrupt("回收元数据阶段与原回执冲突"));
     }
@@ -240,7 +320,13 @@ pub(in super::super) async fn require_idle_at(
 }
 
 async fn parent_at(tr: &Transaction, reservation: &ReclaimReservation, owner: u64) -> Result<()> {
-    if record_at(tr, reservation, owner).await?["owner_epoch"] != owner {
+    let parent = record_at(tr, reservation, owner).await?;
+    if parent["phase"] == "reformatting" {
+        return Err(CatalogError::Invalid(
+            "源卷已进入原持久格式化阶段，不能再写迁移元数据",
+        ));
+    }
+    if parent["owner_epoch"] != owner {
         return Err(CatalogError::OwnerFenced);
     }
     Ok(())
@@ -339,6 +425,7 @@ async fn load_id_at(
     if task.completed() {
         Box::pin(publication::require_task_at(tr, reservation, &task)).await?;
     }
+    Box::pin(resolution::require_state_at(tr, reservation, &task)).await?;
     Ok(Some(task))
 }
 
@@ -391,6 +478,74 @@ async fn input_at(
     Ok(input)
 }
 
+// Coverage accepts only the original raw node's committed outcome. A Discard,
+// Checkpoint or merely successful body upload cannot cover its attributes.
+pub(super) async fn coverage_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    owner: u64,
+    uid: u64,
+    id: Uuid,
+) -> Result<Object> {
+    let (plan, _, _) = destination_at(tr, reservation, owner, uid, id).await?;
+    if plan.0.source.kind != ReclaimSourceNodeKind::File && !plan.is_raw_body() {
+        return Err(CatalogError::Invalid("原始文件覆盖要求普通文件任务"));
+    }
+    Ok(plan.0.source)
+}
+
+pub(super) async fn destination_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    owner: u64,
+    uid: u64,
+    id: Uuid,
+) -> Result<(ReclaimMetadataPlan, Uuid, ActiveIndexIdentity)> {
+    parent_at(tr, reservation, owner).await?;
+    let task = load_id_at(tr, reservation, uid, id)
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+    if task.owner() > owner {
+        return Err(CatalogError::OwnerFenced);
+    }
+    context::input_for_task_at(tr, reservation, owner, &task).await?;
+    let index = if task.completed() {
+        publication::require_task_at(tr, reservation, &task)
+            .await?
+            .observation()
+            .current()
+    } else if task.resolved() {
+        let result = resolution::require_task_at(tr, reservation, &task).await?;
+        if result.kind() != ReclaimMetadataRecoveryKind::Committed {
+            return Err(CatalogError::Incomplete);
+        }
+        result.current()
+    } else {
+        return Err(CatalogError::Incomplete);
+    };
+    let plan = task.plan();
+    let placement = verified_placement(tr, plan.volume())
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+    let assignment =
+        ManagedCatalog::verified_assignment(tr, reservation.serial(), &placement.barcode)
+            .await?
+            .ok_or(CatalogError::Incomplete)?;
+    let (scan, head) = active_volume::observed_at(tr, reservation.serial(), plan.volume()).await?;
+    if placement.namespace != reservation.namespace()
+        || placement.pool_id != reservation.spec().pool
+        || placement.library_serial != reservation.serial()
+        || assignment.volume_id != Some(plan.volume())
+        || !assignment.allows_io()
+        || scan.id != task.scan_id()
+        || head.generation < index.generation
+        || head.generation == index.generation && head != index
+    {
+        return Err(CatalogError::Invalid("原始文件覆盖的目的卷或索引链改变"));
+    }
+    Ok((plan, task.scan_id(), index))
+}
+
 async fn target_at(
     tr: &Transaction,
     reservation: &ReclaimReservation,
@@ -409,7 +564,17 @@ async fn target_policy_at(
     input: &ReclaimMetadataInput,
     new_file: bool,
 ) -> Result<Uuid> {
-    require_pool_without_reclaim_at(tr, reservation.namespace(), reservation.spec().pool).await?;
+    target_context_policy_at(tr, reservation, plan, Some(input), new_file).await
+}
+
+async fn target_context_policy_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    plan: &ReclaimMetadataPlan,
+    input: Option<&ReclaimMetadataInput>,
+    new_file: bool,
+) -> Result<Uuid> {
+    require_parent_pool_at(tr, reservation).await?;
     let (scan, index) = active_volume::observed_at(tr, reservation.serial(), plan.volume()).await?;
     let mut encoded = Vec::new();
     active_volume::encode_index(&mut encoded, index);
@@ -419,6 +584,58 @@ async fn target_policy_at(
             "回收元数据准入时目标卷头或物理文件计数改变",
         ));
     }
+    if let Some(input) = input {
+        target_placement_policy_at(tr, reservation, input, count, new_file).await?;
+    } else {
+        let placement = verified_placement(tr, plan.volume())
+            .await?
+            .ok_or(CatalogError::Incomplete)?;
+        if !plan.is_source_based()
+            || placement.namespace != reservation.namespace()
+            || placement.pool_id != reservation.spec().pool
+            || placement.library_serial != reservation.serial()
+            || plan.volume() == reservation.spec().volume()
+        {
+            return Err(CatalogError::Invalid("原始节点目的卷改变原池或带库"));
+        }
+        target_barcode_policy_at(
+            tr,
+            reservation,
+            &placement.barcode,
+            Some(plan.volume()),
+            count,
+            new_file,
+        )
+        .await?;
+    }
+    Ok(scan.id)
+}
+
+async fn target_placement_policy_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    input: &ReclaimMetadataInput,
+    count: u64,
+    new_file: bool,
+) -> Result<()> {
+    target_barcode_policy_at(
+        tr,
+        reservation,
+        &input.destination().placement().barcode,
+        Some(input.destination().copy().volume_id),
+        count,
+        new_file,
+    )
+    .await
+}
+async fn target_barcode_policy_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    barcode: &str,
+    volume: Option<Uuid>,
+    count: u64,
+    new_file: bool,
+) -> Result<()> {
     let pool_raw = tr
         .get(
             &pool_key(reservation.namespace(), reservation.spec().pool),
@@ -430,24 +647,15 @@ async fn target_policy_at(
     if new_file && count.checked_add(1).is_none_or(|n| n > pool.file_limit) {
         return Err(CatalogError::Incomplete);
     }
-    let assignment = ManagedCatalog::verified_assignment(
-        tr,
-        reservation.serial(),
-        &input.destination().placement().barcode,
-    )
-    .await?
-    .ok_or(CatalogError::Incomplete)?;
-    if !assignment.allows_io() {
+    let assignment = ManagedCatalog::verified_assignment(tr, reservation.serial(), barcode)
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+    if !assignment.allows_io() || assignment.volume_id != volume {
         return Err(CatalogError::MediaUnavailable);
     }
-    tape_monitor::require_data_writable(
-        tr,
-        reservation.namespace(),
-        reservation.serial(),
-        &input.destination().placement().barcode,
-    )
-    .await?;
-    Ok(scan.id)
+    tape_monitor::require_data_writable(tr, reservation.namespace(), reservation.serial(), barcode)
+        .await?;
+    Ok(())
 }
 
 impl ManagedCatalog {
@@ -462,7 +670,52 @@ impl ManagedCatalog {
         plan: &ReclaimMetadataPlan,
     ) -> Result<ReclaimMetadataWrite> {
         request.validate()?;
+        let context = context::Context::new(reservation, file, request)?;
+        self.prepare_reclaim_metadata_context(reservation, owner, &context, plan)
+            .await
+    }
+
+    pub async fn prepare_reclaim_metadata_node(
+        &self,
+        reservation: &ReclaimReservation,
+        owner: u64,
+        plan: &ReclaimMetadataPlan,
+    ) -> Result<ReclaimMetadataWrite> {
+        if !plan.is_node_metadata() {
+            return Err(CatalogError::Invalid("原始节点准备要求目录或原生链接计划"));
+        }
+        self.prepare_reclaim_metadata_context(reservation, owner, &context::Context::node(), plan)
+            .await
+    }
+
+    /// Persist actual source-byte facts with the exact raw append recipe.
+    pub async fn prepare_reclaim_raw_body(
+        &self,
+        reservation: &ReclaimReservation,
+        owner: u64,
+        plan: &ReclaimMetadataPlan,
+        proof: &ReclaimRawSourceRead,
+    ) -> Result<ReclaimMetadataWrite> {
+        if proof.observed_owner() != owner {
+            return Err(CatalogError::OwnerFenced);
+        }
+        let context = context::Context::Raw {
+            raw: Box::new(proof.fact.clone()),
+        };
+        context.require_plan(plan)?;
+        self.prepare_reclaim_metadata_context(reservation, owner, &context, plan)
+            .await
+    }
+
+    async fn prepare_reclaim_metadata_context(
+        &self,
+        reservation: &ReclaimReservation,
+        owner: u64,
+        context: &context::Context,
+        plan: &ReclaimMetadataPlan,
+    ) -> Result<ReclaimMetadataWrite> {
         plan.encode()?;
+        context.require_plan(plan)?;
         if plan.0.parent != reservation.fingerprint() {
             return Err(CatalogError::Invalid("回收元数据计划不属于原父任务"));
         }
@@ -474,7 +727,8 @@ impl ManagedCatalog {
                             parent_at(&tr, reservation, owner).await?;
                             registry::read_at(&tr, reservation).await?;
                             let input =
-                                input_at(&tr, reservation, owner, file, request, plan).await?;
+                                context::input_for_plan_at(&tr, reservation, owner, context, plan)
+                                    .await?;
                             if let Some(saved) =
                                 load_at(&tr, reservation, plan.0.source.uid).await?
                             {
@@ -486,8 +740,7 @@ impl ManagedCatalog {
                                 )
                                 .await?
                                 .ok_or(CatalogError::Corrupt("元数据准备缺少原首次尝试"))?;
-                                saved.0.context.require(reservation, file, request)?;
-                                if saved.plan() != *plan {
+                                if saved.0.context != *context || saved.plan() != *plan {
                                     return Err(CatalogError::Invalid(
                                         "回收元数据重试改变固定计划",
                                     ));
@@ -500,32 +753,50 @@ impl ManagedCatalog {
                                 return Ok(saved);
                             }
                             require_idle_at(&tr, reservation).await?;
-                            let scan = target_at(&tr, reservation, plan, &input).await?;
+                            let scan = target_context_policy_at(
+                                &tr,
+                                reservation,
+                                plan,
+                                input.as_ref(),
+                                plan.added_files() > 0,
+                            )
+                            .await?;
                             native_device::require_volume_quiescent_at(
                                 &tr,
                                 reservation.namespace(),
                                 plan.volume(),
                             )
                             .await?;
-                            let context = context::Context::new(reservation, file, request)?;
                             let id = Uuid::new_v4().to_string();
                             let task = ReclaimMetadataWrite(Record {
-                                version: 5,
+                                version: 7,
                                 id: id.clone(),
-                                first: id,
+                                first: id.clone(),
+                                plan_origin: id,
                                 previous: None,
                                 scan: scan.to_string(),
                                 plan: plan.0.clone(),
-                                context,
+                                context: context.clone(),
                                 owner,
                                 phase: Phase::Prepared,
+                                recovery_epoch: 0,
                                 observation: None,
                             });
                             let raw = task.encode()?;
                             let key = task_key(reservation, &task);
                             let held = claim(reservation, &task)?;
                             let header = registry::encode(reservation, &task)?;
+                            let parent = if context.is_source_based() {
+                                let mut value = record_at(&tr, reservation, owner).await?;
+                                value["phase"] = json!("copying");
+                                Some(value.to_string())
+                            } else {
+                                None
+                            };
                             // All fallible validation/encoding precedes the first mutation.
+                            if let Some(parent) = parent {
+                                tr.set(&reservation.journal_key(), parent.as_bytes());
+                            }
                             tr.set(&key, &raw);
                             tr.set(
                                 &latest_key(reservation, plan.0.source.uid),
@@ -551,11 +822,9 @@ impl ManagedCatalog {
         &self,
         reservation: &ReclaimReservation,
         owner: u64,
-        file: &ReclaimFile,
-        request: &ActiveFileRequest,
+
         original: &ReclaimMetadataWrite,
     ) -> Result<ReclaimMetadataAdmission> {
-        request.validate()?;
         original.encode()?;
         if original.owner() != owner {
             return Err(CatalogError::OwnerFenced);
@@ -578,9 +847,13 @@ impl ManagedCatalog {
                                 return Err(CatalogError::Invalid("准入改变原回收元数据计划"));
                             }
                             require_phase_history(original, &task)?;
-                            task.0.context.require(reservation, file, request)?;
+
                             let needs_observation = match task.0.phase {
-                                Phase::Closed | Phase::Committed | Phase::Discarding => {
+                                Phase::Closed
+                                | Phase::Committed
+                                | Phase::Discarding
+                                | Phase::Checkpointing
+                                | Phase::Resolved => {
                                     return Err(CatalogError::Invalid(
                                         "已关闭、已发布或已转入修尾的元数据任务不能重新准入",
                                     ));
@@ -591,16 +864,22 @@ impl ManagedCatalog {
                             // Replays keep the same child/retirement identity;
                             // changed arguments cannot become a new plan.
                             let input =
-                                input_at(&tr, reservation, owner, file, request, &plan).await?;
+                                context::input_for_task_at(&tr, reservation, owner, &task).await?;
                             if needs_observation {
                                 return Ok(ReclaimMetadataAdmission {
                                     task,
                                     needs_observation: true,
                                 });
                             }
-                            if target_at(&tr, reservation, &plan, &input)
-                                .await?
-                                .to_string()
+                            if target_context_policy_at(
+                                &tr,
+                                reservation,
+                                &plan,
+                                input.as_ref(),
+                                plan.added_files() > 0,
+                            )
+                            .await?
+                            .to_string()
                                 != task.0.scan
                             {
                                 return Err(CatalogError::Corrupt("准入改变原元数据目标扫描"));
@@ -630,11 +909,9 @@ impl ManagedCatalog {
         &self,
         reservation: &ReclaimReservation,
         owner: u64,
-        file: &ReclaimFile,
-        request: &ActiveFileRequest,
+
         original: &ReclaimMetadataWrite,
     ) -> Result<()> {
-        request.validate()?;
         let tr = self.db.create_trx()?;
         parent_at(&tr, reservation, owner).await?;
         let plan = original.plan();
@@ -647,10 +924,16 @@ impl ManagedCatalog {
         if task != *original || !task.writing() {
             return Err(CatalogError::Invalid("设备执行改变原 Writing 任务或观察"));
         }
-        let input = input_at(&tr, reservation, owner, file, request, &plan).await?;
-        if target_at(&tr, reservation, &plan, &input)
-            .await?
-            .to_string()
+        let input = context::input_for_task_at(&tr, reservation, owner, &task).await?;
+        if target_context_policy_at(
+            &tr,
+            reservation,
+            &plan,
+            input.as_ref(),
+            plan.added_files() > 0,
+        )
+        .await?
+        .to_string()
             != task.0.scan
         {
             return Err(CatalogError::Corrupt("设备执行改变原元数据目标扫描"));
@@ -697,7 +980,7 @@ impl ManagedCatalog {
                                 return Err(CatalogError::Invalid("观察改变原回收元数据计划"));
                             }
                             require_phase_history(original, &task)?;
-                            if task.discarding() {
+                            if task.recovering() || task.resolved() {
                                 return Err(CatalogError::Invalid(
                                     "原任务已转入修尾，不能再记录普通写入观察",
                                 ));
@@ -758,6 +1041,23 @@ impl ManagedCatalog {
             .reclaim_metadata_checkpoint(reservation, owner)
             .await?
             .filter(|task| task.holds_claim()))
+    }
+
+    /// Discover a retained source task before explicitly claiming its original
+    /// handle. An older recorded owner is a fact, never execution permission.
+    pub async fn discover_reclaim_metadata_write(
+        &self,
+        reservation: &ReclaimReservation,
+        owner: u64,
+        source_uid: u64,
+    ) -> Result<Option<ReclaimMetadataWrite>> {
+        let tr = self.db.create_trx()?;
+        parent_at(&tr, reservation, owner).await?;
+        let task = load_at(&tr, reservation, source_uid).await?;
+        if task.as_ref().is_some_and(|t| t.owner() > owner) {
+            return Err(CatalogError::OwnerFenced);
+        }
+        Ok(task)
     }
 
     /// Read the retained original task. Missing/corrupt slots are never repaired.

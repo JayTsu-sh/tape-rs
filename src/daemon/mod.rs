@@ -24,6 +24,10 @@ pub mod fdb_node_media;
 #[cfg(feature = "fdb")]
 pub mod fdb_read;
 #[cfg(feature = "fdb")]
+pub mod fdb_reclaim_format;
+#[cfg(feature = "fdb")]
+pub mod fdb_reclaim_mechanics;
+#[cfg(feature = "fdb")]
 pub mod fdb_reclaim_media;
 #[cfg(feature = "fdb")]
 pub mod fdb_rename_media;

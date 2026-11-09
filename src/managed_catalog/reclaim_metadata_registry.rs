@@ -23,7 +23,7 @@ fn checksum(parent: &str, raw: &[u8]) -> [u8; 32] {
 }
 fn task_digest(task: &ReclaimMetadataWrite) -> Result<[u8; 32]> {
     let mut hash = Sha256::new();
-    hash.update(b"tape-rs/reclaim-metadata-task/5");
+    hash.update(b"tape-rs/reclaim-metadata-task/7");
     hash.update(task.encode()?);
     Ok(hash.finalize().into())
 }
@@ -73,6 +73,26 @@ pub(super) fn edge_key(reservation: &ReclaimReservation, uid: u64, previous: Uui
     key.extend_from_slice(previous.as_bytes());
     key
 }
+fn same_origin(a: &ReclaimMetadataWrite, b: &ReclaimMetadataWrite) -> bool {
+    a.0.context == b.0.context
+        && a.0.scan == b.0.scan
+        && a.0.plan.parent == b.0.plan.parent
+        && a.0.plan.inventory == b.0.plan.inventory
+        && a.0.plan.raw_body == b.0.plan.raw_body
+        && a.0.plan.source == b.0.plan.source
+        && a.0.plan.source_index == b.0.plan.source_index
+        && a.0.plan.input == b.0.plan.input
+        && a.0.plan.volume == b.0.plan.volume
+        && if a.plan().is_source_based() {
+            a.0.plan.donor.uid == b.0.plan.donor.uid
+                && a.0.plan.donor.path == b.0.plan.donor.path
+                && a.0.plan.donor.kind == b.0.plan.donor.kind
+        } else {
+            a.0.plan.donor == b.0.plan.donor
+        }
+        && a.0.plan.expected.path == b.0.plan.expected.path
+}
+
 pub(super) async fn require_previous_at(
     tr: &Transaction,
     reservation: &ReclaimReservation,
@@ -85,31 +105,95 @@ pub(super) async fn require_previous_at(
     let old = read_body_at(tr, reservation, uid, previous)
         .await?
         .ok_or(CatalogError::Corrupt("新元数据尝试缺少原已关闭前身"))?;
-    if !old.closed()
-        || old.first_attempt() != task.first_attempt()
-        || old.plan() != task.plan()
-        || old.0.context != task.0.context
-        || old.0.scan != task.0.scan
-        || tr
-            .get(&edge_key(reservation, uid, previous), false)
-            .await?
-            .as_deref()
-            != Some(task.id().as_bytes())
-    {
-        return Err(CatalogError::Corrupt("元数据后继与原关闭尝试或幂等边不同"));
+    if old.first_attempt() != task.first_attempt() || !same_origin(&old, task) {
+        return Err(CatalogError::Corrupt(
+            "元数据后继改变原来源、正文或执行上下文",
+        ));
     }
+    if old.closed() {
+        if old.plan() != task.plan()
+            || old.plan_origin() != task.plan_origin()
+            || task.plan_origin() == task.id()
+            || tr
+                .get(&edge_key(reservation, uid, previous), false)
+                .await?
+                .as_deref()
+                != Some(task.id().as_bytes())
+            || tr
+                .get(&replan::key(reservation, uid, previous), false)
+                .await?
+                .is_some()
+        {
+            return Err(CatalogError::Corrupt(
+                "同计划后继与原 Closed 尝试或唯一边不同",
+            ));
+        }
+    } else if old.resolved() {
+        Box::pin(replan::require_previous_at(tr, reservation, &old, task)).await?;
+    } else {
+        return Err(CatalogError::Corrupt("元数据后继的原尝试尚未明确结清"));
+    }
+    require_plan_origin_at(tr, reservation, task).await?;
     if previous != task.first_attempt() {
         let first = read_body_at(tr, reservation, uid, task.first_attempt())
             .await?
             .ok_or(CatalogError::Corrupt("元数据后继缺少原首次尝试"))?;
-        if !first.closed()
-            || first.first_attempt() != first.id()
-            || first.plan() != task.plan()
-            || first.0.context != task.0.context
-            || first.0.scan != task.0.scan
+        if first.first_attempt() != first.id()
+            || !same_origin(&first, task)
+            || !(first.closed() || first.resolved())
         {
-            return Err(CatalogError::Corrupt("元数据首次尝试与原后继根身份不同"));
+            return Err(CatalogError::Corrupt("元数据首次尝试与原后继来源不同"));
         }
+        if first.resolved()
+            && Box::pin(resolution::require_task_at(tr, reservation, &first))
+                .await?
+                .kind()
+                == ReclaimMetadataRecoveryKind::Committed
+        {
+            return Err(CatalogError::Corrupt(
+                "元数据首次尝试已经提交，不能另建后继",
+            ));
+        }
+    }
+    Ok(())
+}
+
+// Same-plan Closed retries inherit the immutable plan origin. Resolve that
+// one origin directly, so losing an RV proof never becomes a valid retry and
+// recovery cost remains independent of the number of intermediate attempts.
+async fn require_plan_origin_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    task: &ReclaimMetadataWrite,
+) -> Result<()> {
+    if task.plan_origin() == task.id() {
+        return Ok(());
+    }
+    let uid = task.plan().source_uid();
+    let origin = read_body_at(tr, reservation, uid, task.plan_origin())
+        .await?
+        .ok_or(CatalogError::Corrupt("元数据尝试缺少原计划来源"))?;
+    if !origin.closed()
+        || origin.plan_origin() != origin.id()
+        || origin.first_attempt() != task.first_attempt()
+        || origin.plan() != task.plan()
+        || !same_origin(&origin, task)
+    {
+        return Err(CatalogError::Corrupt("元数据重试改变原计划来源"));
+    }
+    if let Some(previous) = origin.previous_attempt() {
+        let original = read_body_at(tr, reservation, uid, previous)
+            .await?
+            .ok_or(CatalogError::Corrupt("计划来源缺少原恢复尝试"))?;
+        Box::pin(replan::require_previous_at(
+            tr,
+            reservation,
+            &original,
+            &origin,
+        ))
+        .await?;
+    } else if origin.id() != task.first_attempt() {
+        return Err(CatalogError::Corrupt("计划来源不是原首次或重新规划尝试"));
     }
     Ok(())
 }
@@ -126,6 +210,7 @@ pub(super) fn read_at<'a>(
             if requests::prefix_has_rows(tr, &ledger::own_key(reservation, b'W')).await?
                 || requests::prefix_has_rows(tr, &ledger::own_key(reservation, b'T')).await?
                 || requests::prefix_has_rows(tr, &ledger::own_key(reservation, b'U')).await?
+                || requests::prefix_has_rows(tr, &ledger::own_key(reservation, b'V')).await?
                 || tr
                     .get(&ledger::own_key(reservation, b'A'), false)
                     .await?
@@ -162,6 +247,7 @@ pub(super) fn read_at<'a>(
         if task.completed() {
             Box::pin(publication::require_task_at(tr, reservation, &task)).await?;
         }
+        Box::pin(resolution::require_state_at(tr, reservation, &task)).await?;
         Ok(Some(task))
     })
 }

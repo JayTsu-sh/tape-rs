@@ -198,11 +198,9 @@ impl ManagedCatalog {
         &self,
         reservation: &ReclaimReservation,
         owner: u64,
-        file: &ReclaimFile,
-        request: &ActiveFileRequest,
+
         original: &ReclaimMetadataWrite,
     ) -> Result<Option<ReclaimMetadataPublication>> {
-        request.validate()?;
         original.encode()?;
         let tr = self.db.create_trx()?;
         parent_at(&tr, reservation, owner).await?;
@@ -221,7 +219,7 @@ impl ManagedCatalog {
         if !task.completed() {
             return Ok(None);
         }
-        input_at(&tr, reservation, owner, file, request, &task.plan()).await?;
+        context::input_for_task_at(&tr, reservation, owner, &task).await?;
         Ok(Some(require_task_at(&tr, reservation, &task).await?))
     }
 
@@ -231,12 +229,10 @@ impl ManagedCatalog {
         &self,
         reservation: &ReclaimReservation,
         owner: u64,
-        file: &ReclaimFile,
-        request: &ActiveFileRequest,
+
         original: &ReclaimMetadataWrite,
         proof: &ReclaimMetadataCommitEvidence,
     ) -> Result<ReclaimMetadataPublication> {
-        request.validate()?;
         original.encode()?;
         let evidence = proof.require(original, owner)?;
         evidence.encode(&original.plan())?;
@@ -266,7 +262,7 @@ impl ManagedCatalog {
                             }
                             // Replays retain the original child request as well as
                             // the physical attempt; terminal state cannot bypass it.
-                            input_at(&tr, reservation, owner, file, request, &plan).await?;
+                            context::input_for_task_at(&tr, reservation, owner, &task).await?;
                             if task.completed() {
                                 return require_task_at(&tr, reservation, &task).await;
                             }

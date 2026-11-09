@@ -14,7 +14,7 @@
 |---|---|---|
 | library list/show、pool list/show、tape list/show、task list/show | 可读取已提交状态 | 查询不取得任务互斥权，不以查询返回授予设备操作权限 |
 | library rescan | 与同库 reclaim、unassign、其他 rescan 和 tape set 互斥 | 运行前持久化原任务的库占用；原任务完成后释放 |
-| tape reclaim | 与同库 rescan、unassign、其他 reclaim 和 tape set 互斥 | 原父任务持有占用，复制子任务不另建竞争任务；完整原生 reclaim 尚未开放 |
+| tape reclaim | 与同库 rescan、unassign、其他 reclaim 和 tape set 互斥 | 原父任务持有占用，复制子任务不另建竞争任务；[原生 reclaim](native-reclaim.md) 接管仍保留原占用 |
 | tape unassign | 与同库 rescan、reclaim、其他 unassign 和 tape set 互斥 | 保留既有零引用、卷静默和机械任务约束 |
 | tape set / offline | 与同库正在运行的上述任务互斥 | 纯目录修改在单个 FDB 事务中检查占用；多个纯目录提交由事务线性化 |
 
@@ -26,7 +26,7 @@
 
 ## 参数互斥
 
-EE 的 datamigrate/reclaim 规定 `-L` 与 `-S` 互斥，二者也分别与 `--use-readonly-drive` 互斥；节流选项只适用于单盘显式磁带请求。这些属于请求合法性检查，不能用任务互斥锁代替。当前原生 reclaim 尚未开放，不增加未实现选项或兼容分支；以后开放参数时，CLI 与 HTTP 必须共同校验。
+EE 的 datamigrate/reclaim 规定 `-L` 与 `-S` 互斥，二者也分别与 `--use-readonly-drive` 互斥；节流选项只适用于单盘显式磁带请求。这些属于请求合法性检查，不能用任务互斥锁代替。本项目原生 reclaim 当前仅支持显式条码、初始化确认、完成后解绑与原请求恢复；不提供未实现的 EE 调度/节流参数，CLI 与 HTTP 均拒绝未知字段或选项。
 
 ## 验收要求
 

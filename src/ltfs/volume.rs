@@ -909,11 +909,97 @@ impl<'a> LtfsVolume<'a> {
             .map_err(|error| TapeError::Catalog(error.to_string()))
     }
 
+    /// Prove the exact latest closed DP and a known incomplete IP without
+    /// changing either partition. Only the dedicated recovery goal may repair it.
+    #[cfg(feature = "fdb")]
+    pub fn reclaim_metadata_checkpoint_evidence(
+        &mut self,
+        task: &crate::managed_catalog::ReclaimMetadataWrite,
+        original: &crate::ltfs::recovery::CapturedIndexSource,
+        budget: &RecoveryBudget,
+    ) -> Result<crate::managed_catalog::ReclaimMetadataCheckpointEvidence> {
+        if self.dirty {
+            return Err(TapeError::Catalog("IP 恢复前提不能使用未提交工作树".into()));
+        }
+        let current = self.verified_recovery_index_construct()?;
+        let target = recovery::capture_dp_checkpoint_source(&self.drive, &self.label, budget)?;
+        if target.construct() != current {
+            return Err(TapeError::Catalog(
+                "IP 恢复 DP 实读与刚挂载的构造不同".into(),
+            ));
+        }
+        let opening_only = if self.recovery.ip.tail == recovery::TailKind::UnindexedData
+            && self.recovery.ip.last_index.is_none()
+            && self.recovery.ip.eod == P1_DATA_START + 1
+        {
+            self.drive.locate(0, P1_DATA_START, true)?;
+            let mut record = vec![0u8; self.block_size as usize];
+            let n = self.drive.read_block(&mut record)?;
+            let position = self.drive.read_position()?;
+            n == 0 && position.partition == 0 && position.block_number == P1_DATA_START + 1
+        } else {
+            false
+        };
+        let round = self.reservation_guard.expect("verified guard").round();
+        crate::managed_catalog::ReclaimMetadataCheckpointEvidence::from_report(
+            task,
+            round,
+            &target,
+            original,
+            &self.recovery,
+            opening_only,
+        )
+        .map_err(|error| TapeError::Catalog(error.to_string()))
+    }
+
+    /// Execute only the original goal's verified checkpoint. Full DP needs only
+    /// IP; an Incremental DP requires a new Full checkpoint on both partitions
+    /// (SNIA LTFS 2.5.1 §§5.4.3,H.1). No file or directory is added.
+    #[cfg(feature = "fdb")]
+    pub fn checkpoint_reclaim_metadata(
+        &mut self,
+        task: &crate::managed_catalog::ReclaimMetadataWrite,
+        original: &crate::ltfs::recovery::CapturedIndexSource,
+        budget: &RecoveryBudget,
+    ) -> Result<()> {
+        if !task.recovering() {
+            return Err(TapeError::Catalog("检查点写入要求原持久恢复阶段".into()));
+        }
+        let evidence = self.reclaim_metadata_checkpoint_evidence(task, original, budget)?;
+        let round = self.reservation_guard.expect("verified guard").round();
+        evidence
+            .require(task, round)
+            .map_err(|error| TapeError::Catalog(error.to_string()))?;
+        if self.recovery.dp.eod != evidence.dp_eod()
+            || self.verified_recovery_index_construct()? != evidence.current()
+        {
+            return Err(TapeError::Catalog("检查点执行改变刚核实的 DP".into()));
+        }
+        self.ensure_writable()?;
+        if evidence.current().incremental {
+            if !task.checkpointing()
+                || evidence.current()
+                    != task
+                        .plan()
+                        .previous_source()
+                        .map_err(|error| TapeError::Catalog(error.to_string()))?
+                        .head()
+            {
+                return Err(TapeError::RecoveryRestricted {
+                    reason: "原增量 DP 需要显式 Checkpointing 阶段，不能仅重写 IP".into(),
+                });
+            }
+            self.dirty = true;
+            self.commit_mode(false, true)
+        } else {
+            let result = self.checkpoint_existing();
+            self.finish_commit(result)
+        }
+    }
+
     /// Read-only precondition for journaling this exact metadata attempt's tail
-    /// Discard. Requires a fresh full-budget mount and current PR; callers still
-    /// enforce the original FDB task and Permission on every device command
-    /// from the serialized device executor. Positioning may settle already
-    /// buffered writes; this method appends no data, index or filemarks.
+    /// Discard. The serialized caller checks the original task, Permission and PR
+    /// on every command. Positioning may settle already buffered writes.
     #[cfg(feature = "fdb")]
     pub fn reclaim_metadata_tail_evidence(
         &mut self,
@@ -1582,6 +1668,119 @@ impl<'a> LtfsVolume<'a> {
         }
         self.working
             .reference_reclaimed_body(path, uid, body, source)?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Append one already planned raw body. The caller must persist Writing
+    /// before entry and independently read the destination after committing.
+    #[cfg(feature = "fdb")]
+    pub(crate) fn append_reclaimed_body<R: Read>(
+        &mut self,
+        path: &str,
+        expected: &FileNode,
+        reader: &mut R,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        let parent = path
+            .trim_start_matches('/')
+            .rsplit_once('/')
+            .map_or("", |(parent, _)| parent);
+        let name = path.rsplit('/').next().unwrap_or("");
+        let source = super::index::IndexEntry::File {
+            path: path.trim_start_matches('/').into(),
+            node: expected.clone(),
+        };
+        // This validates attributes/closure/hash syntax without copying any
+        // source address into the working tree or touching the device.
+        FileNode::reclaimed_reference(path, expected.meta.file_uid, expected, &source)?;
+        if !matches!(
+            crate::managed_catalog::ContentDigest::from_ltfs_xattrs(&expected.xattrs)
+                .map_err(|error| TapeError::Catalog(error.to_string()))?,
+            crate::managed_catalog::ContentDigest::Sha256(_)
+        ) || path.contains("//")
+        {
+            return Err(TapeError::Ltfs(
+                "原始正文追加须固定 SHA-256 和规范路径".into(),
+            ));
+        }
+        let planned = if expected.length == 0 {
+            Vec::new()
+        } else {
+            vec![Extent {
+                partition: self.label.data_partition,
+                start_block: self.p1_write_head,
+                byte_offset: 0,
+                byte_count: expected.length,
+                file_offset: 0,
+            }]
+        };
+        if self.dirty
+            || expected.meta.file_uid
+                != self
+                    .working
+                    .highest_file_uid
+                    .checked_add(1)
+                    .ok_or_else(|| TapeError::Ltfs("UID 空间耗尽".into()))?
+            || expected.name != name
+            || expected.extents != planned
+            || self.working.find_directory(parent).is_none()
+            || self.working.find_file(path).is_some()
+            || self.working.find_directory(path).is_some()
+        {
+            return Err(TapeError::Ltfs(
+                "原始正文追加缺少精确空闲卷、父目录、UID 或位置".into(),
+            ));
+        }
+        let limit = expected
+            .length
+            .checked_add(1)
+            .ok_or_else(|| TapeError::Ltfs("原始正文长度超出有界验证范围".into()))?;
+        let metadata = FileMetadata {
+            meta: expected.meta.clone(),
+            xattrs: expected.xattrs.clone(),
+        };
+        let mut input = reader.take(limit);
+        self.append_file_inner(path, &mut input, &[], Some(&metadata))?;
+        if let Err(error) = self.working.finish_reclaimed_body(path, expected) {
+            self.freeze_after_commit_failure("reclaim_data_verification", &error);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Stage one fixed raw directory or link without changing existing nodes.
+    /// The managed actor must first persist its intent; publication requires
+    /// the ordinary guarded commit and independent destination readback.
+    pub fn reference_reclaimed_node(
+        &mut self,
+        path: &str,
+        uid: u64,
+        source: &super::index::IndexEntry,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        self.working.reference_reclaimed_node(path, uid, source)?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    #[cfg(feature = "fdb")]
+    pub(crate) fn displace_reclaimed_file(
+        &mut self,
+        path: &str,
+        uid: u64,
+        archive: &str,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        let original = self
+            .index
+            .find_file(path)
+            .filter(|n| n.meta.file_uid == uid)
+            .ok_or_else(|| TapeError::Ltfs("同名节点的已提交原文件缺失".into()))?;
+        if self.working.find_file(path) != Some(original) {
+            return Err(TapeError::Ltfs("同名节点存在未提交改动".into()));
+        }
+        self.working.displace_reclaimed_file(path, uid, archive)?;
         self.dirty = true;
         Ok(())
     }
@@ -2404,6 +2603,32 @@ pub fn read_label_only(device: &dyn crate::scsi::transport::TapeTransport) -> Re
     let drive = TapeDrive::new(device);
     let label_bytes = read_single_block(&drive, 0, LABEL_BLOCK, /*max=*/ 64 * 1024)?;
     LtfsLabel::parse(&label_bytes)
+}
+
+/// Read both actual labels and compare their common fields (LTFS2.5.1
+/// §8.1.2). This grants neither repair nor write permission.
+#[cfg(feature = "fdb")]
+pub(crate) fn read_label_pair(
+    device: &dyn crate::scsi::transport::TapeTransport,
+) -> Result<LtfsLabel> {
+    let drive = TapeDrive::new(device);
+    let first = read_label_only(device)?;
+    if first.location != crate::ltfs::label::PART_INDEX
+        || first.index_partition != crate::ltfs::label::PART_INDEX
+        || first.data_partition != crate::ltfs::label::PART_DATA
+    {
+        return Err(TapeError::Ltfs("原卷标签分区映射不是 LTFS a/b 布局".into()));
+    }
+    let bytes = read_single_block(&drive, 1, LABEL_BLOCK, 64 << 10)?;
+    let mut second = LtfsLabel::parse(&bytes)?;
+    if second.location != crate::ltfs::label::PART_DATA {
+        return Err(TapeError::Ltfs("原数据分区标签 location 无效".into()));
+    }
+    second.location = first.location;
+    if second.to_xml()? != first.to_xml()? {
+        return Err(TapeError::Ltfs("两分区标签公共字段不一致".into()));
+    }
+    Ok(first)
 }
 
 /// 读 P0 label 那类"已知单块、较小"的数据。先 LOCATE，然后 read_block 一次。

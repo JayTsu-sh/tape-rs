@@ -68,6 +68,35 @@ impl Default for MkltfsOptions {
 
 /// 主入口。**破坏性操作**——会抹掉整盘磁带的内容。
 pub fn mkltfs(device: &dyn TapeTransport, opts: &MkltfsOptions) -> Result<Uuid> {
+    mkltfs_at(device, opts, None)
+}
+
+/// Deterministic same-goal empty-volume reset. The caller must persist its
+/// exact UUID/time and verify the existing two-partition medium beforehand.
+#[cfg(feature = "fdb")]
+pub(crate) fn reset_ltfs_at(
+    device: &dyn TapeTransport,
+    opts: &MkltfsOptions,
+    time: &str,
+) -> Result<Uuid> {
+    crate::ltfs::index::MetadataChange {
+        modify_time: Some(time.into()),
+        ..Default::default()
+    }
+    .validate()?;
+    if !opts.quick || opts.volume_uuid.is_none_or(|uuid| uuid.is_nil()) {
+        return Err(TapeError::Refused {
+            reason: "回收初始化须固定原 UUID 并保留原两分区布局".into(),
+        });
+    }
+    mkltfs_at(device, opts, Some(time))
+}
+
+fn mkltfs_at(
+    device: &dyn TapeTransport,
+    opts: &MkltfsOptions,
+    fixed_time: Option<&str>,
+) -> Result<Uuid> {
     if opts.volume_id.is_empty() || opts.volume_id.len() > 6 {
         return Err(TapeError::Ltfs(format!(
             "volume_id 长度非法: {}（必须 1..=6）",
@@ -108,7 +137,9 @@ pub fn mkltfs(device: &dyn TapeTransport, opts: &MkltfsOptions) -> Result<Uuid> 
 
     // 两个分区的卷标除 <location> 外必须逐字段相同（LTFS 2.5.1 §8.1.2），formattime 只取一次。
     // IBM LTFS 会比较两份卷标，不同则拒绝加载（LTFS11184E）。
-    let format_time = crate::ltfs::label::ltfs_time_now();
+    let format_time = fixed_time
+        .map(str::to_owned)
+        .unwrap_or_else(crate::ltfs::label::ltfs_time_now);
 
     // 4. 写 P0 labels + 空 index
     write_partition_prologue(
@@ -121,7 +152,7 @@ pub fn mkltfs(device: &dyn TapeTransport, opts: &MkltfsOptions) -> Result<Uuid> 
     )?;
 
     // P0 的 index XML
-    let mut p0_index = LtfsIndex::empty(volume_uuid, APP_NAME.to_string(), PART_DATA);
+    let mut p0_index = initial_empty_index(volume_uuid, fixed_time);
     p0_index.self_location = IndexLocation {
         partition: PART_INDEX,
         start_block: P0_INDEX_BLOCK,
@@ -189,6 +220,78 @@ pub fn mkltfs(device: &dyn TapeTransport, opts: &MkltfsOptions) -> Result<Uuid> 
     Ok(volume_uuid)
 }
 
+fn initial_empty_index(volume_uuid: Uuid, fixed_time: Option<&str>) -> LtfsIndex {
+    let mut p0_index = LtfsIndex::empty(volume_uuid, APP_NAME.to_string(), PART_DATA);
+    if let Some(time) = fixed_time {
+        p0_index.update_time = time.into();
+        for value in [
+            &mut p0_index.root.meta.creation_time,
+            &mut p0_index.root.meta.change_time,
+            &mut p0_index.root.meta.modify_time,
+            &mut p0_index.root.meta.access_time,
+            &mut p0_index.root.meta.backup_time,
+        ] {
+            *value = time.into();
+        }
+    }
+    p0_index
+}
+
+/// Exact record sequence for the persisted empty-volume reset recipe. None is
+/// one filemark. Only trusted empty metadata is materialized, never user data.
+#[cfg(feature = "fdb")]
+pub(crate) fn reset_partition_records(
+    opts: &MkltfsOptions,
+    time: &str,
+    partition: u8,
+) -> Result<Vec<Option<Vec<u8>>>> {
+    let uuid = opts
+        .volume_uuid
+        .filter(|uuid| !uuid.is_nil())
+        .ok_or_else(|| TapeError::Refused {
+            reason: "空卷配方缺少固定 UUID".into(),
+        })?;
+    if partition > 1 || !opts.quick {
+        return Err(TapeError::Refused {
+            reason: "空卷配方要求原生快速两分区初始化".into(),
+        });
+    }
+    let location = if partition == 0 {
+        PART_INDEX
+    } else {
+        PART_DATA
+    };
+    let mut label = LtfsLabel::new(uuid, location, opts.block_size, APP_NAME.into());
+    label.format_time = time.into();
+    label.compression = opts.compression;
+    let mut index = initial_empty_index(uuid, Some(time));
+    index.self_location = IndexLocation {
+        partition: location,
+        start_block: FIRST_INDEX_BLOCK,
+    };
+    if partition == 0 {
+        index.previous_location = Some(IndexLocation {
+            partition: PART_DATA,
+            start_block: FIRST_INDEX_BLOCK,
+        });
+    }
+    let xml = index.to_xml()?;
+    if xml.len() > opts.block_size as usize {
+        return Err(TapeError::Refused {
+            reason: "初始空索引超出单记录配方".into(),
+        });
+    }
+    Ok(vec![
+        Some(Vol1Label::encode(&opts.volume_id, &opts.owner).to_vec()),
+        None,
+        Some(label.to_xml()?.to_vec()),
+        None,
+        None,
+        Some(xml.to_vec()),
+        None,
+    ])
+}
+
 /// 写入某个 partition 的开头：VOL1 → FM → LTFS Label XML → FM。
 fn write_partition_prologue(
     drive: &TapeDrive<'_>,
@@ -249,6 +352,23 @@ fn apply_two_partition_mode(device: &dyn TapeTransport) -> Result<()> {
 }
 
 fn two_partition_parameters(current: &[u8]) -> Result<Vec<u8>> {
+    let page = partition_page(current)?;
+    let len = page.len();
+    let mut params = vec![0; 8];
+    // §6.6.1：Buffered Mode=1，Speed=0；省略 block descriptor，不改变块模式。
+    params[3] = 0x10;
+    params.extend_from_slice(&page[..len]);
+    params[8] &= 0x7f;
+    params[11] = 1;
+    params[12] = 0x38 | (params[12] & 0x07); // IDP=1，PSUM=11；保留 POFM 等位。
+    params[14] = 9; // partitioning type=0 自动选择流式；单位10^9字节。
+    params[16..].fill(0);
+    params[17] = 1;
+    params[18..20].copy_from_slice(&[0xff, 0xff]);
+    Ok(params)
+}
+
+fn partition_page(current: &[u8]) -> Result<&[u8]> {
     let invalid = || TapeError::Ltfs("MODE SENSE 分区页缺失、截断或不支持两分区".into());
     if current.len() < 8 {
         return Err(invalid());
@@ -266,18 +386,31 @@ fn two_partition_parameters(current: &[u8]) -> Result<Vec<u8>> {
     if len < 12 || len > page.len() || page[2] < 1 {
         return Err(invalid());
     }
-    let mut params = vec![0; 8];
-    // §6.6.1：Buffered Mode=1，Speed=0；省略 block descriptor，不改变块模式。
-    params[3] = 0x10;
-    params.extend_from_slice(&page[..len]);
-    params[8] &= 0x7f;
-    params[11] = 1;
-    params[12] = 0x38 | (params[12] & 0x07); // IDP=1，PSUM=11；保留 POFM 等位。
-    params[14] = 9; // partitioning type=0 自动选择流式；单位10^9字节。
-    params[16..].fill(0);
-    params[17] = 1;
-    params[18..20].copy_from_slice(&[0xff, 0xff]);
-    Ok(params)
+    Ok(&page[..len])
+}
+
+/// IBM GA32-0928-05 table339: byte3 is the number of additional
+/// partitions actually defined, distinct from maximum support in byte2.
+#[cfg(feature = "fdb")]
+pub(crate) fn require_two_partition_layout(device: &dyn TapeTransport) -> Result<()> {
+    let mut data = [0u8; 64];
+    let cdb = crate::scsi::cdb::mode_sense_10(0x11, data.len() as u16);
+    let result =
+        crate::scsi::transport::retry_unit_attention("回收读取原分区布局", || {
+            device.execute_read(&cdb, &mut data, 30_000)
+        })?;
+    let bytes = data
+        .get(..result.transferred)
+        .ok_or(TapeError::InvalidResponse {
+            expected: data.len(),
+            actual: result.transferred,
+        })?;
+    if partition_page(bytes)?[3] != 1 {
+        return Err(TapeError::Refused {
+            reason: "回收初始化只接受已定义的 LTFS 两分区布局".into(),
+        });
+    }
+    Ok(())
 }
 
 fn write_blocks(drive: &TapeDrive<'_>, data: &[u8], block_size: usize) -> Result<()> {
@@ -333,6 +466,103 @@ mod partition_tests {
             let mut bad = response.clone();
             bad[offset] = value;
             assert!(two_partition_parameters(&bad).is_err(), "offset {offset}");
+        }
+    }
+}
+
+#[cfg(all(test, feature = "fdb"))]
+mod quick_reset_tests {
+    use super::*;
+    use crate::ltfs::recovery::{RecoveryBudget, capture_index_source};
+    use crate::ltfs::volume::{LtfsVolume, read_label_pair};
+    use crate::scsi::sim::{Fault, FaultAction, SimCartridge, SimLibrary};
+    fn capture(device: &dyn TapeTransport) -> crate::ltfs::recovery::IndexSourceIdentity {
+        capture_index_source(
+            &TapeDrive::new(device),
+            &read_label_pair(device).unwrap(),
+            &RecoveryBudget::default(),
+        )
+        .unwrap()
+        .identity()
+        .unwrap()
+    }
+    #[test]
+    fn quick_reclaim_recipe_preserves_layout_and_identity_and_is_deterministic_after_interruptions()
+    {
+        let time = "2026-11-09T01:02:03.123456789Z";
+        for (opcode, after) in [
+            (0x0a, 0),
+            (0x0a, 2),
+            (0x0a, 5),
+            (0x10, 0),
+            (0x10, 3),
+            (0x10, 7),
+            (0x8d, 0),
+            (0x8d, 5),
+        ] {
+            let lib = SimLibrary::new(1, 2, 1);
+            lib.insert_cartridge(SimCartridge::blank("RSET00L8", 64 << 20), 0)
+                .unwrap();
+            lib.load_into_drive("RSET00L8", 0).unwrap();
+            let device = lib.drive(0);
+            assert!(require_two_partition_layout(&device).is_err());
+            mkltfs(
+                &device,
+                &MkltfsOptions {
+                    volume_id: "RSET00".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let medium = Mam::new(&device).read_medium_identity().unwrap();
+            let mut volume = LtfsVolume::mount(&device).unwrap();
+            volume
+                .append_bytes("old-data", b"already-relocated-and-verified-by-caller")
+                .unwrap();
+            volume.commit().unwrap();
+            drop(volume);
+            let before = device.command_log().len();
+            require_two_partition_layout(&device).unwrap();
+            let opts = MkltfsOptions {
+                volume_id: "RSET00".into(),
+                volume_uuid: Some(Uuid::new_v4()),
+                quick: true,
+                ..Default::default()
+            };
+            device.inject(Fault {
+                opcode,
+                action: FaultAction::HostError(3),
+                after,
+                remaining: 1,
+            });
+            assert!(
+                reset_ltfs_at(&device, &opts, time).is_err(),
+                "opcode={opcode:#x} after={after}"
+            );
+            device.clear_faults();
+            lib.power_cut();
+            require_two_partition_layout(&device).unwrap();
+            reset_ltfs_at(&device, &opts, time).unwrap();
+            let first = capture(&device);
+            assert_eq!(first.head().volume_uuid, opts.volume_uuid.unwrap());
+            let volume = LtfsVolume::mount(&device).unwrap();
+            assert!(volume.index().root.files.is_empty() && volume.index().root.subdirs.is_empty());
+            assert_eq!(volume.index().root.meta.modify_time, time);
+            drop(volume);
+            assert_eq!(read_label_pair(&device).unwrap().format_time, time);
+            reset_ltfs_at(&device, &opts, time).unwrap();
+            assert_eq!(
+                capture(&device),
+                first,
+                "固定时间及 UUID 的原初始化配方完全一致"
+            );
+            assert_eq!(Mam::new(&device).read_medium_identity().unwrap(), medium);
+            assert!(
+                !device.command_log()[before..]
+                    .iter()
+                    .any(|opcode| matches!(*opcode, 0x04 | 0x55)),
+                "不发送 FORMAT 或修改原分区布局"
+            );
         }
     }
 }

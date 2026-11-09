@@ -61,7 +61,17 @@ pub(super) fn xattrs(attrs: &[Xattr]) -> Result<BTreeMap<&str, (&str, bool)>> {
     Ok(result)
 }
 
+#[cfg(test)]
 fn require_attributes(source: &NodeAttributes, target: &FileNode, sha: [u8; 32]) -> Result<()> {
+    require_attributes_with_body(source, target, sha, None)
+}
+
+fn require_attributes_with_body(
+    source: &NodeAttributes,
+    target: &FileNode,
+    sha: [u8; 32],
+    body_md5: Option<[u8; 16]>,
+) -> Result<()> {
     let (expected, _) = source.data_relocation()?;
     let mut actual_meta = target.meta.clone();
     actual_meta.file_uid = expected.meta.file_uid;
@@ -93,7 +103,11 @@ fn require_attributes(source: &NodeAttributes, target: &FileNode, sha: [u8; 32])
             digest => Some(digest),
         })
     };
-    if md5(original)? != md5(&target.xattrs)? {
+    let original_md5 = md5(original)?;
+    let body_md5 = body_md5.map(ContentDigest::Md5);
+    if original_md5.is_some() && body_md5.is_some() && original_md5 != body_md5
+        || body_md5.or(original_md5) != md5(&target.xattrs)?
+    {
         return Err(CatalogError::Invalid("迁移未保留原 MD5 属性"));
     }
     for key in [XATTR_SHA256, XATTR_MD5, crate::ltfs::volume::XATTR_VERSION] {
@@ -164,6 +178,7 @@ impl ReclaimSourceInventory<'_> {
         if data_node.symlink.is_some() || data_node.length != source.size {
             return Err(CatalogError::Invalid("原数据对象类型或长度已改变"));
         }
+        let body_md5 = super::read::expected_md5(data_node)?;
         let data = Object::capture(data_entry)?;
         let logical_uid = source
             .media
@@ -223,7 +238,7 @@ impl ReclaimSourceInventory<'_> {
         if read.attributes.as_ref().map(NodeAttributes::digest) != Some(target_attrs.digest()) {
             return Err(CatalogError::Invalid("目的介质属性与 FDB 已发布属性不同"));
         }
-        require_attributes(&attrs, target_node, sha)?;
+        require_attributes_with_body(&attrs, target_node, sha, body_md5)?;
         let mut target_index = Vec::new();
         active_volume::encode_index(&mut target_index, verified_head);
         Ok(ReclaimFileMetadata(MetadataEvidence {
@@ -255,6 +270,72 @@ pub(in super::super) async fn require_no_metadata_at(
         }
     }
     Ok(())
+}
+
+/// Revalidate an already sealed EE alias without re-running the sealing
+/// transaction or its retirement mutations. The raw data node is covered
+/// separately by its full-metadata publication.
+pub(super) async fn alias_coverage_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    owner: u64,
+    file: &ReclaimFile,
+    request: &ActiveFileRequest,
+) -> Result<Object> {
+    let input = relocation::metadata_input_at(tr, reservation, owner, file, request).await?;
+    let copy = input.source().source().copy();
+    let media = copy
+        .media
+        .as_ref()
+        .filter(|m| m.ee_alias && !m.native_symlink)
+        .ok_or(CatalogError::Invalid("别名覆盖要求原 EE 别名副本"))?;
+    let mut key = ledger::own_key(reservation, b'h');
+    key.extend_from_slice(&media.logical_file_uid.to_be_bytes());
+    let raw = tr.get(&key, false).await?.ok_or(CatalogError::Incomplete)?;
+    let proof: MetadataEvidence = serde_json::from_slice(&raw).map_err(cache)?;
+    let manifest = ledger::require_complete_at(tr, reservation).await?;
+    let mut index = Vec::new();
+    active_volume::encode_index(&mut index, input.destination().index());
+    if serde_json::to_vec(&proof).map_err(cache)?.as_slice() != raw.as_ref()
+        || proof.version != 1
+        || proof.parent != reservation.fingerprint()
+        || proof.request != request.fingerprint()
+        || proof.inventory != manifest.summary.digest
+        || proof.source_copy
+            != <[u8; 32]>::from(Sha256::digest(copy_records::encode_physical_copy(copy)?))
+        || proof.data != *input.source().byte_proof().object()
+        || proof.node.uid != media.logical_file_uid
+        || proof.node.kind != ReclaimSourceNodeKind::Symlink
+        || proof.target.kind != ReclaimSourceNodeKind::File
+        || proof.target_copy != copy_records::encode_physical_copy(input.destination().copy())?
+        || proof.target_head != encode_head(input.destination().head())
+        || proof.target_index != index
+        || tr
+            .get(&ledger::object_key(reservation, proof.node.uid), false)
+            .await?
+            .as_deref()
+            != Some(proof.node.encode()?.as_slice())
+    {
+        return Err(CatalogError::Corrupt("EE 别名覆盖改变原已封存迁移证明"));
+    }
+    let full = pool_catalog_path(reservation.spec().pool, file.path().as_bytes())?;
+    let Some(ResolvedPath::File {
+        attributes: Some(attrs),
+        ..
+    }) = lookup::resolve_active_path_at_mode(
+        tr,
+        reservation.namespace(),
+        lookup::path_components(&full)?,
+        false,
+    )
+    .await?
+    else {
+        return Err(CatalogError::Incomplete);
+    };
+    if attrs.digest() != proof.target_attributes {
+        return Err(CatalogError::Invalid("EE 别名目的属性在封存后改变"));
+    }
+    Ok(proof.node)
 }
 
 impl ManagedCatalog {

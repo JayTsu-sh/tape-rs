@@ -69,6 +69,174 @@ fn seed(device: &SimTransport, bytes: &[u8]) -> FileNode {
 }
 
 #[test]
+fn raw_body_append_uses_new_extents_and_preserves_attributes_before_full_or_delta_publication() {
+    use crate::ltfs::index::IndexLocation;
+    use crate::scsi::reservation::{ReservationKey, fence};
+    use sha2::{Digest, Sha256};
+    for bytes in [Vec::new(), (0..150_013).map(|i| (i % 251) as u8).collect()] {
+        for delta in [false, true] {
+            for unknown in [false, true] {
+                let (lib, device) = media();
+                let body = seed(&device, &bytes);
+                let mut original = source(&body);
+                if let IndexEntry::File { node, .. } = &mut original {
+                    node.open_for_write = Some(false);
+                    if unknown {
+                        node.xattrs
+                            .retain(|attr| !matches!(attr.key.as_str(), XATTR_SHA256 | XATTR_MD5));
+                    }
+                }
+                let key = ReservationKey::new(1, 10);
+                fence(&device, key).unwrap();
+                let mut volume = LtfsVolume::mount(&device).unwrap();
+                volume.set_reservation_guard(Some(key));
+                let uid = volume.index().highest_file_uid + 1;
+                let start = volume.recovery().dp.eod;
+                let expected = FileNode::reclaimed_body(
+                    "/metadata/raw",
+                    uid,
+                    &original,
+                    IndexLocation {
+                        partition: volume.label().data_partition,
+                        start_block: start,
+                    },
+                    Sha256::digest(&bytes).into(),
+                    (!unknown).then(|| md5::Md5::digest(&bytes).into()),
+                )
+                .unwrap();
+                let old = volume.index().root.clone();
+                let count = device.command_log().len();
+                volume
+                    .append_reclaimed_body("/metadata/raw", &expected, &mut Cursor::new(&bytes))
+                    .unwrap();
+                assert_eq!(volume.index().root, old, "数据追加不提前发布目录");
+                assert_eq!(
+                    device.command_log()[count..]
+                        .iter()
+                        .filter(|opcode| **opcode == 0x0a)
+                        .count(),
+                    bytes.len().div_ceil(volume.block_size() as usize)
+                );
+                if delta {
+                    volume.commit_incremental().unwrap();
+                } else {
+                    volume.commit().unwrap();
+                }
+                assert_eq!(
+                    volume.committed_index_construct().location.start_block,
+                    start + (bytes.len() as u64).div_ceil(volume.block_size() as u64) + 1
+                );
+                drop(volume);
+                lib.power_cut();
+                let volume = LtfsVolume::mount(&device).unwrap();
+                assert_eq!(volume.index().find_file("metadata/raw"), Some(&expected));
+                assert_eq!(volume.index().find_file("body"), Some(&body));
+                let mut out = Vec::new();
+                volume
+                    .read_file_to_writer("metadata/raw", &mut out)
+                    .unwrap();
+                assert_eq!(out, bytes);
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_body_bad_input_freezes_without_committing_or_replaying() {
+    use crate::ltfs::index::IndexLocation;
+    use sha2::{Digest, Sha256};
+    let bytes = b"body";
+    for input in [
+        b"bad!".as_slice(),
+        b"bod".as_slice(),
+        b"body-and-extra".as_slice(),
+    ] {
+        let (lib, device) = media();
+        let body = seed(&device, bytes);
+        let original = source(&body);
+        let mut volume = LtfsVolume::mount(&device).unwrap();
+        let expected = FileNode::reclaimed_body(
+            "metadata/raw",
+            volume.index().highest_file_uid + 1,
+            &original,
+            IndexLocation {
+                partition: volume.label().data_partition,
+                start_block: volume.recovery().dp.eod,
+            },
+            Sha256::digest(bytes).into(),
+            Some(md5::Md5::digest(bytes).into()),
+        )
+        .unwrap();
+        let old = volume.index().root.clone();
+        assert!(
+            volume
+                .append_reclaimed_body("metadata/raw", &expected, &mut Cursor::new(input))
+                .is_err()
+        );
+        assert_eq!(volume.index().root, old);
+        assert!(!volume.writable());
+        let count = device.command_log().len();
+        assert!(volume.commit().is_err());
+        assert!(
+            volume
+                .append_reclaimed_body("metadata/raw", &expected, &mut Cursor::new(bytes))
+                .is_err()
+        );
+        assert_eq!(device.command_log().len(), count);
+        drop(volume);
+        lib.power_cut();
+        assert!(
+            LtfsVolume::mount(&device)
+                .unwrap()
+                .index()
+                .find_file("metadata/raw")
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn raw_body_rejects_foreign_extents_and_missing_digests_before_io() {
+    use crate::ltfs::index::IndexLocation;
+    use sha2::{Digest, Sha256};
+    let (_lib, device) = media();
+    let bytes = b"body";
+    let body = seed(&device, bytes);
+    let original = source(&body);
+    let mut volume = LtfsVolume::mount(&device).unwrap();
+    let expected = FileNode::reclaimed_body(
+        "metadata/raw",
+        volume.index().highest_file_uid + 1,
+        &original,
+        IndexLocation {
+            partition: volume.label().data_partition,
+            start_block: volume.recovery().dp.eod,
+        },
+        Sha256::digest(bytes).into(),
+        Some(md5::Md5::digest(bytes).into()),
+    )
+    .unwrap();
+    let before = device.command_log().len();
+    for case in 0..4 {
+        let mut wrong = expected.clone();
+        match case {
+            0 => wrong.extents[0].start_block += 10_000,
+            1 => wrong.meta.file_uid += 1,
+            2 => wrong.xattrs.retain(|attr| attr.key != XATTR_SHA256),
+            _ => wrong.name = "other".into(),
+        }
+        assert!(
+            volume
+                .append_reclaimed_body("metadata/raw", &wrong, &mut Cursor::new(bytes))
+                .is_err()
+        );
+        assert!(volume.writable());
+        assert!(!volume.needs_checkpoint());
+        assert_eq!(device.command_log().len(), before);
+    }
+}
+
+#[test]
 fn shared_body_preserves_raw_attributes_without_rewriting_data_and_recovers_both_indexes() {
     for bytes in [Vec::new(), (0..150_013).map(|i| (i % 251) as u8).collect()] {
         for incremental in [false, true] {

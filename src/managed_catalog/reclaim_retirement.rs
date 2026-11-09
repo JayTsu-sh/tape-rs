@@ -277,6 +277,50 @@ pub(super) async fn retired_destination_at(
 }
 
 impl ManagedCatalog {
+    /// Only a query: both initialization gates are still checked atomically
+    /// during preparation and every actual initialization admission.
+    pub async fn reclaim_source_has_retained_references(
+        &self,
+        reservation: &ReclaimReservation,
+        owner: u64,
+    ) -> Result<bool> {
+        let tr = self.db.create_trx()?;
+        let parent = record_at(&tr, reservation, owner).await?;
+        if parent["owner_epoch"] != owner {
+            return Err(CatalogError::OwnerFenced);
+        }
+        source_state_at(&tr, reservation).await?;
+        let mut prefix = super::super::key(b'V');
+        prefix.extend_from_slice(reservation.spec().volume().as_bytes());
+        requests::prefix_has_rows(&tr, &prefix).await
+    }
+
+    /// Query only the original retained readback. Absence is not permission to
+    /// append; the upload result and its original attempt remain independent.
+    pub async fn reclaim_file_body_verified(
+        &self,
+        reservation: &ReclaimReservation,
+        owner: u64,
+        file: &ReclaimFile,
+        request: &ActiveFileRequest,
+    ) -> Result<bool> {
+        let tr = self.db.create_trx()?;
+        let parent = record_at(&tr, reservation, owner).await?;
+        if parent["owner_epoch"] != owner {
+            return Err(CatalogError::OwnerFenced);
+        }
+        children::require_request_identity_at(&tr, request, owner).await?;
+        if tr
+            .get(&walk::verification_key(reservation, file), false)
+            .await?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        check_retirement_at(&tr, reservation, owner, file, request).await?;
+        Ok(true)
+    }
+
     /// Retire only the original source after destination readback. It never
     /// releases the parent fence or authorizes format of the remaining source.
     pub async fn retire_reclaim_file_source(

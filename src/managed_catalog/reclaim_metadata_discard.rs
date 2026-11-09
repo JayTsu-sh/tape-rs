@@ -57,7 +57,7 @@ impl ReclaimMetadataPlan {
             || original.construct_end() != self.previous_dp_eod()
             || original.identity().map_err(cache)? != previous
             || !original.header().unknown_elements.is_empty()
-            || original.header().highest_file_uid.checked_add(1) != Some(self.uid())
+            || original.header().highest_file_uid.checked_add(1) != Some(self.first_uid()?)
         {
             return Err(CatalogError::Invalid(
                 "修尾来源不是原 Recorded 构造、闭合边界或完整链",
@@ -122,8 +122,18 @@ impl ReclaimMetadataPlan {
         target: &CapturedIndexSource,
         original: &CapturedIndexSource,
     ) -> Result<ReclaimMetadataDiscardObservation> {
-        let original_attrs = self.require_discard_source(original)?;
         current_proof(target.scope(), target.header())?;
+        self.observe_discarded_dp(target, original)
+    }
+
+    // Used only after the dedicated checkpoint precondition has independently
+    // proved current DP/history. Recorded itself never becomes Current proof.
+    pub(super) fn observe_discarded_dp(
+        &self,
+        target: &CapturedIndexSource,
+        original: &CapturedIndexSource,
+    ) -> Result<ReclaimMetadataDiscardObservation> {
+        let original_attrs = self.require_discard_source(original)?;
         let previous = self.previous_source()?;
         let old = previous.head();
         let head = target.header();
@@ -247,7 +257,9 @@ impl ReclaimMetadataTailEvidence {
         use crate::ltfs::recovery::TailKind;
         let plan = task.plan();
         if task.owner() != owner
-            || !(task.writing() || task.discarding())
+            || !(task.writing()
+                || task.discarding()
+                || task.checkpointing() && plan.previous_source()?.head().incremental)
             || task
                 .observation()?
                 .is_some_and(|value| value.kind() == ReclaimMetadataObservationKind::Committed)
@@ -312,4 +324,4 @@ impl ReclaimMetadataTailEvidence {
 
 #[cfg(test)]
 #[path = "reclaim_metadata_discard_tests.rs"]
-mod tests;
+pub(super) mod tests;

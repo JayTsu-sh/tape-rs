@@ -9,12 +9,10 @@ impl ManagedCatalog {
         &self,
         reservation: &ReclaimReservation,
         owner: u64,
-        file: &ReclaimFile,
-        request: &ActiveFileRequest,
+
         original: &ReclaimMetadataWrite,
         evidence: &ReclaimMetadataTailEvidence,
     ) -> Result<ReclaimMetadataWrite> {
-        request.validate()?;
         original.encode()?;
         evidence.require(original, owner)?;
         self.db
@@ -35,13 +33,15 @@ impl ManagedCatalog {
                                 return Err(CatalogError::Invalid("修尾意图改变原固定计划"));
                             }
                             require_phase_history(original, &task)?;
-                            task.0.context.require(reservation, file, request)?;
+
                             let input =
-                                input_at(&tr, reservation, owner, file, request, &plan).await?;
+                                context::input_for_task_at(&tr, reservation, owner, &task).await?;
                             if task.discarding() {
                                 return Ok(task);
                             }
-                            if !task.writing()
+                            if !(task.writing()
+                                || task.checkpointing()
+                                    && plan.previous_source()?.head().incremental)
                                 || task != *original
                                 || task.observation()?.is_some_and(|value| {
                                     value.kind() == ReclaimMetadataObservationKind::Committed
@@ -51,9 +51,15 @@ impl ManagedCatalog {
                                     "修尾意图要求原未决 Writing 快照",
                                 ));
                             }
-                            if target_policy_at(&tr, reservation, &plan, &input, false)
-                                .await?
-                                .to_string()
+                            if target_context_policy_at(
+                                &tr,
+                                reservation,
+                                &plan,
+                                input.as_ref(),
+                                false,
+                            )
+                            .await?
+                            .to_string()
                                 != task.0.scan
                             {
                                 return Err(CatalogError::Corrupt("修尾意图改变原目标扫描"));
@@ -75,6 +81,11 @@ impl ManagedCatalog {
                             )
                             .await?;
                             task.0.phase = Phase::Discarding;
+                            task.0.recovery_epoch = task
+                                .0
+                                .recovery_epoch
+                                .checked_add(1)
+                                .ok_or(CatalogError::Corrupt("元数据恢复序号溢出"))?;
                             let raw = task.encode()?;
                             let header = registry::encode(reservation, &task)?;
                             tr.set(&task_key(reservation, &task), &raw);

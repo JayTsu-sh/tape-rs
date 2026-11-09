@@ -494,6 +494,10 @@ fn metadata_router(ctx: Arc<Context>) -> Router {
             axum::routing::post(lifecycle::validate),
         )
         .route(
+            "/libraries/{serial}/admin/pools/{pool}/tapes/{barcode}/reclaim",
+            axum::routing::post(lifecycle::reclaim),
+        )
+        .route(
             "/libraries/{serial}/admin/pools/{pool}/tapes/{barcode}/move",
             axum::routing::post(lifecycle::move_tape),
         )

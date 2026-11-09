@@ -142,6 +142,21 @@ pub(super) async fn validate(
     )
     .await
 }
+pub(super) async fn reclaim(
+    State(ctx): State<Arc<Context>>,
+    Path((serial, pool, barcode)): Path<(String, String, String)>,
+    request: Request,
+) -> Response {
+    action(
+        ctx,
+        serial,
+        Some(pool),
+        Some(barcode),
+        "media-reclaim",
+        request,
+    )
+    .await
+}
 pub(super) async fn move_tape(
     State(ctx): State<Arc<Context>>,
     Path((serial, pool, barcode)): Path<(String, String, String)>,

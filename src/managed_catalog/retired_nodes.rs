@@ -153,6 +153,43 @@ pub(super) fn from_node_record(
     Ok(Some(value))
 }
 
+/// A deleted inode's H is historical. It must still equal the permanent
+/// deletion input; absence of a live path alone never proves deletion.
+pub(super) async fn deleted_copy_at(
+    tr: &Transaction,
+    namespace: Uuid,
+    file: Uuid,
+    copy: Uuid,
+    version: u64,
+) -> Result<Option<NodeRetirement>> {
+    let raw = tr
+        .get(&node_key(namespace, file), false)
+        .await?
+        .ok_or(CatalogError::Corrupt("已回收副本缺少原 inode 身份"))?;
+    let Some(retired) = from_node_record(namespace, file, &raw)? else {
+        return Ok(None);
+    };
+    let head = tr
+        .get(&head_key(namespace, file), false)
+        .await?
+        .ok_or(CatalogError::Corrupt("删除 inode 缺少历史 head"))?;
+    let head = decode_head(&head)?;
+    if tr.get(&namespace_key(namespace), false).await?.as_deref()
+        != Some(&[NamespaceState::Active as u8][..])
+        || retired.kind != NodeKind::File
+        || retired.previous_head.as_ref() != Some(&head)
+        || version == 0
+        || version > head.version
+        || version >= retired.deleted_version
+        || (copy == head.copy_id && version != head.version)
+    {
+        return Err(CatalogError::Corrupt(
+            "删除 inode 的旧副本、历史 head 或删除版本不符",
+        ));
+    }
+    Ok(Some(retired))
+}
+
 fn barrier_key(namespace: Uuid, pool: Uuid, path: &str) -> Vec<u8> {
     let mut out = control::management::prefix(namespace, b'Q');
     out.push(b'b');

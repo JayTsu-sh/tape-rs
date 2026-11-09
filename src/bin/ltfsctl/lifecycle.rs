@@ -29,6 +29,17 @@ pub struct Assign {
     force_format: bool,
 }
 #[derive(Args)]
+pub struct Reclaim {
+    #[command(flatten)]
+    targets: Targets,
+    /// 确认迁移校验完成后重新初始化源带
+    #[arg(long)]
+    yes: bool,
+    /// 完成后将源带归槽并解除池归属
+    #[arg(short = 'u', long)]
+    unassign: bool,
+}
+#[derive(Args)]
 pub struct Move {
     #[command(flatten)]
     targets: Targets,
@@ -60,6 +71,7 @@ pub struct Rescan {
 }
 enum Action {
     Assign { yes: bool, force: bool },
+    Reclaim { yes: bool, unassign: bool },
     Move { location: Option<String> },
     Unassign,
     Validate,
@@ -70,6 +82,7 @@ impl Action {
     fn kind(&self) -> &'static str {
         match self {
             Self::Assign { .. } => "media-assign",
+            Self::Reclaim { .. } => "media-reclaim",
             Self::Move { .. } => "media-move",
             Self::Unassign => "media-unassign",
             Self::Validate => "media-validate",
@@ -82,6 +95,8 @@ impl Action {
             self,
             Self::Assign { yes: true, .. }
                 | Self::Assign { force: true, .. }
+                | Self::Reclaim { yes: true, .. }
+                | Self::Reclaim { unassign: true, .. }
                 | Self::Move { location: Some(_) }
                 | Self::Policy { patch: Some(_) }
         )
@@ -175,6 +190,9 @@ fn run(
         return Err("同一批任务不得重复条码".into());
     }
     match &action {
+        Action::Reclaim { yes: false, .. } => {
+            return Err("reclaim 将在迁移与完整校验后重新初始化源带，必须显式 --yes".into());
+        }
         Action::Assign { yes: false, .. } => {
             return Err(
                 "assign 可能初始化并格式化介质，必须显式 --yes；保留已有文件请使用 tape import"
@@ -235,7 +253,11 @@ fn run(
                     json!({"kind":action.kind(),"pool":assignment["pool"],"barcode":barcode,"volume":assignment["volume"],"revision":assignment["revision"],"destination":location.as_deref().unwrap()})
                 }
             }
-            Action::Unassign | Action::Validate | Action::Online | Action::Policy { .. } => {
+            Action::Reclaim { .. }
+            | Action::Unassign
+            | Action::Validate
+            | Action::Online
+            | Action::Policy { .. } => {
                 if assignment.is_null()
                     || assignment["pool"] != pool.unwrap().to_string()
                     || assignment["volume"].is_null()
@@ -245,6 +267,10 @@ fn run(
                 let mut value = json!({"kind":action.kind(),"pool":assignment["pool"],"barcode":barcode,"volume":assignment["volume"],"revision":assignment["revision"]});
                 if let Action::Policy { patch } = &action {
                     value["patch"] = patch.clone().ok_or("tape set 必须指定 --patch")?;
+                }
+                if let Action::Reclaim { unassign, .. } = &action {
+                    value["confirm_format"] = json!(true);
+                    value["unassign"] = json!(unassign);
                 }
                 value
             }
@@ -263,6 +289,25 @@ fn run(
         saved.push(file);
     }
     submit_all(client, saved)
+}
+pub fn reclaim(
+    client: &FdbClient,
+    control: &mut Client,
+    library: Option<&str>,
+    pool: Option<&str>,
+    command: Reclaim,
+) -> Result<()> {
+    run(
+        client,
+        control,
+        library,
+        pool,
+        command.targets,
+        Action::Reclaim {
+            yes: command.yes,
+            unassign: command.unassign,
+        },
+    )
 }
 pub fn online(
     client: &FdbClient,

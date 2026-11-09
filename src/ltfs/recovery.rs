@@ -45,7 +45,8 @@ pub use source::{
 };
 #[cfg(feature = "fdb")]
 pub(crate) use source::{
-    CapturedReadIndex, capture_current_read_index, verify_recorded_source_constructs,
+    CapturedReadIndex, capture_current_read_index, capture_dp_checkpoint_source,
+    verify_recorded_source_constructs,
 };
 #[cfg(feature = "fdb")]
 mod identity;

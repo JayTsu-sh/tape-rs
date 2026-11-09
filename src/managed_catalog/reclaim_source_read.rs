@@ -113,7 +113,7 @@ impl ReclaimSourceRead {
     }
 }
 
-fn expected_md5(node: &crate::ltfs::index::FileNode) -> Result<Option<[u8; 16]>> {
+pub(super) fn expected_md5(node: &crate::ltfs::index::FileNode) -> Result<Option<[u8; 16]>> {
     // Validate both algorithms and reject duplicate/malformed attributes even
     // though the preferred digest may mask the secondary one.
     ContentDigest::from_ltfs_xattrs(&node.xattrs)?;

@@ -104,11 +104,9 @@ impl ManagedCatalog {
         &self,
         reservation: &ReclaimReservation,
         owner: u64,
-        file: &ReclaimFile,
-        request: &ActiveFileRequest,
+
         original: &ReclaimMetadataWrite,
     ) -> Result<ReclaimMetadataWrite> {
-        request.validate()?;
         original.encode()?;
         if !original.closed() {
             return Err(CatalogError::Invalid("新尝试要求原任务已明确关闭"));
@@ -128,9 +126,9 @@ impl ManagedCatalog {
                             if !old.closed() || old.plan() != plan || old.owner() > owner {
                                 return Err(CatalogError::Invalid("元数据新尝试改变原关闭事实"));
                             }
-                            old.0.context.require(reservation, file, request)?;
+
                             let input =
-                                input_at(&tr, reservation, owner, file, request, &plan).await?;
+                                context::input_for_task_at(&tr, reservation, owner, &old).await?;
                             let edge = registry::edge_key(reservation, uid, old.id());
                             if let Some(raw) = tr.get(&edge, false).await? {
                                 let id = uuid_from(&raw)?;
@@ -161,7 +159,14 @@ impl ManagedCatalog {
                                     "原元数据最新索引改变却缺少后继边",
                                 ));
                             }
-                            let scan = target_at(&tr, reservation, &plan, &input).await?;
+                            let scan = target_context_policy_at(
+                                &tr,
+                                reservation,
+                                &plan,
+                                input.as_ref(),
+                                plan.added_files() > 0,
+                            )
+                            .await?;
                             if scan.to_string() != old.0.scan {
                                 return Err(CatalogError::Corrupt("元数据新尝试改变原扫描"));
                             }
@@ -172,15 +177,17 @@ impl ManagedCatalog {
                             )
                             .await?;
                             let task = ReclaimMetadataWrite(Record {
-                                version: 5,
+                                version: 7,
                                 id: Uuid::new_v4().to_string(),
                                 first: old.0.first.clone(),
+                                plan_origin: old.0.plan_origin.clone(),
                                 previous: Some(old.id().to_string()),
                                 scan: old.0.scan.clone(),
                                 plan: plan.0.clone(),
                                 context: old.0.context.clone(),
                                 owner,
                                 phase: Phase::Prepared,
+                                recovery_epoch: 0,
                                 observation: None,
                             });
                             let raw = task.encode()?;

@@ -546,6 +546,17 @@ impl IndexReplay {
         Ok(Some(entry))
     }
 
+    pub(super) fn payload_by_path(&self, path: &str) -> Result<Option<IndexEntry>> {
+        if !self.payloads {
+            return Err(bad("路径查询需要完整节点捕获"));
+        }
+        let mut query = self
+            .db
+            .prepare("SELECT CAST(path AS TEXT),kind,uid,body,payload FROM dp WHERE path=?1")?;
+        let mut rows = query.query([path.as_bytes()])?;
+        rows.next()?.map(complete_payload).transpose()
+    }
+
     pub(super) fn require_equal(&self) -> Result<()> {
         let different: bool = self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM dp LEFT JOIN ip USING(path)
@@ -706,6 +717,14 @@ mod tests {
             all.extend(page);
         }
         assert_eq!(all, ["", "a", "d", "d/child", "d0"]);
+        assert!(replay.payload_by_path("missing").unwrap().is_none());
+        assert!(
+            matches!(replay.payload_by_path("").unwrap(), Some(IndexEntry::Directory {path,..}) if path.is_empty())
+        );
+        assert_eq!(
+            replay.payload_by_path("a").unwrap(),
+            replay.payload_by_uid(2).unwrap()
+        );
         assert!(replay.payload_by_uid(0).is_err());
         assert!(replay.payload_by_uid(u64::MAX).unwrap().is_none());
         assert!(
@@ -743,6 +762,10 @@ mod tests {
         assert!(
             replay.payload_by_uid(2).is_err(),
             "UID 查询也必须拒绝损坏 payload"
+        );
+        assert!(
+            replay.payload_by_path("a").is_err(),
+            "路径点读必须核验节点完整性"
         );
         replay
             .db

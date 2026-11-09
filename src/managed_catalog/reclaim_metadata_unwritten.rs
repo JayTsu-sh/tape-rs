@@ -7,12 +7,10 @@ impl ManagedCatalog {
         &self,
         reservation: &ReclaimReservation,
         owner: u64,
-        file: &ReclaimFile,
-        request: &ActiveFileRequest,
+
         original: &ReclaimMetadataWrite,
         proof: &ReclaimMetadataUnwrittenEvidence,
     ) -> Result<ReclaimMetadataWrite> {
-        request.validate()?;
         original.encode()?;
         let evidence = proof.require(original, owner)?;
         evidence.encode(&original.plan())?;
@@ -31,7 +29,7 @@ impl ManagedCatalog {
                                     .await?
                                     .ok_or(CatalogError::Incomplete)?;
                             publication::require_original(original, &task, owner)?;
-                            input_at(&tr, reservation, owner, file, request, &plan).await?;
+                            context::input_for_task_at(&tr, reservation, owner, &task).await?;
                             if task.observation()?.as_ref() != Some(evidence) {
                                 return Err(CatalogError::Invalid("关闭改变或绕过原已保存观察"));
                             }

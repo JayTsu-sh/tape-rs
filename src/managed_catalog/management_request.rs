@@ -110,6 +110,9 @@ fn validate_change(value: &Value) -> Result<()> {
             }
         }
         "library-rescan" => fields(value, &["kind"])?,
+        "media-reclaim" => {
+            super::reclaim::ReclaimSpec::parse(value)?;
+        }
         "media-assign" => {
             fields(
                 value,

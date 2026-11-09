@@ -73,12 +73,20 @@ impl ReclaimMetadataCommitEvidence {
     pub fn observation(&self) -> &ReclaimMetadataObservation {
         &self.0.observation
     }
-    pub(crate) fn from_current(
+    pub(crate) fn from_current_with_raw_read(
         task: &ReclaimMetadataWrite,
         owner: u64,
         target: &CapturedIndexSource,
         predecessor: Option<&CapturedIndexSource>,
+        bytes: Option<(u64, [u8; 32], Option<[u8; 16]>)>,
     ) -> Result<Self> {
+        task.plan().require_raw_readback(target, bytes)?;
+        if !matches!(target.scope(),IndexSourceScope::Current { ip_generation:Some(ip),.. } if (1..=target.construct().generation).contains(&ip))
+        {
+            return Err(CatalogError::Invalid(
+                "元数据发布前须先结清缺失或残缺的 IP 检查点",
+            ));
+        }
         CurrentMetadataEvidence::capture(
             task,
             owner,
@@ -213,8 +221,8 @@ impl ReclaimMetadataObservation {
             ReclaimMetadataObservationKind::Committed => {
                 previous.generation.checked_add(1) == Some(current.generation)
                     && current.location.partition == previous.location.partition
-                    && Some(current.location.start_block) == plan.previous_dp_eod().checked_add(1)
-                    && plan.0.physical_files.checked_add(1) == Some(files)
+                    && Some(current.location.start_block) == Some(plan.index_start()?)
+                    && plan.0.physical_files.checked_add(plan.added_files()) == Some(files)
             }
         };
         if raw[2..34] != fingerprint || !matches {
@@ -247,8 +255,19 @@ impl ReclaimMetadataPlan {
         target: &CapturedIndexSource,
         predecessor: Option<&CapturedIndexSource>,
     ) -> Result<ReclaimMetadataObservation> {
-        self.encode()?;
         let (dp_eod, _, _) = current_proof(target.scope(), target.header())?;
+        self.observe_verified_dp(target, predecessor, dp_eod)
+    }
+
+    // The dedicated checkpoint precondition separately proves latest closed DP,
+    // full mounted history and permitted IP damage before using this recipe.
+    pub(super) fn observe_verified_dp(
+        &self,
+        target: &CapturedIndexSource,
+        predecessor: Option<&CapturedIndexSource>,
+        dp_eod: u64,
+    ) -> Result<ReclaimMetadataObservation> {
+        self.encode()?;
         let current: ActiveIndexIdentity = target.construct().into();
         let previous = active_volume::decode_index(self.volume(), &self.0.previous)?;
         let original = self.previous_source()?;
@@ -264,7 +283,7 @@ impl ReclaimMetadataPlan {
         }
         let kind = if current == previous {
             if dp_eod != self.previous_dp_eod()
-                || header.highest_file_uid.checked_add(1) != Some(self.uid())
+                || header.highest_file_uid.checked_add(1) != Some(self.first_uid()?)
                 || target.identity().map_err(cache)? != original
             {
                 return Err(CatalogError::Invalid(
@@ -293,7 +312,7 @@ impl ReclaimMetadataPlan {
             };
             if previous.generation.checked_add(1) != Some(current.generation)
                 || current.location.partition != previous.location.partition
-                || Some(current.location.start_block) != self.previous_dp_eod().checked_add(1)
+                || Some(current.location.start_block) != Some(self.index_start()?)
                 || header.highest_file_uid != self.uid()
                 || !linked
             {
@@ -312,6 +331,9 @@ impl ReclaimMetadataPlan {
         }
         let mut tree = TargetTree::new(self.volume());
         let mut added = false;
+        let mut added_ancestors = std::collections::BTreeSet::new();
+        let mut displaced = false;
+        let mut restored = false;
         let mut files = 0u64;
         target
             .for_each_entry(|entry| {
@@ -331,18 +353,68 @@ impl ReclaimMetadataPlan {
                         )));
                     }
                     added = true;
+                } else if let Some(ancestor) = self
+                    .0
+                    .ancestors
+                    .iter()
+                    .find(|a| a.expected.uid == object.uid)
+                {
+                    if kind != ReclaimMetadataObservationKind::Committed
+                        || object != ancestor.expected
+                        || !added_ancestors.insert(object.uid)
+                    {
+                        return Err(callback(CatalogError::Invalid(
+                            "回收父目录观察偏离固定配方",
+                        )));
+                    }
+                } else if kind == ReclaimMetadataObservationKind::Committed
+                    && self
+                        .0
+                        .displaced
+                        .as_ref()
+                        .is_some_and(|d| d.original.uid == object.uid)
+                {
+                    let fixed = self.0.displaced.as_ref().expect("matched displacement");
+                    if displaced || object != fixed.expected {
+                        return Err(callback(CatalogError::Invalid(
+                            "同名目的节点未按原配方保留",
+                        )));
+                    }
+                    displaced = true;
                 } else {
+                    if kind == ReclaimMetadataObservationKind::Committed
+                        && !restored
+                        && let Some(fixed) = &self.0.displaced
+                        && fixed.original.path.as_bytes() < object.path.as_bytes()
+                    {
+                        tree.add(&fixed.original).map_err(callback)?;
+                        restored = true;
+                    }
                     tree.add(&object).map_err(callback)?;
                 }
                 Ok(())
             })
             .map_err(cache)?;
+        if kind == ReclaimMetadataObservationKind::Committed
+            && !restored
+            && let Some(fixed) = &self.0.displaced
+        {
+            tree.add(&fixed.original)?;
+        }
         let expected_files = if kind == ReclaimMetadataObservationKind::Committed {
-            self.0.physical_files.checked_add(1)
+            self.0.physical_files.checked_add(self.added_files())
         } else {
             Some(self.0.physical_files)
         };
         if added != (kind == ReclaimMetadataObservationKind::Committed)
+            || displaced
+                != (kind == ReclaimMetadataObservationKind::Committed && self.0.displaced.is_some())
+            || added_ancestors.len()
+                != if kind == ReclaimMetadataObservationKind::Committed {
+                    self.0.ancestors.len()
+                } else {
+                    0
+                }
             || Some(files) != expected_files
             || tree.objects != self.0.target_objects
             || tree.finish() != self.0.target_tree

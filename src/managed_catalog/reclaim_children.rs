@@ -20,6 +20,58 @@ fn identity_value(child: &Value) -> Vec<u8> {
         .into_bytes()
 }
 
+/// Completion has an independent immutable receipt. Remove only reverse
+/// identities whose exact original child and parent have both been checked.
+pub(super) async fn cleanup_completed_page_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+) -> Result<bool> {
+    let mut prefix = reservation.journal_key();
+    prefix[domain(reservation.namespace(), b'j').len() - 1] = b'c';
+    let page = read_page(tr, &prefix, None, 16, false).await?;
+    let mut keys = Vec::new();
+    for (key, raw) in page.items {
+        if key.len() != prefix.len() + 16 {
+            return Err(CatalogError::Corrupt("回收清理原子请求键长度"));
+        }
+        let operation = uuid_from(&key[prefix.len()..])?;
+        let child = decode(&raw)?;
+        let reverse = identity_key(reservation.namespace(), operation);
+        if child["parent"] != reservation.token()
+            || child["operation"] != operation.to_string()
+            || child["fingerprint"] != child_fingerprint(&child)
+            || tr.get(&reverse, false).await?.as_deref() != Some(identity_value(&child).as_slice())
+        {
+            return Err(CatalogError::Corrupt("回收清理子请求与原反向身份不符"));
+        }
+        let epoch = child["epoch"]
+            .as_u64()
+            .filter(|n| *n > 0)
+            .ok_or(CatalogError::Corrupt("回收清理子请求代次"))?;
+        let bytes: Vec<u8> = serde_json::from_value(child["attempt"].clone())
+            .map_err(|_| CatalogError::Corrupt("回收清理子请求编码"))?;
+        let (intent, _) = reservation::decode(&bytes, reservation.namespace(), epoch, operation)?;
+        if intent.library_serial != reservation.serial()
+            || intent.pool_id != Some(reservation.spec().pool())
+            || tr
+                .get(&history_pin_key(&intent.request()), false)
+                .await?
+                .is_some()
+        {
+            return Err(CatalogError::Corrupt(
+                "回收清理不能移除未结清或其他作用域的子请求",
+            ));
+        }
+        keys.push((key, reverse));
+    }
+    let cleared = !keys.is_empty();
+    for (key, reverse) in keys {
+        tr.clear(&key);
+        tr.clear(&reverse);
+    }
+    Ok(cleared)
+}
+
 fn original_epoch(raw: &[u8], parent: &Value) -> Result<u64> {
     let value = decode(raw)?;
     let fields = ["version", "epoch", "parent", "fingerprint"];
@@ -89,7 +141,6 @@ pub(super) async fn child_at(
     operation: Uuid,
     owner: u64,
 ) -> Result<Option<(ActiveFileIntent, u16)>> {
-    require_pool_without_reclaim_at(tr, ns, pool).await?;
     let identity = tr.get(&identity_key(ns, operation), false).await?;
     let Some(token) = pool_gate_at(tr, ns, pool).await? else {
         if identity.is_some() {
@@ -97,6 +148,7 @@ pub(super) async fn child_at(
                 "回收复制子身份已保留，原父屏障不存在",
             ));
         }
+        node_tasks::require_pool_without_reclaim_at(tr, ns, pool).await?;
         return Ok(None);
     };
     let raw = tr
@@ -179,7 +231,7 @@ pub(super) async fn child_at(
     if parent["version"] != 1
         || parent["fingerprint"] != token["fingerprint"]
         || parent["fingerprint"] != fingerprint
-        || parent["phase"] != "copying"
+        || !matches!(parent["phase"].as_str(), Some("copying" | "reformatting"))
         || !parent["children"].as_u64().is_some_and(|n| n > 0)
         || parent["intent"]["namespace"] != ns.to_string()
         || parent["intent"]["library"] != token["library"]
@@ -194,6 +246,18 @@ pub(super) async fn child_at(
     if parent["owner_epoch"] != owner {
         return Err(CatalogError::OwnerFenced);
     }
+    let route = routing::decode_active(
+        &tr.get(&routing::active_key(&intent.library_serial), false)
+            .await?
+            .ok_or(CatalogError::Incomplete)?,
+    )?;
+    routing::require_runtime_active_owner(tr, &intent.library_serial, route, owner).await?;
+    let reservation = ReclaimReservation {
+        intent: parent["intent"].clone(),
+        route,
+    };
+    record_at(tr, &reservation, owner).await?;
+    require_parent_pool_at(tr, &reservation).await?;
     ReclaimSourceRead::require_source(
         &value["source_read"],
         token["fingerprint"]
@@ -203,7 +267,275 @@ pub(super) async fn child_at(
         &source_copy,
         &intent,
     )?;
+    upload_retry::identity_at(
+        tr,
+        &reservation,
+        &ReclaimFile::from_request(&intent.request())?,
+    )
+    .await?;
     Ok(Some((intent, permit)))
+}
+
+/// Restore the exact original parent from the child identity, without logical
+/// path resolution or a new request window. This is read-only recovery input.
+async fn parent_for_request_at(
+    tr: &Transaction,
+    request: &ActiveFileRequest,
+    owner: u64,
+) -> Result<Option<ReclaimReservation>> {
+    request.validate()?;
+    let reverse = tr
+        .get(
+            &identity_key(request.namespace, request.operation_id),
+            false,
+        )
+        .await?;
+    let Some(pool) = request.pool_id else {
+        if reverse.is_some() {
+            return Err(CatalogError::Invalid("原回收子请求不能删除 pool 作用域"));
+        }
+        return Ok(None);
+    };
+    let Some(token) = pool_gate_at(tr, request.namespace, pool).await? else {
+        if reverse.is_some() {
+            return Err(CatalogError::Corrupt("回收子身份存在但原父池屏障缺失"));
+        }
+        return Ok(None);
+    };
+    if token["library"] != request.library_serial || reverse.is_none() {
+        return Err(CatalogError::PoolBusy);
+    }
+    let route = routing::decode_active(
+        &tr.get(&routing::active_key(&request.library_serial), false)
+            .await?
+            .ok_or(CatalogError::Incomplete)?,
+    )?;
+    if route.route.namespace != request.namespace {
+        return Err(CatalogError::OwnerFenced);
+    }
+    routing::require_runtime_active_owner(tr, &request.library_serial, route, owner).await?;
+    let mut journal = domain(request.namespace, b'j');
+    journal.extend_from_slice(
+        &token["epoch"]
+            .as_u64()
+            .expect("validated epoch")
+            .to_be_bytes(),
+    );
+    journal.extend_from_slice(
+        node_mutation::id(token["operation"].as_str().expect("validated operation"))?.as_bytes(),
+    );
+    let parent = decode(
+        &tr.get(&journal, false)
+            .await?
+            .ok_or(CatalogError::Incomplete)?,
+    )?;
+    let intent = &parent["intent"];
+    let fields = [
+        "version",
+        "library",
+        "namespace",
+        "epoch",
+        "operation",
+        "change",
+        "scan",
+        "scan_generation",
+        "index",
+    ];
+    if !intent
+        .as_object()
+        .is_some_and(|m| m.len() == fields.len() && m.keys().all(|k| fields.contains(&k.as_str())))
+        || intent["version"] != 1
+        || intent["library"] != request.library_serial
+        || intent["namespace"] != request.namespace.to_string()
+        || intent["epoch"] != token["epoch"]
+        || intent["operation"] != token["operation"]
+        || ReclaimSpec::parse(&intent["change"])?.pool() != pool
+    {
+        return Err(CatalogError::Corrupt("回收写入子身份与原父意图不同"));
+    }
+    let reservation = ReclaimReservation {
+        intent: intent.clone(),
+        route,
+    };
+    let parent = record_at(tr, &reservation, owner).await?;
+    if parent["owner_epoch"] != owner {
+        return Err(CatalogError::OwnerFenced);
+    }
+    if parent["phase"] != "copying" {
+        return Err(CatalogError::Invalid("只有原复制阶段可执行封存子请求"));
+    }
+    let (intent, _) = child_at(
+        tr,
+        request.namespace,
+        pool,
+        request.request_epoch,
+        request.operation_id,
+        owner,
+    )
+    .await?
+    .ok_or(CatalogError::Incomplete)?;
+    if intent.request() != *request {
+        return Err(CatalogError::Invalid("回收写入必须复用封存的完整子请求"));
+    }
+    source_state_at(tr, &reservation).await?;
+    mechanics::require_parent_idle_at(tr, &reservation).await?;
+    if tr
+        .get(
+            &native_device::library_gate(request.namespace, &request.library_serial),
+            false,
+        )
+        .await?
+        .is_some()
+        || automatic_media::pending_at(tr, request.namespace, &request.library_serial)
+            .await?
+            .is_some()
+    {
+        return Err(CatalogError::PoolBusy);
+    }
+    if let Some(layout) = layout::at(tr, &reservation).await?
+        && (intent.volume_id != layout.destination.volume
+            || intent.library_serial != request.library_serial)
+    {
+        return Err(CatalogError::Invalid("原回收子请求不属于固定目的布局"));
+    }
+    Ok(Some(reservation))
+}
+
+pub(in crate::managed_catalog::control) async fn require_write_group_lane_at(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    owner: u64,
+    requests: &[ActiveFileRequest],
+) -> Result<()> {
+    if tr.get(&layout::gate(ns, serial), false).await?.is_none() {
+        return management::moves::require_readable_at(tr, ns, serial).await;
+    }
+    if requests.is_empty() {
+        return Err(CatalogError::PoolBusy);
+    }
+    for request in requests {
+        if request.namespace != ns
+            || request.library_serial != serial
+            || parent_for_request_at(tr, request, owner).await?.is_none()
+        {
+            return Err(CatalogError::PoolBusy);
+        }
+        require_metadata_copy_idle_at(tr, ns, request.pool_id.ok_or(CatalogError::PoolBusy)?)
+            .await?;
+    }
+    Ok(())
+}
+
+impl ManagedCatalog {
+    /// Original sealed byte evidence for relocation attributes. Ordinary
+    /// uploads return None; callers cannot provide hashes for this path.
+    pub(crate) async fn reclaim_upload_read_source(
+        &self,
+        route: ActiveLibraryRoute,
+        owner: u64,
+        request: &ActiveFileRequest,
+    ) -> Result<Option<ReclaimReadSource>> {
+        let tr = self.db.create_trx()?;
+        routing::require_runtime_active_owner(&tr, &request.library_serial, route, owner).await?;
+        let Some(parent) = parent_for_request_at(&tr, request, owner).await? else {
+            return Ok(None);
+        };
+        Box::pin(read_source_at(&tr, &parent, owner, request))
+            .await
+            .map(Some)
+    }
+
+    pub async fn reclaim_upload_parent(
+        &self,
+        request: &ActiveFileRequest,
+        owner: u64,
+    ) -> Result<Option<ReclaimReservation>> {
+        parent_for_request_at(&self.db.create_trx()?, request, owner).await
+    }
+    /// Authority for reconciling an already admitted original physical attempt.
+    /// Owner adoption changes no physical input and never admits fresh data.
+    /// Unlike the ordinary writer, this scope may observe the atomic transition
+    /// from the old Q/I to the exact original terminal result.
+    pub async fn require_reclaim_upload_recovery_lane(
+        &self,
+        reservation: &ReclaimReservation,
+        owner: u64,
+        request: &ActiveFileRequest,
+    ) -> Result<()> {
+        let tr = self.db.create_trx()?;
+        let parent = parent_for_request_at(&tr, request, owner)
+            .await?
+            .ok_or(CatalogError::Incomplete)?;
+        if parent.intent() != reservation.intent() || parent.route != reservation.route {
+            return Err(CatalogError::OwnerFenced);
+        }
+        require_metadata_copy_idle_at(
+            &tr,
+            request.namespace,
+            request.pool_id.ok_or(CatalogError::Incomplete)?,
+        )
+        .await?;
+        let (mut original, _) = child_at(
+            &tr,
+            request.namespace,
+            reservation.spec().pool(),
+            request.request_epoch,
+            request.operation_id,
+            owner,
+        )
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+        if let Some(current) = reservation::active_file_attempt_at(&tr, request).await? {
+            if current.owner_epoch > owner {
+                return Err(CatalogError::OwnerFenced);
+            }
+            original.owner_epoch = current.owner_epoch;
+            if current != original {
+                return Err(CatalogError::Invalid("恢复不能更改原物理尝试的目标或正文"));
+            }
+        } else {
+            let terminal = tr
+                .get(
+                    &op_key(
+                        request.namespace,
+                        request.request_epoch,
+                        request.operation_id,
+                    ),
+                    false,
+                )
+                .await?
+                .ok_or(CatalogError::Incomplete)?;
+            if !matches!(
+                requests::reservation_terminal_result(&terminal, &request.fingerprint())?,
+                PublishOutcome::AlreadyApplied(_) | PublishOutcome::RequestCancelled
+            ) {
+                return Err(CatalogError::Invalid("恢复缺少精确原上传终态"));
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn require_reclaim_upload_lane(
+        &self,
+        reservation: &ReclaimReservation,
+        owner: u64,
+        request: &ActiveFileRequest,
+    ) -> Result<()> {
+        let tr = self.db.create_trx()?;
+        let parent = parent_for_request_at(&tr, request, owner)
+            .await?
+            .ok_or(CatalogError::Incomplete)?;
+        if parent.intent() != reservation.intent() || parent.route != reservation.route {
+            return Err(CatalogError::OwnerFenced);
+        }
+        require_metadata_copy_idle_at(
+            &tr,
+            request.namespace,
+            request.pool_id.ok_or(CatalogError::Incomplete)?,
+        )
+        .await
+    }
 }
 
 pub(in crate::managed_catalog) async fn require_request_at(
@@ -409,9 +741,10 @@ impl ManagedCatalog {
             let source = source.clone();
             Box::pin(async move { requests::retry_result(async {
                 let mut parent = record_at(&tr, reservation, owner).await?;
+                if parent["phase"] == "reformatting" { return Err(CatalogError::Invalid("源卷已进入格式化阶段，不能再准备迁移正文")); }
                 if parent["owner_epoch"] != owner { return Err(CatalogError::OwnerFenced); }
                 source::require_metadata_idle_at(&tr, reservation).await?;
-                require_pool_without_reclaim_at(&tr, reservation.namespace(), source.pool).await?;
+                require_parent_pool_at(&tr, reservation).await?;
                 let (_, source_index) = source_state_at(&tr, reservation).await?;
                 let mut source_index_bytes = Vec::new(); active_volume::encode_index(&mut source_index_bytes, source_index);
                 if source_read.index() != source_index_bytes { return Err(CatalogError::Invalid("回收源实读卷头与封存源不同")); }
@@ -448,6 +781,7 @@ impl ManagedCatalog {
                     return Err(CatalogError::Invalid("回收源身份、大小或内容摘要改变"));
                 }
                 let intent = upload::prepare_upload_at(&tr, reservation.namespace(), reservation.serial(), owner, destination, spec).await?;
+                upload_retry::identity_at(&tr,reservation,&ReclaimFile::from_request(&intent.request())?).await?;
                 if intent.file_id != id || intent.request_epoch != epoch { return Err(CatalogError::Invalid("回收原文件 inode 或请求代次改变")); }
                 ReclaimSourceRead::require_source(&read_value, &reservation.fingerprint(), &head, &copy, &intent)?;
                 let copy_raw = tr.get(&copy_key(reservation.namespace(), id, head.copy_id), false).await?

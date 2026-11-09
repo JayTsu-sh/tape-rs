@@ -266,84 +266,91 @@ pub async fn recover_active_media_tail<'a>(
 /// recovery path from the physical DP generation and FDB observation, never
 /// from an in-memory task status. Every branch consumes the volume; failure
 /// leaves no caller with a mutable session that could append or checkpoint.
-pub async fn reconcile_active_media_on_takeover<'a>(
-    catalog: &ManagedCatalog,
+pub fn reconcile_active_media_on_takeover<'a: 'b, 'b>(
+    catalog: &'b ManagedCatalog,
     mut volume: LtfsVolume<'a>,
-    serial: &str,
+    serial: &'b str,
     owner_epoch: u64,
-) -> Result<ActiveMediaRecovered<'a>> {
-    let current = ActiveIndexIdentity::from(volume.verified_recovery_index_construct()?);
-    let observed = catalog
-        .observed_active_volume_index(serial, current.volume_uuid)
-        .await
-        .map_err(|error| catalog_error("接任核对已观察索引", error))?;
-    // An explicit import must remain possible when an external clean Full
-    // replaced the observed head. Do not cancel or bypass any owned work.
-    let expected_empty_close = observed.generation.checked_add(1) == Some(current.generation)
-        && volume.root_xattr(XATTR_EMPTY_RECOVERY)
-            == Some(
-                empty_recovery_marker(crate::ltfs::volume::CommittedIndexConstruct {
-                    volume_uuid: observed.volume_uuid,
-                    generation: observed.generation,
-                    location: observed.location,
-                    sha256: observed.sha256,
-                    incremental: observed.incremental,
-                })
-                .as_str(),
-            );
-    if current != observed
-        && !current.incremental
-        && volume.recovery().dp.tail == TailKind::Complete
-        && !expected_empty_close
-        && catalog
-            .may_defer_unobserved_media(serial, owner_epoch, observed, current)
+) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<ActiveMediaRecovered<'a>>> + 'b>> {
+    Box::pin(async move {
+        let current = ActiveIndexIdentity::from(volume.verified_recovery_index_construct()?);
+        let observed = catalog
+            .observed_active_volume_index(serial, current.volume_uuid)
             .await
-            .map_err(|error| catalog_error("核对待导入介质占用", error))?
-    {
-        return Err(TapeError::MediaImportRequired {
-            volume: current.volume_uuid,
-            observed_generation: observed.generation,
-            media_generation: current.generation,
-        });
-    }
-    let status = catalog
-        .active_batch_status(serial, current.volume_uuid, current.generation)
-        .await
-        .map_err(|error| catalog_error("接任核对物理批次", error))?;
-    if current == observed {
-        if let Some(batch) = status {
-            if batch.completed {
-                return recover_active_media_tail(catalog, volume, serial, owner_epoch).await;
-            }
-            if batch.phase == ActiveBatchPhase::Sealed {
-                if volume.recovery().dp.tail != TailKind::Complete {
-                    return Err(TapeError::Catalog("已观察批次的介质尾部不完整".into()));
+            .map_err(|error| catalog_error("接任核对已观察索引", error))?;
+        // An explicit import must remain possible when an external clean Full
+        // replaced the observed head. Do not cancel or bypass any owned work.
+        let expected_empty_close = observed.generation.checked_add(1) == Some(current.generation)
+            && volume.root_xattr(XATTR_EMPTY_RECOVERY)
+                == Some(
+                    empty_recovery_marker(crate::ltfs::volume::CommittedIndexConstruct {
+                        volume_uuid: observed.volume_uuid,
+                        generation: observed.generation,
+                        location: observed.location,
+                        sha256: observed.sha256,
+                        incremental: observed.incremental,
+                    })
+                    .as_str(),
+                );
+        if current != observed
+            && !current.incremental
+            && volume.recovery().dp.tail == TailKind::Complete
+            && !expected_empty_close
+            && catalog
+                .may_defer_unobserved_media(serial, owner_epoch, observed, current)
+                .await
+                .map_err(|error| catalog_error("核对待导入介质占用", error))?
+        {
+            return Err(TapeError::MediaImportRequired {
+                volume: current.volume_uuid,
+                observed_generation: observed.generation,
+                media_generation: current.generation,
+            });
+        }
+        let status = catalog
+            .active_batch_status(serial, current.volume_uuid, current.generation)
+            .await
+            .map_err(|error| catalog_error("接任核对物理批次", error))?;
+        if current == observed {
+            if let Some(batch) = status {
+                if batch.completed {
+                    return recover_active_media_tail(catalog, volume, serial, owner_epoch).await;
                 }
-                return resume_observed_active_media_batch(catalog, volume, serial, owner_epoch)
+                if batch.phase == ActiveBatchPhase::Sealed {
+                    if volume.recovery().dp.tail != TailKind::Complete {
+                        return Err(TapeError::Catalog("已观察批次的介质尾部不完整".into()));
+                    }
+                    return resume_observed_active_media_batch(
+                        catalog,
+                        volume,
+                        serial,
+                        owner_epoch,
+                    )
                     .await;
+                }
+                return Err(TapeError::Catalog("已观察代数存在未封存批次".into()));
             }
-            return Err(TapeError::Catalog("已观察代数存在未封存批次".into()));
+            return recover_active_media_tail(catalog, volume, serial, owner_epoch).await;
         }
-        return recover_active_media_tail(catalog, volume, serial, owner_epoch).await;
-    }
-    if observed.generation.checked_add(1) != Some(current.generation) {
-        return Err(TapeError::Catalog("接任介质代数与 FDB 观察不连续".into()));
-    }
-    if let Some(batch) = status
-        && batch.phase == ActiveBatchPhase::Sealed
-    {
-        if volume.recovery().dp.tail != TailKind::Complete {
-            return Err(TapeError::Catalog("未观察封存批次的介质尾部不完整".into()));
+        if observed.generation.checked_add(1) != Some(current.generation) {
+            return Err(TapeError::Catalog("接任介质代数与 FDB 观察不连续".into()));
         }
-        let committed =
-            recover_sealed_active_media_batch(catalog, volume, serial, owner_epoch).await?;
-        let committed = publish_active_media_batch(catalog, committed).await?;
-        return Ok(ActiveMediaRecovered {
-            index: committed.current,
-            volume: committed.volume,
-        });
-    }
-    recover_active_media_tail(catalog, volume, serial, owner_epoch).await
+        if let Some(batch) = status
+            && batch.phase == ActiveBatchPhase::Sealed
+        {
+            if volume.recovery().dp.tail != TailKind::Complete {
+                return Err(TapeError::Catalog("未观察封存批次的介质尾部不完整".into()));
+            }
+            let committed =
+                recover_sealed_active_media_batch(catalog, volume, serial, owner_epoch).await?;
+            let committed = publish_active_media_batch(catalog, committed).await?;
+            return Ok(ActiveMediaRecovered {
+                index: committed.current,
+                volume: committed.volume,
+            });
+        }
+        recover_active_media_tail(catalog, volume, serial, owner_epoch).await
+    })
 }
 
 /// Enter FDB's Active authority only after the Raft execution permit and the
@@ -351,86 +358,91 @@ pub async fn reconcile_active_media_on_takeover<'a>(
 /// leaves the advanced epoch as a fence; the same round may safely retry.
 /// Node attempts resume before generic file recovery. `node_budget` bounds
 /// loading their original request/plan and reconstructing canonical inputs.
-pub async fn establish_active_media_owner<'a>(
-    catalog: &ManagedCatalog,
+pub fn establish_active_media_owner<'a: 'b, 'b>(
+    catalog: &'b ManagedCatalog,
     mut volume: LtfsVolume<'a>,
-    serial: &str,
+    serial: &'b str,
     key: ReservationKey,
-    permission: &Permission,
+    permission: &'b Permission,
     node_budget: usize,
-) -> Result<ActiveMediaRecovered<'a>> {
-    let round = key.round();
-    if !key.is_ours()
-        || round == 0
-        || !(permission.allows(round, Phase::Execution) || permission.allows(round, Phase::Serving))
-    {
-        return Err(TapeError::NotReady(
-            "FDB 接任缺少当前轮次的多数派执行许可".into(),
-        ));
-    }
-    if volume.guarded_execution() != Some((round, permission as *const Permission as usize)) {
-        return Err(TapeError::NotReady(
-            "FDB 接任卷未使用当前轮次的多数派许可设备守护".into(),
-        ));
-    }
-    volume.set_reservation_guard(Some(key));
-    volume.verified_recovery_index_construct()?;
-    match catalog
-        .claim_active_owner_epoch(serial, round)
-        .await
-        .map_err(|error| catalog_error("接任推进 FDB owner", error))?
-    {
-        ActiveOwnerOutcome::Advanced | ActiveOwnerOutcome::AlreadyCurrent => {}
-        ActiveOwnerOutcome::Stale => {
-            return Err(TapeError::Catalog("FDB owner 已由更新轮次持有".into()));
+) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<ActiveMediaRecovered<'a>>> + 'b>> {
+    Box::pin(async move {
+        let round = key.round();
+        if !key.is_ours()
+            || round == 0
+            || !(permission.allows(round, Phase::Execution)
+                || permission.allows(round, Phase::Serving))
+        {
+            return Err(TapeError::NotReady(
+                "FDB 接任缺少当前轮次的多数派执行许可".into(),
+            ));
         }
-    }
-    if !(permission.allows(round, Phase::Execution) || permission.allows(round, Phase::Serving)) {
-        return Err(TapeError::NotReady(
-            "FDB 接任期间多数派执行许可已失效".into(),
-        ));
-    }
-    let source = volume.verified_recovery_index_construct()?;
-    let (route, current_owner) = catalog
-        .active_library_owner(serial)
-        .await
-        .map_err(|error| catalog_error("接任核对当前路由", error))?
-        .ok_or_else(|| TapeError::Catalog("接任带库活动路由缺失".into()))?;
-    if current_owner != round {
-        return Err(TapeError::OwnershipLost {
-            device: serial.into(),
-            detail: "节点恢复前 FDB owner 已改变".into(),
-        });
-    }
-    if let Some(attempt) = catalog
-        .pending_node_mutation_attempt(serial, route, round, source.volume_uuid)
-        .await
-        .map_err(|error| catalog_error("接任发现原节点尝试", error))?
-    {
-        let (epoch, operation) = attempt.request_identity();
-        let task = catalog
-            .node_mutation_task(serial, route, epoch, operation)
+        if volume.guarded_execution() != Some((round, permission as *const Permission as usize)) {
+            return Err(TapeError::NotReady(
+                "FDB 接任卷未使用当前轮次的多数派许可设备守护".into(),
+            ));
+        }
+        volume.set_reservation_guard(Some(key));
+        volume.verified_recovery_index_construct()?;
+        match catalog
+            .claim_active_owner_epoch(serial, round)
             .await
-            .map_err(|error| catalog_error("接任加载原节点任务", error))?
-            .ok_or_else(|| TapeError::Catalog("待恢复节点尝试缺少原任务".into()))?;
-        volume = Box::pin(super::fdb_node_media::execute_node_mutation(
-            catalog,
-            volume,
-            route,
-            key,
-            &task,
-            node_budget,
-        ))
-        .await?
-        .into_volume();
-    }
-    if !(permission.allows(round, Phase::Execution) || permission.allows(round, Phase::Serving)) {
-        return Err(TapeError::NotReady(
-            "FDB 节点恢复期间多数派执行许可已失效".into(),
-        ));
-    }
-    volume.verified_recovery_index_construct()?;
-    reconcile_active_media_on_takeover(catalog, volume, serial, round).await
+            .map_err(|error| catalog_error("接任推进 FDB owner", error))?
+        {
+            ActiveOwnerOutcome::Advanced | ActiveOwnerOutcome::AlreadyCurrent => {}
+            ActiveOwnerOutcome::Stale => {
+                return Err(TapeError::Catalog("FDB owner 已由更新轮次持有".into()));
+            }
+        }
+        if !(permission.allows(round, Phase::Execution) || permission.allows(round, Phase::Serving))
+        {
+            return Err(TapeError::NotReady(
+                "FDB 接任期间多数派执行许可已失效".into(),
+            ));
+        }
+        let source = volume.verified_recovery_index_construct()?;
+        let (route, current_owner) = catalog
+            .active_library_owner(serial)
+            .await
+            .map_err(|error| catalog_error("接任核对当前路由", error))?
+            .ok_or_else(|| TapeError::Catalog("接任带库活动路由缺失".into()))?;
+        if current_owner != round {
+            return Err(TapeError::OwnershipLost {
+                device: serial.into(),
+                detail: "节点恢复前 FDB owner 已改变".into(),
+            });
+        }
+        if let Some(attempt) = catalog
+            .pending_node_mutation_attempt(serial, route, round, source.volume_uuid)
+            .await
+            .map_err(|error| catalog_error("接任发现原节点尝试", error))?
+        {
+            let (epoch, operation) = attempt.request_identity();
+            let task = catalog
+                .node_mutation_task(serial, route, epoch, operation)
+                .await
+                .map_err(|error| catalog_error("接任加载原节点任务", error))?
+                .ok_or_else(|| TapeError::Catalog("待恢复节点尝试缺少原任务".into()))?;
+            volume = Box::pin(super::fdb_node_media::execute_node_mutation(
+                catalog,
+                volume,
+                route,
+                key,
+                &task,
+                node_budget,
+            ))
+            .await?
+            .into_volume();
+        }
+        if !(permission.allows(round, Phase::Execution) || permission.allows(round, Phase::Serving))
+        {
+            return Err(TapeError::NotReady(
+                "FDB 节点恢复期间多数派执行许可已失效".into(),
+            ));
+        }
+        volume.verified_recovery_index_construct()?;
+        reconcile_active_media_on_takeover(catalog, volume, serial, round).await
+    })
 }
 
 /// Rebuild a sealed but unobserved S4 batch from the mounted committed index.
@@ -1266,16 +1278,40 @@ async fn capture_replacement_metadata(
             return Err(TapeError::Catalog("覆盖属性与原文件身份或版本不符".into()));
         }
         let relocation = catalog
-            .reclaim_upload_attempt(route, intent.owner_epoch, &intent.request())
+            .reclaim_upload_read_source(route, intent.owner_epoch, &intent.request())
             .await
-            .map_err(|error| catalog_error("核对回收属性用途", error))?
-            .is_some();
-        let (metadata, bytes) = if relocation {
+            .map_err(|error| catalog_error("核对回收属性用途", error))?;
+        let (mut metadata, mut bytes) = if relocation.is_some() {
             attributes.data_relocation()
         } else {
             attributes.content_replacement()
         }
         .map_err(|error| catalog_error("构建覆盖或迁移属性", error))?;
+        if let Some(md5) = relocation.as_ref().and_then(|s| s.byte_proof().md5()) {
+            let attr = crate::ltfs::index::Xattr {
+                key: crate::ltfs::index::XATTR_MD5.into(),
+                value: md5.iter().map(|byte| format!("{byte:02x}")).collect(),
+                base64: false,
+            };
+            if let Some(old) = metadata.xattrs.iter().find(|a| a.key == attr.key) {
+                let expected = crate::managed_catalog::ContentDigest::from_ltfs_xattrs(
+                    std::slice::from_ref(old),
+                )
+                .map_err(|e| catalog_error("核对原回收 MD5 属性", e))?;
+                if expected != crate::managed_catalog::ContentDigest::Md5(md5) {
+                    return Err(TapeError::Catalog("原别名 MD5 与实读正文不同".into()));
+                }
+            } else {
+                bytes = bytes
+                    .checked_add(
+                        serde_json::to_vec(&attr)
+                            .map_err(|e| catalog_error("核对回收 MD5 预算", e))?
+                            .len(),
+                    )
+                    .ok_or_else(|| TapeError::Catalog("回收 MD5 属性预算溢出".into()))?;
+                metadata.xattrs.push(attr);
+            }
+        }
         remaining = remaining
             .checked_sub(bytes)
             .ok_or_else(|| TapeError::Catalog("覆盖属性超过批次字节预算".into()))?;

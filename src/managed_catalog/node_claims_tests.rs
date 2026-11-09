@@ -138,3 +138,55 @@ fn reclaim_metadata_claim_retains_typed_original_identity_and_rejects_other_payl
     wrong_type[1] = 1;
     assert!(decode(&wrong_type).is_err());
 }
+
+#[test]
+fn reclaim_format_claim_binds_original_source_output_and_parent_goal_key() {
+    let ns = Uuid::new_v4();
+    let mut task = management::prefix(ns, b'R');
+    task.push(b'F');
+    let offset = task.len();
+    task.extend_from_slice(&7u64.to_be_bytes());
+    task.extend_from_slice(Uuid::new_v4().as_bytes());
+    let value = ReclaimFormatVolumeClaim {
+        namespace: ns.to_string(),
+        volume: Uuid::new_v4().to_string(),
+        output: Uuid::new_v4().to_string(),
+        task,
+        fingerprint: [7; 32],
+    };
+    let claim = NodeVolumeClaim::ReclaimFormat(Box::new(value.clone()));
+    let raw = encode(&claim).unwrap();
+    assert_eq!(decode(&raw).unwrap(), claim);
+    for changed in [
+        {
+            let mut c = value.clone();
+            c.output = c.volume.clone();
+            c
+        },
+        {
+            let mut c = value.clone();
+            c.namespace = Uuid::new_v4().to_string();
+            c
+        },
+        {
+            let mut c = value.clone();
+            c.task[offset..offset + 8].fill(0);
+            c
+        },
+        {
+            let mut c = value.clone();
+            c.task[offset + 8..].fill(0);
+            c
+        },
+        {
+            let mut c = value.clone();
+            c.task[offset - 1] = b'W';
+            c
+        },
+    ] {
+        assert!(encode(&NodeVolumeClaim::ReclaimFormat(Box::new(changed))).is_err());
+    }
+    let mut wrong = raw;
+    wrong[1] = 2;
+    assert!(decode(&wrong).is_err(), "格式化不能冒充普通元数据写占用");
+}

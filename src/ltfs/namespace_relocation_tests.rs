@@ -89,6 +89,162 @@ fn expected_meta(uid: u64) -> NodeMeta {
 }
 
 #[test]
+fn reclaim_node_creation_preserves_full_metadata_without_touching_existing_nodes() {
+    let mut index = index();
+    let before = index.clone();
+    let original = directory();
+    let expected = original.reclaimed_metadata_node("/archive", 5).unwrap();
+    index
+        .reference_reclaimed_node("/archive", 5, &original)
+        .unwrap();
+    assert_eq!(
+        index.find_directory("/archive").unwrap().meta,
+        expected_meta(5)
+    );
+    assert_eq!(index.find_directory("/archive").unwrap().xattrs, xattrs());
+    assert_eq!(
+        index.root.meta, before.root.meta,
+        "原父节点的时间不能被随手重写"
+    );
+    assert_eq!(index.root.files, before.root.files);
+    assert_eq!(
+        index.root.subdirs[..before.root.subdirs.len()],
+        before.root.subdirs
+    );
+    assert_eq!(index.highest_file_uid, 5);
+    let IndexEntry::Directory { node, .. } = expected else {
+        panic!("directory")
+    };
+    assert_eq!(index.find_directory("archive"), Some(&node));
+    let link = link();
+    index
+        .reference_reclaimed_node("archive/link", 6, &link)
+        .unwrap();
+    let target = index.find_file("archive/link").unwrap();
+    assert_eq!(target.meta, expected_meta(6));
+    assert_eq!(target.xattrs, xattrs());
+    assert_eq!(target.symlink.as_deref(), Some("../missing"));
+    assert_eq!(target.open_for_write, Some(false));
+    assert!(target.extents.is_empty());
+}
+
+#[test]
+fn reclaim_node_creation_rejects_stale_uids_collisions_and_invalid_sources_atomically() {
+    let mut invalid = vec![directory(), link()];
+    if let IndexEntry::Directory { node, .. } = &mut invalid[0] {
+        node.files.push(FileNode::default());
+    }
+    if let IndexEntry::File { node, .. } = &mut invalid[1] {
+        node.extents.push(Extent {
+            partition: 'b',
+            start_block: 3,
+            byte_count: 1,
+            byte_offset: 0,
+            file_offset: 0,
+        });
+    }
+    for (path, uid, source) in [
+        ("/archive", 4, directory()),
+        ("/archive", 6, directory()),
+        ("/kept", 5, directory()),
+        ("/link", 5, directory()),
+        ("/missing/child", 5, directory()),
+        ("/", 5, directory()),
+        ("/archive//child", 5, directory()),
+    ]
+    .into_iter()
+    .chain(invalid.into_iter().map(|source| ("/archive", 5, source)))
+    {
+        let mut index = index();
+        let before = index.to_xml().unwrap();
+        assert!(
+            index.reference_reclaimed_node(path, uid, &source).is_err(),
+            "{path}/{uid}"
+        );
+        assert_eq!(index.to_xml().unwrap(), before);
+    }
+}
+
+#[test]
+fn reclaimed_new_node_is_published_only_after_a_guarded_commit() {
+    use crate::ltfs::volume::LtfsVolume;
+    let (library, device) = media();
+    let key = crate::scsi::reservation::ReservationKey::new(1, 13);
+    crate::scsi::reservation::fence(&device, key).unwrap();
+    let mut volume = LtfsVolume::mount(&device).unwrap();
+    volume.set_reservation_guard(Some(key));
+    let uid = volume.index().highest_file_uid + 1;
+    let count = device.command_log().len();
+    volume
+        .reference_reclaimed_node("/archive", uid, &directory())
+        .unwrap();
+    assert!(volume.index().find_directory("archive").is_none());
+    assert_eq!(device.command_log().len(), count, "纯暂存不得发CDB");
+    volume.commit_incremental().unwrap();
+    drop(volume);
+    library.power_cut();
+    let mounted = LtfsVolume::mount(&device).unwrap();
+    let node = mounted.index().find_directory("archive").unwrap();
+    assert_eq!(node.meta, expected_meta(uid));
+    assert_eq!(node.xattrs, xattrs());
+}
+
+#[test]
+fn reclaimed_new_node_keeps_an_unknown_commit_frozen_until_actual_readback() {
+    use crate::ltfs::volume::LtfsVolume;
+    use crate::scsi::{
+        cdb::opcode,
+        sim::{Fault, FaultAction},
+    };
+    for command in [opcode::WRITE_6, opcode::WRITE_ATTRIBUTE] {
+        let (library, device) = media();
+        let key = crate::scsi::reservation::ReservationKey::new(1, 14);
+        crate::scsi::reservation::fence(&device, key).unwrap();
+        let mut volume = LtfsVolume::mount(&device).unwrap();
+        volume.set_reservation_guard(Some(key));
+        let uid = volume.index().highest_file_uid + 1;
+        volume
+            .reference_reclaimed_node("/archive-link", uid, &link())
+            .unwrap();
+        device.inject(Fault {
+            opcode: command,
+            action: FaultAction::CheckCondition {
+                sense_key: 3,
+                asc: 0x0c,
+                ascq: 0,
+            },
+            after: 0,
+            remaining: 1,
+        });
+        assert!(matches!(
+            volume.commit_incremental(),
+            Err(TapeError::CommitFailed { .. })
+        ));
+        assert!(volume.index().find_file("archive-link").is_none());
+        assert!(!volume.writable());
+        let count = device.command_log().len();
+        assert!(
+            volume
+                .reference_reclaimed_node("/archive-link", uid, &link())
+                .is_err()
+        );
+        assert_eq!(device.command_log().len(), count, "未知提交不原地重放");
+        drop(volume);
+        library.power_cut();
+        let recovered = LtfsVolume::mount(&device).unwrap();
+        let actual = recovered.index().find_file("archive-link");
+        if command == opcode::WRITE_6 {
+            assert!(actual.is_none());
+        } else {
+            let actual = actual.unwrap();
+            assert_eq!(actual.meta, expected_meta(uid));
+            assert_eq!(actual.xattrs, xattrs());
+            assert_eq!(actual.symlink.as_deref(), Some("../missing"));
+        }
+    }
+}
+
+#[test]
 fn root_and_directory_preservation_keeps_children_uids_and_all_original_attributes() {
     let mut index = index();
     let children = index.root.subdirs.clone();

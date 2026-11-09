@@ -18,7 +18,10 @@ fn encode(progress: &ReclaimSourceProgress) -> Result<Vec<u8>> {
     }
     Ok(raw)
 }
-fn validate(progress: &ReclaimSourceProgress, reservation: &ReclaimReservation) -> Result<()> {
+pub(super) fn validate(
+    progress: &ReclaimSourceProgress,
+    reservation: &ReclaimReservation,
+) -> Result<()> {
     let counts = &progress.counts;
     let expected = &progress.summary.counts;
     if progress.version != 1
@@ -107,7 +110,8 @@ pub(super) async fn require_complete_at(
 /// children. Clearing only its read-proof prefix cannot erase tape contents.
 pub(in super::super) fn clear_reserved_at(tr: &Transaction, reservation: &ReclaimReservation) {
     tr.clear(&own_key(reservation, b'm'));
-    for kind in *b"en" {
+    tr.clear(&own_key(reservation, b'y'));
+    for kind in *b"enq" {
         let prefix = own_key(reservation, kind);
         tr.clear_range(&prefix, &prefix_end(&prefix));
     }

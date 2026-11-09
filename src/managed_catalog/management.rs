@@ -72,6 +72,12 @@ pub(super) fn clear_queued(tr: &Transaction, request: &ManagementRequest) {
     ));
 }
 async fn project_progress(tr: &Transaction, value: &mut Value) -> Result<()> {
+    if value["request"]["change"]["kind"] == "media-reclaim" {
+        let progress = reclaim::management_progress_at(tr, value).await?;
+        if let Some(progress) = progress {
+            value["progress"] = progress;
+        }
+    }
     if matches!(
         value["request"]["change"]["kind"].as_str(),
         Some("media-import" | "media-unassign" | "media-validate" | "media-online")
@@ -205,7 +211,7 @@ fn task(bytes: &[u8], serial: &str, namespace: Uuid, epoch: u64, operation: Uuid
     } else if value["status"] == "running" {
         if !(matches!(
             request.value()["change"]["kind"].as_str(),
-            Some("media-import")
+            Some("media-import" | "media-reclaim")
         ) || request.value()["change"]["kind"]
             .as_str()
             .is_some_and(device_kind))
@@ -248,6 +254,19 @@ async fn require_queue(
     }
     Ok(())
 }
+pub(super) async fn has_task_at(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    epoch: u64,
+    operation: Uuid,
+) -> Result<bool> {
+    Ok(tr
+        .get(&identity_key(ns, serial, b'o', epoch, operation), false)
+        .await?
+        .is_some())
+}
+
 pub(super) async fn read_task_at(
     tr: &Transaction,
     ns: Uuid,
@@ -434,6 +453,15 @@ impl ManagedCatalog {
                         let mut value = read_task_at(&tr, ns, serial, epoch, operation)
                             .await?
                             .ok_or(CatalogError::Invalid("管理请求不存在"))?;
+                        if value["status"] == "running"
+                            && value["request"]["change"]["kind"] == "media-reclaim"
+                        {
+                            return reclaim::cancel_reserved_management_at(
+                                &tr, serial, route, owner, &value,
+                            )
+                            .await
+                            .map_err(notifications::atomic_error);
+                        }
                         if value["status"] == "running"
                             && matches!(
                                 value["request"]["change"]["kind"].as_str(),

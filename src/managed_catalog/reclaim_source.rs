@@ -11,9 +11,17 @@ const MAX_ROW: usize = 48_000;
 #[path = "reclaim_source_ledger.rs"]
 mod ledger;
 pub(super) use ledger::clear_reserved_at;
+#[path = "reclaim_source_coverage.rs"]
+mod coverage;
+pub use coverage::ReclaimCoverageProgress;
+pub(super) use coverage::completed_at as copy_coverage_complete_at;
+pub(super) use coverage::require_complete_at as require_complete_coverage_at;
 #[path = "reclaim_source_read.rs"]
 mod read;
 pub use read::{ReclaimReadSource, ReclaimSourceRead};
+#[path = "reclaim_raw_source_read.rs"]
+mod raw_read;
+pub use raw_read::{ReclaimRawReadContext, ReclaimRawSourceRead};
 #[path = "reclaim_data_relocation.rs"]
 mod relocation;
 pub(super) use relocation::require_no_data_at;
@@ -33,9 +41,14 @@ pub use metadata_observation::{
 #[path = "reclaim_metadata_write.rs"]
 mod metadata_write;
 pub(super) use metadata_write::require_idle_at as require_metadata_idle_at;
-pub(in crate::managed_catalog) use metadata_write::require_publication_at;
 pub use metadata_write::{
-    ReclaimMetadataAdmission, ReclaimMetadataPublication, ReclaimMetadataWrite,
+    ReclaimMetadataAdmission, ReclaimMetadataCheckpointEvidence, ReclaimMetadataDonorContext,
+    ReclaimMetadataDonorEvidence, ReclaimMetadataPublication, ReclaimMetadataRecoveryEvidence,
+    ReclaimMetadataRecoveryKind, ReclaimMetadataResolution, ReclaimMetadataSourceReplanContext,
+    ReclaimMetadataSourceReplanEvidence, ReclaimMetadataWrite,
+};
+pub(in crate::managed_catalog) use metadata_write::{
+    require_publication_at, require_resolution_at, require_resolution_commit_at,
 };
 #[path = "reclaim_file_metadata.rs"]
 mod metadata;
@@ -44,6 +57,14 @@ pub use metadata::{ReclaimFileMetadata, ReclaimMetadataProgress};
 #[path = "reclaim_node_metadata.rs"]
 mod node_metadata;
 pub use node_metadata::{ReclaimNodeDestination, ReclaimNodeMetadata, ReclaimNodeReadRequest};
+
+#[path = "reclaim_native_link.rs"]
+mod native_link;
+
+#[path = "reclaim_format_source.rs"]
+mod format_source;
+pub(super) use format_source::FormatSourceFact;
+pub use format_source::ReclaimFormatSourceEvidence;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -368,3 +389,31 @@ impl ReclaimSourceProgress {
 #[cfg(test)]
 #[path = "reclaim_source_tests.rs"]
 mod tests;
+
+pub(super) fn own_format_key(reservation: &ReclaimReservation) -> Vec<u8> {
+    ledger::own_key(reservation, b'F')
+}
+
+impl ManagedCatalog {
+    /// Original read-only source scope before its full inventory is sealed.
+    /// The caller must still verify the medium and owner/PR before every CDB.
+    pub async fn reclaim_source_head(
+        &self,
+        reservation: &ReclaimReservation,
+        owner: u64,
+    ) -> Result<ActiveIndexIdentity> {
+        let tr = self.db.create_trx()?;
+        let parent = record_at(&tr, reservation, owner).await?;
+        if parent["owner_epoch"] != owner {
+            return Err(CatalogError::OwnerFenced);
+        }
+        if parent["phase"] == "reformatting" {
+            return Err(CatalogError::Invalid(
+                "原源卷已进入格式化阶段，不能重读旧索引",
+            ));
+        }
+        source_state_at(&tr, reservation)
+            .await
+            .map(|(_, head)| head)
+    }
+}

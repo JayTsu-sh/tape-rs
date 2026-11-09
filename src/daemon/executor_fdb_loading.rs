@@ -68,6 +68,243 @@ pub(super) async fn guard(
         })?;
     Ok(())
 }
+/// Only a sealed original child can use the parent's reserved data lane.
+pub(super) async fn upload_guard(
+    owner: &Active,
+    permit: &Permission,
+    control: &FdbOwnerControl,
+    parent: Option<&crate::managed_catalog::ReclaimReservation>,
+    request: &crate::managed_catalog::ActiveFileRequest,
+) -> std::result::Result<(), ReadError> {
+    if let Some(parent) = parent {
+        authority_guard(owner, permit, control).await?;
+        control
+            .catalog
+            .require_reclaim_upload_lane(parent, owner.round, request)
+            .await
+            .map_err(lost)
+    } else {
+        guard(owner, permit, control).await
+    }
+}
+
+/// Read-only selection of the already loaded fixed destination. Loading and
+/// movement belong to the parent's separately persisted mechanical commands.
+pub(super) async fn reclaim_write_binding(
+    owner: &Active,
+    control: &FdbOwnerControl,
+    original: (
+        &crate::managed_catalog::ReclaimReservation,
+        &crate::managed_catalog::ActiveFileRequest,
+    ),
+    volume: uuid::Uuid,
+    barcode: &str,
+    drive: usize,
+) -> std::result::Result<crate::managed_catalog::ReclaimLayout, ReadError> {
+    let (parent, request) = original;
+    control
+        .catalog
+        .require_reclaim_upload_lane(parent, owner.round, request)
+        .await
+        .map_err(lost)?;
+    let layout = control
+        .catalog
+        .reclaim_layout(parent, owner.round)
+        .await
+        .map_err(lost)?
+        .ok_or_else(|| lost("原回收固定布局缺失"))?;
+    let dest = &layout.destination;
+    if dest.volume != volume
+        || dest.barcode != barcode
+        || dest.drive_serial != owner.devices[drive].serial
+    {
+        return Err(lost("回收正文目标改变原固定驱动和介质"));
+    }
+    let current = policy(owner, control, &[parent.spec().pool()], Some(barcode)).await?;
+    if !tape_allowed(&current, barcode)
+        || !super::super::management::drive_allowed(&current, &dest.drive_serial, 'm')
+    {
+        return Err(lost("原回收目的策略已禁止访问"));
+    }
+    Ok(layout)
+}
+pub(super) async fn select_reclaim_write(
+    owner: &Active,
+    permit: &Permission,
+    control: &FdbOwnerControl,
+    placement: &VolumePlacement,
+    index: ActiveIndexIdentity,
+    original: (
+        &crate::managed_catalog::ReclaimReservation,
+        &crate::managed_catalog::ActiveFileRequest,
+    ),
+) -> std::result::Result<usize, ReadError> {
+    select_fixed_reclaim(
+        owner,
+        permit,
+        control,
+        placement,
+        index,
+        original,
+        ReclaimAccess::NewData,
+    )
+    .await
+}
+pub(super) async fn select_reclaim_recovery(
+    owner: &Active,
+    permit: &Permission,
+    control: &FdbOwnerControl,
+    placement: &VolumePlacement,
+    index: ActiveIndexIdentity,
+    original: (
+        &crate::managed_catalog::ReclaimReservation,
+        &crate::managed_catalog::ActiveFileRequest,
+    ),
+) -> std::result::Result<usize, ReadError> {
+    select_fixed_reclaim(
+        owner,
+        permit,
+        control,
+        placement,
+        index,
+        original,
+        ReclaimAccess::RecoverOriginal,
+    )
+    .await
+}
+enum ReclaimAccess {
+    NewData,
+    RecoverOriginal,
+}
+async fn select_fixed_reclaim(
+    owner: &Active,
+    permit: &Permission,
+    control: &FdbOwnerControl,
+    placement: &VolumePlacement,
+    index: ActiveIndexIdentity,
+    original: (
+        &crate::managed_catalog::ReclaimReservation,
+        &crate::managed_catalog::ActiveFileRequest,
+    ),
+    access: ReclaimAccess,
+) -> std::result::Result<usize, ReadError> {
+    upload_guard(owner, permit, control, Some(original.0), original.1).await?;
+    let layout = control
+        .catalog
+        .reclaim_layout(original.0, owner.round)
+        .await
+        .map_err(lost)?
+        .ok_or_else(|| lost("回收固定布局缺失"))?;
+    let drive = owner
+        .devices
+        .iter()
+        .position(|d| d.kind == DeviceKind::Drive && d.serial == layout.destination.drive_serial)
+        .ok_or_else(|| lost("原回收目的驱动器缺失"))?;
+    let changer = owner
+        .devices
+        .iter()
+        .find(|d| d.kind == DeviceKind::Changer)
+        .ok_or_else(|| lost("回收换带器缺失"))?;
+    let check = || {
+        futures_executor::block_on(async {
+            reclaim_write_binding(
+                owner,
+                control,
+                original,
+                placement.volume_id,
+                &placement.barcode,
+                drive,
+            )
+            .await?;
+            let head = control
+                .catalog
+                .active_loaded_volume_head(
+                    &control.serial,
+                    &placement.barcode,
+                    control.route,
+                    owner.round,
+                )
+                .await
+                .map_err(lost)?
+                .ok_or_else(|| lost("回收写入卷头缺失"))?;
+            if head.index != index || head.pool_id != placement.pool_id {
+                return Err(lost("回收写入原卷头改变"));
+            }
+            Ok(())
+        })
+        .map_err(|e: ReadError| TapeError::Catalog(e.to_string()))
+    };
+    let checked = operation_guard(owner, permit, changer.dev.as_ref(), &check);
+    let mut robot = MediumChanger::new(&checked);
+    if robot.load_address_map().map_err(lost)? != &layout.map {
+        return Err(lost("回收原 address map 改变"));
+    }
+    let rows = robot.read_all_status().map_err(lost)?;
+    let dest = &layout.destination;
+    if rows
+        .iter()
+        .filter(|r| r.full && r.volume_tag.as_deref() == Some(dest.barcode.as_str()))
+        .count()
+        != 1
+        || !rows.iter().any(|r| {
+            r.address == dest.address
+                && r.full
+                && r.volume_tag.as_deref() == Some(dest.barcode.as_str())
+                && r.source_address == Some(dest.home)
+                && r.drive_id.as_deref() == Some(dest.drive_serial.as_str())
+        })
+    {
+        return Err(lost("原回收目的尚未装入固定驱动器"));
+    }
+    checked.verify_proof().map_err(lost)?;
+    let device = operation_guard(owner, permit, owner.devices[drive].dev.as_ref(), &check);
+    if crate::scsi::inquiry::read_unit_serial(&device).as_deref()
+        != Some(dest.drive_serial.as_str())
+    {
+        return Err(lost("实际回收目的驱动序列号不同"));
+    }
+    let label = crate::ltfs::volume::read_label_only(&device).map_err(lost)?;
+    let raw = crate::scsi::transport::retry_unit_attention("回收目的密度查询", || {
+        TapeDrive::new(&device).report_density_support(false)
+    })
+    .map_err(lost)?;
+    if label.volume_uuid != dest.volume
+        || !super::super::scheduling::densities(&raw)
+            .is_some_and(|d| super::super::scheduling::compatible(&d, &dest.barcode, true))
+    {
+        return Err(lost("原回收目的标签或密度不同"));
+    }
+    device.verify_proof().map_err(lost)?;
+    fdb_monitor::sample_for_reclaim(
+        owner,
+        permit,
+        control,
+        drive,
+        &dest.barcode,
+        dest.volume,
+        original,
+    )
+    .await?;
+    match access {
+        ReclaimAccess::NewData => {
+            fdb_monitor::write_allowed(owner, control, &dest.barcode, true).await?
+        }
+        ReclaimAccess::RecoverOriginal => {
+            if control
+                .catalog
+                .active_tape_monitor(&control.serial, control.route, &dest.barcode)
+                .await
+                .map_err(lost)?
+                .is_some_and(|r| !r.recovery_write_allowed())
+            {
+                return Err(ReadError::Busy(
+                    "原复制恢复等待介质写保护或永久故障解除".into(),
+                ));
+            }
+        }
+    }
+    Ok(drive)
+}
 async fn intake_guard(
     owner: &Active,
     permit: &Permission,

@@ -120,6 +120,23 @@ async fn reclaim_prepared_cancel_settles_original_permit_once_and_survives_gc_an
         .await
         .unwrap();
     let request = saved.request();
+    assert!(
+        c.begin_reclaim_upload_recovery(&reservation, 100, &request)
+            .await
+            .is_err(),
+        "只封存尚未准入 Q/I 的请求不能创建恢复收尾书签"
+    );
+    assert!(
+        !c.reclaim_upload_recovery_pending(&reservation, 100, &request)
+            .await
+            .unwrap()
+    );
+    assert!(
+        c.retry_cancelled_reclaim_upload(&reservation, 100, &request)
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(
         c.maintenance_status(request.namespace)
             .await
@@ -441,6 +458,179 @@ async fn reclaim_prepared_cancel_settles_original_permit_once_and_survives_gc_an
         c.check_active_pool_gate(&serial, route, 101, pool.id).await,
         Err(CatalogError::PoolBusy)
     ));
+    let parent = &claimed.items[0];
+    let (first, second) = tokio::join!(
+        c.retry_cancelled_reclaim_upload(parent, 101, &request),
+        observer.retry_cancelled_reclaim_upload(parent, 101, &request),
+    );
+    let successor = first.unwrap().unwrap();
+    assert_eq!(second.unwrap(), Some(successor.clone()));
+    assert_ne!(successor.operation(), scanned.operation());
+    assert_eq!(successor.path(), scanned.path());
+    assert_eq!(successor.file_id(), scanned.file_id());
+    assert_eq!(successor.version(), scanned.version());
+    assert_eq!(successor.size(), scanned.size());
+    assert_eq!(
+        c.step_reclaim_walk(parent, 101).await.unwrap().current(),
+        Some(&successor)
+    );
+    assert_eq!(
+        c.maintenance_status(request.namespace)
+            .await
+            .unwrap()
+            .pending,
+        pending_before
+    );
+    // A durable edge is not a new source read, request, or upload admission.
+    assert_eq!(
+        c.reclaim_uploads_page(parent, 101, None, 16)
+            .await
+            .unwrap()
+            .items,
+        vec![request.clone()]
+    );
+    let tr = c.db.create_trx().unwrap();
+    assert_eq!(
+        tr.get(&receipt_key, false).await.unwrap().unwrap().as_ref(),
+        original_receipt
+    );
+    assert!(tr.get(&op, false).await.unwrap().is_none());
+    let mut edge = receipt_key.clone();
+    edge.extend_from_slice(b"/next");
+    let edge_raw = tr.get(&edge, false).await.unwrap().unwrap().to_vec();
+    tr.set(&edge, b"damaged-successor");
+    tr.commit().await.unwrap();
+    assert!(
+        c.retry_cancelled_reclaim_upload(parent, 101, &request)
+            .await
+            .is_err()
+    );
+    let tr = c.db.create_trx().unwrap();
+    tr.set(&edge, &edge_raw);
+    tr.commit().await.unwrap();
+    assert_eq!(
+        observer
+            .retry_cancelled_reclaim_upload(parent, 101, &request)
+            .await
+            .unwrap(),
+        Some(successor.clone())
+    );
+    let source_read = inventory
+        .bind_verified_read(
+            parent,
+            &successor,
+            &original_read.read,
+            source_head,
+            Sha256::digest([]).into(),
+            None,
+        )
+        .unwrap();
+    let spec = ActiveUploadSpec {
+        operation_id: successor.operation(),
+        ..spec
+    };
+    let next = c
+        .prepare_reclaim_upload(parent, 101, "RECLAIMD1L8", &spec, &source_read)
+        .await
+        .unwrap();
+    assert_ne!(next.request().operation_id, request.operation_id);
+    assert!(next.request().request_epoch > request.request_epoch);
+    assert_eq!(
+        c.reclaim_original_file(parent, 101, &request)
+            .await
+            .unwrap(),
+        scanned
+    );
+    assert_eq!(
+        c.maintenance_status(request.namespace)
+            .await
+            .unwrap()
+            .pending,
+        pending_before + 1
+    );
+    let mut retry_intent = next;
+    c.cancel_unstarted_reclaim_upload(parent, 101, &retry_intent.request())
+        .await
+        .unwrap();
+    let mut missing_reverse = receipt_key[..receipt_key.len() - 16].to_vec();
+    missing_reverse.extend_from_slice(retry_intent.operation_id.as_bytes());
+    missing_reverse.extend_from_slice(b"/from");
+    let tr = c.db.create_trx().unwrap();
+    let original_reverse = tr
+        .get(&missing_reverse, false)
+        .await
+        .unwrap()
+        .unwrap()
+        .to_vec();
+    tr.clear(&missing_reverse);
+    tr.commit().await.unwrap();
+    assert!(
+        c.retry_cancelled_reclaim_upload(parent, 101, &retry_intent.request())
+            .await
+            .is_err(),
+        "已固定的后继丢失反向边，不能视为新根重置预算"
+    );
+    let tr = c.db.create_trx().unwrap();
+    tr.set(&missing_reverse, &original_reverse);
+    tr.commit().await.unwrap();
+    for _ in 2..=3 {
+        c.cancel_unstarted_reclaim_upload(parent, 101, &retry_intent.request())
+            .await
+            .unwrap();
+        let next_file = c
+            .retry_cancelled_reclaim_upload(parent, 101, &retry_intent.request())
+            .await
+            .unwrap()
+            .unwrap();
+        let proof = inventory
+            .bind_verified_read(
+                parent,
+                &next_file,
+                &original_read.read,
+                source_head,
+                Sha256::digest([]).into(),
+                None,
+            )
+            .unwrap();
+        let spec = ActiveUploadSpec {
+            operation_id: next_file.operation(),
+            ..spec.clone()
+        };
+        retry_intent = c
+            .prepare_reclaim_upload(parent, 101, "RECLAIMD1L8", &spec, &proof)
+            .await
+            .unwrap();
+    }
+    c.cancel_unstarted_reclaim_upload(parent, 101, &retry_intent.request())
+        .await
+        .unwrap();
+    assert!(
+        c.retry_cancelled_reclaim_upload(parent, 101, &retry_intent.request())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("三次")
+    );
+    assert_eq!(
+        c.retry_cancelled_reclaim_upload(parent, 101, &request)
+            .await
+            .unwrap(),
+        Some(successor)
+    );
+    assert_eq!(
+        c.maintenance_status(request.namespace)
+            .await
+            .unwrap()
+            .pending,
+        pending_before
+    );
+    assert_eq!(
+        c.resolve_active_path_for_route(&serial, &pool_catalog_path(pool.id, path).unwrap(), route)
+            .await
+            .unwrap()
+            .unwrap(),
+        before
+    );
     drop(captured_source);
     std::fs::remove_dir_all(root).unwrap();
 }

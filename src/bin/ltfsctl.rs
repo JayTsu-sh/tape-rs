@@ -396,9 +396,8 @@ enum TapeCmd {
     Set(lifecycle::Set),
     /// 异步核验标签、LTFS 索引和结构；不读取全部文件正文
     Validate(lifecycle::Targets),
-    /// 回收：FDB 原生模式尚未开放，会拒绝此命令。
-    /// 目录模式需要两台驱动器，后台搬迁有效文件后重新格式化源带
-    Reclaim { barcode: String },
+    /// 异步原生回收：同池迁移并实读校验，完整覆盖且零引用后重新初始化源带；须 --yes
+    Reclaim(lifecycle::Reclaim),
 }
 
 fn main() {
@@ -1197,8 +1196,14 @@ fn main() {
                 command,
             )?,
             Cmd::Tape {
-                cmd: TapeCmd::Reclaim { barcode },
-            } => println!("{}", c.tape_reclaim(&barcode)?),
+                cmd: TapeCmd::Reclaim(command),
+            } => lifecycle::reclaim(
+                &tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?,
+                &mut c,
+                args.library.as_deref(),
+                args.pool.as_deref(),
+                command,
+            )?,
             Cmd::Cluster => {
                 let mut failed = false;
                 for e in &args.endpoints {

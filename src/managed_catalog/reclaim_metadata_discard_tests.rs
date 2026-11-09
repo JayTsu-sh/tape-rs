@@ -10,13 +10,13 @@ use crate::scsi::sim::{LogicalObject, SimCartridge, SimLibrary, SimTransport};
 use crate::tape::commands::TapeDrive;
 use metadata_plan::Plan;
 
-struct Scenario {
-    library: SimLibrary,
-    device: SimTransport,
-    before: CapturedIndexSource,
-    plan: ReclaimMetadataPlan,
+pub(in super::super) struct Scenario {
+    pub(in super::super) library: SimLibrary,
+    pub(in super::super) device: SimTransport,
+    pub(in super::super) before: CapturedIndexSource,
+    pub(in super::super) plan: ReclaimMetadataPlan,
 }
-fn capture(device: &SimTransport) -> CapturedIndexSource {
+pub(in super::super) fn capture(device: &SimTransport) -> CapturedIndexSource {
     capture_index_source(
         &TapeDrive::new(device),
         &read_label_only(device).unwrap(),
@@ -24,7 +24,7 @@ fn capture(device: &SimTransport) -> CapturedIndexSource {
     )
     .unwrap()
 }
-fn original(s: &Scenario) -> CapturedIndexSource {
+pub(in super::super) fn original(s: &Scenario) -> CapturedIndexSource {
     capture_recorded_index_source(
         &TapeDrive::new(&s.device),
         &read_label_only(&s.device).unwrap(),
@@ -33,7 +33,7 @@ fn original(s: &Scenario) -> CapturedIndexSource {
     )
     .unwrap()
 }
-fn setup(delta: bool) -> Scenario {
+pub(in super::super) fn setup(delta: bool) -> Scenario {
     let library = SimLibrary::new(1, 2, 1);
     library
         .insert_cartridge(SimCartridge::blank("DSC000L8", 64 << 20), 0)
@@ -108,7 +108,8 @@ fn setup(delta: bool) -> Scenario {
     let mut previous = Vec::new();
     active_volume::encode_index(&mut previous, before.construct().into());
     let plan = ReclaimMetadataPlan(Plan {
-        version: 3,
+        raw_body: None,
+        version: 7,
         parent: "01".repeat(32),
         inventory: [1; 32],
         source: Object::capture(donor_entry.clone()).unwrap(),
@@ -119,6 +120,8 @@ fn setup(delta: bool) -> Scenario {
         previous_dp_eod: current_proof(before.scope(), before.header()).unwrap().0,
         previous_source: before.identity().unwrap().to_bytes(),
         donor: Object::capture(donor_entry).unwrap(),
+        ancestors: Vec::new(),
+        displaced: None,
         expected: Object::capture(IndexEntry::File {
             path: "raw".into(),
             node: expected,

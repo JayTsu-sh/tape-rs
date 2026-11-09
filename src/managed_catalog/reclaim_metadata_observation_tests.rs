@@ -72,7 +72,8 @@ fn observe(previous_delta: bool, current_delta: bool) {
     let mut previous = Vec::new();
     active_volume::encode_index(&mut previous, before.construct().into());
     let plan = ReclaimMetadataPlan(Plan {
-        version: 3,
+        raw_body: None,
+        version: 7,
         parent: "01".repeat(32),
         inventory: [1; 32],
         source: Object::capture(donor_entry.clone()).unwrap(),
@@ -83,6 +84,8 @@ fn observe(previous_delta: bool, current_delta: bool) {
         previous_dp_eod: current_proof(before.scope(), before.header()).unwrap().0,
         previous_source: before.identity().unwrap().to_bytes(),
         donor: Object::capture(donor_entry.clone()).unwrap(),
+        ancestors: Vec::new(),
+        displaced: None,
         expected: Object::capture(IndexEntry::File {
             path: "raw".into(),
             node: expected,

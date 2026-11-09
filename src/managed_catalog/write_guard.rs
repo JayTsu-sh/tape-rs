@@ -29,7 +29,7 @@ impl ManagedCatalog {
         }
         let tr = self.db.create_trx()?;
         let ns = routing::require_runtime_active_owner(&tr, serial, route, owner).await?;
-        management::moves::require_readable_at(&tr, ns, serial).await?;
+        reclaim::require_write_group_lane_at(&tr, ns, serial, owner, &requests).await?;
         let mut pools = std::collections::BTreeSet::new();
         let mut observed = Vec::with_capacity(intents.len());
         for (request, original) in requests.iter().zip(intents) {

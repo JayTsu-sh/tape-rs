@@ -25,7 +25,8 @@ impl ManagedCatalog {
         let held = node_tasks::held_task_at(&tr, namespace, placement.pool_id).await?;
         match tr.get(&node_attempts::volume_key(volume), false).await? {
             Some(raw) => match node_claims::decode(&raw)? {
-                node_claims::NodeVolumeClaim::ReclaimMetadata(_) => {
+                node_claims::NodeVolumeClaim::ReclaimMetadata(_)
+                | node_claims::NodeVolumeClaim::ReclaimFormat(_) => {
                     return Err(CatalogError::PoolBusy);
                 }
                 node_claims::NodeVolumeClaim::Rename(value) => {

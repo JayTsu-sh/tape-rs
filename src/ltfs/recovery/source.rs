@@ -79,6 +79,9 @@ impl CapturedIndexSource {
     pub(crate) fn entry_by_uid(&self, uid: u64) -> Result<Option<IndexEntry>> {
         self.replay.payload_by_uid(uid)
     }
+    pub(crate) fn entry_by_path(&self, path: &str) -> Result<Option<IndexEntry>> {
+        self.replay.payload_by_path(path)
+    }
 }
 
 /// Discover a clean latest DP head and retain complete replayed node payloads
@@ -136,6 +139,39 @@ pub fn capture_index_source(
             history_depth,
             history_truncated,
         },
+    })
+}
+
+/// DP-only capture for the dedicated IP-checkpoint precondition. This remains
+/// Recorded, and cannot enter ordinary current observations or source intake.
+/// The caller must independently match its end/head and complete mounted
+/// history before granting the narrowly scoped IP repair.
+pub(crate) fn capture_dp_checkpoint_source(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    budget: &RecoveryBudget,
+) -> Result<CapturedIndexSource> {
+    let HeadPayload {
+        construct,
+        head,
+        replay,
+        bytes,
+        eod,
+    } = capture_head_payload(drive, label, budget)?;
+    let (predecessors, header) = if construct.incremental {
+        replay_captured_chain(drive, label, budget, &replay, head)?
+    } else {
+        replay.load_full(0, head.highest_file_uid)?;
+        (Vec::new(), head)
+    };
+    Ok(CapturedIndexSource {
+        construct,
+        header,
+        replay,
+        predecessors,
+        source_bytes: bytes,
+        construct_end: eod,
+        scope: IndexSourceScope::Recorded,
     })
 }
 

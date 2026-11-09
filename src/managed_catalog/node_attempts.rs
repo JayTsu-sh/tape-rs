@@ -19,6 +19,7 @@ pub use publication::NodeMutationPublication;
 #[path = "node_attempts/deletion.rs"]
 mod deletion;
 pub use deletion::NodeMutationDeletion;
+pub(in crate::managed_catalog) use deletion::require_retirement_at;
 #[path = "node_attempts/completion.rs"]
 mod completion;
 pub(super) use completion::task_outcome_at;
@@ -327,7 +328,8 @@ async fn pending_at(
     };
     let value = match node_claims::decode(&raw)? {
         node_claims::NodeVolumeClaim::Single(value) => *value,
-        node_claims::NodeVolumeClaim::ReclaimMetadata(_) => return Err(CatalogError::PoolBusy),
+        node_claims::NodeVolumeClaim::ReclaimMetadata(_)
+        | node_claims::NodeVolumeClaim::ReclaimFormat(_) => return Err(CatalogError::PoolBusy),
         node_claims::NodeVolumeClaim::Rename(value) => {
             Box::pin(node_rename::require_prepared_volume_claim_at(
                 tr, placement, &value,

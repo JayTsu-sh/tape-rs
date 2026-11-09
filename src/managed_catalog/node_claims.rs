@@ -23,6 +23,7 @@ pub(in crate::managed_catalog) enum NodeVolumeClaim {
     Single(Box<NodeMutationAttempt>),
     Rename(Box<RenameVolumeClaim>),
     ReclaimMetadata(Box<ReclaimMetadataVolumeClaim>),
+    ReclaimFormat(Box<ReclaimFormatVolumeClaim>),
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,6 +49,41 @@ impl ReclaimMetadataVolumeClaim {
         }
         let suffix = &self.task[prefix.len()..];
         if suffix[..8] == [0; 8] || suffix[8..24] == [0; 16] || suffix[24..32] == [0; 8] {
+            return Err(bad());
+        }
+        node_mutation::canonical(self)
+    }
+    fn decode(raw: &[u8]) -> Result<Self> {
+        let value: Self = serde_json::from_slice(raw).map_err(|_| bad())?;
+        if value.encode()? != raw {
+            return Err(bad());
+        }
+        Ok(value)
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::managed_catalog) struct ReclaimFormatVolumeClaim {
+    pub namespace: String,
+    pub volume: String,
+    pub output: String,
+    pub task: Vec<u8>,
+    pub fingerprint: [u8; 32],
+}
+impl ReclaimFormatVolumeClaim {
+    fn encode(&self) -> Result<Vec<u8>> {
+        let ns = node_mutation::id(&self.namespace)?;
+        let volume = node_mutation::id(&self.volume)?;
+        if volume == node_mutation::id(&self.output)? {
+            return Err(bad());
+        }
+        let mut prefix = management::prefix(ns, b'R');
+        prefix.push(b'F');
+        if !self.task.starts_with(&prefix) || self.task.len() != prefix.len() + 24 {
+            return Err(bad());
+        }
+        let suffix = &self.task[prefix.len()..];
+        if suffix[..8] == [0; 8] || suffix[8..] == [0; 16] {
             return Err(bad());
         }
         node_mutation::canonical(self)
@@ -151,6 +187,7 @@ pub(in crate::managed_catalog) fn encode(claim: &NodeVolumeClaim) -> Result<Vec<
         NodeVolumeClaim::Single(value) => (0, node_attempts::encode(value)?),
         NodeVolumeClaim::Rename(value) => (1, value.encode()?),
         NodeVolumeClaim::ReclaimMetadata(value) => (2, value.encode()?),
+        NodeVolumeClaim::ReclaimFormat(value) => (3, value.encode()?),
     };
     if body.len() > MAX_BODY {
         return Err(bad());
@@ -173,6 +210,9 @@ pub(in crate::managed_catalog) fn decode(raw: &[u8]) -> Result<NodeVolumeClaim> 
         ))),
         2 => Ok(NodeVolumeClaim::ReclaimMetadata(Box::new(
             ReclaimMetadataVolumeClaim::decode(&raw[2..])?,
+        ))),
+        3 => Ok(NodeVolumeClaim::ReclaimFormat(Box::new(
+            ReclaimFormatVolumeClaim::decode(&raw[2..])?,
         ))),
         _ => Err(bad()),
     }

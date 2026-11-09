@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 /// Only a complete current CHECK CONDITION is a confirmed device rejection.
 /// Raw host/driver failures and deferred or truncated sense keep the result unknown.
-pub(super) fn confirmed_device_failure(error: &TapeError) -> bool {
+pub(in crate::daemon) fn confirmed_device_failure(error: &TapeError) -> bool {
     matches!(error,TapeError::ScsiCommand{status:2,sense_key,asc,ascq,sense}
         if !matches!(sense_key,2|6|0x0b) && sense.as_deref().and_then(|raw|raw.current_condition())==Some((*sense_key,*asc,*ascq)))
 }

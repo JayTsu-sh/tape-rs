@@ -40,6 +40,7 @@ impl PreparedManagement {
                         | "media-validate"
                         | "media-online"
                         | "media-move"
+                        | "media-reclaim"
                 )
             )
         {
@@ -142,7 +143,9 @@ pub(super) fn verify_task_for_request(request: &Value, value: &Value) -> Result<
     );
     let progress = matches!(
         request["change"]["kind"].as_str(),
-        Some("media-import" | "media-unassign" | "media-validate" | "media-online")
+        Some(
+            "media-import" | "media-unassign" | "media-validate" | "media-online" | "media-reclaim"
+        )
     );
     if !value.as_object().is_some_and(|record| {
         fields.iter().all(|key| record.contains_key(*key))
@@ -190,6 +193,7 @@ pub(super) fn verify_task_for_request(request: &Value, value: &Value) -> Result<
                         | "media-validate"
                         | "media-online"
                         | "media-move"
+                        | "media-reclaim"
                 )
             ) && value["owner_epoch"].as_u64().is_some_and(|n| n > 0)
                 && value["result"].is_null()
@@ -235,6 +239,15 @@ fn validate_device_change(change: &Value) -> Result<()> {
             "revision",
             "destination",
         ],
+        "media-reclaim" => &[
+            "kind",
+            "pool",
+            "barcode",
+            "volume",
+            "revision",
+            "confirm_format",
+            "unassign",
+        ],
         _ => return Ok(()),
     };
     if !change
@@ -271,6 +284,11 @@ fn validate_device_change(change: &Value) -> Result<()> {
         && (change["confirm_format"] != true || !change["force_format"].is_boolean())
     {
         return Err(invalid("初始化/格式化必须明确确认并固定 force_format"));
+    }
+    if kind == "media-reclaim"
+        && (change["confirm_format"] != true || !change["unassign"].is_boolean())
+    {
+        return Err(invalid("回收须明确确认源带重新初始化并固定 unassign"));
     }
     if kind == "media-move"
         && !matches!(change["destination"].as_str(), Some("homeslot" | "ieslot"))
@@ -430,6 +448,7 @@ impl FdbClient {
                     | "media-validate"
                     | "media-online"
                     | "media-move"
+                    | "media-reclaim"
             )
         ) {
             return Err(invalid(
@@ -551,6 +570,43 @@ mod tests {
             "I/O: 磁带导入是异步任务；使用 submit_management_saved 提交并查询任务状态"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reclaim_requires_exact_consent_and_retains_async_identity() {
+        let value = json!({"version":1,"library":"SIM","namespace":Uuid::new_v4().to_string(),"epoch":1,"operation":Uuid::new_v4().to_string(),
+            "change":{"kind":"media-reclaim","pool":Uuid::new_v4().to_string(),"barcode":"TEST00L8","volume":Uuid::new_v4().to_string(),"revision":1,"confirm_format":true,"unassign":false}});
+        let original = PreparedManagement::parse(value.clone()).unwrap();
+        for field in ["pool", "volume", "revision", "confirm_format", "unassign"] {
+            let mut bad = value.clone();
+            bad["change"].as_object_mut().unwrap().remove(field);
+            assert!(PreparedManagement::parse(bad).is_err(), "{field}");
+        }
+        for bad in [json!(false), Value::Null, json!("true")] {
+            let mut changed = value.clone();
+            changed["change"]["confirm_format"] = bad;
+            assert!(PreparedManagement::parse(changed).is_err());
+        }
+        let root = std::env::temp_dir().join(format!("fdb-reclaim-async-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("request.json");
+        original.save_new(&path).unwrap();
+        assert_eq!(PreparedManagement::load(&path).unwrap().value(), &value);
+        let client = FdbClient::new(["127.0.0.1:1"]).unwrap();
+        assert!(
+            client
+                .run_management_saved(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("异步任务")
+        );
+        fs::remove_dir_all(root).unwrap();
+        let mut task = json!({"version":1,"library_serial":value["library"],"namespace":value["namespace"],"epoch":value["epoch"],"operation":value["operation"],"request":value,
+            "fingerprint":format!("{:x}",sha2::Sha256::digest(value.to_string().as_bytes())),"status":"running","owner_epoch":7,"created_at_millis":1,"completed_at_millis":null,"result":null,
+            "progress":{"phase":"copying","dependency":{"reason":"等待目的带"}}});
+        verify_task_for_request(&value, &task).unwrap();
+        task["request"]["change"]["unassign"] = json!(true);
+        assert!(verify_task_for_request(&value, &task).is_err());
     }
 
     #[test]

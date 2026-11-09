@@ -156,6 +156,7 @@ pub(super) enum IndexKind {
     NodeRename(Uuid),
     NodeRenameDiscard(Uuid),
     ReclaimMetadata(Uuid),
+    ReclaimRecovery(Uuid),
 }
 
 fn encode_history(kind: IndexKind, index: ActiveIndexIdentity) -> Vec<u8> {
@@ -168,6 +169,7 @@ fn encode_history(kind: IndexKind, index: ActiveIndexIdentity) -> Vec<u8> {
         IndexKind::NodeRename(id) => (5, id),
         IndexKind::NodeRenameDiscard(id) => (6, id),
         IndexKind::ReclaimMetadata(id) => (7, id),
+        IndexKind::ReclaimRecovery(id) => (8, id),
     };
     out.push(tag);
     out.extend_from_slice(id.as_bytes());
@@ -176,7 +178,7 @@ fn encode_history(kind: IndexKind, index: ActiveIndexIdentity) -> Vec<u8> {
 }
 
 fn decode_history(volume: Uuid, bytes: &[u8]) -> Result<(IndexKind, ActiveIndexIdentity)> {
-    if bytes.len() != HISTORY_LEN || !matches!(bytes[0], 1..=7) {
+    if bytes.len() != HISTORY_LEN || !matches!(bytes[0], 1..=8) {
         return Err(CatalogError::Corrupt("活动卷历史批次版本或长度"));
     }
     let id = uuid_from(&bytes[1..17])?;
@@ -191,6 +193,7 @@ fn decode_history(volume: Uuid, bytes: &[u8]) -> Result<(IndexKind, ActiveIndexI
         5 => IndexKind::NodeRename(id),
         6 => IndexKind::NodeRenameDiscard(id),
         7 => IndexKind::ReclaimMetadata(id),
+        8 => IndexKind::ReclaimRecovery(id),
         _ => unreachable!("validated tag"),
     };
     Ok((kind, decode_index(volume, &bytes[17..])?))
@@ -224,6 +227,9 @@ pub(super) async fn history_at(
     }
     if let IndexKind::ReclaimMetadata(attempt) = kind {
         control::require_reclaim_metadata_publication_at(tr, serial, attempt, index).await?;
+    }
+    if let IndexKind::ReclaimRecovery(attempt) = kind {
+        control::require_reclaim_metadata_resolution_at(tr, serial, attempt, index).await?;
     }
     Ok((kind, index))
 }
@@ -425,6 +431,17 @@ pub(super) async fn observed_copy_index_at(
                 | IndexKind::ReclaimMetadata(_),
                 index,
             )) => Some(index),
+            Some((IndexKind::ReclaimRecovery(attempt), index)) => {
+                if control::require_reclaim_metadata_resolution_commit_at(
+                    tr, serial, attempt, index,
+                )
+                .await?
+                {
+                    Some(index)
+                } else {
+                    None
+                }
+            }
             _ => None,
         },
     )
@@ -461,6 +478,22 @@ pub(super) fn set_reclaim_observation_at(
         previous,
         current,
         IndexKind::ReclaimMetadata(attempt),
+        file_count,
+    );
+}
+
+pub(super) fn set_reclaim_recovery_at(
+    tr: &Transaction,
+    previous: ActiveIndexIdentity,
+    current: ActiveIndexIdentity,
+    attempt: Uuid,
+    file_count: u64,
+) {
+    set_node_index_at(
+        tr,
+        previous,
+        current,
+        IndexKind::ReclaimRecovery(attempt),
         file_count,
     );
 }
@@ -1222,8 +1255,14 @@ mod tests {
             decode_history(volume, &metadata).unwrap(),
             (IndexKind::ReclaimMetadata(batch_id), current)
         );
+        let recovery = encode_history(IndexKind::ReclaimRecovery(batch_id), current);
+        assert_ne!(recovery, metadata);
+        assert_eq!(
+            decode_history(volume, &recovery).unwrap(),
+            (IndexKind::ReclaimRecovery(batch_id), current)
+        );
         let mut unknown = metadata.clone();
-        unknown[0] = 8;
+        unknown[0] = 9;
         assert!(decode_history(volume, &unknown).is_err());
         let mut nil = metadata;
         nil[1..17].fill(0);
@@ -1262,7 +1301,7 @@ mod tests {
             (IndexKind::NodeRenameDiscard(batch_id), current)
         );
         let mut invalid = renamed.clone();
-        invalid[0] = 8;
+        invalid[0] = 9;
         assert!(decode_history(volume, &invalid).is_err());
         invalid = renamed;
         invalid[1..17].fill(0);

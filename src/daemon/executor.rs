@@ -345,6 +345,9 @@ pub(super) mod fdb_monitor;
 #[path = "executor_fdb_nodes.rs"]
 mod fdb_nodes;
 #[cfg(feature = "fdb")]
+#[path = "executor_fdb_reclaim.rs"]
+mod fdb_reclaim;
+#[cfg(feature = "fdb")]
 #[path = "executor_fdb_rename.rs"]
 mod fdb_rename;
 #[cfg(feature = "fdb")]
@@ -940,6 +943,23 @@ fn run_fdb_owner_inner(
         {
             let round = owner.round;
             let result = runtime.block_on(async {
+                fdb_reclaim::cleanup(
+                    owner,
+                    permission.as_deref().expect("Serving permit checked"),
+                    &control,
+                    false,
+                )
+                .await?;
+                if fdb_reclaim::advance(
+                    owner,
+                    permission.as_deref().expect("Serving permit checked"),
+                    &control,
+                    &status,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
                 let pending = control
                     .catalog
                     .active_library_mechanical_task(&control.serial, control.route, round)
@@ -1008,6 +1028,27 @@ fn run_fdb_owner_inner(
                                 &opts,
                             )
                             .await?;
+                        }
+                    } else if task["request"]["change"]["kind"] == "media-reclaim" {
+                        match control
+                            .catalog
+                            .start_reclaim_management(
+                                &control.serial,
+                                control.route,
+                                round,
+                                epoch,
+                                id,
+                            )
+                            .await
+                        {
+                            Ok(_) => {}
+                            Err(error)
+                                if matches!(
+                                    error.domain(),
+                                    crate::managed_catalog::CatalogError::PoolBusy
+                                        | crate::managed_catalog::CatalogError::PoolImporting
+                                ) => {}
+                            Err(error) => return Err(ReadError::Lost(error.to_string())),
                         }
                     } else if matches!(
                         task["request"]["change"]["kind"].as_str(),
@@ -1387,6 +1428,11 @@ fn run_fdb_owner_inner(
                             return Err(TapeError::Catalog("FDB owner 已由更新轮次持有".into()));
                         }
                     }
+                    if writable {
+                        runtime
+                            .block_on(fdb_reclaim::cleanup(owner, permit, &control, true))
+                            .map_err(|e| TapeError::Catalog(e.to_string()))?;
+                    }
                     // A takeover first settles the original mechanical task.
                     // Ordinary recovery must not LOAD an unknown UNLOAD/MOVE.
                     if runtime
@@ -1426,6 +1472,19 @@ fn run_fdb_owner_inner(
                             break;
                         };
                         reclaim_after = Some(next);
+                    }
+                    // Original reclaim mechanics/metadata/initialization are
+                    // continued before ordinary media recovery. Its fixed Kg
+                    // keeps normal data access closed while management remains
+                    // available to observe the asynchronous parent.
+                    if writable {
+                        match runtime.block_on(Box::pin(fdb_reclaim::advance(
+                            owner, permit, &control, &status,
+                        ))) {
+                            Ok(true) | Err(ReadError::Busy(_)) => return Ok(0),
+                            Ok(false) => {}
+                            Err(error) => return Err(TapeError::Catalog(error.to_string())),
+                        }
                     }
                     let cache_dir = files.extent_cache_dir();
                     if cache_dir.exists() {

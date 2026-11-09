@@ -49,6 +49,35 @@ pub const ATTR_APP_FORMAT_VERSION: u16 = 0x080B;
 /// **注意**：早期代码错用 0x080B（那是 ASCII 的 Format Version）。
 pub const ATTR_VCI: u16 = 0x080C;
 
+/// IBM GA32-0928-06 §§6.5.2.3.1–2: immutable manufacturer identity,
+/// distinct from the host-writable barcode or application volume UUID.
+pub const ATTR_MEDIUM_MANUFACTURER: u16 = 0x0400;
+pub const ATTR_MEDIUM_SERIAL: u16 = 0x0401;
+
+#[cfg_attr(feature = "fdb", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "fdb", serde(deny_unknown_fields))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediumIdentity {
+    manufacturer: [u8; 8],
+    serial: [u8; 32],
+}
+impl MediumIdentity {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if [&self.manufacturer[..], &self.serial[..]]
+            .into_iter()
+            .any(|raw| {
+                !raw.iter().all(|byte| (0x20..=0x7e).contains(byte))
+                    || raw.iter().all(|byte| *byte == b' ')
+            })
+        {
+            return Err(TapeError::Refused {
+                reason: "介质制造商或序列号不是有效的非空 ASCII 标识".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// 解析后的单个 MAM attribute。
 #[derive(Debug, Clone)]
 pub struct MamAttribute {
@@ -230,6 +259,12 @@ impl<'a> Mam<'a> {
             self.device.execute_read(&cdb_bytes, &mut buf, 30_000)
         })?;
 
+        if result.transferred > buf.len() {
+            return Err(TapeError::InvalidResponse {
+                expected: buf.len(),
+                actual: result.transferred,
+            });
+        }
         if result.transferred < 4 {
             return Ok(None);
         }
@@ -257,6 +292,36 @@ impl<'a> Mam<'a> {
             off = val_end;
         }
         Ok(None)
+    }
+
+    /// Read manufacturer-supplied read-only attributes. Missing or malformed
+    /// values never fall back to a barcode or a newly generated identity.
+    pub fn read_medium_identity(&self) -> Result<MediumIdentity> {
+        let manufacturer = self
+            .read_attribute(ATTR_MEDIUM_MANUFACTURER)?
+            .ok_or_else(|| TapeError::Refused {
+                reason: "MAM 缺少介质制造商标识，不能绑定初始化目标".into(),
+            })?;
+        let serial =
+            self.read_attribute(ATTR_MEDIUM_SERIAL)?
+                .ok_or_else(|| TapeError::Refused {
+                    reason: "MAM 缺少介质序列号，不能绑定初始化目标".into(),
+                })?;
+        if manufacturer.format != AttributeFormat::Ascii as u8
+            || serial.format != AttributeFormat::Ascii as u8
+            || manufacturer.value.len() != 8
+            || serial.value.len() != 32
+        {
+            return Err(TapeError::Refused {
+                reason: "MAM 介质身份字段格式或固定长度无效".into(),
+            });
+        }
+        let identity = MediumIdentity {
+            manufacturer: manufacturer.value[..].try_into().expect("checked length"),
+            serial: serial.value[..].try_into().expect("checked length"),
+        };
+        identity.validate()?;
+        Ok(identity)
     }
 
     /// WRITE ATTRIBUTE 写入单个属性。
@@ -454,6 +519,51 @@ mod tests {
             !vcr_is_valid(&[0, 0, 0, 0])
                 && !vcr_is_valid(&[0xFF; 4])
                 && vcr_is_valid(&[0, 0, 1, 7])
+        );
+    }
+}
+
+#[cfg(test)]
+mod medium_identity_tests {
+    use super::*;
+    use crate::scsi::sim::{SimCartridge, SimLibrary};
+    #[test]
+    fn medium_identity_survives_format_and_refuses_replacement_or_host_rewrite() {
+        let lib = SimLibrary::new(1, 2, 1);
+        lib.insert_cartridge(SimCartridge::blank("ID0010L8", 64 << 20), 0)
+            .unwrap();
+        lib.insert_cartridge(SimCartridge::blank("ID0011L8", 64 << 20), 1)
+            .unwrap();
+        lib.load_into_drive("ID0010L8", 0).unwrap();
+        let device = lib.drive(0);
+        let before = Mam::new(&device).read_medium_identity().unwrap();
+        assert!(
+            Mam::new(&device)
+                .write_ascii(ATTR_MEDIUM_SERIAL, "replacement", 32)
+                .is_err()
+        );
+        crate::ltfs::mkltfs::mkltfs(&device, &crate::ltfs::mkltfs::MkltfsOptions::default())
+            .unwrap();
+        assert_eq!(Mam::new(&device).read_medium_identity().unwrap(), before);
+        lib.with_cartridge_mut("ID0010L8", |cart| {
+            cart.mam.remove(&(0, ATTR_MEDIUM_SERIAL));
+        });
+        assert!(Mam::new(&device).read_medium_identity().is_err());
+        for (format, bytes) in [
+            (0, vec![b'S'; 32]),
+            (1, vec![b'S'; 31]),
+            (1, vec![b' '; 32]),
+            (1, vec![0; 32]),
+        ] {
+            lib.with_cartridge_mut("ID0010L8", |cart| {
+                cart.mam.insert((0, ATTR_MEDIUM_SERIAL), (format, bytes));
+            });
+            assert!(Mam::new(&device).read_medium_identity().is_err());
+        }
+        let other = lib.cartridge("ID0011L8").unwrap();
+        assert_ne!(
+            before.serial.as_slice(),
+            other.mam[&(0, ATTR_MEDIUM_SERIAL)].1
         );
     }
 }

@@ -99,13 +99,19 @@ pub struct SimCartridge {
 }
 
 impl SimCartridge {
-    /// 未格式化的空白磁带：单分区、无 MAM 属性。
+    /// 未格式化的空白磁带：单分区，仅含制造商写入的只读 MAM 身份。
     pub fn blank(barcode: &str, capacity: u64) -> Self {
         Self {
             barcode: barcode.to_string(),
             medium_type: 1,
             partitions: vec![SimPartition::empty(capacity)],
-            mam: BTreeMap::new(),
+            mam: BTreeMap::from([
+                ((0, 0x0400), (1, b"TAPE-RS ".to_vec())),
+                (
+                    (0, 0x0401),
+                    (1, uuid::Uuid::new_v4().simple().to_string().into_bytes()),
+                ),
+            ]),
             write_protected: false,
             capacity,
             vcr: 1,
@@ -1519,8 +1525,8 @@ fn drive_media_command(
                 if start + len > p.len() {
                     return illegal_request();
                 }
-                if id < 0x0400 {
-                    // 设备属性（含 0x0009 VCR）由驱动器维护，主机只读
+                if id < 0x0800 {
+                    // 设备及制造商介质属性（含 VCR、0400/0401）均为主机只读。
                     return check(SENSE_KEY_ILLEGAL_REQUEST, 0x26, 0x00);
                 }
                 if len == 0 {

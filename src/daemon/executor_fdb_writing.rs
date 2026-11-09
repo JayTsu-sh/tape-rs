@@ -187,6 +187,7 @@ struct Prepared {
     head: ActiveLoadedVolumeHead,
     available: u64,
     batchable: bool,
+    reclaim: Option<crate::managed_catalog::ReclaimReservation>,
 }
 
 enum PreparedWrite {
@@ -198,26 +199,22 @@ enum PreparedWrite {
 // incompatible next upload is resolved again after the preceding group commits.
 type WritePlan = (std::fs::File, Prepared);
 
-#[cfg(test)]
-pub(super) async fn write(
-    owner: &mut Active,
-    permit: &Permission,
-    control: &FdbOwnerControl,
-    status: &SharedStatus,
+/// One original object, with the large batch state allocated outside its
+/// caller's async poll frame. Reclaim and tests use the same production path.
+pub(super) fn write<'a>(
+    owner: &'a mut Active,
+    permit: &'a Permission,
+    control: &'a FdbOwnerControl,
+    status: &'a SharedStatus,
     request: ActiveFileRequest,
     file: std::fs::File,
-) -> std::result::Result<u64, ReadError> {
-    // Large lifecycle fixtures must not embed the complete write-batch state
-    // in every await of this test-only single-upload adapter.
-    Box::pin(write_batch(
-        owner,
-        permit,
-        control,
-        status,
-        vec![(request, file)],
-    ))
-    .await
-    .remove(0)
+) -> std::pin::Pin<Box<impl std::future::Future<Output = std::result::Result<u64, ReadError>> + 'a>>
+{
+    Box::pin(async move {
+        write_batch(owner, permit, control, status, vec![(request, file)])
+            .await
+            .remove(0)
+    })
 }
 
 pub(super) async fn write_batch(
@@ -325,7 +322,7 @@ async fn prepare_write(
         return Err(ReadError::Failed("上传不属于当前带库、命名空间或池".into()));
     }
     verify_spool(file, request, control.storage.download_bytes)?;
-    fdb_loading::guard(owner, permit, control).await?;
+    fdb_loading::authority_guard(owner, permit, control).await?;
     if let Some(result) = control
         .catalog
         .active_upload_result(request, control.route)
@@ -337,6 +334,22 @@ async fn prepare_write(
             other => Err(ReadError::Failed(format!("上传请求不能重用: {other:?}"))),
         };
     }
+    let reclaim = control
+        .catalog
+        .reclaim_upload_parent(request, owner.round)
+        .await
+        .map_err(lost)?;
+    let reclaim = if let Some(parent) = reclaim {
+        control
+            .catalog
+            .reclaim_layout(&parent, owner.round)
+            .await
+            .map_err(lost)?
+            .map(|_| parent)
+    } else {
+        None
+    };
+    fdb_loading::upload_guard(owner, permit, control, reclaim.as_ref(), request).await?;
     control
         .catalog
         .check_active_upload_gate(control.route, owner.round, request)
@@ -460,120 +473,228 @@ async fn prepare_write(
         head,
         available: pool.file_limit - count,
         batchable,
+        reclaim,
     })))
 }
 
-async fn write_group(
-    owner: &mut Active,
-    permit: &Permission,
-    control: &FdbOwnerControl,
-    status: &SharedStatus,
-    writes: &[WritePlan],
-) -> std::result::Result<Vec<u64>, ReadError> {
-    let (_, plan) = &writes[0];
-    let (intent, placement, head) = (&plan.intent, &plan.placement, plan.head);
-    let drive =
-        fdb_loading::select_write(owner, permit, control, status, placement, head.index).await?;
-    fdb_monitor::write_allowed(owner, control, &placement.barcode, true).await?;
-    fdb_loading::guard(owner, permit, control).await?;
-    let round = owner.round;
-    let session = owner.write_session.take();
-    let original_intents = writes
-        .iter()
-        .map(|(_, plan)| plan.intent.clone())
-        .collect::<Vec<_>>();
-    let seen_reservations = std::cell::RefCell::new(vec![false; writes.len()]);
-    let checked =
-        fdb_loading::operation_guard(owner, permit, owner.devices[drive].dev.as_ref(), || {
-            futures_executor::block_on(async {
-                let observed = control
-                    .catalog
-                    .check_active_write_group(
-                        &control.serial,
-                        control.route,
-                        round,
-                        &original_intents,
-                    )
-                    .await
-                    .map_err(|e| TapeError::Catalog(e.to_string()))?;
-                let mut seen = seen_reservations.borrow_mut();
-                if seen.iter().zip(&observed).any(|(seen, now)| *seen && !now) {
-                    return Err(TapeError::Catalog(
-                        "上传原物理尝试已被移除，停止后续命令".into(),
-                    ));
+// Allocate the physical group phase before polling its media-recovery chain.
+fn write_group<'a>(
+    owner: &'a mut Active,
+    permit: &'a Permission,
+    control: &'a FdbOwnerControl,
+    status: &'a SharedStatus,
+    writes: &'a [WritePlan],
+) -> std::pin::Pin<
+    Box<impl std::future::Future<Output = std::result::Result<Vec<u64>, ReadError>> + 'a>,
+> {
+    Box::pin(async move {
+        let (_, plan) = &writes[0];
+        let (intent, placement, head) = (&plan.intent, &plan.placement, plan.head);
+        let request = intent.request();
+        let drive = if let Some(parent) = &plan.reclaim {
+            fdb_loading::select_reclaim_write(
+                owner,
+                permit,
+                control,
+                placement,
+                head.index,
+                (parent, &request),
+            )
+            .await?
+        } else {
+            fdb_loading::select_write(owner, permit, control, status, placement, head.index).await?
+        };
+        fdb_monitor::write_allowed(owner, control, &placement.barcode, true).await?;
+        fdb_loading::upload_guard(owner, permit, control, plan.reclaim.as_ref(), &request).await?;
+        let round = owner.round;
+        let session = owner.write_session.take();
+        let original_intents = writes
+            .iter()
+            .map(|(_, plan)| plan.intent.clone())
+            .collect::<Vec<_>>();
+        let seen_reservations = std::cell::RefCell::new(vec![false; writes.len()]);
+        let checked =
+            fdb_loading::operation_guard(owner, permit, owner.devices[drive].dev.as_ref(), || {
+                futures_executor::block_on(async {
+                    let observed = control
+                        .catalog
+                        .check_active_write_group(
+                            &control.serial,
+                            control.route,
+                            round,
+                            &original_intents,
+                        )
+                        .await
+                        .map_err(|e| TapeError::Catalog(e.to_string()))?;
+                    let mut seen = seen_reservations.borrow_mut();
+                    if seen.iter().zip(&observed).any(|(seen, now)| *seen && !now) {
+                        return Err(TapeError::Catalog(
+                            "上传原物理尝试已被移除，停止后续命令".into(),
+                        ));
+                    }
+                    for (seen, now) in seen.iter_mut().zip(observed) {
+                        *seen |= now;
+                    }
+                    Ok(())
+                })
+            });
+        let tracked = fdb_monitor::Tracked::new(&checked, "write");
+        let mounted = match session.filter(|session| {
+            session.matches_device(&tracked, owner.key)
+                && ActiveIndexIdentity::from(session.committed_index_construct()) == head.index
+        }) {
+            Some(session) => {
+                let resumed = session.resume(&tracked, owner.key);
+                if resumed.is_ok() {
+                    log::debug!(
+                        "FDB 复用顺序追加会话: {} gen={}",
+                        placement.barcode,
+                        head.index.generation
+                    );
                 }
-                for (seen, now) in seen.iter_mut().zip(observed) {
-                    *seen |= now;
-                }
-                Ok(())
-            })
-        });
-    let tracked = fdb_monitor::Tracked::new(&checked, "write");
-    let mounted = match session.filter(|session| {
-        session.matches_device(&tracked, owner.key)
-            && ActiveIndexIdentity::from(session.committed_index_construct()) == head.index
-    }) {
-        Some(session) => {
-            let resumed = session.resume(&tracked, owner.key);
-            if resumed.is_ok() {
-                log::debug!(
-                    "FDB 复用顺序追加会话: {} gen={}",
-                    placement.barcode,
-                    head.index.generation
-                );
+                resumed
             }
-            resumed
+            None => LtfsVolume::mount(&tracked),
+        };
+        if mounted.is_err() {
+            fdb_monitor::io_error(
+                owner,
+                permit,
+                control,
+                &placement.barcode,
+                intent.volume_id,
+                tracked.error(),
+            )
+            .await;
         }
-        None => LtfsVolume::mount(&tracked),
-    };
-    if mounted.is_err() {
-        fdb_monitor::io_error(
-            owner,
+        let volume = mounted.map_err(lost)?;
+        let max_index_bytes = usize::try_from(control.storage.index_bytes).map_err(lost)?;
+        let ready = establish_active_media_owner(
+            &control.catalog,
+            volume,
+            &control.serial,
+            owner.key,
             permit,
-            control,
-            &placement.barcode,
-            intent.volume_id,
-            tracked.error(),
+            max_index_bytes,
         )
         .await;
-    }
-    let volume = mounted.map_err(lost)?;
-    let max_index_bytes = usize::try_from(control.storage.index_bytes).map_err(lost)?;
-    let ready = establish_active_media_owner(
-        &control.catalog,
-        volume,
-        &control.serial,
-        owner.key,
-        permit,
-        max_index_bytes,
-    )
-    .await;
-    if ready.is_err() {
-        fdb_monitor::io_error(
-            owner,
-            permit,
-            control,
-            &placement.barcode,
-            intent.volume_id,
-            tracked.error(),
-        )
-        .await;
-    }
-    let ready = ready.map_err(media_error)?;
-    let volume = ready.into_volume();
-    let mut recovered = Vec::with_capacity(writes.len());
-    for (_, plan) in writes {
-        let intent = &plan.intent;
-        recovered.push(
-            control
-                .catalog
-                .active_upload_result(&intent.request(), control.route)
-                .await
-                .map_err(lost)?,
+        if ready.is_err() {
+            fdb_monitor::io_error(
+                owner,
+                permit,
+                control,
+                &placement.barcode,
+                intent.volume_id,
+                tracked.error(),
+            )
+            .await;
+        }
+        let ready = ready.map_err(media_error)?;
+        let volume = ready.into_volume();
+        let mut recovered = Vec::with_capacity(writes.len());
+        for (_, plan) in writes {
+            let intent = &plan.intent;
+            recovered.push(
+                control
+                    .catalog
+                    .active_upload_result(&intent.request(), control.route)
+                    .await
+                    .map_err(lost)?,
+            );
+        }
+        if recovered.iter().any(Option::is_some) {
+            drop(volume);
+            owner.fdb_reads.insert(
+                drive,
+                fdb_loading::Mount {
+                    barcode: placement.barcode.clone(),
+                    volume: intent.volume_id,
+                    pool: placement.pool_id,
+                    last_used: Instant::now(),
+                },
+            );
+            return recovered
+                .into_iter()
+                .map(|result| match result {
+                    Some(PublishOutcome::AlreadyApplied(version)) => Ok(version),
+                    result => Err(lost(format!("原上传批次恢复结果拒绝: {result:?}"))),
+                })
+                .collect();
+        }
+        let batch = uuid::Uuid::new_v4();
+        let uploads: Vec<_> = writes
+            .iter()
+            .map(|(file, plan)| ActiveMediaUpload {
+                intent: plan.intent.clone(),
+                spool: format!("/proc/self/fd/{}", file.as_raw_fd()).into(),
+            })
+            .collect();
+        log::debug!(
+            "FDB 顺序合批提交: {} files={} previous_gen={}",
+            placement.barcode,
+            writes.len(),
+            head.index.generation
         );
-    }
-    if recovered.iter().any(Option::is_some) {
-        drop(volume);
+        let committed =
+            commit_active_media_batch(&control.catalog, volume, batch, &uploads, max_index_bytes)
+                .await;
+        if committed.is_err() {
+            fdb_monitor::io_error(
+                owner,
+                permit,
+                control,
+                &placement.barcode,
+                intent.volume_id,
+                tracked.error(),
+            )
+            .await;
+        }
+        // A later member can lose its gate after an earlier member appended.
+        // Once the batch kernel starts, even PoolBusy/MediaUnavailable cannot
+        // prove that no bytes were written. Freeze this round for recovery.
+        let committed = committed.map_err(lost)?;
+        let committed = publish_active_media_batch(&control.catalog, committed)
+            .await
+            .map_err(lost)?;
+        // Keep only this clean S4 session, without a device borrow or another
+        // checkpoint. A later request must recheck its device epoch, PR and the
+        // exact FDB index before reusing its confirmed sequential append head.
+        let session = committed.into_volume().into_session();
+        let current = control
+            .catalog
+            .active_loaded_volume_head(
+                &control.serial,
+                &placement.barcode,
+                control.route,
+                owner.round,
+            )
+            .await
+            .map_err(lost)?
+            .ok_or_else(|| lost("写入后卷身份缺失"))?;
+        fdb_monitor::index_state(owner, control, &placement.barcode, current.index, false).await?;
+        if let Some(parent) = &plan.reclaim {
+            fdb_monitor::sample_for_reclaim(
+                owner,
+                permit,
+                control,
+                drive,
+                &placement.barcode,
+                intent.volume_id,
+                (parent, &request),
+            )
+            .await?;
+        } else {
+            fdb_monitor::sample(
+                owner,
+                permit,
+                control,
+                drive,
+                &placement.barcode,
+                intent.volume_id,
+            )
+            .await?;
+        }
+        fdb_loading::upload_guard(owner, permit, control, plan.reclaim.as_ref(), &request).await?;
         owner.fdb_reads.insert(
             drive,
             fdb_loading::Mount {
@@ -583,98 +704,22 @@ async fn write_group(
                 last_used: Instant::now(),
             },
         );
-        return recovered
-            .into_iter()
-            .map(|result| match result {
-                Some(PublishOutcome::AlreadyApplied(version)) => Ok(version),
-                result => Err(lost(format!("原上传批次恢复结果拒绝: {result:?}"))),
-            })
-            .collect();
-    }
-    let batch = uuid::Uuid::new_v4();
-    let uploads: Vec<_> = writes
-        .iter()
-        .map(|(file, plan)| ActiveMediaUpload {
-            intent: plan.intent.clone(),
-            spool: format!("/proc/self/fd/{}", file.as_raw_fd()).into(),
-        })
-        .collect();
-    log::debug!(
-        "FDB 顺序合批提交: {} files={} previous_gen={}",
-        placement.barcode,
-        writes.len(),
-        head.index.generation
-    );
-    let committed =
-        commit_active_media_batch(&control.catalog, volume, batch, &uploads, max_index_bytes).await;
-    if committed.is_err() {
-        fdb_monitor::io_error(
-            owner,
-            permit,
-            control,
-            &placement.barcode,
-            intent.volume_id,
-            tracked.error(),
-        )
-        .await;
-    }
-    // A later member can lose its gate after an earlier member appended.
-    // Once the batch kernel starts, even PoolBusy/MediaUnavailable cannot
-    // prove that no bytes were written. Freeze this round for recovery.
-    let committed = committed.map_err(lost)?;
-    let committed = publish_active_media_batch(&control.catalog, committed)
-        .await
-        .map_err(lost)?;
-    // Keep only this clean S4 session, without a device borrow or another
-    // checkpoint. A later request must recheck its device epoch, PR and the
-    // exact FDB index before reusing its confirmed sequential append head.
-    let session = committed.into_volume().into_session();
-    let current = control
-        .catalog
-        .active_loaded_volume_head(
-            &control.serial,
-            &placement.barcode,
-            control.route,
-            owner.round,
-        )
-        .await
-        .map_err(lost)?
-        .ok_or_else(|| lost("写入后卷身份缺失"))?;
-    fdb_monitor::index_state(owner, control, &placement.barcode, current.index, false).await?;
-    fdb_monitor::sample(
-        owner,
-        permit,
-        control,
-        drive,
-        &placement.barcode,
-        intent.volume_id,
-    )
-    .await?;
-    fdb_loading::guard(owner, permit, control).await?;
-    owner.fdb_reads.insert(
-        drive,
-        fdb_loading::Mount {
-            barcode: placement.barcode.clone(),
-            volume: intent.volume_id,
-            pool: placement.pool_id,
-            last_used: Instant::now(),
-        },
-    );
-    let mut versions = Vec::with_capacity(writes.len());
-    for (_, plan) in writes {
-        let intent = &plan.intent;
-        match control
-            .catalog
-            .active_upload_result(&intent.request(), control.route)
-            .await
-            .map_err(lost)?
-        {
-            Some(PublishOutcome::AlreadyApplied(version)) => versions.push(version),
-            result => return Err(lost(format!("发布后请求结果不一致: {result:?}"))),
+        let mut versions = Vec::with_capacity(writes.len());
+        for (_, plan) in writes {
+            let intent = &plan.intent;
+            match control
+                .catalog
+                .active_upload_result(&intent.request(), control.route)
+                .await
+                .map_err(lost)?
+            {
+                Some(PublishOutcome::AlreadyApplied(version)) => versions.push(version),
+                result => return Err(lost(format!("发布后请求结果不一致: {result:?}"))),
+            }
         }
-    }
-    owner.write_session = session;
-    Ok(versions)
+        owner.write_session = session;
+        Ok(versions)
+    })
 }
 
 #[cfg(test)]
