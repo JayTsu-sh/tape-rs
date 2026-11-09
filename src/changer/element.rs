@@ -67,6 +67,14 @@ pub struct ElementStatus {
 }
 
 impl ElementStatus {
+    /// DVCID may contain fixed vendor/model fields before the VPD 0x80 serial.
+    /// Compare the complete final token, never a substring of another serial.
+    pub fn drive_serial(&self) -> Option<&str> {
+        (self.element_type == ElementType::DataTransfer)
+            .then(|| self.drive_id.as_deref()?.split_whitespace().last())
+            .flatten()
+    }
+
     pub fn cleaning_source(&self) -> Option<&'static str> {
         self.full
             .then(|| cleaning_source(self.medium_type, self.volume_tag.as_deref()))
@@ -96,4 +104,43 @@ pub fn cleaning_source(medium_type: Option<u8>, barcode: Option<&str>) -> Option
             .bytes()
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()))
     .then_some("barcode")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dvcid_serial_is_the_complete_last_token_of_a_drive() {
+        let mut row = ElementStatus {
+            address: 1,
+            element_type: ElementType::DataTransfer,
+            full: false,
+            accessible: Some(true),
+            exception: false,
+            asc: 0,
+            ascq: 0,
+            disabled: false,
+            medium_type: None,
+            volume_tag: None,
+            source_address: None,
+            drive_id: None,
+        };
+        for (id, expected) in [
+            (None, None),
+            (Some(""), None),
+            (Some("   "), None),
+            (Some("117018605B"), Some("117018605B")),
+            (
+                Some("IBM     ULT3580-TD8     117018605B  "),
+                Some("117018605B"),
+            ),
+            (Some("IBM 117018605B 117018605BX"), Some("117018605BX")),
+        ] {
+            row.drive_id = id.map(str::to_owned);
+            assert_eq!(row.drive_serial(), expected);
+        }
+        row.element_type = ElementType::Storage;
+        assert_eq!(row.drive_serial(), None);
+    }
 }

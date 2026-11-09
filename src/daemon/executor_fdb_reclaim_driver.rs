@@ -149,7 +149,7 @@ fn binding(
             r.element_type == ElementType::DataTransfer
                 && !r.full
                 && Some(r.address) != avoid
-                && r.drive_id.as_deref().is_some_and(|id| {
+                && r.drive_serial().is_some_and(|id| {
                     owner
                         .devices
                         .iter()
@@ -163,7 +163,7 @@ fn binding(
         barcode: assignment.barcode.clone(),
         volume: assignment.volume_id?,
         revision: assignment.revision,
-        drive_serial: drive.drive_id.clone()?,
+        drive_serial: drive.drive_serial()?.to_owned(),
         address: drive.address,
         home: if media.element_type == ElementType::Storage {
             media.address

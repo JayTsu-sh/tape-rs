@@ -161,6 +161,8 @@ pub struct SimQuirks {
     pub eod_space_illegal_request: bool,
     /// 未修复的 Holo-VTL：VCR（MAM 0x0009）不随写入变化，VCI 因而永远"新鲜"。
     pub vcr_never_changes: bool,
+    /// IBM DVCID：在序列号前返回厂商和型号字段。
+    pub dvcid_vendor_model: bool,
 }
 
 impl SimQuirks {
@@ -170,6 +172,7 @@ impl SimQuirks {
             bop_space_illegal_request: true,
             eod_space_illegal_request: true,
             vcr_never_changes: true,
+            ..Default::default()
         }
     }
 }
@@ -895,7 +898,16 @@ fn read_element_status(st: &LibState, cdb: &[u8], out: Option<&mut [u8]>) -> Res
     let mut first_addr: Option<u16> = None;
     for (t, elems) in &groups {
         let base = if voltag { 48 } else { 12 };
-        let id_extra = if dvcid && *t == 4 { 4 + 10 } else { 0 };
+        let id_prefix = if st.quirks.dvcid_vendor_model {
+            "IBM ULT3580-TD8 "
+        } else {
+            ""
+        };
+        let id_extra = if dvcid && *t == 4 {
+            4 + id_prefix.len() + 10
+        } else {
+            0
+        };
         let desc_len = (base + id_extra) as u16;
         let mut page = vec![*t, if voltag { 0x80 } else { 0x00 }];
         page.extend_from_slice(&desc_len.to_be_bytes());
@@ -937,10 +949,12 @@ fn read_element_status(st: &LibState, cdb: &[u8], out: Option<&mut [u8]>) -> Res
             if id_extra > 0 {
                 let off = base;
                 d[off] = 0x02;
-                d[off + 3] = 10;
+                d[off + 3] = (id_prefix.len() + 10) as u8;
+                d[off + 4..off + 4 + id_prefix.len()].copy_from_slice(id_prefix.as_bytes());
                 let s = id.clone().unwrap_or_default();
                 let n = s.len().min(10);
-                d[off + 4..off + 4 + n].copy_from_slice(&s.as_bytes()[..n]);
+                let start = off + 4 + id_prefix.len();
+                d[start..start + n].copy_from_slice(&s.as_bytes()[..n]);
             }
             page.extend_from_slice(&d);
         }

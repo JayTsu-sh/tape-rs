@@ -129,7 +129,7 @@ impl ReclaimMediaPlan {
             .iter()
             .filter(|e| {
                 e.element_type == ElementType::DataTransfer
-                    && e.drive_id.as_deref() == Some(&self.drive_serial)
+                    && e.drive_serial() == Some(self.drive_serial.as_str())
             })
             .collect();
         if ids.len() != 1 || ids[0].address != drive.address {
@@ -606,6 +606,31 @@ mod tests {
             ],
         )
     }
+    #[test]
+    fn vendor_model_dvcid_requires_one_exact_serial_at_the_original_address() {
+        let (plan, mut rows) = fixture();
+        rows[0].drive_id = Some("IBM ULT3580-TD8 DRIVE1".into());
+        assert!(
+            plan.condition(&plan.map, &rows, Some(false), false)
+                .unwrap()
+        );
+        rows[0].drive_id = Some("IBM ULT3580-TD8 DRIVE10".into());
+        assert!(
+            plan.condition(&plan.map, &rows, Some(false), false)
+                .is_err()
+        );
+        rows[0].drive_id = Some("IBM ULT3580-TD8 DRIVE1".into());
+        let mut duplicate = rows[0].clone();
+        duplicate.address = 11;
+        let mut plan = plan;
+        plan.map.dt_count = 2;
+        rows.push(duplicate);
+        assert!(
+            plan.condition(&plan.map, &rows, Some(false), false)
+                .is_err()
+        );
+    }
+
     #[test]
     fn mechanical_receipt_detects_corrupt_bytes_truncation_and_changed_plan() {
         let (plan, _) = fixture();

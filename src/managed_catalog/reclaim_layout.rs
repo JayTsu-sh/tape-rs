@@ -161,7 +161,7 @@ impl ReclaimLayoutEvidence {
                 .iter()
                 .filter(|r| {
                     r.element_type == ElementType::DataTransfer
-                        && r.drive_id.as_deref() == Some(binding.drive_serial.as_str())
+                        && r.drive_serial() == Some(binding.drive_serial.as_str())
                 })
                 .collect();
             if media.len() != 1

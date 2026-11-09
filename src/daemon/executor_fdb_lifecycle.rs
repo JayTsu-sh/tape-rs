@@ -2710,6 +2710,22 @@ mod tests {
         EeAlias,
         MountLimit,
         StaleQueued,
+        VendorDvcid,
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim IBM 厂商/型号 DVCID 的完整原生回收"]
+    async fn native_reclaim_parent_accepts_vendor_model_dvcid() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::VendorDvcid,
+        ))
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3309,6 +3325,12 @@ mod tests {
             Fixture::with_drives(2),
         ))
         .await;
+        if case == NativeParentCase::VendorDvcid {
+            fixture.lib.set_quirks(crate::scsi::sim::SimQuirks {
+                dvcid_vendor_model: true,
+                ..Default::default()
+            });
+        }
         fixture.format(uuid::Uuid::new_v4());
         let mut volume = LtfsVolume::mount(fixture.device()).unwrap();
         if case == NativeParentCase::EeAlias {

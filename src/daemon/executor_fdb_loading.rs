@@ -251,7 +251,7 @@ async fn select_fixed_reclaim(
                 && r.full
                 && r.volume_tag.as_deref() == Some(dest.barcode.as_str())
                 && r.source_address == Some(dest.home)
-                && r.drive_id.as_deref() == Some(dest.drive_serial.as_str())
+                && r.drive_serial() == Some(dest.drive_serial.as_str())
         })
     {
         return Err(lost("原回收目的尚未装入固定驱动器"));
