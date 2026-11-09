@@ -41,7 +41,8 @@ pub use streamed::{StreamedFullRecovery, capture_full_recovery};
 mod source;
 #[cfg(feature = "fdb")]
 pub use source::{
-    CapturedIndexSource, IndexSourceScope, capture_index_source, capture_recorded_index_source,
+    CapturedIndexSource, IndexSourceScope, capture_complete_index_source, capture_index_source,
+    capture_recorded_index_source,
 };
 #[cfg(feature = "fdb")]
 pub(crate) use source::{
@@ -112,6 +113,26 @@ pub struct RecoveryBudget {
     pub max_index_bytes: usize,
     /// 回指链核验深度上限；超出时记为"部分核验"。
     pub max_chain_len: u32,
+    /// 原生回收完整核验 Full 历史；以实际头部块位置代替普通历史深度上限。
+    /// 增量重放继续遵守 max_chain_len，不扩大其内存或身份格式。
+    pub complete_full_history: bool,
+}
+
+impl RecoveryBudget {
+    /// Complete historical Full verification for a native reclaim operation.
+    pub fn with_complete_full_history(mut self) -> Self {
+        self.complete_full_history = true;
+        self
+    }
+    fn full_history_limit(&self, head_block: u64) -> u32 {
+        if self.complete_full_history {
+            // Every predecessor is strictly earlier. Saturation preserves a
+            // finite, representable counter even for 64-bit logical blocks.
+            u32::try_from(head_block).unwrap_or(u32::MAX)
+        } else {
+            self.max_chain_len
+        }
+    }
 }
 
 impl Default for RecoveryBudget {
@@ -122,6 +143,7 @@ impl Default for RecoveryBudget {
             max_back_steps: 8,
             max_index_bytes: 8usize << 30,
             max_chain_len: 64,
+            complete_full_history: false,
         }
     }
 }
@@ -1439,6 +1461,7 @@ pub fn verify_chain(
     let mut prev = cand.index.previous_location;
     let mut current = std::borrow::Cow::Borrowed(&cand.index);
     let mut depth = 0u32;
+    let history_limit = budget.full_history_limit(cand.index.self_location.start_block);
     while let Some(loc) = prev {
         if loc.partition != dp_char {
             // 历史版本的 commit 把回指写成 IP 位置；按规范这不是 DP 链的一环，链在此结束。
@@ -1448,8 +1471,8 @@ pub fn verify_chain(
             ));
             return Ok((true, depth, false));
         }
-        if depth >= budget.max_chain_len {
-            notes.push(format!("链核验深度达到预算 {}", budget.max_chain_len));
+        if depth >= history_limit {
+            notes.push(format!("链核验深度达到预算 {}", history_limit));
             return Ok((true, depth, true));
         }
         if loc.start_block >= current.self_location.start_block {

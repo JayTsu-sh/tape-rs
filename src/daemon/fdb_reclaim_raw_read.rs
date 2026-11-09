@@ -74,7 +74,7 @@ impl ActiveMediaReader<'_> {
         budget.index_scratch.directory = scratch.into();
         budget.index_scratch.max_bytes = self.storage.index_bytes;
         budget.index_scratch.headroom_bytes = self.storage.headroom_bytes;
-        let actual = capture_index_source(&TapeDrive::new(&checked), &label, &budget)?;
+        let actual = capture_complete_index_source(&TapeDrive::new(&checked), &label, &budget)?;
         let node = before.require_capture(&actual).map_err(error)?;
         let mut writer = StreamHash {
             out,
@@ -98,7 +98,7 @@ impl ActiveMediaReader<'_> {
         }
         let sha = writer.sha.finalize().into();
         let md5 = writer.md5.map(|hash| hash.finalize().into());
-        let after = capture_index_source(&TapeDrive::new(&checked), &label, &budget)?;
+        let after = capture_complete_index_source(&TapeDrive::new(&checked), &label, &budget)?;
         if after.identity()? != actual.identity()?
             || after.construct_end() != actual.construct_end()
         {
@@ -192,7 +192,7 @@ impl ActiveMediaReader<'_> {
         budget.index_scratch.directory = scratch.into();
         budget.index_scratch.max_bytes = self.storage.index_bytes;
         budget.index_scratch.headroom_bytes = self.storage.headroom_bytes;
-        let captured = crate::ltfs::recovery::capture_index_source(
+        let captured = crate::ltfs::recovery::capture_complete_index_source(
             &TapeDrive::new(&checked),
             &label,
             &budget,

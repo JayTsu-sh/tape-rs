@@ -84,6 +84,33 @@ impl CapturedIndexSource {
     }
 }
 
+/// Capture complete history for reclaim, bounded by the actual head's block
+/// position. Every verified predecessor must occupy a strictly earlier block,
+/// so this finite geometric bound replaces the general historical-depth cap.
+/// Incremental replay retains its original depth/identity budget. XML,
+/// node/scratch storage and tail-search budgets remain unchanged. A
+/// truncated history is an error, never permission to migrate or initialize.
+pub fn capture_complete_index_source(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    budget: &RecoveryBudget,
+) -> Result<CapturedIndexSource> {
+    let captured =
+        capture_index_source(drive, label, &budget.clone().with_complete_full_history())?;
+    if matches!(
+        captured.scope(),
+        IndexSourceScope::Current {
+            history_truncated: true,
+            ..
+        }
+    ) {
+        return Err(TapeError::RecoveryRestricted {
+            reason: "完整历史超出可计数深度，禁止接受部分证明".into(),
+        });
+    }
+    Ok(captured)
+}
+
 /// Discover a clean latest DP head and retain complete replayed node payloads
 /// on bounded local disk. No index XML, file tree or path set grows in memory.
 /// This does not format, repair, checkpoint, write MAM or authorize appends.

@@ -9,7 +9,9 @@ use crate::ltfs::mam::{Mam, MediumIdentity};
 use crate::ltfs::mkltfs::{
     MkltfsOptions, require_two_partition_layout, reset_ltfs_at, reset_partition_records,
 };
-use crate::ltfs::recovery::{RecoveryBudget, capture_index_source, capture_recorded_index_source};
+use crate::ltfs::recovery::{
+    RecoveryBudget, capture_complete_index_source, capture_recorded_index_source,
+};
 use crate::managed_catalog::{
     ActiveLibraryRoute, ManagedCatalog, ReclaimFormatAdmission, ReclaimFormatCommitEvidence,
     ReclaimFormatPlan, ReclaimFormatRetryEvidence, ReclaimReservation,
@@ -278,7 +280,7 @@ impl ReclaimFormatter<'_> {
         let mut complete = false;
         match (a, b) {
             (1, 1) => {
-                let actual = capture_index_source(
+                let actual = capture_complete_index_source(
                     &TapeDrive::new(&checked),
                     ip.as_ref().unwrap(),
                     self.budget,
@@ -302,8 +304,11 @@ impl ReclaimFormatter<'_> {
             _ => return Err(refused("原初始化两分区状态不属于可恢复的写入顺序")),
         }
         let outcome = if complete {
-            let current =
-                capture_index_source(&TapeDrive::new(&checked), ip.as_ref().unwrap(), self.budget)?;
+            let current = capture_complete_index_source(
+                &TapeDrive::new(&checked),
+                ip.as_ref().unwrap(),
+                self.budget,
+            )?;
             ReclaimFormatOutcome::Committed(
                 ReclaimFormatCommitEvidence::from_current(plan, self.key.round(), &current)
                     .map_err(error)?,

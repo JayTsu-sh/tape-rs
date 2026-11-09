@@ -264,12 +264,13 @@ pub fn capture_full_recovery(
     };
     let source_bytes = head.bytes;
     let mut depth = 0;
+    let history_limit = budget.full_history_limit(head.index.self_location.start_block);
     let mut truncated = false;
     while let Some(previous) = head.index.previous_location {
         if previous.partition != label.data_partition {
             break;
         }
-        if depth >= budget.max_chain_len {
+        if depth >= history_limit {
             truncated = true;
             break;
         }

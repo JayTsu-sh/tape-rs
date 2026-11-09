@@ -2711,6 +2711,61 @@ mod tests {
         MountLimit,
         StaleQueued,
         VendorDvcid,
+        LongHistory,
+        LongHistoryT2,
+        LongHistoryIp,
+    }
+    impl NativeParentCase {
+        fn long_history(self) -> bool {
+            matches!(
+                self,
+                Self::LongHistory | Self::LongHistoryT2 | Self::LongHistoryIp
+            )
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 超过64代Full后的原生元数据T2修复和完整回收"]
+    async fn native_reclaim_parent_recovers_long_full_history_t2() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::LongHistoryT2,
+        ))
+        .await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 超过64代Full后的原生元数据IP修复和完整回收"]
+    async fn native_reclaim_parent_recovers_long_full_history_ip() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::LongHistoryIp,
+        ))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 源和目的均超过64代Full历史的完整原生回收"]
+    async fn native_reclaim_parent_checks_long_full_source_and_destination_history() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::LongHistory,
+        ))
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3305,6 +3360,128 @@ mod tests {
         })
     }
 
+    fn lengthen_native_target_history<'a>(
+        fixture: &'a mut Fixture,
+        control: &'a FdbOwnerControl,
+        status: &'a SharedStatus,
+        pool: uuid::Uuid,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = ()> + 'a>> {
+        Box::pin(async move {
+            // Deliberate external Full writes on Sim only, followed by the
+            // supported assigned-tape import to refresh the original FDB head.
+            let changer = fixture
+                .owner
+                .devices
+                .iter()
+                .find(|d| d.kind == DeviceKind::Changer)
+                .unwrap();
+            let mut robot = MediumChanger::new(changer.dev.as_ref());
+            robot.load_address_map().unwrap();
+            let rows = robot.read_all_status().unwrap();
+            let media = rows
+                .iter()
+                .find(|r| r.full && r.volume_tag.as_deref() == Some("LAYOUTL8"))
+                .unwrap();
+            let address =
+                if media.element_type == crate::changer::element::ElementType::DataTransfer {
+                    media.address
+                } else {
+                    let drive = rows
+                        .iter()
+                        .find(|r| {
+                            r.element_type == crate::changer::element::ElementType::DataTransfer
+                                && !r.full
+                        })
+                        .unwrap();
+                    robot.move_medium(media.address, drive.address).unwrap();
+                    drive.address
+                };
+            let mapping = inventory_elements(
+                &fixture.owner.devices,
+                &robot.read_all_status().unwrap(),
+                true,
+            )
+            .unwrap();
+            let dev = mapping
+                .drives
+                .iter()
+                .find(|d| d.addr == address)
+                .unwrap()
+                .dev;
+            let device = fixture.owner.devices[dev].dev.as_ref();
+            TapeDrive::new(device).load().unwrap();
+            let mut volume = LtfsVolume::mount(device).unwrap();
+            volume.set_reservation_guard(Some(fixture.owner.key));
+            for i in 0..70 {
+                volume
+                    .set_node_xattr(
+                        "/",
+                        crate::ltfs::index::Xattr {
+                            key: "destination-history".into(),
+                            value: i.to_string(),
+                            base64: false,
+                        },
+                        i == 0,
+                        i > 0,
+                    )
+                    .unwrap();
+                volume.commit().unwrap();
+            }
+            drop(volume);
+            renew_native_parent_permit(fixture);
+            let refresh = crate::managed_catalog::ManagementRequest::parse(json!({
+                "version":1,"library":control.serial,"namespace":control.route.route.namespace.to_string(),
+                "epoch":1,"operation":uuid::Uuid::new_v4().to_string(),"change":{
+                    "kind":"media-import","pool":pool.to_string(),"barcode":"LAYOUTL8","volume":null,
+                    "path":"/","merge_tapes":true
+                }
+            })).unwrap();
+            assert_eq!(
+                execute(fixture, control, status, &refresh).await["status"],
+                "succeeded"
+            );
+        })
+    }
+
+    struct ParentPermitHeartbeat {
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl ParentPermitHeartbeat {
+        fn new(fixture: &Fixture) -> Self {
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = stop.clone();
+            let permit = fixture.permit.clone();
+            let round = fixture.owner.round;
+            let thread = std::thread::spawn(move || {
+                // This long-history Sim case has no ownership change. Model
+                // the production Raft thread renewing the same majority lease
+                // while one guarded device phase runs longer than 60 seconds.
+                while !flag.load(std::sync::atomic::Ordering::Acquire) {
+                    permit.renew(
+                        round,
+                        Phase::Serving,
+                        Instant::now() + Duration::from_secs(60),
+                    );
+                    std::thread::park_timeout(Duration::from_millis(250));
+                }
+            });
+            Self {
+                stop,
+                thread: Some(thread),
+            }
+        }
+    }
+    impl Drop for ParentPermitHeartbeat {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                thread.thread().unpark();
+                thread.join().unwrap();
+            }
+        }
+    }
+
     async fn native_reclaim_parent_case(
         catalog: Arc<crate::managed_catalog::ManagedCatalog>,
         cluster: &str,
@@ -3325,6 +3502,9 @@ mod tests {
             Fixture::with_drives(2),
         ))
         .await;
+        let _heartbeat = case
+            .long_history()
+            .then(|| ParentPermitHeartbeat::new(&fixture));
         if case == NativeParentCase::VendorDvcid {
             fixture.lib.set_quirks(crate::scsi::sim::SimQuirks {
                 dvcid_vendor_model: true,
@@ -3377,6 +3557,23 @@ mod tests {
                 .unwrap();
         }
         volume.commit().unwrap();
+        if case == NativeParentCase::LongHistory {
+            for i in 0..70 {
+                volume
+                    .set_node_xattr(
+                        "/",
+                        crate::ltfs::index::Xattr {
+                            key: "source-history".into(),
+                            value: i.to_string(),
+                            base64: false,
+                        },
+                        i == 0,
+                        i > 0,
+                    )
+                    .unwrap();
+                volume.commit().unwrap();
+            }
+        }
         let orphan = volume
             .index()
             .find_file(".LTFSEE_DATA/orphan")
@@ -3408,6 +3605,9 @@ mod tests {
         );
         let assigned = execute(&mut fixture, &control, &status, &assign).await;
         assert_eq!(assigned["status"], "succeeded", "{assigned}");
+        if case.long_history() {
+            lengthen_native_target_history(&mut fixture, &control, &status, pool.id).await;
+        }
         let source = catalog
             .tape_assignment(&control.serial, "LIFE00L8")
             .await
@@ -3538,6 +3738,40 @@ mod tests {
             .unwrap()
             .unwrap();
         let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let history_fault = matches!(
+            case,
+            NativeParentCase::LongHistoryT2 | NativeParentCase::LongHistoryIp
+        );
+        let mut history_fault_seen = false;
+        let history_fault_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if history_fault {
+            let current = inventory(&fixture.owner.devices).unwrap();
+            let dest = current
+                .drives
+                .iter()
+                .find(|d| {
+                    d.loaded
+                        .as_ref()
+                        .is_some_and(|(barcode, _)| barcode == "LAYOUTL8")
+                })
+                .expect("long-history destination remains loaded after refresh");
+            assert!(dest.dev < fixture.lib.drive_count());
+            let dev = dest.dev;
+            let inner = std::mem::replace(
+                &mut fixture.owner.devices[dev].dev,
+                Box::new(fixture.lib.drive_as(dev, 1)),
+            );
+            fixture.owner.devices[dev].dev = Box::new(parent_recovery::FailOneAppend::new(
+                inner,
+                if case == NativeParentCase::LongHistoryT2 {
+                    crate::scsi::cdb::opcode::WRITE_FILEMARKS_6
+                } else {
+                    crate::scsi::cdb::opcode::WRITE_6
+                },
+                1,
+                history_fault_fired.clone(),
+            ));
+        }
         if case == NativeParentCase::MountLimit {
             verify_native_parent_mount_wait(&mut fixture, &control, &status, &parent, &original)
                 .await;
@@ -3788,6 +4022,36 @@ mod tests {
                 &status,
             ))
             .await;
+            if history_fault && !history_fault_seen && result.is_err() {
+                assert!(
+                    history_fault_fired.load(std::sync::atomic::Ordering::SeqCst),
+                    "fault must reach the original managed transport"
+                );
+                let expected = if case == NativeParentCase::LongHistoryT2 {
+                    "closing_fm"
+                } else {
+                    "index_partition"
+                };
+                assert!(
+                    matches!(&result, Err(ReadError::Lost(reason)) if reason.contains(expected)),
+                    "{result:?}"
+                );
+                let saved = catalog
+                    .reclaim_metadata_checkpoint(&parent, fixture.owner.round)
+                    .await
+                    .unwrap()
+                    .expect("original metadata attempt retained");
+                assert!(saved.writing());
+                assert!(
+                    catalog
+                        .reclaim_format_plan(&parent, fixture.owner.round)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                history_fault_seen = true;
+                continue;
+            }
             if interrupt_child && step == 0 {
                 assert!(matches!(result, Err(ReadError::Lost(_))), "{result:?}");
                 assert!(interrupted.load(std::sync::atomic::Ordering::SeqCst));
@@ -3962,6 +4226,10 @@ mod tests {
                     if native_links { 2 } else { 1 }
                 );
                 assert_eq!(done.value()["unassigned"], unassign);
+                assert_eq!(
+                    history_fault_seen, history_fault,
+                    "long-history recovery must actually exercise the injected failure"
+                );
                 let source_after = catalog
                     .tape_assignment(&control.serial, &source.barcode)
                     .await

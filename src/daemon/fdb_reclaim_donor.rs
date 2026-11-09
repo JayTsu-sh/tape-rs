@@ -90,7 +90,8 @@ impl ReclaimMetadataWriter<'_> {
             if label.volume_uuid != context.current().volume_uuid {
                 return Err(catalog("donor 已装入介质不是原目标卷"));
             }
-            let target = capture_index_source(&TapeDrive::new(&checked), &label, self.budget)?;
+            let target =
+                capture_complete_index_source(&TapeDrive::new(&checked), &label, self.budget)?;
             let node = context.require_donor(&target).map_err(catalog)?;
             let mut body = BodyHash {
                 sha: Sha256::new(),
@@ -117,7 +118,8 @@ impl ReclaimMetadataWriter<'_> {
             if length != body.length || length != body.expected {
                 return Err(catalog("donor 正文实读残缺"));
             }
-            let after = capture_index_source(&TapeDrive::new(&checked), &label, self.budget)?;
+            let after =
+                capture_complete_index_source(&TapeDrive::new(&checked), &label, self.budget)?;
             if after.identity()? != target.identity()?
                 || after.construct_end() != target.construct_end()
             {

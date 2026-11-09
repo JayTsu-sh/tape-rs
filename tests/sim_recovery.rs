@@ -1342,6 +1342,18 @@ fn streamed_source_captures_full_and_incremental_payloads_without_writes() {
         )
         .is_err()
     );
+    assert!(
+        tape_rs::ltfs::recovery::capture_complete_index_source(
+            &drive,
+            &label,
+            &RecoveryBudget {
+                max_chain_len: 1,
+                ..Default::default()
+            }
+        )
+        .is_err(),
+        "完整 Full 历史模式不能放宽增量重放预算或身份长度"
+    );
     drop(source);
     let mut checkpoint = expected.clone();
     checkpoint.self_location = tape_rs::ltfs::index::IndexLocation {
@@ -1747,4 +1759,155 @@ fn streamed_recovery_accepts_full_handoff_after_native_incremental_writes() {
         })
         .unwrap();
     assert_eq!(files, ["a", "b"]);
+}
+
+#[cfg(feature = "fdb")]
+#[test]
+fn reclaim_complete_source_checks_full_history_beyond_the_default_budget() {
+    use tape_rs::ltfs::index::Xattr;
+    use tape_rs::ltfs::recovery::{
+        IndexSourceScope, capture_complete_index_source, capture_index_source,
+    };
+    use tape_rs::ltfs::volume::read_label_only;
+    use tape_rs::tape::commands::TapeDrive;
+    let (lib, dev) = setup();
+    let mut volume = LtfsVolume::mount(&dev).unwrap();
+    for i in 0..70 {
+        volume
+            .set_node_xattr(
+                "/",
+                Xattr {
+                    key: "history".into(),
+                    value: i.to_string(),
+                    base64: false,
+                },
+                i == 0,
+                i > 0,
+            )
+            .unwrap();
+        volume.commit().unwrap();
+    }
+    let head = volume.committed_index_construct();
+    drop(volume);
+    let label = read_label_only(&dev).unwrap();
+    let drive = TapeDrive::new(&dev);
+    let before = dev.command_log().len();
+    let bounded = capture_index_source(&drive, &label, &RecoveryBudget::default()).unwrap();
+    assert!(matches!(
+        bounded.scope(),
+        IndexSourceScope::Current {
+            history_truncated: true,
+            ..
+        }
+    ));
+    let complete =
+        capture_complete_index_source(&drive, &label, &RecoveryBudget::default()).unwrap();
+    assert_eq!(complete.construct(), head);
+    assert!(
+        matches!(
+            complete.scope(),
+            IndexSourceScope::Current {
+                history_depth: 70,
+                history_truncated: false,
+                ..
+            }
+        ),
+        "{:?}",
+        complete.scope()
+    );
+    assert!(
+        !dev.command_log()[before..]
+            .iter()
+            .any(|op| matches!(*op, 0x0a | 0x10 | 0x8d | 0x04 | 0x19))
+    );
+    lib.with_cartridge_mut(BARCODE, |cartridge| {
+        let LogicalObject::Record(record) = &mut cartridge.partitions[1].objects[5] else {
+            panic!("generation-1 index");
+        };
+        let text = String::from_utf8(record.clone()).unwrap();
+        assert!(text.contains("<generationnumber>1</generationnumber>"));
+        let changed = text.replace("<startblock>5</startblock>", "<startblock>6</startblock>");
+        assert_ne!(text, changed);
+        *record = changed.into_bytes();
+    });
+    assert!(
+        capture_complete_index_source(&drive, &label, &RecoveryBudget::default()).is_err(),
+        "64 代以前的损坏不能通过完整历史检查"
+    );
+}
+
+#[cfg(feature = "fdb")]
+#[test]
+fn reclaim_recovery_mount_checks_long_history_before_t1_t2_repair() {
+    use tape_rs::ltfs::index::Xattr;
+    use tape_rs::tape::commands::TapeDrive;
+    for truncated in [false, true] {
+        let (lib, dev) = setup();
+        let mut volume = LtfsVolume::mount(&dev).unwrap();
+        for i in 0..70 {
+            volume
+                .set_node_xattr(
+                    "/",
+                    Xattr {
+                        key: "history".into(),
+                        value: i.to_string(),
+                        base64: false,
+                    },
+                    i == 0,
+                    i > 0,
+                )
+                .unwrap();
+            volume.commit().unwrap();
+        }
+        volume
+            .append_file("/uncommitted", &mut Cursor::new(b"unindexed tail"))
+            .unwrap();
+        if truncated {
+            dev.inject(Fault {
+                opcode: opcode::WRITE_FILEMARKS_6,
+                action: FaultAction::CheckCondition {
+                    sense_key: 3,
+                    asc: 0x0c,
+                    ascq: 0,
+                },
+                after: 1,
+                remaining: 1,
+            });
+            assert!(
+                matches!(volume.commit(), Err(TapeError::CommitFailed { ref stage,.. }) if stage=="closing_fm")
+            );
+        } else {
+            TapeDrive::new(&dev).write_filemark(0).unwrap();
+        }
+        drop(volume);
+        flush_all(&lib);
+        let expected = if truncated {
+            TailKind::TruncatedIndex
+        } else {
+            TailKind::UnindexedData
+        };
+        let before = dev.command_log().len();
+        let ordinary = LtfsVolume::mount(&dev).unwrap();
+        assert_eq!(ordinary.recovery().dp.tail, expected);
+        assert!(ordinary.recovery().chain_truncated_by_budget);
+        drop(ordinary);
+        let complete = LtfsVolume::mount_with_budget(
+            &dev,
+            &RecoveryBudget::default().with_complete_full_history(),
+        )
+        .unwrap();
+        assert_eq!(complete.recovery().dp.tail, expected);
+        assert!(
+            !complete.recovery().chain_truncated_by_budget,
+            "完整恢复前置仍受64代截断"
+        );
+        assert_eq!(complete.recovery().chain_depth, 70);
+        assert!(!complete.writable());
+        assert!(
+            !dev.command_log()[before..]
+                .iter()
+                .any(|op| matches!(*op, 0x0a | 0x10 | 0x8d | 0x04 | 0x19)),
+            "核前置不自动修尾或写IP"
+        );
+    }
 }

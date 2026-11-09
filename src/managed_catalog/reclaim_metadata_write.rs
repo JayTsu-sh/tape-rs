@@ -177,6 +177,9 @@ impl ReclaimMetadataWrite {
         }
         if let Some(observed) = self.observation()?
             && !(self.writing()
+                // A DP commit can be observed before IP repair is admitted.
+                // Checkpointing retains that exact fact without publishing it.
+                || self.checkpointing()
                 || self.completed()
                 || self.resolved()
                 || (self.closed() || self.recovering())

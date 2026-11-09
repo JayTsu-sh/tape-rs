@@ -14,7 +14,7 @@ use crate::catalog::volume_extents::{ExpectedIndex, VolumeExtentCache};
 use crate::error::{Result, TapeError};
 use crate::ltfs::label::LtfsLabel;
 use crate::ltfs::recovery::{
-    RecoveryBudget, capture_index_source, capture_recorded_index_source,
+    RecoveryBudget, capture_complete_index_source, capture_recorded_index_source,
     verify_dp_ip_head_with_evidence,
 };
 use crate::ltfs::volume::{CommittedIndexConstruct, read_cached_file_to_writer, read_label_only};
@@ -280,7 +280,7 @@ impl ActiveMediaReader<'_> {
         budget.index_scratch.max_bytes = self.storage.index_bytes;
         budget.index_scratch.headroom_bytes = self.storage.headroom_bytes;
         let captured = retry_after_space_reclaim(
-            || capture_index_source(&TapeDrive::new(reader.device), &label, &budget),
+            || capture_complete_index_source(&TapeDrive::new(reader.device), &label, &budget),
             || reclaim_cache_space(cache_dir, self.storage),
         )?;
         let (_, head) = reader
@@ -402,7 +402,7 @@ impl ActiveMediaReader<'_> {
         budget.index_scratch.max_bytes = self.storage.index_bytes;
         budget.index_scratch.headroom_bytes = self.storage.headroom_bytes;
         let captured = retry_after_space_reclaim(
-            || capture_index_source(&TapeDrive::new(reader.device), &label, &budget),
+            || capture_complete_index_source(&TapeDrive::new(reader.device), &label, &budget),
             || reclaim_cache_space(cache_dir, self.storage),
         )?;
         let (_, after) = reader

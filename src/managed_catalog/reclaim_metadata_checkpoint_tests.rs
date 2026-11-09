@@ -265,3 +265,39 @@ fn checkpoint_rejects_an_ip_ahead_view_and_never_reclassifies_recorded_as_curren
             .any(|op| matches!(op, 0x0a | 0x10 | 0x8d | 0x04 | 0x19))
     );
 }
+
+#[test]
+fn checkpoint_preserves_a_committed_observation_without_authorizing_discard_or_close() {
+    let s = setup(false);
+    let retained = original(&s);
+    let mut volume = LtfsVolume::mount(&s.device).unwrap();
+    volume.set_reservation_guard(Some(ReservationKey::new(1, 7)));
+    s.plan
+        .stage_reference(&mut volume, &s.before, &s.before)
+        .unwrap();
+    volume.commit().unwrap();
+    drop(volume);
+    let current = capture(&s.device);
+    let observed = s.plan.observe_current(&current, Some(&retained)).unwrap();
+    assert_eq!(observed.kind(), ReclaimMetadataObservationKind::Committed);
+    let mut writing = task(&s, Phase::Writing);
+    writing.0.observation = Some(observed.encode(&s.plan).unwrap());
+    writing.encode().unwrap();
+    let mut checkpointing = writing.clone();
+    checkpointing.0.phase = Phase::Checkpointing;
+    checkpointing.0.recovery_epoch = 1;
+    let encoded = checkpointing
+        .encode()
+        .expect("IP repair must retain the original exact DP observation");
+    let reopened = ReclaimMetadataWrite::decode(&encoded).unwrap();
+    assert_eq!(reopened.observation().unwrap(), Some(observed));
+    for phase in [Phase::Prepared, Phase::Closed, Phase::Discarding] {
+        let mut refused = writing.clone();
+        refused.0.phase = phase;
+        refused.0.recovery_epoch = u64::from(phase == Phase::Discarding);
+        assert!(
+            refused.encode().is_err(),
+            "committed observation cannot authorize {phase:?}"
+        );
+    }
+}

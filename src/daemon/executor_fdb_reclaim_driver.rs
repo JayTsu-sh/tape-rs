@@ -79,7 +79,7 @@ fn reader<'a>(
     }
 }
 fn budget(owner: &Active, control: &FdbOwnerControl) -> RecoveryBudget {
-    let mut budget = RecoveryBudget::default();
+    let mut budget = RecoveryBudget::default().with_complete_full_history();
     budget.max_index_bytes = budget
         .max_index_bytes
         .min(usize::try_from(control.storage.index_bytes).unwrap_or(usize::MAX));
@@ -373,7 +373,7 @@ fn capture_destination(
     if label.volume_uuid != layout.destination.volume {
         return Err(lost("原目的标签改变"));
     }
-    let captured = crate::ltfs::recovery::capture_index_source(
+    let captured = crate::ltfs::recovery::capture_complete_index_source(
         &TapeDrive::new(&checked),
         &label,
         &budget(owner, control),

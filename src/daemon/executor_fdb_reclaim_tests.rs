@@ -157,3 +157,72 @@ impl TapeTransport for AfterChildBarrier {
         self.inner.execution_guard()
     }
 }
+
+/// Fails the original managed handle once at a precise append stage. A new
+/// SimTransport handle has a separate fault queue and cannot exercise it.
+pub(super) struct FailOneAppend {
+    inner: Box<dyn TapeTransport + Send>,
+    opcode: u8,
+    after: usize,
+    matching: std::sync::atomic::AtomicUsize,
+    fired: Arc<AtomicBool>,
+}
+impl FailOneAppend {
+    pub(super) fn new(
+        inner: Box<dyn TapeTransport + Send>,
+        opcode: u8,
+        after: usize,
+        fired: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            inner,
+            opcode,
+            after,
+            matching: std::sync::atomic::AtomicUsize::new(0),
+            fired,
+        }
+    }
+    fn before(&self, cdb: &[u8]) -> Result<()> {
+        if cdb.first() == Some(&self.opcode)
+            && !self.fired.load(Ordering::SeqCst)
+            && self.matching.fetch_add(1, Ordering::SeqCst) == self.after
+            && !self.fired.swap(true, Ordering::SeqCst)
+        {
+            return Err(TapeError::ScsiHost(3));
+        }
+        Ok(())
+    }
+}
+impl TapeTransport for FailOneAppend {
+    fn execute_no_data(&self, cdb: &[u8], timeout: u32) -> Result<crate::scsi::device::ScsiResult> {
+        self.before(cdb)?;
+        self.inner.execute_no_data(cdb, timeout)
+    }
+    fn execute_read(
+        &self,
+        cdb: &[u8],
+        out: &mut [u8],
+        timeout: u32,
+    ) -> Result<crate::scsi::device::ScsiResult> {
+        self.before(cdb)?;
+        self.inner.execute_read(cdb, out, timeout)
+    }
+    fn execute_write(
+        &self,
+        cdb: &[u8],
+        data: &[u8],
+        timeout: u32,
+    ) -> Result<crate::scsi::device::ScsiResult> {
+        self.before(cdb)?;
+        self.inner.execute_write(cdb, data, timeout)
+    }
+    fn identity(&self) -> &str {
+        self.inner.identity()
+    }
+    fn session_epoch(&self) -> Option<u64> {
+        self.inner.session_epoch()
+    }
+    fn execution_guard(&self) -> Option<(u64, usize)> {
+        self.inner.execution_guard()
+    }
+}

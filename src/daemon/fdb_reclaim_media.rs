@@ -5,7 +5,8 @@ use super::executor::fdb_operation_guard::Guard;
 use super::permission::{Permission, Phase};
 use crate::error::{Result, TapeError};
 use crate::ltfs::recovery::{
-    CapturedIndexSource, RecoveryBudget, capture_index_source, capture_recorded_index_source,
+    CapturedIndexSource, RecoveryBudget, capture_complete_index_source,
+    capture_recorded_index_source,
 };
 use crate::ltfs::volume::{LtfsVolume, read_label_only};
 use crate::managed_catalog::{
@@ -58,6 +59,10 @@ impl ReclaimMetadataExecution {
 }
 
 impl ReclaimMetadataWriter<'_> {
+    fn recovery_budget(&self) -> RecoveryBudget {
+        self.budget.clone().with_complete_full_history()
+    }
+
     /// A directory/link needs a new current target-index proof after repair,
     /// without inventing a zero-byte file donor or changing its original path.
     pub fn read_source_replan<'a>(
@@ -100,7 +105,8 @@ impl ReclaimMetadataWriter<'_> {
             if label.volume_uuid != task.plan().volume() {
                 return Err(catalog("节点重新规划装入了其他介质"));
             }
-            let target = capture_index_source(&TapeDrive::new(&checked), &label, self.budget)?;
+            let target =
+                capture_complete_index_source(&TapeDrive::new(&checked), &label, self.budget)?;
             let inventory = crate::managed_catalog::ReclaimSourceInventory::from_captured(source)
                 .map_err(catalog)?;
             let plan = task
@@ -157,7 +163,7 @@ impl ReclaimMetadataWriter<'_> {
         if length != body.length || length != body.expected {
             return Err(catalog("原始正文目的实读残缺"));
         }
-        let after = capture_index_source(&TapeDrive::new(checked), label, self.budget)?;
+        let after = capture_complete_index_source(&TapeDrive::new(checked), label, self.budget)?;
         if after.identity()? != current.identity()?
             || after.scope() != current.scope()
             || after.construct_end() != current.construct_end()
@@ -318,10 +324,10 @@ impl ReclaimMetadataWriter<'_> {
             return Err(catalog("回收元数据已装入介质不是原目标卷"));
         }
         let drive = TapeDrive::new(&checked);
-        let before = capture_index_source(&drive, &label, self.budget)?;
+        let before = capture_complete_index_source(&drive, &label, self.budget)?;
         if !admission.needs_observation() {
             let source = source.ok_or_else(|| catalog("首次元数据执行缺少原来源"))?;
-            let mut volume = LtfsVolume::mount_with_budget(&checked, self.budget)?;
+            let mut volume = LtfsVolume::mount_with_budget(&checked, &self.recovery_budget())?;
             volume.set_reservation_guard(Some(self.key));
             if plan.is_raw_body() {
                 let stream = reader
@@ -340,7 +346,7 @@ impl ReclaimMetadataWriter<'_> {
         let actual = if admission.needs_observation() {
             before
         } else {
-            capture_index_source(&drive, &label, self.budget)?
+            capture_complete_index_source(&drive, &label, self.budget)?
         };
         let predecessor = if actual.construct().incremental
             || actual.identity()? == plan.previous_source().map_err(catalog)?

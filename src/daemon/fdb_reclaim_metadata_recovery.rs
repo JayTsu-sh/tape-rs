@@ -86,7 +86,7 @@ impl ReclaimMetadataWriter<'_> {
                     &writing.plan().previous_source().map_err(catalog)?,
                     self.budget,
                 )?;
-                let mut volume = LtfsVolume::mount_with_budget(&checked, self.budget)?;
+                let mut volume = LtfsVolume::mount_with_budget(&checked, &self.recovery_budget())?;
                 volume.set_reservation_guard(Some(self.key));
                 let proof = match goal {
                     Goal::Discard => Admission::Discard(
@@ -96,7 +96,7 @@ impl ReclaimMetadataWriter<'_> {
                         Admission::Checkpoint(volume.reclaim_metadata_checkpoint_evidence(
                             writing,
                             &original,
-                            self.budget,
+                            &self.recovery_budget(),
                         )?)
                     }
                 };
@@ -177,7 +177,7 @@ impl ReclaimMetadataWriter<'_> {
                 self.budget,
             )?;
             {
-                let mut volume = LtfsVolume::mount_with_budget(&checked, self.budget)?;
+                let mut volume = LtfsVolume::mount_with_budget(&checked, &self.recovery_budget())?;
                 volume.set_reservation_guard(Some(self.key));
                 match volume.recovery().dp.tail {
                     TailKind::Complete => {}
@@ -192,7 +192,7 @@ impl ReclaimMetadataWriter<'_> {
                         volume.reclaim_metadata_tail_evidence(task, &original)?;
                         volume.close_tail(TailPolicy::Discard)?;
                         drop(volume);
-                        volume = LtfsVolume::mount_with_budget(&checked, self.budget)?;
+                        volume = LtfsVolume::mount_with_budget(&checked, &self.recovery_budget())?;
                         volume.set_reservation_guard(Some(self.key));
                     }
                     _ => return Err(catalog("修尾重入未识别到原任务可恢复的尾部")),
@@ -203,10 +203,11 @@ impl ReclaimMetadataWriter<'_> {
                     // This routine independently recognizes the exact DP result
                     // and known IP damage before overwriting IP. An original
                     // delta requires the explicit Checkpointing goal.
-                    volume.checkpoint_reclaim_metadata(task, &original, self.budget)?;
+                    volume.checkpoint_reclaim_metadata(task, &original, &self.recovery_budget())?;
                 }
             }
-            let current = capture_index_source(&TapeDrive::new(&checked), &label, self.budget)?;
+            let current =
+                capture_complete_index_source(&TapeDrive::new(&checked), &label, self.budget)?;
             let raw_read = if plan
                 .observe_current(&current, Some(&original))
                 .is_ok_and(|o| o.kind() == ReclaimMetadataObservationKind::Committed)
