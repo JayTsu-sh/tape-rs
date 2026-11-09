@@ -1,7 +1,9 @@
-use super::super::metadata_discard::tests::{capture, original, setup};
+use super::super::metadata_discard::tests::{Scenario, capture, original, setup};
 use super::*;
-use crate::ltfs::volume::LtfsVolume;
+use crate::ltfs::recovery::{RecoveryBudget, capture_recorded_index_source};
+use crate::ltfs::volume::{LtfsVolume, read_label_only};
 use crate::scsi::reservation::ReservationKey;
+use crate::tape::commands::TapeDrive;
 
 fn reservation(source: &CapturedIndexSource) -> ReclaimReservation {
     let ns = Uuid::new_v4();
@@ -24,6 +26,29 @@ fn reservation(source: &CapturedIndexSource) -> ReclaimReservation {
                 "barcode":"DSC000L8","volume":source.construct().volume_uuid.to_string(),
                 "revision":1,"confirm_format":true,"unassign":false}}),
     }
+}
+
+fn append_unreferenced_target_file(target: &mut Scenario, delta: bool) {
+    let mut volume = LtfsVolume::mount(&target.device).unwrap();
+    volume.set_reservation_guard(Some(ReservationKey::new(1, 7)));
+    volume.append_bytes("unused", b"old unused").unwrap();
+    if delta {
+        volume.commit_incremental().unwrap();
+    } else {
+        volume.commit().unwrap();
+    }
+    drop(volume);
+    target.before = capture(&target.device);
+}
+
+fn plan_predecessor(target: &Scenario, plan: &ReclaimMetadataPlan) -> CapturedIndexSource {
+    capture_recorded_index_source(
+        &TapeDrive::new(&target.device),
+        &read_label_only(&target.device).unwrap(),
+        &plan.previous_source().unwrap(),
+        &RecoveryBudget::default(),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -145,7 +170,7 @@ fn node_plan_rejects_unrelated_metadata_changes_in_the_same_commit() {
 fn native_link_collision_preserves_original_target_file_and_all_attributes() {
     for delta in [false, true] {
         let source = setup(false);
-        let target = setup(false);
+        let mut target = setup(false);
         let inventory = ReclaimSourceInventory::from_captured(&source.before).unwrap();
         let node = ReclaimSourceNode(
             Object::capture(source.before.entry_by_uid(4).unwrap().unwrap()).unwrap(),
@@ -166,9 +191,10 @@ fn native_link_collision_preserves_original_target_file_and_all_attributes() {
             "相对链接不能换父目录后假装仍保持语义"
         );
         assert_eq!(target.device.command_log().len(), commands);
-        let old = target.before.entry_by_path("body").unwrap().unwrap();
+        append_unreferenced_target_file(&mut target, false);
+        let old = target.before.entry_by_path("unused").unwrap().unwrap();
         let plan = inventory
-            .plan_reclaimed_node(&parent, &node, &target.before, "body")
+            .plan_reclaimed_node(&parent, &node, &target.before, "unused")
             .unwrap();
         let mut volume = LtfsVolume::mount(&target.device).unwrap();
         volume.set_reservation_guard(Some(ReservationKey::new(1, 7)));
@@ -183,7 +209,7 @@ fn native_link_collision_preserves_original_target_file_and_all_attributes() {
         target.library.power_cut();
         let actual = capture(&target.device);
         assert_eq!(
-            plan.observe_current(&actual, Some(&original(&target)))
+            plan.observe_current(&actual, Some(&plan_predecessor(&target, &plan)))
                 .unwrap()
                 .kind(),
             ReclaimMetadataObservationKind::Committed
@@ -199,15 +225,152 @@ fn native_link_collision_preserves_original_target_file_and_all_attributes() {
         else {
             panic!("old body")
         };
-        assert_ne!(path, "body");
+        assert_ne!(path, "unused");
         old.name = preserved.name.clone();
         assert_eq!(
             preserved, old,
             "原 UID、正文位置和全部属性保持，只有归档名称改变"
         );
         assert_eq!(
-            Object::capture(actual.entry_by_path("body").unwrap().unwrap()).unwrap(),
+            Object::capture(actual.entry_by_path("unused").unwrap().unwrap()).unwrap(),
             plan.0.expected
         );
+        let volume = LtfsVolume::mount(&target.device).unwrap();
+        for link in ["alias", "unused"] {
+            let mut bytes = Vec::new();
+            volume.read_file_to_writer(link, &mut bytes).unwrap();
+            assert_eq!(bytes, b"body", "已有链接及新链接都保持正文解析");
+        }
+        let mut bytes = Vec::new();
+        volume.read_file_to_writer(&path, &mut bytes).unwrap();
+        assert_eq!(bytes, b"old unused");
+    }
+}
+
+#[test]
+fn native_link_collision_preserves_existing_incoming_link() {
+    for delta in [false, true] {
+        for (link_path, link_target) in [
+            ("alias", "body"),
+            ("alias", "./body"),
+            ("nested/alias", "../body"),
+        ] {
+            let source = setup(false);
+            let mut target = setup(delta);
+            if (link_path, link_target) != ("alias", "body") {
+                let mut volume = LtfsVolume::mount(&target.device).unwrap();
+                volume.set_reservation_guard(Some(ReservationKey::new(1, 7)));
+                volume.remove_file("alias").unwrap();
+                volume.add_symlink(link_path, link_target).unwrap();
+                volume.commit().unwrap();
+                drop(volume);
+                target.before = capture(&target.device);
+            }
+            let mut old_body = Vec::new();
+            LtfsVolume::mount(&target.device)
+                .unwrap()
+                .read_file_to_writer(link_path, &mut old_body)
+                .unwrap();
+            assert_eq!(old_body, b"body");
+            let inventory = ReclaimSourceInventory::from_captured(&source.before).unwrap();
+            let node = ReclaimSourceNode(
+                Object::capture(source.before.entry_by_uid(4).unwrap().unwrap()).unwrap(),
+            );
+            let before = target.device.command_log().len();
+            let planned = inventory.plan_reclaimed_node(
+                &reservation(&source.before),
+                &node,
+                &target.before,
+                "body",
+            );
+            if let Ok(plan) = &planned {
+                let mut volume = LtfsVolume::mount(&target.device).unwrap();
+                volume.set_reservation_guard(Some(ReservationKey::new(1, 7)));
+                plan.stage_reference(&mut volume, &source.before, &target.before)
+                    .unwrap();
+                if delta {
+                    volume.commit_incremental().unwrap();
+                } else {
+                    volume.commit().unwrap();
+                }
+                drop(volume);
+                target.library.power_cut();
+                let mut actual = Vec::new();
+                let read = LtfsVolume::mount(&target.device)
+                    .unwrap()
+                    .read_file_to_writer(link_path, &mut actual);
+                assert!(read.is_ok(), "合法计划破坏已有相对链接: {read:?}");
+                assert_eq!(actual, old_body);
+            }
+            assert!(planned.is_err(), "已有相对链接引用的文件不能被改名归档");
+            assert_eq!(target.device.command_log().len(), before, "拒绝时不发CDB");
+        }
+    }
+}
+
+#[test]
+fn legacy_displacement_cannot_stage_or_publish_a_broken_incoming_link() {
+    for delta in [false, true] {
+        let source = setup(false);
+        let mut target = setup(false);
+        append_unreferenced_target_file(&mut target, delta);
+        let inventory = ReclaimSourceInventory::from_captured(&source.before).unwrap();
+        let entry = source.before.entry_by_uid(4).unwrap().unwrap();
+        let node = ReclaimSourceNode(Object::capture(entry.clone()).unwrap());
+        let parent = reservation(&source.before);
+        let mut legacy = inventory
+            .plan_reclaimed_node(&parent, &node, &target.before, "unused")
+            .unwrap();
+        // Reconstruct the otherwise valid recipe produced before the incoming
+        // link guard. Keep the same original target and exact tree fingerprint.
+        let old = target.before.entry_by_path("body").unwrap().unwrap();
+        let original = Object::capture(old.clone()).unwrap();
+        let archive = format!(
+            "_reclaim_displaced_{}_{}",
+            parent.fingerprint(),
+            original.uid
+        );
+        legacy.0.displaced = Some(Scaffold {
+            original,
+            expected: Object::capture(moved_file(old, &archive).unwrap()).unwrap(),
+        });
+        legacy.0.expected =
+            Object::capture(entry.reclaimed_metadata_node("body", legacy.uid()).unwrap()).unwrap();
+        legacy.encode().unwrap();
+        let before = target.device.command_log().len();
+        assert_eq!(
+            legacy.observe_current(&target.before, None).unwrap().kind(),
+            ReclaimMetadataObservationKind::Unchanged,
+            "拒绝后续写入不应阻止实际 NoWrite 观察及旧意图结清"
+        );
+        assert_eq!(target.device.command_log().len(), before);
+        let mut volume = LtfsVolume::mount(&target.device).unwrap();
+        volume.set_reservation_guard(Some(ReservationKey::new(1, 7)));
+        let before = target.device.command_log().len();
+        assert!(
+            legacy
+                .stage_reference(&mut volume, &source.before, &target.before)
+                .is_err()
+        );
+        assert_eq!(target.device.command_log().len(), before);
+        // Simulate an unsafe result already written by the old implementation.
+        // Recovery must not publish it or count it toward source coverage.
+        volume.displace_reclaimed_file("body", 2, &archive).unwrap();
+        let relocated = node_metadata::relocation_source(&entry, "body").unwrap();
+        volume
+            .reference_reclaimed_node("body", legacy.uid(), &relocated)
+            .unwrap();
+        if delta {
+            volume.commit_incremental().unwrap();
+        } else {
+            volume.commit().unwrap();
+        }
+        drop(volume);
+        target.library.power_cut();
+        let actual = capture(&target.device);
+        let previous = plan_predecessor(&target, &legacy);
+        let before = target.device.command_log().len();
+        assert!(legacy.observe_current(&actual, Some(&previous)).is_err());
+        assert_eq!(target.device.command_log().len(), before);
     }
 }

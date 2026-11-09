@@ -13,7 +13,7 @@ ltfsctl -e HOST:PORT -l LIBRARY -p POOL tape reclaim BARCODE --yes \
 
 `--yes` 明确允许在迁移、实读校验和全部安全条件满足后重新初始化源带。默认保留池归属；`-u` / `--unassign` 要求初始化后将源带正常退带、归原 home 并解除池归属。新请求可以指定多个条码，按盘保存独立请求并排队；同库串行执行。
 
-提交只返回原 `task_id`、`request_file` 和任务回执，不等待机械操作。通过 `task show TASK_ID` / `task list -l LIBRARY` 检查原任务。响应丢失或客户端重启时执行：
+提交只返回原 `task_id`、`request_file` 和任务回执，不等待机械操作。通过 `task show TASK_ID` / `task list -l LIBRARY` 检查原任务。逻辑文件的 inode、路径和正文保持；迁移经普通原子上传发布，新版本号递增，S3 的 opaque ETag 可能变化。恢复数据通道后，以新 HEAD/List 返回的 ETag 进行条件读取。响应丢失或客户端重启时执行：
 
 ```sh
 ltfsctl -e HOST:PORT tape reclaim --request /var/lib/tape-client/reclaim.json
@@ -40,7 +40,7 @@ HTTP 提交入口为 `POST /libraries/{serial}/admin/pools/{pool}/tapes/{barcode
 7. 原格式化目标先持久化，固定新 UUID、时间和空索引配方，再逐 CDB 检查当前 owner、Permission 和 PR 执行。当前使用已有两分区的快速重新初始化，不发送重新分区 FORMAT/MODE SELECT，不提供安全擦除承诺。
 8. 实读确认两分区标签、精确空索引与 MAM；按原请求保留归属或实际归槽后解绑，原子完成原任务、保存独立结果并释放自己的占用。有界清理临时账本保留独立结果及永久卷 UUID 身份。
 
-原始属性归档使用 `_reclaim_<operation>/data-<uid>`、`node-<uid>` 等内部路径；逻辑路径仍由 FDB 维护。原生链接按逻辑相对路径落带，并保留链接文本。缺失父目录按固定来源配方创建。若该路径已有普通文件，原文件只改名称保留到固定 `_reclaim_displaced_<parent-fingerprint>_<uid>` 路径，原 UID、正文 extent 和属性不变。已有目录或链接冲突明确拒绝，避免改变原相对链接的解释或丢弃子树。
+原始属性归档使用 `_reclaim_<operation>/data-<uid>`、`node-<uid>` 等内部路径；逻辑路径仍由 FDB 维护。原生链接按逻辑相对路径落带，并保留链接文本。缺失父目录按固定来源配方创建。若该路径已有普通文件且没有其他相对链接指向其旧路径，原文件只改名称保留到固定 `_reclaim_displaced_<parent-fingerprint>_<uid>` 路径，原 UID、正文 extent 和属性不变。已有目录、链接或仍被其他相对链接引用的文件冲突明确拒绝，避免改变已有链接的解释或丢弃子树。执行和结果观察也复核已封存计划；不发布破坏现有链接解析的提交结果，但仍允许以实际 NoWrite 证明结清未开写意图。
 
 ## 故障与 HA
 

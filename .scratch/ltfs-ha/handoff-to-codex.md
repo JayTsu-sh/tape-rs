@@ -1,3 +1,30 @@
+# 优先接续更新：原任务冻结，修复 incoming 相对链接P2（2026-11-09 15:20UTC左右）
+
+**本条优先于下方进行中的部署/调度状态。** 追加Spec review发现目标普通文件被改名后，原有相对链接仍指旧路径，会破坏当前LTFS视图。原B任务已通过新正常withdraw冻结，207–209应用全停、B队列quiet/所有sg及st/nst别名FD0，FDB45153不变。证据 `history-fix-v1/incoming-link-fix-v1/RUNNING-WITHDRAW-COMPLETE.json`。原5271父仍copying/child1、原布局/35对象封存/原Rc与P保留，无sourceRF/Rf，未开始源初始化；metadata后继W3结果未知仍保留。旧59候选不能直接重启续行。
+
+生产保护已补齐：planner、封存计划执行（position I/O前）、Committed/检查点观察拒绝破坏既有相对链接的displacement；真实Unchanged仍可结清NoWrite。冷读实际RED0.04s、NoWrite RED0.05s均已绿；5项相关Full/delta/旧计划测试通过。六项最终检查v5全部0（默认771、FDB+FUSE1147通过），15父流程matrix-v6收尾中；产品两轴review-v1均0。冻结466源码在 `history-fix-v1/incoming-link-fix-v1/checked-sources.json`，本地提交以git log/CANDIDATE.json为准，EL9新发布仍待构建/部署。详细状态见local/handoff-history最新段。无实现agent，只有code-review技能明确要求的两个只读reviewer。
+
+旧post sequencer已仅SIGINT停止，确认没有DATA-AUDIT/HTTP-u阶段issue；POST-PIPELINE-PASSIVE-WITHDRAW-COMPLETE及UNRESOLVED保留。**禁止重跑旧sequencer/post/u/withdraw/upgrade/submit**；rootwatch及coveragewatch仍只读。后续需新候选通过软件/两轴/EL9，再以新控制器保留原copying/未知metadata/原PR进行正常部署和恢复，同原5271，最后新后验调度/报告review/GitHub合入。A禁止/B605d/sourceL84→destL85限制保持。
+
+---
+
+# 最新接续：完整 native reclaim 真实 B 验收进行中（2026-11-09，本条优先）
+
+唯一工作树 `/work/jay/tape-rs`，`main`；产品候选 `59bb7f9f52a93ea32cc1350fd4264fa8163e84b3`（含 `9dac53d` 完整父流程、`20a54bd` 实机 DVCID 修复和长 Full 历史/IP 恢复修复），未推 GitHub。当前未提交内容为发布文档。整项须完成真实回收、数据复读、HTTP `-u`、报告及最终 review 后合 GitHub main；不能以软件通过结束，也不要请求用户反复继续。
+
+- 证据根 `/work/tmp/tape-native-reclaim-completion-20261109-2d357wak`，最新发布/部署子目录 `history-fix-v1`。最终六检查 `/work/tmp/native-reclaim-final-checks-v4/results.json` 全0，默认771/FDB+FUSE1145通过；私有 FDB43843+Sim 的15项完整父流程 `/work/tmp/native-reclaim-public-matrix-v5/results.json` 全0，包含70代Full、T2及IP失败。普通默认栈，未增加硬件超时。产品两轴v2均0，原P2恢复挂载64代截止已闭合，证据不等同实带。
+- 三节点207–209已正常部署59bb7f9，路径 `/opt/tape-rs/v1-20261109-59bb7f9f52a9`；ltfsd SHA `95ce7c68cdabbc0793a74ee696d8107520150a712bc074f390d8647c4d9e6b8c`。普通EL9，无fault/minstack/GPFS。原45153、c51 namespace/state/unit保持。**仅 B605d 可用，A禁止；仅L84源→L85目的允许本轮写入。**
+- **原任务绝不能重建/替换**：epoch1/operation `5271c82b-f857-4e4c-9112-d3eb660345de`，原请求根下`physical-reclaim-request.json`；source旧UUID643ea0be.../revision13，destination17f487c8.../revision3，pool native6/02004aa0...。原`--yes`、unassign=false已封存。当前真实progress已进入copying/children0，root元数据RW Writing；当前owner2254359（实时查）。源35物理对象/26可见文件402709395B已封存，初始化尚未验收。不得手工删除V、清锁、PR_OUT或盲重放机械命令。
+- `history-fix-v1/withdraw-only-v1.py`、`upgrade-history-v1.py` **均已消费完成，禁止重跑**；停服时PR实际保留node2/2251142 key/type3，由新daemon正常fence接管，未人工清PR。全部原目录/副本/布局数据到START保持。原9dac/20a submit及upgrade也不可重跑。
+- 根`watch-native-v1.py`仍只读运行。旧dvcid及history-v1 HA观察器均在未触发时仅SIGINT本地passive进程，UNRESOLVED保留，绝不重跑。**当前新HA观察器** `history-fix-v1/ha-v2/accept-parent-ha-v2.py`（session73269）已实际完成HA-ISSUED→原父/Rc接管→旧207正常rejoin，ha-v2/HA-COMPLETE记录2254359→2288565（14:59UTC），不能重跑；原I已有P终态，metadataW2 Writing仍待新owner观察结清，整回收未完成。备用v3虽已审查，**v2已issue，绝不能启动v3**。两轴0；该实验只声明原父/Rc身份接管，精确写中Q/I边界仍仅Sim。
+- **后验已有后台顺序调度** `history-fix-v1/run-post-acceptance-v1.py`（session35905，只读等待已启动，两轴0），先查POST-PIPELINE-*和post-acceptance-controller-v1.log，**勿手动并发运行post或HTTP-u、勿重跑调度器**。原任务succeeded且ha-v2/HA-COMPLETE后，调度器才运行`history-fix-v1/post-native-v1.py`：1096文件元数据/1070旧目的N/H/R保持、全部26源正文+原目的13样本/1 native链接实读。原body scope为根`physical-baseline/BODY-BASELINE-SCOPE.json`，**没有/不会有BODY-BASELINE-COMPLETE**；不能声称全部1070旧目的正文读过。
+- 最后`history-fix-v1/accept-empty-http-unassign-v1.py`由同一后台调度器执行（接续以HTTP各ISSUED/COMPLETE实际状态为准），仅当前任务+POST-COMPLETE全通过后，对实时新空L84 UUID/revision发新namedHTTP reclaim-u，禁止改原请求；两轴v3均0且HTTP-UNASSIGN-REVIEW.json绑定。等待本次完成后的库存时间，库存/观察/executor/FDB owner轮次节点一致，再证明1004归位与解绑。
+- `docs/reference`已从新实际EL9产物生成；普通ltfsctl为fuse客户端，另提供fdb,fuse的ltfsctl-init。新增CLI帮助不代表实带已验收。历史20261108报告后续须追加本轮真实结果与性能限制。长历史重复核验/逐对象提交定位成本仍需如实计入报告，不能删证明或缩timeout提速。
+
+现场最新细节及已消费控制器见 `.scratch/ltfs-ha/local/handoff-history.md`；以下均为较早历史，部署/未完成状态不覆盖本条。
+
+---
+
 # 最新优先：软件验收与最终审查通过，准备本地候选提交/EL9真实B验收（2026-11-09）
 
 以下记录于本地候选提交前，实际提交SHA以git log及本轮artifact.json为准；GitHub未push、真实集群仍3bc8cf2未部署。本轮整项仍须完成普通EL9的真实B完整回收/HA/冷读、验证报告和GitHub主分支合入，不能以软件通过结束。

@@ -49,6 +49,32 @@ pub(super) fn moved_file(entry: IndexEntry, path: &str) -> Result<IndexEntry> {
     })
 }
 
+/// Renaming a plain file must not redirect an existing relative link. The
+/// replacement at `path` itself is new; it was a plain file in the original tree.
+pub(super) fn require_displacement_keeps_links(
+    target: &CapturedIndexSource,
+    path: &str,
+) -> Result<()> {
+    target
+        .for_each_entry(|entry| {
+            if let IndexEntry::File {
+                path: link_path,
+                node,
+            } = entry
+                && link_path != path
+                && let Some(link_target) = &node.symlink
+                && crate::ltfs::volume::resolve_symlink(&link_path, link_target).as_deref()
+                    == Some(path)
+            {
+                return Err(callback(CatalogError::Invalid(
+                    "同名目的文件仍被已有相对链接引用，不能改名归档",
+                )));
+            }
+            Ok(())
+        })
+        .map_err(cache)
+}
+
 /// A physical append has different index geometry from a shared-body reference.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -265,6 +291,10 @@ impl ReclaimMetadataPlan {
         self.validate_source(source)?;
         if self.is_raw_body() {
             return Err(CatalogError::Invalid("原始正文需要专用流式追加路径"));
+        }
+        if let Some(displaced) = &self.0.displaced {
+            // Reject sealed unsafe plans before position I/O or tree changes.
+            require_displacement_keeps_links(target, &displaced.original.path)?;
         }
         if self.observe_current(target, None)?.kind() != ReclaimMetadataObservationKind::Unchanged
             || volume.verified_committed_index_construct().map_err(cache)? != target.construct()
@@ -620,6 +650,9 @@ impl ReclaimSourceInventory<'_> {
         } else {
             None
         };
+        if let Some(displaced) = &displaced {
+            require_displacement_keeps_links(target, &displaced.original.path)?;
+        }
         let mut existing = std::collections::BTreeMap::new();
         let mut files = 0u64;
         let mut tree = TargetTree::new(target.header().volume_uuid);

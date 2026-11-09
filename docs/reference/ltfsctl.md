@@ -4,7 +4,7 @@
 
 本页由 `tools/generate-cli-reference.py` 从实际构建产物递归采集 `--help` 生成，不表示所有服务模式均支持所有命令，也不表示列出的操作均已完成硬件验收。可选命令随构建特性变化，下面的帮助为本次构建内容。
 
-构建产物 SHA256：`90798e1ea39188c816e0871292134deecbd0995e5ea3713ef57a5b284fe5b406`。共 83 个帮助入口。
+构建产物 SHA256：`3efbf9aa1fda993d8f6dc8b75d9872b3e2ab2db64f5641ca106ce8491ad60cab`。共 82 个帮助入口。
 
 ## 目录
 
@@ -38,7 +38,6 @@
 - [ltfsctl fdb drive](#ltfsctl-fdb-drive)
 - [ltfsctl fdb drive show](#ltfsctl-fdb-drive-show)
 - [ltfsctl fdb drive set](#ltfsctl-fdb-drive-set)
-- [ltfsctl fdb init](#ltfsctl-fdb-init)
 - [ltfsctl fdb stat](#ltfsctl-fdb-stat)
 - [ltfsctl fdb list](#ltfsctl-fdb-list)
 - [ltfsctl fdb children](#ltfsctl-fdb-children)
@@ -299,7 +298,6 @@ Commands:
   fs        文件、目录和链接变更；先保存逻辑请求，再提交或查询原请求
   control   FDB 持久化管理任务：查询、重试及取消原请求
   drive     FDB 驱动器策略
-  init      从三节点冻结屏障初始化全新空目录；需 fdb 特性，不导入旧目录、不操作磁带
   stat      查询库级命名空间的路径元数据（不读磁带）
   list      按 S3 ListObjectsV2 规则列举池内对象；完整对象键字典序
   children  库级目录的一页直接子项；内部诊断用途
@@ -640,21 +638,6 @@ Options:
   -p, --pool <POOL>            文件命名空间的池名称或 UUID；库内有多个池时必填
       --request <REQUEST>      原请求的保存位置；目标必须不存在，文件系统变更使用目录
   -h, --help                   Print help
-```
-
-## ltfsctl fdb init
-
-```text
-从三节点冻结屏障初始化全新空目录；需 fdb 特性，不导入旧目录、不操作磁带
-
-Usage: ltfsctl fdb init [OPTIONS] --cluster-file <CLUSTER_FILE> --namespace <NAMESPACE>
-
-Options:
-      --cluster-file <CLUSTER_FILE>
-  -l, --library <LIBRARY>            目标带库的真实 changer 序列号；省略时访问默认库
-      --namespace <NAMESPACE>        稳定初始化身份；重复执行必须使用同一 UUID
-  -p, --pool <POOL>                  文件命名空间的池名称或 UUID；库内有多个池时必填
-  -h, --help                         Print help
 ```
 
 ## ltfsctl fdb stat
@@ -1322,7 +1305,7 @@ Commands:
   online    实际装带验证后解除离线；返回管理任务号
   set       设置黑名单及离线属性；返回管理任务号
   validate  异步核验标签、LTFS 索引和结构；不读取全部文件正文
-  reclaim   回收：FDB 原生模式尚未开放，会拒绝此命令。 目录模式需要两台驱动器，后台搬迁有效文件后重新格式化源带
+  reclaim   异步原生回收：同池迁移并实读校验，完整覆盖且零引用后重新初始化源带；须 --yes
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1513,15 +1496,18 @@ Options:
 ## ltfsctl tape reclaim
 
 ```text
-回收：FDB 原生模式尚未开放，会拒绝此命令。 目录模式需要两台驱动器，后台搬迁有效文件后重新格式化源带
+异步原生回收：同池迁移并实读校验，完整覆盖且零引用后重新初始化源带；须 --yes
 
-Usage: ltfsctl tape reclaim [OPTIONS] <BARCODE>
+Usage: ltfsctl tape reclaim [OPTIONS] [BARCODES]...
 
 Arguments:
-  <BARCODE>
+  [BARCODES]...  目标条码；恢复时省略并指定原请求文件
 
 Options:
+      --request <REQUEST>  单盘原请求文件，或多盘新请求目录
   -l, --library <LIBRARY>  目标带库的真实 changer 序列号；省略时访问默认库
+      --yes                确认迁移校验完成后重新初始化源带
   -p, --pool <POOL>        文件命名空间的池名称或 UUID；库内有多个池时必填
+  -u, --unassign           完成后将源带归槽并解除池归属
   -h, --help               Print help
 ```

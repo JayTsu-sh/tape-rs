@@ -1,6 +1,6 @@
 # tape-rs 命令行参考手册
 
-适用版本：首版开发版本，2026-11-04。以当前源码及全特性构建产物为依据。主要面向使用 FDB 集群管理多个真实带库的运维人员。
+适用版本：首版开发版本，2026-11-09。以当前源码及相应特性构建产物为依据。主要面向使用 FDB 集群管理多个真实带库的运维人员。
 
 模型为 **Library → Pool → Tape**：一个池只属于一个带库，数据带最多属于一个池；未分池带和清洗带属于带库库存。每个带库显示参与节点 `nodes` 和唯一就绪执行节点 `active_node`，多个库的执行节点尽量分散。完整语义见[管理模型](management-model.md)。
 
@@ -540,7 +540,7 @@ FDB namespace 模式默认只读；显式提供 `--fdb-journal-dir` 才启用持
 - [tape-library：独占单机库命令](reference/tape-library.md)
 - [tape-rs：底层 SCSI/LTFS/PR 命令](reference/tape-rs.md)
 
-附录由本轮实际部署的五个全特性 binary 采集，记录各自 SHA256。帮助是参数事实，服务模式和操作语义以本手册及链接的功能文档为准；本轮物理验收范围见[管理模型现场报告](../.scratch/ltfs-ha/reports/management-model-physical-20261104.md)。未把附录中全部底层命令作为本轮实带测试项目。
+附录由本轮发布产物采集，记录各自 SHA256：`ltfsctl` 为 `fuse` 客户端构建，其余四个工具为 `fdb,fuse` 服务端构建。需要直接初始化空 FDB 目录时，部署包另提供 `ltfsctl-init`（`fdb,fuse` 构建）；普通客户端附录不包含 `fdb init`。帮助是参数事实，服务模式和操作语义以本手册及链接的功能文档为准；本轮物理验收范围见[管理模型现场报告](../.scratch/ltfs-ha/reports/management-model-physical-20261104.md)。未把附录中全部底层命令作为本轮实带测试项目。
 
 修改 CLI 后，用相应版本的构建产物更新附录：
 

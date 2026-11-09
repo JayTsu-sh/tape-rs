@@ -322,6 +322,13 @@ impl ReclaimMetadataPlan {
             }
             ReclaimMetadataObservationKind::Committed
         };
+        if kind == ReclaimMetadataObservationKind::Committed
+            && let Some(displaced) = &self.0.displaced
+        {
+            // An unchanged result remains a valid NoWrite observation. A broken
+            // committed result cannot be published or authorize IP repair.
+            metadata_plan::require_displacement_keeps_links(target, &displaced.original.path)?;
+        }
         let donor = target
             .entry_by_uid(self.0.donor.uid)
             .map_err(cache)?
