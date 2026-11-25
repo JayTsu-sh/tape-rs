@@ -975,13 +975,16 @@ mod tests {
         assert_eq!(decode_active(&encoded).unwrap(), value);
         assert!(decode_active(&encoded[..72]).is_err());
         let mut corrupt = encoded;
-        corrupt[0] = 3;
+        corrupt[0] = 4;
         assert!(decode_active(&corrupt).is_err());
         let mut protected = encoded;
         protected[0] = 2;
         assert_eq!(decode_active(&protected).unwrap(), value);
         // The v1 decoder in released binaries requires this byte to be 1.
         assert_ne!(protected[0], 1);
+        protected[0] = LOGICAL_ROUTE_VERSION;
+        assert_eq!(decode_active(&protected).unwrap(), value);
+        assert!(!matches!(protected[0], 1 | HANDOFF_ROUTE_VERSION));
         corrupt = encoded;
         corrupt[65..73].fill(0);
         assert!(decode_active(&corrupt).is_err());
