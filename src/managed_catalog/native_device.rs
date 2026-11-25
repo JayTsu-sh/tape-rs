@@ -798,6 +798,16 @@ impl ManagedCatalog {
                 "home 查询的卷或 namespace 与当前归属不符",
             ));
         }
+        Self::native_device_home_at(&tr, ns, serial, barcode, assignment.as_ref()).await
+    }
+
+    pub(in crate::managed_catalog) async fn native_device_home_at(
+        tr: &Transaction,
+        ns: Uuid,
+        serial: &str,
+        barcode: &str,
+        assignment: Option<&TapeAssignment>,
+    ) -> Result<Option<u16>> {
         let Some(raw) = tr.get(&home_key(ns, serial, barcode), false).await? else {
             return Ok(None);
         };
@@ -845,7 +855,7 @@ impl ManagedCatalog {
         {
             return Err(CatalogError::Corrupt("持久 home 的字段或介质身份不符"));
         }
-        if value["volume"] != json!(expected_volume.map(|v| v.to_string())) {
+        if value["volume"] != json!(assignment.and_then(|a| a.volume_id)) {
             return Ok(None);
         }
         if let Some(a) = assignment

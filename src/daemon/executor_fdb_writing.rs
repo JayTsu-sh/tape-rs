@@ -44,13 +44,14 @@ pub(super) async fn prepare(
         .check_active_pool_gate(&control.serial, control.route, owner.round, spec.pool_id)
         .await
         .map_err(|error| match error.domain() {
-            CatalogError::PoolBusy | CatalogError::PoolImporting => {
-                ReadError::Busy(error.to_string())
-            }
+            CatalogError::PoolBusy
+            | CatalogError::PoolImporting
+            | CatalogError::LogicalInventoryBlocked(_) => ReadError::Busy(error.to_string()),
             CatalogError::Invalid(reason) => ReadError::Failed((*reason).into()),
             _ => lost(error),
         })?;
     fdb_loading::guard(owner, permit, control).await?;
+    let logical = fdb_loading::pool_resources(owner, control, spec.pool_id).await?;
     let inventory = inventory_inner(&owner.devices, true).map_err(lost)?;
     let management = fdb_loading::policy(owner, control, &[spec.pool_id], None).await?;
     let pool = spec.pool_id.to_string();
@@ -59,7 +60,10 @@ pub(super) async fn prepare(
         .ok_or_else(|| lost("FDB 池介质限制缺失"))?;
     let mut capabilities = std::collections::BTreeMap::new();
     for slot in &inventory.drives {
-        if !super::super::management::drive_allowed(
+        if logical
+            .as_ref()
+            .is_some_and(|resources| !resources.drives.contains(&owner.devices[slot.dev].serial))
+            || !super::super::management::drive_allowed(
             &management,
             &owner.devices[slot.dev].serial,
             'm',
@@ -83,8 +87,18 @@ pub(super) async fn prepare(
     let candidates = inventory
         .drives
         .iter()
+        .filter(|slot| {
+            logical
+                .as_ref()
+                .is_none_or(|resources| resources.drives.contains(&owner.devices[slot.dev].serial))
+        })
         .filter_map(|slot| slot.loaded.as_ref().map(|(barcode, _)| barcode))
-        .chain(inventory.slots.keys());
+        .chain(inventory.slots.iter().filter_map(|(barcode, address)| {
+            logical
+                .as_ref()
+                .is_none_or(|resources| resources.storage_slots.contains(address))
+                .then_some(barcode)
+        }));
     for candidate in candidates {
         if owner.fdb_pending_import.contains(candidate)
             || barcode.is_some_and(|barcode| barcode != candidate)
@@ -133,7 +147,9 @@ pub(super) async fn prepare(
             Err(error)
                 if matches!(
                     error.domain(),
-                    CatalogError::PoolBusy | CatalogError::PoolImporting
+                    CatalogError::PoolBusy
+                        | CatalogError::PoolImporting
+                        | CatalogError::LogicalInventoryBlocked(_)
                 ) =>
             {
                 return Err(ReadError::Busy(error.to_string()));
@@ -354,12 +370,13 @@ async fn prepare_write(
         .catalog
         .check_active_upload_gate(control.route, owner.round, request)
         .await
-        .map_err(|error| match error {
+        .map_err(|error| match error.domain() {
             CatalogError::PoolImporting => {
                 ReadError::Busy("池正在接入介质；保留原上传请求重试".into())
             }
             CatalogError::PoolBusy => ReadError::Busy("池存在节点修改；保留原上传请求重试".into()),
-            CatalogError::Invalid(reason) => ReadError::Failed(reason.into()),
+            CatalogError::LogicalInventoryBlocked(reason) => ReadError::Busy(reason.clone()),
+            CatalogError::Invalid(reason) => ReadError::Failed((*reason).into()),
             error => lost(error),
         })?;
     let mut batchable = false;

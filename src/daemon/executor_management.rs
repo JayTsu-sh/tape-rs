@@ -295,6 +295,7 @@ pub(super) fn observation_from_elements(
     if complete_range(ElementType::Storage, map.storage_start, map.storage_count)
         && complete_range(ElementType::ImportExport, map.ie_start, map.ie_count)
         && complete_range(ElementType::DataTransfer, map.dt_start, map.dt_count)
+        && rows.iter().all(|row| !row.full || row.volume_tag.is_some())
         && inv.drives.iter().all(|d| {
             rows.iter()
                 .find(|row| row.address == d.addr)

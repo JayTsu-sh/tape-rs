@@ -10,6 +10,12 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
+#[path = "logical_inventory_reconciliation.rs"]
+mod reconciliation;
+pub(super) use reconciliation::{reconcile_after_acquire, require_acquire_reconciliation};
+#[path = "logical_library_activation.rs"]
+mod activation;
+
 #[derive(Debug)]
 pub(crate) enum Creation {
     Created(Value),
@@ -40,6 +46,19 @@ fn by_id(mut key: Vec<u8>, id: Uuid) -> Vec<u8> {
 fn by_name(mut key: Vec<u8>, name: &str) -> Vec<u8> {
     append_component(&mut key, name.as_bytes());
     key
+}
+
+pub(super) async fn require_explicit_scope_at(tr: &Transaction, serial: &str) -> Result<()> {
+    let route = tr
+        .get(&routing::active_key(serial), false)
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+    if route.first() == Some(&routing::LOGICAL_ROUTE_VERSION) {
+        return Err(CatalogError::Invalid(
+            "已启用逻辑带库，业务请求须指定逻辑带库 UUID",
+        ));
+    }
+    Ok(())
 }
 
 fn drive_key(prefix: &[u8], drive: &str) -> Vec<u8> {
@@ -134,6 +153,21 @@ pub(super) async fn require_pool_scope_at(
     if pool_library_at(tr, ns, serial, pool).await? != logical {
         return Err(CatalogError::Invalid("介质请求的池不属于指定逻辑带库范围"));
     }
+    if let Some(logical) = logical {
+        reconciliation::require_ready(tr, ns, serial, logical).await?;
+    }
+    Ok(())
+}
+
+pub(in crate::managed_catalog) async fn require_pool_inventory_ready_at(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    pool: Uuid,
+) -> Result<()> {
+    if let Some(logical) = pool_library_at(tr, ns, serial, pool).await? {
+        reconciliation::require_ready(tr, ns, serial, logical).await?;
+    }
     Ok(())
 }
 
@@ -148,8 +182,13 @@ pub(super) async fn mechanical_resources_at(
     if let Some(pool) = change["pool"].as_str() {
         let pool = Uuid::parse_str(pool).expect("validated pool");
         require_pool_scope_at(tr, ns, serial, pool, logical).await?;
+    } else if let Some(id) = logical {
+        reconciliation::require_ready(tr, ns, serial, id).await?;
     }
-    let Some(id) = logical else { return Ok(None) };
+    let Some(id) = logical else {
+        require_explicit_scope_at(tr, serial).await?;
+        return Ok(None);
+    };
     let raw = tr
         .get(&by_id(at(ns, serial, b'l'), id), false)
         .await?
@@ -213,6 +252,11 @@ pub(super) async fn require_automatic_resource_claims(
     storage: Option<u16>,
 ) -> Result<()> {
     let expected = pool_library_at(tr, ns, serial, pool).await?;
+    if let Some(id) = expected {
+        reconciliation::require_ready(tr, ns, serial, id).await?;
+    } else {
+        require_explicit_scope_at(tr, serial).await?;
+    }
     let prefix = at(ns, serial, b'r');
     let keys = std::iter::once(drive_key(&prefix, drive))
         .chain(storage.map(|address| slot_key(&prefix, b's', address)));
@@ -275,8 +319,10 @@ pub(in crate::managed_catalog) async fn pool_resources_at(
     pool: Uuid,
 ) -> Result<Option<LogicalLibraryResources>> {
     let Some(id) = pool_library_at(tr, ns, serial, pool).await? else {
+        require_explicit_scope_at(tr, serial).await?;
         return Ok(None);
     };
+    reconciliation::require_ready(tr, ns, serial, id).await?;
     let raw = tr
         .get(&by_id(at(ns, serial, b'l'), id), false)
         .await?
@@ -340,28 +386,7 @@ impl Inventory {
         } else if recent_failure || observation["slot_layout"].is_null() {
             "incomplete"
         } else {
-            let slots = |start: &str, count: &str| {
-                let start = observation["slot_layout"][start]
-                    .as_u64()
-                    .expect("validated layout");
-                let count = observation[count].as_u64().expect("validated slot count");
-                (start..start + count).map(|addr| addr as u16).collect()
-            };
-            resources = Some(LogicalLibraryResources {
-                drives: observation["drives"]
-                    .as_array()
-                    .expect("validated drives")
-                    .iter()
-                    .map(|drive| {
-                        drive["serial"]
-                            .as_str()
-                            .expect("validated drive serial")
-                            .to_owned()
-                    })
-                    .collect(),
-                storage_slots: slots("storage_start", "num_of_slots"),
-                ie_slots: slots("ie_start", "num_of_ieslots"),
-            });
+            resources = Some(observed_resources(&observation));
             "current"
         };
         Ok(Self {
@@ -398,6 +423,31 @@ impl Inventory {
                 });
         }
         json!({"status":self.status,"observation":observation})
+    }
+}
+
+fn observed_resources(observation: &Value) -> LogicalLibraryResources {
+    let slots = |start: &str, count: &str| {
+        let start = observation["slot_layout"][start]
+            .as_u64()
+            .expect("validated layout");
+        let count = observation[count].as_u64().expect("validated slot count");
+        (start..start + count).map(|addr| addr as u16).collect()
+    };
+    LogicalLibraryResources {
+        drives: observation["drives"]
+            .as_array()
+            .expect("validated drives")
+            .iter()
+            .map(|drive| {
+                drive["serial"]
+                    .as_str()
+                    .expect("validated drive serial")
+                    .to_owned()
+            })
+            .collect(),
+        storage_slots: slots("storage_start", "num_of_slots"),
+        ie_slots: slots("ie_start", "num_of_ieslots"),
     }
 }
 
@@ -486,6 +536,8 @@ impl ManagedCatalog {
         }
         if let Some(logical) = logical {
             require_library_at(&tr, ns, serial, logical).await?;
+        } else {
+            require_explicit_scope_at(&tr, serial).await?;
         }
         Ok(())
     }
@@ -619,9 +671,10 @@ impl ManagedCatalog {
             }
             let inventory = Inventory::read(&tr, ns, serial, read_u64(&epoch)).await?;
             let revision = revision_at(&tr, ns, serial, id).await?;
+            let reconciliation = reconciliation::conflict_at(&tr, ns, serial, id).await?;
             return Ok(Some(
                 json!({"logical_library":definition(&record, revision),
-                "inventory":inventory.view(Some(&record.resources))}),
+                "inventory":inventory.view(Some(&record.resources)), "reconciliation":reconciliation}),
             ));
         }
 
@@ -657,10 +710,10 @@ impl ManagedCatalog {
         });
         let mut items = Vec::with_capacity(records.len());
         for record in &records {
-            items.push(definition(
-                record,
-                revision_at(&tr, ns, serial, record.id).await?,
-            ));
+            let mut item = definition(record, revision_at(&tr, ns, serial, record.id).await?);
+            item["reconciliation"] =
+                json!(reconciliation::conflict_at(&tr, ns, serial, record.id).await?);
+            items.push(item);
         }
         Ok(Some(json!({"items": items,
             "inventory": inventory.view(None), "unallocated_resources": available})))

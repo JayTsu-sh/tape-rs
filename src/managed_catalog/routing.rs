@@ -72,6 +72,11 @@ pub(super) fn active_key(serial: &str) -> Vec<u8> {
 }
 
 pub(super) const HANDOFF_ROUTE_VERSION: u8 = 2;
+pub(super) const LOGICAL_ROUTE_VERSION: u8 = 3;
+
+pub(super) fn supports_handoff(version: u8) -> bool {
+    matches!(version, HANDOFF_ROUTE_VERSION | LOGICAL_ROUTE_VERSION)
+}
 
 pub(super) fn encode_active(value: ActiveLibraryRoute) -> [u8; ACTIVE_ROUTE_LEN] {
     let mut out = [0; ACTIVE_ROUTE_LEN];
@@ -85,7 +90,7 @@ pub(super) fn encode_active(value: ActiveLibraryRoute) -> [u8; ACTIVE_ROUTE_LEN]
 }
 
 pub(super) fn decode_active(bytes: &[u8]) -> Result<ActiveLibraryRoute> {
-    if bytes.len() != ACTIVE_ROUTE_LEN || !matches!(bytes[0], 1 | HANDOFF_ROUTE_VERSION) {
+    if bytes.len() != ACTIVE_ROUTE_LEN || (bytes[0] != 1 && !supports_handoff(bytes[0])) {
         return Err(CatalogError::Corrupt("活动带库路由格式"));
     }
     let mut certificate_sha256 = [0; 32];

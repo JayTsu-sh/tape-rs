@@ -550,7 +550,7 @@ fn checked_device<'a>(
     )
 }
 
-async fn pool_resources(
+pub(super) async fn pool_resources(
     owner: &Active,
     control: &FdbOwnerControl,
     pool: uuid::Uuid,
@@ -559,7 +559,12 @@ async fn pool_resources(
         .catalog
         .active_logical_pool_resources(&control.serial, control.route, owner.round, pool)
         .await
-        .map_err(lost)
+        .map_err(|error| match error.domain() {
+            crate::managed_catalog::CatalogError::LogicalInventoryBlocked(detail) => {
+                ReadError::Busy(detail.clone())
+            }
+            _ => lost(error),
+        })
 }
 
 fn changer_index(owner: &Active) -> std::result::Result<usize, ReadError> {

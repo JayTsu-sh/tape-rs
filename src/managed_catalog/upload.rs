@@ -1,6 +1,7 @@
 //! Prepare a stable upload from one catalog read version, without admitting
 //! work or changing either media or catalog. The executor selects the tape.
 use super::*;
+use control::logical_libraries;
 use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug)]
@@ -26,6 +27,7 @@ impl ManagedCatalog {
         let tr = self.db.create_trx()?;
         let namespace = routing::require_runtime_active_owner(&tr, serial, route, owner).await?;
         control::require_pool_library(&tr, namespace, pool, serial).await?;
+        logical_libraries::require_pool_inventory_ready_at(&tr, namespace, serial, pool).await?;
         control::require_pool_writable_at(&tr, namespace, pool).await
     }
 
@@ -42,6 +44,8 @@ impl ManagedCatalog {
         let namespace =
             routing::require_runtime_active_owner(&tr, serial, route, owner_epoch).await?;
         control::require_pool_writable_at(&tr, namespace, spec.pool_id).await?;
+        logical_libraries::require_pool_inventory_ready_at(&tr, namespace, serial, spec.pool_id)
+            .await?;
         prepare_upload_at(&tr, namespace, serial, owner_epoch, barcode, spec).await
     }
 }

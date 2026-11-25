@@ -64,4 +64,22 @@ tape-fuse -e HOST:7401 --library LIBRARY --pool POOL_UUID \
 
 S3 通过 `ListBuckets` 查找逻辑带库下的 pool 名称。应用也可用 Rust 函数 `s3::logical_bucket_name` 根据物理带库序列号、逻辑带库 UUID 和 pool UUID 计算 bucket 名称。旧的物理库 bucket 名称无法访问已绑定逻辑带库的 pool。
 
-业务启用需要完成库存对账、既有 pool 切换及现场验收。[逻辑带库 ADR](../adr/0003-logical-library-resource-boundary.md)
+## 整库交还和重新加载
+
+重新加载取得设备后，执行器先采集完整库存，再把原加载操作推进至 `online`。库存缺失或设备身份不符时，保留原加载操作及原因。介质跨逻辑库或 home 不符时，相关逻辑库的读写与介质操作暂停。通过 `logical-library show` 或 `list` 的 `reconciliation` 字段查看相关条码、原因和原加载 UUID。原 pool 归属及整库交还回执继续可查。库存恢复一致并经完整观测核对后，相关业务可继续。[整库交还手册](library-handoff.md)
+
+## 首次启用已有物理带库
+
+在维护窗口停发新的业务，确认全部任务结清。完成整库交还并保存回执 UUID。停止所有能够访问该物理库的执行器，确认此前发出的设备命令已经结清。候选版本要在所有节点准备完毕。离线命令要求原设备组的 PR 注册与持有者均已清空，并加载当前完整库存。
+
+在任一停机成员上，用其原 `--id`、`--listen`、`--peer`、`--data-dir`、`--libraries-config` 和 `--fdb-cluster-file` 参数运行以下命令，保留生成的启用 UUID 和预览的 `plan_sha256`。
+
+```sh
+ltfsd <原节点参数> --activate-logical-library-offline LIBRARY \
+  --logical-library-namespace NAMESPACE_UUID \
+  --logical-library-release RELEASE_UUID --logical-library-operation ACTIVATION_UUID
+```
+
+核对预览中的 pool 与资源后，追加 `--commit-logical-library-plan PLAN_SHA256`。命令重新采集库存并核对摘要，然后用同一 FDB 事务发布 `default`、资源和既有 pool 的归属、启用状态及回执。`default` 使用启用 UUID。原有 pool、卷和文件保持原身份，物理资源先归入 `default`。之后可释放当前为空闲且无 home 引用的资源，并划分给新的逻辑库。
+
+同一 UUID 和计划可查询原结果。HTTP 使用 `GET /libraries/{serial}/admin/logical-libraries/activation/{operation}`，携带 `x-tapers-catalog-namespace`。启用后使用支持逻辑库的版本启动全部成员，使用原交还 UUID 重新加载，并用 `default` 范围读回原文件核对摘要。新的路由版本要求显式逻辑库范围，也使旧执行器无法通过原路由准入。[逻辑带库 ADR](../adr/0003-logical-library-resource-boundary.md)

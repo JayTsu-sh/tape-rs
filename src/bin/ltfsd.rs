@@ -60,6 +60,43 @@ struct Args {
     #[cfg(feature = "fdb")]
     #[arg(long, requires = "enable_library_handoff_offline", value_name = "UUID")]
     verify_release_operation: Option<uuid::Uuid>,
+    /// 已完成整库交还并停止所有成员后，预览现有 pool 的离线迁移
+    #[cfg(feature = "fdb")]
+    #[arg(long, value_name = "SERIAL", requires_all = ["fdb_cluster_file", "libraries_config", "logical_library_namespace", "logical_library_operation", "logical_library_release"],
+        conflicts_with_all = ["enable_library_handoff_offline", "fdb_control_only", "fdb_metadata_readonly", "fdb_owner_mode", "expand_libraries_offline", "replace_drive_offline", "remove_drive_offline"])]
+    activate_logical_library_offline: Option<String>,
+    /// 首次启用的当前 FDB namespace
+    #[cfg(feature = "fdb")]
+    #[arg(
+        long,
+        requires = "activate_logical_library_offline",
+        value_name = "UUID"
+    )]
+    logical_library_namespace: Option<uuid::Uuid>,
+    /// 首次启用的原操作 UUID，同时用作默认逻辑带库 UUID
+    #[cfg(feature = "fdb")]
+    #[arg(
+        long,
+        requires = "activate_logical_library_offline",
+        value_name = "UUID"
+    )]
+    logical_library_operation: Option<uuid::Uuid>,
+    /// 已完成的原交还操作 UUID
+    #[cfg(feature = "fdb")]
+    #[arg(
+        long,
+        requires = "activate_logical_library_offline",
+        value_name = "UUID"
+    )]
+    logical_library_release: Option<uuid::Uuid>,
+    /// 确认提交刚预览的计划，传入原 plan_sha256
+    #[cfg(feature = "fdb")]
+    #[arg(
+        long,
+        requires = "activate_logical_library_offline",
+        value_name = "SHA256"
+    )]
+    commit_logical_library_plan: Option<String>,
     /// 显式无业务控制副本：只观察原 Frozen 空目录，永不打开设备或暂存区
     #[cfg(feature = "fdb")]
     #[arg(long, requires_all = ["fdb_cluster_file", "libraries_config", "control_binding"],
@@ -408,7 +445,11 @@ fn main() {
                 std::process::exit(2)
             });
     #[cfg(feature = "fdb")]
-    if let Some(serial) = &args.enable_library_handoff_offline {
+    if let Some(serial) = args
+        .enable_library_handoff_offline
+        .as_ref()
+        .or(args.activate_logical_library_offline.as_ref())
+    {
         let result = (|| -> tape_rs::error::Result<()> {
             use tape_rs::daemon::multilib::LibrariesConfig;
             use tape_rs::error::TapeError;
@@ -431,10 +472,35 @@ fn main() {
             let _network = unsafe { foundationdb::boot() };
             let catalog = tape_rs::managed_catalog::ManagedCatalog::open(Some(cluster))
                 .map_err(|e| TapeError::Catalog(e.to_string()))?;
-            let namespace = args.handoff_namespace.unwrap();
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
+            if args.activate_logical_library_offline.is_some() {
+                let provider = tape_rs::daemon::executor::OfflineSgProvider(
+                    tape_rs::daemon::executor::SgProvider {
+                        changer_serial: Some(library.changer_serial.clone()),
+                        changer_target_port: library.changer_target_port.clone(),
+                        drive_serials: library.drive_serials.clone(),
+                    },
+                );
+                let value = runtime.block_on(
+                    tape_rs::daemon::executor::activate_logical_library_offline(
+                        &catalog,
+                        serial,
+                        args.logical_library_namespace.unwrap(),
+                        args.logical_library_operation.unwrap(),
+                        args.logical_library_release.unwrap(),
+                        args.commit_logical_library_plan.as_deref(),
+                        &provider,
+                    ),
+                )?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).expect("启用结果可编码")
+                );
+                return Ok(());
+            }
+            let namespace = args.handoff_namespace.unwrap();
             if let Some(operation) = args.verify_release_operation {
                 let provider = tape_rs::daemon::executor::OfflineSgProvider(
                     tape_rs::daemon::executor::SgProvider {
@@ -454,12 +520,15 @@ fn main() {
                 .map_err(|e| TapeError::Catalog(e.to_string()))
         })();
         match result {
-            Ok(()) if args.verify_release_operation.is_none() => {
+            Ok(())
+                if args.enable_library_handoff_offline.is_some()
+                    && args.verify_release_operation.is_none() =>
+            {
                 println!("带库 {serial} 的交还协议已启用")
             }
             Ok(()) => {}
             Err(error) => {
-                eprintln!("离线启用带库交还失败：{error}");
+                eprintln!("带库离线操作失败：{error}");
                 std::process::exit(2);
             }
         }

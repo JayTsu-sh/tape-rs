@@ -14,6 +14,11 @@ pub(super) async fn refresh(
         .catalog
         .record_active_library_inventory(&control.serial, control.route, owner.round, &observation)
         .await
-        .map_err(|e| ReadError::Lost(format!("带库库存发布失败: {e}")))?;
+        .map_err(|error| match error.domain() {
+            crate::managed_catalog::CatalogError::Incomplete => {
+                ReadError::Busy("库存缺少完整的逻辑带库对账证据".into())
+            }
+            _ => ReadError::Lost(format!("带库库存发布失败: {error}")),
+        })?;
     fdb_loading::guard(owner, permit, control).await
 }

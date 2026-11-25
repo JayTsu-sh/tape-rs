@@ -469,6 +469,10 @@ fn metadata_router(ctx: Arc<Context>) -> Router {
             get(logical_libraries::change_status),
         )
         .route(
+            "/libraries/{serial}/admin/logical-libraries/activation/{operation}",
+            get(logical_libraries::activation_status),
+        )
+        .route(
             "/libraries/{serial}/admin/pools",
             get(pools::list).post(pools::create),
         )

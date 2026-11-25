@@ -99,6 +99,33 @@ pub(super) async fn show(
     view(ctx, serial, Some(&selector), request).await
 }
 
+pub(super) async fn activation_status(
+    State(ctx): State<Arc<Context>>,
+    Path((serial, operation)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    let (_permit, route) = match queries::scoped(&ctx, &serial, &request, &[]) {
+        Ok(value) => value,
+        Err(error) => return *error,
+    };
+    let operation = match pools::canonical_id(&operation) {
+        Ok(value) => value,
+        Err(error) => return *error,
+    };
+    match ctx
+        .catalog
+        .logical_library_activation_receipt(&serial, route, operation)
+        .await
+    {
+        Ok(Some(value)) => reply(StatusCode::OK, value),
+        Ok(None) => reply(
+            StatusCode::NOT_FOUND,
+            json!({"error":"logical_library_activation_not_found"}),
+        ),
+        Err(error) => pools::failure(error),
+    }
+}
+
 pub(super) async fn replace(
     State(ctx): State<Arc<Context>>,
     Path((serial, target)): Path<(String, String)>,

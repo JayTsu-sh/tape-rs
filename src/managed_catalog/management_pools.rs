@@ -34,6 +34,8 @@ pub(super) async fn require_scope(
     if let Some(logical) = logical {
         require_library_at(tr, ns, serial, logical).await?;
         require_pool_library(tr, ns, id, serial).await?;
+    } else {
+        super::super::logical_libraries::require_explicit_scope_at(tr, serial).await?;
     }
     Ok(logical)
 }

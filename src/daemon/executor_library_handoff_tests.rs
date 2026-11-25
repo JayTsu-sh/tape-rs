@@ -93,6 +93,190 @@ fn wait_phase(client: &FdbClient, serial: &str, ns: Uuid, id: Uuid, phase: &str)
     }
 }
 
+#[tokio::test]
+#[ignore = "需要隔离 FDB_TEST_CLUSTER；设备均为 SimLibrary"]
+async fn logical_activation_requires_original_release_and_stable_inventory() {
+    use crate::managed_catalog::{ActivePoolCreation, LibraryHandoffPhase, PoolPolicy, PoolRecord};
+    struct Devices<'a>(&'a str, SimLibrary);
+    impl DeviceProvider for Devices<'_> {
+        fn open_all(&self) -> Result<Vec<ManagedDevice>> {
+            Ok(vec![
+                ManagedDevice {
+                    name: "changer".into(),
+                    serial: self.0.into(),
+                    kind: DeviceKind::Changer,
+                    dev: Box::new(self.1.changer_as(1)),
+                },
+                ManagedDevice {
+                    name: "drive".into(),
+                    serial: "SIMDRV0000".into(),
+                    kind: DeviceKind::Drive,
+                    dev: Box::new(self.1.drive_as(0, 1)),
+                },
+            ])
+        }
+    }
+
+    let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+    let _network = unsafe { foundationdb::boot() };
+    let catalog = ManagedCatalog::open(Some(&cluster)).unwrap();
+    let ns = Uuid::new_v4();
+    let serial = format!("ACTIVATE-{ns}");
+    let challenge = Uuid::new_v4();
+    let barriers: Vec<_> = (1..=3).map(|id| json!({"version":1,"library_serial":serial,
+        "challenge":challenge,"node_id":id,"term":7,"leader":2,"role":if id==2 {"Leader"} else {"Follower"},
+        "members":{"1":"a:1","2":"b:2","3":"c:3"},"quiesce_index":89,"frozen_index":90,
+        "applied_index":92,"executor_absent":true,"catalog_pending":false,"shutting_down":false,"catalog_empty":true})).collect();
+    let route = catalog
+        .initialize_native_library(
+            ns,
+            &verify_native_barriers(&serial, challenge, &barriers).unwrap(),
+        )
+        .await
+        .unwrap();
+    catalog
+        .enable_library_handoff_offline(&serial, ns)
+        .await
+        .unwrap();
+    let epoch = route.initial_owner_epoch;
+    let pool = PoolRecord {
+        id: Uuid::new_v4(),
+        library_serial: serial.clone(),
+        name: "original".into(),
+        file_limit: 100,
+        created_at_millis: 1,
+        revision: 1,
+        policy: PoolPolicy::default(),
+    };
+    assert_eq!(
+        catalog
+            .create_active_pool(&serial, route, epoch, &pool)
+            .await
+            .unwrap(),
+        ActivePoolCreation::Created(pool.clone())
+    );
+    let sim = SimLibrary::new(1, 4, 1);
+    sim.enable_changer_pr();
+    sim.insert_cartridge(SimCartridge::blank("ORIGN0L8", 1 << 20), 0)
+        .unwrap();
+    let provider = Devices(&serial, sim);
+    let operation = Uuid::new_v4();
+    let release = LibraryHandoff {
+        library_serial: serial.clone(),
+        namespace: ns,
+        operation: Uuid::new_v4(),
+        release: None,
+        phase: LibraryHandoffPhase::Releasing,
+        release_key: ReservationKey::new(2, epoch).0,
+        release_retry_used: false,
+        attempt_key: None,
+        owner_epoch: epoch,
+        devices: vec![serial.clone(), "SIMDRV0000".into()],
+        detail: None,
+    };
+    let activate = |expected| {
+        activate_logical_library_offline(
+            &catalog,
+            &serial,
+            ns,
+            operation,
+            release.operation,
+            expected,
+            &provider,
+        )
+    };
+    assert!(activate(None).await.is_err());
+    catalog
+        .begin_library_handoff(&release, route)
+        .await
+        .unwrap();
+    let mut released = release.clone();
+    released.phase = LibraryHandoffPhase::Released;
+    catalog
+        .update_library_handoff(route, &release, &released)
+        .await
+        .unwrap();
+    let external = provider.1.drive_as(0, 3);
+    let external_key = ReservationKey(0x1234);
+    reservation::reserve_for_reload(&external, external_key).unwrap();
+    assert!(activate(None).await.is_err());
+    reservation::clear_reload_registration(&external, external_key).unwrap();
+
+    let preview = activate(None).await.unwrap();
+    assert_eq!(preview["status"], "preview");
+    assert_eq!(preview["pools"][0]["id"], json!(pool.id));
+    assert_eq!(
+        preview["logical_library"]["resources"]["drives"],
+        json!(["SIMDRV0000"])
+    );
+    assert!(
+        catalog
+            .logical_library_activation_receipt(&serial, route, operation)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        catalog
+            .require_logical_pool_scope(&serial, route, pool.id, Some(operation))
+            .await
+            .is_err()
+    );
+    let plan = preview["plan_sha256"].as_str().unwrap();
+    provider
+        .1
+        .insert_cartridge(SimCartridge::blank("NEW000L8", 1 << 20), 2)
+        .unwrap();
+    assert!(activate(Some(plan)).await.is_err());
+    assert!(
+        catalog
+            .logical_library_activation_receipt(&serial, route, operation)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let preview = activate(None).await.unwrap();
+    let plan = preview["plan_sha256"].as_str().unwrap();
+    let enabled = activate(Some(plan)).await.unwrap();
+    assert_eq!(enabled["status"], "enabled");
+    assert_eq!(activate(Some(plan)).await.unwrap(), enabled);
+    assert_eq!(
+        catalog
+            .logical_library_activation_receipt(&serial, route, operation)
+            .await
+            .unwrap(),
+        Some(enabled)
+    );
+    assert!(
+        catalog
+            .require_logical_pool_scope(&serial, route, pool.id, None)
+            .await
+            .is_err()
+    );
+    catalog
+        .require_logical_pool_scope(&serial, route, pool.id, Some(operation))
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog
+            .admin_pool(&serial, route, Some(operation), "original")
+            .await
+            .unwrap(),
+        Some(pool.clone())
+    );
+    assert_eq!(
+        catalog
+            .library_handoff(&serial, route, Some(release.operation))
+            .await
+            .unwrap(),
+        Some(released)
+    );
+    assert_eq!(
+        catalog.active_library_route(&serial).await.unwrap(),
+        Some(route)
+    );
+}
+
 #[test]
 #[ignore = "需要隔离 FDB_TEST_CLUSTER；设备均为 SimLibrary"]
 fn library_handoff_sdk_preserves_loaded_media_and_never_preempts_external_owner() {

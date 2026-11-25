@@ -432,6 +432,10 @@ pub(super) async fn rescan_result_at(
     Ok(result)
 }
 
+pub(super) fn canonical_inventory(serial: &str, owner: u64, value: &Value) -> Result<Value> {
+    input(serial, owner, value).map(|observation| json_value(&observation))
+}
+
 pub(super) async fn record_inventory_at(
     tr: &Transaction,
     serial: &str,
@@ -448,6 +452,7 @@ pub(super) async fn record_inventory_at(
     };
     let raw = encode(&record)?;
     let old = inventory_at(tr, ns, serial).await?;
+    logical_libraries::reconcile_after_acquire(tr, ns, serial, owner, value).await?;
     let before = old.as_ref().map(|r| inventory_view(&r.observation));
     notifications::changed_at(
         tr,

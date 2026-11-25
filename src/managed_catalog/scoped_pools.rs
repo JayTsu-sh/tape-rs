@@ -33,6 +33,8 @@ impl ManagedCatalog {
         let ns = routing::require_expected_active_namespace(&tr, serial, Some(route)).await?;
         if let Some(logical) = logical {
             require_library_at(&tr, ns, serial, logical).await?;
+        } else {
+            logical_libraries::require_explicit_scope_at(&tr, serial).await?;
         }
         if let Ok(id) = Uuid::parse_str(selector) {
             if id.is_nil() || id.to_string() != selector {
@@ -65,6 +67,7 @@ impl ManagedCatalog {
             require_library_at(&tr, ns, serial, logical).await?;
             pool_membership_prefix(ns, serial, logical)
         } else {
+            logical_libraries::require_explicit_scope_at(&tr, serial).await?;
             pool_prefix(ns)
         };
         if !(1..=100).contains(&limit)

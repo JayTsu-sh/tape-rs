@@ -179,6 +179,8 @@ impl ManagedCatalog {
                                 });
                             }
                             require_library_at(&tr, namespace, serial, logical).await?;
+                        } else {
+                            logical_libraries::require_explicit_scope_at(&tr, serial).await?;
                         }
                         let record = pool_key(namespace, pool.id);
                         native_device::require_pool_metadata_available(
