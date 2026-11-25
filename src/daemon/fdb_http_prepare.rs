@@ -35,6 +35,11 @@ pub(super) async fn prepare(
     let Ok(permit) = owner.requests.clone().try_acquire_owned() else {
         return unavailable("http_busy");
     };
+    let logical =
+        match require_file_pool_scope(&ctx, &serial, route, &pool, request.headers()).await {
+            Ok(logical) => logical,
+            Err(error) => return *error,
+        };
     let status = library
         .status
         .lock()
@@ -156,14 +161,18 @@ pub(super) async fn prepare(
             .map_err(|_| ReadError::Busy("准备回执已断开".into()))?
     });
     match tokio::time::timeout(timeout, pending).await {
-        Ok(Ok(Ok(intent))) => reply(
-            StatusCode::OK,
-            json!({
+        Ok(Ok(Ok(intent))) => {
+            let mut value = json!({
                 "version":2, "library":serial, "pool":pool,
                 "path":URL_SAFE_NO_PAD.encode(intent.ltfs_path().expect("validated path")),
-            "namespace":intent.namespace.to_string(), "metadata":upload::encode_intent(&intent.request()).expect("validated intent"),
-            }),
-        ),
+                "namespace":intent.namespace.to_string(),
+                "metadata":upload::encode_intent(&intent.request()).expect("validated intent"),
+            });
+            if let Some(logical) = logical {
+                value["logical_library"] = json!(logical);
+            }
+            reply(StatusCode::OK, value)
+        }
         Ok(Ok(Err(ReadError::Failed(reason)))) => {
             reply(StatusCode::CONFLICT, json!({"error":reason}))
         }

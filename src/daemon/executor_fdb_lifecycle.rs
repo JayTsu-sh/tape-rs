@@ -7456,15 +7456,95 @@ mod tests {
         }
     }
 
+    async fn next_file_request(
+        rx: std::sync::mpsc::Receiver<ExecRequest>,
+    ) -> (std::sync::mpsc::Receiver<ExecRequest>, ExecRequest) {
+        tokio::task::spawn_blocking(move || {
+            let request = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            (rx, request)
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn serve_file_upload(
+        fixture: &mut Fixture,
+        control: &FdbOwnerControl,
+        status: &SharedStatus,
+        rx: std::sync::mpsc::Receiver<ExecRequest>,
+    ) -> std::sync::mpsc::Receiver<ExecRequest> {
+        let (rx, prepare) = next_file_request(rx).await;
+        let ExecRequest::FdbPrepare {
+            spec,
+            barcode,
+            reply,
+        } = prepare
+        else {
+            panic!("上传准备必须先固定原意图");
+        };
+        let intent = Box::pin(fdb_writing::prepare(
+            &fixture.owner,
+            &fixture.permit,
+            control,
+            &spec,
+            barcode.as_deref(),
+        ))
+        .await;
+        reply.send(intent).unwrap();
+        let (rx, write) = next_file_request(rx).await;
+        let ExecRequest::FdbWrite {
+            intent,
+            file,
+            reply,
+        } = write
+        else {
+            panic!("文件正文必须使用已准备的原请求");
+        };
+        let mut results = Box::pin(fdb_writing::write_batch(
+            &mut fixture.owner,
+            &fixture.permit,
+            control,
+            status,
+            vec![(*intent, file)],
+        ))
+        .await;
+        reply.send(results.pop().unwrap()).unwrap();
+        rx
+    }
+
+    async fn serve_file_read(
+        fixture: &mut Fixture,
+        control: &FdbOwnerControl,
+        status: &SharedStatus,
+        rx: std::sync::mpsc::Receiver<ExecRequest>,
+    ) -> std::sync::mpsc::Receiver<ExecRequest> {
+        let (rx, pending) = next_file_request(rx).await;
+        let ExecRequest::Scoped { pool, request, .. } = pending else {
+            panic!("HTTP 读取必须派发有 pool 范围的请求");
+        };
+        let ExecRequest::ReadTo { path, file, reply } = *request else {
+            panic!("HTTP 读取必须派发文件流");
+        };
+        drop(file);
+        let result = Box::pin(read_fdb(
+            &mut fixture.owner,
+            Some(&fixture.permit),
+            control,
+            status,
+            &path,
+            Some(&pool),
+        ))
+        .await;
+        reply.send(result).unwrap();
+        rx
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 逻辑库自动装卸，不访问实际设备"]
     async fn logical_pool_automatic_mechanics_use_its_drive_and_original_home() {
-        use crate::daemon::{fdb_http, http::HttpContext, state::Executor};
+        use crate::daemon::{fdb_http, http::HttpContext, s3, state::Executor};
         use crate::logical_library::{CreateLogicalLibrary, LogicalLibraryResources};
-        use crate::managed_catalog::{
-            ActiveUploadSpec, AutomaticMediaAction, AutomaticMediaPlan, ContentDigest,
-            ManagementRequest,
-        };
+        use crate::managed_catalog::{AutomaticMediaAction, AutomaticMediaPlan, ManagementRequest};
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
         use http_body_util::BodyExt;
         use hyper_util::rt::TokioIo;
@@ -7613,33 +7693,140 @@ mod tests {
         let bytes = b"logical library cold read";
         let file = fixture.root.join("logical-read-fixture");
         std::fs::write(&file, bytes).unwrap();
-        let intent = Box::pin(fdb_writing::prepare(
-            &fixture.owner,
-            &fixture.permit,
-            &control,
-            &ActiveUploadSpec {
-                pool_id: pool.id,
-                path: b"/cold-read".to_vec(),
-                operation_id: Uuid::new_v4(),
-                expected_version: None,
-                size: bytes.len() as u64,
-                digest: ContentDigest::Sha256(Sha256::digest(bytes).into()),
-            },
-            Some("LIFE00L8"),
-        ))
-        .await
-        .unwrap();
-        assert_eq!(
-            Box::pin(fdb_writing::write_batch(
-                &mut fixture.owner,
-                &fixture.permit,
-                &control,
-                &status,
-                vec![(intent.request(), std::fs::File::open(&file).unwrap())],
-            ))
-            .await,
-            vec![Ok(1)]
+        let (tx, rx) = mpsc::channel();
+        let file_service = fixture.owner.files.clone();
+        file_service.set_permission(fixture.permit.clone());
+        let http_context = |node| {
+            let mut view = status.lock().unwrap().clone();
+            view.id = node;
+            view.executor_ready = true;
+            view.catalog_frozen_index = Some(control.route.frozen_index);
+            view.executor = Some(Executor {
+                node: 1,
+                round: epoch,
+                term: 1,
+                fenced: true,
+            });
+            Arc::new(HttpContext {
+                files: file_service.clone(),
+                status: Arc::new(std::sync::Mutex::new(view)),
+                exec: std::sync::Mutex::new(tx.clone()),
+                node: std::sync::Mutex::new(mpsc::channel().0),
+                client_addrs: Default::default(),
+                wait_timeout: Duration::from_secs(15),
+            })
+        };
+        let routes = BTreeMap::from([(control.serial.clone(), control.route)]);
+        let s3_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let s3_address = s3_listener.local_addr().unwrap();
+        let s3_context = http_context(1);
+        let s3_router = s3::fdb_router(
+            catalog.clone(),
+            routes.clone(),
+            BTreeMap::from([(control.serial.clone(), s3_context.clone())]),
+            s3_context,
+            Default::default(),
+            true,
         );
+        let s3_http = tokio::spawn(async move {
+            axum::serve(s3_listener, s3_router).await.unwrap();
+        });
+        let owner_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let owner_address = owner_listener.local_addr().unwrap().to_string();
+        let owner_router = fdb_http::writer_router(
+            catalog.clone(),
+            routes.clone(),
+            BTreeMap::from([(control.serial.clone(), http_context(1))]),
+            Default::default(),
+            control.storage,
+        )
+        .unwrap();
+        let owner_http = tokio::spawn(async move {
+            axum::serve(owner_listener, owner_router).await.unwrap();
+        });
+        let entry_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let entry_address = entry_listener.local_addr().unwrap();
+        let entry_router = fdb_http::writer_router(
+            catalog.clone(),
+            routes,
+            BTreeMap::from([(control.serial.clone(), http_context(2))]),
+            [(1, owner_address)].into(),
+            control.storage,
+        )
+        .unwrap();
+        let entry_http = tokio::spawn(async move {
+            axum::serve(entry_listener, entry_router).await.unwrap();
+        });
+        let upload_library = control.serial.clone();
+        let upload_address = entry_address.to_string();
+        let upload_namespace = control.route.route.namespace;
+        let upload_pool = pool.id;
+        let journal = fixture.root.join("scoped-upload");
+        let upload = tokio::task::spawn_blocking(move || {
+            use crate::client::fdb::{FdbClient, UploadCondition, UploadStatus};
+            let client = FdbClient::new([upload_address.as_str()])
+                .unwrap()
+                .with_logical_library(logical)
+                .unwrap();
+            let root = client
+                .stat(&upload_library, upload_pool, "/")
+                .unwrap()
+                .unwrap();
+            let condition = || UploadCondition::Create {
+                namespace: upload_namespace,
+                parent: root["id"].as_str().unwrap().parse().unwrap(),
+            };
+            for scope in [None, Some(other_logical)] {
+                let unscoped = FdbClient::new([upload_address.as_str()]).unwrap();
+                let wrong = match scope {
+                    Some(id) => unscoped.with_logical_library(id).unwrap(),
+                    None => unscoped,
+                };
+                let rejected = wrong
+                    .prepare_file(
+                        &upload_library,
+                        upload_pool,
+                        "/cold-read",
+                        &file,
+                        condition(),
+                        Some("LIFE00L8"),
+                        &journal.with_extension(Uuid::new_v4().to_string()),
+                    )
+                    .unwrap_err();
+                assert!(
+                    matches!(
+                        rejected,
+                        crate::client::ClientError::Rejected { status: 404, .. }
+                    ),
+                    "{rejected:?}"
+                );
+            }
+            client
+                .prepare_file(
+                    &upload_library,
+                    upload_pool,
+                    "/cold-read",
+                    &file,
+                    condition(),
+                    Some("LIFE00L8"),
+                    &journal,
+                )
+                .unwrap();
+            let wrong = FdbClient::new([upload_address.as_str()])
+                .unwrap()
+                .with_logical_library(other_logical)
+                .unwrap();
+            assert!(wrong.upload_saved(&journal).is_err());
+            let reopened = FdbClient::new([upload_address.as_str()]).unwrap();
+            let result = reopened.upload_saved(&journal).unwrap();
+            assert_eq!(result.details()["version"], 1);
+            assert_eq!(
+                reopened.status_saved(&journal).unwrap(),
+                UploadStatus::Committed(1)
+            );
+        });
+        let rx = serve_file_upload(&mut fixture, &control, &status, rx).await;
+        upload.await.unwrap();
         Box::pin(fdb_loading::unload(
             &mut fixture.owner,
             &fixture.permit,
@@ -7658,52 +7845,6 @@ mod tests {
             rows.iter()
                 .any(|row| row.address == other_slot && !row.full)
         );
-        let (tx, rx) = mpsc::channel();
-        let http_context = |node| {
-            let mut view = status.lock().unwrap().clone();
-            view.id = node;
-            view.executor_ready = true;
-            view.catalog_frozen_index = Some(control.route.frozen_index);
-            view.executor = Some(Executor {
-                node: 1,
-                round: epoch,
-                term: 1,
-                fenced: true,
-            });
-            Arc::new(HttpContext {
-                files: fixture.owner.files.clone(),
-                status: Arc::new(std::sync::Mutex::new(view)),
-                exec: std::sync::Mutex::new(tx.clone()),
-                node: std::sync::Mutex::new(mpsc::channel().0),
-                client_addrs: Default::default(),
-                wait_timeout: Duration::from_secs(15),
-            })
-        };
-        let routes = BTreeMap::from([(control.serial.clone(), control.route)]);
-        let owner_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let owner_address = owner_listener.local_addr().unwrap().to_string();
-        let owner_router = fdb_http::owner_router(
-            catalog.clone(),
-            routes.clone(),
-            BTreeMap::from([(control.serial.clone(), http_context(1))]),
-            Default::default(),
-        )
-        .unwrap();
-        let owner_http = tokio::spawn(async move {
-            axum::serve(owner_listener, owner_router).await.unwrap();
-        });
-        let entry_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let entry_address = entry_listener.local_addr().unwrap();
-        let entry_router = fdb_http::owner_router(
-            catalog.clone(),
-            routes,
-            BTreeMap::from([(control.serial.clone(), http_context(2))]),
-            [(1, owner_address)].into(),
-        )
-        .unwrap();
-        let entry_http = tokio::spawn(async move {
-            axum::serve(entry_listener, entry_router).await.unwrap();
-        });
         let path = format!(
             "/v1/fdb/files/{}?pool={}&path={}",
             control.serial,
@@ -7745,33 +7886,161 @@ mod tests {
             assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
             assert_eq!(fixture.commands.lock().unwrap().len(), before);
         }
-        let read = async {
-            let pending =
-                tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(10)))
-                    .await
+        let library = control.serial.clone();
+        let endpoint = entry_address.to_string();
+        let file = fixture.root.join("logical-http-download");
+        let pool_id = pool.id;
+        let download = tokio::task::spawn_blocking(move || {
+            use crate::client::fdb::FdbClient;
+            let client = FdbClient::new([endpoint.as_str()]).unwrap();
+            assert!(
+                client
+                    .stat(&library, pool_id, "/cold-read")
                     .unwrap()
+                    .is_none()
+            );
+            let foreign = FdbClient::new([endpoint.as_str()])
+                .unwrap()
+                .with_logical_library(other_logical)
+                .unwrap();
+            assert!(
+                foreign
+                    .stat(&library, pool_id, "/cold-read")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                foreign
+                    .list_children(&library, pool_id, "/", 100, None)
+                    .is_err()
+            );
+            let client = client.with_logical_library(logical).unwrap();
+            assert_eq!(
+                client
+                    .list_children(&library, pool_id, "/", 100, None)
+                    .unwrap()["items"][0]["name"],
+                "cold-read"
+            );
+            client
+                .download_new(&library, pool_id, "/cold-read", &file)
+                .unwrap();
+            std::fs::read(file).unwrap()
+        });
+        let (body, rx) = tokio::join!(
+            download,
+            serve_file_read(&mut fixture, &control, &status, rx)
+        );
+        assert_eq!(body.unwrap(), bytes);
+
+        let s3_request = |method, path: String, body: &'static [u8]| async move {
+            let stream = tokio::net::TcpStream::connect(s3_address).await.unwrap();
+            let (mut sender, connection) =
+                hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                    .await
                     .unwrap();
-            let ExecRequest::Scoped { pool, request, .. } = pending else {
-                panic!("HTTP 读取必须派发有 pool 范围的请求");
-            };
-            let ExecRequest::ReadTo { path, file, reply } = *request else {
-                panic!("HTTP 读取必须派发文件流");
-            };
-            drop(file);
-            let result = Box::pin(read_fdb(
-                &mut fixture.owner,
-                Some(&fixture.permit),
-                &control,
-                &status,
-                &path,
-                Some(&pool),
-            ))
-            .await;
-            reply.send(result).unwrap();
+            let connection = tokio::spawn(connection);
+            let response = sender
+                .send_request(
+                    hyper::Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("host", s3_address.to_string())
+                        .header("content-length", body.len().to_string())
+                        .body(http_body_util::Full::new(bytes::Bytes::from_static(body)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let code = response.status().as_u16();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            connection.abort();
+            (code, body)
         };
-        let ((code, body), ()) = tokio::join!(get(Some(logical)), read);
-        assert_eq!(code, 200, "{body:?}");
-        assert_eq!(body.as_ref(), bytes);
+        for wrong in [
+            s3::bucket_name(&control.serial, &pool.id.to_string()),
+            s3::logical_bucket_name(&control.serial, other_logical, pool.id),
+        ] {
+            let (code, _) = s3_request("PUT", format!("/{wrong}/scoped-s3"), bytes).await;
+            assert_eq!(code, 404);
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        }
+        let bucket = s3::logical_bucket_name(&control.serial, logical, pool.id);
+        let object = format!("/{bucket}/scoped-s3");
+        let ((code, response), rx) = tokio::join!(
+            s3_request("PUT", object.clone(), bytes),
+            serve_file_upload(&mut fixture, &control, &status, rx)
+        );
+        assert_eq!(code, 200, "{response:?}");
+        let ((code, response), rx) = tokio::join!(
+            s3_request("GET", object, b""),
+            serve_file_read(&mut fixture, &control, &status, rx)
+        );
+        assert_eq!(code, 200, "{response:?}");
+        assert_eq!(response.as_ref(), bytes);
+        s3_http.abort();
+
+        let fuse_address = entry_address.to_string();
+        let fuse_library = control.serial.clone();
+        let fuse_namespace = control.route.route.namespace;
+        let fuse_pool = pool.id;
+        let fuse_root = fixture.root.clone();
+        let (written, rx) = tokio::join!(
+            tokio::task::spawn_blocking(move || {
+                use crate::client::fdb::FdbClient;
+                use crate::tapefs::{FdbBackend, ROOT_INO, TapeFs};
+                let foreign = FdbClient::new([fuse_address.as_str()])
+                    .unwrap()
+                    .with_logical_library(other_logical)
+                    .unwrap();
+                assert!(
+                    FdbBackend::new(foreign, fuse_library.clone(), fuse_namespace, fuse_pool)
+                        .is_err()
+                );
+                let client = FdbClient::new([fuse_address.as_str()])
+                    .unwrap()
+                    .with_logical_library(logical)
+                    .unwrap();
+                let backend = FdbBackend::new_writable(
+                    client,
+                    fuse_library,
+                    fuse_namespace,
+                    fuse_pool,
+                    &fuse_root.join("fuse-journals"),
+                )
+                .unwrap();
+                let fs = TapeFs::new(backend, fuse_root.join("fuse-write-cache")).unwrap();
+                let (_, handle) = fs.create(ROOT_INO, "scoped-fuse", true).unwrap();
+                fs.write(handle, 0, bytes).unwrap();
+                fs.fsync(handle).unwrap();
+                fs.release(handle);
+            }),
+            serve_file_upload(&mut fixture, &control, &status, rx)
+        );
+        written.unwrap();
+
+        let fuse_address = entry_address.to_string();
+        let fuse_library = control.serial.clone();
+        let fuse_root = fixture.root.clone();
+        let (body, _rx) = tokio::join!(
+            tokio::task::spawn_blocking(move || {
+                use crate::client::fdb::FdbClient;
+                use crate::tapefs::{FdbBackend, ROOT_INO, TapeFs};
+                let client = FdbClient::new([fuse_address.as_str()])
+                    .unwrap()
+                    .with_logical_library(logical)
+                    .unwrap();
+                let backend =
+                    FdbBackend::new(client, fuse_library, fuse_namespace, fuse_pool).unwrap();
+                let fs = TapeFs::new(backend, fuse_root.join("fuse-read-cache")).unwrap();
+                let object = fs.lookup(ROOT_INO, "scoped-fuse").unwrap();
+                let handle = fs.open(object.ino, nix::libc::O_RDONLY).unwrap();
+                let body = fs.read(handle, 0, bytes.len() as u32).unwrap();
+                fs.release(handle);
+                body
+            }),
+            serve_file_read(&mut fixture, &control, &status, rx)
+        );
+        assert_eq!(body.unwrap(), bytes);
         owner_http.abort();
         entry_http.abort();
         let (_, rows) = management::elements(&fixture.owner.devices).unwrap();

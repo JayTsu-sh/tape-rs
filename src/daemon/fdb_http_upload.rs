@@ -171,6 +171,15 @@ pub(super) async fn status(
         Ok(intent) => intent,
         Err(error) => return invalid(error),
     };
+    let pool = intent
+        .pool_id
+        .expect("wire write requires a pool")
+        .to_string();
+    if let Err(error) =
+        require_file_pool_scope(&ctx, &serial, route, &pool, request.headers()).await
+    {
+        return *error;
+    }
     match ctx.catalog.active_upload_result(&intent, route).await {
         Ok(Some(PublishOutcome::AlreadyApplied(version))) => reply(
             StatusCode::OK,
@@ -202,6 +211,15 @@ pub(super) async fn receipt(
         Ok(value) => value,
         Err(error) => return invalid(error),
     };
+    let pool = intent
+        .pool_id
+        .expect("wire write requires a pool")
+        .to_string();
+    if let Err(error) =
+        require_file_pool_scope(&ctx, &serial, route, &pool, request.headers()).await
+    {
+        return *error;
+    }
     let original = match ctx
         .catalog
         .active_upload_receipt(&intent, route, 8 << 20)
@@ -260,6 +278,15 @@ async fn dispatch(ctx: Arc<Context>, serial: String, request: Request) -> Respon
         Ok(intent) => intent,
         Err(error) => return invalid(error),
     };
+    let pool = intent
+        .pool_id
+        .expect("wire write requires a pool")
+        .to_string();
+    if let Err(error) =
+        require_file_pool_scope(&ctx, &serial, route, &pool, request.headers()).await
+    {
+        return *error;
+    }
     if request.headers().contains_key(header::TRANSFER_ENCODING)
         || request
             .headers()

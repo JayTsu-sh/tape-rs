@@ -450,6 +450,28 @@ impl ManagedCatalog {
         pool_resources_at(&tr, ns, serial, pool).await
     }
 
+    pub(crate) async fn active_pool_logical_libraries(
+        &self,
+        serial: &str,
+        route: ActiveLibraryRoute,
+        pools: &[PoolRecord],
+    ) -> Result<Vec<Option<Uuid>>> {
+        let tr = self.db.create_trx()?;
+        let ns = routing::require_expected_active_namespace(&tr, serial, Some(route)).await?;
+        let mut scopes = Vec::with_capacity(pools.len());
+        let mut verified = BTreeSet::new();
+        for pool in pools {
+            let logical = pool_library_at(&tr, ns, serial, pool.id).await?;
+            if let Some(id) = logical
+                && verified.insert(id)
+            {
+                require_library_at(&tr, ns, serial, id).await?;
+            }
+            scopes.push(logical);
+        }
+        Ok(scopes)
+    }
+
     pub(crate) async fn require_logical_pool_scope(
         &self,
         serial: &str,

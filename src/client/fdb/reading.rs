@@ -92,6 +92,12 @@ fn check_stat(value: &Value, library: &str, pool: Uuid) -> Result<()> {
 }
 
 impl FdbClient {
+    fn file_read_header(&self) -> Option<(&str, &str)> {
+        self.logical_library
+            .as_deref()
+            .map(|scope| ("x-tapers-logical-library", scope))
+    }
+
     /// Pool-scoped metadata; this does not mount or read a tape. A missing
     /// digest is reported as null; verified exports still require a digest.
     pub fn stat(&self, library: &str, pool: Uuid, path: &str) -> Result<Option<Value>> {
@@ -102,7 +108,7 @@ impl FdbClient {
             "GET",
             &format!("{}&pool={pool}", read_route("stat", library, path)?),
             None,
-            &[],
+            self.file_read_header().as_slice(),
         )?;
         match response.status {
             200 => {
@@ -147,7 +153,8 @@ impl FdbClient {
             route.push_str("&after=");
             route.push_str(after);
         }
-        let response = self.retry_request("GET", &route, None, &[])?;
+        let response =
+            self.retry_request("GET", &route, None, self.file_read_header().as_slice())?;
         if response.status == 404 {
             return Err(ClientError::NotFound);
         }
@@ -304,7 +311,7 @@ impl FdbClient {
                     "GET",
                     &route,
                     None,
-                    &[],
+                    self.file_read_header().as_slice(),
                     Some(&mut sink),
                 ) {
                     Ok(response) if matches!(response.status, 503 | 504) => {}

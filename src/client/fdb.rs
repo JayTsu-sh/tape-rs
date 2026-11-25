@@ -42,6 +42,10 @@ use http_body_util::BodyExt;
 use hyper_util::rt::TokioIo;
 mod queries;
 
+fn valid_logical_library(value: &str) -> bool {
+    Uuid::parse_str(value).is_ok_and(|id| !id.is_nil() && id.to_string() == value)
+}
+
 fn invalid(reason: &str) -> ClientError {
     ClientError::Io(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
@@ -73,10 +77,16 @@ impl PreparedUpload {
             "namespace",
             "metadata",
         ];
+        let scoped = value.get("logical_library").is_some();
         if value["version"] != 2
             || !value.as_object().is_some_and(|obj| {
-                obj.len() == fields.len() && obj.keys().all(|key| fields.contains(&key.as_str()))
+                obj.len() == fields.len() + usize::from(scoped)
+                    && fields.iter().all(|key| obj.contains_key(*key))
             })
+            || scoped
+                && !value["logical_library"]
+                    .as_str()
+                    .is_some_and(valid_logical_library)
         {
             return Err(invalid("上传请求头字段或版本无效"));
         }
@@ -188,8 +198,8 @@ impl PreparedUpload {
         )
     }
 
-    fn headers(&self) -> [(&str, &str); 2] {
-        [
+    fn headers(&self) -> Vec<(&str, &str)> {
+        let mut headers = vec![
             (
                 "x-tapers-fdb-write",
                 self.value["metadata"].as_str().unwrap(),
@@ -198,7 +208,11 @@ impl PreparedUpload {
                 "x-tapers-catalog-namespace",
                 self.value["namespace"].as_str().unwrap(),
             ),
-        ]
+        ];
+        if let Some(scope) = self.value["logical_library"].as_str() {
+            headers.push(("x-tapers-logical-library", scope));
+        }
+        headers
     }
 
     #[cfg(test)]
@@ -230,6 +244,7 @@ fn validate_path(path: &str) -> Result<()> {
 
 pub struct FdbClient {
     transport: Client,
+    logical_library: Option<String>,
 }
 
 // Each attempt owns and closes its connection, including timeout/error paths.
@@ -262,8 +277,25 @@ impl FdbClient {
         {
             return Err(invalid("FDB 节点地址须为不带路径的 host:port"));
         }
-        Ok(Self { transport })
+        Ok(Self {
+            transport,
+            logical_library: None,
+        })
     }
+
+    /// Select the owning logical library for native file metadata, reads and new uploads.
+    pub fn with_logical_library(mut self, logical: Uuid) -> Result<Self> {
+        if logical.is_nil() {
+            return Err(invalid("逻辑带库 UUID 不能为零"));
+        }
+        self.logical_library = Some(logical.to_string());
+        Ok(self)
+    }
+
+    pub(crate) fn file_logical_scope(&self) -> Option<&str> {
+        self.logical_library.as_deref()
+    }
+
     pub fn with_timeouts(mut self, retry: Duration, io: Duration) -> Self {
         self.transport.retry_for = retry;
         self.transport.io_timeout = io;
@@ -276,6 +308,19 @@ impl FdbClient {
         body: Option<&[u8]>,
         headers: &[(&str, &str)],
     ) -> Result<Response> {
+        let mut scoped_headers;
+        let headers = if let Some(logical) = self.file_logical_scope()
+            && route.starts_with("/v1/fdb/")
+            && !headers
+                .iter()
+                .any(|(name, _)| *name == "x-tapers-logical-library")
+        {
+            scoped_headers = headers.to_vec();
+            scoped_headers.push(("x-tapers-logical-library", logical));
+            &scoped_headers
+        } else {
+            headers
+        };
         // Node requests carry bounded LTFS attributes, unlike small control
         // requests. Keep their existing 8 MiB wire budget end to end.
         let maximum =
@@ -1065,12 +1110,19 @@ impl FdbClient {
         barcode: Option<&str>,
         directory: &Path,
     ) -> Result<PreparedUpload> {
-        let mut saved =
-            UploadJournal::create(library, pool, path, source, condition, barcode, directory)?;
+        let mut saved = UploadJournal::create_scoped(
+            (library, pool, self.logical_library.as_deref()),
+            path,
+            source,
+            condition,
+            barcode,
+            directory,
+        )?;
         self.prepare_journal(&mut saved)
     }
     pub fn prepare_journal(&self, saved: &mut UploadJournal) -> Result<PreparedUpload> {
         saved.require_exclusive()?;
+        self.require_upload_scope(saved.original.logical_library.as_deref())?;
         if let Some(request) = &saved.request {
             return Ok(request.clone());
         }
@@ -1088,12 +1140,11 @@ impl FdbClient {
             original.pool,
             URL_SAFE_NO_PAD.encode(&original.path)
         );
-        let response = self.retry_request(
-            "POST",
-            &route,
-            Some(body.as_bytes()),
-            &[("Content-Type", "application/json")],
-        )?;
+        let mut headers = vec![("Content-Type", "application/json")];
+        if let Some(scope) = original.logical_library.as_deref() {
+            headers.push(("x-tapers-logical-library", scope));
+        }
+        let response = self.retry_request("POST", &route, Some(body.as_bytes()), &headers)?;
         if response.status != 200 {
             return Err(rejected(response));
         }
@@ -1104,6 +1155,7 @@ impl FdbClient {
     }
     pub fn status_saved(&self, directory: &Path) -> Result<UploadStatus> {
         let saved = upload_state::UploadJournal::open_locked(directory, false)?;
+        self.require_upload_scope(saved.original.logical_library.as_deref())?;
         if let Some(committed) = saved.acknowledged()? {
             return Ok(UploadStatus::Committed(
                 committed.details()["version"].as_u64().unwrap(),
@@ -1116,6 +1168,7 @@ impl FdbClient {
     }
     pub fn saved_receipt(&self, directory: &Path) -> Result<Option<CommittedUpload>> {
         let saved = upload_state::UploadJournal::open_locked(directory, false)?;
+        self.require_upload_scope(saved.original.logical_library.as_deref())?;
         if let Some(receipt) = saved.acknowledged()? {
             return Ok(Some(receipt));
         }
@@ -1126,7 +1179,19 @@ impl FdbClient {
             .map(|value| CommittedUpload::parse(value, request))
             .transpose()
     }
+    fn require_upload_scope(&self, logical: Option<&str>) -> Result<()> {
+        if self
+            .logical_library
+            .as_deref()
+            .is_some_and(|scope| Some(scope) != logical)
+        {
+            return Err(invalid("上传请求与所选逻辑带库不一致"));
+        }
+        Ok(())
+    }
+
     pub fn status(&self, request: &PreparedUpload) -> Result<UploadStatus> {
+        self.require_upload_scope(request.value["logical_library"].as_str())?;
         let response =
             self.retry_request("GET", &request.route("uploads"), None, &request.headers())?;
         let value = response.json();
@@ -1151,6 +1216,7 @@ impl FdbClient {
     }
     pub fn upload_journal(&self, saved: &mut UploadJournal) -> Result<CommittedUpload> {
         saved.require_exclusive()?;
+        self.require_upload_scope(saved.original.logical_library.as_deref())?;
         if let Some(committed) = saved.acknowledged()? {
             saved.release_payload()?;
             return Ok(committed);

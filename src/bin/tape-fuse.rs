@@ -35,6 +35,9 @@ struct Args {
     /// 固定 FDB 命名空间；须指定 --library 和 UUID 格式的 --pool，默认只读
     #[arg(long, requires_all = ["library_serial", "pool"], conflicts_with = "library_changer")]
     fdb_namespace: Option<uuid::Uuid>,
+    /// FDB 磁带池归属的逻辑带库 UUID
+    #[arg(long, requires = "fdb_namespace", conflicts_with = "library_changer")]
+    logical_library: Option<uuid::Uuid>,
     /// FDB 持久化请求日志目录（0700）；指定后恢复原操作并启用文件及节点修改
     #[arg(long, requires = "fdb_namespace", conflicts_with = "library_changer")]
     fdb_journal_dir: Option<PathBuf>,
@@ -573,6 +576,12 @@ fn main() {
                 .map_err(|_| std::io::Error::other("FDB 挂载的 pool 必须为 UUID"))?;
             let client = tape_rs::client::fdb::FdbClient::new(args.endpoints)
                 .map_err(std::io::Error::other)?;
+            let client = match args.logical_library {
+                Some(logical) => client
+                    .with_logical_library(logical)
+                    .map_err(std::io::Error::other)?,
+                None => client,
+            };
             let backend = if let Some(directory) = args.fdb_journal_dir {
                 tape_rs::tapefs::FdbBackend::new_writable(
                     client, serial, namespace, pool, &directory,

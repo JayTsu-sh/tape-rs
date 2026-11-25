@@ -52,4 +52,16 @@ HTTP 和 Rust SDK 将 UUID 固定在原管理请求的 `change.logical_library`�
 
 `tape import`、`validate`、`online`、`offline`、`set`、`unassign` 和 `reclaim` 也使用 `--logical-library LOGICAL_UUID` 及所属 pool。索引导入使用原归位槽。回收在源带和目标带就位前固定两台所属驱动器和各自的归位槽。驱动器不足时，原回收任务保留等待状态和原因。
 
-业务启用和完整的设备、文件入口隔离需要完成后续切换及验收。[逻辑带库 ADR](../adr/0003-logical-library-resource-boundary.md)
+## 文件读写
+
+原生文件入口使用物理带库、逻辑带库 UUID 和 pool UUID。HTTP 请求携带 `x-tapers-logical-library`。Rust SDK 使用 `FdbClient::with_logical_library` 设置范围。原生上传日志会保存逻辑带库 UUID，续传与回执查询使用原 UUID。
+
+```sh
+ltfsctl -e HOST:7401 -l LIBRARY -p POOL_UUID fdb --logical-library LOGICAL_UUID stat /archive.tar
+tape-fuse -e HOST:7401 --library LIBRARY --pool POOL_UUID \
+  --fdb-namespace NAMESPACE_UUID --logical-library LOGICAL_UUID --cache-dir CACHE MOUNTPOINT
+```
+
+S3 通过 `ListBuckets` 查找逻辑带库下的 pool 名称。应用也可用 Rust 函数 `s3::logical_bucket_name` 根据物理带库序列号、逻辑带库 UUID 和 pool UUID 计算 bucket 名称。旧的物理库 bucket 名称无法访问已绑定逻辑带库的 pool。
+
+业务启用需要完成库存对账、既有 pool 切换及现场验收。[逻辑带库 ADR](../adr/0003-logical-library-resource-boundary.md)

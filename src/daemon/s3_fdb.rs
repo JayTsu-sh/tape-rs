@@ -80,7 +80,15 @@ fn catalog_error(error: CatalogError) -> S3Error {
     }
 }
 
-async fn buckets(s: &FdbS3) -> S3Result<BTreeMap<String, (String, Uuid, u64)>> {
+#[derive(Clone)]
+struct Bucket {
+    serial: String,
+    pool: Uuid,
+    logical_library: Option<Uuid>,
+    created_at_millis: u64,
+}
+
+async fn buckets(s: &FdbS3) -> S3Result<BTreeMap<String, Bucket>> {
     let mut all = BTreeMap::new();
     for (serial, route) in &s.routes {
         let mut after = None;
@@ -90,14 +98,28 @@ async fn buckets(s: &FdbS3) -> S3Result<BTreeMap<String, (String, Uuid, u64)>> {
                 .list_active_pools_for_route(serial, *route, after.as_deref(), 100)
                 .await
                 .map_err(catalog_error)?;
-            for pool in page.items {
-                if all.len() >= 4096 {
-                    return Err(unavailable("S3 bucket 列表超过本入口上限"));
+            if all.len() + page.items.len() > 4096 {
+                return Err(unavailable("S3 bucket 列表超过本入口上限"));
+            }
+            let logical = s
+                .catalog
+                .active_pool_logical_libraries(serial, *route, &page.items)
+                .await
+                .map_err(catalog_error)?;
+            for (pool, logical_library) in page.items.into_iter().zip(logical) {
+                let name = match logical_library {
+                    Some(logical) => logical_bucket_name(serial, logical, pool.id),
+                    None => bucket_name(serial, &pool.id.to_string()),
+                };
+                let bucket = Bucket {
+                    serial: serial.clone(),
+                    pool: pool.id,
+                    logical_library,
+                    created_at_millis: pool.created_at_millis,
+                };
+                if all.insert(name, bucket).is_some() {
+                    return Err(unavailable("S3 bucket 身份冲突"));
                 }
-                all.insert(
-                    bucket_name(serial, &pool.id.to_string()),
-                    (serial.clone(), pool.id, pool.created_at_millis),
-                );
             }
             after = page.next;
             if after.is_none() {
@@ -233,22 +255,22 @@ async fn dispatch_inner(s: FdbS3, req: Request) -> S3Result<Response> {
     };
     let ctx = match &scope {
         None => s.gateway.clone(),
-        Some((serial, _, _)) => s
+        Some(bucket) => s
             .libraries
-            .get(serial)
+            .get(&bucket.serial)
             .cloned()
             .ok_or_else(|| unavailable("目标带库未配置"))?,
     };
     let rename_input = if is_rename {
-        let (serial, pool, _) = scope
+        let target = scope
             .as_ref()
             .ok_or_else(|| S3Error::new(400, "InvalidArgument", "RenameObject 缺少 bucket"))?;
         Some(rename::input(
             &req,
             &bucket,
-            serial,
-            s.routes[serial],
-            *pool,
+            &target.serial,
+            s.routes[&target.serial],
+            target.pool,
         )?)
     } else {
         None
@@ -299,8 +321,23 @@ async fn dispatch_inner(s: FdbS3, req: Request) -> S3Result<Response> {
         return Ok(response);
     }
     let round = owner.round;
-    if let Some((serial, pool, _)) = scope {
+    if let Some(Bucket {
+        serial,
+        pool,
+        logical_library,
+        ..
+    }) = scope
+    {
         check_owner(&s, &serial, round).await?;
+        s.catalog
+            .require_logical_pool_scope(&serial, s.routes[&serial], pool, logical_library)
+            .await
+            .map_err(|error| match error.domain() {
+                CatalogError::Invalid(_) => {
+                    S3Error::new(404, "NoSuchBucket", "指定 bucket 范围已改变")
+                }
+                _ => catalog_error(error),
+            })?;
         if let Some(input) = &rename_input {
             return rename::execute(&s, input, round).await;
         }
@@ -360,8 +397,8 @@ async fn dispatch_inner(s: FdbS3, req: Request) -> S3Result<Response> {
             return Err(unavailable("统一入口多数派许可已失效"));
         }
         let mut names = String::new();
-        for (name, (_, _, created)) in &all {
-            let time = chrono::DateTime::from_timestamp_millis(*created as i64)
+        for (name, bucket) in &all {
+            let time = chrono::DateTime::from_timestamp_millis(bucket.created_at_millis as i64)
                 .ok_or_else(|| unavailable("池创建时间无效"))?
                 .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
             names.push_str(&format!(

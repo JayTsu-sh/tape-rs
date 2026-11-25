@@ -75,6 +75,12 @@ pub fn bucket_name(library: &str, pool: &str) -> String {
     format!("pool-{}", &format!("{:x}", hash.finalize())[..56])
 }
 
+/// Stable bucket identity for a pool belonging to an explicit logical library.
+#[cfg(feature = "fdb")]
+pub fn logical_bucket_name(library: &str, logical: uuid::Uuid, pool: uuid::Uuid) -> String {
+    bucket_name(library, &format!("{logical}/{pool}"))
+}
+
 fn buckets(s: &S3) -> BTreeMap<String, (String, String)> {
     let mut out = BTreeMap::new();
     for (library, ctx) in &s.libraries {

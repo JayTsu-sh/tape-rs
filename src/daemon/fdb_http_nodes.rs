@@ -37,6 +37,11 @@ pub(super) async fn attributes(
         Ok(value) => value,
         Err(error) => return invalid(error),
     };
+    if let Err(error) =
+        require_file_pool_scope(&ctx, &serial, route, &pool, request.headers()).await
+    {
+        return *error;
+    }
     let catalog_path = match crate::managed_catalog::pool_catalog_path(
         Uuid::parse_str(&pool).expect("validated pool"),
         path.as_bytes(),
@@ -183,6 +188,7 @@ async fn read_status(
     route: ActiveLibraryRoute,
     epoch: u64,
     operation: Uuid,
+    logical: Option<Uuid>,
     accepting: bool,
 ) -> Response {
     match ctx
@@ -193,6 +199,11 @@ async fn read_status(
         Ok(Some(value)) => {
             if value.task.kind != NodeMutationTaskKind::SingleNode {
                 return invalid("原任务不是单节点修改，请使用对应请求类型");
+            }
+            if let Err(error) =
+                check_file_pool_scope(ctx, serial, route, value.task.pool, logical).await
+            {
+                return *error;
             }
             let pending = matches!(
                 value.task.state,
@@ -226,6 +237,10 @@ pub(super) async fn prepare(
     if let Err(error) = scope(&request, route) {
         return error;
     }
+    let logical = match pools::logical_scope(request.headers()) {
+        Ok(logical) => logical,
+        Err(error) => return *error,
+    };
     let max = match limit(&ctx) {
         Ok(value) => value,
         Err(error) => return error,
@@ -262,6 +277,9 @@ pub(super) async fn prepare(
         Ok(value) => value,
         Err(error) => return error,
     };
+    if let Err(error) = check_file_pool_scope(&ctx, &serial, route, pool, logical).await {
+        return *error;
+    }
     let spec = NodeMutationSpec {
         pool,
         operation,
@@ -302,6 +320,10 @@ pub(super) async fn admit(
     if let Err(error) = scope(&request, route) {
         return error;
     }
+    let logical = match pools::logical_scope(request.headers()) {
+        Ok(logical) => logical,
+        Err(error) => return *error,
+    };
     let max = match limit(&ctx) {
         Ok(value) => value,
         Err(error) => return error,
@@ -325,12 +347,26 @@ pub(super) async fn admit(
     if local.library.files.serving_deadline(local.round).is_none() {
         return unavailable("Serving 许可已失效");
     }
+    if let Err(error) = check_file_pool_scope(&ctx, &serial, route, c.pool, logical).await {
+        return *error;
+    }
     match ctx
         .catalog
         .queue_node_mutation_request(route, local.round, &request, max)
         .await
     {
-        Ok(_) => read_status(&ctx, &serial, route, c.request_epoch, c.operation, true).await,
+        Ok(_) => {
+            read_status(
+                &ctx,
+                &serial,
+                route,
+                c.request_epoch,
+                c.operation,
+                logical,
+                true,
+            )
+            .await
+        }
         Err(error) => catalog_error(error),
     }
 }
@@ -347,11 +383,15 @@ pub(super) async fn status(
     if let Err(error) = scope(&request, route) {
         return error;
     }
+    let logical = match pools::logical_scope(request.headers()) {
+        Ok(logical) => logical,
+        Err(error) => return *error,
+    };
     let operation = match identity(epoch, &operation) {
         Ok(value) => value,
         Err(error) => return error,
     };
-    read_status(&ctx, &serial, route, epoch, operation, false).await
+    read_status(&ctx, &serial, route, epoch, operation, logical, false).await
 }
 
 pub(super) async fn cancel(
@@ -366,6 +406,10 @@ pub(super) async fn cancel(
     if let Err(error) = scope(&request, route) {
         return error;
     }
+    let logical = match pools::logical_scope(request.headers()) {
+        Ok(logical) => logical,
+        Err(error) => return *error,
+    };
     let operation = match identity(epoch, &operation) {
         Ok(value) => value,
         Err(error) => return error,
@@ -374,12 +418,24 @@ pub(super) async fn cancel(
         Ok(value) => value,
         Err(error) => return error,
     };
+    let pool = match ctx
+        .catalog
+        .node_mutation_task_status(&serial, route, epoch, operation)
+        .await
+    {
+        Ok(Some(task)) => task.task.pool,
+        Ok(None) => return reply(StatusCode::NOT_FOUND, json!({"error":"原节点任务不存在"})),
+        Err(error) => return catalog_error(error),
+    };
+    if let Err(error) = check_file_pool_scope(&ctx, &serial, route, pool, logical).await {
+        return *error;
+    }
     match ctx
         .catalog
         .cancel_node_mutation_task(&serial, route, local.round, epoch, operation)
         .await
     {
-        Ok(_) => read_status(&ctx, &serial, route, epoch, operation, false).await,
+        Ok(_) => read_status(&ctx, &serial, route, epoch, operation, logical, false).await,
         Err(error) => catalog_error(error),
     }
 }

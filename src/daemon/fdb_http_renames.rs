@@ -56,6 +56,7 @@ async fn read_status(
     route: ActiveLibraryRoute,
     epoch: u64,
     operation: Uuid,
+    logical: Option<Uuid>,
     accepting: bool,
 ) -> Response {
     let task = match ctx
@@ -73,6 +74,9 @@ async fn read_status(
         }
         Err(error) => return catalog_error(error),
     };
+    if let Err(error) = check_file_pool_scope(ctx, serial, route, task.pool, logical).await {
+        return *error;
+    }
     let result = if task.state == NodeMutationTaskState::Completed {
         let publication = match ctx
             .catalog
@@ -146,6 +150,10 @@ pub(super) async fn prepare(
     if let Err(error) = scope(&request, route) {
         return error;
     }
+    let logical = match pools::logical_scope(request.headers()) {
+        Ok(logical) => logical,
+        Err(error) => return *error,
+    };
     let max = match limit(&ctx) {
         Ok(value) => value,
         Err(error) => return error,
@@ -211,6 +219,9 @@ pub(super) async fn prepare(
     {
         return invalid("rename 原身份与当前 namespace 不符");
     }
+    if let Err(error) = check_file_pool_scope(&ctx, &serial, route, spec.pool, logical).await {
+        return *error;
+    }
     let prepared = match ctx
         .catalog
         .prepare_node_rename_request(&serial, route, local.round, &spec, &input.time)
@@ -243,6 +254,10 @@ pub(super) async fn admit(
     if let Err(error) = scope(&request, route) {
         return error;
     }
+    let logical = match pools::logical_scope(request.headers()) {
+        Ok(logical) => logical,
+        Err(error) => return *error,
+    };
     let max = match limit(&ctx) {
         Ok(value) => value,
         Err(error) => return error,
@@ -265,6 +280,11 @@ pub(super) async fn admit(
     if local.library.files.serving_deadline(local.round).is_none() {
         return unavailable("Serving 许可已失效");
     }
+    if let Err(error) =
+        check_file_pool_scope(&ctx, &serial, route, original.spec().pool, logical).await
+    {
+        return *error;
+    }
     match ctx
         .catalog
         .queue_node_rename_request(route, local.round, &original, max)
@@ -277,6 +297,7 @@ pub(super) async fn admit(
                 route,
                 original.request_epoch(),
                 original.spec().operation,
+                logical,
                 true,
             )
             .await
@@ -296,11 +317,15 @@ pub(super) async fn status(
     if let Err(error) = scope(&request, route) {
         return error;
     }
+    let logical = match pools::logical_scope(request.headers()) {
+        Ok(logical) => logical,
+        Err(error) => return *error,
+    };
     let operation = match identity(epoch, &operation) {
         Ok(value) => value,
         Err(error) => return error,
     };
-    read_status(&ctx, &serial, route, epoch, operation, false).await
+    read_status(&ctx, &serial, route, epoch, operation, logical, false).await
 }
 pub(super) async fn cancel(
     State(ctx): State<Arc<Context>>,
@@ -314,6 +339,10 @@ pub(super) async fn cancel(
     if let Err(error) = scope(&request, route) {
         return error;
     }
+    let logical = match pools::logical_scope(request.headers()) {
+        Ok(logical) => logical,
+        Err(error) => return *error,
+    };
     let operation = match identity(epoch, &operation) {
         Ok(value) => value,
         Err(error) => return error,
@@ -322,12 +351,24 @@ pub(super) async fn cancel(
         Ok(value) => value,
         Err(error) => return error,
     };
+    let pool = match ctx
+        .catalog
+        .node_mutation_task_status(&serial, route, epoch, operation)
+        .await
+    {
+        Ok(Some(task)) => task.task.pool,
+        Ok(None) => return reply(StatusCode::NOT_FOUND, json!({"error":"原节点任务不存在"})),
+        Err(error) => return catalog_error(error),
+    };
+    if let Err(error) = check_file_pool_scope(&ctx, &serial, route, pool, logical).await {
+        return *error;
+    }
     match ctx
         .catalog
         .cancel_node_rename_task(&serial, route, local.round, epoch, operation)
         .await
     {
-        Ok(_) => read_status(&ctx, &serial, route, epoch, operation, false).await,
+        Ok(_) => read_status(&ctx, &serial, route, epoch, operation, logical, false).await,
         Err(error) => catalog_error(error),
     }
 }

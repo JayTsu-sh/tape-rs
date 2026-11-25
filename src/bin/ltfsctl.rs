@@ -47,6 +47,9 @@ enum Cmd {
     },
     /// FDB 服务：查询、校验下载和持久上传
     Fdb {
+        /// 原生文件读取和上传使用的逻辑带库 UUID
+        #[arg(long)]
+        logical_library: Option<uuid::Uuid>,
         #[command(subcommand)]
         cmd: FdbCmd,
     },
@@ -443,11 +446,18 @@ fn main() {
             c = c.with_pool(pool.clone())?;
         }
         match args.cmd {
-            Cmd::Fdb { cmd } => {
+            Cmd::Fdb {
+                logical_library,
+                cmd,
+            } => {
                 use tape_rs::client::fdb::{
                     FdbClient, NodeCondition, PreparedManagement, UploadStatus,
                 };
                 let client = FdbClient::new(args.endpoints.clone())?;
+                let client = match logical_library {
+                    Some(logical) => client.with_logical_library(logical)?,
+                    None => client,
+                };
                 match cmd {
                     FdbCmd::Rename { cmd } => fdb_rename::run(
                         &client,
