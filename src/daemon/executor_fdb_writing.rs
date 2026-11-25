@@ -64,10 +64,11 @@ pub(super) async fn prepare(
             .as_ref()
             .is_some_and(|resources| !resources.drives.contains(&owner.devices[slot.dev].serial))
             || !super::super::management::drive_allowed(
-            &management,
-            &owner.devices[slot.dev].serial,
-            'm',
-        ) {
+                &management,
+                &owner.devices[slot.dev].serial,
+                'm',
+            )
+        {
             continue;
         }
         let raw =

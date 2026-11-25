@@ -122,7 +122,7 @@ impl ManagedCatalog {
                             return Err(CatalogError::Invalid("首次启用逻辑带库须引用当前已完成的原交还"));
                         }
                         management::handoff::require_drained_at(&tr, ns, serial).await?;
-                        for kind in [b'l', b'n', b'r', b'p', b'm', b'c', b'E'] {
+                        for &kind in b"lnrpmcE" {
                             let prefix = at(ns, serial, kind);
                             if !read_page(&tr, &prefix, None, 1, false).await?.items.is_empty() {
                                 return Err(CatalogError::Invalid("物理库已有逻辑带库配置，不能执行首次迁移"));
@@ -173,7 +173,7 @@ impl ManagedCatalog {
                             tr.set(&key, logical.id.as_bytes());
                         }
                         tr.set(&by_name(at(ns, serial, b'n'), &logical.name), logical.id.as_bytes());
-                        for kind in [b'l', b'c'] {
+                        for &kind in b"lc" {
                             tr.set(&by_id(at(ns, serial, kind), logical.id), encoded);
                         }
                         tr.set(&by_id(at(ns, serial, b'v'), logical.id), &1u64.to_be_bytes());
