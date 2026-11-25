@@ -2,6 +2,13 @@ use super::*;
 use crate::managed_catalog::{LibraryHandoff, LibraryHandoffPhase};
 use uuid::Uuid;
 
+#[derive(serde::Deserialize)]
+#[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
+enum Change {
+    Release {},
+    Acquire { release: Uuid },
+}
+
 fn receipt(value: LibraryHandoff) -> Response {
     let status = match value.phase {
         LibraryHandoffPhase::Releasing | LibraryHandoffPhase::Loading => StatusCode::ACCEPTED,
@@ -66,18 +73,14 @@ pub(super) async fn submit(
     let Ok(bytes) = axum::body::to_bytes(body, 1024).await else {
         return invalid("交还或加载请求体过长");
     };
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Change {
-        release: Option<Uuid>,
-    }
     let Ok(change) = serde_json::from_slice::<Change>(&bytes) else {
         return invalid("请求必须是交还或加载 JSON 对象");
     };
-    if change
-        .release
-        .is_some_and(|id| id.is_nil() || id == operation)
-    {
+    let release = match change {
+        Change::Release {} => None,
+        Change::Acquire { release } => Some(release),
+    };
+    if release.is_some_and(|id| id.is_nil() || id == operation) {
         return invalid("加载须引用不同的有效交还回执 ID");
     }
     match ctx
@@ -85,7 +88,7 @@ pub(super) async fn submit(
         .library_handoff(&serial, route, Some(operation))
         .await
     {
-        Ok(Some(value)) if value.release == change.release => {
+        Ok(Some(value)) if value.release == release => {
             if value.phase != LibraryHandoffPhase::Blocked {
                 return receipt(value);
             }
@@ -94,7 +97,7 @@ pub(super) async fn submit(
         Ok(None) => {}
         Err(error) => return catalog_error(error),
     }
-    if let Some(release) = change.release {
+    if let Some(release) = release {
         return match ctx
             .catalog
             .begin_library_reload(&serial, route, operation, release)
@@ -162,5 +165,32 @@ fn catalog_error_domain(error: CatalogError) -> Response {
     match error.domain() {
         CatalogError::Invalid(detail) => invalid(detail),
         _ => catalog_error(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handoff_actions_require_explicit_valid_shapes() {
+        assert!(matches!(
+            serde_json::from_str::<Change>(r#"{"action":"release"}"#),
+            Ok(Change::Release {})
+        ));
+        assert!(matches!(
+            serde_json::from_str::<Change>(
+                r#"{"action":"acquire","release":"11111111-1111-4111-8111-111111111111"}"#
+            ),
+            Ok(Change::Acquire { .. })
+        ));
+        for body in [
+            r#"{}"#,
+            r#"{"release":null}"#,
+            r#"{"action":"acquire"}"#,
+            r#"{"action":"release","release":null}"#,
+        ] {
+            assert!(serde_json::from_str::<Change>(body).is_err(), "{body}");
+        }
     }
 }

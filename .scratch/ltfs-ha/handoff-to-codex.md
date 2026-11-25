@@ -778,3 +778,13 @@ review 未通过：executor_library_handoff::reconcile 在其他节点可能仅�
 软件：880 项 FDB lib 通过，263 忽略；两项交还隔离回归、全功能 check 与 Clippy 通过。隔离 pinned FDB 的 group-only 准入、普通模式兼容、两文件完整 lineage/FORMAT 三项通过。默认并行 HA 在构建并行时有 7 项许可过期失败，单独串行重跑 13 项全过；全套串行日志 `/work/tmp/tape-b-field-fds7_2vg/default-serial.log`。全树 fmt 仍有原差异。独立 Git 索引冻结全范围，Git diff --check 通过。SSH GitHub 和 HTTPS 偶发连接失败，合入前核对远端真实 head 与完整验证结果。
 
 `cargo test -- --test-threads=1` 完整通过，包含 HA、S3、多库和文档测试。复审按仓库规范与用户需求两条线进行，现有工具没有独立子代理。重点核对 PR/机械命令边界、FDB 原意图及代次互斥、SDK/CLI/HTTP 回执、旧路由兼容和回收上线门槛。当前已核对项无新增合入阻断。此段交接晚于现场源码冻结，产品源码及测试与已验收候选一致。
+
+### release/acquire 接口改名
+
+CLI 使用 `library release` 和 `library acquire`，SDK 使用 `release_library` 和 `acquire_library`。HTTP handoff PUT 请求体必须使用 `{"action":"release"}` 或 `{"action":"acquire","release":"<UUID>"}`。按用户要求不保留旧 CLI、SDK 和 HTTP 请求兼容。FDB 内持久化回执结构不变，新旧客户端与服务端须同步更新。
+
+隔离 FDB/Sim 的 SDK、HTTP 交还及外部预留阻塞/取得端到端回归通过，独立 FDB 已停止。CLI 参数和 HTTP 格式边界测试通过，全功能 check 和 Clippy 通过，既有告警与格式差异仍存在。
+
+EL9 候选 `/work/tmp/tape-b-field-zldckprw`，源码清单摘要 `eb41dddd1997135e4f86fbbd95a29e77096c8249d049746eb1b5973e0f2f82a5`，三节点当前程序 `/opt/tape-rs/library-handoff-actions-eb41dddd1997/bin/ltfsd`，摘要 `07854878872ef1ded1c19ca80f16e3f6626e657f6eeb4040fc6a573f029f339d`。服务切换前停止三节点，B 设备提交与完成计数两轮相等且未变化，重启后三节点就绪。实带新 CLI 交还 `114adbc0-1f90-4d24-a816-8696c05c425b` 到 released，取得 `ae827d6b-fa23-4570-908c-a0b10429636d` 到 online，代次 1007537。64 文件清单不变，1 MiB 原文件复读 SHA256 `1084b67ee9743ae18c2523b389fd049a58259c8054e215bd8f665dd337e38e4b`。本次交还前两驱均为空，已载带交还仍以此前候选验收及本次 Sim 回归为准。
+
+`cargo test -- --test-threads=1` 全套通过，日志 `/tmp/tape-release-acquire-test.log`。

@@ -3,13 +3,18 @@ use serde_json::json;
 
 impl FdbClient {
     /// 交还整座带库。保留 operation，使用它查询终态或重送同一请求。
-    pub fn unload_library(&self, library: &str, namespace: Uuid, operation: Uuid) -> Result<Value> {
+    pub fn release_library(
+        &self,
+        library: &str,
+        namespace: Uuid,
+        operation: Uuid,
+    ) -> Result<Value> {
         self.library_handoff_request(library, namespace, operation, Some(None))?
             .ok_or_else(|| ClientError::Verification("交还请求缺少回执".into()))
     }
 
     /// 外部应用停止使用设备后，引用当前交还回执重新加载整座带库。
-    pub fn reload_library(
+    pub fn acquire_library(
         &self,
         library: &str,
         namespace: Uuid,
@@ -44,7 +49,10 @@ impl FdbClient {
         }
         let base = management::base(library)?;
         let path = format!("{base}/library/handoffs/{operation}");
-        let body = change.map(|release| json!({"release":release}).to_string());
+        let body = change.map(|release| match release {
+            None => json!({"action": "release"}).to_string(),
+            Some(release) => json!({"action": "acquire", "release": release}).to_string(),
+        });
         let response = self.retry_request(
             if body.is_some() { "PUT" } else { "GET" },
             &path,

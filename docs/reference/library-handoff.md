@@ -15,7 +15,7 @@ FDB writer 可以按机械手序列号把一座受管带库交给外部应用。
 用明确的库序列号、当前 FDB namespace 和自己生成并保存的操作 UUID。以下示例假定已在环境中设好 `ENDPOINT`、`LIBRARY`、`NAMESPACE`、`RELEASE` 和 `RELOAD`。
 
 ```sh
-ltfsctl -e "$ENDPOINT" -l "$LIBRARY" library unload \
+ltfsctl -e "$ENDPOINT" -l "$LIBRARY" library release \
   --namespace "$NAMESPACE" --operation "$RELEASE"
 ltfsctl -e "$ENDPOINT" -l "$LIBRARY" library handoff-status \
   --namespace "$NAMESPACE" --operation "$RELEASE"
@@ -24,7 +24,7 @@ ltfsctl -e "$ENDPOINT" -l "$LIBRARY" library handoff-status \
 收到 `released` 后，外部应用可以接手。外部应用停止操作并注销其设备注册后，再提交加载并查询原加载回执。
 
 ```sh
-ltfsctl -e "$ENDPOINT" -l "$LIBRARY" library load \
+ltfsctl -e "$ENDPOINT" -l "$LIBRARY" library acquire \
   --namespace "$NAMESPACE" --operation "$RELOAD" --release "$RELEASE"
 ltfsctl -e "$ENDPOINT" -l "$LIBRARY" library handoff-status \
   --namespace "$NAMESPACE" --operation "$RELOAD"
@@ -32,7 +32,7 @@ ltfsctl -e "$ENDPOINT" -l "$LIBRARY" library handoff-status \
 
 ## Rust SDK 和 HTTP
 
-`FdbClient::unload_library`、`reload_library` 和 `library_handoff_status` 使用同一回执。HTTP 使用 `PUT` 提交或重试，用 `GET` 查询。路径为 `/libraries/{serial}/admin/library/handoffs/{operation}`，带 `x-tapers-catalog-namespace` 请求头。交还的 JSON 请求体为 `{"release":null}`，加载为 `{"release":"<交还操作 UUID>"}`。
+`FdbClient::release_library`、`acquire_library` 和 `library_handoff_status` 使用同一回执。HTTP 使用 `PUT` 提交或重试，用 `GET` 查询。路径为 `/libraries/{serial}/admin/library/handoffs/{operation}`，带 `x-tapers-catalog-namespace` 请求头。交还的 JSON 请求体为 `{"action":"release"}`，加载为 `{"action":"acquire","release":"<交还操作 UUID>"}`。
 
 | 回执或响应 | 含义 |
 | --- | --- |

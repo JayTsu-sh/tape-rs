@@ -335,9 +335,9 @@ enum LibraryCmd {
     /// 显式刷新当前库的设备库存
     Rescan(lifecycle::Rescan),
     /// 将整座带库交给外部应用，保留驱动器内的磁带
-    Unload(LibraryHandoffArgs),
+    Release(LibraryHandoffArgs),
     /// 外部应用停止使用后，引用交还回执重新取得整座带库
-    Load {
+    Acquire {
         #[command(flatten)]
         request: LibraryHandoffArgs,
         #[arg(long)]
@@ -994,12 +994,12 @@ fn main() {
                 )?;
             }
             Cmd::Library {
-                cmd: LibraryCmd::Unload(request),
+                cmd: LibraryCmd::Release(request),
             } => {
                 let serial = args.library.as_deref().ok_or("带库交还须指定 --library")?;
                 let client = tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?;
                 let receipt =
-                    client.unload_library(serial, request.namespace, request.operation)?;
+                    client.release_library(serial, request.namespace, request.operation)?;
                 let failed = receipt["phase"] == "failed";
                 print_json(receipt);
                 if failed {
@@ -1007,11 +1007,11 @@ fn main() {
                 }
             }
             Cmd::Library {
-                cmd: LibraryCmd::Load { request, release },
+                cmd: LibraryCmd::Acquire { request, release },
             } => {
                 let serial = args.library.as_deref().ok_or("带库加载须指定 --library")?;
                 let client = tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?;
-                print_json(client.reload_library(
+                print_json(client.acquire_library(
                     serial,
                     request.namespace,
                     request.operation,
@@ -1293,6 +1293,24 @@ fn print_json(value: serde_json::Value) {
 #[cfg(test)]
 mod inventory_cli_tests {
     use super::*;
+
+    #[test]
+    fn library_handoff_uses_release_and_acquire_commands() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        for command in ["release", "acquire", "unload", "load"] {
+            let mut args = vec![
+                "ltfsctl", "-e", "localhost:1", "library", command, "--namespace", id,
+                "--operation", id,
+            ];
+            if matches!(command, "acquire" | "load") {
+                args.extend(["--release", id]);
+            }
+            assert_eq!(
+                Args::try_parse_from(args).is_ok(),
+                matches!(command, "release" | "acquire")
+            );
+        }
+    }
 
     #[test]
     fn control_page_size_is_rejected_during_argument_parsing() {

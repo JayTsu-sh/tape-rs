@@ -236,7 +236,7 @@ fn library_handoff_sdk_preserves_loaded_media_and_never_preempts_external_owner(
         after: 0,
         remaining: 1,
     });
-    let failed = client.unload_library(&serial, ns, Uuid::new_v4()).unwrap();
+    let failed = client.release_library(&serial, ns, Uuid::new_v4()).unwrap();
     assert_eq!(failed["phase"], "failed");
     reservation::verify_holder(changer.as_ref(), ReservationKey::new(2, round)).unwrap();
     reservation::verify_holder(drive.as_ref(), ReservationKey::new(2, round)).unwrap();
@@ -252,7 +252,7 @@ fn library_handoff_sdk_preserves_loaded_media_and_never_preempts_external_owner(
         remaining: 1,
     });
     assert_eq!(
-        client.unload_library(&serial, ns, release).unwrap()["phase"],
+        client.release_library(&serial, ns, release).unwrap()["phase"],
         "releasing"
     );
     wait_event(
@@ -273,7 +273,7 @@ fn library_handoff_sdk_preserves_loaded_media_and_never_preempts_external_owner(
     unknown.release_retry_used = true;
     rt.block_on(catalog.update_library_handoff(route, &original, &unknown))
         .unwrap();
-    let repeated = client.unload_library(&serial, ns, release).unwrap();
+    let repeated = client.release_library(&serial, ns, release).unwrap();
     assert_eq!(repeated["release_retry_used"], true);
     assert_eq!(repeated["detail"], unknown.detail.as_deref().unwrap());
     rt.block_on(catalog.update_library_handoff(route, &unknown, &original))
@@ -336,7 +336,7 @@ fn library_handoff_sdk_preserves_loaded_media_and_never_preempts_external_owner(
         Some(in_flight.clone()),
         "其他节点不能仅凭空预留确认正在执行的交还"
     );
-    let replay = client.unload_library(&serial, ns, release).unwrap();
+    let replay = client.release_library(&serial, ns, release).unwrap();
     assert_eq!(replay["release_retry_used"], true);
     assert!(replay["detail"].is_null());
     assert_eq!(
@@ -469,7 +469,7 @@ fn library_handoff_sdk_preserves_loaded_media_and_never_preempts_external_owner(
     assert_eq!(log.lock().unwrap().len(), command_count);
     let released = wait_phase(&client, &serial, ns, release, "released");
     assert_eq!(
-        client.unload_library(&serial, ns, release).unwrap(),
+        client.release_library(&serial, ns, release).unwrap(),
         released
     );
     assert_eq!(sim.loaded_barcode(0).as_deref(), Some("TEST01L8"));
@@ -494,7 +494,7 @@ fn library_handoff_sdk_preserves_loaded_media_and_never_preempts_external_owner(
     let operation = Uuid::new_v4();
     assert_eq!(
         client
-            .reload_library(&serial, ns, operation, release)
+            .acquire_library(&serial, ns, operation, release)
             .unwrap()["phase"],
         "loading"
     );
@@ -508,7 +508,7 @@ fn library_handoff_sdk_preserves_loaded_media_and_never_preempts_external_owner(
     reservation::release_and_unregister(&external, foreign).unwrap();
     assert_eq!(
         client
-            .reload_library(&serial, ns, operation, release)
+            .acquire_library(&serial, ns, operation, release)
             .unwrap()["phase"],
         "loading"
     );
@@ -531,7 +531,7 @@ fn library_handoff_sdk_preserves_loaded_media_and_never_preempts_external_owner(
     assert_eq!(sim.loaded_barcode(0).as_deref(), Some("TEST01L8"));
     assert!(
         client
-            .reload_library(&serial, ns, Uuid::new_v4(), release)
+            .acquire_library(&serial, ns, Uuid::new_v4(), release)
             .is_err()
     );
 
