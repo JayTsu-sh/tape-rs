@@ -174,6 +174,14 @@ pub(super) async fn require_mechanical_locations(
             }
         });
     }
+    require_resource_claims(tr, keys, expected).await
+}
+
+async fn require_resource_claims(
+    tr: &Transaction,
+    keys: impl IntoIterator<Item = Vec<u8>>,
+    expected: Option<Uuid>,
+) -> Result<()> {
     for key in keys {
         let claim = tr.get(&key, false).await?;
         if claim.as_deref() != expected.as_ref().map(|id| id.as_bytes().as_slice()) {
@@ -183,6 +191,21 @@ pub(super) async fn require_mechanical_locations(
         }
     }
     Ok(())
+}
+
+pub(super) async fn require_automatic_resource_claims(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    pool: Uuid,
+    drive: &str,
+    storage: Option<u16>,
+) -> Result<()> {
+    let expected = pool_library_at(tr, ns, serial, pool).await?;
+    let prefix = at(ns, serial, b'r');
+    let keys = std::iter::once(drive_key(&prefix, drive))
+        .chain(storage.map(|address| slot_key(&prefix, b's', address)));
+    require_resource_claims(tr, keys, expected).await
 }
 
 pub(in crate::managed_catalog) fn pool_binding_key(ns: Uuid, serial: &str, pool: Uuid) -> Vec<u8> {
@@ -474,11 +497,19 @@ impl ManagedCatalog {
                                 return Ok(Creation::Conflict("本物理带库已使用该逻辑带库名称"));
                             }
                             let inventory = Inventory::read(&tr, ns, serial, epoch).await?;
-                            let Some(physical) = inventory.resources else {
+                            let Some(physical) = inventory.resources.as_ref() else {
                                 return Ok(Creation::InventoryUnavailable);
                             };
-                            ensure_subset(&request.resources, &physical)?;
+                            ensure_subset(&request.resources, physical)?;
                             native_device::require_library_available(&tr, ns, serial).await?;
+                            management::require_no_queued_tasks(&tr, ns, serial).await?;
+                            if !resources_idle(&tr, ns, serial, &inventory, &request.resources)
+                                .await?
+                            {
+                                return Ok(Creation::Conflict(
+                                    "待划分资源仍有介质占用或 home 引用",
+                                ));
+                            }
                             let resources: Vec<_> =
                                 resource_keys(&at(ns, serial, b'r'), &request.resources).collect();
                             for batch in resources.chunks(64) {
@@ -630,6 +661,18 @@ fn removed_resources(
     }
 }
 
+async fn resources_idle(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    inventory: &Inventory,
+    resources: &LogicalLibraryResources,
+) -> Result<bool> {
+    Ok(!inventory.has_occupied_resource(resources)
+        && !native_device::has_home_in(tr, ns, serial, &resources.storage_slots).await?
+        && !management::moves::has_home_in(tr, ns, serial, &resources.storage_slots).await?)
+}
+
 impl Inventory {
     fn has_occupied_resource(&self, removed: &LogicalLibraryResources) -> bool {
         let view = self.view(Some(removed));
@@ -761,11 +804,14 @@ impl ManagedCatalog {
                     native_device::require_library_available(&tr, ns, serial).await?;
                     management::require_no_queued_tasks(&tr, ns, serial).await?;
                     let removed = removed_resources(&old.resources, replacement.as_ref().map(|r| &r.resources));
-                    if inventory.has_occupied_resource(&removed)
-                        || native_device::has_home_in(&tr, ns, serial, &removed.storage_slots).await?
-                        || management::moves::has_home_in(&tr, ns, serial, &removed.storage_slots).await?
-                    {
+                    if !resources_idle(&tr, ns, serial, &inventory, &removed).await? {
                         return Ok(Change::Conflict("待释放资源仍有介质占用或 home 引用"));
+                    }
+                    if let Some(replacement) = replacement {
+                        let added = removed_resources(&replacement.resources, Some(&old.resources));
+                        if !resources_idle(&tr, ns, serial, &inventory, &added).await? {
+                            return Ok(Change::Conflict("待加入资源仍有介质占用或 home 引用"));
+                        }
                     }
                 }
 

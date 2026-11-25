@@ -200,8 +200,6 @@ fn original_mechanical_checkpoint_survives_ack_loss_and_takeover_without_duplica
     };
     let lib = SimLibrary::new(1, 3, 2);
     lib.enable_changer_pr();
-    lib.insert_cartridge(SimCartridge::blank("TEST01L8", 1 << 20), 0)
-        .unwrap();
     let root = std::env::temp_dir().join(format!("tapers-move-fault-{ns}"));
     let files = FileService::new(root.join("spool")).unwrap();
     let permission = Arc::new(Permission::default());
@@ -286,6 +284,8 @@ fn original_mechanical_checkpoint_survives_ack_loss_and_takeover_without_duplica
             crate::managed_catalog::LogicalLibraryCreation::Created(_)
         ));
     }
+    lib.insert_cartridge(SimCartridge::blank("TEST01L8", 1 << 20), 0)
+        .unwrap();
     let request = enqueue(&context(), &runtime, "ieslot", logical);
     let rejected = Snapshot::capture(&context())
         .unwrap()

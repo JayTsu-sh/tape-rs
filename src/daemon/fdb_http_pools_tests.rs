@@ -220,7 +220,7 @@ async fn run_pool_api(cluster: &str) {
         ..(*readonly).clone()
     });
     let (b, tb) = serve(owner.clone()).await;
-    logical_library_creation(&catalog, &serial, route, &b, &namespace).await;
+    let logical = logical_library_creation(&catalog, &serial, route, &b, &namespace).await;
     let rescan = json!({"version":1,"library":serial,"namespace":namespace,"epoch":1,"operation":Uuid::new_v4().to_string(),"change":{"kind":"library-rescan"}});
     let rescan_path = format!("{root}/library/rescan");
     assert_eq!(
@@ -406,7 +406,7 @@ async fn run_pool_api(cluster: &str) {
         .0,
         400
     );
-    let movement = json!({"version":1,"library":serial,"namespace":namespace,"epoch":1,"operation":Uuid::new_v4().to_string(),"change":{"kind":"media-move","pool":null,"volume":null,"revision":null,"barcode":"TEST01L8","destination":"ieslot"}});
+    let movement = json!({"version":1,"library":serial,"namespace":namespace,"epoch":1,"operation":Uuid::new_v4().to_string(),"change":{"kind":"media-move","pool":null,"volume":null,"revision":null,"barcode":"TEST01L8","destination":"ieslot","logical_library":logical}});
     let move_path = format!("{root}/tapes/TEST01L8/move");
     assert_eq!(
         request(
@@ -971,7 +971,7 @@ async fn logical_library_creation(
     route: ActiveLibraryRoute,
     address: &str,
     namespace: &str,
-) {
+) -> Uuid {
     let base = format!("/libraries/{serial}/admin/logical-libraries");
     let id = Uuid::new_v4();
     let create = json!({"version":1,"id":id,"name":"archive-a","resources":{"drives":["SIMDRV0000"],
@@ -1011,6 +1011,22 @@ async fn logical_library_creation(
         .0,
         412
     );
+    let mut occupied = observation.clone();
+    occupied["volumes"] = json!([{"barcode":"BUSY01L8","address":101,"element_type":3,
+        "medium_type":1,"source_address":null,"home_slot":null}]);
+    catalog
+        .record_active_library_inventory(serial, route, epoch, &occupied)
+        .await
+        .unwrap();
+    let (status, busy) = request(
+        address,
+        "POST",
+        &base,
+        Some(namespace),
+        create_body.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 409, "{busy}");
     catalog
         .record_active_library_inventory(serial, route, epoch, &observation)
         .await
@@ -1353,6 +1369,27 @@ async fn logical_library_creation(
     let edit = json!({"version":1,"operation":op,"revision":1,"replacement":{
         "name":"renamed-logical-library","resources":{"drives":[],"storage_slots":[1002],"ie_slots":[102]}}});
     let edit_body = edit.to_string();
+    occupied["volumes"][0]["address"] = json!(102);
+    occupied["observed_at"] = json!(crate::ltfs::label::ltfs_time_now());
+    catalog
+        .record_active_library_inventory(serial, route, epoch, &occupied)
+        .await
+        .unwrap();
+    let (status, busy) = request(
+        address,
+        "PATCH",
+        &target,
+        Some(namespace),
+        edit_body.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 409, "{busy}");
+    let mut empty = observation.clone();
+    empty["observed_at"] = json!(crate::ltfs::label::ltfs_time_now());
+    catalog
+        .record_active_library_inventory(serial, route, epoch, &empty)
+        .await
+        .unwrap();
     let (status, changed) = request(
         address,
         "PATCH",
@@ -1499,4 +1536,5 @@ async fn logical_library_creation(
         matches!((creation.0, deletion.0), (201, 409) | (400, 200)),
         "{creation:?} {deletion:?}"
     );
+    id
 }

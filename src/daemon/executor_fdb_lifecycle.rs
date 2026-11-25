@@ -6466,21 +6466,26 @@ mod tests {
             Self::with_drives(1)
         }
         fn with_drives(drives: usize) -> Self {
+            Self::with_media(drives, true)
+        }
+        fn with_media(drives: usize, loaded: bool) -> Self {
             let root =
                 std::env::temp_dir().join(format!("native-lifecycle-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir(&root).unwrap();
             let lib = SimLibrary::new(drives, 3, 1);
             lib.enable_changer_pr();
-            lib.insert_cartridge(SimCartridge::blank("LIFE00L8", 128 << 20), 0)
-                .unwrap();
-            // Exercise MOVE MEDIUM so READ ELEMENT STATUS carries the real
-            // source address; a direct fixture load has no trusted home.
-            let changer_device = lib.changer_as(1);
-            let mut changer = MediumChanger::new(&changer_device);
-            let map = changer.load_address_map().unwrap().clone();
-            changer
-                .move_medium(map.storage_start, map.dt_start)
-                .unwrap();
+            if loaded {
+                lib.insert_cartridge(SimCartridge::blank("LIFE00L8", 128 << 20), 0)
+                    .unwrap();
+                // Exercise MOVE MEDIUM so READ ELEMENT STATUS carries the real
+                // source address; a direct fixture load has no trusted home.
+                let changer_device = lib.changer_as(1);
+                let mut changer = MediumChanger::new(&changer_device);
+                let map = changer.load_address_map().unwrap().clone();
+                changer
+                    .move_medium(map.storage_start, map.dt_start)
+                    .unwrap();
+            }
             let permit = Arc::new(Permission::default());
             permit.renew(7, Phase::Fencing, Instant::now() + Duration::from_secs(60));
             let opts = ExecOptions {
@@ -6505,9 +6510,11 @@ mod tests {
             )
             .unwrap();
             permit.renew(7, Phase::Serving, Instant::now() + Duration::from_secs(60));
-            TapeDrive::new(owner.devices[0].dev.as_ref())
-                .load()
-                .unwrap();
+            if loaded {
+                TapeDrive::new(owner.devices[0].dev.as_ref())
+                    .load()
+                    .unwrap();
+            }
             Self {
                 root,
                 lib,
@@ -7378,7 +7385,10 @@ mod tests {
     #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 逻辑库自动装卸，不访问实际设备"]
     async fn logical_pool_automatic_mechanics_use_its_drive_and_original_home() {
         use crate::logical_library::{CreateLogicalLibrary, LogicalLibraryResources};
-        use crate::managed_catalog::{AutomaticMediaAction, AutomaticMediaPlan, ManagementRequest};
+        use crate::managed_catalog::{
+            ActiveUploadSpec, AutomaticMediaAction, AutomaticMediaPlan, ContentDigest,
+            ManagementRequest,
+        };
         use uuid::Uuid;
 
         let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
@@ -7388,7 +7398,7 @@ mod tests {
         let (mut fixture, control, mut pool, status) = Box::pin(native_fixture_from(
             catalog.clone(),
             None,
-            Fixture::with_drives(2),
+            Fixture::with_media(2, false),
         ))
         .await;
         let epoch = fixture.owner.round;
@@ -7396,22 +7406,9 @@ mod tests {
             ManagementRequest::parse(json!({"version":1,"library":control.serial,
             "namespace":control.route.route.namespace,"epoch":1,"operation":Uuid::new_v4(),"change":change})).unwrap()
         };
-        let moved = request(json!({"kind":"media-move","pool":null,"barcode":"LIFE00L8",
-            "volume":null,"revision":null,"destination":"homeslot"}));
-        assert_eq!(
-            execute(&mut fixture, &control, &status, &moved).await["status"],
-            "succeeded"
-        );
-
-        let (map, rows) = management::elements(&fixture.owner.devices).unwrap();
-        let home = rows
-            .iter()
-            .find(|row| row.volume_tag.as_deref() == Some("LIFE00L8"))
-            .unwrap()
-            .address;
-        let other_slot = (map.storage_start..map.storage_start + map.storage_count)
-            .find(|slot| *slot != home)
-            .unwrap();
+        let (map, _) = management::elements(&fixture.owner.devices).unwrap();
+        let home = map.storage_start;
+        let other_slot = home + 1;
         let mut drives = fixture
             .owner
             .devices
@@ -7465,6 +7462,10 @@ mod tests {
                 crate::managed_catalog::LogicalLibraryCreation::Created(_)
             ));
         }
+        fixture
+            .lib
+            .insert_cartridge(SimCartridge::blank("LIFE00L8", 128 << 20), 0)
+            .unwrap();
         pool.id = Uuid::new_v4();
         pool.name = "logical-test-pool".into();
         catalog
@@ -7474,7 +7475,8 @@ mod tests {
         let volume = Uuid::new_v4();
         let assign = request(
             json!({"kind":"media-assign","pool":pool.id,"barcode":"LIFE00L8",
-            "volume":volume,"confirm_format":true,"force_format":false}),
+            "volume":volume,"confirm_format":true,"force_format":false,
+            "logical_library":logical}),
         );
         let assigned = execute(&mut fixture, &control, &status, &assign).await;
         assert_eq!(assigned["status"], "succeeded", "{assigned}");
@@ -7527,6 +7529,36 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(fixture.owner.devices[selected].serial, drive);
+        let bytes = b"logical library cold read";
+        let file = fixture.root.join("logical-read-fixture");
+        std::fs::write(&file, bytes).unwrap();
+        let intent = Box::pin(fdb_writing::prepare(
+            &fixture.owner,
+            &fixture.permit,
+            &control,
+            &ActiveUploadSpec {
+                pool_id: pool.id,
+                path: b"/cold-read".to_vec(),
+                operation_id: Uuid::new_v4(),
+                expected_version: None,
+                size: bytes.len() as u64,
+                digest: ContentDigest::Sha256(Sha256::digest(bytes).into()),
+            },
+            Some("LIFE00L8"),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            Box::pin(fdb_writing::write_batch(
+                &mut fixture.owner,
+                &fixture.permit,
+                &control,
+                &status,
+                vec![(intent.request(), std::fs::File::open(&file).unwrap())],
+            ))
+            .await,
+            vec![Ok(1)]
+        );
         Box::pin(fdb_loading::unload(
             &mut fixture.owner,
             &fixture.permit,
@@ -7544,6 +7576,28 @@ mod tests {
         assert!(
             rows.iter()
                 .any(|row| row.address == other_slot && !row.full)
+        );
+        let mut body = Box::pin(read_fdb(
+            &mut fixture.owner,
+            Some(&fixture.permit),
+            &control,
+            &status,
+            &format!("/{}/cold-read", pool.id),
+            Some(&pool.id.to_string()),
+        ))
+        .await
+        .unwrap();
+        let mut actual = Vec::new();
+        std::io::Read::read_to_end(&mut body, &mut actual).unwrap();
+        assert_eq!(actual, bytes);
+        let (_, rows) = management::elements(&fixture.owner.devices).unwrap();
+        assert!(rows.iter().any(|row| {
+            row.drive_id.as_deref() == Some(drive.as_str())
+                && row.volume_tag.as_deref() == Some("LIFE00L8")
+        }));
+        assert!(
+            rows.iter()
+                .any(|row| row.drive_id.as_deref() == Some(other_drive.as_str()) && !row.full)
         );
     }
 

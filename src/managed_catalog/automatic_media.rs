@@ -119,24 +119,21 @@ async fn original(
     {
         return Err(CatalogError::OwnerFenced);
     }
-    if let Some(resources) =
-        logical_libraries::pool_resources_at(tr, ns, serial, assignment.pool_id).await?
-    {
-        let plan = &command.plan;
-        let storage = match plan.action {
-            AutomaticMediaAction::Load => None,
-            AutomaticMediaAction::MoveIn => Some(plan.source),
-            AutomaticMediaAction::UnloadMove => Some(plan.destination),
-        };
-        if !resources.drives.contains(&plan.drive_serial)
-            || storage.is_some_and(|address| !resources.storage_slots.contains(&address))
-        {
-            return Err(CatalogError::Invalid(
-                "自动装卸计划超出池所属逻辑带库资源范围",
-            ));
-        }
-    }
-    Ok(())
+    let plan = &command.plan;
+    let storage = match plan.action {
+        AutomaticMediaAction::Load => None,
+        AutomaticMediaAction::MoveIn => Some(plan.source),
+        AutomaticMediaAction::UnloadMove => Some(plan.destination),
+    };
+    logical_libraries::require_automatic_resource_claims(
+        tr,
+        ns,
+        serial,
+        assignment.pool_id,
+        &plan.drive_serial,
+        storage,
+    )
+    .await
 }
 impl ManagedCatalog {
     pub async fn automatic_media_pending(
