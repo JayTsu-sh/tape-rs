@@ -256,6 +256,24 @@ async fn assignment_at(
         )),
     }
 }
+async fn require_move_scope(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    request: &ManagementRequest,
+    plan: &MovePlan,
+) -> Result<()> {
+    logical_libraries::require_mechanical_locations(
+        tr,
+        ns,
+        serial,
+        request,
+        &[&plan.source, &plan.destination],
+        plan.home_address,
+    )
+    .await
+}
+
 async fn save(
     tr: &Transaction,
     request: &ManagementRequest,
@@ -355,6 +373,7 @@ impl ManagedCatalog {
                     return Ok(task);
                 }
                 assignment_at(&tr, ns, serial, request).await?;
+                require_move_scope(&tr, ns, serial, request, plan).await?;
                 native_device::require_library_available(&tr, ns, serial).await?;
                 let home = home_at(&tr, ns, serial, &plan.barcode).await?;
                 if let Some(home) = home {
@@ -403,6 +422,7 @@ impl ManagedCatalog {
                         assignment_at(&tr, ns, serial, request).await?;
                         let mut execution =
                             MoveExecution::parse(task["execution"].clone(), request)?;
+                        require_move_scope(&tr, ns, serial, request, &execution.plan).await?;
                         let valid = next == execution.phase
                             || matches!(
                                 (execution.phase, next),
@@ -421,6 +441,7 @@ impl ManagedCatalog {
                         {
                             return Err(CatalogError::Invalid("搬带阶段不能回退或跳过机械检查点"));
                         }
+                        logical_libraries::note_mechanical_observation_stale(&tr, ns, serial);
                         execution.phase = next;
                         execution.error = None;
                         save(&tr, request, &mut task, &execution).await?;

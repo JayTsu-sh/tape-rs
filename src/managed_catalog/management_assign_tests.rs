@@ -29,11 +29,47 @@ async fn media_assign_journal_pins_format_intent_and_atomic_membership() {
         policy: PoolPolicy::default(),
         revision: 1,
     };
-    c.create_active_pool(&serial, route, owner, &pool)
+    use crate::logical_library::{CreateLogicalLibrary, LogicalLibraryResources};
+    let logical = Uuid::new_v4();
+    let observation = json!({"library_serial":serial,"owner":2,"round":owner,
+        "observed_at": crate::ltfs::label::ltfs_time_now(),"volumes":[],
+        "drives":[{"serial":"SIMDRV0000","address":1,"barcode":null},
+                  {"serial":"SIMDRV0001","address":2,"barcode":null}],
+        "num_of_slots":3,"num_of_ieslots":1,"slot_layout":{"storage_start":1001,"ie_start":101},
+        "scsi_vendor_id":"SIM","scsi_product_id":"SIM-CHANGER","scsi_firmware_revision":"0001"});
+    c.record_active_library_inventory(&serial, route, owner, &observation)
+        .await
+        .unwrap();
+    let other = Uuid::new_v4();
+    for (id, name, drive, slot) in [
+        (logical, "assign-local", "SIMDRV0000", 1001),
+        (other, "assign-other", "SIMDRV0001", 1002),
+    ] {
+        let creation = c
+            .create_logical_library(
+                &serial,
+                route,
+                owner,
+                CreateLogicalLibrary {
+                    version: 1,
+                    id,
+                    name: name.into(),
+                    resources: LogicalLibraryResources {
+                        drives: vec![drive.into()],
+                        storage_slots: vec![slot],
+                        ie_slots: vec![],
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(creation, LogicalLibraryCreation::Created(_)));
+    }
+    c.create_admin_pool(&serial, route, owner, Some(logical), &pool)
         .await
         .unwrap();
     let volume = Uuid::new_v4();
-    let r = ManagementRequest::parse(json!({"version":1,"library":serial,"namespace":ns.to_string(),"epoch":1,"operation":Uuid::new_v4().to_string(),"change":{"kind":"media-assign","pool":pool.id.to_string(),"barcode":"TEST01L8","volume":volume.to_string(),"confirm_format":true,"force_format":false}})).unwrap();
+    let r = ManagementRequest::parse(json!({"version":1,"library":serial,"namespace":ns.to_string(),"epoch":1,"operation":Uuid::new_v4().to_string(),"change":{"kind":"media-assign","pool":pool.id.to_string(),"barcode":"TEST01L8","volume":volume.to_string(),"confirm_format":true,"force_format":false,"logical_library":logical}})).unwrap();
     let p = AssignPlan {
         version: 1,
         barcode: "TEST01L8".into(),
@@ -46,7 +82,7 @@ async fn media_assign_journal_pins_format_intent_and_atomic_membership() {
             ie_start: 101,
             ie_count: 1,
             dt_start: 1,
-            dt_count: 1,
+            dt_count: 2,
         },
         source: MoveLocation {
             address: 1001,
@@ -70,8 +106,57 @@ async fn media_assign_journal_pins_format_intent_and_atomic_membership() {
     bad.source.kind = MoveLocationKind::ImportExport;
     bad.source.address = 101;
     assert!(bad.validate().is_err());
+    let mut unscoped = r.value().clone();
+    unscoped["change"]
+        .as_object_mut()
+        .unwrap()
+        .remove("logical_library");
+    assert!(
+        c.admit_management(
+            &serial,
+            route,
+            owner,
+            &ManagementRequest::parse(unscoped).unwrap()
+        )
+        .await
+        .is_err()
+    );
+    let mut wrong_scope = r.value().clone();
+    wrong_scope["change"]["logical_library"] = json!(other);
+    assert!(
+        c.admit_management(
+            &serial,
+            route,
+            owner,
+            &ManagementRequest::parse(wrong_scope).unwrap()
+        )
+        .await
+        .is_err()
+    );
     let queued = c.admit_management(&serial, route, owner, &r).await.unwrap();
     assert!(queued.as_object().unwrap().contains_key("execution"));
+    let mut other_drive = p.clone();
+    other_drive.drive.address = 2;
+    other_drive.drive.drive_serial = Some("SIMDRV0001".into());
+    assert!(
+        c.prepare_media_assign(&serial, route, owner, &r, &other_drive)
+            .await
+            .is_err()
+    );
+    let mut other_home = p.clone();
+    other_home.source.address = 1002;
+    other_home.home_address = 1002;
+    assert!(
+        c.prepare_media_assign(&serial, route, owner, &r, &other_home)
+            .await
+            .is_err()
+    );
+    assert!(
+        c.active_library_mechanical_task(&serial, route, owner)
+            .await
+            .unwrap()
+            .is_none()
+    );
     let running = c
         .prepare_media_assign(&serial, route, owner, &r, &p)
         .await

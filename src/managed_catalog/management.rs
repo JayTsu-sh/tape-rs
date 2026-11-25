@@ -492,6 +492,12 @@ impl ManagedCatalog {
             if matches!(change["kind"].as_str(), Some("pool" | "pool-delete")) {
                 pools::require_scope(&tr, ns, serial, change).await?;
             }
+            if matches!(change["kind"].as_str(), Some("media-assign" | "media-move"))
+                && (change.get("logical_library").is_some()
+                    || change["pool"].as_str().is_some())
+            {
+                logical_libraries::mechanical_resources_at(&tr, ns, serial, request).await?;
+            }
             let queued=read_page(&tr,&library_prefix(ns,serial,b'q'),None,MAX_QUEUED,false).await?;
             if queued.items.len()>=MAX_QUEUED {return Err(CatalogError::ManagementQueueFull);}
             let mut value=json!({"version":1,"library_serial":serial,"namespace":ns.to_string(),

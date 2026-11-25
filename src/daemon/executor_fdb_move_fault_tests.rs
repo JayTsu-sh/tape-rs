@@ -113,12 +113,13 @@ fn enqueue(
     context: &Context<'_>,
     runtime: &tokio::runtime::Runtime,
     destination: &str,
+    logical: Uuid,
 ) -> ManagementRequest {
     let c = context.control;
     let window = runtime
         .block_on(c.catalog.active_management_window(&c.serial, c.route))
         .unwrap();
-    let request=ManagementRequest::parse(json!({"version":1,"library":c.serial,"namespace":c.route.route.namespace.to_string(),"epoch":window.accepting,"operation":Uuid::new_v4().to_string(),"change":{"kind":"media-move","pool":null,"volume":null,"revision":null,"barcode":"TEST01L8","destination":destination}})).unwrap();
+    let request=ManagementRequest::parse(json!({"version":1,"library":c.serial,"namespace":c.route.route.namespace.to_string(),"epoch":window.accepting,"operation":Uuid::new_v4().to_string(),"change":{"kind":"media-move","pool":null,"volume":null,"revision":null,"barcode":"TEST01L8","destination":destination,"logical_library":logical}})).unwrap();
     runtime
         .block_on(
             c.catalog
@@ -197,7 +198,7 @@ fn original_mechanical_checkpoint_survives_ack_loss_and_takeover_without_duplica
         route,
         storage: Default::default(),
     };
-    let lib = SimLibrary::new(1, 3, 1);
+    let lib = SimLibrary::new(1, 3, 2);
     lib.enable_changer_pr();
     lib.insert_cartridge(SimCartridge::blank("TEST01L8", 1 << 20), 0)
         .unwrap();
@@ -240,7 +241,62 @@ fn original_mechanical_checkpoint_survives_ack_loss_and_takeover_without_duplica
         status: &status,
         node: 2,
     };
-    let request = enqueue(&context(), &runtime, "ieslot");
+    let logical = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    let observed = Snapshot::capture(&context()).unwrap().observation;
+    runtime
+        .block_on(catalog.record_active_library_inventory(&serial, route, round, &observed))
+        .unwrap();
+    for (id, name, storage, ie, drives) in [
+        (
+            logical,
+            "move-local",
+            map.storage_start,
+            map.ie_start + 1,
+            vec!["SIMDRV0000".into()],
+        ),
+        (
+            other,
+            "move-other",
+            map.storage_start + 1,
+            map.ie_start,
+            vec![],
+        ),
+    ] {
+        use crate::logical_library::{CreateLogicalLibrary, LogicalLibraryResources};
+        let result = runtime
+            .block_on(catalog.create_logical_library(
+                &serial,
+                route,
+                round,
+                CreateLogicalLibrary {
+                    version: 1,
+                    id,
+                    name: name.into(),
+                    resources: LogicalLibraryResources {
+                        drives,
+                        storage_slots: vec![storage],
+                        ie_slots: vec![ie],
+                    },
+                },
+            ))
+            .unwrap();
+        assert!(matches!(
+            result,
+            crate::managed_catalog::LogicalLibraryCreation::Created(_)
+        ));
+    }
+    let request = enqueue(&context(), &runtime, "ieslot", logical);
+    let rejected = Snapshot::capture(&context())
+        .unwrap()
+        .plan(&request, None, None)
+        .unwrap();
+    assert_eq!(rejected.destination.address, map.ie_start);
+    assert!(
+        runtime
+            .block_on(catalog.prepare_media_move(&serial, route, round, &request, &rejected))
+            .is_err()
+    );
     let mut job = Job::new(request.clone(), &saved(&context(), &runtime, &request)).unwrap();
     let mut publisher = Publisher::default();
     faults.commands.lock().unwrap().clear();
@@ -292,6 +348,7 @@ fn original_mechanical_checkpoint_survives_ack_loss_and_takeover_without_duplica
     );
     let moved = finish(context(), &runtime, &mut job, &mut publisher);
     assert_eq!(moved["status"], "succeeded");
+    assert_eq!(moved["result"]["to"], map.ie_start + 1);
     assert_eq!(
         faults
             .commands
@@ -327,7 +384,7 @@ fn original_mechanical_checkpoint_survives_ack_loss_and_takeover_without_duplica
         count,
         "原终态重放无CDB"
     );
-    let back = enqueue(&context(), &runtime, "homeslot");
+    let back = enqueue(&context(), &runtime, "homeslot", logical);
     let mut back_job = Job::new(back.clone(), &saved(&context(), &runtime, &back)).unwrap();
     assert_eq!(
         finish(context(), &runtime, &mut back_job, &mut publisher)["status"],
@@ -336,7 +393,7 @@ fn original_mechanical_checkpoint_survives_ack_loss_and_takeover_without_duplica
     // Simulate an ordinary loaded tape, then lose UNLOAD ACK. Source SVALID is
     // learned by the real simulated changer MOVE, not a synthetic task record.
     move_medium(&active.devices, map.storage_start, map.dt_start).unwrap();
-    let home = enqueue(&context(), &runtime, "homeslot");
+    let home = enqueue(&context(), &runtime, "homeslot", logical);
     let mut home_job = Job::new(home.clone(), &saved(&context(), &runtime, &home)).unwrap();
     faults.drop_unload.store(true, Ordering::SeqCst);
     faults.commands.lock().unwrap().clear();
@@ -381,7 +438,7 @@ fn original_mechanical_checkpoint_survives_ack_loss_and_takeover_without_duplica
         route,
         storage: Default::default(),
     };
-    let pending = enqueue(&context(), &runtime, "ieslot");
+    let pending = enqueue(&context(), &runtime, "ieslot", logical);
     let mut pending_job =
         Job::new(pending.clone(), &saved(&context(), &runtime, &pending)).unwrap();
     faults.commands.lock().unwrap().clear();
@@ -406,9 +463,12 @@ fn original_mechanical_checkpoint_survives_ack_loss_and_takeover_without_duplica
         "FDB不可用时准备前不采样或发机械CDB"
     );
     assert_eq!(saved(&context(), &runtime, &pending)["status"], "queued");
+    let resources = runtime
+        .block_on(catalog.active_mechanical_resources(&serial, route, round, &pending))
+        .unwrap();
     let plan = Snapshot::capture(&context())
         .unwrap()
-        .plan(&pending, None)
+        .plan(&pending, None, resources.as_ref())
         .unwrap();
     runtime
         .block_on(catalog.prepare_media_move(&serial, route, round, &pending, &plan))
@@ -481,7 +541,7 @@ fn original_mechanical_checkpoint_survives_ack_loss_and_takeover_without_duplica
     ));
     assert_eq!(saved(&context(), &runtime, &pending), done);
     assert!(faults.commands.lock().unwrap().is_empty());
-    let back = enqueue(&context(), &runtime, "homeslot");
+    let back = enqueue(&context(), &runtime, "homeslot", logical);
     let mut back_job = Job::new(back.clone(), &saved(&context(), &runtime, &back)).unwrap();
     assert_eq!(
         finish(context(), &runtime, &mut back_job, &mut publisher)["status"],
@@ -492,7 +552,7 @@ fn original_mechanical_checkpoint_survives_ack_loss_and_takeover_without_duplica
     // effect in a worker until explicitly released; Access remains zero meanwhile.
     move_medium(&active.devices, map.storage_start, map.dt_start).unwrap();
     wait_ready(active.devices[1].dev.as_ref()).unwrap();
-    let pending_unload = enqueue(&context(), &runtime, "homeslot");
+    let pending_unload = enqueue(&context(), &runtime, "homeslot", logical);
     let mut unloading = Job::new(
         pending_unload.clone(),
         &saved(&context(), &runtime, &pending_unload),
@@ -547,10 +607,14 @@ fn original_mechanical_checkpoint_survives_ack_loss_and_takeover_without_duplica
     // only the phase ACK was lost. It may confirm that exact phase and send once.
     move_medium(&active.devices, map.storage_start, map.dt_start).unwrap();
     wait_ready(active.devices[1].dev.as_ref()).unwrap();
-    let phase_lost = enqueue(&context(), &runtime, "homeslot");
+    let phase_lost = enqueue(&context(), &runtime, "homeslot", logical);
     let plan = Snapshot::capture(&context())
         .unwrap()
-        .plan(&phase_lost, Some(&plan_for_home(&context(), &runtime)))
+        .plan(
+            &phase_lost,
+            Some(&plan_for_home(&context(), &runtime)),
+            None,
+        )
         .unwrap();
     let receipt = runtime
         .block_on(catalog.prepare_media_move(&serial, route, round, &phase_lost, &plan))
@@ -584,7 +648,7 @@ fn original_mechanical_checkpoint_survives_ack_loss_and_takeover_without_duplica
     // Revoke precisely after UNLOAD: the original journal stays running and no
     // MOVE is sent under that old permission. The next fenced owner resumes it.
     move_medium(&active.devices, map.storage_start, map.dt_start).unwrap();
-    let interrupted = enqueue(&context(), &runtime, "homeslot");
+    let interrupted = enqueue(&context(), &runtime, "homeslot", logical);
     let mut interrupted_job = Job::new(
         interrupted.clone(),
         &saved(&context(), &runtime, &interrupted),
@@ -695,10 +759,14 @@ fn original_mechanical_checkpoint_survives_ack_loss_and_takeover_without_duplica
     );
     // A permanent stage error must stop this controller even after somebody
     // repairs the stored fact. No hidden same-round recovery or second CDB scan.
-    let broken = enqueue(&context, &runtime, "ieslot");
+    let broken = enqueue(&context, &runtime, "ieslot", logical);
     let plan = Snapshot::capture(&context)
         .unwrap()
-        .plan(&broken, Some(&plan_for_home(&context, &runtime)))
+        .plan(
+            &broken,
+            Some(&plan_for_home(&context, &runtime)),
+            resources.as_ref(),
+        )
         .unwrap();
     runtime
         .block_on(catalog.prepare_media_move(&serial, route, next, &broken, &plan))

@@ -121,6 +121,70 @@ pub(in crate::managed_catalog) async fn require_library_at(
     Ok(())
 }
 
+pub(super) async fn mechanical_resources_at(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    request: &ManagementRequest,
+) -> Result<Option<LogicalLibraryResources>> {
+    let change = &request.value()["change"];
+    let logical = request.logical_library();
+    if let Some(pool) = change["pool"].as_str() {
+        let pool = Uuid::parse_str(pool).expect("validated pool");
+        if logical.is_some() {
+            require_pool_library(tr, ns, pool, serial).await?;
+        }
+        if pool_library_at(tr, ns, serial, pool).await? != logical {
+            return Err(CatalogError::Invalid("介质请求的池不属于指定逻辑带库范围"));
+        }
+    }
+    let Some(id) = logical else { return Ok(None) };
+    let raw = tr
+        .get(&by_id(at(ns, serial, b'l'), id), false)
+        .await?
+        .ok_or(CatalogError::Invalid("目标逻辑带库不存在"))?;
+    revision_at(tr, ns, serial, id).await?;
+    Ok(Some(decode(id, &raw)?.resources))
+}
+
+pub(super) async fn require_mechanical_locations(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    request: &ManagementRequest,
+    locations: &[&management::moves::MoveLocation],
+    home: Option<u16>,
+) -> Result<()> {
+    use management::moves::MoveLocationKind;
+    mechanical_resources_at(tr, ns, serial, request).await?;
+    let expected = request.logical_library();
+    let prefix = at(ns, serial, b'r');
+    let mut keys = Vec::with_capacity(locations.len() + 1);
+    keys.extend(home.map(|address| slot_key(&prefix, b's', address)));
+    for location in locations {
+        keys.push(match location.kind {
+            MoveLocationKind::Storage => slot_key(&prefix, b's', location.address),
+            MoveLocationKind::ImportExport => slot_key(&prefix, b'i', location.address),
+            MoveLocationKind::Drive => {
+                let drive = location
+                    .drive_serial
+                    .as_deref()
+                    .ok_or(CatalogError::Corrupt("机械计划缺少驱动器序列号"))?;
+                drive_key(&prefix, drive)
+            }
+        });
+    }
+    for key in keys {
+        let claim = tr.get(&key, false).await?;
+        if claim.as_deref() != expected.as_ref().map(|id| id.as_bytes().as_slice()) {
+            return Err(CatalogError::Invalid(
+                "介质位置、驱动器或 home 超出指定逻辑带库范围",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(in crate::managed_catalog) fn pool_binding_key(ns: Uuid, serial: &str, pool: Uuid) -> Vec<u8> {
     by_id(at(ns, serial, b'p'), pool)
 }
@@ -328,6 +392,18 @@ fn ensure_subset(
 }
 
 impl ManagedCatalog {
+    pub(crate) async fn active_mechanical_resources(
+        &self,
+        serial: &str,
+        route: ActiveLibraryRoute,
+        owner: u64,
+        request: &ManagementRequest,
+    ) -> Result<Option<LogicalLibraryResources>> {
+        let tr = self.db.create_trx()?;
+        let ns = routing::require_runtime_active_owner(&tr, serial, route, owner).await?;
+        mechanical_resources_at(&tr, ns, serial, request).await
+    }
+
     pub(crate) async fn active_logical_pool_resources(
         &self,
         serial: &str,
@@ -402,6 +478,7 @@ impl ManagedCatalog {
                                 return Ok(Creation::InventoryUnavailable);
                             };
                             ensure_subset(&request.resources, &physical)?;
+                            native_device::require_library_available(&tr, ns, serial).await?;
                             let resources: Vec<_> =
                                 resource_keys(&at(ns, serial, b'r'), &request.resources).collect();
                             for batch in resources.chunks(64) {

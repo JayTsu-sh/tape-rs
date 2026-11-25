@@ -253,11 +253,20 @@ fn validate_device_change(change: &Value) -> Result<()> {
     };
     if !change.as_object().is_some_and(|v| {
         let group_only = kind == "media-reclaim" && change["mode"] == "group-only";
-        v.len() == fields.len() + usize::from(group_only)
-            && v.keys().all(|k| fields.contains(&k.as_str()) || group_only && k == "mode")
+        let scoped = matches!(kind, "media-move" | "media-assign")
+            && change.get("logical_library").is_some();
+        v.len() == fields.len() + usize::from(group_only) + usize::from(scoped)
+            && v.keys().all(|k| fields.contains(&k.as_str()) || group_only && k == "mode"
+                || scoped && k == "logical_library")
     })
     {
         return Err(invalid("设备管理请求字段无效"));
+    }
+    if change.get("logical_library").is_some() {
+        let id = reading::uuid_field(change, "logical_library", false)?;
+        if change["logical_library"] != id.to_string() {
+            return Err(invalid("逻辑带库 UUID 必须规范化"));
+        }
     }
     if kind == "library-rescan" {
         return Ok(());

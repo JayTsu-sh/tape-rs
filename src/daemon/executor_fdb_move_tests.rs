@@ -44,12 +44,23 @@ fn original_move_plan_rejects_inaccessible_disabled_exceptional_or_occupied_elem
             "ie_start": original.map.ie_start,
         })
     );
-    let plan = original.plan(&r, None).unwrap();
+    let plan = original.plan(&r, None, None).unwrap();
     assert_eq!(plan.source.address, original.map.storage_start);
     assert_eq!(plan.destination.address, original.map.ie_start);
     assert_eq!(plan.home_address, Some(original.map.storage_start));
     assert!(!original.reconcile(&plan).unwrap());
-    let same_home = original.plan(&request("homeslot"), None).unwrap();
+    let without_ie = crate::logical_library::LogicalLibraryResources {
+        storage_slots: vec![original.map.storage_start],
+        ..Default::default()
+    };
+    assert!(
+        original
+            .plan(&r, None, Some(&without_ie))
+            .unwrap_err()
+            .to_string()
+            .contains("没有可访问的空I/E槽")
+    );
+    let same_home = original.plan(&request("homeslot"), None, None).unwrap();
     assert_eq!(same_home.source, same_home.destination);
     assert!(original.reconcile(&same_home).unwrap());
     for address in [
@@ -73,7 +84,7 @@ fn original_move_plan_rejects_inaccessible_disabled_exceptional_or_occupied_elem
                 continue;
             } // no Access bit on transport
             assert!(
-                sample.plan(&r, None).is_err(),
+                sample.plan(&r, None, None).is_err(),
                 "address={address} flag={flag}"
             );
             assert!(
@@ -90,10 +101,10 @@ fn original_move_plan_rejects_inaccessible_disabled_exceptional_or_occupied_elem
     let at_ie = snapshot(&lib);
     assert!(at_ie.reconcile(&plan).unwrap());
     assert!(
-        at_ie.plan(&request("homeslot"), None).is_err(),
+        at_ie.plan(&request("homeslot"), None, None).is_err(),
         "不能从I/E凭空学习home"
     );
-    let back = at_ie.plan(&request("homeslot"), Some(&plan)).unwrap();
+    let back = at_ie.plan(&request("homeslot"), Some(&plan), None).unwrap();
     assert_eq!(back.destination, plan.source);
     let mut changed_map = plan.clone();
     changed_map.map.storage_count += 1;
@@ -106,7 +117,7 @@ fn original_move_plan_rejects_inaccessible_disabled_exceptional_or_occupied_elem
     );
     assert!(
         snapshot(&lib)
-            .plan(&request("homeslot"), Some(&plan))
+            .plan(&request("homeslot"), Some(&plan), None)
             .is_err()
     );
 }
@@ -125,7 +136,7 @@ fn drive_access_and_home_follow_actual_simulated_unload_without_requiring_ltfs()
     let drive = threaded.at(before.map.dt_start).unwrap();
     assert_eq!(drive.accessible, Some(false));
     assert_eq!(drive.source_address, Some(before.map.storage_start));
-    let plan = threaded.plan(&request("homeslot"), None).unwrap();
+    let plan = threaded.plan(&request("homeslot"), None, None).unwrap();
     assert_eq!(plan.source.kind, MoveLocationKind::Drive);
     assert_eq!(plan.source.drive_serial.as_deref(), Some("SIMDRV0000"));
     assert!(!threaded.reconcile(&plan).unwrap());

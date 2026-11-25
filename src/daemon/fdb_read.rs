@@ -729,7 +729,9 @@ impl ActiveMediaReader<'_> {
         spool_dir: &Path,
         managed_cache: Option<&Path>,
     ) -> Result<Option<ActiveMediaRead>> {
-        self.check_device_owner()?;
+        if !matches!(target, ReadTarget::Published(_)) {
+            self.check_device_owner()?;
+        }
         let Some(mut source) = target.resolve(self).await? else {
             return Ok(None);
         };

@@ -626,6 +626,8 @@ enum MechanicalChange {
         volume: String,
         confirm_format: bool,
         force_format: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        logical_library: Option<String>,
     },
     #[serde(rename = "media-move")]
     Move {
@@ -634,6 +636,8 @@ enum MechanicalChange {
         pool: Value,
         volume: Value,
         revision: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        logical_library: Option<String>,
     },
 }
 #[derive(serde::Deserialize, serde::Serialize)]

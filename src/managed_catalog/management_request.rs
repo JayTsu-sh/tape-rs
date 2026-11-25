@@ -78,6 +78,18 @@ fn patch(value: &Value, pool: bool) -> Result<()> {
     Ok(())
 }
 fn validate_change(value: &Value) -> Result<()> {
+    let unscoped;
+    let value = if matches!(value["kind"].as_str(), Some("media-assign" | "media-move"))
+        && value.get("logical_library").is_some()
+    {
+        id(value, "logical_library")?;
+        let mut fields = value.as_object().expect("validated change").clone();
+        fields.remove("logical_library");
+        unscoped = Value::Object(fields);
+        &unscoped
+    } else {
+        value
+    };
     match text(value, "kind")? {
         "tape" => {
             fields(
@@ -294,6 +306,12 @@ impl ManagementRequest {
     pub fn value(&self) -> &Value {
         &self.value
     }
+    pub(super) fn logical_library(&self) -> Option<Uuid> {
+        self.value["change"]["logical_library"]
+            .as_str()
+            .map(|id| Uuid::parse_str(id).expect("validated logical library"))
+    }
+
     pub fn namespace(&self) -> Uuid {
         self.namespace
     }

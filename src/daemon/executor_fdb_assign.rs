@@ -51,6 +51,7 @@ fn plan(
     request: &ManagementRequest,
     revision: u64,
     status: &SharedStatus,
+    resources: Option<&crate::logical_library::LogicalLibraryResources>,
 ) -> Result<AssignPlan> {
     snapshot.robot()?;
     let barcode = request.value()["change"]["barcode"]
@@ -81,12 +82,13 @@ fn plan(
             .filter(|e| e.element_type == ElementType::DataTransfer && !e.full)
             .filter(|e| Snapshot::enabled(e, true).is_ok())
             .filter(|e| {
-                e.drive_id
-                    .as_ref()
-                    .is_some_and(|s| policy::drive_allowed(&view, s, 'm'))
+                e.drive_id.as_ref().is_some_and(|s| {
+                    policy::drive_allowed(&view, s, 'm')
+                        && resources.is_none_or(|r| r.drives.contains(s))
+                })
             })
             .min_by_key(|e| e.address)
-            .ok_or_else(|| refused("没有允许装载的空驱动器"))?
+            .ok_or_else(|| refused("请求范围内没有允许装载的空驱动器"))?
     };
     Snapshot::enabled(drive, source.address != drive.address)?;
     if !drive
@@ -493,11 +495,20 @@ impl Job {
                 }
                 other => return Ok(other.map(|_| false)),
             };
+            let resources = match publish(
+                &context,
+                runtime,
+                c.active_mechanical_resources(serial, route, owner, &self.request),
+            ) {
+                Publication::Confirmed(resources) => resources,
+                other => return Ok(other.map(|_| false)),
+            };
             self.plan = Some(plan(
                 &Snapshot::capture(&context)?,
                 &self.request,
                 policy.revision,
                 context.status,
+                resources.as_ref(),
             )?);
         }
         match publish(&context, runtime, async {

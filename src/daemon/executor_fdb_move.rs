@@ -118,7 +118,12 @@ impl Snapshot {
         }
         Ok(())
     }
-    fn plan(&self, request: &ManagementRequest, home: Option<&MovePlan>) -> Result<MovePlan> {
+    fn plan(
+        &self,
+        request: &ManagementRequest,
+        home: Option<&MovePlan>,
+        resources: Option<&crate::logical_library::LogicalLibraryResources>,
+    ) -> Result<MovePlan> {
         self.robot()?;
         let barcode = request.value()["change"]["barcode"]
             .as_str()
@@ -155,8 +160,9 @@ impl Snapshot {
                 .iter()
                 .filter(|e| e.element_type == ElementType::ImportExport && !e.full)
                 .filter(|e| Self::enabled(e, true).is_ok())
+                .filter(|e| resources.is_none_or(|r| r.ie_slots.contains(&e.address)))
                 .min_by_key(|e| e.address)
-                .ok_or_else(|| refused("没有可访问的空I/E槽"))?,
+                .ok_or_else(|| refused("请求范围内没有可访问的空I/E槽"))?,
             _ => return Err(refused("未知搬带目标")),
         };
         Self::enabled(destination, true)?;
@@ -326,7 +332,17 @@ impl Job {
                 Publication::Confirmed(home) => home,
                 other => return Ok(other.map(|_| false)),
             };
-            match Snapshot::capture(&context).and_then(|s| s.plan(&self.request, home.as_ref())) {
+            let resources = match publish(
+                &context,
+                runtime,
+                catalog.active_mechanical_resources(serial, route, round, &self.request),
+            ) {
+                Publication::Confirmed(resources) => resources,
+                other => return Ok(other.map(|_| false)),
+            };
+            match Snapshot::capture(&context)
+                .and_then(|s| s.plan(&self.request, home.as_ref(), resources.as_ref()))
+            {
                 Ok(plan) => self.plan = Some(plan),
                 Err(error) if ownership_lost(&error) => return Err(error),
                 Err(error) => {
