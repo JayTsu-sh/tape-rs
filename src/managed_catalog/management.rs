@@ -492,9 +492,8 @@ impl ManagedCatalog {
             if matches!(change["kind"].as_str(), Some("pool" | "pool-delete")) {
                 pools::require_scope(&tr, ns, serial, change).await?;
             }
-            if matches!(change["kind"].as_str(), Some("media-assign" | "media-move"))
-                && (change.get("logical_library").is_some()
-                    || change["pool"].as_str().is_some())
+            if matches!(change["kind"].as_str(),
+                Some("media-assign" | "media-move" | "media-unassign" | "media-validate" | "media-online" | "media-import" | "tape" | "media-reclaim"))
             {
                 logical_libraries::mechanical_resources_at(&tr, ns, serial, request).await?;
             }

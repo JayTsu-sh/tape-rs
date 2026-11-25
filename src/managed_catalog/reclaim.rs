@@ -442,6 +442,8 @@ async fn reserve_at_version(
         return Err(CatalogError::Invalid("回收fresh协议无效"));
     }
     let ns = routing::require_runtime_active_owner(tr, serial, route, owner).await?;
+    logical_libraries::require_pool_scope_at(tr, ns, serial, spec.pool, spec.logical_library)
+        .await?;
     // Restore the saved protocol/index before looking at today's scan. A retry
     // cannot upgrade a child0/no-walk v1 or manufacture a new identity for v2.
     if let Some(raw) = tr
@@ -660,6 +662,7 @@ impl ManagedCatalog {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReclaimSpec {
     pool: Uuid,
+    logical_library: Option<Uuid>,
     barcode: String,
     volume: Uuid,
     revision: u64,
@@ -670,6 +673,9 @@ pub struct ReclaimSpec {
 impl ReclaimSpec {
     pub fn pool(&self) -> Uuid {
         self.pool
+    }
+    pub fn logical_library(&self) -> Option<Uuid> {
+        self.logical_library
     }
     pub fn barcode(&self) -> &str {
         &self.barcode
@@ -698,11 +704,12 @@ impl ReclaimSpec {
             "confirm_format",
             "unassign",
         ];
+        let scoped = value.get("logical_library").is_some();
+        let group_only = value.get("mode").is_some();
         if !value.as_object().is_some_and(|fields| {
-            (fields.len() == FIELDS.len()
-                || fields.len() == FIELDS.len() + 1 && value["mode"] == "group-only")
-                && fields.keys().all(|key| FIELDS.contains(&key.as_str()) || key == "mode")
-                && (!fields.contains_key("mode") || value["mode"] == "group-only")
+            fields.len() == FIELDS.len() + usize::from(scoped) + usize::from(group_only)
+                && FIELDS.iter().all(|key| fields.contains_key(*key))
+                && (!group_only || value["mode"] == "group-only")
         }) || value["kind"] != "media-reclaim"
             || value["confirm_format"] != true
             || !value["unassign"].is_boolean()
@@ -731,11 +738,12 @@ impl ReclaimSpec {
             .ok_or(CatalogError::Invalid("回收须固定磁带原策略修订号"))?;
         Ok(Self {
             pool: id("pool")?,
+            logical_library: scoped.then(|| id("logical_library")).transpose()?,
             barcode: barcode.to_owned(),
             volume: id("volume")?,
             revision,
             unassign: value["unassign"].as_bool().expect("validated boolean"),
-            group_only: value.get("mode").is_some(),
+            group_only,
         })
     }
 
@@ -744,6 +752,9 @@ impl ReclaimSpec {
             "volume":self.volume.to_string(),"revision":self.revision,"confirm_format":true,"unassign":self.unassign});
         if self.group_only {
             value["mode"] = json!("group-only");
+        }
+        if let Some(logical) = self.logical_library {
+            value["logical_library"] = json!(logical);
         }
         value
     }

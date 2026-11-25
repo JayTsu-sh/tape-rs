@@ -377,9 +377,27 @@ async fn choose_plan(
         .await
         .map_err(lost)?;
     let home = choose_home(&map, &rows, item, prior_home, assignment.is_none())?;
+    let resources = control
+        .catalog
+        .active_mechanical_resources(&control.serial, control.route, owner.round, task.request())
+        .await
+        .map_err(lost)?;
+    if resources
+        .as_ref()
+        .is_some_and(|r| !r.storage_slots.contains(&home))
+    {
+        return Err(failed("原 home 不属于指定逻辑带库"));
+    }
     plan.source = Some(item.address);
     plan.home = Some(home);
     let source_drive = inv.drives.iter().find(|d| d.addr == item.address);
+    if source_drive.is_some_and(|drive| {
+        resources
+            .as_ref()
+            .is_some_and(|r| !r.drives.contains(&owner.devices[drive.dev].serial))
+    }) {
+        return Err(failed("磁带所在驱动器不属于指定逻辑带库"));
+    }
     if matches!(kind(task), "media-move" | "media-unassign") {
         if let Some(drive) = source_drive {
             if assignment.is_none() {
@@ -442,7 +460,11 @@ async fn choose_plan(
     }
     let mut selected = None;
     for drive in &inv.drives {
-        if !super::super::management::drive_allowed(&policy, &owner.devices[drive.dev].serial, 'g')
+        let serial = &owner.devices[drive.dev].serial;
+        if resources
+            .as_ref()
+            .is_some_and(|r| !r.drives.contains(serial))
+            || !super::super::management::drive_allowed(&policy, serial, 'g')
         {
             continue;
         }
@@ -478,8 +500,8 @@ async fn choose_plan(
             break;
         }
     }
-    let drive = selected
-        .ok_or_else(|| ReadError::Busy("没有兼容且空闲的维护驱动器；不自动淘汰其他介质".into()))?;
+    let drive =
+        selected.ok_or_else(|| ReadError::Busy("请求范围内没有兼容且空闲的维护驱动器".into()))?;
     if drive.loaded.is_none()
         && let Some(pool) = task.pool()
     {
@@ -5319,12 +5341,64 @@ mod tests {
         let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
         let _network = unsafe { foundationdb::boot() };
         let catalog = Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());
-        let (mut fixture, control, pool, status) = Box::pin(native_fixture_from(
+        use crate::logical_library::{CreateLogicalLibrary, LogicalLibraryResources};
+        let (mut fixture, control, mut pool, status) = Box::pin(native_fixture_from(
             catalog.clone(),
             None,
-            Fixture::with_drives(2),
+            Fixture::with_media(2, false),
         ))
         .await;
+        let epoch = fixture.owner.round;
+        let logical = uuid::Uuid::new_v4();
+        let (map, _) = management::elements(&fixture.owner.devices).unwrap();
+        let observation = management::observe_devices(&fixture.owner.devices, 2, epoch).unwrap();
+        catalog
+            .record_active_library_inventory(&control.serial, control.route, epoch, &observation)
+            .await
+            .unwrap();
+        let resources = LogicalLibraryResources {
+            drives: fixture
+                .owner
+                .devices
+                .iter()
+                .filter(|device| device.kind == DeviceKind::Drive)
+                .map(|device| device.serial.clone())
+                .collect(),
+            storage_slots: vec![map.storage_start, map.storage_start + 1],
+            ie_slots: vec![],
+        };
+        catalog
+            .create_logical_library(
+                &control.serial,
+                control.route,
+                epoch,
+                CreateLogicalLibrary {
+                    version: 1,
+                    id: logical,
+                    name: "reclaim-logical".into(),
+                    resources,
+                },
+            )
+            .await
+            .unwrap();
+        pool.id = uuid::Uuid::new_v4();
+        pool.name = "reclaim-logical-pool".into();
+        catalog
+            .create_admin_pool(&control.serial, control.route, epoch, Some(logical), &pool)
+            .await
+            .unwrap();
+        fixture
+            .lib
+            .insert_cartridge(SimCartridge::blank("LIFE00L8", 128 << 20), 0)
+            .unwrap();
+        {
+            let mut changer = MediumChanger::new(changer_device(&fixture.owner).unwrap());
+            changer.load_address_map().unwrap();
+            changer
+                .move_medium(map.storage_start, map.dt_start)
+                .unwrap();
+        }
+        TapeDrive::new(fixture.device()).load().unwrap();
         fixture.format(uuid::Uuid::new_v4());
         let mut volume = LtfsVolume::mount(fixture.device()).unwrap();
         volume
@@ -5332,7 +5406,8 @@ mod tests {
             .unwrap();
         volume.commit().unwrap();
         drop(volume);
-        let request = |change: Value| {
+        let request = |mut change: Value| {
+            change["logical_library"] = json!(logical);
             ManagementRequest::parse(json!({"version":1,"library":control.serial,"namespace":control.route.route.namespace.to_string(),"epoch":1,"operation":uuid::Uuid::new_v4().to_string(),"change":change})).unwrap()
         };
         let home = request(
@@ -5368,7 +5443,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let spec=ReclaimSpec::parse(&json!({"kind":"media-reclaim","pool":pool.id.to_string(),"barcode":source.barcode,"volume":source.volume_id.unwrap().to_string(),"revision":source.revision,"confirm_format":true,"unassign":false})).unwrap();
+        let spec=ReclaimSpec::parse(&json!({"kind":"media-reclaim","pool":pool.id.to_string(),"barcode":source.barcode,"volume":source.volume_id.unwrap().to_string(),"revision":source.revision,"confirm_format":true,"unassign":false,"logical_library":logical})).unwrap();
         let original = request(spec.to_json());
         catalog
             .admit_management(
@@ -7384,11 +7459,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 逻辑库自动装卸，不访问实际设备"]
     async fn logical_pool_automatic_mechanics_use_its_drive_and_original_home() {
+        use crate::daemon::{fdb_http, http::HttpContext, state::Executor};
         use crate::logical_library::{CreateLogicalLibrary, LogicalLibraryResources};
         use crate::managed_catalog::{
             ActiveUploadSpec, AutomaticMediaAction, AutomaticMediaPlan, ContentDigest,
             ManagementRequest,
         };
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        use http_body_util::BodyExt;
+        use hyper_util::rt::TokioIo;
+        use std::{collections::BTreeMap, sync::mpsc};
         use uuid::Uuid;
 
         let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
@@ -7424,6 +7504,7 @@ mod tests {
             .unwrap();
 
         let logical = Uuid::new_v4();
+        let other_logical = Uuid::new_v4();
         for (id, name, resources) in [
             (
                 logical,
@@ -7435,7 +7516,7 @@ mod tests {
                 },
             ),
             (
-                Uuid::new_v4(),
+                other_logical,
                 "other-resources",
                 LogicalLibraryResources {
                     drives: vec![other_drive.clone()],
@@ -7577,19 +7658,122 @@ mod tests {
             rows.iter()
                 .any(|row| row.address == other_slot && !row.full)
         );
-        let mut body = Box::pin(read_fdb(
-            &mut fixture.owner,
-            Some(&fixture.permit),
-            &control,
-            &status,
-            &format!("/{}/cold-read", pool.id),
-            Some(&pool.id.to_string()),
-        ))
-        .await
+        let (tx, rx) = mpsc::channel();
+        let http_context = |node| {
+            let mut view = status.lock().unwrap().clone();
+            view.id = node;
+            view.executor_ready = true;
+            view.catalog_frozen_index = Some(control.route.frozen_index);
+            view.executor = Some(Executor {
+                node: 1,
+                round: epoch,
+                term: 1,
+                fenced: true,
+            });
+            Arc::new(HttpContext {
+                files: fixture.owner.files.clone(),
+                status: Arc::new(std::sync::Mutex::new(view)),
+                exec: std::sync::Mutex::new(tx.clone()),
+                node: std::sync::Mutex::new(mpsc::channel().0),
+                client_addrs: Default::default(),
+                wait_timeout: Duration::from_secs(15),
+            })
+        };
+        let routes = BTreeMap::from([(control.serial.clone(), control.route)]);
+        let owner_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let owner_address = owner_listener.local_addr().unwrap().to_string();
+        let owner_router = fdb_http::owner_router(
+            catalog.clone(),
+            routes.clone(),
+            BTreeMap::from([(control.serial.clone(), http_context(1))]),
+            Default::default(),
+        )
         .unwrap();
-        let mut actual = Vec::new();
-        std::io::Read::read_to_end(&mut body, &mut actual).unwrap();
-        assert_eq!(actual, bytes);
+        let owner_http = tokio::spawn(async move {
+            axum::serve(owner_listener, owner_router).await.unwrap();
+        });
+        let entry_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let entry_address = entry_listener.local_addr().unwrap();
+        let entry_router = fdb_http::owner_router(
+            catalog.clone(),
+            routes,
+            BTreeMap::from([(control.serial.clone(), http_context(2))]),
+            [(1, owner_address)].into(),
+        )
+        .unwrap();
+        let entry_http = tokio::spawn(async move {
+            axum::serve(entry_listener, entry_router).await.unwrap();
+        });
+        let path = format!(
+            "/v1/fdb/files/{}?pool={}&path={}",
+            control.serial,
+            pool.id,
+            URL_SAFE_NO_PAD.encode(b"/cold-read")
+        );
+        let get = |scope: Option<Uuid>| {
+            let path = path.as_str();
+            async move {
+                let stream = tokio::net::TcpStream::connect(entry_address).await.unwrap();
+                let (mut sender, connection) =
+                    hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                        .await
+                        .unwrap();
+                let connection = tokio::spawn(connection);
+                let mut request =
+                    hyper::Request::get(path).header("host", entry_address.to_string());
+                if let Some(scope) = scope {
+                    request = request.header("x-tapers-logical-library", scope.to_string());
+                }
+                let response = sender
+                    .send_request(
+                        request
+                            .body(http_body_util::Empty::<bytes::Bytes>::new())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status().as_u16();
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                connection.abort();
+                (status, body)
+            }
+        };
+        let before = fixture.commands.lock().unwrap().len();
+        for scope in [None, Some(other_logical)] {
+            let (code, response) = get(scope).await;
+            assert_eq!(code, 404, "{response:?}");
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            assert_eq!(fixture.commands.lock().unwrap().len(), before);
+        }
+        let read = async {
+            let pending =
+                tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(10)))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let ExecRequest::Scoped { pool, request, .. } = pending else {
+                panic!("HTTP 读取必须派发有 pool 范围的请求");
+            };
+            let ExecRequest::ReadTo { path, file, reply } = *request else {
+                panic!("HTTP 读取必须派发文件流");
+            };
+            drop(file);
+            let result = Box::pin(read_fdb(
+                &mut fixture.owner,
+                Some(&fixture.permit),
+                &control,
+                &status,
+                &path,
+                Some(&pool),
+            ))
+            .await;
+            reply.send(result).unwrap();
+        };
+        let ((code, body), ()) = tokio::join!(get(Some(logical)), read);
+        assert_eq!(code, 200, "{body:?}");
+        assert_eq!(body.as_ref(), bytes);
+        owner_http.abort();
+        entry_http.abort();
         let (_, rows) = management::elements(&fixture.owner.devices).unwrap();
         assert!(rows.iter().any(|row| {
             row.drive_id.as_deref() == Some(drive.as_str())
@@ -7598,6 +7782,213 @@ mod tests {
         assert!(
             rows.iter()
                 .any(|row| row.drive_id.as_deref() == Some(other_drive.as_str()) && !row.full)
+        );
+        Box::pin(fdb_loading::unload(
+            &mut fixture.owner,
+            &fixture.permit,
+            &control,
+            selected,
+            &['r'],
+        ))
+        .await
+        .unwrap();
+
+        let assignment = catalog
+            .tape_assignment(&control.serial, "LIFE00L8")
+            .await
+            .unwrap()
+            .unwrap();
+        let change = json!({"kind":"media-validate","pool":pool.id,"barcode":"LIFE00L8",
+            "volume":volume,"revision":assignment.revision});
+        for invalid in [None, Some(other_logical)] {
+            let mut change = change.clone();
+            if let Some(id) = invalid {
+                change["logical_library"] = json!(id);
+            }
+            assert!(
+                catalog
+                    .admit_management(&control.serial, control.route, epoch, &request(change))
+                    .await
+                    .is_err()
+            );
+        }
+        let mut scoped = change;
+        scoped["logical_library"] = json!(logical);
+        let validation = request(scoped);
+        catalog
+            .admit_management(&control.serial, control.route, epoch, &validation)
+            .await
+            .unwrap();
+        let task = catalog
+            .start_native_device_task(
+                &control.serial,
+                control.route,
+                epoch,
+                validation.epoch(),
+                validation.operation(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut forbidden = choose_plan(&fixture.owner, &fixture.permit, &control, &task)
+            .await
+            .unwrap();
+        assert_eq!(forbidden.drive_serial.as_deref(), Some(drive.as_str()));
+        forbidden.destination = Some(map.dt_start + 1);
+        forbidden.drive_serial = Some(other_drive.clone());
+        assert!(matches!(
+            catalog
+                .checkpoint_native_device_task(&task, epoch, "ready", "planned", &json!(forbidden), None)
+                .await,
+            Err(error) if matches!(error.domain(), CatalogError::Invalid(_))
+        ));
+        let done = execute(&mut fixture, &control, &status, &validation).await;
+        assert_eq!(done["status"], "succeeded", "{done}");
+
+        let other_volume = Uuid::new_v4();
+        fixture
+            .lib
+            .insert_cartridge(SimCartridge::blank("LIFE01L8", 128 << 20), 1)
+            .unwrap();
+        let other_index = fixture
+            .owner
+            .devices
+            .iter()
+            .position(|device| device.serial == other_drive)
+            .unwrap();
+        {
+            let mut changer = MediumChanger::new(changer_device(&fixture.owner).unwrap());
+            changer.load_address_map().unwrap();
+            changer.move_medium(other_slot, map.dt_start + 1).unwrap();
+            let device = fixture.owner.devices[other_index].dev.as_ref();
+            TapeDrive::new(device).load().unwrap();
+            mkltfs(
+                device,
+                &MkltfsOptions {
+                    volume_id: "LIFE01".into(),
+                    volume_uuid: Some(other_volume),
+                    block_size: fixture.opts.block_size,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            TapeDrive::new(device).unload().unwrap();
+            changer.move_medium(map.dt_start + 1, other_slot).unwrap();
+        }
+        let other_pool = crate::managed_catalog::PoolRecord {
+            id: Uuid::new_v4(),
+            name: "other-logical-test-pool".into(),
+            ..pool
+        };
+        catalog
+            .create_admin_pool(
+                &control.serial,
+                control.route,
+                epoch,
+                Some(other_logical),
+                &other_pool,
+            )
+            .await
+            .unwrap();
+        let change = json!({"kind":"media-import","pool":other_pool.id,"barcode":"LIFE01L8",
+            "volume":other_volume,"path":"/","merge_tapes":true,"logical_library":logical});
+        assert!(
+            catalog
+                .admit_management(
+                    &control.serial,
+                    control.route,
+                    epoch,
+                    &request(change.clone())
+                )
+                .await
+                .is_err()
+        );
+        let mut change = change;
+        change["logical_library"] = json!(other_logical);
+        let import_request = request(change);
+        catalog
+            .admit_management(&control.serial, control.route, epoch, &import_request)
+            .await
+            .unwrap();
+        let intake = catalog
+            .start_native_media(
+                &control.serial,
+                control.route,
+                epoch,
+                import_request.epoch(),
+                import_request.operation(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let wrong = crate::managed_catalog::NativeMediaLoadPlan {
+            source: other_slot,
+            destination: map.dt_start,
+            drive_serial: drive,
+            home: Some(other_slot),
+            eviction: None,
+        };
+        assert!(matches!(
+            catalog.prepare_native_media_load(&intake, epoch, &wrong).await,
+            Err(error) if matches!(error.domain(), CatalogError::Invalid(_))
+        ));
+        let imported = execute(&mut fixture, &control, &status, &import_request).await;
+        assert_eq!(imported["status"], "succeeded", "{imported}");
+        assert_eq!(
+            catalog
+                .volume_placement(other_volume)
+                .await
+                .unwrap()
+                .unwrap()
+                .pool_id,
+            other_pool.id,
+        );
+        assert_eq!(fixture.lib.loaded_barcode(1).as_deref(), Some("LIFE01L8"));
+
+        let source = catalog
+            .tape_assignment(&control.serial, "LIFE00L8")
+            .await
+            .unwrap()
+            .unwrap();
+        let reclaim = request(
+            json!({"kind":"media-reclaim","pool":source.pool_id,"barcode":source.barcode,
+            "volume":source.volume_id,"revision":source.revision,"confirm_format":true,
+            "unassign":false,"logical_library":logical}),
+        );
+        catalog
+            .admit_management(&control.serial, control.route, epoch, &reclaim)
+            .await
+            .unwrap();
+        let parent = catalog
+            .start_reclaim_management(
+                &control.serial,
+                control.route,
+                epoch,
+                reclaim.epoch(),
+                reclaim.operation(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let before_reclaim = fixture.commands.lock().unwrap().len();
+        assert!(matches!(
+            super::super::fdb_reclaim::advance(
+                &mut fixture.owner,
+                &fixture.permit,
+                &control,
+                &status,
+            ).await,
+            Err(ReadError::Busy(reason)) if reason.contains("至少需要两个维护驱动器")
+        ));
+        assert_eq!(fixture.commands.lock().unwrap().len(), before_reclaim);
+        assert!(
+            catalog
+                .reclaim_dependency_snapshot(&parent, epoch)
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .contains("至少需要两个维护驱动器")
         );
     }
 

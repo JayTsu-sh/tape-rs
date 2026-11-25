@@ -9,6 +9,9 @@ use uuid::Uuid;
 
 #[derive(Args)]
 pub struct Command {
+    /// 逻辑带库 UUID
+    #[arg(long)]
+    logical_library: Option<Uuid>,
     /// 要导入的条码；使用 --request 恢复原请求时省略
     barcodes: Vec<String>,
     /// 单盘请求文件或多盘请求目录；省略时在本机状态目录自动保存
@@ -36,6 +39,9 @@ pub fn run(
     pool: Option<&str>,
     command: Command,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if command.logical_library.is_some_and(|id| id.is_nil()) {
+        return Err("逻辑带库 UUID 不能为零".into());
+    }
     if command.barcodes.is_empty() {
         if command.path.is_some() || command.merge_tapes {
             return Err("恢复任务只能使用原请求，不得覆盖 --path 或 --merge-tapes".into());
@@ -47,8 +53,12 @@ pub fn run(
         if request.value()["change"]["kind"] != "media-import" {
             return Err("该文件不是磁带导入请求".into());
         }
-        if library.is_some_and(|s| request.value()["library"] != s) {
-            return Err("所选带库与原请求不符".into());
+        if library.is_some_and(|s| request.value()["library"] != s)
+            || command
+                .logical_library
+                .is_some_and(|id| request.value()["change"]["logical_library"] != json!(id))
+        {
+            return Err("所选物理带库或逻辑带库与原请求不符".into());
         }
         if let Some(pool) = pool
             && request.value()["change"]["pool"] != pool
@@ -84,35 +94,16 @@ pub fn run(
         }
     };
     let selector = pool.ok_or("导入必须指定 --pool 池名称或 UUID")?;
-    let id = Uuid::parse_str(selector).ok();
-    let mut after = None;
-    let mut scope = None;
-    let mut target = None;
-    loop {
-        let page = client.list_pools(&library, 100, after.as_deref())?;
-        let namespace = page["namespace"]
-            .as_str()
-            .ok_or("池清单缺少 namespace")?
-            .parse::<Uuid>()?;
-        if scope.is_some_and(|old| old != namespace) {
-            return Err("查找池期间目录已切换，请重新检查".into());
-        }
-        scope = Some(namespace);
-        for p in page["items"].as_array().ok_or("池清单无效")? {
-            if id.map_or(p["name"] == selector, |id| p["id"] == id.to_string()) {
-                target = Some(p["id"].as_str().ok_or("池缺少 UUID")?.parse::<Uuid>()?);
-            }
-        }
-        if target.is_some() {
-            break;
-        }
-        after = page["next"].as_str().map(str::to_owned);
-        if after.is_none() {
-            break;
-        }
-    }
-    let pool = target.ok_or("指定池不存在")?;
-    let namespace = scope.ok_or("池清单缺少 namespace")?;
+    let context = client.management_context(&library)?;
+    let namespace = context["namespace"]
+        .as_str()
+        .ok_or("池清单缺少 namespace")?;
+    let pool = client.pool_in_scope(&library, namespace, command.logical_library, selector)?;
+    let pool = pool["pool"]["id"]
+        .as_str()
+        .ok_or("池缺少 UUID")?
+        .parse::<Uuid>()?;
+    let namespace = namespace.parse::<Uuid>()?;
     let default_root = || -> Result<PathBuf, Box<dyn std::error::Error>> {
         let base = std::env::var_os("XDG_STATE_HOME")
             .map(PathBuf::from)
@@ -142,11 +133,11 @@ pub fn run(
     }
     let mut prepared = Vec::new();
     for barcode in command.barcodes {
-        let request = client.prepare_control(
-            &library,
-            namespace,
-            json!({"kind":"media-import","pool":pool.to_string(),"barcode":barcode,"volume":null,"path":command.path.as_deref().unwrap_or("/IMPORT"),"merge_tapes":command.merge_tapes}),
-        )?;
+        let mut change = json!({"kind":"media-import","pool":pool,"barcode":barcode,"volume":null,"path":command.path.as_deref().unwrap_or("/IMPORT"),"merge_tapes":command.merge_tapes});
+        if let Some(logical) = command.logical_library {
+            change["logical_library"] = json!(logical);
+        }
+        let request = client.prepare_control(&library, namespace, change)?;
         let path = single.clone().unwrap_or_else(|| {
             directory.join(format!(
                 "{}.json",
@@ -196,6 +187,7 @@ mod tests {
     fn resumption_refuses_path_changes_before_network_or_file_access() {
         for (path, merge_tapes) in [(Some("/elsewhere".into()), false), (None, true)] {
             let command = Command {
+                logical_library: None,
                 barcodes: vec![],
                 request: Some("missing-original.json".into()),
                 path,

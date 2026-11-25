@@ -155,12 +155,14 @@ async fn apply_change(
     tr: &Transaction,
     namespace: Uuid,
     serial: &str,
-    change: &Value,
+    request: &ManagementRequest,
 ) -> Result<Value> {
+    let change = &request.value()["change"];
     validate_admission_change(change)?;
     match text(change, "kind")? {
         "pool-delete" => Err(CatalogError::Invalid("池操作必须由共享池执行器处理")),
         "tape" => {
+            logical_libraries::mechanical_resources_at(tr, namespace, serial, request).await?;
             exclusion::require_available_at(tr, namespace, serial).await?;
             reclaim::require_pool_write_at(tr, namespace, id(change, "pool")?).await?;
             let mut assignment =
@@ -345,14 +347,7 @@ impl ManagedCatalog {
                         let (status, result) = if cancel {
                             ("cancelled", json!({"cancelled":true}))
                         } else {
-                            match apply_change(
-                                &tr,
-                                request.namespace(),
-                                serial,
-                                &request.value()["change"],
-                            )
-                            .await
-                            {
+                            match apply_change(&tr, request.namespace(), serial, &request).await {
                                 Ok(result) => ("succeeded", result),
                                 Err(CatalogError::Invalid(reason)) => {
                                     ("failed", json!({"error":reason}))

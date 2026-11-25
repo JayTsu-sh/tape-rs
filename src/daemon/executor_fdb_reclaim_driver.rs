@@ -259,6 +259,8 @@ fn binding(
     rows: &[ElementStatus],
     assignment: &crate::managed_catalog::TapeAssignment,
     avoid: Option<u16>,
+    drive_allowed: impl Fn(&str) -> bool,
+    resources: Option<&crate::logical_library::LogicalLibraryResources>,
 ) -> Option<ReclaimDriveBinding> {
     let media: Vec<_> = rows
         .iter()
@@ -268,18 +270,28 @@ fn binding(
         return None;
     }
     let media = media[0];
+    let home = if media.element_type == ElementType::Storage {
+        media.address
+    } else {
+        media.source_address?
+    };
+    if resources.is_some_and(|resources| !resources.storage_slots.contains(&home)) {
+        return None;
+    }
     let drive = if media.element_type == ElementType::DataTransfer {
-        (Some(media.address) != avoid).then_some(media)?
+        (Some(media.address) != avoid && media.drive_serial().is_some_and(&drive_allowed))
+            .then_some(media)?
     } else if media.element_type == ElementType::Storage {
         rows.iter().find(|r| {
             r.element_type == ElementType::DataTransfer
                 && !r.full
                 && Some(r.address) != avoid
                 && r.drive_serial().is_some_and(|id| {
-                    owner
-                        .devices
-                        .iter()
-                        .any(|d| d.kind == DeviceKind::Drive && d.serial == id)
+                    drive_allowed(id)
+                        && owner
+                            .devices
+                            .iter()
+                            .any(|d| d.kind == DeviceKind::Drive && d.serial == id)
                 })
         })?
     } else {
@@ -291,11 +303,7 @@ fn binding(
         revision: assignment.revision,
         drive_serial: drive.drive_serial()?.to_owned(),
         address: drive.address,
-        home: if media.element_type == ElementType::Storage {
-            media.address
-        } else {
-            media.source_address?
-        },
+        home,
     })
 }
 async fn layout(
@@ -303,6 +311,7 @@ async fn layout(
     permit: &Permission,
     control: &FdbOwnerControl,
     parent: &ReclaimReservation,
+    resources: Option<&crate::logical_library::LogicalLibraryResources>,
 ) -> std::result::Result<ReclaimLayout, ReadError> {
     if let Some(layout) = control
         .catalog
@@ -320,6 +329,14 @@ async fn layout(
         .map_err(parent_error)?
         .ok_or_else(|| lost("原源归属缺失"))?;
     let management = fdb_loading::policy(owner, control, &[parent.spec().pool()], None).await?;
+    let drive_allowed = |id: &str| {
+        let allowed = super::super::super::management::drive_allowed(&management, id, 'm');
+        allowed
+            && resources.is_none_or(|r| {
+                r.drives.iter().any(|serial| serial == id)
+                    && super::super::super::management::drive_allowed(&management, id, 'g')
+            })
+    };
     let pool = &management["pools"][parent.spec().pool().to_string()];
     let limit = pool["mountlimit"]
         .as_str()
@@ -401,10 +418,24 @@ async fn layout(
                         && r.volume_tag.as_deref() == Some(barcode)
                 })
                 .map(|r| r.address);
-            let Some(src) = binding(owner, &rows, &source, target_loaded) else {
+            let Some(src) = binding(
+                owner,
+                &rows,
+                &source,
+                target_loaded,
+                drive_allowed,
+                resources,
+            ) else {
                 continue;
             };
-            let Some(dst) = binding(owner, &rows, &target, Some(src.address)) else {
+            let Some(dst) = binding(
+                owner,
+                &rows,
+                &target,
+                Some(src.address),
+                drive_allowed,
+                resources,
+            ) else {
                 continue;
             };
             let additional = [&src, &dst]
@@ -421,11 +452,6 @@ async fn layout(
             if limit != 0 && occupied.saturating_add(additional) > limit {
                 continue;
             }
-            if ![&src, &dst].iter().all(|b| {
-                super::super::super::management::drive_allowed(&management, &b.drive_serial, 'm')
-            }) {
-                continue;
-            }
             let drive = device(owner, &src.drive_serial)?;
             match actor(owner, permit, control, drive)?
                 .prepare_layout(parent, src, dst)
@@ -438,7 +464,7 @@ async fn layout(
         after = page["next"].as_str().map(str::to_owned);
         if after.is_none() {
             return Err(ReadError::Busy(
-                "reclaim 等待符合介质/健康/挂载上限策略的同池目的带及两个独立可用驱动器".into(),
+                "reclaim 等待同池目的带及范围内两个符合介质、健康和挂载策略的可用驱动器".into(),
             ));
         }
     }
@@ -1101,6 +1127,28 @@ pub(in crate::daemon::executor) fn advance<'a>(
                     return Ok(true);
                 }
             }
+            let resources = control
+                .catalog
+                .active_logical_pool_resources(
+                    &control.serial,
+                    control.route,
+                    owner.round,
+                    parent.spec().pool(),
+                )
+                .await
+                .map_err(parent_error)?;
+            if resources.as_ref().is_some_and(|r| r.drives.len() < 2)
+                && control
+                    .catalog
+                    .reclaim_layout(parent, owner.round)
+                    .await
+                    .map_err(parent_error)?
+                    .is_none()
+            {
+                return Err(ReadError::Busy(
+                    "逻辑带库至少需要两个维护驱动器才能回收".into(),
+                ));
+            }
             fdb_loading::authority_guard(owner, permit, control).await?;
             let previous_source = owner.fdb_reclaim_source_session.take();
             control
@@ -1133,7 +1181,7 @@ pub(in crate::daemon::executor) fn advance<'a>(
                 }
                 return Ok(true);
             }
-            let layout = layout(owner, permit, control, parent).await?;
+            let layout = layout(owner, permit, control, parent, resources.as_ref()).await?;
             if let Some((_, _, token)) = &previous_dependency {
                 control
                     .catalog

@@ -383,8 +383,47 @@ fn validate_plan(task: &NativeDeviceTask, plan: &Value) -> Result<()> {
     {
         return Err(CatalogError::Invalid("归槽计划必须使用固定 storage 地址"));
     }
+    if matches!(task.kind(), "media-validate" | "media-online")
+        && plan["source"] != plan["home"]
+        && plan["source"] != plan["destination"]
+        || task.kind() == "media-unassign"
+            && plan["drive_serial"].is_null()
+            && plan["source"] != plan["home"]
+    {
+        return Err(CatalogError::Invalid("维护计划的存储源必须是原 home"));
+    }
     Ok(())
 }
+
+async fn require_plan_scope(tr: &Transaction, task: &NativeDeviceTask, plan: &Value) -> Result<()> {
+    use management::moves::{MoveLocation, MoveLocationKind};
+    if !matches!(
+        task.kind(),
+        "media-unassign" | "media-validate" | "media-online"
+    ) {
+        return Ok(());
+    }
+    let on_drive = plan["drive_serial"].as_str().map(|serial| MoveLocation {
+        address: if task.kind() == "media-unassign" {
+            plan["source"].as_u64().expect("validated source") as u16
+        } else {
+            plan["destination"].as_u64().expect("validated destination") as u16
+        },
+        kind: MoveLocationKind::Drive,
+        drive_serial: Some(serial.to_owned()),
+    });
+    let home = plan["home"].as_u64().expect("validated home") as u16;
+    logical_libraries::require_mechanical_locations(
+        tr,
+        task.request.namespace(),
+        task.serial(),
+        &task.request,
+        &on_drive.iter().collect::<Vec<_>>(),
+        Some(home),
+    )
+    .await
+}
+
 fn validate_observation(task: &NativeDeviceTask, value: &Value, phase: &str) -> Result<()> {
     let keys = ["inventory", "diagnostic", "validation"];
     if encoded(value).len() > 32_000
@@ -875,6 +914,18 @@ impl ManagedCatalog {
                             if requests::has_namespace_holds(&tr, ns).await? {
                                 return Err(CatalogError::PoolBusy);
                             }
+                            if matches!(
+                                task.kind(),
+                                "media-unassign" | "media-validate" | "media-online"
+                            ) {
+                                logical_libraries::mechanical_resources_at(
+                                    &tr,
+                                    ns,
+                                    serial,
+                                    &task.request,
+                                )
+                                .await?;
+                            }
                             let assigned = require_assignment(&tr, &task).await?;
                             if task.kind() == "media-unassign" {
                                 require_unreferenced(
@@ -917,6 +968,9 @@ impl ManagedCatalog {
                             let value: Value = serde_json::from_slice(&raw)
                                 .map_err(|_| CatalogError::Corrupt("接任设备检查点 JSON"))?;
                             validate_state(&value, &task)?;
+                            if old_owner != owner && !value["plan"].is_null() {
+                                require_plan_scope(&tr, &task, &value["plan"]).await?;
+                            }
                             if old_owner == 0 || old_owner > owner {
                                 return Err(CatalogError::Corrupt("设备任务旧owner为零"));
                             }
@@ -991,6 +1045,7 @@ impl ManagedCatalog {
                 requests::retry_result(
                     async {
                         let mut value = read_state(&tr, task, owner).await?;
+                        require_plan_scope(&tr, task, plan).await?;
                         if matches!(task.kind(), "media-validate" | "media-online")
                             && next_phase == "verified"
                         {
@@ -1022,6 +1077,13 @@ impl ManagedCatalog {
                             && matches!(next_phase, "load-issued" | "move-issued")
                         {
                             return Err(CatalogError::Invalid("已取消任务不能开始新的设备操作"));
+                        }
+                        if matches!(next_phase, "move-issued" | "load-issued") {
+                            logical_libraries::note_mechanical_observation_stale(
+                                &tr,
+                                task.request.namespace(),
+                                task.serial(),
+                            );
                         }
                         value["phase"] = json!(next_phase);
                         value["plan"] = plan.clone();

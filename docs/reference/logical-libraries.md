@@ -39,7 +39,7 @@ ltfsctl -e HOST:7401 -l LIBRARY pool create --logical-library LOGICAL_UUID archi
 ltfsctl -e HOST:7401 -l LIBRARY pool list --logical-library LOGICAL_UUID --json
 ```
 
-## 搬带和分池
+## 搬带、分池和介质维护
 
 在逻辑带库内执行 `tape move` 或 `tape assign` 时使用 `--logical-library LOGICAL_UUID`。分池须明确指定所属 pool。移动已分池介质时同样指定该 pool。未分池介质可直接指定逻辑带库和条码。
 
@@ -49,5 +49,7 @@ ltfsctl -e HOST:7401 -l LIBRARY tape assign -p archive --logical-library LOGICAL
 ```
 
 HTTP 和 Rust SDK 将 UUID 固定在原管理请求的 `change.logical_library`。设备命令前核对源位置、目标和 home 的归属。没有归属当前逻辑库且可访问的空 I/E 槽或可用驱动器时，任务记录拒绝原因。结果未知时保留原检查点与请求文件。
+
+`tape import`、`validate`、`online`、`offline`、`set`、`unassign` 和 `reclaim` 也使用 `--logical-library LOGICAL_UUID` 及所属 pool。索引导入使用原归位槽。回收在源带和目标带就位前固定两台所属驱动器和各自的归位槽。驱动器不足时，原回收任务保留等待状态和原因。
 
 业务启用和完整的设备、文件入口隔离需要完成后续切换及验收。[逻辑带库 ADR](../adr/0003-logical-library-resource-boundary.md)

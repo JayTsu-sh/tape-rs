@@ -101,6 +101,36 @@ impl ReclaimLayout {
         }
         Ok(())
     }
+    pub(super) async fn require_resource_scope_at(
+        &self,
+        tr: &Transaction,
+        reservation: &ReclaimReservation,
+    ) -> Result<()> {
+        let spec = reservation.spec();
+        let ns = reservation.namespace();
+        let serial = reservation.serial();
+        logical_libraries::require_pool_scope_at(
+            tr,
+            ns,
+            serial,
+            spec.pool(),
+            spec.logical_library(),
+        )
+        .await?;
+        for binding in [&self.source, &self.destination] {
+            logical_libraries::require_automatic_resource_claims(
+                tr,
+                ns,
+                serial,
+                spec.pool(),
+                &binding.drive_serial,
+                Some(binding.home),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     pub(super) fn require_plan(&self, plan: &ReclaimMediaPlan) -> Result<()> {
         self.validate()?;
         let binding = [&self.source, &self.destination]
@@ -272,7 +302,11 @@ impl ManagedCatalog {
         if parent["owner_epoch"] != owner {
             return Err(CatalogError::OwnerFenced);
         }
-        at(&tr, reservation).await
+        let layout = at(&tr, reservation).await?;
+        if let Some(layout) = &layout {
+            layout.require_resource_scope_at(&tr, reservation).await?;
+        }
+        Ok(layout)
     }
     pub async fn prepare_reclaim_layout(
         &self,
@@ -295,6 +329,10 @@ impl ManagedCatalog {
                             if parent["owner_epoch"] != owner {
                                 return Err(CatalogError::OwnerFenced);
                             }
+                            evidence
+                                .layout
+                                .require_resource_scope_at(&tr, reservation)
+                                .await?;
                             if let Some(layout) = at(&tr, reservation).await? {
                                 if layout != evidence.layout {
                                     return Err(CatalogError::Invalid("不能更换原回收驱动布局"));

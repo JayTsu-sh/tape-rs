@@ -324,9 +324,31 @@ async fn scope(
     plan.validate()?;
     let parent = record_at(tr, reservation, owner).await?;
     isolation::require_normal_mutation_at(tr, reservation, owner).await?;
+    let spec = reservation.spec();
     if let Some(layout) = layout::at(tr, reservation).await? {
         layout.require_plan(plan)?;
+    } else if spec.logical_library().is_some() {
+        return Err(CatalogError::Invalid(
+            "逻辑带库回收必须先固定两个驱动器及原 home",
+        ));
     }
+    logical_libraries::require_pool_scope_at(
+        tr,
+        reservation.namespace(),
+        reservation.serial(),
+        spec.pool(),
+        spec.logical_library(),
+    )
+    .await?;
+    logical_libraries::require_automatic_resource_claims(
+        tr,
+        reservation.namespace(),
+        reservation.serial(),
+        spec.pool(),
+        &plan.drive_serial,
+        Some(plan.home),
+    )
+    .await?;
     if parent["owner_epoch"] != owner {
         return Err(CatalogError::OwnerFenced);
     }
@@ -495,6 +517,11 @@ impl ManagedCatalog {
                                 return Ok((command, granted));
                             }
                             scope(&tr, reservation, owner, &proof.plan).await?;
+                            logical_libraries::note_mechanical_observation_stale(
+                                &tr,
+                                reservation.namespace(),
+                                reservation.serial(),
+                            );
                             tr.set(&gate(reservation.namespace(), reservation.serial()), raw);
                             tr.set(&own_key(reservation), raw);
                             Ok((proposed.clone(), true))

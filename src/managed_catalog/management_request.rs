@@ -79,8 +79,18 @@ fn patch(value: &Value, pool: bool) -> Result<()> {
 }
 fn validate_change(value: &Value) -> Result<()> {
     let unscoped;
-    let value = if matches!(value["kind"].as_str(), Some("media-assign" | "media-move"))
-        && value.get("logical_library").is_some()
+    let value = if matches!(
+        value["kind"].as_str(),
+        Some(
+            "media-assign"
+                | "media-move"
+                | "media-unassign"
+                | "media-validate"
+                | "media-online"
+                | "media-import"
+                | "tape"
+        )
+    ) && value.get("logical_library").is_some()
     {
         id(value, "logical_library")?;
         let mut fields = value.as_object().expect("validated change").clone();

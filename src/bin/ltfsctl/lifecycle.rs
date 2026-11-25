@@ -11,6 +11,9 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Args)]
 pub struct Targets {
+    /// 逻辑带库 UUID
+    #[arg(long)]
+    logical_library: Option<Uuid>,
     /// 目标条码；恢复时省略并指定原请求文件
     barcodes: Vec<String>,
     /// 单盘原请求文件，或多盘新请求目录
@@ -21,9 +24,6 @@ pub struct Targets {
 pub struct Assign {
     #[command(flatten)]
     targets: Targets,
-    /// 逻辑带库 UUID
-    #[arg(long)]
-    logical_library: Option<Uuid>,
     /// 确认允许初始化/格式化指定介质
     #[arg(long)]
     yes: bool,
@@ -49,9 +49,6 @@ pub struct Reclaim {
 pub struct Move {
     #[command(flatten)]
     targets: Targets,
-    /// 逻辑带库 UUID
-    #[arg(long)]
-    logical_library: Option<Uuid>,
     /// 目的位置；已分池卷出库前须 offline
     #[arg(short='L',long,value_parser=["homeslot","ieslot"])]
     location: Option<String>,
@@ -79,9 +76,18 @@ pub struct Rescan {
     request: Option<PathBuf>,
 }
 enum Action {
-    Assign { yes: bool, force: bool, logical: Option<Uuid> },
-    Reclaim { yes: bool, unassign: bool, group_only: bool },
-    Move { location: Option<String>, logical: Option<Uuid> },
+    Assign {
+        yes: bool,
+        force: bool,
+    },
+    Reclaim {
+        yes: bool,
+        unassign: bool,
+        group_only: bool,
+    },
+    Move {
+        location: Option<String>,
+    },
     Unassign,
     Validate,
     Online,
@@ -173,10 +179,7 @@ fn run(
     targets: Targets,
     action: Action,
 ) -> Result<()> {
-    let logical = match &action {
-        Action::Assign { logical, .. } | Action::Move { logical, .. } => *logical,
-        _ => None,
-    };
+    let logical = targets.logical_library;
     if logical.is_some_and(|id| id.is_nil()) {
         return Err("逻辑带库 UUID 不能为零".into());
     }
@@ -412,7 +415,6 @@ pub fn assign(
         Action::Assign {
             yes: command.yes,
             force: command.force_format,
-            logical: command.logical_library,
         },
     )
 }
@@ -431,7 +433,6 @@ pub fn move_tape(
         command.targets,
         Action::Move {
             location: command.location,
-            logical: command.logical_library,
         },
     )
 }

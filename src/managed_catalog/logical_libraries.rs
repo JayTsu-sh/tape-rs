@@ -121,6 +121,22 @@ pub(in crate::managed_catalog) async fn require_library_at(
     Ok(())
 }
 
+pub(super) async fn require_pool_scope_at(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    pool: Uuid,
+    logical: Option<Uuid>,
+) -> Result<()> {
+    if logical.is_some() {
+        require_pool_library(tr, ns, pool, serial).await?;
+    }
+    if pool_library_at(tr, ns, serial, pool).await? != logical {
+        return Err(CatalogError::Invalid("介质请求的池不属于指定逻辑带库范围"));
+    }
+    Ok(())
+}
+
 pub(super) async fn mechanical_resources_at(
     tr: &Transaction,
     ns: Uuid,
@@ -131,12 +147,7 @@ pub(super) async fn mechanical_resources_at(
     let logical = request.logical_library();
     if let Some(pool) = change["pool"].as_str() {
         let pool = Uuid::parse_str(pool).expect("validated pool");
-        if logical.is_some() {
-            require_pool_library(tr, ns, pool, serial).await?;
-        }
-        if pool_library_at(tr, ns, serial, pool).await? != logical {
-            return Err(CatalogError::Invalid("介质请求的池不属于指定逻辑带库范围"));
-        }
+        require_pool_scope_at(tr, ns, serial, pool, logical).await?;
     }
     let Some(id) = logical else { return Ok(None) };
     let raw = tr
