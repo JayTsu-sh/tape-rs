@@ -368,6 +368,16 @@ pub(super) async fn read_task_at(
 fn task_entity(epoch: u64, operation: Uuid) -> String {
     format!("task:{epoch}:{operation}")
 }
+pub(super) async fn require_no_queued_tasks(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+) -> Result<()> {
+    if requests::prefix_has_rows(tr, &library_prefix(ns, serial, b'q')).await? {
+        return Err(CatalogError::PoolBusy);
+    }
+    Ok(())
+}
 fn task_event_view(value: &Value) -> Value {
     let change = &value["request"]["change"];
     let pool = if matches!(change["kind"].as_str(), Some("pool" | "pool-delete")) {
@@ -478,6 +488,10 @@ impl ManagedCatalog {
                 return Ok(saved);
             }
             if request.epoch()!=w.accepting {return Err(CatalogError::Invalid("管理请求代次已关闭"));}
+            let change = &request.value()["change"];
+            if matches!(change["kind"].as_str(), Some("pool" | "pool-delete")) {
+                pools::require_scope(&tr, ns, serial, change).await?;
+            }
             let queued=read_page(&tr,&library_prefix(ns,serial,b'q'),None,MAX_QUEUED,false).await?;
             if queued.items.len()>=MAX_QUEUED {return Err(CatalogError::ManagementQueueFull);}
             let mut value=json!({"version":1,"library_serial":serial,"namespace":ns.to_string(),

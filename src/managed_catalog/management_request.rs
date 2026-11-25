@@ -198,7 +198,15 @@ fn validate_change(value: &Value) -> Result<()> {
             }
         }
         "pool" => {
-            fields(value, &["kind", "id", "revision", "patch"])?;
+            if value.get("logical_library").is_some() {
+                fields(
+                    value,
+                    &["kind", "id", "revision", "patch", "logical_library"],
+                )?;
+                id(value, "logical_library")?;
+            } else {
+                fields(value, &["kind", "id", "revision", "patch"])?;
+            }
             id(value, "id")?;
             if number(value, "revision")? == 0 {
                 return Err(CatalogError::Invalid("池修订号不能为零"));
@@ -207,7 +215,12 @@ fn validate_change(value: &Value) -> Result<()> {
             patch(&value["patch"], true)?;
         }
         "pool-delete" => {
-            fields(value, &["kind", "id", "revision"])?;
+            if value.get("logical_library").is_some() {
+                fields(value, &["kind", "id", "revision", "logical_library"])?;
+                id(value, "logical_library")?;
+            } else {
+                fields(value, &["kind", "id", "revision"])?;
+            }
             id(value, "id")?;
             if number(value, "revision")? == 0 {
                 return Err(CatalogError::Invalid("池修订号不能为零"));

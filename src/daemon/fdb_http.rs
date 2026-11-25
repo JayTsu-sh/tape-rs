@@ -416,7 +416,13 @@ fn metadata_router(ctx: Arc<Context>) -> Router {
         )
         .route(
             "/libraries/{serial}/admin/logical-libraries/{selector}",
-            get(logical_libraries::show),
+            get(logical_libraries::show)
+                .patch(logical_libraries::replace)
+                .delete(logical_libraries::delete),
+        )
+        .route(
+            "/libraries/{serial}/admin/logical-libraries/{selector}/changes/{operation}",
+            get(logical_libraries::change_status),
         )
         .route(
             "/libraries/{serial}/admin/pools",
@@ -732,6 +738,24 @@ async fn content(
     let Ok(permit) = owner.requests.clone().try_acquire_owned() else {
         return unavailable("http_busy");
     };
+    let logical = match pools::logical_scope(request.headers()) {
+        Ok(logical) => logical,
+        Err(response) => return *response,
+    };
+    let pool_id = uuid::Uuid::parse_str(&pool).expect("content scope validates UUID");
+    if let Err(error) = ctx
+        .catalog
+        .require_logical_pool_scope(&serial, route, pool_id, logical)
+        .await
+    {
+        return match error.domain() {
+            CatalogError::Invalid(_) => reply(
+                StatusCode::NOT_FOUND,
+                json!({"error":"pool_not_found","detail":"池不属于请求的逻辑带库范围"}),
+            ),
+            _ => catalog_error(error),
+        };
+    }
     let status = library
         .status
         .lock()

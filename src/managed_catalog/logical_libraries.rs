@@ -2,16 +2,24 @@
 
 use super::*;
 use crate::logical_library::{
-    CreateLogicalLibrary, LogicalLibraryResources, MAX_REQUEST_BYTES, MAX_RESOURCES, valid_name,
+    ChangeLogicalLibrary, CreateLogicalLibrary, LogicalLibraryResources, MAX_REQUEST_BYTES,
+    MAX_RESOURCES, valid_name,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 #[derive(Debug)]
 pub(crate) enum Creation {
     Created(Value),
     Replayed(Value),
+    Conflict(&'static str),
+    InventoryUnavailable,
+}
+
+pub(crate) enum Change {
+    Applied(Value),
     Conflict(&'static str),
     InventoryUnavailable,
 }
@@ -83,9 +91,107 @@ fn decode(id: Uuid, raw: &[u8]) -> Result<CreateLogicalLibrary> {
     Ok(record)
 }
 
-fn definition(record: &CreateLogicalLibrary) -> Value {
-    json!({"version":record.version,"id":record.id,"name":record.name,"revision":1,
+fn definition(record: &CreateLogicalLibrary, revision: u64) -> Value {
+    json!({"version":record.version,"id":record.id,"name":record.name,"revision":revision,
         "resources":record.resources})
+}
+
+async fn revision_at(tr: &Transaction, ns: Uuid, serial: &str, id: Uuid) -> Result<u64> {
+    let raw = tr
+        .get(&by_id(at(ns, serial, b'v'), id), false)
+        .await?
+        .ok_or(CatalogError::Corrupt("逻辑带库缺少修订号"))?;
+    if raw.len() != 8 || read_u64(&raw) == 0 {
+        return Err(CatalogError::Corrupt("逻辑带库修订号无效"));
+    }
+    Ok(read_u64(&raw))
+}
+
+pub(in crate::managed_catalog) async fn require_library_at(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    id: Uuid,
+) -> Result<()> {
+    let raw = tr
+        .get(&by_id(at(ns, serial, b'l'), id), false)
+        .await?
+        .ok_or(CatalogError::Invalid("目标逻辑带库不存在"))?;
+    decode(id, &raw)?;
+    Ok(())
+}
+
+pub(in crate::managed_catalog) fn pool_binding_key(ns: Uuid, serial: &str, pool: Uuid) -> Vec<u8> {
+    by_id(at(ns, serial, b'p'), pool)
+}
+
+pub(super) fn pool_create_receipt_key(
+    ns: Uuid,
+    serial: &str,
+    logical: Uuid,
+    pool: Uuid,
+) -> Vec<u8> {
+    by_id(by_id(at(ns, serial, b'P'), logical), pool)
+}
+
+pub(in crate::managed_catalog) fn pool_membership_prefix(
+    ns: Uuid,
+    serial: &str,
+    library: Uuid,
+) -> Vec<u8> {
+    by_id(at(ns, serial, b'm'), library)
+}
+
+pub(in crate::managed_catalog) fn pool_membership_key(
+    ns: Uuid,
+    serial: &str,
+    library: Uuid,
+    pool: Uuid,
+) -> Vec<u8> {
+    by_id(pool_membership_prefix(ns, serial, library), pool)
+}
+
+pub(in crate::managed_catalog) async fn pool_library_at(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    pool: Uuid,
+) -> Result<Option<Uuid>> {
+    let Some(raw) = tr.get(&pool_binding_key(ns, serial, pool), false).await? else {
+        return Ok(None);
+    };
+    let id = uuid_from(&raw)?;
+    let indexed = tr
+        .get(&pool_membership_key(ns, serial, id, pool), false)
+        .await?;
+    if id.is_nil() || !indexed.is_some_and(|value| value.is_empty()) {
+        return Err(CatalogError::Corrupt("池与逻辑带库的归属索引不一致"));
+    }
+    Ok(Some(id))
+}
+
+pub(in crate::managed_catalog) async fn pool_resources_at(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    pool: Uuid,
+) -> Result<Option<LogicalLibraryResources>> {
+    let Some(id) = pool_library_at(tr, ns, serial, pool).await? else {
+        return Ok(None);
+    };
+    let raw = tr
+        .get(&by_id(at(ns, serial, b'l'), id), false)
+        .await?
+        .ok_or(CatalogError::Corrupt("池引用的逻辑带库缺少配置"))?;
+    revision_at(tr, ns, serial, id).await?;
+    Ok(Some(decode(id, &raw)?.resources))
+}
+
+pub(super) fn note_mechanical_observation_stale(tr: &Transaction, ns: Uuid, serial: &str) {
+    tr.set(
+        &at(ns, serial, b't'),
+        crate::ltfs::label::ltfs_time_now().as_bytes(),
+    );
 }
 
 struct Inventory {
@@ -109,6 +215,16 @@ impl Inventory {
             .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
             .ok_or(CatalogError::Corrupt("逻辑带库库存观测时间无效"))?;
         let age = Utc::now().signed_duration_since(timestamp);
+        let changed_after_observation =
+            if let Some(value) = tr.get(&at(ns, serial, b't'), false).await? {
+                let changed = std::str::from_utf8(&value)
+                    .ok()
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                    .ok_or(CatalogError::Corrupt("逻辑带库库存变更时间无效"))?;
+                changed >= timestamp
+            } else {
+                false
+            };
         let fresh = age >= TimeDelta::seconds(-5) && age <= TimeDelta::seconds(90);
         let owner_current = observation["round"].as_u64() == Some(epoch)
             && management::handoff::allows_owner(tr, ns, serial, epoch).await?;
@@ -121,7 +237,7 @@ impl Inventory {
                     .is_some_and(|attempt| attempt >= timestamp)
         });
         let mut resources = None;
-        let status = if !fresh || !owner_current {
+        let status = if !fresh || !owner_current || changed_after_observation {
             "stale"
         } else if recent_failure || observation["slot_layout"].is_null() {
             "incomplete"
@@ -212,6 +328,35 @@ fn ensure_subset(
 }
 
 impl ManagedCatalog {
+    pub(crate) async fn active_logical_pool_resources(
+        &self,
+        serial: &str,
+        route: ActiveLibraryRoute,
+        epoch: u64,
+        pool: Uuid,
+    ) -> Result<Option<LogicalLibraryResources>> {
+        let tr = self.db.create_trx()?;
+        let ns = routing::require_runtime_active_owner(&tr, serial, route, epoch).await?;
+        pool_resources_at(&tr, ns, serial, pool).await
+    }
+
+    pub(crate) async fn require_logical_pool_scope(
+        &self,
+        serial: &str,
+        route: ActiveLibraryRoute,
+        pool: Uuid,
+        logical: Option<Uuid>,
+    ) -> Result<()> {
+        let tr = self.db.create_trx()?;
+        let ns = routing::require_expected_active_namespace(&tr, serial, Some(route)).await?;
+        if pool_library_at(&tr, ns, serial, pool).await? != logical {
+            return Err(CatalogError::Invalid("池不属于请求的逻辑带库范围"));
+        }
+        if let Some(logical) = logical {
+            require_library_at(&tr, ns, serial, logical).await?;
+        }
+        Ok(())
+    }
     pub(crate) async fn create_logical_library(
         &self,
         serial: &str,
@@ -239,7 +384,7 @@ impl ManagedCatalog {
                             if let Some(raw) = tr.get(&receipt, false).await? {
                                 let original = decode(request.id, &raw)?;
                                 return Ok(if original == *request {
-                                    Creation::Replayed(definition(&original))
+                                    Creation::Replayed(definition(&original, 1))
                                 } else {
                                     Creation::Conflict("同一逻辑带库 UUID 已绑定不同的原请求")
                                 });
@@ -276,7 +421,11 @@ impl ManagedCatalog {
                             tr.set(&name, request.id.as_bytes());
                             tr.set(&primary, encoded);
                             tr.set(&receipt, encoded);
-                            Ok(Creation::Created(definition(request)))
+                            tr.set(
+                                &by_id(at(ns, serial, b'v'), request.id),
+                                &1u64.to_be_bytes(),
+                            );
+                            Ok(Creation::Created(definition(request, 1)))
                         }
                         .await,
                     )
@@ -328,8 +477,11 @@ impl ManagedCatalog {
                 return Err(CatalogError::Corrupt("逻辑带库名称索引与主记录不符"));
             }
             let inventory = Inventory::read(&tr, ns, serial, read_u64(&epoch)).await?;
-            return Ok(Some(json!({"logical_library":definition(&record),
-                "inventory":inventory.view(Some(&record.resources))})));
+            let revision = revision_at(&tr, ns, serial, id).await?;
+            return Ok(Some(
+                json!({"logical_library":definition(&record, revision),
+                "inventory":inventory.view(Some(&record.resources))}),
+            ));
         }
 
         let page = read_page(&tr, &prefix, None, MAX_RESOURCES, false).await?;
@@ -362,9 +514,223 @@ impl ManagedCatalog {
             }
             resources
         });
-        Ok(Some(
-            json!({"items": records.iter().map(definition).collect::<Vec<_>>(),
-            "inventory": inventory.view(None), "unallocated_resources": available}),
-        ))
+        let mut items = Vec::with_capacity(records.len());
+        for record in &records {
+            items.push(definition(
+                record,
+                revision_at(&tr, ns, serial, record.id).await?,
+            ));
+        }
+        Ok(Some(json!({"items": items,
+            "inventory": inventory.view(None), "unallocated_resources": available})))
+    }
+}
+
+fn removed_resources(
+    old: &LogicalLibraryResources,
+    next: Option<&LogicalLibraryResources>,
+) -> LogicalLibraryResources {
+    let Some(next) = next else { return old.clone() };
+    LogicalLibraryResources {
+        drives: old
+            .drives
+            .iter()
+            .filter(|id| !next.drives.contains(id))
+            .cloned()
+            .collect(),
+        storage_slots: old
+            .storage_slots
+            .iter()
+            .copied()
+            .filter(|addr| !next.storage_slots.contains(addr))
+            .collect(),
+        ie_slots: old
+            .ie_slots
+            .iter()
+            .copied()
+            .filter(|addr| !next.ie_slots.contains(addr))
+            .collect(),
+    }
+}
+
+impl Inventory {
+    fn has_occupied_resource(&self, removed: &LogicalLibraryResources) -> bool {
+        let view = self.view(Some(removed));
+        view["observation"]["volumes"]
+            .as_array()
+            .is_none_or(|volumes| !volumes.is_empty())
+            || self.observation.as_ref().is_some_and(|current| {
+                current["volumes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|volume| {
+                        volume["source_address"]
+                            .as_u64()
+                            .and_then(|n| u16::try_from(n).ok())
+                            .is_some_and(|source| removed.storage_slots.contains(&source))
+                    })
+            })
+    }
+}
+
+async fn saved_change_at(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    operation: Uuid,
+) -> Result<Option<Value>> {
+    let Some(raw) = tr
+        .get(&by_id(at(ns, serial, b'o'), operation), false)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let result: Value = serde_json::from_slice(&raw)
+        .map_err(|_| CatalogError::Corrupt("逻辑带库变更回执编码无效"))?;
+    if result["operation"] != operation.to_string()
+        || !result["fingerprint"]
+            .as_str()
+            .is_some_and(|v| v.len() == 64)
+        || result["deleted"].as_bool().is_none()
+        || !result["logical_library"].is_object()
+    {
+        return Err(CatalogError::Corrupt("逻辑带库变更回执身份或内容无效"));
+    }
+    Ok(Some(result))
+}
+
+impl ManagedCatalog {
+    pub(crate) async fn logical_library_change_receipt(
+        &self,
+        serial: &str,
+        route: ActiveLibraryRoute,
+        id: Uuid,
+        operation: Uuid,
+    ) -> Result<Option<Value>> {
+        let tr = self.db.create_trx()?;
+        let ns = routing::require_expected_active_namespace(&tr, serial, Some(route)).await?;
+        Ok(saved_change_at(&tr, ns, serial, operation)
+            .await?
+            .filter(|saved| saved["logical_library"]["id"] == id.to_string()))
+    }
+
+    pub(crate) async fn change_logical_library(
+        &self,
+        serial: &str,
+        route: ActiveLibraryRoute,
+        epoch: u64,
+        id: Uuid,
+        request: ChangeLogicalLibrary,
+    ) -> Result<Change> {
+        let revision = request
+            .revision
+            .checked_add(1)
+            .filter(|_| request.revision != 0)
+            .ok_or(CatalogError::Invalid("逻辑带库修订号无效或已耗尽"))?;
+        if id.is_nil() || request.version != 1 || request.operation.is_nil() {
+            return Err(CatalogError::Invalid("逻辑带库变更版本或身份无效"));
+        }
+        let replacement = request
+            .replacement
+            .map(|replacement| {
+                let mut desired = CreateLogicalLibrary {
+                    version: 1,
+                    id,
+                    name: replacement.name,
+                    resources: replacement.resources,
+                };
+                desired.normalize().map_err(CatalogError::Invalid)?;
+                Ok::<_, CatalogError>(desired)
+            })
+            .transpose()?;
+        let fingerprint = format!(
+            "{:x}",
+            Sha256::digest(
+                json!({"id":id,"revision":request.revision,"replacement":replacement}).to_string()
+            )
+        );
+        self.db.run(|tr, _| {
+            let replacement = &replacement;
+            let fingerprint = &fingerprint;
+            async move { requests::retry_result(async {
+                let ns = routing::require_runtime_active_owner(&tr, serial, route, epoch).await?;
+                if let Some(saved) = saved_change_at(&tr, ns, serial, request.operation).await? {
+                    return Ok(if saved["fingerprint"] == *fingerprint {
+                        Change::Applied(saved)
+                    } else {
+                        Change::Conflict("变更操作 UUID 已绑定不同请求")
+                    });
+                }
+                let primary = by_id(at(ns, serial, b'l'), id);
+                let Some(raw) = tr.get(&primary, false).await? else {
+                    return Ok(Change::Conflict("目标逻辑带库不存在"));
+                };
+                let old = decode(id, &raw)?;
+                if revision_at(&tr, ns, serial, id).await? != request.revision {
+                    return Ok(Change::Conflict("逻辑带库修订号已改变"));
+                }
+                if replacement.is_none() && requests::prefix_has_rows(&tr, &pool_membership_prefix(ns, serial, id)).await? {
+                    return Ok(Change::Conflict("逻辑带库仍有 pool，不能删除"));
+                }
+                let result_record = replacement.as_ref().unwrap_or(&old);
+                let deleting = replacement.is_none();
+                let resource_change = deleting || result_record.resources != old.resources;
+                if resource_change {
+                    let inventory = Inventory::read(&tr, ns, serial, epoch).await?;
+                    let Some(physical) = inventory.resources.as_ref() else { return Ok(Change::InventoryUnavailable) };
+                    ensure_subset(&old.resources, physical)?;
+                    ensure_subset(&result_record.resources, physical)?;
+                    native_device::require_library_available(&tr, ns, serial).await?;
+                    management::require_no_queued_tasks(&tr, ns, serial).await?;
+                    let removed = removed_resources(&old.resources, replacement.as_ref().map(|r| &r.resources));
+                    if inventory.has_occupied_resource(&removed)
+                        || native_device::has_home_in(&tr, ns, serial, &removed.storage_slots).await?
+                        || management::moves::has_home_in(&tr, ns, serial, &removed.storage_slots).await?
+                    {
+                        return Ok(Change::Conflict("待释放资源仍有介质占用或 home 引用"));
+                    }
+                }
+
+                let old_name = by_name(at(ns, serial, b'n'), &old.name);
+                let new_name = by_name(at(ns, serial, b'n'), &result_record.name);
+                if tr.get(&old_name, false).await?.as_deref() != Some(id.as_bytes().as_slice()) {
+                    return Err(CatalogError::Corrupt("逻辑带库名称索引与主记录不符"));
+                }
+                if new_name != old_name && tr.get(&new_name, false).await?.is_some() {
+                    return Ok(Change::Conflict("本物理带库已使用该逻辑带库名称"));
+                }
+                let prefix = at(ns, serial, b'r');
+                let old_keys: BTreeSet<_> = resource_keys(&prefix, &old.resources).collect();
+                let new_keys: BTreeSet<_> = replacement.iter().flat_map(|next| resource_keys(&prefix, &next.resources)).collect();
+                for key in old_keys.difference(&new_keys) {
+                    if tr.get(key, false).await?.as_deref() != Some(id.as_bytes().as_slice()) {
+                        return Err(CatalogError::Corrupt("待释放资源的逻辑带库归属不符"));
+                    }
+                }
+                for key in new_keys.difference(&old_keys) {
+                    if tr.get(key, false).await?.is_some() {
+                        return Ok(Change::Conflict("请求的资源已归属其他逻辑带库"));
+                    }
+                }
+                let receipt = json!({"operation":request.operation,"deleted":deleting,
+                    "logical_library":definition(result_record, revision),"fingerprint":fingerprint});
+                let encoded = serde_json::to_vec(result_record).expect("logical library serializes");
+                let receipt_bytes = receipt.to_string();
+                if encoded.len() > MAX_REQUEST_BYTES || receipt_bytes.len() > MAX_REQUEST_BYTES + 1024 {
+                    return Err(CatalogError::Invalid("逻辑带库变更或回执超过大小上限"));
+                }
+                for key in old_keys.difference(&new_keys) { tr.clear(key); }
+                for key in new_keys.difference(&old_keys) { tr.set(key, id.as_bytes()); }
+                if deleting || old_name != new_name { tr.clear(&old_name); }
+                if deleting { tr.clear(&primary); } else {
+                    tr.set(&primary, &encoded);
+                    tr.set(&new_name, id.as_bytes());
+                }
+                tr.set(&by_id(at(ns, serial, b'v'), id), &revision.to_be_bytes());
+                tr.set(&by_id(at(ns, serial, b'o'), request.operation), receipt_bytes.as_bytes());
+                Ok(Change::Applied(receipt))
+            }.await) }
+        }).await?
     }
 }

@@ -119,6 +119,23 @@ async fn original(
     {
         return Err(CatalogError::OwnerFenced);
     }
+    if let Some(resources) =
+        logical_libraries::pool_resources_at(tr, ns, serial, assignment.pool_id).await?
+    {
+        let plan = &command.plan;
+        let storage = match plan.action {
+            AutomaticMediaAction::Load => None,
+            AutomaticMediaAction::MoveIn => Some(plan.source),
+            AutomaticMediaAction::UnloadMove => Some(plan.destination),
+        };
+        if !resources.drives.contains(&plan.drive_serial)
+            || storage.is_some_and(|address| !resources.storage_slots.contains(&address))
+        {
+            return Err(CatalogError::Invalid(
+                "自动装卸计划超出池所属逻辑带库资源范围",
+            ));
+        }
+    }
     Ok(())
 }
 impl ManagedCatalog {
@@ -173,6 +190,7 @@ impl ManagedCatalog {
                             native_device::require_library_available(&tr, ns, serial).await?;
                             tr.set(&gate(ns, serial), &encoded(proposed)?);
                             original(&tr, serial, route, owner, proposed).await?;
+                            logical_libraries::note_mechanical_observation_stale(&tr, ns, serial);
                             Ok((proposed.clone(), true))
                         }
                         .await
@@ -204,6 +222,11 @@ impl ManagedCatalog {
                 requests::retry_result(
                     async {
                         original(&tr, serial, route, owner, command).await?;
+                        logical_libraries::note_mechanical_observation_stale(
+                            &tr,
+                            route.route.namespace,
+                            serial,
+                        );
                         tr.clear(&gate(route.route.namespace, serial));
                         Ok(())
                     }

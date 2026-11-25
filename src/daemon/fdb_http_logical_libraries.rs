@@ -1,8 +1,8 @@
 //! Logical library metadata endpoints in the physical library's admin scope.
 
 use super::*;
-use crate::logical_library::{CreateLogicalLibrary, MAX_REQUEST_BYTES};
-use crate::managed_catalog::LogicalLibraryCreation;
+use crate::logical_library::{ChangeLogicalLibrary, CreateLogicalLibrary, MAX_REQUEST_BYTES};
+use crate::managed_catalog::{LogicalLibraryChange, LogicalLibraryCreation};
 
 fn envelope(mut value: Value, serial: &str, route: ActiveLibraryRoute) -> Value {
     value["version"] = json!(1);
@@ -97,4 +97,97 @@ pub(super) async fn show(
     request: Request,
 ) -> Response {
     view(ctx, serial, Some(&selector), request).await
+}
+
+pub(super) async fn replace(
+    State(ctx): State<Arc<Context>>,
+    Path((serial, target)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    change(ctx, serial, target, request, false).await
+}
+
+pub(super) async fn delete(
+    State(ctx): State<Arc<Context>>,
+    Path((serial, target)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    change(ctx, serial, target, request, true).await
+}
+
+async fn change(
+    ctx: Arc<Context>,
+    serial: String,
+    target: String,
+    request: Request,
+    deleting: bool,
+) -> Response {
+    let (_permit, route) = match queries::scoped(&ctx, &serial, &request, &[]) {
+        Ok(value) => value,
+        Err(error) => return *error,
+    };
+    let id = match pools::canonical_id(&target) {
+        Ok(value) => value,
+        Err(error) => return *error,
+    };
+    let (owner, request) = match pools::writer(&ctx, &serial, route, request).await {
+        Ok(value) => value,
+        Err(error) => return *error,
+    };
+    let input =
+        match pools::body_with_limit::<ChangeLogicalLibrary>(request, MAX_REQUEST_BYTES).await {
+            Ok(value) if value.replacement.is_none() == deleting => value,
+            Ok(_) => return invalid("变更内容与 HTTP 操作不符"),
+            Err(error) => return *error,
+        };
+    match pools::permitted(
+        &owner,
+        route,
+        ctx.catalog
+            .change_logical_library(&serial, route, owner.round, id, input),
+    )
+    .await
+    {
+        Ok(LogicalLibraryChange::Applied(receipt)) => {
+            reply(StatusCode::OK, envelope(receipt, &serial, route))
+        }
+        Ok(LogicalLibraryChange::Conflict(detail)) => reply(
+            StatusCode::CONFLICT,
+            json!({"error":"logical_library_conflict","detail":detail}),
+        ),
+        Ok(LogicalLibraryChange::InventoryUnavailable) => reply(
+            StatusCode::PRECONDITION_FAILED,
+            json!({"error":"inventory_unavailable","detail":"变更资源前须核对本轮完整库存"}),
+        ),
+        Err(error) => *error,
+    }
+}
+
+pub(super) async fn change_status(
+    State(ctx): State<Arc<Context>>,
+    Path((serial, target, operation)): Path<(String, String, String)>,
+    request: Request,
+) -> Response {
+    let (_permit, route) = match queries::scoped(&ctx, &serial, &request, &[]) {
+        Ok(value) => value,
+        Err(error) => return *error,
+    };
+    let (id, operation) = match pools::canonical_id(&target)
+        .and_then(|id| pools::canonical_id(&operation).map(|operation| (id, operation)))
+    {
+        Ok(value) => value,
+        Err(error) => return *error,
+    };
+    match ctx
+        .catalog
+        .logical_library_change_receipt(&serial, route, id, operation)
+        .await
+    {
+        Ok(Some(receipt)) => reply(StatusCode::OK, envelope(receipt, &serial, route)),
+        Ok(None) => reply(
+            StatusCode::NOT_FOUND,
+            json!({"error":"logical_library_change_not_found"}),
+        ),
+        Err(error) => pools::failure(error),
+    }
 }

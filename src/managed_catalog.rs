@@ -100,7 +100,6 @@ mod staged_import;
 mod staged_sources;
 pub use body_layouts::{PhysicalPlanProvenance, PlanExtents, VerifiedPhysicalPlan};
 pub use cleanup::PurgeProgress;
-pub(crate) use control::LogicalLibraryCreation;
 pub use control::{
     ActivePoolCreation, AssignExecution, AssignPhase, AssignPlan, AutomaticMediaAction,
     AutomaticMediaCommand, AutomaticMediaPlan, ControlOutcome, ManagementRequest, MoveExecution,
@@ -139,6 +138,7 @@ pub use control::{
     ReclaimSourceInventory, ReclaimSourceNode, ReclaimSourceNodeKind, ReclaimSourceProgress,
     ReclaimSourceRead, ReclaimSpec, ReclaimWalk, TapeAssignment, VolumePlacement,
 };
+pub(crate) use control::{LogicalLibraryChange, LogicalLibraryCreation};
 pub use cutover::{
     FrozenSnapshotIdentity, VerifiedNodeExport, inspect_frozen_snapshot, verify_node_export,
 };

@@ -1,5 +1,8 @@
 //! Prepare metadata changes before the first mutation. Task result, notification,
 //! and pool indexes commit together; device work belongs to another actor.
+use super::super::logical_libraries::{
+    pool_binding_key, pool_library_at, pool_membership_key, require_library_at,
+};
 use super::*;
 
 enum Mutation {
@@ -13,6 +16,26 @@ struct PreparedChange {
 fn pool_id(change: &Value) -> Uuid {
     Uuid::parse_str(change["id"].as_str().expect("validated pool UUID"))
         .expect("validated pool UUID")
+}
+
+pub(super) async fn require_scope(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    change: &Value,
+) -> Result<Option<Uuid>> {
+    let id = pool_id(change);
+    let logical = change["logical_library"]
+        .as_str()
+        .map(|raw| Uuid::parse_str(raw).expect("validated logical library UUID"));
+    if pool_library_at(tr, ns, serial, id).await? != logical {
+        return Err(CatalogError::Invalid("池不属于请求的逻辑带库范围"));
+    }
+    if let Some(logical) = logical {
+        require_library_at(tr, ns, serial, logical).await?;
+        require_pool_library(tr, ns, id, serial).await?;
+    }
+    Ok(logical)
 }
 fn next_revision(change: &Value) -> Result<u64> {
     change["revision"]
@@ -53,6 +76,7 @@ async fn prepare(
     change: &Value,
 ) -> Result<PreparedChange> {
     let id = pool_id(change);
+    let logical = require_scope(tr, ns, serial, change).await?;
     if change["kind"] == "pool-delete" {
         native_device::require_library_available(tr, ns, serial).await?;
         require_pool_writable_at(tr, ns, id).await?;
@@ -107,15 +131,22 @@ async fn prepare(
         }
         let retirement = encode_pool_retirement(revision)?.to_vec();
         pool.revision = revision;
+        let mut mutations = vec![
+            Mutation::Delete(pool_key(ns, id)),
+            Mutation::Delete(pool_name_key(ns, &pool.name)),
+            Mutation::Delete(child_key(ns, Uuid::nil(), id.to_string().as_bytes())),
+            Mutation::Delete(node_key(ns, root)),
+            Mutation::Put(retired_pool_key(ns, id), retirement),
+        ];
+        if let Some(logical) = logical {
+            mutations.push(Mutation::Delete(pool_binding_key(ns, serial, id)));
+            mutations.push(Mutation::Delete(pool_membership_key(
+                ns, serial, logical, id,
+            )));
+        }
         return Ok(PreparedChange {
             result: json!({"pool":pool.to_json()?,"deleted":true}),
-            mutations: vec![
-                Mutation::Delete(pool_key(ns, id)),
-                Mutation::Delete(pool_name_key(ns, &pool.name)),
-                Mutation::Delete(child_key(ns, Uuid::nil(), id.to_string().as_bytes())),
-                Mutation::Delete(node_key(ns, root)),
-                Mutation::Put(retired_pool_key(ns, id), retirement),
-            ],
+            mutations,
         });
     }
     let old_name = pool.name.clone();

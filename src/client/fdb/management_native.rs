@@ -81,6 +81,7 @@ impl PreparedManagement {
             version: 1,
             library: self.library().into(),
             namespace: self.namespace().into(),
+            logical_library: None,
             input: ManagementIntent::Native {
                 change: self.value["change"].clone(),
             },

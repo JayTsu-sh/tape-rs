@@ -132,12 +132,52 @@ pub(super) async fn require_gate(
     }
     Ok(task)
 }
-fn home_key(ns: Uuid, serial: &str, barcode: &str) -> Vec<u8> {
+fn home_prefix(ns: Uuid, serial: &str) -> Vec<u8> {
     let mut key = prefix(ns, b'H');
     append_component(&mut key, serial.as_bytes());
+    key
+}
+fn home_key(ns: Uuid, serial: &str, barcode: &str) -> Vec<u8> {
+    let mut key = home_prefix(ns, serial);
     append_component(&mut key, barcode.as_bytes());
     key
 }
+
+pub(in crate::managed_catalog::control) async fn has_home_in(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    slots: &[u16],
+) -> Result<bool> {
+    if slots.is_empty() {
+        return Ok(false);
+    }
+    let prefix = home_prefix(ns, serial);
+    let mut after = None;
+    loop {
+        let page = read_page(tr, &prefix, after.as_deref(), 100, false).await?;
+        for (_, raw) in page.items {
+            if raw.len() > 1024 {
+                return Err(CatalogError::Corrupt("搬带 home 记录过大"));
+            }
+            let value: Value = serde_json::from_slice(&raw)
+                .map_err(|_| CatalogError::Corrupt("搬带 home 记录编码无效"))?;
+            let address = value["address"]
+                .as_u64()
+                .and_then(|n| u16::try_from(n).ok())
+                .filter(|_| value["version"] == 1)
+                .ok_or(CatalogError::Corrupt("搬带 home 记录版本或地址无效"))?;
+            if slots.contains(&address) {
+                return Ok(true);
+            }
+        }
+        after = page.next;
+        if after.is_none() {
+            return Ok(false);
+        }
+    }
+}
+
 async fn home_at(
     tr: &Transaction,
     ns: Uuid,

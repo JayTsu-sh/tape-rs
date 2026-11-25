@@ -25,6 +25,22 @@ pub struct CreateLogicalLibrary {
     pub resources: LogicalLibraryResources,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplaceLogicalLibrary {
+    pub name: String,
+    pub resources: LogicalLibraryResources,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangeLogicalLibrary {
+    pub version: u8,
+    pub operation: Uuid,
+    pub revision: u64,
+    pub replacement: Option<ReplaceLogicalLibrary>,
+}
+
 pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 255

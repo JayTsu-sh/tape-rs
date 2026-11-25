@@ -14,4 +14,29 @@ ltfsctl -e HOST:7401 -l LIBRARY logical-library show archive-a --namespace NAMES
 
 HTTP 使用 `/libraries/{serial}/admin/logical-libraries` 的 `GET` 和 `POST`。详情使用 `GET /libraries/{serial}/admin/logical-libraries/{selector}`，选择器为名称或 UUID。所有请求携带 `x-tapers-catalog-namespace`。`POST` 的 JSON 包含 `version`、`id`、`name` 和 `resources`，资源对象包含 `drives`、`storage_slots` 和 `ie_slots` 三个数组。首次成功返回 201，重试成功返回 200。Rust 客户端提供 `FdbClient::create_logical_library`、`list_logical_libraries` 和 `logical_library`。
 
-本阶段提供资源登记。pool 归属、业务设备隔离和维护窗口启用将在后续交付。[逻辑带库 ADR](../adr/0003-logical-library-resource-boundary.md)
+## 修改、删除及查询回执
+
+用 `logical-library show` 查询当前修订号。`set` 接受完整的目标名称和资源清单。`delete` 要求逻辑库没有 pool，并在完整库存中证实待释放资源为空且没有未结清的动作或 home 引用。保存原操作 UUID 和参数，结果未定时查询原回执。
+
+```sh
+ltfsctl -e HOST:7401 -l LIBRARY logical-library set LOGICAL_UUID \
+  --namespace NAMESPACE_UUID --revision 1 --operation OPERATION_UUID \
+  --name archive-b --drive DRIVE_SERIAL --storage-slot 1001 --ie-slot 101
+ltfsctl -e HOST:7401 -l LIBRARY logical-library delete LOGICAL_UUID \
+  --namespace NAMESPACE_UUID --revision 2 --operation DELETE_UUID
+ltfsctl -e HOST:7401 -l LIBRARY logical-library change-status LOGICAL_UUID \
+  --namespace NAMESPACE_UUID --operation DELETE_UUID
+```
+
+HTTP `PATCH` 和 `DELETE` 使用逻辑库 UUID。请求包含 `version`、`operation`、`revision` 和 `replacement`，其中 `replacement` 是 `name` 和 `resources` 对象，删除时为 `null`。回执地址为 `GET /libraries/{serial}/admin/logical-libraries/{id}/changes/{operation}`，删除后仍可按原 UUID 查询。
+
+## 在逻辑带库下管理 pool
+
+`ltfsctl pool create/list/show/set/delete` 使用 `--logical-library LOGICAL_UUID`。HTTP 的 `/libraries/{serial}/admin/pools` 及池详情使用 `x-tapers-logical-library` 请求头，修改和删除还在原 `change.logical_library` 中固定同一 UUID。池分页游标只对原物理库、namespace 和逻辑带库有效。创建会一起提交 pool、逻辑带库归属和原创建回执。
+
+```sh
+ltfsctl -e HOST:7401 -l LIBRARY pool create --logical-library LOGICAL_UUID archive
+ltfsctl -e HOST:7401 -l LIBRARY pool list --logical-library LOGICAL_UUID --json
+```
+
+业务启用和完整的设备、文件入口隔离需要完成后续切换及验收。[逻辑带库 ADR](../adr/0003-logical-library-resource-boundary.md)

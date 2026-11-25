@@ -112,11 +112,51 @@ pub(super) fn clear_import_gate_at(tr: &Transaction, import: &NativeMediaImport)
         request.value()["library"].as_str().expect("library"),
     ));
 }
-fn home_key(ns: Uuid, serial: &str, barcode: &str) -> Vec<u8> {
+fn home_prefix(ns: Uuid, serial: &str) -> Vec<u8> {
     let mut out = domain(ns, b'h');
     append_component(&mut out, serial.as_bytes());
+    out
+}
+fn home_key(ns: Uuid, serial: &str, barcode: &str) -> Vec<u8> {
+    let mut out = home_prefix(ns, serial);
     append_component(&mut out, barcode.as_bytes());
     out
+}
+pub(super) async fn has_home_in(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    slots: &[u16],
+) -> Result<bool> {
+    if slots.is_empty() {
+        return Ok(false);
+    }
+    let prefix = home_prefix(ns, serial);
+    let mut after = None;
+    loop {
+        let page = read_page(tr, &prefix, after.as_deref(), 100, false).await?;
+        for (_, raw) in page.items {
+            let value: Value = serde_json::from_slice(&raw)
+                .map_err(|_| CatalogError::Corrupt("持久 home 编码"))?;
+            if value["library"] != serial
+                || value["namespace"] != ns.to_string()
+                || value["version"] != 1
+            {
+                return Err(CatalogError::Corrupt("持久 home 作用域无效"));
+            }
+            let address = value["home"]
+                .as_u64()
+                .and_then(|v| u16::try_from(v).ok())
+                .ok_or(CatalogError::Corrupt("持久 home 地址无效"))?;
+            if slots.contains(&address) {
+                return Ok(true);
+            }
+        }
+        after = page.next;
+        if after.is_none() {
+            return Ok(false);
+        }
+    }
 }
 pub(super) fn clear_home_at(tr: &Transaction, ns: Uuid, serial: &str, barcode: &str) {
     tr.clear(&home_key(ns, serial, barcode));

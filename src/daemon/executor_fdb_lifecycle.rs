@@ -7375,6 +7375,179 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 逻辑库自动装卸，不访问实际设备"]
+    async fn logical_pool_automatic_mechanics_use_its_drive_and_original_home() {
+        use crate::logical_library::{CreateLogicalLibrary, LogicalLibraryResources};
+        use crate::managed_catalog::{AutomaticMediaAction, AutomaticMediaPlan, ManagementRequest};
+        use uuid::Uuid;
+
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        let (mut fixture, control, mut pool, status) = Box::pin(native_fixture_from(
+            catalog.clone(),
+            None,
+            Fixture::with_drives(2),
+        ))
+        .await;
+        let epoch = fixture.owner.round;
+        let request = |change| {
+            ManagementRequest::parse(json!({"version":1,"library":control.serial,
+            "namespace":control.route.route.namespace,"epoch":1,"operation":Uuid::new_v4(),"change":change})).unwrap()
+        };
+        let moved = request(json!({"kind":"media-move","pool":null,"barcode":"LIFE00L8",
+            "volume":null,"revision":null,"destination":"homeslot"}));
+        assert_eq!(
+            execute(&mut fixture, &control, &status, &moved).await["status"],
+            "succeeded"
+        );
+
+        let (map, rows) = management::elements(&fixture.owner.devices).unwrap();
+        let home = rows
+            .iter()
+            .find(|row| row.volume_tag.as_deref() == Some("LIFE00L8"))
+            .unwrap()
+            .address;
+        let other_slot = (map.storage_start..map.storage_start + map.storage_count)
+            .find(|slot| *slot != home)
+            .unwrap();
+        let mut drives = fixture
+            .owner
+            .devices
+            .iter()
+            .filter(|device| device.kind == DeviceKind::Drive)
+            .map(|device| device.serial.clone());
+        let drive = drives.next().unwrap();
+        let other_drive = drives.next().unwrap();
+        let observation = management::observe_devices(&fixture.owner.devices, 2, epoch).unwrap();
+        catalog
+            .record_active_library_inventory(&control.serial, control.route, epoch, &observation)
+            .await
+            .unwrap();
+
+        let logical = Uuid::new_v4();
+        for (id, name, resources) in [
+            (
+                logical,
+                "assigned-resources",
+                LogicalLibraryResources {
+                    drives: vec![drive.clone()],
+                    storage_slots: vec![home],
+                    ie_slots: vec![],
+                },
+            ),
+            (
+                Uuid::new_v4(),
+                "other-resources",
+                LogicalLibraryResources {
+                    drives: vec![other_drive.clone()],
+                    storage_slots: vec![other_slot],
+                    ie_slots: vec![],
+                },
+            ),
+        ] {
+            assert!(matches!(
+                catalog
+                    .create_logical_library(
+                        &control.serial,
+                        control.route,
+                        epoch,
+                        CreateLogicalLibrary {
+                            version: 1,
+                            id,
+                            name: name.into(),
+                            resources
+                        }
+                    )
+                    .await
+                    .unwrap(),
+                crate::managed_catalog::LogicalLibraryCreation::Created(_)
+            ));
+        }
+        pool.id = Uuid::new_v4();
+        pool.name = "logical-test-pool".into();
+        catalog
+            .create_admin_pool(&control.serial, control.route, epoch, Some(logical), &pool)
+            .await
+            .unwrap();
+        let volume = Uuid::new_v4();
+        let assign = request(
+            json!({"kind":"media-assign","pool":pool.id,"barcode":"LIFE00L8",
+            "volume":volume,"confirm_format":true,"force_format":false}),
+        );
+        let assigned = execute(&mut fixture, &control, &status, &assign).await;
+        assert_eq!(assigned["status"], "succeeded", "{assigned}");
+
+        let forbidden = AutomaticMediaPlan {
+            action: AutomaticMediaAction::MoveIn,
+            barcode: "LIFE00L8".into(),
+            volume: volume.to_string(),
+            pool: pool.id.to_string(),
+            drive_serial: drive.clone(),
+            source: other_slot,
+            destination: map.dt_start,
+            role: 'r',
+        };
+        assert!(
+            matches!(catalog.issue_automatic_media(&control.serial, control.route, epoch, &forbidden).await,
+            Err(error) if matches!(error.domain(), crate::managed_catalog::CatalogError::Invalid(_)))
+        );
+        let forbidden_drive = AutomaticMediaPlan {
+            drive_serial: other_drive.clone(),
+            source: home,
+            destination: map.dt_start + 1,
+            ..forbidden.clone()
+        };
+        assert!(
+            matches!(catalog.issue_automatic_media(&control.serial, control.route, epoch, &forbidden_drive).await,
+            Err(error) if matches!(error.domain(), crate::managed_catalog::CatalogError::Invalid(_)))
+        );
+        assert!(
+            catalog
+                .automatic_media_pending(&control.serial, control.route, epoch)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let head = catalog
+            .active_loaded_volume_head(&control.serial, "LIFE00L8", control.route, epoch)
+            .await
+            .unwrap()
+            .unwrap();
+        let placement = catalog.volume_placement(volume).await.unwrap().unwrap();
+        let selected = Box::pin(fdb_loading::select_write(
+            &mut fixture.owner,
+            &fixture.permit,
+            &control,
+            &status,
+            &placement,
+            head.index,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(fixture.owner.devices[selected].serial, drive);
+        Box::pin(fdb_loading::unload(
+            &mut fixture.owner,
+            &fixture.permit,
+            &control,
+            selected,
+            &['m'],
+        ))
+        .await
+        .unwrap();
+        let (_, rows) = management::elements(&fixture.owner.devices).unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| row.address == home && row.volume_tag.as_deref() == Some("LIFE00L8"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.address == other_slot && !row.full)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 自动UNLOAD/MOVE回执未知，不访问实际设备"]
     async fn ordinary_unload_unknown_keeps_original_bundle_and_excludes_new_tasks() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

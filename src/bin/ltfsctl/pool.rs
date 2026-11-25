@@ -55,17 +55,20 @@ pub(super) fn library<'a>(
 pub(super) fn submit(
     client: &FdbClient,
     library: &str,
+    logical: Uuid,
     input: ManagementIntent,
     path: PathBuf,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     match ManagementRequestFile::load(&path) {
         Ok(saved) => {
-            if !saved.matches(library, &input) {
-                return Err("请求文件的带库或参数不同；禁止覆盖原请求".into());
+            if !saved.matches_pool_scope(library, Some(logical), &input) {
+                return Err("请求文件的物理库、逻辑库或参数不同；禁止覆盖原请求".into());
             }
         }
         Err(tape_rs::client::ClientError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            client.prepare_management(library, input)?.save_new(&path)?;
+            client
+                .prepare_pool_management(library, Some(logical), input)?
+                .save_new(&path)?;
         }
         Err(e) => return Err(e.into()),
     }
@@ -77,7 +80,7 @@ pub(super) fn submit(
 fn items(
     client: &FdbClient,
     library: &str,
-    tasks: bool,
+    logical: Uuid,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let context = client.management_context(library)?;
     let ns = context["namespace"].as_str().ok_or("缺少目录命名空间")?;
@@ -85,11 +88,7 @@ fn items(
     let mut seen = std::collections::HashSet::new();
     let mut items = Vec::new();
     loop {
-        let page = if tasks {
-            client.management_page(library, ns, after.as_deref())?
-        } else {
-            client.pool_page(library, ns, after.as_deref())?
-        };
+        let page = client.pool_page_in_scope(library, ns, Some(logical), after.as_deref())?;
         items.extend(page["items"].as_array().ok_or("分页清单无效")?.clone());
         after = page["next"].as_str().map(str::to_owned);
         if let Some(cursor) = &after {
@@ -100,7 +99,7 @@ fn items(
             break;
         }
     }
-    Ok(json!({"library_serial":library,"namespace":ns,"items":items}))
+    Ok(json!({"library_serial":library,"logical_library":logical,"namespace":ns,"items":items}))
 }
 fn print(value: Value) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", serde_json::to_string_pretty(&value)?);
@@ -121,9 +120,13 @@ pub fn run(
     client: &FdbClient,
     serial: Option<&str>,
     pool: Option<&str>,
+    logical: Option<Uuid>,
     command: Command,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let library = library(serial, pool)?;
+    let logical = logical
+        .filter(|id| !id.is_nil())
+        .ok_or("池管理必须通过 --logical-library 指定逻辑带库 UUID")?;
     let result = match command {
         Command::Create {
             name,
@@ -132,6 +135,7 @@ pub fn run(
         } => submit(
             client,
             library,
+            logical,
             ManagementIntent::Create { name, file_limit },
             request_path(request)?,
         )?,
@@ -143,6 +147,7 @@ pub fn run(
         } => submit(
             client,
             library,
+            logical,
             ManagementIntent::Set {
                 selector,
                 attribute,
@@ -153,19 +158,21 @@ pub fn run(
         Command::Delete { selector, request } => submit(
             client,
             library,
+            logical,
             ManagementIntent::Delete { selector },
             request_path(request)?,
         )?,
         Command::Show { selector } => {
             let context = client.management_context(library)?;
-            client.pool(
+            client.pool_in_scope(
                 library,
                 context["namespace"].as_str().ok_or("缺少命名空间")?,
+                Some(logical),
                 &selector,
             )?
         }
         Command::List { json } => {
-            let result = items(client, library, false)?;
+            let result = items(client, library, logical)?;
             if json {
                 return print(result);
             }

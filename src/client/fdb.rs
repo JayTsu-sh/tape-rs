@@ -284,7 +284,8 @@ impl FdbClient {
             } else if route
                 .strip_prefix("/libraries/")
                 .and_then(|path| path.split_once('/'))
-                .is_some_and(|(_, path)| path == "admin/logical-libraries")
+                .and_then(|(_, path)| path.strip_prefix("admin/logical-libraries"))
+                .is_some_and(|tail| tail.is_empty() || tail.starts_with('/'))
             {
                 crate::logical_library::MAX_REQUEST_BYTES
             } else {

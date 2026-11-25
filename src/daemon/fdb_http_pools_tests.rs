@@ -29,6 +29,17 @@ async fn request(
     ns: Option<&str>,
     body: &[u8],
 ) -> (u16, Value) {
+    request_scoped(address, method, path, ns, None, body).await
+}
+
+async fn request_scoped(
+    address: &str,
+    method: &str,
+    path: &str,
+    ns: Option<&str>,
+    logical: Option<Uuid>,
+    body: &[u8],
+) -> (u16, Value) {
     let stream = tokio::net::TcpStream::connect(address).await.unwrap();
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
@@ -42,6 +53,9 @@ async fn request(
         .header("host", address);
     if let Some(ns) = ns {
         req = req.header("x-tapers-catalog-namespace", ns);
+    }
+    if let Some(id) = logical {
+        req = req.header("x-tapers-logical-library", id.to_string());
     }
     let response = sender
         .send_request(
@@ -84,15 +98,15 @@ async fn run_pool_api(cluster: &str) {
         crate::managed_catalog::verify_native_barriers(&serial, challenge, &replies).unwrap();
     let route = catalog.initialize_native_library(ns, &proof).await.unwrap();
     let epoch = route.initial_owner_epoch;
-    let cursor = pools::pool_cursor(&serial, route, b"underlying-key");
+    let cursor = pools::pool_cursor(&serial, route, None, b"underlying-key");
     assert_eq!(
-        pools::decode_pool_cursor(&serial, route, &cursor).unwrap(),
+        pools::decode_pool_cursor(&serial, route, None, &cursor).unwrap(),
         b"underlying-key"
     );
-    assert!(pools::decode_pool_cursor("OTHER", route, &cursor).is_err());
+    assert!(pools::decode_pool_cursor("OTHER", route, None, &cursor).is_err());
     let mut other = route;
     other.route.namespace = Uuid::new_v4();
-    assert!(pools::decode_pool_cursor(&serial, other, &cursor).is_err());
+    assert!(pools::decode_pool_cursor(&serial, other, None, &cursor).is_err());
     let readonly = Arc::new(Context {
         catalog: catalog.clone(),
         routes: BTreeMap::from([(serial.clone(), route)]),
@@ -977,7 +991,7 @@ async fn logical_library_creation(
     let observation = json!({"library_serial":serial,"owner":2,"round":epoch,
         "observed_at": crate::ltfs::label::ltfs_time_now(),"volumes":[],
         "drives":[{"serial":"SIMDRV0000","address":1,"barcode":null}],
-        "num_of_slots":2,"num_of_ieslots":1,"slot_layout":{"storage_start":1001,"ie_start":101},
+        "num_of_slots":2,"num_of_ieslots":2,"slot_layout":{"storage_start":1001,"ie_start":101},
         "scsi_vendor_id":"SIM","scsi_product_id":"SIM-CHANGER","scsi_firmware_revision":"0001"});
     let mut incomplete = observation.clone();
     incomplete.as_object_mut().unwrap().remove("slot_layout");
@@ -1051,6 +1065,207 @@ async fn logical_library_creation(
     let mut codes = [left.0, right.0];
     codes.sort_unstable();
     assert_eq!(codes, [201, 409], "{left:?} {right:?}");
+
+    let other = Uuid::parse_str(
+        (if left.0 == 201 { &left.1 } else { &right.1 })["logical_library"]["id"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let pools = format!("/libraries/{serial}/admin/pools");
+    let new_pool = json!({"version":1,"id":Uuid::new_v4(),"name":"logical-pool-test",
+        "file_limit":100,"created_at_millis":1234,"policy":{
+            "media_restriction":"none","mount_limit":0,"low_space_warning_enabled":true,
+            "low_space_warning_threshold":0,"no_space_warning_enabled":true}});
+    let body = new_pool.to_string();
+    let (status, receipt) = request_scoped(
+        address,
+        "POST",
+        &pools,
+        Some(namespace),
+        Some(id),
+        body.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 201, "{receipt}");
+    assert_eq!(receipt["logical_library"], id.to_string());
+    let path = format!("{pools}/logical-pool-test");
+    assert_eq!(
+        request_scoped(address, "GET", &path, Some(namespace), Some(id), b"")
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        request_scoped(address, "GET", &path, Some(namespace), Some(other), b"")
+            .await
+            .0,
+        404
+    );
+    assert_eq!(
+        request(address, "GET", &path, Some(namespace), b"").await.0,
+        404
+    );
+    assert_eq!(
+        request_scoped(
+            address,
+            "POST",
+            &pools,
+            Some(namespace),
+            Some(id),
+            body.as_bytes()
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        request_scoped(
+            address,
+            "POST",
+            &pools,
+            Some(namespace),
+            Some(other),
+            body.as_bytes()
+        )
+        .await
+        .0,
+        409
+    );
+
+    let endpoint = address.to_owned();
+    let library = serial.to_owned();
+    let second_pool = tokio::task::spawn_blocking(move || {
+        use crate::client::fdb::{FdbClient, management::ManagementIntent};
+        let client = FdbClient::new([endpoint]).unwrap();
+        let request = client
+            .prepare_pool_management(
+                &library,
+                Some(id),
+                ManagementIntent::Create {
+                    name: "logical-pool-page".into(),
+                    file_limit: 100,
+                },
+            )
+            .unwrap();
+        let path = std::env::temp_dir().join(format!("scoped-pool-{}.json", Uuid::new_v4()));
+        request.save_new(&path).unwrap();
+        let result = client.submit_management(&path).unwrap();
+        let observed = client.management_request_status(&path, false).unwrap();
+        assert_eq!(observed["pool"], result["pool"]);
+        std::fs::remove_file(path).unwrap();
+        result
+    })
+    .await
+    .unwrap();
+    assert_eq!(second_pool["logical_library"], id.to_string());
+    let (_, page) = request_scoped(
+        address,
+        "GET",
+        &format!("{pools}?limit=1"),
+        Some(namespace),
+        Some(id),
+        b"",
+    )
+    .await;
+    assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    let next = page["next"].as_str().unwrap();
+    assert_eq!(
+        request_scoped(
+            address,
+            "GET",
+            &format!("{pools}?after={next}"),
+            Some(namespace),
+            Some(other),
+            b""
+        )
+        .await
+        .0,
+        400
+    );
+
+    let accepting = catalog
+        .active_management_window(serial, route)
+        .await
+        .unwrap()
+        .accepting;
+    let pool_path = format!("{pools}/{}", new_pool["id"].as_str().unwrap());
+    let operation = Uuid::new_v4();
+    let mut change = json!({"version":1,"library":serial,"namespace":namespace,
+        "epoch":accepting,"operation":operation,"change":{"kind":"pool","id":new_pool["id"],
+        "logical_library":id,"revision":1,"patch":{"file_limit":200}}});
+    assert_eq!(
+        request_scoped(
+            address,
+            "PATCH",
+            &pool_path,
+            Some(namespace),
+            Some(other),
+            change.to_string().as_bytes()
+        )
+        .await
+        .0,
+        400
+    );
+    assert_eq!(
+        request_scoped(
+            address,
+            "PATCH",
+            &pool_path,
+            Some(namespace),
+            Some(id),
+            change.to_string().as_bytes()
+        )
+        .await
+        .0,
+        202
+    );
+    let updated = catalog
+        .apply_pool_management(serial, route, epoch, accepting, operation)
+        .await
+        .unwrap();
+    assert_eq!(updated["status"], "succeeded", "{updated}");
+    assert_eq!(updated["result"]["pool"]["file_limit"], 200);
+    let (replayed_status, replayed) = request_scoped(
+        address,
+        "POST",
+        &pools,
+        Some(namespace),
+        Some(id),
+        body.as_bytes(),
+    )
+    .await;
+    assert_eq!(replayed_status, 200);
+    assert_eq!(replayed["pool"], receipt["pool"]);
+
+    let operation = Uuid::new_v4();
+    change["operation"] = json!(operation);
+    change["change"] =
+        json!({"kind":"pool-delete","id":new_pool["id"],"logical_library":id,"revision":2});
+    assert_eq!(
+        request_scoped(
+            address,
+            "DELETE",
+            &pool_path,
+            Some(namespace),
+            Some(id),
+            change.to_string().as_bytes()
+        )
+        .await
+        .0,
+        202
+    );
+    let deleted = catalog
+        .apply_pool_management(serial, route, epoch, accepting, operation)
+        .await
+        .unwrap();
+    assert_eq!(deleted["result"]["deleted"], true, "{deleted}");
+    assert_eq!(
+        request_scoped(address, "GET", &pool_path, Some(namespace), Some(id), b"")
+            .await
+            .0,
+        404
+    );
 
     let mut wrong_type = competing("wrong-type");
     wrong_type["resources"]["storage_slots"] = json!([101]);
@@ -1133,4 +1348,155 @@ async fn logical_library_creation(
         .record_active_library_inventory(serial, route, epoch, &observation)
         .await
         .unwrap();
+    let target = format!("{base}/{other}");
+    let op = Uuid::new_v4();
+    let edit = json!({"version":1,"operation":op,"revision":1,"replacement":{
+        "name":"renamed-logical-library","resources":{"drives":[],"storage_slots":[1002],"ie_slots":[102]}}});
+    let edit_body = edit.to_string();
+    let (status, changed) = request(
+        address,
+        "PATCH",
+        &target,
+        Some(namespace),
+        edit_body.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 200, "{changed}");
+    assert_eq!(changed["logical_library"]["revision"], 2);
+    let status_path = format!("{target}/changes/{op}");
+    assert_eq!(
+        request(address, "GET", &status_path, Some(namespace), b"").await,
+        (200, changed.clone())
+    );
+    assert_eq!(
+        request(
+            address,
+            "PATCH",
+            &target,
+            Some(namespace),
+            edit_body.as_bytes()
+        )
+        .await,
+        (200, changed)
+    );
+    let mut wrong_revision = edit;
+    wrong_revision["operation"] = json!(Uuid::new_v4());
+    assert_eq!(
+        request(
+            address,
+            "PATCH",
+            &target,
+            Some(namespace),
+            wrong_revision.to_string().as_bytes()
+        )
+        .await
+        .0,
+        409
+    );
+
+    let operation = Uuid::new_v4();
+    let delete =
+        json!({"version":1,"operation":operation,"revision":2,"replacement":null}).to_string();
+    let occupied = json!([{"barcode":"BUSY01L8","address":102,"element_type":3,"medium_type":1,"source_address":null,"home_slot":null}]);
+    let mut loaded = observation.clone();
+    loaded["volumes"] = occupied;
+    catalog
+        .record_active_library_inventory(serial, route, epoch, &loaded)
+        .await
+        .unwrap();
+    assert_eq!(
+        request(
+            address,
+            "DELETE",
+            &target,
+            Some(namespace),
+            delete.as_bytes()
+        )
+        .await
+        .0,
+        409
+    );
+    catalog
+        .record_active_library_inventory(serial, route, epoch, &observation)
+        .await
+        .unwrap();
+    let (status, deleted) = request(
+        address,
+        "DELETE",
+        &target,
+        Some(namespace),
+        delete.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 200, "{deleted}");
+    assert_eq!(deleted["deleted"], true);
+    assert_eq!(
+        request(
+            address,
+            "GET",
+            &format!("{target}/changes/{operation}"),
+            Some(namespace),
+            b""
+        )
+        .await,
+        (200, deleted)
+    );
+
+    let still_has_pool =
+        json!({"version":1,"operation":Uuid::new_v4(),"revision":1,"replacement":null});
+    assert_eq!(
+        request(
+            address,
+            "DELETE",
+            &format!("{base}/{id}"),
+            Some(namespace),
+            still_has_pool.to_string().as_bytes()
+        )
+        .await
+        .0,
+        409
+    );
+    let reassigned = competing("reassigned");
+    let reassigned_id = Uuid::parse_str(reassigned["id"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        request(
+            address,
+            "POST",
+            &base,
+            Some(namespace),
+            reassigned.to_string().as_bytes()
+        )
+        .await
+        .0,
+        201
+    );
+
+    let mut racing_pool = new_pool;
+    racing_pool["id"] = json!(Uuid::new_v4());
+    racing_pool["name"] = json!("create-during-logical-delete");
+    let pool_body = racing_pool.to_string();
+    let delete_body =
+        json!({"version":1,"operation":Uuid::new_v4(),"revision":1,"replacement":null}).to_string();
+    let target = format!("{base}/{reassigned_id}");
+    let (creation, deletion) = tokio::join!(
+        request_scoped(
+            address,
+            "POST",
+            &pools,
+            Some(namespace),
+            Some(reassigned_id),
+            pool_body.as_bytes()
+        ),
+        request(
+            address,
+            "DELETE",
+            &target,
+            Some(namespace),
+            delete_body.as_bytes()
+        ),
+    );
+    assert!(
+        matches!((creation.0, deletion.0), (201, 409) | (400, 200)),
+        "{creation:?} {deletion:?}"
+    );
 }

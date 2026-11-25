@@ -122,6 +122,9 @@ enum Cmd {
     },
     /// 池管理
     Pool {
+        /// 目标逻辑带库的 UUID
+        #[arg(long, global = true)]
+        logical_library: Option<uuid::Uuid>,
         #[command(subcommand)]
         cmd: pool::Command,
     },
@@ -962,10 +965,14 @@ fn main() {
                 let client = tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?;
                 reading::list(&client, library, pool, dir.as_deref())?;
             }
-            Cmd::Pool { cmd } => pool::run(
+            Cmd::Pool {
+                logical_library,
+                cmd,
+            } => pool::run(
                 &tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?,
                 args.library.as_deref(),
                 args.pool.as_deref(),
+                logical_library,
                 cmd,
             )?,
             Cmd::LogicalLibrary { cmd } => logical_library::run(
