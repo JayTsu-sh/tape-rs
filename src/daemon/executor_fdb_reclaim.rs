@@ -4,6 +4,56 @@ use super::*;
 #[path = "executor_fdb_reclaim_driver.rs"]
 mod driver;
 pub(super) use driver::advance;
+pub(super) use driver::PreparedReclaimFormatSource;
+#[cfg(test)]
+pub(super) use driver::probe_original_for_test;
+#[cfg(test)]
+pub(super) use driver::arm_original_probe_seal_for_test;
+#[cfg(test)]
+pub(super) use driver::{arm_original_checkpoint_s4_stop_for_test, OriginalS4StopFacts};
+#[cfg(test)]
+pub(super) use driver::{
+    ReadbackSealMode, arm_readback_seal_for_test, observe_group_read_for_test,
+};
+pub(in crate::daemon) use driver::{OriginalAttemptProbeIo, FreshReclaimGroupIo, ObserveReclaimGroupIo};
+
+/// Claim and classify every parent using FDB only. A protected original task
+/// keeps generic recovery away from its media, even if it is not the first
+/// parent in the bounded queue page.
+pub(super) async fn recovery_barrier(
+    owner: &Active,
+    control: &FdbOwnerControl,
+) -> std::result::Result<bool, ReadError> {
+    let mut after = None;
+    let mut protected = false;
+    loop {
+        let page = control
+            .catalog
+            .claim_reclaim_reservations_page(
+                &control.serial,
+                control.route,
+                owner.round,
+                after.as_deref(),
+                16,
+            )
+            .await
+            .map_err(|e| ReadError::Lost(format!("回收恢复隔离接任: {e}")))?;
+        for parent in &page.items {
+            protected |= !matches!(
+                control
+                    .catalog
+                    .classify_reclaim_execution(parent, owner.round)
+                    .await
+                    .map_err(|e| ReadError::Lost(format!("回收恢复隔离: {e}")))?,
+                crate::managed_catalog::ReclaimExecutionGate::Fresh
+            );
+        }
+        let Some(next) = page.next else {
+            return Ok(protected);
+        };
+        after = Some(next);
+    }
+}
 
 pub(super) async fn cleanup(
     owner: &Active,

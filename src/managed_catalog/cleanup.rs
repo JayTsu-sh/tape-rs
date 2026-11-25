@@ -8,7 +8,7 @@ const MAX_PURGE_PAGE: usize = 100;
 // The managed marker a is cleared after all assignments have been released.
 // Forward reservations are namespace-owned too; has_namespace_holds prevents
 // purging them while live. Their volume/target reverse rows use other scopes.
-pub(super) const NAMESPACE_ROWS: &[u8] = b"RtjsquvwnlkhgfoNCHmMPLZ0IFABDKE@eaWTUX";
+pub(super) const NAMESPACE_ROWS: &[u8] = b"RtjsquvwnlkhgfoNCHmMPLZ0IFABDKE@eaWTUX\x80\x81";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PurgeProgress {
@@ -229,7 +229,23 @@ pub(super) mod tests {
         assert!(NAMESPACE_ROWS.contains(&b's'));
         assert!(NAMESPACE_ROWS.contains(&b'v'));
         assert!(NAMESPACE_ROWS.contains(&b'w'));
-        assert!(NAMESPACE_ROWS.ends_with(b"TUX"));
+        assert!(NAMESPACE_ROWS[..NAMESPACE_ROWS.len() - 2].ends_with(b"TUX"));
+        assert_eq!(NAMESPACE_ROWS[NAMESPACE_ROWS.len() - 2], BODY_LAYOUT_KIND);
+        assert_eq!(NAMESPACE_ROWS.last(), Some(&FULL_HISTORY_HINT_KIND));
+        assert_eq!(
+            NAMESPACE_ROWS
+                .iter()
+                .filter(|&&kind| kind == BODY_LAYOUT_KIND)
+                .count(),
+            1
+        );
+        assert_eq!(
+            NAMESPACE_ROWS
+                .iter()
+                .filter(|&&kind| kind == FULL_HISTORY_HINT_KIND)
+                .count(),
+            1
+        );
     }
 
     async fn raw(catalog: &ManagedCatalog, key: &[u8]) -> Option<Vec<u8>> {

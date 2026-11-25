@@ -79,6 +79,28 @@ impl Directory {
         Ok(Self { db, applied: 0 })
     }
 
+    /// 仅用于已证明无 WAL/SHM 的冻结来源；URI 的路径字节完整编码。
+    pub(crate) fn open_immutable_reader(path: &Path) -> Result<Self> {
+        use std::os::unix::ffi::OsStrExt;
+        if !path.is_absolute() {
+            return Err(TapeError::Ltfs("冻结审计源必须是绝对路径".into()));
+        }
+        let encoded: String = path
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("%{b:02X}"))
+            .collect();
+        let db = Connection::open_with_flags(
+            format!("file:{encoded}?mode=ro&immutable=1"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(db_err)?;
+        Ok(Self { db, applied: 0 })
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let db = Connection::open(path).map_err(db_err)?;
         db.execute_batch(
@@ -159,10 +181,13 @@ impl Directory {
     }
 
     pub fn cutover_audit(&self) -> Result<CutoverAudit> {
-        let (applied, frozen, staging, tasks, rows): (Option<i64>, Option<i64>, i64, i64, i64) =
-            self.db
-                .query_row(
-                    "SELECT (SELECT v FROM meta WHERE k='applied_index'),
+        Self::audit_readonly_connection(&self.db)
+    }
+
+    pub(crate) fn audit_readonly_connection(db: &Connection) -> Result<CutoverAudit> {
+        let (applied, frozen, staging, tasks, rows): (Option<i64>, Option<i64>, i64, i64, i64) = db
+            .query_row(
+                "SELECT (SELECT v FROM meta WHERE k='applied_index'),
                         (SELECT v FROM meta WHERE k='catalog_frozen_index'),
                         EXISTS(SELECT 1 FROM staging LIMIT 1),
                         EXISTS(SELECT 1 FROM file_tasks
@@ -171,10 +196,10 @@ impl Directory {
                         EXISTS(SELECT 1 FROM tapes LIMIT 1) OR
                         EXISTS(SELECT 1 FROM files LIMIT 1) OR
                         EXISTS(SELECT 1 FROM file_tasks LIMIT 1)",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-                )
-                .map_err(db_err)?;
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .map_err(db_err)?;
         let applied_index = applied
             .and_then(|index| u64::try_from(index).ok())
             .ok_or_else(|| TapeError::Ltfs("目录库缺少有效的已应用日志索引".into()))?;

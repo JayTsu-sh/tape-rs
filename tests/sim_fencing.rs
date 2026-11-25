@@ -17,6 +17,68 @@ const BARCODE: &str = "FENCE1L8";
 const NODE_A: u32 = 1;
 const NODE_B: u32 = 2;
 
+#[test]
+fn releasing_an_old_round_preserves_a_successor_on_the_same_initiator() {
+    use tape_rs::scsi::device::ScsiResult;
+    use tape_rs::scsi::transport::TapeTransport;
+
+    struct SuccessorAfterRelease<'a> {
+        drive: &'a dyn TapeTransport,
+        successor: ReservationKey,
+    }
+
+    impl TapeTransport for SuccessorAfterRelease<'_> {
+        fn execute_no_data(&self, cdb: &[u8], timeout_ms: u32) -> Result<ScsiResult, TapeError> {
+            self.drive.execute_no_data(cdb, timeout_ms)
+        }
+
+        fn execute_read(
+            &self,
+            cdb: &[u8],
+            buf: &mut [u8],
+            timeout_ms: u32,
+        ) -> Result<ScsiResult, TapeError> {
+            self.drive.execute_read(cdb, buf, timeout_ms)
+        }
+
+        fn execute_write(
+            &self,
+            cdb: &[u8],
+            buf: &[u8],
+            timeout_ms: u32,
+        ) -> Result<ScsiResult, TapeError> {
+            let result = self.drive.execute_write(cdb, buf, timeout_ms)?;
+            if cdb[0] == opcode::PERSISTENT_RESERVE_OUT && cdb[1] & 0x1f == 0x02 {
+                assert!(matches!(
+                    fence(self.drive, self.successor).unwrap(),
+                    FenceOutcome::Fenced { .. }
+                ));
+            }
+            Ok(result)
+        }
+
+        fn identity(&self) -> &str {
+            self.drive.identity()
+        }
+    }
+
+    let library = SimLibrary::new(1, 1, 1);
+    let drive = library.drive_as(0, NODE_A);
+    let old = ReservationKey::new(1, 1);
+    let successor = ReservationKey::new(1, 2);
+    assert!(matches!(
+        fence(&drive, old).unwrap(),
+        FenceOutcome::Fenced { .. }
+    ));
+    let interrupted = SuccessorAfterRelease {
+        drive: &drive,
+        successor,
+    };
+    let released = release_and_unregister(&interrupted, old);
+    verify_holder(&drive, successor).expect("旧执行器不得删除后继预留");
+    assert!(released.is_err());
+}
+
 fn setup() -> SimLibrary {
     let lib = SimLibrary::new(1, 4, 1);
     lib.insert_cartridge(SimCartridge::blank(BARCODE, 64 << 20), 0)

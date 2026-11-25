@@ -695,6 +695,18 @@ impl ManagedCatalog {
     }
 
     pub async fn reserve_active_file(&self, intent: &ActiveFileIntent) -> Result<PublishOutcome> {
+        self.reserve_active_file_in(intent,control::reclaim::ReclaimProtocolContext::Single).await
+    }
+
+    pub(crate) async fn reserve_reclaim_group_file(
+        &self, intent: &ActiveFileIntent, scope: &ReclaimGroupExecution,
+    ) -> Result<PublishOutcome> {
+        self.reserve_active_file_in(intent,control::reclaim::ReclaimProtocolContext::Group(scope)).await
+    }
+
+    async fn reserve_active_file_in(
+        &self, intent: &ActiveFileIntent, context: control::reclaim::ReclaimProtocolContext<'_>,
+    ) -> Result<PublishOutcome> {
         validate_active_file_intent(intent)?;
         let intent = intent.clone();
         self.db
@@ -738,7 +750,7 @@ impl ManagedCatalog {
                                 );
                             }
                             let sealed_reclaim =
-                                control::reclaim::require_intent_at(&tr, &intent).await?;
+                                control::reclaim::require_intent_in(&tr, &intent,context).await?;
                             if !control::receipt_placement_matches(&tr, &stub).await? {
                                 return Ok(PublishOutcome::PlacementMismatch);
                             }
@@ -859,6 +871,18 @@ impl ManagedCatalog {
     /// Upgrade a logical reservation after LTFS has appended data and supplied
     /// its exact fileuid and attributes. The reservation's permit is reused.
     pub async fn complete_active_file(&self, receipt: &CommitReceipt) -> Result<PublishOutcome> {
+        self.complete_active_file_in(receipt,control::reclaim::ReclaimProtocolContext::Single).await
+    }
+
+    pub(crate) async fn complete_reclaim_group_file(
+        &self, receipt: &CommitReceipt, scope: &ReclaimGroupExecution,
+    ) -> Result<PublishOutcome> {
+        self.complete_active_file_in(receipt,control::reclaim::ReclaimProtocolContext::Group(scope)).await
+    }
+
+    async fn complete_active_file_in(
+        &self, receipt: &CommitReceipt, context: control::reclaim::ReclaimProtocolContext<'_>,
+    ) -> Result<PublishOutcome> {
         validate_receipt(receipt)?;
         let receipt = receipt.clone();
         self.db
@@ -877,6 +901,7 @@ impl ManagedCatalog {
                             {
                                 return Ok(PublishOutcome::StaleOwner);
                             }
+                            control::reclaim::require_receipt_in(&tr,&receipt,context).await?;
                             if tr
                                 .get(
                                     &op_key(

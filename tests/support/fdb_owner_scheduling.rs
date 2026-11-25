@@ -2457,3 +2457,6 @@ mod tape_monitor;
 
 #[path = "fdb_notify.rs"]
 mod notify;
+
+#[path = "fdb_owner_reclaim_batch.rs"]
+mod reclaim_batch;

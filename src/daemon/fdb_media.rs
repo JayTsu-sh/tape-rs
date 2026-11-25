@@ -27,11 +27,29 @@ use crate::managed_catalog::{
     ActiveBatchOutcome, ActiveBatchPhase, ActiveCompactionOutcome, ActiveFileIntent,
     ActiveFinalizationOutcome, ActiveIndexIdentity, ActiveIndexOutcome, ActiveLibraryRoute,
     ActiveMaterializationOutcome, ActiveOwnerOutcome, ActivePreparationOutcome,
-    ActivePublicationOutcome, ActiveRecoveryOutcome, CommitReceipt, ManagedCatalog,
-    PreparedActiveFile, PublishOutcome, ResolvedPath, pool_catalog_path, prepare_active_file,
-    prepare_committed_active_file,
+    ActivePublicationOutcome, ActiveRecoveryOutcome, CommitReceipt, CommittedLayoutSource,
+    ManagedCatalog, PreparedActiveFile, PublishOutcome, ResolvedPath, pool_catalog_path,
+    prepare_active_file, prepare_committed_active_file,
 };
 use crate::scsi::reservation::ReservationKey;
+
+#[path = "fdb_reclaim_batch_media.rs"]
+mod reclaim_batch_media;
+pub(in crate::daemon) use reclaim_batch_media::{
+    PendingCheckpoint, ReclaimCheckpointSession, commit_reclaim_media_checkpoint,
+};
+
+#[path = "fdb_reclaim_attempt_media.rs"]
+mod reclaim_attempt_media;
+pub(in crate::daemon) use reclaim_attempt_media::{
+    CapturedAttemptEvidence, probe_original_attempt,
+};
+
+#[path = "fdb_reclaim_original_checkpoint.rs"]
+mod reclaim_original_checkpoint;
+pub(in crate::daemon) use reclaim_original_checkpoint::{
+    publish_original_reclaim_checkpoint, resume_original_reclaim_checkpoint,
+};
 
 #[cfg(feature = "hardware-fault-tests")]
 #[path = "fdb_media_s4_gate.rs"]
@@ -78,6 +96,28 @@ pub async fn recover_active_media_tail<'a>(
         .await
         .map_err(|error| catalog_error("恢复前核对 FDB 索引", error))?;
     let tail = volume.recovery().dp.tail;
+    let route = catalog
+        .active_library_route(serial)
+        .await
+        .map_err(|error| catalog_error("恢复前查询活动路由", error))?
+        .ok_or_else(|| TapeError::NotReady("活动带库不存在".into()))?;
+    if !catalog
+        .verify_reloaded_volume(
+            serial,
+            route,
+            owner_epoch,
+            mounted,
+            tail == TailKind::Complete,
+        )
+        .await
+        .map_err(|error| catalog_error("核对重新加载卷", error))?
+    {
+        return Err(TapeError::MediaImportRequired {
+            volume: mounted.volume_uuid,
+            observed_generation: observed.generation,
+            media_generation: mounted.generation,
+        });
+    }
     let already_closed = Some(mounted.generation) == observed.generation.checked_add(1)
         && tail == TailKind::Complete
         && volume.root_xattr(XATTR_EMPTY_RECOVERY)
@@ -103,11 +143,6 @@ pub async fn recover_active_media_tail<'a>(
         ));
     }
     if !already_closed && matches!(tail, TailKind::UnindexedData | TailKind::TruncatedIndex) {
-        let route = catalog
-            .active_library_route(serial)
-            .await
-            .map_err(|error| catalog_error("修尾前查询活动路由", error))?
-            .ok_or_else(|| TapeError::NotReady("活动带库不存在".into()))?;
         require_media_io(catalog, serial, route, owner_epoch, mounted.volume_uuid).await?;
     }
     expect_outcome(
@@ -262,6 +297,42 @@ pub async fn recover_active_media_tail<'a>(
     })
 }
 
+// Keep recovery-future construction outside reconcile's poll frame. Its
+// mutually exclusive branches must not retain large constructor temporaries
+// while the selected branch polls the catalog recovery chain.
+#[inline(never)]
+fn recover_tail_phase<'a: 'b, 'b>(
+    catalog: &'b ManagedCatalog,
+    volume: LtfsVolume<'a>,
+    serial: &'b str,
+    owner_epoch: u64,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<ActiveMediaRecovered<'a>>> + 'b>> {
+    Box::pin(recover_active_media_tail(
+        catalog,
+        volume,
+        serial,
+        owner_epoch,
+    ))
+}
+
+#[inline(never)]
+fn recover_sealed_phase<'a: 'b, 'b>(
+    catalog: &'b ManagedCatalog,
+    volume: LtfsVolume<'a>,
+    serial: &'b str,
+    owner_epoch: u64,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<ActiveMediaRecovered<'a>>> + 'b>> {
+    Box::pin(async move {
+        let committed =
+            recover_sealed_active_media_batch(catalog, volume, serial, owner_epoch).await?;
+        let committed = publish_active_media_batch(catalog, committed).await?;
+        Ok(ActiveMediaRecovered {
+            index: committed.current,
+            volume: committed.volume,
+        })
+    })
+}
+
 /// The takeover decision for one PR-fenced mounted volume. Select the
 /// recovery path from the physical DP generation and FDB observation, never
 /// from an in-memory task status. Every branch consumes the volume; failure
@@ -278,6 +349,28 @@ pub fn reconcile_active_media_on_takeover<'a: 'b, 'b>(
             .observed_active_volume_index(serial, current.volume_uuid)
             .await
             .map_err(|error| catalog_error("接任核对已观察索引", error))?;
+        let route = catalog
+            .active_library_route(serial)
+            .await
+            .map_err(|error| catalog_error("接任查询活动路由", error))?
+            .ok_or_else(|| TapeError::NotReady("活动带库不存在".into()))?;
+        if !catalog
+            .verify_reloaded_volume(
+                serial,
+                route,
+                owner_epoch,
+                current,
+                volume.recovery().dp.tail == TailKind::Complete,
+            )
+            .await
+            .map_err(|error| catalog_error("接任核对重新加载卷", error))?
+        {
+            return Err(TapeError::MediaImportRequired {
+                volume: current.volume_uuid,
+                observed_generation: observed.generation,
+                media_generation: current.generation,
+            });
+        }
         // An explicit import must remain possible when an external clean Full
         // replaced the observed head. Do not cancel or bypass any owned work.
         let expected_empty_close = observed.generation.checked_add(1) == Some(current.generation)
@@ -314,7 +407,7 @@ pub fn reconcile_active_media_on_takeover<'a: 'b, 'b>(
         if current == observed {
             if let Some(batch) = status {
                 if batch.completed {
-                    return recover_active_media_tail(catalog, volume, serial, owner_epoch).await;
+                    return recover_tail_phase(catalog, volume, serial, owner_epoch).await;
                 }
                 if batch.phase == ActiveBatchPhase::Sealed {
                     if volume.recovery().dp.tail != TailKind::Complete {
@@ -330,7 +423,7 @@ pub fn reconcile_active_media_on_takeover<'a: 'b, 'b>(
                 }
                 return Err(TapeError::Catalog("已观察代数存在未封存批次".into()));
             }
-            return recover_active_media_tail(catalog, volume, serial, owner_epoch).await;
+            return recover_tail_phase(catalog, volume, serial, owner_epoch).await;
         }
         if observed.generation.checked_add(1) != Some(current.generation) {
             return Err(TapeError::Catalog("接任介质代数与 FDB 观察不连续".into()));
@@ -341,15 +434,9 @@ pub fn reconcile_active_media_on_takeover<'a: 'b, 'b>(
             if volume.recovery().dp.tail != TailKind::Complete {
                 return Err(TapeError::Catalog("未观察封存批次的介质尾部不完整".into()));
             }
-            let committed =
-                recover_sealed_active_media_batch(catalog, volume, serial, owner_epoch).await?;
-            let committed = publish_active_media_batch(catalog, committed).await?;
-            return Ok(ActiveMediaRecovered {
-                index: committed.current,
-                volume: committed.volume,
-            });
+            return recover_sealed_phase(catalog, volume, serial, owner_epoch).await;
         }
-        recover_active_media_tail(catalog, volume, serial, owner_epoch).await
+        recover_tail_phase(catalog, volume, serial, owner_epoch).await
     })
 }
 
@@ -487,6 +574,7 @@ pub async fn recover_sealed_active_media_batch<'a>(
     if batch.completed || batch.phase != ActiveBatchPhase::Sealed {
         return Err(TapeError::Catalog("介质新代数批次尚未封存".into()));
     }
+    let mut physical_paths = HashMap::new();
     let mut files = Vec::with_capacity(batch.items as usize);
     let mut expected_delta = Vec::with_capacity(batch.items as usize);
     for page in 0..batch.pages {
@@ -517,6 +605,7 @@ pub async fn recover_sealed_active_media_batch<'a>(
                     "封存批次收据与已提交介质文件不一致".into(),
                 ));
             }
+            physical_paths.insert(prepared.receipt.file_id, path.clone());
             expected_delta.push((path, prepared.receipt.ltfs_file_uid));
             files.push(prepared);
         }
@@ -596,6 +685,7 @@ pub async fn recover_sealed_active_media_batch<'a>(
         previous,
         current,
         files,
+        physical_paths,
     })
 }
 
@@ -624,6 +714,7 @@ pub async fn resume_observed_active_media_batch<'a>(
     if status.phase != ActiveBatchPhase::Sealed {
         return Err(TapeError::Catalog("恢复发布批次未封存".into()));
     }
+    let mut physical_paths = HashMap::new();
     let mut pages = Vec::with_capacity(usize::from(status.pages));
     for page in 0..status.pages {
         let recovered = catalog
@@ -659,6 +750,7 @@ pub async fn resume_observed_active_media_batch<'a>(
             if prepared.receipt != receipt {
                 return Err(TapeError::Catalog("恢复发布文件与介质收据不一致".into()));
             }
+            physical_paths.insert(prepared.receipt.file_id, path);
             files.push(prepared);
         }
         pages.push(files);
@@ -668,6 +760,52 @@ pub async fn resume_observed_active_media_batch<'a>(
     }
     if !status.completed {
         if !status.published {
+            {
+                let source = CommittedLayoutSource::new(&mut volume)
+                    .map_err(|error| catalog_error("恢复已提交正文布局", error))?;
+                let mut supported = true;
+                for file in pages.iter().flatten() {
+                    supported &= source
+                        .projection_supported(layout_path(&physical_paths, file)?)
+                        .map_err(|error| catalog_error("恢复正文布局尺寸预检", error))?;
+                }
+                if supported {
+                    expect_outcome(
+                        "恢复正文布局要求",
+                        catalog
+                            .require_observed_active_body_layouts(
+                                serial,
+                                owner_epoch,
+                                current.volume_uuid,
+                                current.generation,
+                                status.batch_id,
+                            )
+                            .await
+                            .map_err(|error| catalog_error("恢复正文布局要求", error))?,
+                        &[
+                            ActivePreparationOutcome::Prepared,
+                            ActivePreparationOutcome::AlreadyPrepared,
+                        ],
+                    )?;
+                    for file in pages.iter().flatten() {
+                        let layout = source
+                            .prepared(layout_path(&physical_paths, file)?, file)
+                            .map_err(|error| catalog_error("恢复提取正文布局", error))?
+                            .ok_or_else(|| {
+                                TapeError::Catalog("恢复正文布局支持范围在预检后改变".into())
+                            })?;
+                        catalog
+                            .stage_observed_body_layout(
+                                serial,
+                                owner_epoch,
+                                status.batch_id,
+                                &layout,
+                            )
+                            .await
+                            .map_err(|error| catalog_error("恢复持久化正文布局", error))?;
+                    }
+                }
+            }
             for (page, files) in pages.iter().enumerate() {
                 for file in files {
                     expect_outcome(
@@ -1088,6 +1226,7 @@ pub struct ActiveMediaCommit<'a> {
     previous: ActiveIndexIdentity,
     current: ActiveIndexIdentity,
     files: Vec<PreparedActiveFile>,
+    physical_paths: HashMap<Uuid, String>,
 }
 
 impl<'a> ActiveMediaCommit<'a> {
@@ -1112,6 +1251,13 @@ impl<'a> ActiveMediaCommit<'a> {
     pub fn files(&self) -> &[PreparedActiveFile] {
         &self.files
     }
+}
+
+fn layout_path<'a>(paths: &'a HashMap<Uuid, String>, file: &PreparedActiveFile) -> Result<&'a str> {
+    paths
+        .get(&file.receipt.file_id)
+        .map(String::as_str)
+        .ok_or_else(|| TapeError::Catalog("已提交批次缺少原物理路径".into()))
 }
 
 fn index_file_count(index: &LtfsIndex) -> u64 {
@@ -1471,6 +1617,11 @@ pub async fn commit_active_media_batch<'a>(
         previous,
         current,
         files,
+        physical_paths: uploads
+            .iter()
+            .zip(physical_paths)
+            .map(|(upload, path)| (upload.intent.file_id, path))
+            .collect(),
     })
 }
 
@@ -1504,6 +1655,46 @@ pub async fn publish_active_media_batch<'a>(
         return Err(TapeError::Catalog(
             "FDB 活动发布时已观察索引与介质不一致".into(),
         ));
+    }
+
+    {
+        let source = CommittedLayoutSource::new(&mut committed.volume)
+            .map_err(|error| catalog_error("核对已提交正文布局", error))?;
+        let mut supported = true;
+        for file in &committed.files {
+            supported &= source
+                .projection_supported(layout_path(&committed.physical_paths, file)?)
+                .map_err(|error| catalog_error("正文布局尺寸预检", error))?;
+        }
+        if supported {
+            expect_outcome(
+                "声明正文布局要求",
+                catalog
+                    .require_observed_active_body_layouts(
+                        serial,
+                        owner_epoch,
+                        volume,
+                        generation,
+                        committed.batch_id,
+                    )
+                    .await
+                    .map_err(|error| catalog_error("声明正文布局要求", error))?,
+                &[
+                    ActivePreparationOutcome::Prepared,
+                    ActivePreparationOutcome::AlreadyPrepared,
+                ],
+            )?;
+            for file in &committed.files {
+                let layout = source
+                    .prepared(layout_path(&committed.physical_paths, file)?, file)
+                    .map_err(|error| catalog_error("提取已提交正文布局", error))?
+                    .ok_or_else(|| TapeError::Catalog("正文布局支持范围在预检后改变".into()))?;
+                catalog
+                    .stage_observed_body_layout(serial, owner_epoch, committed.batch_id, &layout)
+                    .await
+                    .map_err(|error| catalog_error("持久化已提交正文布局", error))?;
+            }
+        }
     }
 
     committed

@@ -16,6 +16,8 @@ pub struct CapturedIndexSource {
     source_bytes: u64,
     construct_end: u64,
     scope: IndexSourceScope,
+    full_history: Option<FullHistoryDirectory>,
+    history_hint_used: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,7 +31,146 @@ pub enum IndexSourceScope {
     Recorded,
 }
 
+/// Expected physical bounds of a previously verified complete Current Full.
+/// May carry its bounded physical history schedule for a fresh readback.
+pub struct ReclaimReadbackFullHead {
+    construct_end: u64,
+    scope: IndexSourceScope,
+    history: FullHistoryManifest,
+    schedule: Option<FullHistoryDirectory>,
+}
+
+impl ReclaimReadbackFullHead {
+    /// Independently read the current Full, all predecessors, and DP/IP.
+    /// An exact raw Full match preserves the already-verified tree and
+    /// member layouts; no second replay database is needed.
+    pub fn verify(
+        self,
+        drive: &TapeDrive<'_>,
+        label: &LtfsLabel,
+        budget: &RecoveryBudget,
+    ) -> Result<()> {
+        let (proof, history) = if let Some(schedule) = self
+            .schedule
+            .filter(|schedule| Self::schedule_fits(schedule, budget.index_scratch.max_bytes))
+        {
+            if schedule.manifest() != self.history
+                || label.volume_uuid != self.history.head.volume_uuid
+                || !self
+                    .history
+                    .matches(label, self.history.head, self.construct_end)
+            {
+                return Err(TapeError::RecoveryRestricted {
+                    reason: "回收组历史排程与原卷头、标签或EOD不符".into(),
+                });
+            }
+            let mut remaining = budget.clone();
+            remaining.index_scratch.max_bytes -= schedule.reserved_bytes();
+            let proof = super::streamed::verify_scheduled_full_recovery(
+                drive, label, &remaining, &schedule,
+            )?;
+            (proof, self.history)
+        } else {
+            super::streamed::verify_complete_full_recovery(drive, label, budget)?
+        };
+        let scope = IndexSourceScope::Current {
+            dp_eod: proof.dp_eod,
+            ip_generation: proof.ip_generation,
+            history_depth: proof.history_depth,
+            history_truncated: proof.history_truncated,
+        };
+        if proof.construct != self.history.head
+            || proof.dp_eod != self.construct_end
+            || scope != self.scope
+            || history != self.history
+        {
+            return Err(TapeError::RecoveryRestricted {
+                reason: "回收组正文读后实际卷头、历史或EOD/closing改变".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn schedule_fits(schedule: &FullHistoryDirectory, scratch_bytes: u64) -> bool {
+        // The old history directory still holds its comparison reservation.
+        // Leave at least that much for the fresh ascending comparison.
+        let reserved = schedule.reserved_bytes();
+        scratch_bytes.saturating_sub(reserved) >= reserved
+    }
+}
+
 impl CapturedIndexSource {
+    // A complete Full capture keeps the replay and history directory while
+    // allocating the final DP/IP comparison. Reserve one chunk for each.
+    pub(crate) const RECLAIM_PREFLIGHT_SCRATCH_MIN_BYTES: u64 =
+        3 * super::super::index_scratch::CHUNK;
+    pub(crate) const RECLAIM_PREFLIGHT_WITH_HINT_SCRATCH_MIN_BYTES: u64 =
+        Self::RECLAIM_PREFLIGHT_SCRATCH_MIN_BYTES + super::super::index_scratch::CHUNK;
+
+    pub(crate) fn scratch_reserved_bytes(&self) -> u64 {
+        self.replay.reserved_bytes().saturating_add(
+            self.full_history
+                .as_ref()
+                .map_or(0, FullHistoryDirectory::reserved_bytes),
+        )
+    }
+
+    /// Only a verified complete Current Full with a canonical history
+    /// directory can take the compact destination readback path.
+    pub fn reclaim_readback_full_head(&self) -> Option<ReclaimReadbackFullHead> {
+        let IndexSourceScope::Current {
+            dp_eod,
+            history_truncated: false,
+            ..
+        } = self.scope
+        else {
+            return None;
+        };
+        let history = self.full_history.as_ref()?.manifest();
+        if self.construct.incremental
+            || !self.predecessors.is_empty()
+            || self.construct != history.head
+            || self.construct_end != dp_eod
+            || history.dp_eod != dp_eod
+        {
+            return None;
+        }
+        Some(ReclaimReadbackFullHead {
+            construct_end: self.construct_end,
+            scope: self.scope,
+            history,
+            schedule: None,
+        })
+    }
+
+    /// Keep only the eligible history directory across the body read. The
+    /// replay can be dropped before B obtains its own comparison database.
+    pub fn take_reclaim_readback_full_head(
+        &mut self,
+        scratch_bytes: u64,
+    ) -> Option<ReclaimReadbackFullHead> {
+        let mut full_head = self.reclaim_readback_full_head()?;
+        full_head.schedule = self
+            .take_full_history_hint()
+            .filter(|schedule| ReclaimReadbackFullHead::schedule_fits(schedule, scratch_bytes));
+        Some(full_head)
+    }
+
+    /// Whether this capture actually completed physical ascending hint reads.
+    pub fn history_hint_used(&self) -> bool {
+        self.history_hint_used
+    }
+
+    /// Complete Full-history addresses from this actual capture. These remain
+    /// scheduling hints: a later capture must read every construct again.
+    pub fn full_history_hint(&self) -> Option<&FullHistoryDirectory> {
+        self.full_history.as_ref()
+    }
+
+    pub fn take_full_history_hint(&mut self) -> Option<FullHistoryDirectory> {
+        self.full_history.take()
+    }
+
     pub fn scope(&self) -> IndexSourceScope {
         self.scope
     }
@@ -95,8 +236,84 @@ pub fn capture_complete_index_source(
     label: &LtfsLabel,
     budget: &RecoveryBudget,
 ) -> Result<CapturedIndexSource> {
-    let captured =
-        capture_index_source(drive, label, &budget.clone().with_complete_full_history())?;
+    capture_complete_index_source_with_history_hint(drive, label, budget, None)
+}
+
+/// Capture the target preparation view and audit its Full history under the
+/// same read-only guard. The private replay seeds the audit, which still
+/// independently rereads the current DP head and verifies IP before return.
+pub fn capture_reclaim_preparation_index_source(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    budget: &RecoveryBudget,
+) -> Result<CapturedIndexSource> {
+    capture_reclaim_preparation_index_source_with_history_hint(drive, label, budget, None)
+}
+
+/// Use a bounded history schedule without losing the preparation-specific
+/// head reuse when the schedule is missing or cannot be used.
+pub fn capture_reclaim_preparation_index_source_with_history_hint(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    budget: &RecoveryBudget,
+    hint: Option<FullHistoryDirectory>,
+) -> Result<CapturedIndexSource> {
+    capture_complete_index_source_inner(drive, label, budget, hint, true)
+}
+
+/// A hint changes read order only. Ownership is transferred so its temporary
+/// disk reservation can be released before an optional-capacity fallback.
+/// Every historical XML/filemark/hash and original DP/IP check still runs.
+pub fn capture_complete_index_source_with_history_hint(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    budget: &RecoveryBudget,
+    hint: Option<FullHistoryDirectory>,
+) -> Result<CapturedIndexSource> {
+    capture_complete_index_source_inner(drive, label, budget, hint, false)
+}
+
+fn capture_complete_index_source_inner(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    budget: &RecoveryBudget,
+    hint: Option<FullHistoryDirectory>,
+    reuse_captured_full: bool,
+) -> Result<CapturedIndexSource> {
+    let mut hint = hint;
+    let complete = budget.clone().with_complete_full_history();
+    let mut with_hint = complete.clone();
+    with_hint.index_scratch.max_bytes = complete.index_scratch.max_bytes.saturating_sub(
+        hint.as_ref()
+            .map_or(0, FullHistoryDirectory::reserved_bytes),
+    );
+    let mut optional_capacity = false;
+    let result = capture_index_source_inner(
+        drive,
+        label,
+        &with_hint,
+        hint.as_mut(),
+        true,
+        reuse_captured_full,
+        &mut optional_capacity,
+    );
+    let captured = match result {
+        // Only policy capacity from the optional directory may try the exact
+        // original complete capture without it. Device/IO/parse errors escape.
+        Err(TapeError::LocalCapacity { .. }) if optional_capacity => {
+            drop(hint);
+            capture_index_source_inner(
+                drive,
+                label,
+                &complete,
+                None,
+                false,
+                reuse_captured_full,
+                &mut false,
+            )?
+        }
+        other => other?,
+    };
     if matches!(
         captured.scope(),
         IndexSourceScope::Current {
@@ -119,34 +336,97 @@ pub fn capture_index_source(
     label: &LtfsLabel,
     budget: &RecoveryBudget,
 ) -> Result<CapturedIndexSource> {
-    let HeadPayload {
-        construct,
-        head,
-        replay,
-        bytes,
-        eod,
-    } = capture_head_payload(drive, label, budget)?;
+    capture_index_source_inner(drive, label, budget, None, false, false, &mut false)
+}
+
+fn capture_index_source_inner(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    budget: &RecoveryBudget,
+    hint: Option<&mut FullHistoryDirectory>,
+    collect_history: bool,
+    reuse_captured_full: bool,
+    optional_capacity: &mut bool,
+) -> Result<CapturedIndexSource> {
+    *optional_capacity = hint.is_some();
+    let mut full_history = None;
+    let mut history_hint_used = false;
+    let payload = capture_head_payload(drive, label, budget)?;
+    let construct = payload.construct;
+    let eod = payload.eod;
     let (header, predecessors, ip_generation, history_depth, history_truncated) =
-        if head.incremental {
-            let (proof, view) =
-                verify_incremental_replay(drive, label, construct, budget, &replay, head)?;
+        if construct.incremental {
+            let (proof, view) = verify_incremental_replay(
+                drive,
+                label,
+                construct,
+                budget,
+                &payload.replay,
+                payload.head,
+            )?;
             let depth = proof.predecessors.len() as u32;
             (view, proof.predecessors, proof.ip_generation, depth, false)
         } else {
-            replay.load_full(0, head.highest_file_uid)?;
+            payload.replay.load_full(0, payload.head.highest_file_uid)?;
+            *optional_capacity |= collect_history;
             let mut remaining = budget.clone();
             remaining.index_scratch.max_bytes = budget
                 .index_scratch
                 .max_bytes
-                .saturating_sub(replay.reserved_bytes());
-            let proof = capture_full_recovery(drive, label, &remaining, &mut std::io::sink())?;
+                .saturating_sub(payload.replay.reserved_bytes());
+            let candidate = match hint {
+                Some(hint) if hint.manifest().matches(label, construct, eod) => Some(hint),
+                Some(hint) => {
+                    if hint.try_append_successor_candidate(
+                        label,
+                        construct,
+                        eod,
+                        payload.head.previous_location,
+                    )? {
+                        Some(hint)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            };
+            let hinted = if let Some(hint) = candidate {
+                super::streamed::capture_full_recovery_from_hint(
+                    drive,
+                    label,
+                    &remaining,
+                    hint,
+                    collect_history,
+                )?
+            } else {
+                None
+            };
+            history_hint_used = hinted.is_some();
+            let (proof, directory) = match hinted {
+                Some(proof) => proof,
+                None if reuse_captured_full => super::streamed::capture_full_recovery_from_payload(
+                    drive,
+                    label,
+                    &remaining,
+                    &payload,
+                    collect_history,
+                )?,
+                None => super::streamed::capture_full_recovery_collect(
+                    drive,
+                    label,
+                    &remaining,
+                    &mut std::io::sink(),
+                    collect_history,
+                )?,
+            };
+            full_history = directory;
             if proof.construct != construct || proof.dp_eod != eod {
                 return Err(TapeError::RecoveryRestricted {
                     reason: "Full 来源在捕获和核验之间改变".into(),
                 });
             }
             (
-                head,
+                payload.head,
                 Vec::new(),
                 proof.ip_generation,
                 proof.history_depth,
@@ -156,10 +436,12 @@ pub fn capture_index_source(
     Ok(CapturedIndexSource {
         construct,
         header,
-        replay,
+        replay: payload.replay,
         predecessors,
-        source_bytes: bytes,
+        source_bytes: payload.bytes,
         construct_end: eod,
+        full_history,
+        history_hint_used,
         scope: IndexSourceScope::Current {
             dp_eod: eod,
             ip_generation,
@@ -198,6 +480,8 @@ pub(crate) fn capture_dp_checkpoint_source(
         predecessors,
         source_bytes: bytes,
         construct_end: eod,
+        full_history: None,
+        history_hint_used: false,
         scope: IndexSourceScope::Recorded,
     })
 }
@@ -256,12 +540,12 @@ pub(crate) fn capture_current_read_index(
     })
 }
 
-struct HeadPayload {
-    construct: CommittedIndexConstruct,
-    head: LtfsIndex,
-    replay: IndexReplay,
-    bytes: u64,
-    eod: u64,
+pub(super) struct HeadPayload {
+    pub(super) construct: CommittedIndexConstruct,
+    pub(super) head: LtfsIndex,
+    pub(super) replay: IndexReplay,
+    pub(super) bytes: u64,
+    pub(super) eod: u64,
 }
 
 fn capture_head_payload(
@@ -317,7 +601,25 @@ pub fn capture_recorded_index_source(
     expected: &IndexSourceIdentity,
     budget: &RecoveryBudget,
 ) -> Result<CapturedIndexSource> {
-    let target = expected.head();
+    let captured = capture_recorded_construct_source(drive, label, expected.head(), budget)?;
+    if captured.predecessors != expected.predecessors() {
+        return Err(TapeError::Catalog(
+            "历史来源完整前驱链与持久证据不符".into(),
+        ));
+    }
+    Ok(captured)
+}
+
+/// Capture an exact durable construct and discover its actual replay chain.
+/// This grants no latest-head or owner authority; callers must validate both
+/// independently before releasing content. A durable identity, when present,
+/// must use `capture_recorded_index_source` to retain its exact-chain check.
+pub(crate) fn capture_recorded_construct_source(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    target: CommittedIndexConstruct,
+    budget: &RecoveryBudget,
+) -> Result<CapturedIndexSource> {
     if target.volume_uuid != label.volume_uuid || target.location.partition != label.data_partition
     {
         return Err(TapeError::Catalog("历史来源与介质标签不符".into()));
@@ -360,11 +662,6 @@ pub fn capture_recorded_index_source(
         replay.load_full(0, head.highest_file_uid)?;
         (Vec::new(), head)
     };
-    if predecessors != expected.predecessors() {
-        return Err(TapeError::Catalog(
-            "历史来源完整前驱链与持久证据不符".into(),
-        ));
-    }
     Ok(CapturedIndexSource {
         construct: target,
         header,
@@ -372,6 +669,8 @@ pub fn capture_recorded_index_source(
         predecessors,
         source_bytes,
         construct_end,
+        full_history: None,
+        history_hint_used: false,
         scope: IndexSourceScope::Recorded,
     })
 }

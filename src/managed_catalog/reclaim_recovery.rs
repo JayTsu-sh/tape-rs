@@ -125,32 +125,16 @@ impl ManagedCatalog {
                                 };
                                 // Validate fields before using the private, structurally
                                 // trusted handle's infallible accessors.
-                                let fields = [
-                                    "version",
-                                    "library",
-                                    "namespace",
-                                    "epoch",
-                                    "operation",
-                                    "change",
-                                    "scan",
-                                    "scan_generation",
-                                    "index",
-                                ];
                                 let intent = &reservation.intent;
-                                if intent["version"] != 1
-                                    || intent["library"] != serial
+                                let spec = validate_parent_intent(intent)
+                                    .map_err(|_| CatalogError::Corrupt("回收接任原意图结构"))?;
+                                if intent["library"] != serial
                                     || intent["namespace"] != ns.to_string()
                                     || intent["epoch"] != token["epoch"]
                                     || intent["operation"] != token["operation"]
-                                    || !intent.as_object().is_some_and(|m| {
-                                        m.len() == fields.len()
-                                            && m.keys().all(|k| fields.contains(&k.as_str()))
-                                    })
                                 {
                                     return Err(CatalogError::Corrupt("回收接任意图结构"));
                                 }
-                                let spec = ReclaimSpec::parse(&intent["change"])
-                                    .map_err(|_| CatalogError::Corrupt("回收接任原磁带身份"))?;
                                 if spec.pool != pool {
                                     return Err(CatalogError::Corrupt("回收接任池身份"));
                                 }

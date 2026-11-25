@@ -97,6 +97,7 @@ pub use node_rename::{
 pub(super) use node_rename::{require_rename_discard_at, require_rename_observation_at};
 #[path = "node_tasks.rs"]
 mod node_tasks;
+pub(super) use node_tasks::pending_library_prefix as pending_node_task_prefix;
 pub use node_tasks::{
     NodeMutationTask, NodeMutationTaskKind, NodeMutationTaskOutcome, NodeMutationTaskState,
     NodeMutationTaskStatus,
@@ -573,6 +574,34 @@ pub(super) async fn verified_placement(
     volume_id: Uuid,
 ) -> Result<Option<VolumePlacement>> {
     verified_placement_in_state(tr, volume_id, NamespaceState::Ready).await
+}
+
+/// Capture exact placement/policy rows at the caller's read version. This is
+/// a short-lived comparison snapshot, never a second key schema or authority.
+pub(super) async fn body_layout_snapshot_rows_at(
+    tr: &Transaction,
+    placement: &VolumePlacement,
+) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+    let p = placement;
+    let keys = [
+        placement_key(p.volume_id),
+        assignment_key(&p.library_serial, &p.barcode),
+        barcode_key(&p.library_serial, &p.barcode),
+        namespace_assignment_key(p.namespace, p.pool_id, &p.library_serial, &p.barcode),
+        pool_key(p.namespace, p.pool_id),
+        retired_pool_key(p.namespace, p.pool_id),
+        library_key(p.namespace, &p.library_serial),
+        managed_layout_key(p.namespace),
+    ];
+    let mut rows = Vec::with_capacity(keys.len());
+    for key in keys {
+        let value = tr.get(&key, false).await?;
+        if value.as_ref().is_some_and(|value| value.len() > 100_000) {
+            return Err(CatalogError::Corrupt("正文布局归属快照值过长"));
+        }
+        rows.push((key, value.map(|value| value.to_vec())));
+    }
+    Ok(rows)
 }
 
 pub(super) async fn verified_import_placement(

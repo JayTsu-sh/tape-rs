@@ -211,7 +211,28 @@ impl ReclaimFormatCommitEvidence {
         actual: &crate::ltfs::recovery::CapturedIndexSource,
     ) -> Result<Self> {
         use crate::ltfs::recovery::IndexSourceScope;
-        let index: ActiveIndexIdentity = actual.construct().into();
+        if actual.construct_end() != crate::ltfs::volume::FIRST_INDEX_BLOCK + 2
+            || !matches!(actual.scope(),IndexSourceScope::Current {dp_eod,ip_generation:Some(1),..} if dp_eod==actual.construct_end())
+            || !actual.predecessors().is_empty()
+        {
+            return Err(CatalogError::Invalid(
+                "初始化结果不是原固定空索引及完整两分区检查点",
+            ));
+        }
+        Self::from_empty_head(plan, owner, actual.construct())
+    }
+    pub(crate) fn from_verified_reset(
+        plan: &ReclaimFormatPlan,
+        owner: u64,
+        actual: crate::daemon::fdb_reclaim_format::VerifiedEmptyReset,
+    ) -> Result<Self> {
+        Self::from_empty_head(plan, owner, actual.head())
+    }
+    fn from_empty_head(
+        plan: &ReclaimFormatPlan,
+        owner: u64,
+        index: crate::ltfs::volume::CommittedIndexConstruct,
+    ) -> Result<Self> {
         let options = crate::ltfs::mkltfs::MkltfsOptions {
             volume_uuid: Some(plan.output()),
             quick: true,
@@ -229,17 +250,13 @@ impl ReclaimFormatCommitEvidence {
             || index.location.partition != crate::ltfs::label::PART_DATA
             || index.location.start_block != crate::ltfs::volume::FIRST_INDEX_BLOCK
             || index.sha256 != <[u8; 32]>::from(Sha256::digest(expected))
-            || actual.construct_end() != crate::ltfs::volume::FIRST_INDEX_BLOCK + 2
-            || !matches!(actual.scope(),IndexSourceScope::Current {dp_eod,ip_generation:Some(1),..} if dp_eod==actual.construct_end())
-            || !actual.predecessors().is_empty()
         {
             return Err(CatalogError::Invalid(
                 "初始化结果不是原固定空索引及完整两分区检查点",
             ));
         }
         let source = NativeMediaSource {
-            identity: actual
-                .identity()
+            identity: crate::ltfs::recovery::IndexSourceIdentity::new(index, Vec::new())
                 .map_err(|e| CatalogError::Cache(e.to_string()))?,
             files: 0,
             paths: 0,
@@ -273,11 +290,22 @@ async fn output_at(
 ) -> Result<()> {
     let output = node_mutation::id(&goal.output)?;
     let claim = goal.claim(reservation)?;
-    for key in [
+    // These non-snapshot reads use one transaction and do not depend on each
+    // other's values. Start the point reads together before awaiting results.
+    let claims = [
         output_reservation(output),
         native_media::volume_claim_key(output),
-    ] {
-        let raw = tr.get(&key, false).await?;
+    ]
+    .map(|key| tr.get(&key, false));
+    let occupied = [
+        placement_key(output),
+        ready_volume_key(output),
+        reconcile_volume_key(output),
+        node_attempts::volume_key(output),
+    ]
+    .map(|key| tr.get(&key, false));
+    for claim_read in claims {
+        let raw = claim_read.await?;
         if owned && raw.as_deref() != Some(claim.as_slice()) {
             return Err(CatalogError::Corrupt("回收原输出 UUID 占用丢失或冲突"));
         }
@@ -292,13 +320,8 @@ async fn output_at(
             "回收输出 UUID 已有历史扫描，不能复用",
         ));
     }
-    for key in [
-        placement_key(output),
-        ready_volume_key(output),
-        reconcile_volume_key(output),
-        node_attempts::volume_key(output),
-    ] {
-        if tr.get(&key, false).await?.is_some() {
+    for occupancy_read in occupied {
+        if occupancy_read.await?.is_some() {
             return Err(CatalogError::Invalid("回收输出 UUID 已被使用"));
         }
     }
@@ -336,6 +359,22 @@ async fn gates_at(
     owner: u64,
     goal: Option<&Goal>,
 ) -> Result<[u8; 32]> {
+    let parent = record_at(tr, reservation, owner).await?;
+    if parent["owner_epoch"] != owner {
+        return Err(CatalogError::OwnerFenced);
+    }
+    gates_after_parent_at(tr, reservation, owner, goal).await
+}
+
+// The caller has checked the live parent and owner in this transaction.
+async fn gates_after_parent_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    owner: u64,
+    goal: Option<&Goal>,
+) -> Result<[u8; 32]> {
+    isolation::require_normal_mutation_at(tr, reservation, owner).await?;
+    source::group_only::require_ready_at(tr,reservation,owner,None).await?;
     mechanics::require_parent_idle_at(tr, reservation).await?;
     if let Some(layout) = layout::at(tr, reservation).await? {
         let destination = tape_monitor::read_at(
@@ -357,15 +396,13 @@ async fn gates_at(
         }
     }
     upload_recovery::require_idle_at(tr, reservation).await?;
-    let parent = record_at(tr, reservation, owner).await?;
-    if parent["owner_epoch"] != owner {
-        return Err(CatalogError::OwnerFenced);
-    }
+    copy_groups::require_no_unsettled_at(tr, reservation).await?;
     source_state_at(tr, reservation).await?;
     if !walk::current_state_at(tr, reservation).await?.complete() {
         return Err(CatalogError::Incomplete);
     }
     let coverage = source::require_complete_coverage_at(tr, reservation, owner).await?;
+    let coverage=copy_groups::require_format_audit_at(tr,reservation,coverage).await?;
     let volume = reservation.spec().volume();
     let mut prefix = super::super::key(b'V');
     prefix.extend_from_slice(volume.as_bytes());
@@ -602,10 +639,27 @@ impl ManagedCatalog {
             .await?
             .ok_or(CatalogError::Incomplete)?;
         if saved != *original
-            || gates_at(&tr, reservation, owner, Some(&saved.goal)).await? != saved.goal.coverage
+            || gates_after_parent_at(&tr, reservation, owner, Some(&saved.goal)).await?
+                != saved.goal.coverage
         {
             return Err(CatalogError::Invalid("回收格式化原目标或双门槛改变"));
         }
         Ok(())
+    }
+
+    pub(crate) async fn verify_reclaim_format_for_route(
+        &self,
+        reservation: &ReclaimReservation,
+        route: ActiveLibraryRoute,
+        owner: u64,
+        original: &ReclaimFormatPlan,
+    ) -> Result<()> {
+        if route != reservation.route {
+            return Err(CatalogError::OwnerFenced);
+        }
+        // The parent check verifies this exact route and owner with the plan
+        // and gates at one fresh read version.
+        self.verify_reclaim_format(reservation, owner, original)
+            .await
     }
 }

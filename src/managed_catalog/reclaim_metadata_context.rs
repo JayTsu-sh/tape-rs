@@ -107,6 +107,7 @@ pub(super) async fn claimed_task_at(
 ) -> Result<ReclaimMetadataWrite> {
     original.encode()?;
     parent_at(tr, reservation, owner).await?;
+    isolation::require_normal_mutation_at(tr, reservation, owner).await?;
     let task = load_id_at(tr, reservation, original.plan().source_uid(), original.id())
         .await?
         .ok_or(CatalogError::Incomplete)?;

@@ -4823,3 +4823,7 @@ mod reclaim_source_tests;
 #[cfg(test)]
 #[path = "native_media_reclaim_cancel_tests.rs"]
 mod reclaim_cancel_tests;
+
+#[cfg(test)]
+#[path = "native_media_retained_layout_tests.rs"]
+mod retained_layout_tests;

@@ -34,7 +34,9 @@ impl ActiveMediaReader<'_> {
             return Ok(None);
         };
         require_pool(pool, source.placement().pool_id)?;
-        if source.copy().media.is_some()
+        if source.layout_binding().is_none()
+            || source.needs_marker_upgrade()
+            || source.copy().media.is_some()
             || !matches!(source.copy().content_digest, ContentDigest::Sha256(_))
             || self.device.session_epoch().is_none()
         {
@@ -159,10 +161,13 @@ impl ActiveMediaReader<'_> {
                 }
             }
         };
-        let plan = session
-            .captured
-            .entry_by_uid(source.copy().ltfs_file_uid)?
-            .and_then(|entry| source.plan_current_body(entry));
+        let plan = VerifiedPhysicalPlan::from_current_read(
+            &source,
+            &session.captured,
+            &session.label,
+            spool_dir,
+            self.storage,
+        )?;
         let Some(plan) = plan else {
             // A retained historical UID may no longer occur in the current
             // tree, or may describe a different version. Preserve its exact
@@ -172,6 +177,45 @@ impl ActiveMediaReader<'_> {
             return self
                 .read_with_cache_scoped(path, pool, cache_dir, spool_dir)
                 .await;
+        };
+        let plan = if let Some(binding) = source.layout_binding() {
+            if plan.scratch_bytes().saturating_add(binding.encoded_bytes())
+                > self.storage.index_bytes
+            {
+                // Optional session comparison must not double the plan budget.
+                drop(plan);
+                drop(session);
+                drop(file);
+                return self
+                    .read_with_cache_scoped(path, pool, cache_dir, spool_dir)
+                    .await;
+            }
+            let temporary = download_file(
+                spool_dir,
+                binding.encoded_bytes(),
+                ReadStorageBudget {
+                    download_bytes: self.storage.index_bytes,
+                    ..self.storage
+                },
+            )?;
+            let stored = self
+                .catalog
+                .prepare_body_read_plan(binding, temporary, self.storage.index_bytes)
+                .await?;
+            if !plan.same_location(&stored)? {
+                // The current view cannot substitute a different physical
+                // position for this original copy's authoritative FDB layout.
+                drop(stored);
+                drop(plan);
+                drop(session);
+                drop(file);
+                return self
+                    .read_with_cache_scoped(path, pool, cache_dir, spool_dir)
+                    .await;
+            }
+            stored
+        } else {
+            return Err(TapeError::Catalog("顺序读缺少已发布 FDB 正文布局".into()));
         };
         let tracked =
             crate::daemon::executor::fdb_monitor::Tracked::new(self.device, "sequential_read");
@@ -201,20 +245,22 @@ impl ActiveMediaReader<'_> {
         });
         let mut writer = DigestingFile {
             file,
-            remaining: plan.copy.size,
+            remaining: source.copy().size,
             digest: ReadDigest::Sha256(Sha256::new()),
         };
-        crate::ltfs::volume::read_cached_file_sequential_to_writer(
+        crate::ltfs::volume::read_extent_plan_sequential_to_writer(
             &checked,
             &session.label,
-            &plan.physical,
+            plan.path(),
+            plan.length(),
+            plan.extents(),
             &mut writer,
         )?;
         let ReadDigest::Sha256(hash) = writer.digest else {
             unreachable!("SHA-only sequential body proof")
         };
         if writer.remaining != 0
-            || ContentDigest::Sha256(hash.finalize().into()) != plan.copy.content_digest
+            || ContentDigest::Sha256(hash.finalize().into()) != source.copy().content_digest
         {
             return Err(TapeError::Catalog("顺序读正文长度或 SHA-256 不符".into()));
         }
@@ -255,7 +301,8 @@ impl ActiveMediaReader<'_> {
         writer.file.rewind()?;
         *saved = Some(session);
         Ok(Some(ActiveMediaRead {
-            metadata: plan,
+            metadata: source.metadata(),
+            physical: plan,
             verified_head: head.index,
             file: writer.file,
         }))

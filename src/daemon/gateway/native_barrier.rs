@@ -118,11 +118,17 @@ pub(super) async fn respond(
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let before = ctx.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        ctx.files
+            .verify_control_only_status(&before)
+            .map_err(|e| e.to_string())?;
         let audit = ctx
             .files
             .catalog_cutover_audit()
             .map_err(|e| e.to_string())?;
         let after = ctx.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        ctx.files
+            .verify_control_only_status(&after)
+            .map_err(|e| e.to_string())?;
         Ok::<_, String>(build(&serial, challenge, &members, &before, &after, audit))
     })
     .await

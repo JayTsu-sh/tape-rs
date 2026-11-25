@@ -14,6 +14,14 @@ pub(super) struct FullIndexComparison {
 }
 
 impl FullIndexComparison {
+    pub(super) fn database(&self) -> &ScratchDatabase {
+        &self.db
+    }
+
+    pub(super) fn into_database(self) -> ScratchDatabase {
+        self.db
+    }
+
     pub(super) fn empty_dp(&self) -> Result<bool> {
         Ok(!self
             .db

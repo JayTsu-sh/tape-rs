@@ -250,9 +250,11 @@ fn validate_device_change(change: &Value) -> Result<()> {
         ],
         _ => return Ok(()),
     };
-    if !change
-        .as_object()
-        .is_some_and(|v| v.len() == fields.len() && v.keys().all(|k| fields.contains(&k.as_str())))
+    if !change.as_object().is_some_and(|v| {
+        let group_only = kind == "media-reclaim" && change["mode"] == "group-only";
+        v.len() == fields.len() + usize::from(group_only)
+            && v.keys().all(|k| fields.contains(&k.as_str()) || group_only && k == "mode")
+    })
     {
         return Err(invalid("设备管理请求字段无效"));
     }
@@ -692,3 +694,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "management_group_only_tests.rs"]
+mod group_only_mode_tests;

@@ -323,6 +323,7 @@ async fn scope(
 ) -> Result<()> {
     plan.validate()?;
     let parent = record_at(tr, reservation, owner).await?;
+    isolation::require_normal_mutation_at(tr, reservation, owner).await?;
     if let Some(layout) = layout::at(tr, reservation).await? {
         layout.require_plan(plan)?;
     }

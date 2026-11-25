@@ -21,6 +21,7 @@ impl ManagedCatalog {
                     requests::retry_result(
                         async {
                             parent_at(&tr, reservation, owner).await?;
+                            isolation::require_normal_mutation_at(&tr, reservation, owner).await?;
                             let plan = original.plan();
                             let mut task =
                                 load_id_at(&tr, reservation, plan.source_uid(), original.id())

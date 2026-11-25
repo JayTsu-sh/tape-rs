@@ -47,6 +47,28 @@ struct Args {
     #[cfg(feature = "fdb")]
     #[arg(long, value_name = "PATH")]
     fdb_cluster_file: Option<PathBuf>,
+    /// 全体设备执行器停机且待执行设备命令已排空后，为指定带库离线启用交还协议并退出
+    #[cfg(feature = "fdb")]
+    #[arg(long, value_name = "SERIAL", requires_all = ["fdb_cluster_file", "libraries_config", "handoff_namespace"],
+        conflicts_with_all = ["fdb_control_only", "fdb_metadata_readonly", "fdb_owner_mode", "expand_libraries_offline", "replace_drive_offline", "remove_drive_offline"])]
+    enable_library_handoff_offline: Option<String>,
+    /// 离线启用的原带库 FDB namespace
+    #[cfg(feature = "fdb")]
+    #[arg(long, requires = "enable_library_handoff_offline")]
+    handoff_namespace: Option<uuid::Uuid>,
+    /// 同一停机和排空条件下，只读核验已发起的交还，并补存原操作回执
+    #[cfg(feature = "fdb")]
+    #[arg(long, requires = "enable_library_handoff_offline", value_name = "UUID")]
+    verify_release_operation: Option<uuid::Uuid>,
+    /// 显式无业务控制副本：只观察原 Frozen 空目录，永不打开设备或暂存区
+    #[cfg(feature = "fdb")]
+    #[arg(long, requires_all = ["fdb_cluster_file", "libraries_config", "control_binding"],
+        conflicts_with_all = ["fdb_metadata_readonly", "fdb_owner_readonly", "fdb_owner_writable", "fdb_s3", "s3_listen", "http_vip", "demo_write", "salvage", "expand_libraries_offline", "replace_drive_offline", "remove_drive_offline"])]
+    fdb_control_only: bool,
+    /// 该节点原链、Frozen 目录与 FDB 原路由的不可变绑定 JSON
+    #[cfg(feature = "fdb")]
+    #[arg(long, requires = "fdb_control_only", value_name = "FILE")]
+    control_binding: Option<PathBuf>,
     /// 只读 FDB 目录元数据入口；不启动旧 Raft/SQLite 文件服务或设备执行器
     #[cfg(feature = "fdb")]
     #[arg(
@@ -233,6 +255,36 @@ fn install_signal_handler(inbox: std::sync::mpsc::Sender<NodeInput>) {
         .expect("信号线程");
 }
 
+#[cfg(feature = "fdb")]
+fn require_handoff_peers_offline(peers: &HashMap<u64, String>) -> tape_rs::error::Result<()> {
+    use std::io::ErrorKind;
+    use std::net::{TcpStream, ToSocketAddrs};
+    for (&id, address) in peers {
+        let mut sockets = address.to_socket_addrs()?.peekable();
+        if sockets.peek().is_none() {
+            return Err(tape_rs::error::TapeError::NotReady(format!(
+                "节点 {id} 没有可检查的 Raft 地址"
+            )));
+        }
+        for socket in sockets {
+            match TcpStream::connect_timeout(&socket, Duration::from_millis(500)) {
+                Err(error) if error.kind() == ErrorKind::ConnectionRefused => continue,
+                Err(error) => {
+                    return Err(tape_rs::error::TapeError::NotReady(format!(
+                        "无法确认节点 {id} 的 Raft 端口：{error}"
+                    )));
+                }
+                Ok(_) => {
+                    return Err(tape_rs::error::TapeError::NotReady(format!(
+                        "节点 {id} 的 Raft 端口仍可连接，请先停止全部成员"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
@@ -271,6 +323,42 @@ fn main() {
         eprintln!("--peer 必须列出包含本节点在内的至少三个成员");
         std::process::exit(2);
     }
+    // 在任何目录创建、VIP/provider、网络及 spool 操作之前验证原始来源。
+    #[cfg(feature = "fdb")]
+    let control_binding = if args.fdb_control_only {
+        if peers.get(&me) != Some(&args.listen) {
+            eprintln!("control-only 的 --listen 必须与该节点原成员地址完全一致");
+            std::process::exit(2);
+        }
+        let result = (|| -> tape_rs::error::Result<_> {
+            use tape_rs::daemon::{control_only::ControlOnlyBinding, multilib::LibrariesConfig};
+            let value =
+                serde_json::from_slice(&std::fs::read(args.libraries_config.as_ref().unwrap())?)
+                    .map_err(|e| tape_rs::error::TapeError::Ltfs(format!("多库配置无效：{e}")))?;
+            let config = LibrariesConfig::parse(&value)?;
+            let binding = Arc::new(ControlOnlyBinding::load(
+                args.control_binding.as_ref().unwrap(),
+            )?);
+            binding.validate_local(
+                &args.data_dir,
+                me,
+                &peers,
+                args.fdb_cluster_file.as_ref().unwrap(),
+                &config,
+            )?;
+            let pinned = Arc::new(tape_rs::daemon::control_only::PinnedCluster::new(
+                args.fdb_cluster_file.as_ref().unwrap(),
+                &binding.cluster_sha256,
+            )?);
+            Ok((binding, config, pinned))
+        })();
+        Some(result.unwrap_or_else(|e| {
+            eprintln!("control-only 原始绑定预检失败：{e}");
+            std::process::exit(2);
+        }))
+    } else {
+        None
+    };
     let mut http_vip = args
         .http_vip
         .filter(|_| {
@@ -298,7 +386,13 @@ fn main() {
         });
     let mut ids: Vec<u64> = peers.keys().copied().collect();
     ids.sort();
-    std::fs::create_dir_all(&args.data_dir).expect("创建数据目录");
+    #[cfg(feature = "fdb")]
+    let is_control_only = args.fdb_control_only;
+    #[cfg(not(feature = "fdb"))]
+    let is_control_only = false;
+    if !is_control_only {
+        std::fs::create_dir_all(&args.data_dir).expect("创建数据目录");
+    }
     // 必须在打开 SQLite、清理 spool、启动网络和设备线程之前取得锁。
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
@@ -313,6 +407,64 @@ fn main() {
                 eprintln!("该数据目录已有 ltfsd 实例：{e}");
                 std::process::exit(2)
             });
+    #[cfg(feature = "fdb")]
+    if let Some(serial) = &args.enable_library_handoff_offline {
+        let result = (|| -> tape_rs::error::Result<()> {
+            use tape_rs::daemon::multilib::LibrariesConfig;
+            use tape_rs::error::TapeError;
+            let value =
+                serde_json::from_slice(&std::fs::read(args.libraries_config.as_ref().unwrap())?)
+                    .map_err(|e| TapeError::Ltfs(format!("多库配置 JSON 无效：{e}")))?;
+            let config = LibrariesConfig::parse(&value)?;
+            let library = config
+                .libraries
+                .iter()
+                .find(|entry| entry.changer_serial == *serial)
+                .ok_or_else(|| TapeError::NotReady("配置中不存在目标带库".into()))?;
+            require_handoff_peers_offline(&peers)?;
+            let cluster = args
+                .fdb_cluster_file
+                .as_ref()
+                .unwrap()
+                .to_str()
+                .ok_or_else(|| TapeError::NotReady("FDB 集群文件路径需要有效 UTF-8".into()))?;
+            let _network = unsafe { foundationdb::boot() };
+            let catalog = tape_rs::managed_catalog::ManagedCatalog::open(Some(cluster))
+                .map_err(|e| TapeError::Catalog(e.to_string()))?;
+            let namespace = args.handoff_namespace.unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            if let Some(operation) = args.verify_release_operation {
+                let provider = tape_rs::daemon::executor::OfflineSgProvider(
+                    tape_rs::daemon::executor::SgProvider {
+                        changer_serial: Some(library.changer_serial.clone()),
+                        changer_target_port: library.changer_target_port.clone(),
+                        drive_serials: library.drive_serials.clone(),
+                    },
+                );
+                runtime.block_on(tape_rs::daemon::executor::verify_library_release_offline(
+                    &catalog, serial, namespace, operation, &provider,
+                ))?;
+                println!("带库 {serial} 原交还 {operation} 回执已确认");
+                return Ok(());
+            }
+            runtime
+                .block_on(catalog.enable_library_handoff_offline(serial, namespace))
+                .map_err(|e| TapeError::Catalog(e.to_string()))
+        })();
+        match result {
+            Ok(()) if args.verify_release_operation.is_none() => {
+                println!("带库 {serial} 的交还协议已启用")
+            }
+            Ok(()) => {}
+            Err(error) => {
+                eprintln!("离线启用带库交还失败：{error}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
     if args.expand_libraries_offline
         || args.replace_drive_offline.is_some()
         || args.remove_drive_offline.is_some()
@@ -370,13 +522,45 @@ fn main() {
     #[cfg(feature = "fdb")]
     let mut fdb_routes = None;
     #[cfg(feature = "fdb")]
+    let mut control_authority = None;
+    #[cfg(feature = "fdb")]
     let _fdb_network = if let Some(cluster_file) = args.fdb_cluster_file.as_ref() {
         let network = unsafe { foundationdb::boot() };
-        match preflight_catalog(&args, cluster_file) {
-            Ok(routes) => fdb_routes = Some(routes),
-            Err(error) => {
-                eprintln!("FDB 目录权威预检失败：{error}");
-                std::process::exit(2);
+        if let Some((binding, config, pinned)) = control_binding.as_ref() {
+            use tape_rs::daemon::control_only::{
+                AuthorityReader, CatalogExpectation, FdbAuthorityReader,
+            };
+            let reader = Arc::new(
+                FdbAuthorityReader::open(pinned.clone()).unwrap_or_else(|e| {
+                    eprintln!("control-only 固定连接失败：{e}");
+                    std::process::exit(2);
+                }),
+            );
+            for library in &config.libraries {
+                let actual = reader
+                    .active_route(&library.changer_serial)
+                    .unwrap_or_else(|e| {
+                        eprintln!("control-only FDB 依赖未确认：{e}");
+                        std::process::exit(2);
+                    });
+                let CatalogExpectation::ExistingRoute { route } =
+                    &binding.libraries[&library.changer_serial].catalog
+                else {
+                    unreachable!("本批仅支持 ExistingRoute")
+                };
+                if actual.as_ref() != Some(route) {
+                    eprintln!("control-only 原 FDB 路由绑定不符");
+                    std::process::exit(2);
+                }
+            }
+            control_authority = Some(reader);
+        } else {
+            match preflight_catalog(&args, cluster_file) {
+                Ok(routes) => fdb_routes = Some(routes),
+                Err(error) => {
+                    eprintln!("FDB 目录权威预检失败：{error}");
+                    std::process::exit(2);
+                }
             }
         }
         Some(network)
@@ -439,11 +623,40 @@ fn main() {
     } else {
         None
     };
+    #[cfg(feature = "fdb")]
+    let control = control_binding.map(|(binding, config, _pinned)| {
+        let cluster = args.fdb_cluster_file.as_ref().unwrap();
+        let reader = control_authority
+            .take()
+            .expect("control-only 已用同一固定 catalog 完成预检");
+        let mut audits = std::collections::BTreeMap::new();
+        for library in &config.libraries {
+            let source = binding
+                .audit_source(
+                    &library.changer_serial,
+                    cluster.clone(),
+                    config.clone(),
+                    reader.clone(),
+                )
+                .and_then(|source| {
+                    source.audit()?;
+                    Ok(source)
+                })
+                .unwrap_or_else(|e| {
+                    eprintln!("control-only 原目录/路由预检失败：{e}");
+                    std::process::exit(2);
+                });
+            audits.insert(library.changer_serial.clone(), source);
+        }
+        ControlOnlyMode { audits }
+    });
+    #[cfg(not(feature = "fdb"))]
+    let control = None;
     if args.libraries_config.is_some() {
         #[cfg(feature = "fdb")]
-        let result = run_libraries(args, peers, http_vip, fdb_owner);
+        let result = run_libraries(args, peers, http_vip, control, fdb_owner);
         #[cfg(not(feature = "fdb"))]
-        let result = run_libraries(args, peers, http_vip);
+        let result = run_libraries(args, peers, http_vip, control);
         if let Err(e) = result {
             eprintln!("多库 ltfsd 退出：{e}");
             std::process::exit(1);
@@ -653,6 +866,11 @@ fn preflight_catalog(
 ) -> tape_rs::error::Result<
     std::collections::BTreeMap<String, tape_rs::managed_catalog::ActiveLibraryRoute>,
 > {
+    if args.fdb_control_only {
+        return Err(tape_rs::error::TapeError::Ltfs(
+            "control-only 必须复用固定 catalog 预检，禁止按原路径重连".into(),
+        ));
+    }
     use tape_rs::daemon::multilib::LibrariesConfig;
     use tape_rs::error::TapeError;
     use tape_rs::managed_catalog::ManagedCatalog;
@@ -661,7 +879,9 @@ fn preflight_catalog(
         let value = serde_json::from_slice(&std::fs::read(path)?)
             .map_err(|error| TapeError::Ltfs(format!("多库配置 JSON 无效：{error}")))?;
         let config = LibrariesConfig::parse(&value)?;
-        config.check_manifest(&args.data_dir)?;
+        if !args.fdb_control_only {
+            config.check_manifest(&args.data_dir)?;
+        }
         config
             .load_additions(&args.data_dir)?
             .libraries
@@ -688,7 +908,11 @@ fn preflight_catalog(
         let active = runtime
             .block_on(catalog.active_library_route(serial))
             .map_err(|error| TapeError::Ltfs(format!("带库 {serial} 的 FDB 路由无效：{error}")))?;
-        if args.fdb_metadata_readonly || args.fdb_owner_readonly || args.fdb_owner_writable {
+        if args.fdb_metadata_readonly
+            || args.fdb_owner_readonly
+            || args.fdb_owner_writable
+            || args.fdb_control_only
+        {
             let route = active.ok_or_else(|| {
                 TapeError::Ltfs(format!(
                     "带库 {serial} 尚未激活 FDB 路由，禁止启动 FDB 运行时"
@@ -758,11 +982,16 @@ fn s3_peer_addrs(args: &Args, peers: &HashMap<u64, String>) -> HashMap<u64, Stri
         .collect()
 }
 
+struct ControlOnlyMode {
+    audits: std::collections::BTreeMap<String, tape_rs::daemon::control_only::BoundDirectoryAudit>,
+}
+
 /// 多库启动仍只有一份 RaftStore/TcpNet；每个库使用独立执行线程。
 fn run_libraries(
     args: Args,
     peers: HashMap<u64, String>,
     mut vip: Option<HttpVip>,
+    control: Option<ControlOnlyMode>,
     #[cfg(feature = "fdb")] fdb_owner: Option<FdbOwnerMode>,
 ) -> tape_rs::error::Result<()> {
     use std::collections::BTreeMap;
@@ -773,16 +1002,34 @@ fn run_libraries(
     let value = serde_json::from_slice(&std::fs::read(args.libraries_config.as_ref().unwrap())?)
         .map_err(|e| tape_rs::error::TapeError::Ltfs(format!("多库配置 JSON 无效：{e}")))?;
     let config = LibrariesConfig::parse(&value)?;
-    config.check_manifest(&args.data_dir)?;
+    if let Some(mode) = control.as_ref() {
+        if mode.audits.len() != config.libraries.len() {
+            return Err(tape_rs::error::TapeError::Ltfs(
+                "control-only 库绑定集合不符".into(),
+            ));
+        }
+        for library in &config.libraries {
+            mode.audits
+                .get(&library.changer_serial)
+                .ok_or_else(|| {
+                    tape_rs::error::TapeError::Ltfs("control-only 缺少库来源绑定".into())
+                })?
+                .verify_startup(&args.data_dir, args.id as u64, &peers, &config)?;
+        }
+    } else {
+        config.check_manifest(&args.data_dir)?;
+    }
     let config = config.load_additions(&args.data_dir)?;
     #[cfg(feature = "fdb")]
-    let fdb_active = fdb_owner.is_some();
+    let fdb_active = fdb_owner.is_some() || control.is_some();
     #[cfg(not(feature = "fdb"))]
-    let fdb_active = false;
+    let fdb_active = control.is_some();
     let lock_dir = std::path::Path::new("/run/lock/tape-rs");
-    std::fs::create_dir_all(lock_dir)?;
+    if control.is_none() {
+        std::fs::create_dir_all(lock_dir)?;
+    }
     let mut locks = Vec::new();
-    for l in &config.libraries {
+    for l in config.libraries.iter().filter(|_| control.is_none()) {
         for serial in std::iter::once(&l.changer_serial).chain(&l.drive_serials) {
             let path = lock_dir.join(format!(
                 "ltfsd-{:x}.lock",
@@ -856,30 +1103,40 @@ fn run_libraries(
     };
     for library in &config.libraries {
         let dir = config.library_dir(&args.data_dir, &library.changer_serial);
-        std::fs::create_dir_all(&dir)?;
+        if control.is_none() {
+            std::fs::create_dir_all(&dir)?;
+        }
         let directory_file = (!fdb_active).then(|| dir.join("directory.db"));
         if let Some(path) = directory_file.as_ref() {
             // 旧目录模式先创建目录，HTTP reader 可在协调线程之前打开。
             drop(tape_rs::daemon::directory::Directory::open(path)?);
         }
-        let files = FileService::with_options(
-            dir.join(if fdb_active {
-                "fdb-owner-spool"
-            } else {
-                "spool"
-            }),
-            policy,
-            directory_file.clone(),
-        )?;
+        let files = if let Some(mode) = control.as_ref() {
+            FileService::control_only(Some(mode.audits[&library.changer_serial].clone()))
+        } else {
+            FileService::with_options(
+                dir.join(if fdb_active {
+                    "fdb-owner-spool"
+                } else {
+                    "spool"
+                }),
+                policy,
+                directory_file.clone(),
+            )?
+        };
         let status = Arc::new(Mutex::new(NodeStatus::default()));
         let (exec, requests) = channel();
         let (events, event_rx) = channel();
         files.set_executor(exec.clone());
         files.set_task_events(events.clone());
-        let provider = Box::new(SgProvider {
-            changer_serial: Some(library.changer_serial.clone()),
-            changer_target_port: library.changer_target_port.clone(),
-            drive_serials: library.drive_serials.clone(),
+        let provider = control.is_none().then(|| {
+            #[cfg(test)]
+            CONTROL_ONLY_PROVIDER_CONSTRUCTIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::new(SgProvider {
+                changer_serial: Some(library.changer_serial.clone()),
+                changer_target_port: library.changer_target_port.clone(),
+                drive_serials: library.drive_serials.clone(),
+            })
         });
         let opts = ExecOptions {
             node_id: args.id,
@@ -908,6 +1165,10 @@ fn run_libraries(
         thread::Builder::new()
             .name(format!("ltfsd-{}", library.changer_serial))
             .spawn(move || {
+                let Some(provider) = provider else {
+                    tape_rs::daemon::control_only::run_deny(requests, events);
+                    return;
+                };
                 #[cfg(feature = "fdb")]
                 if let Some(control) = fdb_control {
                     if fdb_writable {
@@ -950,26 +1211,36 @@ fn run_libraries(
             files: ctx.files.clone(),
         });
     }
-    let gateway_files = FileService::with_options(
-        args.data_dir.join(if fdb_active {
-            "fdb-gateway-spool"
-        } else {
-            "gateway-spool"
-        }),
-        policy,
-        None,
-    )?;
+    let gateway_files = if control.is_some() {
+        FileService::control_only(None)
+    } else {
+        FileService::with_options(
+            args.data_dir.join(if fdb_active {
+                "fdb-gateway-spool"
+            } else {
+                "gateway-spool"
+            }),
+            policy,
+            None,
+        )?
+    };
     let gateway_status = Arc::new(Mutex::new(NodeStatus::default()));
     let (exec, requests) = channel();
     let (events, event_rx) = channel();
-    let provider: Box<dyn tape_rs::daemon::executor::DeviceProvider> =
-        Box::new(multilib::GatewayProvider);
-    let provider = match vip.as_ref() {
-        Some(v) => v.guard_provider(provider),
-        None => provider,
-    };
-    let files = gateway_files.clone();
-    thread::spawn(move || multilib::run_gateway(provider, requests, events, files));
+    if control.is_some() {
+        thread::spawn(move || tape_rs::daemon::control_only::run_deny(requests, events));
+    } else {
+        #[cfg(test)]
+        CONTROL_ONLY_PROVIDER_CONSTRUCTIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let provider: Box<dyn tape_rs::daemon::executor::DeviceProvider> =
+            Box::new(multilib::GatewayProvider);
+        let provider = match vip.as_ref() {
+            Some(v) => v.guard_provider(provider),
+            None => provider,
+        };
+        let files = gateway_files.clone();
+        thread::spawn(move || multilib::run_gateway(provider, requests, events, files));
+    }
     let forward = tx.clone();
     thread::spawn(move || {
         for event in event_rx {
@@ -1018,47 +1289,57 @@ fn run_libraries(
         )));
     }
     if let Some(listen) = &args.client_listen {
-        #[cfg(feature = "fdb")]
-        if let Some(mode) = fdb_owner.as_ref() {
-            let cluster = args
-                .fdb_cluster_file
-                .as_ref()
-                .and_then(|path| path.to_str())
-                .expect("clap 已检查 FDB 集群文件路径");
-            let catalog = tape_rs::managed_catalog::ManagedCatalog::open(Some(cluster))
-                .map_err(|error| tape_rs::error::TapeError::Catalog(error.to_string()))?;
-            let control = gateway::control_router(
+        if control.is_some() {
+            gateway::serve_control_only(
+                listen,
                 config.clone(),
                 contexts.clone(),
                 gateway.clone(),
                 client_addrs.clone(),
-            );
-            if mode.writable {
-                tape_rs::daemon::fdb_http::serve_writer(
-                    listen,
-                    Arc::new(catalog),
-                    mode.routes.clone(),
-                    contexts,
-                    client_addrs,
-                    mode.storage,
-                    control,
-                )?;
-            } else {
-                tape_rs::daemon::fdb_http::serve_owner(
-                    listen,
-                    Arc::new(catalog),
-                    mode.routes.clone(),
-                    contexts,
-                    client_addrs,
-                    control,
-                )?;
-            }
+            )?;
         } else {
-            gateway::serve(listen, config.clone(), contexts, gateway, client_addrs)?;
-        }
-        #[cfg(not(feature = "fdb"))]
-        {
-            gateway::serve(listen, config.clone(), contexts, gateway, client_addrs)?;
+            #[cfg(feature = "fdb")]
+            if let Some(mode) = fdb_owner.as_ref() {
+                let cluster = args
+                    .fdb_cluster_file
+                    .as_ref()
+                    .and_then(|path| path.to_str())
+                    .expect("clap 已检查 FDB 集群文件路径");
+                let catalog = tape_rs::managed_catalog::ManagedCatalog::open(Some(cluster))
+                    .map_err(|error| tape_rs::error::TapeError::Catalog(error.to_string()))?;
+                let control = gateway::control_router(
+                    config.clone(),
+                    contexts.clone(),
+                    gateway.clone(),
+                    client_addrs.clone(),
+                );
+                if mode.writable {
+                    tape_rs::daemon::fdb_http::serve_writer(
+                        listen,
+                        Arc::new(catalog),
+                        mode.routes.clone(),
+                        contexts,
+                        client_addrs,
+                        mode.storage,
+                        control,
+                    )?;
+                } else {
+                    tape_rs::daemon::fdb_http::serve_owner(
+                        listen,
+                        Arc::new(catalog),
+                        mode.routes.clone(),
+                        contexts,
+                        client_addrs,
+                        control,
+                    )?;
+                }
+            } else {
+                gateway::serve(listen, config.clone(), contexts, gateway, client_addrs)?;
+            }
+            #[cfg(not(feature = "fdb"))]
+            {
+                gateway::serve(listen, config.clone(), contexts, gateway, client_addrs)?;
+            }
         }
         if let Some(vip) = vip.as_mut() {
             vip.start(gateway_status, gateway_files, tx.clone())?;
@@ -1103,6 +1384,40 @@ fn run_libraries(
 #[cfg(all(test, feature = "fdb"))]
 mod fdb_owner_cli_tests {
     use super::*;
+
+    #[test]
+    fn handoff_enable_requires_an_offline_scope_and_rejects_a_live_peer() {
+        let mut args = vec![
+            "ltfsd",
+            "--id",
+            "1",
+            "--listen",
+            "127.0.0.1:7400",
+            "--data-dir",
+            "/tmp/node",
+            "--libraries-config",
+            "/tmp/libraries.json",
+            "--fdb-cluster-file",
+            "/tmp/fdb.cluster",
+            "--enable-library-handoff-offline",
+            "CHANGER",
+        ];
+        assert!(Args::try_parse_from(&args).is_err());
+        args.extend([
+            "--handoff-namespace",
+            "c95fd1f3-c445-4f01-bcec-d3d4b2e3228e",
+        ]);
+        assert!(Args::try_parse_from(&args).is_ok());
+        args.extend(["--fdb-owner-writable", "--client-listen", "127.0.0.1:7500"]);
+        assert!(Args::try_parse_from(&args).is_err());
+
+        let peer = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(
+            require_handoff_peers_offline(&[(1, peer.local_addr().unwrap().to_string())].into())
+                .is_err()
+        );
+        assert!(require_handoff_peers_offline(&[(1, "127.0.0.1".into())].into()).is_err());
+    }
 
     #[test]
     fn fdb_owners_accept_the_managed_vip_with_explicit_s3() {
@@ -1285,3 +1600,11 @@ mod s3_cli_tests {
         assert!(result.err().unwrap().to_string().contains("--http-vip"));
     }
 }
+
+#[cfg(test)]
+static CONTROL_ONLY_PROVIDER_CONSTRUCTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+#[path = "ltfsd/control_only_tests.rs"]
+mod control_only_tests;

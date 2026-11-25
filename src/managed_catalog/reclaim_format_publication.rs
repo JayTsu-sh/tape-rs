@@ -29,6 +29,9 @@ impl ReclaimFormatResult {
     pub fn current(&self) -> ActiveIndexIdentity {
         self.source().identity.head().into()
     }
+    pub(in crate::managed_catalog::control::reclaim) fn source_inventory(&self) -> [u8; 32] {
+        self.0.goal.source_evidence.inventory()
+    }
     pub fn source(&self) -> NativeMediaSource {
         NativeMediaSource {
             identity: IndexSourceIdentity::from_bytes(&self.0.source)
@@ -47,19 +50,8 @@ impl ReclaimFormatResult {
         node_mutation::id(&self.0.namespace)?;
         validate_physical_serial(&self.0.library)?;
         self.0.goal.encode()?;
-        let spec = ReclaimSpec::parse(&self.0.intent["change"])?;
+        let spec = validate_parent_intent(&self.0.intent)?;
         let i = &self.0.intent;
-        let fields = [
-            "version",
-            "library",
-            "namespace",
-            "epoch",
-            "operation",
-            "change",
-            "scan",
-            "scan_generation",
-            "index",
-        ];
         let fingerprint = format!("{:x}", Sha256::digest(i.to_string().as_bytes()));
         let identity = IndexSourceIdentity::from_bytes(&self.0.source)
             .map_err(|e| CatalogError::Cache(e.to_string()))?;
@@ -79,10 +71,6 @@ impl ReclaimFormatResult {
             || self.0.owner == 0
             || self.0.owner > 0xFFFF_FFFF_FFFF
             || !self.0.goal.issued
-            || !i.as_object().is_some_and(|o| {
-                o.len() == fields.len() && o.keys().all(|k| fields.contains(&k.as_str()))
-            })
-            || i["version"] != 1
             || i["library"] != self.0.library
             || i["namespace"] != self.0.namespace
             || !i["epoch"].as_u64().is_some_and(|n| n > 0)
@@ -240,6 +228,7 @@ impl ManagedCatalog {
             let claim=management::exclusion::LibraryTaskClaim::for_reclaim(&reservation.token())?;
             claim.require_owned(&tr).await?;
             let mut parent=record_at(&tr,reservation,owner).await?; parent["phase"]=json!("completed");
+            destination_history::clear_parent_at(&tr,reservation,owner).await?;
             let mut new_assignment=assignment.clone(); new_assignment.volume_id=Some(plan.output());
             // Everything above is read-only. Notification errors below abort the
             // whole transaction through atomic_error; no partial binding escapes.
@@ -279,3 +268,7 @@ impl ManagedCatalog {
         }.await.map_err(notifications::atomic_error)) })).await?
     }
 }
+
+#[cfg(test)]
+#[path = "reclaim_format_result_codec_tests.rs"]
+mod codec_tests;

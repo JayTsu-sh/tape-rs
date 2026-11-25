@@ -12,6 +12,7 @@
 //! `ltfsd` 默认使用新协议；`NodeConfig::coordination=None` 仅保留旧公开调用者的兼容行为。
 //! 不支持旧协议节点与新协议节点混合运行。
 
+pub mod control_only;
 mod coordinator;
 pub mod directory;
 pub mod executor;

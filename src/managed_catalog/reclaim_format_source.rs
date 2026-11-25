@@ -15,6 +15,10 @@ pub(in super::super) struct FormatSourceFact {
     pub cartridge: MediumIdentity,
 }
 impl FormatSourceFact {
+    pub(in super::super) fn inventory(&self) -> [u8; 32] {
+        self.inventory
+    }
+
     pub(in super::super) fn require_origin(&self, volume: Uuid, parent: &str) -> Result<()> {
         self.cartridge.validate().map_err(cache)?;
         let head = active_volume::decode_index(volume, &self.head)?;
@@ -78,6 +82,10 @@ pub struct ReclaimFormatSourceEvidence {
     pub(in super::super) fact: FormatSourceFact,
 }
 impl ReclaimFormatSourceEvidence {
+    pub(crate) fn require_capture(&self, actual: &CapturedIndexSource) -> Result<()> {
+        self.fact.require_capture(actual)
+    }
+
     pub(crate) fn from_read(
         reservation: &ReclaimReservation,
         owner: u64,

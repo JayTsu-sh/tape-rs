@@ -15,7 +15,7 @@ use rusqlite::Connection;
 use crate::error::{Result, TapeError};
 
 const PAGE_SIZE: u64 = 4096;
-const CHUNK: u64 = 16 << 20;
+pub(super) const CHUNK: u64 = 16 << 20;
 
 pub(super) fn index_row_error(error: rusqlite::Error) -> TapeError {
     match error.sqlite_error_code() {

@@ -1,6 +1,10 @@
 //! Durable metadata intent, without device execution or erase authority.
 //! Once admitted, unknown media results retain the original plan and claims.
 use super::*;
+#[cfg(test)]
+#[path = "reclaim_metadata_isolation_test_hook.rs"]
+mod isolation_test_hook;
+pub(super) use publication::require_directory_history_link_at;
 use metadata_plan::Plan;
 #[path = "reclaim_metadata_checkpoint.rs"]
 mod checkpoint;
@@ -661,6 +665,18 @@ async fn target_barcode_policy_at(
     Ok(())
 }
 
+pub(in crate::managed_catalog::control::reclaim) async fn isolation_checkpoint_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    owner: u64,
+) -> Result<Option<ReclaimMetadataWrite>> {
+    let task = registry::read_at(tr, reservation).await?;
+    if task.as_ref().is_some_and(|task| task.owner() > owner) {
+        return Err(CatalogError::OwnerFenced);
+    }
+    Ok(task)
+}
+
 impl ManagedCatalog {
     /// Fix the new raw node and one physical-file slot atomically, with no CDB.
     /// A duplicate returns the retained original phase; it never retries I/O.
@@ -728,6 +744,9 @@ impl ManagedCatalog {
                     requests::retry_result(
                         async {
                             parent_at(&tr, reservation, owner).await?;
+                            group_only::require_ready_at(&tr,reservation,owner,None).await?;
+                            isolation::require_metadata_successor_at(&tr, reservation, owner, plan)
+                                .await?;
                             registry::read_at(&tr, reservation).await?;
                             let input =
                                 context::input_for_plan_at(&tr, reservation, owner, context, plan)
@@ -832,13 +851,16 @@ impl ManagedCatalog {
         if original.owner() != owner {
             return Err(CatalogError::OwnerFenced);
         }
-        self.db
+        let admitted = self.db
             .run(|tr, _| {
                 Box::pin(async move {
                     requests::retry_result(
                         async {
                             parent_at(&tr, reservation, owner).await?;
+                            group_only::require_ready_at(&tr,reservation,owner,None).await?;
                             let plan = original.plan();
+                            isolation::require_metadata_successor_at(&tr, reservation, owner, &plan)
+                                .await?;
                             let mut task =
                                 load_id_at(&tr, reservation, plan.0.source.uid, original.id())
                                     .await?
@@ -860,6 +882,9 @@ impl ManagedCatalog {
                                     return Err(CatalogError::Invalid(
                                         "已关闭、已发布或已转入修尾的元数据任务不能重新准入",
                                     ));
+                                }
+                                Phase::Writing if reservation.spec().group_only() => {
+                                    return Err(CatalogError::Invalid("BlockedUnknown：原group-only MetadataTask已Writing，禁止重放观察"));
                                 }
                                 Phase::Writing => true,
                                 Phase::Prepared => false,
@@ -902,7 +927,10 @@ impl ManagedCatalog {
                     )
                 })
             })
-            .await?
+            .await??;
+        #[cfg(test)]
+        isolation_test_hook::after_committed(reservation)?;
+        Ok(admitted)
     }
 
     /// Read-only, same-version recheck for a fresh device execution. Losing an
@@ -918,6 +946,8 @@ impl ManagedCatalog {
         let tr = self.db.create_trx()?;
         parent_at(&tr, reservation, owner).await?;
         let plan = original.plan();
+        isolation::require_metadata_successor_at(&tr, reservation, owner, &plan).await?;
+        group_only::require_seal_at(&tr,reservation).await?;
         let task = load_id_at(&tr, reservation, plan.source_uid(), original.id())
             .await?
             .ok_or(CatalogError::Incomplete)?;
@@ -1093,6 +1123,7 @@ impl ManagedCatalog {
                     requests::retry_result(
                         async {
                             parent_at(&tr, reservation, owner).await?;
+                            isolation::require_normal_mutation_at(&tr, reservation, owner).await?;
                             let mut task = load_at(&tr, reservation, source_uid)
                                 .await?
                                 .ok_or(CatalogError::Incomplete)?;
@@ -1172,4 +1203,39 @@ impl ManagedCatalog {
             })
             .await?
     }
+}
+
+pub(in super::super) async fn require_planning_absent_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    uid: u64,
+) -> Result<()> {
+    require_idle_at(tr, reservation).await?;
+    if load_at(tr, reservation, uid).await?.is_some() {
+        return Err(CatalogError::Invalid("原UID已有元数据尝试，必须恢复原目标"));
+    }
+    Ok(())
+}
+
+pub(in super::super) async fn history_attempt_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    owner: u64,
+    original: &ReclaimMetadataWrite,
+) -> Result<(Uuid, Option<Uuid>, [u8; 32])> {
+    original.encode()?;
+    parent_at(tr, reservation, owner).await?;
+    let task = load_id_at(tr, reservation, original.plan().source_uid(), original.id())
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+    if task.plan() != original.plan() || task.owner() > owner {
+        return Err(CatalogError::Invalid("目的历史读取改变原尝试计划或owner"));
+    }
+    require_phase_history(original, &task)?;
+    context::input_for_task_at(tr, reservation, owner, &task).await?;
+    Ok((
+        task.plan().volume(),
+        Some(task.scan_id()),
+        Sha256::digest(task.encode()?).into(),
+    ))
 }

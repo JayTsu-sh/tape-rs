@@ -32,6 +32,15 @@ use super::mam::{Mam, VolumeCoherencyInfo, vcr_is_valid, vcr_matches};
 use super::volume::P1_DATA_START;
 
 #[cfg(feature = "fdb")]
+mod history;
+#[cfg(feature = "fdb")]
+pub(crate) use history::FullHistoryHintBuilder;
+#[cfg(feature = "fdb")]
+pub use history::{
+    FULL_HISTORY_ENTRY_BYTES, FULL_HISTORY_MANIFEST_BYTES, FullHistoryDirectory, FullHistoryEntry,
+    FullHistoryManifest,
+};
+#[cfg(feature = "fdb")]
 mod streamed;
 #[cfg(feature = "fdb")]
 pub(crate) use streamed::probe_empty_volume;
@@ -41,13 +50,15 @@ pub use streamed::{StreamedFullRecovery, capture_full_recovery};
 mod source;
 #[cfg(feature = "fdb")]
 pub use source::{
-    CapturedIndexSource, IndexSourceScope, capture_complete_index_source, capture_index_source,
-    capture_recorded_index_source,
+    CapturedIndexSource, IndexSourceScope, ReclaimReadbackFullHead, capture_complete_index_source,
+    capture_complete_index_source_with_history_hint, capture_index_source,
+    capture_reclaim_preparation_index_source,
+    capture_reclaim_preparation_index_source_with_history_hint, capture_recorded_index_source,
 };
 #[cfg(feature = "fdb")]
 pub(crate) use source::{
     CapturedReadIndex, capture_current_read_index, capture_dp_checkpoint_source,
-    verify_recorded_source_constructs,
+    capture_recorded_construct_source, verify_recorded_source_constructs,
 };
 #[cfg(feature = "fdb")]
 mod identity;
@@ -690,6 +701,8 @@ pub fn verify_dp_ip_head(
 pub(crate) struct VerifiedDpIpHead {
     pub ip_generation: Option<u64>,
     pub predecessors: Vec<super::volume::CommittedIndexConstruct>,
+    /// The Full construct's exclusive close, matched to the actual DP EOD.
+    pub full_dp_eod: Option<u64>,
     /// A property of the verified view, never standalone write permission.
     pub empty_unlocked: bool,
 }
@@ -709,7 +722,7 @@ pub(crate) fn verify_dp_ip_head_with_evidence(
     }
     let comparison = super::index_equivalence::FullIndexComparison::new(&budget.index_scratch)?;
     let mut ip_data = false;
-    let dp = with_verified_dp_construct(
+    let (dp, dp_eod) = with_verified_dp_construct_bounds(
         drive,
         label,
         expected.location,
@@ -766,6 +779,7 @@ pub(crate) fn verify_dp_ip_head_with_evidence(
     Ok(VerifiedDpIpHead {
         ip_generation: ip.map(|index| index.generation),
         predecessors: Vec::new(),
+        full_dp_eod: Some(dp_eod),
         empty_unlocked: comparison.empty_dp()?
             && dp
                 .volume_lock_state
@@ -847,6 +861,7 @@ fn verify_incremental_replay(
         VerifiedDpIpHead {
             ip_generation: ip.map(|index| index.generation),
             predecessors,
+            full_dp_eod: None,
             empty_unlocked: replay.empty_dp()?
                 && view
                     .volume_lock_state
@@ -1456,6 +1471,17 @@ pub fn verify_chain(
     budget: &RecoveryBudget,
     notes: &mut Vec<String>,
 ) -> Result<(bool, u32, bool)> {
+    verify_chain_inner(drive, label, cand, budget, notes, false)
+}
+
+fn verify_chain_inner(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    cand: &IndexCandidate,
+    budget: &RecoveryBudget,
+    notes: &mut Vec<String>,
+    preserve_capacity_error: bool,
+) -> Result<(bool, u32, bool)> {
     let block_size = label.blocksize as usize;
     let dp_char = label.data_partition;
     let mut prev = cand.index.previous_location;
@@ -1487,6 +1513,11 @@ pub fn verify_chain(
             budget.max_index_bytes,
         ) {
             Ok(v) => v,
+            Err(error @ (TapeError::LocalCapacity { .. } | TapeError::LocalSpace { .. }))
+                if preserve_capacity_error =>
+            {
+                return Err(error);
+            }
             Err(e) => {
                 notes.push(format!("链 @{} 读取失败: {}", loc.start_block, e));
                 return Ok((false, depth, false));
@@ -1648,15 +1679,86 @@ pub fn recover(
     label: &LtfsLabel,
     budget: &RecoveryBudget,
 ) -> Result<RecoveryReport> {
-    recover_inner(device, label, budget, true)
+    recover_inner(device, label, budget, true, false, None)
 }
 
 pub(crate) fn recover_for_mount(
     device: &dyn TapeTransport,
     label: &LtfsLabel,
     budget: &RecoveryBudget,
+    preserve_capacity_error: bool,
+    preflight_dp: Option<(super::volume::CommittedIndexConstruct, u64)>,
 ) -> Result<RecoveryReport> {
-    recover_inner(device, label, budget, false)
+    recover_inner(
+        device,
+        label,
+        budget,
+        false,
+        preserve_capacity_error,
+        preflight_dp,
+    )
+}
+
+/// Mount after a complete reclaim capture in the same exclusive read-only
+/// drive run. Read the exact DP XML for the writable tree and independently
+/// confirm the trailing filemark and blank end without another EOD seek.
+fn scan_captured_reclaim_dp(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    budget: &RecoveryBudget,
+    expected: super::volume::CommittedIndexConstruct,
+    eod: u64,
+) -> Result<PartitionScan> {
+    let start = expected.location.start_block;
+    let block_size = label.blocksize as usize;
+    let (bytes, ended, next) = read_until_fm(drive, 1, start, block_size, budget.max_index_bytes)?;
+    if !ended
+        || next != eod
+        || bytes.sha256 != expected.sha256
+        || !drive.position_matches(1, eod)?
+    {
+        return Err(TapeError::RecoveryRestricted {
+            reason: "回收目标预挂载 DP 索引或带尾与原实读证据不同".into(),
+        });
+    }
+    let index = bytes.parse()?;
+    validate_candidate(&index, label, label.data_partition, start).map_err(TapeError::Ltfs)?;
+    if index.incremental || index.generation != expected.generation {
+        return Err(TapeError::RecoveryRestricted {
+            reason: "回收目标预挂载实读 DP 卷头改变".into(),
+        });
+    }
+    match drive.read_block(&mut vec![0; block_size]) {
+        Err(TapeError::ScsiCommand {
+            status: 2,
+            sense_key: 8,
+            asc: 0,
+            ascq: 5,
+            sense,
+        }) if sense.as_deref().and_then(|raw| raw.current_condition()) == Some((8, 0, 5)) => {}
+        Err(error) => return Err(error),
+        Ok(_) => {
+            return Err(TapeError::RecoveryRestricted {
+                reason: "回收目标预挂载 DP 结束文件标记后出现其他记录".into(),
+            });
+        }
+    }
+    debug!("回收目标预挂载已实读 DP 卷头与空带尾 EOD={eod}");
+    Ok(PartitionScan {
+        partition: 1,
+        eod,
+        last_index: Some(IndexCandidate {
+            start_block: start,
+            end_block: eod - 1,
+            construct_sha256: expected.sha256,
+            index,
+        }),
+        tail: TailKind::Complete,
+        hint_used: true,
+        back_steps: 0,
+        budget_exhausted: false,
+        notes: Vec::new(),
+    })
 }
 
 /// 新鲜 VCI 与实际完整末构造共同证明当前索引的位置（§10.3），允许 IP 滞后。
@@ -1705,6 +1807,8 @@ fn recover_inner(
     label: &LtfsLabel,
     budget: &RecoveryBudget,
     verify_history: bool,
+    preserve_capacity_error: bool,
+    preflight_dp: Option<(super::volume::CommittedIndexConstruct, u64)>,
 ) -> Result<RecoveryReport> {
     let drive = TapeDrive::new(device);
     let drive = &drive;
@@ -1720,14 +1824,27 @@ fn recover_inner(
         budget,
         hints[0].as_ref().map(|h| h.block),
     )?;
-    let mut dp = scan_partition(
-        drive,
-        1,
-        label.data_partition,
-        label,
-        budget,
-        hints[1].as_ref().map(|h| h.block),
-    )?;
+    let mut dp = match preflight_dp {
+        Some((head, eod))
+            if hints[1].as_ref().is_some_and(|hint| {
+                !head.incremental
+                    && head.volume_uuid == label.volume_uuid
+                    && head.location.partition == label.data_partition
+                    && hint.generation == head.generation
+                    && hint.block == head.location.start_block
+            }) =>
+        {
+            scan_captured_reclaim_dp(drive, label, budget, head, eod)?
+        }
+        _ => scan_partition(
+            drive,
+            1,
+            label.data_partition,
+            label,
+            budget,
+            hints[1].as_ref().map(|h| h.block),
+        )?,
+    };
 
     let fresh_current = fresh_current_index(&dp, &ip, &hints);
     let replay = match &mut dp.last_index {
@@ -1737,7 +1854,9 @@ fn recover_inner(
     let history_checked = verify_history || !fresh_current || replay.is_err();
     let (mut chain_ok, mut chain_depth, chain_truncated) = if history_checked {
         match &dp.last_index {
-            Some(c) => verify_chain(drive, label, c, budget, &mut notes)?,
+            Some(c) => {
+                verify_chain_inner(drive, label, c, budget, &mut notes, preserve_capacity_error)?
+            }
             None => (true, 0, false),
         }
     } else {
@@ -1921,5 +2040,90 @@ mod allocation_tests {
         let result = read_until_fm(&TapeDrive::new(&device), 1, 5, 1 << 24, 8usize << 30);
         assert!(matches!(result, Err(TapeError::LocalCapacity { .. })));
         assert!(!device.command_log()[before..].contains(&0x08));
+    }
+
+    #[cfg(feature = "fdb")]
+    #[test]
+    fn bounded_preflight_reports_historical_index_capacity_for_serial_mount() {
+        use crate::ltfs::mam::ATTR_VCI;
+        use crate::ltfs::volume::{FIRST_INDEX_BLOCK, LtfsVolume};
+        use crate::scsi::sim::LogicalObject;
+
+        let library = SimLibrary::new(1, 1, 0);
+        let barcode = "CAPBDGL8";
+        library
+            .insert_cartridge(SimCartridge::blank(barcode, 32 << 20), 0)
+            .unwrap();
+        library.load_into_drive(barcode, 0).unwrap();
+        let device = library.drive(0);
+        mkltfs(
+            &device,
+            &MkltfsOptions {
+                volume_id: "CAPBDG".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut volume = LtfsVolume::mount(&device).unwrap();
+        volume.append_file("/body", &mut &b"abc"[..]).unwrap();
+        volume.commit().unwrap();
+        let current = volume.committed_index_construct();
+        let dp_eod = volume.recovery().dp.eod;
+        let label = super::super::volume::read_label_only(&device).unwrap();
+        assert_eq!(current.generation, 2);
+        assert!(library.with_cartridge_mut(barcode, |cartridge| {
+            let LogicalObject::Record(xml) =
+                &mut cartridge.partitions[1].objects[FIRST_INDEX_BLOCK as usize]
+            else {
+                panic!("original generation-1 DP index record");
+            };
+            xml.resize(8 << 10, b' ');
+            // Without a fresh VCI, mount must read the original DP history.
+            cartridge.mam.remove(&(0, ATTR_VCI));
+            cartridge.mam.remove(&(1, ATTR_VCI));
+        }));
+
+        assert!(matches!(
+            LtfsVolume::mount_for_reclaim_preflight(&device, label, current, dp_eod, 4 << 10),
+            Err(TapeError::LocalCapacity { .. })
+        ));
+        assert_eq!(
+            LtfsVolume::mount(&device)
+                .unwrap()
+                .committed_index_construct(),
+            current
+        );
+    }
+
+    #[test]
+    fn captured_reclaim_tail_requires_actual_blank_after_filemark() {
+        use crate::ltfs::volume::{LtfsVolume, read_label_only};
+        use crate::scsi::sim::LogicalObject;
+
+        let library = SimLibrary::new(1, 1, 0);
+        let barcode = "CAPTAILL8";
+        library
+            .insert_cartridge(SimCartridge::blank(barcode, 32 << 20), 0)
+            .unwrap();
+        library.load_into_drive(barcode, 0).unwrap();
+        let device = library.drive(0);
+        mkltfs(&device, &MkltfsOptions::default()).unwrap();
+        let baseline = LtfsVolume::mount(&device).unwrap();
+        let expected = baseline.committed_index_construct();
+        let eod = baseline.recovery().dp.eod;
+        let label = read_label_only(&device).unwrap();
+        let budget = RecoveryBudget::default();
+        let drive = TapeDrive::new(&device);
+
+        let scan = scan_captured_reclaim_dp(&drive, &label, &budget, expected, eod).unwrap();
+        assert_eq!(scan.tail, TailKind::Complete);
+        assert!(library.with_cartridge_mut(barcode, |cartridge| {
+            cartridge.partitions[1]
+                .objects
+                .push(LogicalObject::Filemark);
+        }));
+        let error = scan_captured_reclaim_dp(&drive, &label, &budget, expected, eod)
+            .expect_err("previously observed EOD cannot hide an extra filemark");
+        assert!(matches!(error, TapeError::RecoveryRestricted { .. }));
     }
 }

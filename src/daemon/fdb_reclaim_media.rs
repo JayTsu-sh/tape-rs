@@ -20,6 +20,8 @@ use crate::tape::commands::TapeDrive;
 
 #[path = "fdb_reclaim_metadata_recovery.rs"]
 mod recovery;
+#[path = "fdb_reclaim_target_history.rs"]
+mod target_history;
 pub use recovery::ReclaimMetadataRecovery;
 #[path = "fdb_reclaim_donor.rs"]
 mod donor;
@@ -105,24 +107,26 @@ impl ReclaimMetadataWriter<'_> {
             if label.volume_uuid != task.plan().volume() {
                 return Err(catalog("节点重新规划装入了其他介质"));
             }
-            let target =
-                capture_complete_index_source(&TapeDrive::new(&checked), &label, self.budget)?;
+            let target = self.capture_target_history(reservation, task, &checked, &label)?;
             let inventory = crate::managed_catalog::ReclaimSourceInventory::from_captured(source)
                 .map_err(catalog)?;
             let plan = task
                 .replan_source(reservation, &inventory, &target, &label)
                 .map_err(catalog)?;
             checked.verify_proof()?;
-            crate::managed_catalog::ReclaimMetadataSourceReplanEvidence::from_capture(
+            let proof = crate::managed_catalog::ReclaimMetadataSourceReplanEvidence::from_capture(
                 context, &target, plan,
             )
-            .map_err(catalog)
+            .map_err(catalog)?;
+            self.publish_target_history(reservation, task, &target)?;
+            Ok(proof)
         })
     }
     /// Read the destination's actual extents without a payload cache. Every
     /// CDB still runs under the caller's original task/owner/PR guard.
     fn read_raw_result(
         &self,
+        reservation: &ReclaimReservation,
         checked: &dyn TapeTransport,
         label: &crate::ltfs::label::LtfsLabel,
         task: &ReclaimMetadataWrite,
@@ -163,7 +167,7 @@ impl ReclaimMetadataWriter<'_> {
         if length != body.length || length != body.expected {
             return Err(catalog("原始正文目的实读残缺"));
         }
-        let after = capture_complete_index_source(&TapeDrive::new(checked), label, self.budget)?;
+        let after = self.capture_target_history(reservation, task, checked, label)?;
         if after.identity()? != current.identity()?
             || after.scope() != current.scope()
             || after.construct_end() != current.construct_end()
@@ -324,7 +328,7 @@ impl ReclaimMetadataWriter<'_> {
             return Err(catalog("回收元数据已装入介质不是原目标卷"));
         }
         let drive = TapeDrive::new(&checked);
-        let before = capture_complete_index_source(&drive, &label, self.budget)?;
+        let before = self.capture_target_history(reservation, writing, &checked, &label)?;
         if !admission.needs_observation() {
             let source = source.ok_or_else(|| catalog("首次元数据执行缺少原来源"))?;
             let mut volume = LtfsVolume::mount_with_budget(&checked, &self.recovery_budget())?;
@@ -346,7 +350,7 @@ impl ReclaimMetadataWriter<'_> {
         let actual = if admission.needs_observation() {
             before
         } else {
-            capture_complete_index_source(&drive, &label, self.budget)?
+            self.capture_target_history(reservation, writing, &checked, &label)?
         };
         let predecessor = if actual.construct().incremental
             || actual.identity()? == plan.previous_source().map_err(catalog)?
@@ -369,11 +373,12 @@ impl ReclaimMetadataWriter<'_> {
             return Err(catalog("元数据提交后未观察到原固定节点"));
         }
         let raw_read = if observed.kind() == ReclaimMetadataObservationKind::Committed {
-            self.read_raw_result(&checked, &label, writing, &actual)?
+            self.read_raw_result(reservation, &checked, &label, writing, &actual)?
         } else {
             None
         };
         checked.verify_proof()?;
+        self.publish_target_history(reservation, writing, &actual)?;
         let task = self
             .catalog
             .record_reclaim_metadata_observation(reservation, self.key.round(), writing, &observed)

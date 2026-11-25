@@ -3,6 +3,10 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 
+#[path = "reclaim_group_only_walk.rs"]
+mod group_only_walk;
+pub(super) use group_only_walk::{GroupOnlyLogicalManifest, snapshot_at as group_only_snapshot_at};
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Frame {
@@ -196,6 +200,9 @@ pub(super) fn encode(state: &ReclaimWalk) -> Result<Vec<u8>> {
 }
 async fn state_at(tr: &Transaction, reservation: &ReclaimReservation) -> Result<ReclaimWalk> {
     let Some(raw) = tr.get(&state_key(reservation), false).await? else {
+        if reservation.intent()["version"] != 1 {
+            return Err(CatalogError::Corrupt("v2回收父任务缺少原子建立的walk2"));
+        }
         return Ok(ReclaimWalk {
             version: 1,
             reservation: reservation.fingerprint(),
@@ -214,7 +221,8 @@ async fn state_at(tr: &Transaction, reservation: &ReclaimReservation) -> Result<
     let state: ReclaimWalk =
         serde_json::from_slice(&raw).map_err(|_| CatalogError::Corrupt("回收扫描结构"))?;
     if encode(&state)?.as_slice() != raw.as_ref()
-        || state.version != 1
+        || !matches!(state.version, 1 | 2)
+        || reservation.intent()["version"] != state.version
         || state.reservation != reservation.fingerprint()
         || state.stack.len() >= usize::from(MAX_DEPTH)
         || state.complete != state.stack.is_empty()
@@ -300,6 +308,226 @@ pub(super) async fn replace_cancelled_at(
     encode(&state)
 }
 
+/// Read-only strict protocol check; v1 retains delayed initialization.
+pub(super) fn require_protocol_at<'a>(
+    tr: &'a Transaction,
+    reservation: &'a ReclaimReservation,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<()>> + 'a>> {
+    Box::pin(async move { state_at(tr, reservation).await.map(|_| ()) })
+}
+/// Compute both initial bytes before the reservation's first mutation.
+pub(super) async fn prepare_initial_group_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    if reservation.intent()["version"] != 2
+        || tr.get(&state_key(reservation), false).await?.is_some()
+    {
+        return Err(CatalogError::Corrupt("不能重新初始化原group walk"));
+    }
+    let state = ReclaimWalk {
+        version: 2,
+        reservation: reservation.fingerprint(),
+        stack: vec![Frame {
+            directory: active_pools::root_id(reservation.namespace(), reservation.spec().pool)
+                .to_string(),
+            name: String::new(),
+            after: None,
+        }],
+        current: None,
+        complete: false,
+        copied_files: 0,
+        copied_bytes: 0,
+    };
+    Ok((state_key(reservation), encode(&state)?))
+}
+/// Only the v2 selector may transfer this exact cursor into a fixed member.
+pub(super) async fn transfer_current_to_group_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    file: &ReclaimFile,
+) -> Result<Vec<u8>> {
+    let mut state = state_at(tr, reservation).await?;
+    if state.version != 2 || state.current.as_ref() != Some(file) {
+        return Err(CatalogError::Invalid("组成员不是原walk当前文件"));
+    }
+    upload_retry::identity_at(tr, reservation, file).await?;
+    state.current = None;
+    encode(&state)
+}
+/// Existing bounded walk kernel: caller supplies the pre-generated root ID.
+pub(super) async fn advance_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    owner: u64,
+    operation: Uuid,
+) -> Result<ReclaimWalk> {
+    let parent = record_at(tr, reservation, owner).await?;
+    if parent["owner_epoch"] != owner {
+        return Err(CatalogError::OwnerFenced);
+    }
+    let mut state = state_at(tr, reservation).await?;
+    if state.current.is_some() || state.complete {
+        if let Some(file) = state.current() {
+            upload_retry::identity_at(tr, reservation, file).await?;
+        }
+        return Ok(state);
+    }
+    let frame = state.stack.last().expect("nonempty unfinished stack");
+    let directory = uuid(&frame.directory)?;
+    let after = frame
+        .after
+        .as_ref()
+        .map(|name| child_key(reservation.namespace(), directory, name.as_bytes()));
+    let page = lookup::list_active_children_at(
+        tr,
+        reservation.namespace(),
+        directory,
+        after.as_deref(),
+        1,
+    )
+    .await?;
+    // A merged page can contain only tombstones. Its opaque cursor is
+    // still progress and must never be mistaken for end-of-directory.
+    if page.items.is_empty() {
+        if let Some(next) = page.next {
+            let prefix = child_prefix(reservation.namespace(), directory);
+            let name = decode_name(&next[prefix.len()..])?;
+            state.stack.last_mut().unwrap().after = Some(
+                String::from_utf8(name).map_err(|_| CatalogError::Corrupt("回收游标非 UTF-8"))?,
+            );
+        } else {
+            state.stack.pop();
+            state.complete = state.stack.is_empty();
+        }
+    } else {
+        let child = &page.items[0];
+        let name = std::str::from_utf8(&child.name)
+            .map_err(|_| CatalogError::Corrupt("回收文件名非 UTF-8"))?;
+        let current = path(&state.stack);
+        let relative = if current == "/" {
+            format!("/{name}")
+        } else {
+            format!("{current}/{name}")
+        };
+        let full = pool_catalog_path(reservation.spec().pool, relative.as_bytes())?;
+        let resolved = lookup::resolve_active_path_at_mode(
+            tr,
+            reservation.namespace(),
+            lookup::path_components(&full)?,
+            false,
+        )
+        .await?
+        .ok_or(CatalogError::Corrupt("回收分页目标不存在"))?;
+        state.stack.last_mut().unwrap().after = Some(name.into());
+        match resolved {
+            ResolvedPath::Directory { id, .. } if id == child.id => {
+                if state.stack.len() + 1 >= usize::from(MAX_DEPTH) {
+                    return Err(CatalogError::Invalid("回收目录深度超限"));
+                }
+                state.stack.push(Frame {
+                    directory: id.to_string(),
+                    name: name.into(),
+                    after: None,
+                });
+            }
+            ResolvedPath::File { id, head, copy, .. } if id == child.id => {
+                if copy.volume_id == reservation.spec().volume {
+                    let operation = source::group_only::planned_operation_at(
+                        tr, reservation, &relative, id, &head, &copy,
+                    ).await?.unwrap_or(operation);
+                    state.current = Some(ReclaimFile {
+                        path: relative,
+                        file: id.to_string(),
+                        version: head.version,
+                        size: copy.size,
+                        operation: operation.to_string(),
+                    });
+                }
+            }
+            _ => return Err(CatalogError::Corrupt("回收分页 inode 不一致")),
+        }
+    }
+    let raw = encode(&state)?;
+    let root = if let Some(file) = state.current() {
+        Some(upload_retry::prepare_root_at(tr, reservation, file).await?)
+    } else {
+        None
+    };
+    if let Some((key, value)) = root {
+        tr.set(&key, &value);
+    }
+    tr.set(&state_key(reservation), &raw);
+    Ok(state)
+}
+
+/// Keep the original Rv format shared by single-file and group settlement.
+fn verification_value(
+    reservation: &ReclaimReservation, file: &ReclaimFile, request: &ActiveFileRequest,
+    verified: &ReadMetadata, index: Vec<u8>, terminal: Vec<u8>,
+) -> Result<Value> {
+    Ok(json!({"version":1,"parent":reservation.fingerprint(),"request":request.fingerprint(),"file":file,
+        "head":encode_head(&verified.head),"copy":copy_records::encode_physical_copy(&verified.copy)?,
+        "index":index,"terminal":terminal}))
+}
+
+/// Only the typed group settlement caller may replace walk.current with its
+/// immutable original membership edge. No counters or cursor change here.
+pub(super) async fn record_group_verification_at(
+    tr: &Transaction, reservation: &ReclaimReservation, owner: u64,
+    file: &ReclaimFile, request: &ActiveFileRequest,
+    verified: &ReadMetadata, verified_head: ActiveIndexIdentity,
+) -> Result<()> {
+    if reservation.intent()["version"] != 2 || record_at(tr,reservation,owner).await?["owner_epoch"] != owner {
+        return Err(CatalogError::OwnerFenced);
+    }
+    children::require_request_identity_at(tr,request,owner).await?;
+    upload_recovery::require_child_idle_at(tr,reservation,request).await?;
+    if file.operation()!=request.operation_id || file.file_id()!=request.file_id
+        || Some(file.version())!=request.expected_version || file.path()!=request.ltfs_path()?
+        || file.size()!=request.expected_size {
+        return Err(CatalogError::Invalid("分组回读改变原成员请求"));
+    }
+    let (intent,_)=children::child_at(tr,request.namespace,reservation.spec().pool(),request.request_epoch,request.operation_id,owner)
+        .await?.ok_or(CatalogError::Incomplete)?;
+    let version=file.version().checked_add(1).ok_or(CatalogError::Incomplete)?;
+    let proof_key=verification_key(reservation,file);
+    if tr.get(&proof_key,false).await?.is_some() {
+        return Err(CatalogError::Corrupt("新分组结清前出现半套Rv记录"));
+    }
+    let terminal=terminal_evidence_at(tr,request,&intent,version,None).await?;
+    if tr.get(&children::history_pin_key(request),false).await?.as_deref()!=Some(&[][..]) {
+        return Err(CatalogError::Corrupt("分组回读缺原成员历史pin"));
+    }
+    let full=pool_catalog_path(reservation.spec().pool(),file.path().as_bytes())?;
+    let Some(ResolvedPath::File {id,head,copy,placement,..})=
+        lookup::resolve_active_path_at_mode(tr,request.namespace,lookup::path_components(&full)?,false).await?
+    else {return Err(CatalogError::Incomplete);};
+    let (_,index)=active_volume::observed_at(tr,reservation.serial(),intent.volume_id).await?;
+    if id!=verified.id || head!=verified.head || *copy!=verified.copy || placement!=verified.placement
+        || index!=verified_head || copy.volume_id!=intent.volume_id || copy.volume_generation!=intent.volume_generation
+        || copy.volume_scan_id!=intent.volume_scan_id || copy.content_digest!=intent.expected_digest
+        || copy.size!=file.size() || head.version!=version {
+        return Err(CatalogError::Invalid("分组目标真实回读与原副本事实不同"));
+    }
+    let mut bytes=Vec::new();active_volume::encode_index(&mut bytes,verified_head);
+    let proof=verification_value(reservation,file,request,verified,bytes,terminal)?;
+    tr.set(&proof_key,proof.to_string().as_bytes());
+    Ok(())
+}
+
+/// Called only after the original Rv/retirement/Rq/member bundle passed in
+/// this transaction. A group settlement never consumes another current file.
+pub(super) async fn count_group_member_at(
+    tr: &Transaction, reservation: &ReclaimReservation, file: &ReclaimFile,
+) -> Result<ReclaimWalk> {
+    let mut state=state_at(tr,reservation).await?;
+    state.copied_files=state.copied_files.checked_add(1).ok_or(CatalogError::Invalid("回收文件计数溢出"))?;
+    state.copied_bytes=state.copied_bytes.checked_add(file.size()).ok_or(CatalogError::Invalid("回收字节计数溢出"))?;
+    tr.set(&state_key(reservation),&encode(&state)?);
+    Ok(state)
+}
+
 impl ManagedCatalog {
     /// Advance at most one merged directory row or one stack-pop per call.
     /// A selected source remains current until its verified child is recorded.
@@ -313,101 +541,10 @@ impl ManagedCatalog {
             .run(|tr, _| async move {
                 requests::retry_result(
                     async {
-                        let parent = record_at(&tr, reservation, owner).await?;
-                        if parent["owner_epoch"] != owner {
-                            return Err(CatalogError::OwnerFenced);
+                        if reservation.intent()["version"] != 1 {
+                            return Err(CatalogError::Invalid("v2回收遍历必须通过固定组编排入口"));
                         }
-                        let mut state = state_at(&tr, reservation).await?;
-                        if state.current.is_some() || state.complete {
-                            if let Some(file) = state.current() {
-                                upload_retry::identity_at(&tr, reservation, file).await?;
-                            }
-                            return Ok(state);
-                        }
-                        let frame = state.stack.last().expect("nonempty unfinished stack");
-                        let directory = uuid(&frame.directory)?;
-                        let after = frame.after.as_ref().map(|name| {
-                            child_key(reservation.namespace(), directory, name.as_bytes())
-                        });
-                        let page = lookup::list_active_children_at(
-                            &tr,
-                            reservation.namespace(),
-                            directory,
-                            after.as_deref(),
-                            1,
-                        )
-                        .await?;
-                        // A merged page can contain only tombstones. Its opaque cursor is
-                        // still progress and must never be mistaken for end-of-directory.
-                        if page.items.is_empty() {
-                            if let Some(next) = page.next {
-                                let prefix = child_prefix(reservation.namespace(), directory);
-                                let name = decode_name(&next[prefix.len()..])?;
-                                state.stack.last_mut().unwrap().after = Some(
-                                    String::from_utf8(name)
-                                        .map_err(|_| CatalogError::Corrupt("回收游标非 UTF-8"))?,
-                                );
-                            } else {
-                                state.stack.pop();
-                                state.complete = state.stack.is_empty();
-                            }
-                        } else {
-                            let child = &page.items[0];
-                            let name = std::str::from_utf8(&child.name)
-                                .map_err(|_| CatalogError::Corrupt("回收文件名非 UTF-8"))?;
-                            let current = path(&state.stack);
-                            let relative = if current == "/" {
-                                format!("/{name}")
-                            } else {
-                                format!("{current}/{name}")
-                            };
-                            let full =
-                                pool_catalog_path(reservation.spec().pool, relative.as_bytes())?;
-                            let resolved = lookup::resolve_active_path_at_mode(
-                                &tr,
-                                reservation.namespace(),
-                                lookup::path_components(&full)?,
-                                false,
-                            )
-                            .await?
-                            .ok_or(CatalogError::Corrupt("回收分页目标不存在"))?;
-                            state.stack.last_mut().unwrap().after = Some(name.into());
-                            match resolved {
-                                ResolvedPath::Directory { id, .. } if id == child.id => {
-                                    if state.stack.len() + 1 >= usize::from(MAX_DEPTH) {
-                                        return Err(CatalogError::Invalid("回收目录深度超限"));
-                                    }
-                                    state.stack.push(Frame {
-                                        directory: id.to_string(),
-                                        name: name.into(),
-                                        after: None,
-                                    });
-                                }
-                                ResolvedPath::File { id, head, copy, .. } if id == child.id => {
-                                    if copy.volume_id == reservation.spec().volume {
-                                        state.current = Some(ReclaimFile {
-                                            path: relative,
-                                            file: id.to_string(),
-                                            version: head.version,
-                                            size: copy.size,
-                                            operation: operation.to_string(),
-                                        });
-                                    }
-                                }
-                                _ => return Err(CatalogError::Corrupt("回收分页 inode 不一致")),
-                            }
-                        }
-                        let raw = encode(&state)?;
-                        let root = if let Some(file) = state.current() {
-                            Some(upload_retry::prepare_root_at(&tr, reservation, file).await?)
-                        } else {
-                            None
-                        };
-                        if let Some((key, value)) = root {
-                            tr.set(&key, &value);
-                        }
-                        tr.set(&state_key(reservation), &raw);
-                        Ok(state)
+                        advance_at(&tr, reservation, owner, operation).await
                     }
                     .await,
                 )
@@ -455,6 +592,28 @@ impl ManagedCatalog {
         verified: &ResolvedRead,
         verified_head: ActiveIndexIdentity,
     ) -> Result<ReclaimWalk> {
+        self.verify_reclaim_file_metadata(
+            reservation,
+            owner,
+            file,
+            request,
+            &ReadMetadata::from(verified),
+            verified_head,
+        )
+        .await
+    }
+
+    /// Managed reads keep their sealed physical plan separate from metadata.
+    /// The same catalog transaction records the original destination identity.
+    pub async fn verify_reclaim_file_metadata(
+        &self,
+        reservation: &ReclaimReservation,
+        owner: u64,
+        file: &ReclaimFile,
+        request: &ActiveFileRequest,
+        verified: &ReadMetadata,
+        verified_head: ActiveIndexIdentity,
+    ) -> Result<ReclaimWalk> {
         self.db.run(|tr,_| async move {requests::retry_result(async {
             let parent=record_at(&tr,reservation,owner).await?;
             if parent["owner_epoch"]!=owner {return Err(CatalogError::OwnerFenced);}
@@ -471,7 +630,7 @@ impl ManagedCatalog {
                 .map(|raw|decode(&raw)).transpose()?;
             let terminal=terminal_evidence_at(&tr,request,&intent,destination_version,previous.as_ref()).await?;
             let mut index_bytes=Vec::new(); active_volume::encode_index(&mut index_bytes,verified_head);
-            let proof=json!({"version":1,"parent":reservation.fingerprint(),"request":request.fingerprint(),"file":file,"head":encode_head(&verified.head),"copy":copy_records::encode_physical_copy(&verified.copy)?,"index":index_bytes,"terminal":terminal});
+            let proof=verification_value(reservation,file,request,verified,index_bytes,terminal)?;
             let mut state=state_at(&tr,reservation).await?;
             if let Some(old)=previous {
                 if old!=proof {return Err(CatalogError::Invalid("回收验证重试改变原证据"));}

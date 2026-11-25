@@ -554,6 +554,8 @@ impl Inner {
 type DirectoryReader = (Directory, Option<(u64, u64)>);
 
 pub struct FileService {
+    control_only: bool,
+    audit_source: Option<super::control_only::BoundDirectoryAudit>,
     permission: Arc<Mutex<Option<Arc<super::permission::Permission>>>>,
     /// Raft 已应用的旧目录暂停屏障；所有池/驱动 lane 共用。
     catalog_quiesced: Arc<std::sync::atomic::AtomicBool>,
@@ -702,6 +704,9 @@ impl FileService {
 
     /// 下载暂存文件创建后立即 unlink，最后一个句柄关闭时由内核回收。
     pub fn read_spool(&self) -> std::io::Result<std::fs::File> {
+        if self.control_only {
+            return Err(std::io::Error::other("control-only 禁止下载暂存"));
+        }
         use std::os::unix::fs::OpenOptionsExt;
         let path = self
             .spool_dir
@@ -730,6 +735,8 @@ impl FileService {
         let _ = std::fs::remove_dir_all(&spool_dir);
         std::fs::create_dir_all(&spool_dir)?;
         Ok(Arc::new(Self {
+            control_only: false,
+            audit_source: None,
             permission: Arc::new(Mutex::new(None)),
             catalog_quiesced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             inner: Arc::new(Mutex::new(PoolState {
@@ -752,6 +759,58 @@ impl FileService {
             export_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reader: Mutex::new(None),
         }))
+    }
+
+    /// 无暂存路径、无目录连接；本模式不可被许可或执行线程升级。
+    pub fn control_only(audit: Option<super::control_only::BoundDirectoryAudit>) -> Arc<Self> {
+        Arc::new(Self {
+            control_only: true,
+            audit_source: audit,
+            permission: Arc::new(Mutex::new(None)),
+            catalog_quiesced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            inner: Arc::new(Mutex::new(PoolState {
+                current: Inner::empty(),
+                lane: 0,
+                others: BTreeMap::new(),
+                recent: HashMap::new(),
+            })),
+            lane: 0,
+            target_pool: Mutex::new(None),
+            requested: std::sync::atomic::AtomicBool::new(false),
+            parallelism: std::sync::atomic::AtomicUsize::new(1),
+            peers: Mutex::new(Vec::new()),
+            changed: Arc::new(Condvar::new()),
+            spool_dir: PathBuf::new(),
+            exec: Arc::new(Mutex::new(None)),
+            task_events: Arc::new(Mutex::new(None)),
+            policy: BatchPolicy::default(),
+            directory_path: None,
+            export_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reader: Mutex::new(None),
+        })
+    }
+
+    pub fn is_control_only(&self) -> bool {
+        self.control_only
+    }
+
+    pub fn control_only_description(&self) -> Option<serde_json::Value> {
+        self.audit_source
+            .as_ref()
+            .map(|source| source.description())
+    }
+
+    pub(crate) fn verify_control_only_status(
+        &self,
+        status: &super::node::NodeStatus,
+    ) -> crate::error::Result<()> {
+        if self.control_only {
+            self.audit_source
+                .as_ref()
+                .ok_or_else(|| crate::error::TapeError::Ltfs("没有原目录审计源".into()))?
+                .verify_control_status(status)?;
+        }
+        Ok(())
     }
 
     pub fn set_executor(&self, tx: Sender<ExecRequest>) {
@@ -788,6 +847,9 @@ impl FileService {
     }
 
     pub fn set_permission(&self, permission: Arc<super::permission::Permission>) {
+        if self.control_only {
+            return;
+        }
         *self.permission.lock().unwrap_or_else(|e| e.into_inner()) = Some(permission);
     }
 
@@ -797,6 +859,7 @@ impl FileService {
     }
 
     fn require_catalog_writable(&self) -> Result<(), ServiceError> {
+        self.check_control_only()?;
         if self
             .catalog_quiesced
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -809,8 +872,21 @@ impl FileService {
         }
     }
 
+    fn check_control_only(&self) -> Result<(), ServiceError> {
+        if self.control_only {
+            Err(ServiceError::NotServing(
+                "显式 control-only 禁止业务服务".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     /// HTTP VIP 只跟随新 HA 协议的有效 owner；不要求池里已有可写磁带。
     pub(super) fn serving_deadline(&self, round: u64) -> Option<Instant> {
+        if self.control_only {
+            return None;
+        }
         self.permission
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -818,7 +894,21 @@ impl FileService {
             .and_then(|p| p.deadline(round, super::permission::Phase::Serving))
     }
 
+    #[cfg(feature = "fdb")]
+    pub(super) fn device_busy(&self, round: u64) -> bool {
+        self.permission
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|permission| permission.device_busy(round))
+    }
+
     pub(super) fn check_permission(&self) -> Result<(), ServiceError> {
+        if self.control_only {
+            return Err(ServiceError::NotServing(
+                "显式 control-only 禁止业务服务".into(),
+            ));
+        }
         let permission = self.permission.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = permission.as_ref() {
             let g = self.lock();
@@ -951,6 +1041,8 @@ impl FileService {
             }
         }
         let service = Arc::new(Self {
+            control_only: self.control_only,
+            audit_source: self.audit_source.clone(),
             permission: self.permission.clone(),
             catalog_quiesced: self.catalog_quiesced.clone(),
             inner,
@@ -1085,6 +1177,9 @@ impl FileService {
         free_bytes: u64,
         writable: bool,
     ) {
+        if self.control_only {
+            return;
+        }
         self.requested
             .store(false, std::sync::atomic::Ordering::Release);
         let state = Arc::new(VolumeState::new(
@@ -1181,6 +1276,9 @@ impl FileService {
     /// 池里没有可写的磁带：上传以确定的失败拒绝，直到有带可用。
     /// 写不了不影响查：`pool_uuid` 给出时，`stat`/`list` 继续由目录库回答。
     pub fn close_no_tape(&self, round: u64, pool_uuid: Option<String>, reason: &str) {
+        if self.control_only {
+            return;
+        }
         self.close(reason);
         let mut g = self.lock();
         g.no_tape = true;
@@ -1701,6 +1799,9 @@ impl FileService {
     }
 
     pub fn abort(&self, h: UploadHandle) {
+        if self.control_only {
+            return;
+        }
         let _ = std::fs::remove_file(&h.spool);
         let mut g = self.lock();
         if let Some(s) = g.serving.as_mut().filter(|s| s.round == h.round) {
@@ -1803,6 +1904,15 @@ impl FileService {
 
     /// 直接打开当前目录文件做只读切换审计，避免命中快照替换前的缓存连接。
     pub fn catalog_cutover_audit(&self) -> crate::error::Result<super::directory::CutoverAudit> {
+        if self.control_only {
+            return self
+                .audit_source
+                .as_ref()
+                .ok_or_else(|| {
+                    crate::error::TapeError::Ltfs("control-only gateway 没有目录审计源".into())
+                })?
+                .audit();
+        }
         let path = self
             .directory_path
             .as_ref()
@@ -1817,6 +1927,9 @@ impl FileService {
         expected_frozen_index: u64,
     ) -> crate::error::Result<CatalogSnapshotExport> {
         use crate::error::TapeError;
+        if self.control_only {
+            return Err(TapeError::Ltfs("control-only 禁止目录导出".into()));
+        }
         if self
             .export_active
             .swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -2622,6 +2735,7 @@ impl FileService {
     }
 
     pub fn list(&self) -> Result<BTreeMap<String, u64>, ServiceError> {
+        self.check_control_only()?;
         Ok(self
             .list_nodes()?
             .into_iter()
@@ -2779,6 +2893,7 @@ impl FileService {
         dir: &str,
         pending: bool,
     ) -> Result<Option<BTreeMap<String, DirEntry>>, ServiceError> {
+        self.check_control_only()?;
         let prefix = if dir.trim_matches('/').is_empty() {
             "/".to_string()
         } else {
@@ -3159,5 +3274,45 @@ mod tests {
         assert_eq!(state.retired_count(), 0);
         files.close("test complete");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod control_only_spool_regression {
+    use super::*;
+
+    #[test]
+    fn control_only_preserves_existing_spool() {
+        let root =
+            std::env::temp_dir().join(format!("control-only-spool-{}", uuid::Uuid::new_v4()));
+        let spool = root.join("spool");
+        std::fs::create_dir_all(&spool).unwrap();
+        let sentinel = spool.join("original-upload");
+        std::fs::write(&sentinel, b"original pending body").unwrap();
+        let files = FileService::control_only(None);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"original pending body");
+        files.abort(UploadHandle {
+            task: 1,
+            path: "/old".into(),
+            spool: sentinel.clone(),
+            round: 1,
+        });
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"original pending body");
+        assert!(
+            files
+                .finish(
+                    UploadHandle {
+                        task: 1,
+                        path: "/old".into(),
+                        spool: sentinel.clone(),
+                        round: 1
+                    },
+                    21
+                )
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"original pending body");
+        drop(files);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

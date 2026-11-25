@@ -113,6 +113,13 @@ fn mkltfs_at(
     let drive = TapeDrive::new(device);
     let mam = Mam::new(device);
     let volume_uuid = opts.volume_uuid.unwrap_or_else(Uuid::new_v4);
+    let locate_index_start = |partition| {
+        if fixed_time.is_some() {
+            drive.locate_if_needed(partition, P1_DATA_START)
+        } else {
+            drive.locate(partition, P1_DATA_START, true)
+        }
+    };
 
     info!(
         "mkltfs 开始: volume_id={} uuid={}",
@@ -166,7 +173,7 @@ fn mkltfs_at(
     p0_written.previous_location = Some(dp_first);
     let p0_xml = p0_written.to_xml()?;
     // Index Construct = FM + 索引 + FM（§5.2.3）
-    drive.locate(0, P1_DATA_START, true)?;
+    locate_index_start(0)?;
     drive.write_filemark(1)?;
     write_blocks(&drive, &p0_xml, opts.block_size as usize)?;
     drive.write_filemark(1)?;
@@ -186,7 +193,7 @@ fn mkltfs_at(
         start_block: FIRST_INDEX_BLOCK,
     };
     let p1_xml = p1_index.to_xml()?;
-    drive.locate(1, P1_DATA_START, true)?;
+    locate_index_start(1)?;
     drive.write_filemark(1)?;
     write_blocks(&drive, &p1_xml, opts.block_size as usize)?;
     drive.write_filemark(1)?;
@@ -485,6 +492,47 @@ mod quick_reset_tests {
         .unwrap()
         .identity()
         .unwrap()
+    }
+    #[test]
+    fn deterministic_quick_reset_skips_redundant_index_opening_locates() {
+        use crate::scsi::cdb::opcode;
+
+        let lib = SimLibrary::new(1, 2, 1);
+        lib.insert_cartridge(SimCartridge::blank("RSET00L8", 64 << 20), 0)
+            .unwrap();
+        lib.load_into_drive("RSET00L8", 0).unwrap();
+        let device = lib.drive(0);
+        mkltfs(&device, &MkltfsOptions::default()).unwrap();
+        let opts = MkltfsOptions {
+            volume_id: "RSET00".into(),
+            volume_uuid: Some(Uuid::new_v4()),
+            quick: true,
+            ..Default::default()
+        };
+        let from = device.command_log().len();
+        mkltfs(&device, &opts).unwrap();
+        let public = device.command_log();
+        let from_reset = public.len();
+        reset_ltfs_at(&device, &opts, "2026-11-09T01:02:03.123456789Z").unwrap();
+        let reset = device.command_log();
+        let count = |log: &[u8], cmd| log.iter().filter(|&&op| op == cmd).count();
+        assert_eq!(count(&public[from..], opcode::LOCATE_16), 6);
+        assert_eq!(count(&reset[from_reset..], opcode::LOCATE_16), 4);
+        assert_eq!(count(&reset[from_reset..], opcode::READ_POSITION), 2);
+        for cmd in [
+            opcode::WRITE_6,
+            opcode::WRITE_FILEMARKS_6,
+            opcode::WRITE_ATTRIBUTE,
+        ] {
+            assert_eq!(
+                count(&reset[from_reset..], cmd),
+                count(&public[from..], cmd)
+            );
+        }
+        assert_eq!(
+            capture(&device).head().volume_uuid,
+            opts.volume_uuid.unwrap()
+        );
     }
     #[test]
     fn quick_reclaim_recipe_preserves_layout_and_identity_and_is_deterministic_after_interruptions()

@@ -28,6 +28,18 @@ pub trait TapeTransport {
         None
     }
 
+    /// Opaque evidence that the loaded medium has not changed through any
+    /// handle or initiator. Equal tokens must exclude content/identity changes,
+    /// reset, power loss, load/unload and FORMAT, including unknown outcomes.
+    /// Pure positioning and reads may preserve the token; handle-local epoch
+    /// checks remain independent. Updates must be atomic with the modeled
+    /// content/identity change; overflow/lost evidence
+    /// returns None. A handle-local epoch or a merely valid VCR is insufficient.
+    /// Real SG_IO devices currently provide no such guarantee and keep None.
+    fn medium_change_token(&self) -> Option<[u8; 32]> {
+        None
+    }
+
     /// Raft round and opaque permission-object identity checked for every CDB.
     /// The identity is compared only while both borrowed objects are alive.
     fn execution_guard(&self) -> Option<(u64, usize)> {

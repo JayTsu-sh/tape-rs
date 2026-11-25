@@ -38,6 +38,9 @@ pub struct Reclaim {
     /// 完成后将源带归槽并解除池归属
     #[arg(short = 'u', long)]
     unassign: bool,
+    /// 仅执行完整输入能装入单组的普通managed文件回收；不支持时保留原请求
+    #[arg(long)]
+    group_only: bool,
 }
 #[derive(Args)]
 pub struct Move {
@@ -71,7 +74,7 @@ pub struct Rescan {
 }
 enum Action {
     Assign { yes: bool, force: bool },
-    Reclaim { yes: bool, unassign: bool },
+    Reclaim { yes: bool, unassign: bool, group_only: bool },
     Move { location: Option<String> },
     Unassign,
     Validate,
@@ -97,6 +100,7 @@ impl Action {
                 | Self::Assign { force: true, .. }
                 | Self::Reclaim { yes: true, .. }
                 | Self::Reclaim { unassign: true, .. }
+                | Self::Reclaim { group_only: true, .. }
                 | Self::Move { location: Some(_) }
                 | Self::Policy { patch: Some(_) }
         )
@@ -268,9 +272,12 @@ fn run(
                 if let Action::Policy { patch } = &action {
                     value["patch"] = patch.clone().ok_or("tape set 必须指定 --patch")?;
                 }
-                if let Action::Reclaim { unassign, .. } = &action {
+                if let Action::Reclaim { unassign, group_only, .. } = &action {
                     value["confirm_format"] = json!(true);
                     value["unassign"] = json!(unassign);
+                    if *group_only {
+                        value["mode"] = json!("group-only");
+                    }
                 }
                 value
             }
@@ -306,6 +313,7 @@ pub fn reclaim(
         Action::Reclaim {
             yes: command.yes,
             unassign: command.unassign,
+            group_only: command.group_only,
         },
     )
 }

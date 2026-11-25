@@ -61,7 +61,7 @@ pub(super) fn validate(req: &Request, q: &BTreeMap<String, String>) -> S3Result<
     {
         headers.remove(name);
     }
-    supported_request_with_time(&headers, &BTreeMap::new(), true)
+    supported_request(&headers, &BTreeMap::new())
 }
 
 pub(super) fn input(

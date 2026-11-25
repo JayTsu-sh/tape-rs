@@ -18,7 +18,11 @@ use tokio::sync::Semaphore;
 use super::http::{self, HttpContext};
 use super::multilib::LibrariesConfig;
 
+mod control_only;
 mod native_barrier;
+
+/// 显式无业务模式仅提供本地控制观察。
+pub use control_only::router as control_only_router;
 
 const HOP: &str = "x-tapers-forwarded";
 
@@ -767,4 +771,37 @@ mod tests {
         server.join().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
+}
+
+/// 启动显式 control-only 观察接口。
+pub fn serve_control_only(
+    listen: &str,
+    config: LibrariesConfig,
+    libraries: BTreeMap<String, Arc<HttpContext>>,
+    gateway: Arc<HttpContext>,
+    peers: HashMap<u64, String>,
+) -> std::io::Result<()> {
+    http::serve_router(
+        listen,
+        control_only_router(config, libraries, gateway, peers),
+    )
+}
+
+#[cfg(test)]
+pub(crate) async fn native_barrier_test_adapter(
+    serial: &str,
+    members: &HashMap<u64, String>,
+    ctx: Arc<HttpContext>,
+) -> u16 {
+    let request = Request::builder()
+        .uri(format!(
+            "/admin/catalog/native-barrier?challenge={}",
+            uuid::Uuid::new_v4()
+        ))
+        .body(Body::empty())
+        .unwrap();
+    native_barrier::respond(serial, members, ctx, Arc::new(Semaphore::new(1)), request)
+        .await
+        .status()
+        .as_u16()
 }

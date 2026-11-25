@@ -56,6 +56,16 @@ pub(super) async fn writer(
     request: Request,
 ) -> Result<Local, Response> {
     header_scope(&request, route)?;
+    match ctx.catalog.library_handoff(serial, route, None).await {
+        Ok(Some(value)) if value.phase != crate::managed_catalog::LibraryHandoffPhase::Online => {
+            return Err(reply(
+                StatusCode::CONFLICT,
+                json!({"error":"带库设备暂未服务","handoff":value}),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => return Err(catalog_error(error)),
+    }
     if ctx.upload_budget.is_none() {
         return Err(reply(
             StatusCode::METHOD_NOT_ALLOWED,

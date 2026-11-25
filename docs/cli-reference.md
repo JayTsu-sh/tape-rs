@@ -117,6 +117,8 @@ install -d -m 700 /var/lib/tape-client
 
 ## 带库管理
 
+整库交给外部应用及重新加载的命令、SDK 和 HTTP 回执见[物理带库交还与重新加载](reference/library-handoff.md)。
+
 ### library list
 
 ```sh

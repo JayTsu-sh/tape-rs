@@ -114,6 +114,30 @@ fn sg_index(p: &std::path::Path) -> Option<u32> {
         .and_then(|n| n[2..].parse().ok())
 }
 
+/// Linux's cached VPD page 0x80, read without opening the device node.
+#[cfg(feature = "fdb")]
+pub(crate) fn sysfs_unit_serial(path: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::read(
+        std::path::Path::new("/sys/class/scsi_generic")
+            .join(path.file_name()?)
+            .join("device/vpd_pg80"),
+    )
+    .ok()?;
+    parse_cached_unit_serial(&bytes)
+}
+
+#[cfg(feature = "fdb")]
+fn parse_cached_unit_serial(bytes: &[u8]) -> Option<String> {
+    let [_, 0x80, hi, lo] = bytes.get(..4)? else {
+        return None;
+    };
+    let len = usize::from(u16::from_be_bytes([*hi, *lo]));
+    let value = std::str::from_utf8(bytes.get(4..4 + len)?)
+        .ok()?
+        .trim_matches(|c: char| c == '\0' || c.is_whitespace());
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
 /// 读 VPD page 0x80 (Unit Serial Number)，返回 trim 后的非空字符串；失败或为空返回 None。
 pub fn read_unit_serial(dev: &dyn TapeTransport) -> Option<String> {
     let cdb_bytes = cdb::inquiry_vpd(0x80, 252);
@@ -136,6 +160,17 @@ pub fn read_unit_serial(dev: &dyn TapeTransport) -> Option<String> {
 #[cfg(test)]
 mod fc_port_tests {
     use super::*;
+
+    #[cfg(feature = "fdb")]
+    #[test]
+    fn cached_vpd_requires_the_complete_serial_page() {
+        assert_eq!(
+            parse_cached_unit_serial(b"\x01\x80\0\x06DRIVE ").as_deref(),
+            Some("DRIVE")
+        );
+        assert_eq!(parse_cached_unit_serial(b"\x01\x80\0\x06DRIVE"), None);
+        assert_eq!(parse_cached_unit_serial(b"\x01\x83\0\x05DRIVE"), None);
+    }
 
     #[test]
     fn standard_inquiry_checks_transferred_declared_size_and_descriptor_bytes() {

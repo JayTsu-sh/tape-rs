@@ -159,6 +159,148 @@ fn root_value() -> Vec<u8> {
     })
 }
 
+pub(crate) struct ArchivedNativeExpectation<'a> {
+    pub serial: &'a str,
+    pub namespace: Uuid,
+    pub operation_epoch: u64,
+    pub operation: Uuid,
+    pub owner: u64,
+    pub frozen: u64,
+    pub quiesce: u64,
+    pub members: &'a [u64],
+}
+
+/// 只解码归档中的 app22 键值，不构建 FoundationDB 事务。
+pub(crate) fn verify_archived_native_source(
+    rows: &BTreeMap<&[u8], &[u8]>,
+    expected: ArchivedNativeExpectation<'_>,
+) -> Result<(ActiveLibraryRoute, String)> {
+    let ArchivedNativeExpectation {
+        serial,
+        namespace,
+        operation_epoch,
+        operation,
+        owner,
+        frozen,
+        quiesce,
+        members,
+    } = expected;
+    let get = |key: Vec<u8>| rows.get(key.as_slice()).copied();
+    let active =
+        routing::decode_active(get(routing::active_key(serial)).ok_or(CatalogError::Incomplete)?)?;
+    let certificate = get(routing::certificate_key(serial)).ok_or(CatalogError::Incomplete)?;
+    let (cert_namespace, proof) = decode(certificate)?;
+    if cert_namespace != namespace
+        || active.route.namespace != namespace
+        || active.route.revision != 1
+        || active.frozen_index != frozen
+        || proof.frozen != frozen
+        || proof.replies[0]["quiesce_index"].as_u64() != Some(quiesce)
+        || proof.serial != serial
+        || proof
+            .replies
+            .iter()
+            .map(|r| r["node_id"].as_u64())
+            .ne(members.iter().copied().map(Some))
+        || active.initial_owner_epoch != frozen + 1
+        || Sha256::digest(certificate)[..] != active.certificate_sha256
+        || get(routing::route_key(serial)) != Some(routing::encode_route(active.route).as_slice())
+        || get(namespace_key(namespace)) != Some(&[NamespaceState::Active as u8])
+        || get(control::managed_key(namespace)) != Some(&[])
+        || get(control::library_key(namespace, serial)) != Some(&[])
+        || get(node_key(namespace, Uuid::nil())) != Some(root_value().as_slice())
+    {
+        return Err(CatalogError::Corrupt(
+            "归档原生 N1 证明、活动路由或根记录不符",
+        ));
+    }
+    control::validate_managed_layout(get(control::managed_layout_key(namespace)))?;
+    let epoch = get(owner_key(serial)).ok_or(CatalogError::Incomplete)?;
+    if owner < active.initial_owner_epoch || owner > MAX_EPOCH || epoch != owner.to_be_bytes() {
+        return Err(CatalogError::Corrupt("归档 O owner 与原 B 库执行轮次不符"));
+    }
+    let task_sha256 = control::management::read_archived_reclaim_task(
+        rows,
+        serial,
+        namespace,
+        operation_epoch,
+        operation,
+        owner,
+    )?;
+    Ok((active, task_sha256))
+}
+
+#[cfg(test)]
+pub(crate) fn archived_reclaim_fixture_rows(
+    request: &control::ManagementRequest,
+    frozen: u64,
+    quiesce: u64,
+    owner: u64,
+) -> BTreeMap<&'static str, (Vec<u8>, Vec<u8>)> {
+    let serial = request.value()["library"].as_str().unwrap();
+    let namespace = request.namespace();
+    let challenge = Uuid::from_u128(6);
+    let replies: Vec<_> = (1..=3).map(|node| json!({
+        "version":1, "library_serial":serial, "challenge":challenge.to_string(), "node_id":node,
+        "term":1, "leader":1, "role":if node==1 {"Leader"} else {"Follower"},
+        "members":{"1":"127.0.0.1:7001", "2":"127.0.0.1:7002", "3":"127.0.0.1:7003"},
+        "quiesce_index":quiesce, "frozen_index":frozen, "applied_index":frozen,
+        "executor_absent":true, "catalog_pending":false, "shutting_down":false, "catalog_empty":true
+    })).collect();
+    let certificate = verify_native_barriers(serial, challenge, &replies)
+        .unwrap()
+        .certificate(namespace);
+    let route = PreparedLibraryRoute {
+        namespace,
+        revision: 1,
+    };
+    let active = ActiveLibraryRoute {
+        route,
+        frozen_index: frozen,
+        certificate_sha256: Sha256::digest(&certificate).into(),
+        initial_owner_epoch: frozen + 1,
+    };
+    BTreeMap::from([
+        (
+            "active",
+            (
+                routing::active_key(serial),
+                routing::encode_active(active).to_vec(),
+            ),
+        ),
+        (
+            "route",
+            (
+                routing::route_key(serial),
+                routing::encode_route(route).to_vec(),
+            ),
+        ),
+        (
+            "certificate",
+            (routing::certificate_key(serial), certificate),
+        ),
+        (
+            "namespace",
+            (namespace_key(namespace), vec![NamespaceState::Active as u8]),
+        ),
+        ("marker", (control::managed_key(namespace), vec![])),
+        ("library", (control::library_key(namespace, serial), vec![])),
+        (
+            "layout",
+            (
+                control::managed_layout_key(namespace),
+                vec![control::MANAGED_LAYOUT_VERSION],
+            ),
+        ),
+        ("root", (node_key(namespace, Uuid::nil()), root_value())),
+        ("owner", (owner_key(serial), owner.to_be_bytes().to_vec())),
+        (
+            "task",
+            control::management::encode_archived_reclaim_fixture(request, owner),
+        ),
+    ])
+}
+
 pub(super) async fn active_context(
     tr: &Transaction,
     serial: &str,

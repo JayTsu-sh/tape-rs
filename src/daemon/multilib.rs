@@ -1675,6 +1675,21 @@ fn advance_directories(running: &mut BTreeMap<String, Running>, index: u64) -> R
     Ok(())
 }
 
+/// 仅在内存回放控制链；空 Running、write=false，沿用正式 codec/apply 与重映射语义。
+pub(crate) fn readonly_control_replay(
+    config: &LibrariesConfig,
+    snapshot_data: &[u8],
+    entries: &[(u64, Vec<u8>)],
+) -> Result<(u64, u64, BTreeMap<String, ControlState>)> {
+    let (mut state, source, directory_index) = ClusterState::restore(config, snapshot_data)?;
+    let mut running = BTreeMap::<String, Running>::new();
+    for (index, data) in entries {
+        apply_entry_for_replay(&mut state, &mut running, *index, data, false)?;
+    }
+    debug_assert!(running.is_empty());
+    Ok((source, directory_index, state.controls))
+}
+
 #[cfg(test)]
 fn write_bundle(path: &Path, running: &BTreeMap<String, Running>, index: u64) -> Result<()> {
     write_bundle_refs(

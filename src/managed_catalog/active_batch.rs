@@ -7,6 +7,71 @@ use std::collections::{BTreeMap, HashSet};
 
 use super::*;
 
+#[derive(Clone, Copy)]
+enum PublicationAuthority<'a> {
+    Ordinary,
+    Original(&'a crate::managed_catalog::OriginalCheckpointContext),
+}
+impl PublicationAuthority<'_> {
+    #[allow(clippy::too_many_arguments)]
+    fn require_at<'a>(
+        &'a self,
+        tr: &'a Transaction,
+        serial: &'a str,
+        owner: u64,
+        batch: Uuid,
+        volume: Uuid,
+        generation: u64,
+        receipt: Option<&'a CommitReceipt>,
+        page: Option<u16>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<()>> + 'a>> {
+        Box::pin(async move {
+            let Self::Original(context) = self else {
+                return Ok(());
+            };
+            if serial != context.library_serial()
+                || owner != context.owner()
+                || batch != context.batch_id()
+                || volume != context.current_index().volume_uuid
+                || generation != context.current_index().generation
+            {
+                return Err(CatalogError::Invalid("原checkpoint发布参数改变"));
+            }
+            context.require_publishing_at(tr).await?;
+            if let Some(receipt) = receipt {
+                context
+                    .require_member_at(tr, batch, receipt, context.current_index())
+                    .await?;
+            }
+            if let Some(page) = page {
+                let selected = context
+                    .files()
+                    .chunks(PAGE_ITEMS)
+                    .nth(usize::from(page))
+                    .ok_or(CatalogError::Invalid("原checkpoint页越界"))?;
+                if receipt
+                    .is_some_and(|receipt| !selected.iter().any(|file| file.receipt == *receipt))
+                {
+                    return Err(CatalogError::Invalid("原checkpoint成员不属于原页"));
+                }
+            }
+            Ok(())
+        })
+    }
+    fn finish<T: PartialEq + std::fmt::Debug>(&self, result: Result<T>, accepted: &[T]) -> Result<T> {
+        if matches!(self, Self::Ordinary) {
+            return result;
+        }
+        match result {
+            Ok(value) if accepted.contains(&value) => Ok(value),
+            Ok(value) => Err(control::notifications::atomic_error(CatalogError::Cache(
+                format!("原checkpoint事务未完成: {value:?}"),
+            ))),
+            Err(error) => Err(control::notifications::atomic_error(error)),
+        }
+    }
+}
+
 const PAGE_ITEMS: usize = 128;
 const MAX_BATCH_ITEMS: usize = 65_536;
 const HEADER_LEN: usize = 96;
@@ -14,6 +79,10 @@ const PREPARED_LEN: usize = 87;
 const PREPARED_PAGE_LEN: usize = 49;
 const PREPARED_BATCH_LEN: usize = 113;
 const TARGET_LOCATOR_LEN: usize = 81;
+
+#[cfg(test)]
+#[path = "reclaim_active_batch_protocol_tests.rs"]
+mod reclaim_protocol_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActiveBatchOutcome {
@@ -109,7 +178,14 @@ pub struct ActiveSealedBatchPage {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Protocol {
+    Single = 2,
+    ReclaimGroup = 3,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Header {
+    protocol: Protocol,
     batch_id: Uuid,
     namespace: Uuid,
     owner_epoch: u64,
@@ -123,7 +199,7 @@ struct Header {
 impl Header {
     fn encode(self) -> [u8; HEADER_LEN] {
         let mut value = [0; HEADER_LEN];
-        value[0] = 2;
+        value[0] = self.protocol as u8;
         value[1] = self.phase as u8;
         value[2..18].copy_from_slice(self.batch_id.as_bytes());
         value[18..34].copy_from_slice(self.namespace.as_bytes());
@@ -136,10 +212,11 @@ impl Header {
     }
 
     fn decode(value: &[u8]) -> Result<Self> {
-        if value.len() != HEADER_LEN || value[0] != 2 || value[1] > 2 {
+        if value.len() != HEADER_LEN || !matches!(value[0],2 | 3) || value[1] > 2 {
             return Err(CatalogError::Corrupt("活动批次头版本或长度"));
         }
         let header = Self {
+            protocol: match value[0] { 2 => Protocol::Single,3 => Protocol::ReclaimGroup,_ => unreachable!("validated protocol") },
             batch_id: uuid_from(&value[2..18])?,
             namespace: uuid_from(&value[18..34])?,
             owner_epoch: read_u64(&value[34..42]),
@@ -190,10 +267,15 @@ pub(super) async fn unsealed_or_absent_for_recovery(
     volume: Uuid,
     generation: u64,
 ) -> Result<bool> {
+    control::reclaim::require_no_group_recovery_at(tr,volume).await?;
     let Some(value) = tr.get(&batch_key(volume, generation), false).await? else {
         return Ok(true);
     };
-    Ok(Header::decode(&value)?.phase != ActiveBatchPhase::Sealed)
+    let header = Header::decode(&value)?;
+    if header.protocol == Protocol::ReclaimGroup {
+        return Err(CatalogError::Invalid("required回收批次必须按原group/attempt恢复，不能普通收尾"));
+    }
+    Ok(header.phase != ActiveBatchPhase::Sealed)
 }
 
 fn page_key(volume: Uuid, generation: u64, page: u16) -> Vec<u8> {
@@ -466,6 +548,68 @@ fn prepared_batch_value(
     value
 }
 
+/// A declared new-daemon overlay cannot turn a lost projection into the
+/// legacy no-directory path. Its original receipt and manifest remain binding.
+pub(super) async fn require_declared_layout_at(
+    tr: &Transaction,
+    locator: TargetLocator,
+    receipt: &CommitReceipt,
+    source: ActiveIndexIdentity,
+) -> Result<()> {
+    let raw = tr
+        .get(&batch_key(locator.volume, locator.generation), true)
+        .await?
+        .ok_or(CatalogError::Corrupt("已发布活动副本缺少原批次"))?;
+    let header = Header::decode(&raw)?;
+    if header.batch_id != locator.batch_id || header.namespace != receipt.namespace {
+        return Err(CatalogError::Corrupt("已发布活动副本与原批次不同"));
+    }
+    if layout_requirement(header, source).exists_at(tr).await? {
+        body_layouts::require_binding_at(tr, locator.batch_id, receipt, source)
+            .await
+            .map_err(|error| match error {
+                CatalogError::Incomplete => {
+                    CatalogError::Corrupt("已声明正文布局的副本缺少完整绑定")
+                }
+                error => error,
+            })?;
+    }
+    Ok(())
+}
+
+fn layout_requirement(
+    header: Header,
+    index: ActiveIndexIdentity,
+) -> body_layouts::BatchLayoutRequirement {
+    body_layouts::BatchLayoutRequirement {
+        namespace: header.namespace,
+        batch: header.batch_id,
+        source: index,
+        manifest: header.digest,
+        items: header.items,
+        pages: header.pages,
+    }
+}
+
+#[cfg(test)]
+pub(in crate::managed_catalog) async fn test_layout_requirement_at(
+    tr: &Transaction,
+    serial: &str,
+    volume: Uuid,
+    generation: u64,
+) -> Result<body_layouts::BatchLayoutRequirement> {
+    let header = Header::decode(
+        &tr.get(&batch_key(volume, generation), false)
+            .await?
+            .ok_or(CatalogError::Incomplete)?,
+    )?;
+    let (scan, source) = active_volume::observed_at(tr, serial, volume).await?;
+    if source.generation != generation || header.scan_id != scan.id {
+        return Err(CatalogError::Incomplete);
+    }
+    Ok(layout_requirement(header, source))
+}
+
 async fn complete_preparation_at(
     tr: &Transaction,
     volume: Uuid,
@@ -488,6 +632,12 @@ async fn complete_preparation_at(
             return Err(CatalogError::Corrupt("活动准备页标记损坏"));
         }
         markers.push(value.try_into().expect("validated length"));
+    }
+    if !layout_requirement(header, index)
+        .complete_at(tr, &markers)
+        .await?
+    {
+        return Ok(None);
     }
     Ok(Some(prepared_batch_value(header, &markers, index)))
 }
@@ -843,6 +993,56 @@ fn next_generation(current: ActiveIndexIdentity, target: u64) -> bool {
     current.generation.checked_add(1) == Some(target)
 }
 
+pub(super) async fn require_stored_checkpoint_at(
+    tr: &Transaction,
+    batch_id: Uuid,
+    index: ActiveIndexIdentity,
+    file_count: Option<u64>,
+) -> Result<()> {
+    let header = if let Some(raw) = tr.get(&batch_key(index.volume_uuid,index.generation),false).await? {
+        Header::decode(&raw)?
+    } else {
+        let raw = tr.get(&compacted_batch_key(index.volume_uuid,index.generation),false).await?.ok_or(CatalogError::Incomplete)?;
+        decode_compacted_batch(&raw)?.0
+    };
+    if header.batch_id != batch_id || header.phase != ActiveBatchPhase::Sealed {
+        return Err(CatalogError::Invalid("已观察索引不是原封存批次"));
+    }
+    if header.protocol == Protocol::ReclaimGroup {
+        control::reclaim::require_index_checkpoint_at(tr,header.namespace,batch_id,header.digest,index,file_count).await?;
+    }
+    Ok(())
+}
+
+/// Recheck required checkpoint evidence in the same transaction as every
+/// publication/materialization success, including compacted retry markers.
+/// Read immutable history directly: observed_batch_at calls the required
+/// checkpoint validator itself and must not be used to resolve this identity.
+async fn require_published_checkpoint_at(
+    tr: &Transaction,
+    serial: &str,
+    volume: Uuid,
+    generation: u64,
+) -> Result<()> {
+    let header = if let Some(raw) = tr.get(&compacted_batch_key(volume, generation), false).await? {
+        decode_compacted_batch(&raw)?.0
+    } else {
+        let raw = tr
+            .get(&batch_key(volume, generation), false)
+            .await?
+            .ok_or(CatalogError::Incomplete)?;
+        Header::decode(&raw)?
+    };
+    if header.protocol == Protocol::ReclaimGroup {
+        let (kind, index) = active_volume::history_at(tr, serial, volume, generation).await?;
+        if kind != active_volume::IndexKind::FileBatch(header.batch_id) {
+            return Err(CatalogError::Corrupt("组检查点与原批次历史不一致"));
+        }
+        require_stored_checkpoint_at(tr, header.batch_id, index, None).await?;
+    }
+    Ok(())
+}
+
 /// Called inside the volume-index CAS transaction. A sealed header was only
 /// created after every page and request claim passed the manifest check.
 pub(super) async fn sealed_for_index(
@@ -863,6 +1063,325 @@ pub(super) async fn sealed_for_index(
         && header.batch_id == batch_id
         && header.owner_epoch <= owner_epoch
         && header.scan_id == scan_id)
+}
+
+pub(super) async fn sealed_for_checkpoint(
+    tr: &Transaction, namespace: Uuid, volume: Uuid,
+    checkpoint: (ActiveIndexIdentity,u64), batch_id: Uuid, owner_epoch: u64, scan_id: Uuid,
+) -> Result<bool> {
+    let (index,count) = checkpoint;
+    if !sealed_for_index(tr,namespace,volume,index.generation,batch_id,owner_epoch,scan_id).await? {
+        return Ok(false);
+    }
+    require_stored_checkpoint_at(tr,batch_id,index,Some(count)).await?;
+    Ok(true)
+}
+
+/// Original group receipts retain their issuer; execution authority is live.
+/// This only checks stored identity and never turns a sealed header into S4.
+// Pure metadata shape validation shared by completed and candidate headers.
+// A candidate header is not evidence that any device commit happened.
+#[allow(clippy::too_many_arguments)]
+fn require_original_manifest(
+    header: Header,
+    namespace: Uuid,
+    serial: &str,
+    issuer: u64,
+    batch: Uuid,
+    manifest: [u8; 32],
+    volume: Uuid,
+    generation: u64,
+    receipts: &[CommitReceipt],
+) -> Result<()> {
+    let mut receipts = receipts.to_vec();
+    receipts.sort_by_key(|r| (r.request_epoch, r.operation_id));
+    let mut pages = Vec::new();
+    for receipt in &receipts {
+        validate_receipt(receipt)?;
+        if receipt.namespace != namespace
+            || receipt.library_serial != serial
+            || receipt.owner_epoch != issuer
+            || receipt.volume_id != volume
+            || receipt.volume_generation != generation
+            || receipt.volume_scan_id != header.scan_id
+        {
+            return Err(CatalogError::Invalid(
+                "原checkpoint收据issuer或卷身份不一致",
+            ));
+        }
+    }
+    for page in receipts.chunks(PAGE_ITEMS) {
+        pages.push(page_digest(&page_value(page)?));
+    }
+    if header.protocol != Protocol::ReclaimGroup
+        || header.phase != ActiveBatchPhase::Sealed
+        || header.namespace != namespace
+        || header.batch_id != batch
+        || header.owner_epoch != issuer
+        || header.digest != manifest
+        || header.digest != manifest_digest(&pages)
+        || header.items as usize != receipts.len()
+        || usize::from(header.pages) != pages.len()
+    {
+        return Err(CatalogError::Invalid(
+            "原checkpoint Header3/完整manifest不同",
+        ));
+    }
+    Ok(())
+}
+/// Only an unpublished complete Header3 may be a bounded original-observation
+/// candidate without an already saved physical observation. Never an S4 proof.
+pub(in crate::managed_catalog) async fn original_checkpoint_candidate_header_at(
+    tr: &Transaction,
+    serial: &str,
+    owner: u64,
+    issuer: u64,
+    batch: Uuid,
+    manifest: [u8; 32],
+    volume: Uuid,
+    generation: u64,
+    receipts: &[CommitReceipt],
+) -> Result<bool> {
+    if owner == 0 || issuer == 0 || issuer > owner || receipts.is_empty() {
+        return Err(CatalogError::OwnerFenced);
+    }
+    let namespace = routing::require_active_namespace(tr, serial).await?;
+    if !routing::require_active_owner(tr, namespace, serial, owner).await? {
+        return Err(CatalogError::OwnerFenced);
+    }
+    let Some(raw) = tr.get(&batch_key(volume, generation), false).await? else {
+        return Ok(false);
+    };
+    if tr
+        .get(&compacted_batch_key(volume, generation), false)
+        .await?
+        .is_some()
+        || tr
+            .get(&publication_key(volume, generation), false)
+            .await?
+            .is_some()
+        || tr
+            .get(&prepared_batch_key(volume, generation), false)
+            .await?
+            .is_some()
+    {
+        return Ok(false);
+    }
+    let header = Header::decode(&raw)?;
+    require_original_manifest(
+        header, namespace, serial, issuer, batch, manifest, volume, generation, receipts,
+    )?;
+    Ok(true)
+}
+
+pub(in crate::managed_catalog) async fn require_original_checkpoint_header_at(
+    tr: &Transaction,
+    serial: &str,
+    owner: u64,
+    issuer: u64,
+    batch: Uuid,
+    manifest: [u8; 32],
+    index: ActiveIndexIdentity,
+    receipts: &[CommitReceipt],
+) -> Result<crate::managed_catalog::OriginalCheckpointPublication> {
+    use crate::managed_catalog::OriginalCheckpointPublication as Phase;
+    if owner == 0 || issuer == 0 || issuer > owner || receipts.is_empty() {
+        return Err(CatalogError::OwnerFenced);
+    }
+    let namespace = routing::require_active_namespace(tr, serial).await?;
+    if !routing::require_active_owner(tr, namespace, serial, owner).await? {
+        return Err(CatalogError::OwnerFenced);
+    }
+    let open = tr
+        .get(&batch_key(index.volume_uuid, index.generation), false)
+        .await?;
+    let done = tr
+        .get(
+            &compacted_batch_key(index.volume_uuid, index.generation),
+            false,
+        )
+        .await?;
+    if open.is_some() && done.is_some() {
+        return Err(CatalogError::Corrupt("原checkpoint双重Header"));
+    }
+    let (header, phase) = if let Some(raw) = done {
+        let (header, publication) = decode_compacted_batch(&raw)?;
+        if publication[17..49] != header.digest || publication[81..] != index.sha256 {
+            return Err(CatalogError::Corrupt("原checkpoint归并观察改变"));
+        }
+        if tr
+            .get(&publication_key(index.volume_uuid, index.generation), false)
+            .await?
+            .is_some()
+            || tr
+                .get(
+                    &prepared_batch_key(index.volume_uuid, index.generation),
+                    false,
+                )
+                .await?
+                .is_some()
+        {
+            return Err(CatalogError::Corrupt("原checkpoint归并残留发布槽"));
+        }
+        (header, Phase::Compacted)
+    } else {
+        let header = Header::decode(open.as_deref().ok_or(CatalogError::Incomplete)?)?;
+        let phase = if let Some(publication) = tr
+            .get(&publication_key(index.volume_uuid, index.generation), false)
+            .await?
+        {
+            let prepared = tr
+                .get(
+                    &prepared_batch_key(index.volume_uuid, index.generation),
+                    false,
+                )
+                .await?
+                .ok_or(CatalogError::Incomplete)?;
+            if publication.len() != PREPARED_BATCH_LEN
+                || publication[0] != 1
+                || publication[1..17] != batch.as_bytes()[..]
+                || publication[17..49] != manifest
+                || publication[81..] != index.sha256
+                || publication.as_ref() != prepared.as_ref()
+            {
+                return Err(CatalogError::Corrupt("原checkpoint发布槽不一致"));
+            }
+            Phase::Published
+        } else {
+            Phase::Sealed
+        };
+        (header, phase)
+    };
+    require_original_manifest(
+        header,
+        namespace,
+        serial,
+        issuer,
+        batch,
+        manifest,
+        index.volume_uuid,
+        index.generation,
+        receipts,
+    )?;
+    if phase != Phase::Sealed {
+        require_stored_checkpoint_at(tr, batch, index, None).await?;
+    }
+    Ok(phase)
+}
+
+/// Every physical-layout write transaction retains the original batch and
+/// current execution fence. A typed media proof alone is never FDB authority.
+pub(super) async fn require_layout_stage_at(
+    tr: &Transaction,
+    serial: &str,
+    owner: u64,
+    batch: Uuid,
+    receipt: &CommitReceipt,
+    source: ActiveIndexIdentity,
+) -> Result<()> {
+    if owner == 0 || receipt.owner_epoch != owner || receipt.library_serial != serial {
+        return Err(CatalogError::OwnerFenced);
+    }
+    require_layout_stage_core_at(tr, serial, owner, batch, receipt, source).await
+}
+
+pub(super) async fn require_original_layout_stage_at(
+    tr: &Transaction,
+    context: &crate::managed_catalog::OriginalCheckpointContext,
+    batch: Uuid,
+    receipt: &CommitReceipt,
+    source: ActiveIndexIdentity,
+) -> Result<()> {
+    context
+        .require_member_at(tr, batch, receipt, source)
+        .await?;
+    require_layout_stage_core_at(
+        tr,
+        context.library_serial(),
+        context.owner(),
+        batch,
+        receipt,
+        source,
+    )
+    .await
+}
+
+async fn require_layout_stage_core_at(
+    tr: &Transaction,
+    serial: &str,
+    owner: u64,
+    batch: Uuid,
+    receipt: &CommitReceipt,
+    source: ActiveIndexIdentity,
+) -> Result<()> {
+    let namespace = routing::require_active_namespace(tr, serial).await?;
+    if namespace != receipt.namespace
+        || !routing::require_active_owner(tr, namespace, serial, owner).await?
+    {
+        return Err(CatalogError::OwnerFenced);
+    }
+    let placement = control::verified_placement(tr, receipt.volume_id)
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+    if placement.namespace != namespace
+        || placement.library_serial != serial
+        || Some(placement.pool_id) != receipt.pool_id
+    {
+        return Err(CatalogError::Invalid("正文布局写入卷归属改变"));
+    }
+    let raw = tr
+        .get(
+            &batch_key(receipt.volume_id, receipt.volume_generation),
+            false,
+        )
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+    let header = Header::decode(&raw)?;
+    if header.phase != ActiveBatchPhase::Sealed
+        || header.namespace != namespace
+        || header.batch_id != batch
+        || header.owner_epoch > owner
+        || header.scan_id != receipt.volume_scan_id
+        || tr
+            .get(
+                &publication_key(receipt.volume_id, receipt.volume_generation),
+                false,
+            )
+            .await?
+            .is_some()
+    {
+        return Err(CatalogError::Invalid(
+            "正文布局写入必须属于原未发布封存批次",
+        ));
+    }
+    let observed =
+        active_volume::observed_batch_at(tr, serial, receipt.volume_id, receipt.volume_generation)
+            .await?
+            .ok_or(CatalogError::Incomplete)?;
+    if observed != (batch, source) || !target_claims_match(tr, receipt, batch).await? {
+        return Err(CatalogError::Invalid(
+            "正文布局写入与原批次来源或占用不一致",
+        ));
+    }
+    let intent = tr
+        .get(&requests::intent_key(receipt), false)
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+    if requests::matching_permit(&intent, receipt)?.is_none()
+        || tr
+            .get(
+                &op_key(namespace, receipt.request_epoch, receipt.operation_id),
+                false,
+            )
+            .await?
+            .is_some()
+    {
+        return Err(CatalogError::Invalid("正文布局写入缺少原未完成请求"));
+    }
+    if !layout_requirement(header, source).exists_at(tr).await? {
+        return Err(CatalogError::Incomplete);
+    }
+    Ok(())
 }
 
 async fn abort_header(
@@ -887,6 +1406,9 @@ async fn abort_header(
         return Ok(Err(ActiveBatchOutcome::AlreadyAborted));
     };
     let header = Header::decode(&value)?;
+    if header.protocol == Protocol::ReclaimGroup {
+        return Err(CatalogError::Invalid("required回收批次不能使用普通中止或清理入口"));
+    }
     if header.namespace != namespace || header.batch_id != batch_id {
         return Ok(Err(ActiveBatchOutcome::BatchConflict));
     }
@@ -898,16 +1420,55 @@ async fn abort_header(
 }
 
 impl ManagedCatalog {
-    /// Finish the invisible preparation only when every bounded page has
-    /// already been closed. The small marker is a future publication barrier
-    /// prerequisite; writing it does not expose any file or finish any task.
-    pub async fn seal_observed_active_preparation(
+    /// Persist the new daemon's optional layout constraint before preparation
+    /// or publication. No tape operation occurs in this transaction.
+    pub(crate) async fn require_observed_active_body_layouts(
         &self,
         serial: &str,
         owner_epoch: u64,
         volume: Uuid,
         generation: u64,
         batch_id: Uuid,
+    ) -> Result<ActivePreparationOutcome> {
+        self.require_observed_active_body_layouts_with_authority(
+            serial,
+            owner_epoch,
+            volume,
+            generation,
+            batch_id,
+            PublicationAuthority::Ordinary,
+        )
+        .await
+    }
+
+    fn require_observed_active_body_layouts_with_authority<'a>(
+        &'a self,
+        serial: &'a str,
+        owner_epoch: u64,
+        volume: Uuid,
+        generation: u64,
+        batch_id: Uuid,
+        authority: PublicationAuthority<'a>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<ActivePreparationOutcome>> + 'a>>
+    {
+        Box::pin(self.require_observed_active_body_layouts_in(
+            serial,
+            owner_epoch,
+            volume,
+            generation,
+            batch_id,
+            authority,
+        ))
+    }
+
+    async fn require_observed_active_body_layouts_in(
+        &self,
+        serial: &str,
+        owner_epoch: u64,
+        volume: Uuid,
+        generation: u64,
+        batch_id: Uuid,
+        authority: PublicationAuthority<'_>,
     ) -> Result<ActivePreparationOutcome> {
         control::validate_physical_serial(serial)?;
         if owner_epoch == 0 || volume.is_nil() || generation == 0 || batch_id.is_nil() {
@@ -919,60 +1480,234 @@ impl ManagedCatalog {
                 let serial = serial.clone();
                 async move {
                     requests::retry_result(
-                        async {
-                            let namespace = routing::require_active_namespace(&tr, &serial).await?;
-                            if !routing::require_active_owner(&tr, namespace, &serial, owner_epoch)
+                        authority.finish(
+                            async {
+                                authority
+                                    .require_at(
+                                        &tr,
+                                        &serial,
+                                        owner_epoch,
+                                        batch_id,
+                                        volume,
+                                        generation,
+                                        None,
+                                        None,
+                                    )
+                                    .await?;
+                                let namespace =
+                                    routing::require_active_namespace(&tr, &serial).await?;
+                                if !routing::require_active_owner(
+                                    &tr,
+                                    namespace,
+                                    &serial,
+                                    owner_epoch,
+                                )
                                 .await?
-                            {
-                                return Ok(ActivePreparationOutcome::StaleOwner);
-                            }
-                            let placement = control::verified_placement(&tr, volume)
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
-                            if placement.namespace != namespace
-                                || placement.library_serial != serial
-                            {
-                                return Ok(ActivePreparationOutcome::BatchConflict);
-                            }
-                            let header = tr
-                                .get(&batch_key(volume, generation), false)
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
-                            let header = Header::decode(&header)?;
-                            if header.batch_id != batch_id
-                                || header.namespace != namespace
-                                || header.phase != ActiveBatchPhase::Sealed
-                                || header.owner_epoch > owner_epoch
-                            {
-                                return Ok(ActivePreparationOutcome::BatchConflict);
-                            }
-                            let Some((observed_batch, index)) =
-                                active_volume::observed_batch_at(&tr, &serial, volume, generation)
+                                {
+                                    return Ok(ActivePreparationOutcome::StaleOwner);
+                                }
+                                let placement = control::verified_placement(&tr, volume)
                                     .await?
-                            else {
-                                return Ok(ActivePreparationOutcome::IndexNotObserved);
-                            };
-                            if observed_batch != batch_id {
-                                return Ok(ActivePreparationOutcome::BatchConflict);
-                            }
-                            let Some(marker) =
-                                complete_preparation_at(&tr, volume, generation, header, index)
+                                    .ok_or(CatalogError::Incomplete)?;
+                                if placement.namespace != namespace
+                                    || placement.library_serial != serial
+                                {
+                                    return Ok(ActivePreparationOutcome::BatchConflict);
+                                }
+                                let header = tr
+                                    .get(&batch_key(volume, generation), false)
                                     .await?
-                            else {
-                                return Ok(ActivePreparationOutcome::PageIncomplete);
-                            };
-                            let marker_key = prepared_batch_key(volume, generation);
-                            if let Some(existing) = tr.get(&marker_key, false).await? {
-                                return Ok(if existing.as_ref() == marker {
+                                    .ok_or(CatalogError::Incomplete)?;
+                                let header = Header::decode(&header)?;
+                                if header.batch_id != batch_id
+                                    || header.namespace != namespace
+                                    || header.phase != ActiveBatchPhase::Sealed
+                                    || header.owner_epoch > owner_epoch
+                                {
+                                    return Ok(ActivePreparationOutcome::BatchConflict);
+                                }
+                                let Some((observed_batch, index)) =
+                                    active_volume::observed_batch_at(
+                                        &tr, &serial, volume, generation,
+                                    )
+                                    .await?
+                                else {
+                                    return Ok(ActivePreparationOutcome::IndexNotObserved);
+                                };
+                                if observed_batch != batch_id {
+                                    return Ok(ActivePreparationOutcome::BatchConflict);
+                                }
+                                let requirement = layout_requirement(header, index);
+                                if tr
+                                    .get(&publication_key(volume, generation), false)
+                                    .await?
+                                    .is_some()
+                                {
+                                    // A legacy published batch cannot acquire a new constraint.
+                                    requirement.exists_at(&tr).await?;
+                                    return Ok(ActivePreparationOutcome::AlreadyPrepared);
+                                }
+                                let existed = requirement.exists_at(&tr).await?;
+                                requirement.declare_at(&tr).await?;
+                                Ok(if existed {
                                     ActivePreparationOutcome::AlreadyPrepared
                                 } else {
-                                    ActivePreparationOutcome::BatchConflict
-                                });
+                                    ActivePreparationOutcome::Prepared
+                                })
                             }
-                            tr.set(&marker_key, &marker);
-                            Ok(ActivePreparationOutcome::Prepared)
-                        }
-                        .await,
+                            .await,
+                            &[
+                                ActivePreparationOutcome::Prepared,
+                                ActivePreparationOutcome::AlreadyPrepared,
+                            ],
+                        ),
+                    )
+                }
+            })
+            .await?
+    }
+
+    /// Finish the invisible preparation only when every bounded page has
+    /// already been closed. The small marker is a future publication barrier
+    /// prerequisite; writing it does not expose any file or finish any task.
+    pub async fn seal_observed_active_preparation(
+        &self,
+        serial: &str,
+        owner_epoch: u64,
+        volume: Uuid,
+        generation: u64,
+        batch_id: Uuid,
+    ) -> Result<ActivePreparationOutcome> {
+        self.seal_observed_active_preparation_with_authority(
+            serial,
+            owner_epoch,
+            volume,
+            generation,
+            batch_id,
+            PublicationAuthority::Ordinary,
+        )
+        .await
+    }
+
+    fn seal_observed_active_preparation_with_authority<'a>(
+        &'a self,
+        serial: &'a str,
+        owner_epoch: u64,
+        volume: Uuid,
+        generation: u64,
+        batch_id: Uuid,
+        authority: PublicationAuthority<'a>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<ActivePreparationOutcome>> + 'a>>
+    {
+        Box::pin(self.seal_observed_active_preparation_in(
+            serial,
+            owner_epoch,
+            volume,
+            generation,
+            batch_id,
+            authority,
+        ))
+    }
+
+    async fn seal_observed_active_preparation_in(
+        &self,
+        serial: &str,
+        owner_epoch: u64,
+        volume: Uuid,
+        generation: u64,
+        batch_id: Uuid,
+        authority: PublicationAuthority<'_>,
+    ) -> Result<ActivePreparationOutcome> {
+        control::validate_physical_serial(serial)?;
+        if owner_epoch == 0 || volume.is_nil() || generation == 0 || batch_id.is_nil() {
+            return Err(CatalogError::Invalid("活动准备批次身份无效"));
+        }
+        let serial = serial.to_owned();
+        self.db
+            .run(|tr, _| {
+                let serial = serial.clone();
+                async move {
+                    requests::retry_result(
+                        authority.finish(
+                            async {
+                                authority
+                                    .require_at(
+                                        &tr,
+                                        &serial,
+                                        owner_epoch,
+                                        batch_id,
+                                        volume,
+                                        generation,
+                                        None,
+                                        None,
+                                    )
+                                    .await?;
+                                let namespace =
+                                    routing::require_active_namespace(&tr, &serial).await?;
+                                if !routing::require_active_owner(
+                                    &tr,
+                                    namespace,
+                                    &serial,
+                                    owner_epoch,
+                                )
+                                .await?
+                                {
+                                    return Ok(ActivePreparationOutcome::StaleOwner);
+                                }
+                                let placement = control::verified_placement(&tr, volume)
+                                    .await?
+                                    .ok_or(CatalogError::Incomplete)?;
+                                if placement.namespace != namespace
+                                    || placement.library_serial != serial
+                                {
+                                    return Ok(ActivePreparationOutcome::BatchConflict);
+                                }
+                                let header = tr
+                                    .get(&batch_key(volume, generation), false)
+                                    .await?
+                                    .ok_or(CatalogError::Incomplete)?;
+                                let header = Header::decode(&header)?;
+                                if header.batch_id != batch_id
+                                    || header.namespace != namespace
+                                    || header.phase != ActiveBatchPhase::Sealed
+                                    || header.owner_epoch > owner_epoch
+                                {
+                                    return Ok(ActivePreparationOutcome::BatchConflict);
+                                }
+                                let Some((observed_batch, index)) =
+                                    active_volume::observed_batch_at(
+                                        &tr, &serial, volume, generation,
+                                    )
+                                    .await?
+                                else {
+                                    return Ok(ActivePreparationOutcome::IndexNotObserved);
+                                };
+                                if observed_batch != batch_id {
+                                    return Ok(ActivePreparationOutcome::BatchConflict);
+                                }
+                                let Some(marker) =
+                                    complete_preparation_at(&tr, volume, generation, header, index)
+                                        .await?
+                                else {
+                                    return Ok(ActivePreparationOutcome::PageIncomplete);
+                                };
+                                let marker_key = prepared_batch_key(volume, generation);
+                                if let Some(existing) = tr.get(&marker_key, false).await? {
+                                    return Ok(if existing.as_ref() == marker {
+                                        ActivePreparationOutcome::AlreadyPrepared
+                                    } else {
+                                        ActivePreparationOutcome::BatchConflict
+                                    });
+                                }
+                                tr.set(&marker_key, &marker);
+                                Ok(ActivePreparationOutcome::Prepared)
+                            }
+                            .await,
+                            &[
+                                ActivePreparationOutcome::Prepared,
+                                ActivePreparationOutcome::AlreadyPrepared,
+                            ],
+                        ),
                     )
                 }
             })
@@ -991,6 +1726,46 @@ impl ManagedCatalog {
         generation: u64,
         batch_id: Uuid,
     ) -> Result<ActivePublicationOutcome> {
+        self.publish_observed_active_batch_with_authority(
+            serial,
+            owner_epoch,
+            volume,
+            generation,
+            batch_id,
+            PublicationAuthority::Ordinary,
+        )
+        .await
+    }
+
+    fn publish_observed_active_batch_with_authority<'a>(
+        &'a self,
+        serial: &'a str,
+        owner_epoch: u64,
+        volume: Uuid,
+        generation: u64,
+        batch_id: Uuid,
+        authority: PublicationAuthority<'a>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<ActivePublicationOutcome>> + 'a>>
+    {
+        Box::pin(self.publish_observed_active_batch_in(
+            serial,
+            owner_epoch,
+            volume,
+            generation,
+            batch_id,
+            authority,
+        ))
+    }
+
+    async fn publish_observed_active_batch_in(
+        &self,
+        serial: &str,
+        owner_epoch: u64,
+        volume: Uuid,
+        generation: u64,
+        batch_id: Uuid,
+        authority: PublicationAuthority<'_>,
+    ) -> Result<ActivePublicationOutcome> {
         control::validate_physical_serial(serial)?;
         if owner_epoch == 0 || volume.is_nil() || generation == 0 || batch_id.is_nil() {
             return Err(CatalogError::Invalid("活动发布批次身份无效"));
@@ -1001,88 +1776,116 @@ impl ManagedCatalog {
                 let serial = serial.clone();
                 async move {
                     requests::retry_result(
-                        async {
-                            let namespace = routing::require_active_namespace(&tr, &serial).await?;
-                            if !routing::require_active_owner(&tr, namespace, &serial, owner_epoch)
+                        authority.finish(
+                            async {
+                                authority
+                                    .require_at(
+                                        &tr,
+                                        &serial,
+                                        owner_epoch,
+                                        batch_id,
+                                        volume,
+                                        generation,
+                                        None,
+                                        None,
+                                    )
+                                    .await?;
+                                let namespace =
+                                    routing::require_active_namespace(&tr, &serial).await?;
+                                if !routing::require_active_owner(
+                                    &tr,
+                                    namespace,
+                                    &serial,
+                                    owner_epoch,
+                                )
                                 .await?
-                            {
-                                return Ok(ActivePublicationOutcome::StaleOwner);
-                            }
-                            let placement = control::verified_placement(&tr, volume)
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
-                            if placement.namespace != namespace
-                                || placement.library_serial != serial
-                            {
-                                return Ok(ActivePublicationOutcome::BatchConflict);
-                            }
-                            if let Some(done) = tr
-                                .get(&compacted_batch_key(volume, generation), false)
-                                .await?
-                            {
-                                let (header, _) = decode_compacted_batch(&done)?;
-                                return Ok(
-                                    if header.batch_id == batch_id
-                                        && header.namespace == namespace
-                                        && header.owner_epoch <= owner_epoch
-                                    {
+                                {
+                                    return Ok(ActivePublicationOutcome::StaleOwner);
+                                }
+                                let placement = control::verified_placement(&tr, volume)
+                                    .await?
+                                    .ok_or(CatalogError::Incomplete)?;
+                                if placement.namespace != namespace
+                                    || placement.library_serial != serial
+                                {
+                                    return Ok(ActivePublicationOutcome::BatchConflict);
+                                }
+                                require_published_checkpoint_at(&tr, &serial, volume, generation)
+                                    .await?;
+                                if let Some(done) = tr
+                                    .get(&compacted_batch_key(volume, generation), false)
+                                    .await?
+                                {
+                                    let (header, _) = decode_compacted_batch(&done)?;
+                                    return Ok(
+                                        if header.batch_id == batch_id
+                                            && header.namespace == namespace
+                                            && header.owner_epoch <= owner_epoch
+                                        {
+                                            ActivePublicationOutcome::AlreadyPublished
+                                        } else {
+                                            ActivePublicationOutcome::BatchConflict
+                                        },
+                                    );
+                                }
+                                let raw = tr
+                                    .get(&batch_key(volume, generation), false)
+                                    .await?
+                                    .ok_or(CatalogError::Incomplete)?;
+                                let header = Header::decode(&raw)?;
+                                if header.batch_id != batch_id
+                                    || header.namespace != namespace
+                                    || header.phase != ActiveBatchPhase::Sealed
+                                    || header.owner_epoch > owner_epoch
+                                {
+                                    return Ok(ActivePublicationOutcome::BatchConflict);
+                                }
+                                let (scan, _) =
+                                    active_volume::observed_at(&tr, &serial, volume).await?;
+                                if scan.id != header.scan_id {
+                                    return Ok(ActivePublicationOutcome::BatchConflict);
+                                }
+                                let Some((observed_batch, index)) =
+                                    active_volume::observed_batch_at(
+                                        &tr, &serial, volume, generation,
+                                    )
+                                    .await?
+                                else {
+                                    return Ok(ActivePublicationOutcome::IndexNotObserved);
+                                };
+                                if observed_batch != batch_id {
+                                    return Ok(ActivePublicationOutcome::BatchConflict);
+                                }
+                                let Some(expected) =
+                                    complete_preparation_at(&tr, volume, generation, header, index)
+                                        .await?
+                                else {
+                                    return Ok(ActivePublicationOutcome::PageIncomplete);
+                                };
+                                let prepared = tr
+                                    .get(&prepared_batch_key(volume, generation), false)
+                                    .await?;
+                                if prepared.as_deref() != Some(expected.as_slice()) {
+                                    return Ok(ActivePublicationOutcome::PageIncomplete);
+                                }
+                                let key = publication_key(volume, generation);
+                                if let Some(existing) = tr.get(&key, false).await? {
+                                    return Ok(if existing.as_ref() == expected {
                                         ActivePublicationOutcome::AlreadyPublished
                                     } else {
                                         ActivePublicationOutcome::BatchConflict
-                                    },
-                                );
+                                    });
+                                }
+                                tr.set(&key, &expected);
+                                namespace_visibility::publish(&tr, namespace);
+                                Ok(ActivePublicationOutcome::Published)
                             }
-                            let raw = tr
-                                .get(&batch_key(volume, generation), false)
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
-                            let header = Header::decode(&raw)?;
-                            if header.batch_id != batch_id
-                                || header.namespace != namespace
-                                || header.phase != ActiveBatchPhase::Sealed
-                                || header.owner_epoch > owner_epoch
-                            {
-                                return Ok(ActivePublicationOutcome::BatchConflict);
-                            }
-                            let (scan, _) =
-                                active_volume::observed_at(&tr, &serial, volume).await?;
-                            if scan.id != header.scan_id {
-                                return Ok(ActivePublicationOutcome::BatchConflict);
-                            }
-                            let Some((observed_batch, index)) =
-                                active_volume::observed_batch_at(&tr, &serial, volume, generation)
-                                    .await?
-                            else {
-                                return Ok(ActivePublicationOutcome::IndexNotObserved);
-                            };
-                            if observed_batch != batch_id {
-                                return Ok(ActivePublicationOutcome::BatchConflict);
-                            }
-                            let Some(expected) =
-                                complete_preparation_at(&tr, volume, generation, header, index)
-                                    .await?
-                            else {
-                                return Ok(ActivePublicationOutcome::PageIncomplete);
-                            };
-                            let prepared = tr
-                                .get(&prepared_batch_key(volume, generation), false)
-                                .await?;
-                            if prepared.as_deref() != Some(expected.as_slice()) {
-                                return Ok(ActivePublicationOutcome::PageIncomplete);
-                            }
-                            let key = publication_key(volume, generation);
-                            if let Some(existing) = tr.get(&key, false).await? {
-                                return Ok(if existing.as_ref() == expected {
-                                    ActivePublicationOutcome::AlreadyPublished
-                                } else {
-                                    ActivePublicationOutcome::BatchConflict
-                                });
-                            }
-                            tr.set(&key, &expected);
-                            namespace_visibility::publish(&tr, namespace);
-                            Ok(ActivePublicationOutcome::Published)
-                        }
-                        .await,
+                            .await,
+                            &[
+                                ActivePublicationOutcome::Published,
+                                ActivePublicationOutcome::AlreadyPublished,
+                            ],
+                        ),
                     )
                 }
             })
@@ -1103,6 +1906,52 @@ impl ManagedCatalog {
         batch_id: Uuid,
         page: u16,
     ) -> Result<ActiveFinalizationOutcome> {
+        self.finalize_published_active_batch_page_with_authority(
+            serial,
+            owner_epoch,
+            volume,
+            generation,
+            batch_id,
+            page,
+            PublicationAuthority::Ordinary,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_published_active_batch_page_with_authority<'a>(
+        &'a self,
+        serial: &'a str,
+        owner_epoch: u64,
+        volume: Uuid,
+        generation: u64,
+        batch_id: Uuid,
+        page: u16,
+        authority: PublicationAuthority<'a>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<ActiveFinalizationOutcome>> + 'a>>
+    {
+        Box::pin(self.finalize_published_active_batch_page_in(
+            serial,
+            owner_epoch,
+            volume,
+            generation,
+            batch_id,
+            page,
+            authority,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_published_active_batch_page_in(
+        &self,
+        serial: &str,
+        owner_epoch: u64,
+        volume: Uuid,
+        generation: u64,
+        batch_id: Uuid,
+        page: u16,
+        authority: PublicationAuthority<'_>,
+    ) -> Result<ActiveFinalizationOutcome> {
         control::validate_physical_serial(serial)?;
         if owner_epoch == 0 || volume.is_nil() || generation == 0 || batch_id.is_nil() {
             return Err(CatalogError::Invalid("活动终结批次身份无效"));
@@ -1113,210 +1962,253 @@ impl ManagedCatalog {
                 let serial = serial.clone();
                 async move {
                     requests::retry_result(
-                        async {
-                            let namespace = routing::require_active_namespace(&tr, &serial).await?;
-                            if !routing::require_active_owner(&tr, namespace, &serial, owner_epoch)
+                        authority.finish(
+                            async {
+                                authority
+                                    .require_at(
+                                        &tr,
+                                        &serial,
+                                        owner_epoch,
+                                        batch_id,
+                                        volume,
+                                        generation,
+                                        None,
+                                        Some(page),
+                                    )
+                                    .await?;
+                                let namespace =
+                                    routing::require_active_namespace(&tr, &serial).await?;
+                                if !routing::require_active_owner(
+                                    &tr,
+                                    namespace,
+                                    &serial,
+                                    owner_epoch,
+                                )
                                 .await?
-                            {
-                                return Ok(ActiveFinalizationOutcome::StaleOwner);
-                            }
-                            let placement = control::verified_placement(&tr, volume)
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
-                            if placement.namespace != namespace
-                                || placement.library_serial != serial
-                            {
-                                return Ok(ActiveFinalizationOutcome::BatchConflict);
-                            }
-                            if let Some(done) = tr
-                                .get(&compacted_batch_key(volume, generation), false)
-                                .await?
-                            {
-                                let (header, _) = decode_compacted_batch(&done)?;
-                                return Ok(
-                                    if header.batch_id == batch_id
-                                        && header.namespace == namespace
-                                        && header.owner_epoch <= owner_epoch
-                                        && usize::from(page) < usize::from(header.pages)
-                                    {
+                                {
+                                    return Ok(ActiveFinalizationOutcome::StaleOwner);
+                                }
+                                let placement = control::verified_placement(&tr, volume)
+                                    .await?
+                                    .ok_or(CatalogError::Incomplete)?;
+                                if placement.namespace != namespace
+                                    || placement.library_serial != serial
+                                {
+                                    return Ok(ActiveFinalizationOutcome::BatchConflict);
+                                }
+                                require_published_checkpoint_at(&tr, &serial, volume, generation)
+                                    .await?;
+                                if let Some(done) = tr
+                                    .get(&compacted_batch_key(volume, generation), false)
+                                    .await?
+                                {
+                                    let (header, _) = decode_compacted_batch(&done)?;
+                                    return Ok(
+                                        if header.batch_id == batch_id
+                                            && header.namespace == namespace
+                                            && header.owner_epoch <= owner_epoch
+                                            && usize::from(page) < usize::from(header.pages)
+                                        {
+                                            ActiveFinalizationOutcome::AlreadyFinalized
+                                        } else {
+                                            ActiveFinalizationOutcome::BatchConflict
+                                        },
+                                    );
+                                }
+                                let header = tr
+                                    .get(&batch_key(volume, generation), false)
+                                    .await?
+                                    .ok_or(CatalogError::Incomplete)?;
+                                let header = Header::decode(&header)?;
+                                if header.batch_id != batch_id
+                                    || header.namespace != namespace
+                                    || header.phase != ActiveBatchPhase::Sealed
+                                    || header.owner_epoch > owner_epoch
+                                    || usize::from(page) >= usize::from(header.pages)
+                                {
+                                    return Ok(ActiveFinalizationOutcome::BatchConflict);
+                                }
+                                let (scan, _) =
+                                    active_volume::observed_at(&tr, &serial, volume).await?;
+                                if scan.id != header.scan_id {
+                                    return Ok(ActiveFinalizationOutcome::BatchConflict);
+                                }
+                                let Some((observed_batch, index)) =
+                                    active_volume::observed_batch_at(
+                                        &tr, &serial, volume, generation,
+                                    )
+                                    .await?
+                                else {
+                                    return Ok(ActiveFinalizationOutcome::Unpublished);
+                                };
+                                if observed_batch != batch_id {
+                                    return Ok(ActiveFinalizationOutcome::BatchConflict);
+                                }
+                                let Some(publication) =
+                                    tr.get(&publication_key(volume, generation), false).await?
+                                else {
+                                    return Ok(ActiveFinalizationOutcome::Unpublished);
+                                };
+                                let prepared_batch = tr
+                                    .get(&prepared_batch_key(volume, generation), false)
+                                    .await?
+                                    .ok_or(CatalogError::Corrupt("活动发布缺少整批准备证明"))?;
+                                if publication.len() != PREPARED_BATCH_LEN
+                                    || publication[0] != 1
+                                    || publication[1..17] != batch_id.as_bytes()[..]
+                                    || publication[81..] != index.sha256
+                                    || publication.as_ref() != prepared_batch.as_ref()
+                                {
+                                    return Err(CatalogError::Corrupt(
+                                        "活动发布证明与物理索引不一致",
+                                    ));
+                                }
+                                let raw = tr
+                                    .get(&page_key(volume, generation, page), false)
+                                    .await?
+                                    .ok_or(CatalogError::Corrupt("活动终结批次页缺失"))?;
+                                if tr
+                                    .get(&page_digest_key(volume, generation, page), false)
+                                    .await?
+                                    .as_deref()
+                                    != Some(page_digest(&raw).as_slice())
+                                {
+                                    return Err(CatalogError::Corrupt("活动终结批次页摘要不匹配"));
+                                }
+                                let page_proof = tr
+                                    .get(&prepared_page_key(volume, generation, page), false)
+                                    .await?
+                                    .ok_or(CatalogError::Corrupt("活动终结缺少准备页证明"))?;
+                                if page_proof.as_ref() != prepared_page_value(batch_id, &raw) {
+                                    return Err(CatalogError::Corrupt("活动终结准备页证明不一致"));
+                                }
+                                let finalized =
+                                    finalized_page_value(batch_id, &publication, &page_proof);
+                                let finalized_key = finalized_page_key(volume, generation, page);
+                                if let Some(existing) = tr.get(&finalized_key, false).await? {
+                                    return Ok(if existing.as_ref() == finalized {
                                         ActiveFinalizationOutcome::AlreadyFinalized
                                     } else {
                                         ActiveFinalizationOutcome::BatchConflict
-                                    },
-                                );
-                            }
-                            let header = tr
-                                .get(&batch_key(volume, generation), false)
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
-                            let header = Header::decode(&header)?;
-                            if header.batch_id != batch_id
-                                || header.namespace != namespace
-                                || header.phase != ActiveBatchPhase::Sealed
-                                || header.owner_epoch > owner_epoch
-                                || usize::from(page) >= usize::from(header.pages)
-                            {
-                                return Ok(ActiveFinalizationOutcome::BatchConflict);
-                            }
-                            let (scan, _) =
-                                active_volume::observed_at(&tr, &serial, volume).await?;
-                            if scan.id != header.scan_id {
-                                return Ok(ActiveFinalizationOutcome::BatchConflict);
-                            }
-                            let Some((observed_batch, index)) =
-                                active_volume::observed_batch_at(&tr, &serial, volume, generation)
-                                    .await?
-                            else {
-                                return Ok(ActiveFinalizationOutcome::Unpublished);
-                            };
-                            if observed_batch != batch_id {
-                                return Ok(ActiveFinalizationOutcome::BatchConflict);
-                            }
-                            let Some(publication) =
-                                tr.get(&publication_key(volume, generation), false).await?
-                            else {
-                                return Ok(ActiveFinalizationOutcome::Unpublished);
-                            };
-                            let prepared_batch = tr
-                                .get(&prepared_batch_key(volume, generation), false)
-                                .await?
-                                .ok_or(CatalogError::Corrupt("活动发布缺少整批准备证明"))?;
-                            if publication.len() != PREPARED_BATCH_LEN
-                                || publication[0] != 1
-                                || publication[1..17] != batch_id.as_bytes()[..]
-                                || publication[81..] != index.sha256
-                                || publication.as_ref() != prepared_batch.as_ref()
-                            {
-                                return Err(CatalogError::Corrupt("活动发布证明与物理索引不一致"));
-                            }
-                            let raw = tr
-                                .get(&page_key(volume, generation, page), false)
-                                .await?
-                                .ok_or(CatalogError::Corrupt("活动终结批次页缺失"))?;
-                            if tr
-                                .get(&page_digest_key(volume, generation, page), false)
-                                .await?
-                                .as_deref()
-                                != Some(page_digest(&raw).as_slice())
-                            {
-                                return Err(CatalogError::Corrupt("活动终结批次页摘要不匹配"));
-                            }
-                            let page_proof = tr
-                                .get(&prepared_page_key(volume, generation, page), false)
-                                .await?
-                                .ok_or(CatalogError::Corrupt("活动终结缺少准备页证明"))?;
-                            if page_proof.as_ref() != prepared_page_value(batch_id, &raw) {
-                                return Err(CatalogError::Corrupt("活动终结准备页证明不一致"));
-                            }
-                            let finalized =
-                                finalized_page_value(batch_id, &publication, &page_proof);
-                            let finalized_key = finalized_page_key(volume, generation, page);
-                            if let Some(existing) = tr.get(&finalized_key, false).await? {
-                                return Ok(if existing.as_ref() == finalized {
-                                    ActiveFinalizationOutcome::AlreadyFinalized
-                                } else {
-                                    ActiveFinalizationOutcome::BatchConflict
-                                });
-                            }
-                            let claims = page_claim_keys(
-                                namespace,
-                                &raw,
-                                page_items(header, usize::from(page)),
-                            )?;
-                            let (entries, remainder) = raw[2..].as_chunks::<56>();
-                            debug_assert!(remainder.is_empty());
-                            let mut terminals = Vec::with_capacity(entries.len());
-                            let mut permits = BTreeMap::<u16, u64>::new();
-                            for (entry, claim) in entries.iter().zip(claims) {
-                                let epoch = read_u64(&entry[..8]);
-                                let operation = uuid_from(&entry[8..24])?;
-                                if tr.get(&claim, false).await?.as_deref()
-                                    != Some(batch_id.as_bytes())
-                                {
-                                    return Err(CatalogError::Corrupt("活动终结请求占用不一致"));
+                                    });
                                 }
-                                let mut intent_key = requests::epoch_prefix(b'I', namespace, epoch);
-                                intent_key.extend_from_slice(operation.as_bytes());
-                                let intent = tr
-                                    .get(&intent_key, false)
-                                    .await?
-                                    .ok_or(CatalogError::Corrupt("活动终结准入意图缺失"))?;
-                                let receipt =
-                                    requests::decode_intent(&intent, namespace, epoch, operation)?;
-                                if receipt_fingerprint(&receipt) != entry[24..]
-                                    || receipt.library_serial != serial
-                                    || receipt.volume_id != volume
-                                    || receipt.volume_generation != generation
-                                    || receipt.volume_scan_id != header.scan_id
-                                    || receipt.owner_epoch != header.owner_epoch
-                                    || !target_claims_match(&tr, &receipt, batch_id).await?
-                                {
-                                    return Err(CatalogError::Corrupt("活动终结收据与批次不一致"));
-                                }
-                                let prepared = tr
-                                    .get(&prepared_key(volume, generation, epoch, operation), false)
-                                    .await?
-                                    .ok_or(CatalogError::Corrupt("活动终结文件准备缺失"))?;
-                                let (saved_batch, fingerprint, attributes) =
-                                    decode_prepared(&prepared)?;
-                                upload_receipts::require_at(
-                                    &tr,
-                                    &receipt,
-                                    &placement.barcode,
-                                    attributes,
-                                )
-                                .await?;
-                                if saved_batch != batch_id || fingerprint != entry[24..] {
-                                    return Err(CatalogError::Corrupt("活动终结文件准备不一致"));
-                                }
-                                let permit = requests::matching_permit(&intent, &receipt)?
-                                    .ok_or(CatalogError::Corrupt("活动终结准入许可不一致"))?;
-                                *permits.entry(permit).or_default() += 1;
-                                let op = op_key(namespace, epoch, operation);
-                                if tr.get(&op, false).await?.is_some() {
-                                    return Err(CatalogError::Corrupt("活动终结前已有请求结果"));
-                                }
-                                let mut terminal = requests::terminal_value(
-                                    &receipt_fingerprint(&receipt),
-                                    Some(receipt.expected_version.unwrap_or(0) + 1),
-                                );
-                                if let Some(raw) = tr
-                                    .get(&reservation::upgraded_key_for(&receipt), false)
-                                    .await?
-                                {
-                                    let (upload, saved_permit) =
-                                        reservation::decode(&raw, namespace, epoch, operation)?;
-                                    if saved_permit != permit {
+                                let claims = page_claim_keys(
+                                    namespace,
+                                    &raw,
+                                    page_items(header, usize::from(page)),
+                                )?;
+                                let (entries, remainder) = raw[2..].as_chunks::<56>();
+                                debug_assert!(remainder.is_empty());
+                                let mut terminals = Vec::with_capacity(entries.len());
+                                let mut permits = BTreeMap::<u16, u64>::new();
+                                for (entry, claim) in entries.iter().zip(claims) {
+                                    let epoch = read_u64(&entry[..8]);
+                                    let operation = uuid_from(&entry[8..24])?;
+                                    if tr.get(&claim, false).await?.as_deref()
+                                        != Some(batch_id.as_bytes())
+                                    {
                                         return Err(CatalogError::Corrupt(
-                                            "活动终结写前许可不一致",
+                                            "活动终结请求占用不一致",
                                         ));
                                     }
-                                    // Independently bind the retained upload to this exact receipt.
-                                    reservation::intent_for_upgraded_at(&tr, &receipt, permit)
-                                        .await?;
-                                    terminal.extend_from_slice(
-                                        &reservation::cancellation_fingerprint(&upload),
+                                    let mut intent_key =
+                                        requests::epoch_prefix(b'I', namespace, epoch);
+                                    intent_key.extend_from_slice(operation.as_bytes());
+                                    let intent = tr
+                                        .get(&intent_key, false)
+                                        .await?
+                                        .ok_or(CatalogError::Corrupt("活动终结准入意图缺失"))?;
+                                    let receipt = requests::decode_intent(
+                                        &intent, namespace, epoch, operation,
+                                    )?;
+                                    if receipt_fingerprint(&receipt) != entry[24..]
+                                        || receipt.library_serial != serial
+                                        || receipt.volume_id != volume
+                                        || receipt.volume_generation != generation
+                                        || receipt.volume_scan_id != header.scan_id
+                                        || receipt.owner_epoch != header.owner_epoch
+                                        || !target_claims_match(&tr, &receipt, batch_id).await?
+                                    {
+                                        return Err(CatalogError::Corrupt(
+                                            "活动终结收据与批次不一致",
+                                        ));
+                                    }
+                                    let prepared = tr
+                                        .get(
+                                            &prepared_key(volume, generation, epoch, operation),
+                                            false,
+                                        )
+                                        .await?
+                                        .ok_or(CatalogError::Corrupt("活动终结文件准备缺失"))?;
+                                    let (saved_batch, fingerprint, attributes) =
+                                        decode_prepared(&prepared)?;
+                                    upload_receipts::require_at(
+                                        &tr,
+                                        &receipt,
+                                        &placement.barcode,
+                                        attributes,
+                                    )
+                                    .await?;
+                                    if saved_batch != batch_id || fingerprint != entry[24..] {
+                                        return Err(CatalogError::Corrupt(
+                                            "活动终结文件准备不一致",
+                                        ));
+                                    }
+                                    let permit = requests::matching_permit(&intent, &receipt)?
+                                        .ok_or(CatalogError::Corrupt("活动终结准入许可不一致"))?;
+                                    *permits.entry(permit).or_default() += 1;
+                                    let op = op_key(namespace, epoch, operation);
+                                    if tr.get(&op, false).await?.is_some() {
+                                        return Err(CatalogError::Corrupt(
+                                            "活动终结前已有请求结果",
+                                        ));
+                                    }
+                                    let mut terminal = requests::terminal_value(
+                                        &receipt_fingerprint(&receipt),
+                                        Some(receipt.expected_version.unwrap_or(0) + 1),
+                                    );
+                                    if let Some(raw) = tr
+                                        .get(&reservation::upgraded_key_for(&receipt), false)
+                                        .await?
+                                    {
+                                        let (upload, saved_permit) =
+                                            reservation::decode(&raw, namespace, epoch, operation)?;
+                                        if saved_permit != permit {
+                                            return Err(CatalogError::Corrupt(
+                                                "活动终结写前许可不一致",
+                                            ));
+                                        }
+                                        // Independently bind the retained upload to this exact receipt.
+                                        reservation::intent_for_upgraded_at(&tr, &receipt, permit)
+                                            .await?;
+                                        terminal.extend_from_slice(
+                                            &reservation::cancellation_fingerprint(&upload),
+                                        );
+                                    }
+                                    terminals.push((op, terminal));
+                                }
+                                let mut releases = Vec::with_capacity(permits.len());
+                                for (permit, count) in permits {
+                                    releases.push(
+                                        maintenance::release_many(&tr, namespace, permit, count)
+                                            .await?,
                                     );
                                 }
-                                terminals.push((op, terminal));
+                                for (key, value) in terminals {
+                                    tr.set(&key, &value);
+                                }
+                                for release in releases {
+                                    release.apply(&tr);
+                                }
+                                tr.set(&finalized_key, &finalized);
+                                Ok(ActiveFinalizationOutcome::Finalized)
                             }
-                            let mut releases = Vec::with_capacity(permits.len());
-                            for (permit, count) in permits {
-                                releases.push(
-                                    maintenance::release_many(&tr, namespace, permit, count)
-                                        .await?,
-                                );
-                            }
-                            for (key, value) in terminals {
-                                tr.set(&key, &value);
-                            }
-                            for release in releases {
-                                release.apply(&tr);
-                            }
-                            tr.set(&finalized_key, &finalized);
-                            Ok(ActiveFinalizationOutcome::Finalized)
-                        }
-                        .await,
+                            .await,
+                            &[
+                                ActiveFinalizationOutcome::Finalized,
+                                ActiveFinalizationOutcome::AlreadyFinalized,
+                            ],
+                        ),
                     )
                 }
             })
@@ -1335,6 +2227,47 @@ impl ManagedCatalog {
         batch_id: Uuid,
         page: u16,
         receipt: &CommitReceipt,
+    ) -> Result<ActiveMaterializationOutcome> {
+        self.materialize_published_active_file_with_authority(
+            serial,
+            owner_epoch,
+            batch_id,
+            page,
+            receipt,
+            PublicationAuthority::Ordinary,
+        )
+        .await
+    }
+
+    fn materialize_published_active_file_with_authority<'a>(
+        &'a self,
+        serial: &'a str,
+        owner_epoch: u64,
+        batch_id: Uuid,
+        page: u16,
+        receipt: &'a CommitReceipt,
+        authority: PublicationAuthority<'a>,
+    ) -> std::pin::Pin<
+        Box<impl std::future::Future<Output = Result<ActiveMaterializationOutcome>> + 'a>,
+    > {
+        Box::pin(self.materialize_published_active_file_in(
+            serial,
+            owner_epoch,
+            batch_id,
+            page,
+            receipt,
+            authority,
+        ))
+    }
+
+    async fn materialize_published_active_file_in(
+        &self,
+        serial: &str,
+        owner_epoch: u64,
+        batch_id: Uuid,
+        page: u16,
+        receipt: &CommitReceipt,
+        authority: PublicationAuthority<'_>,
     ) -> Result<ActiveMaterializationOutcome> {
         control::validate_physical_serial(serial)?;
         validate_receipt(receipt)?;
@@ -1357,237 +2290,277 @@ impl ManagedCatalog {
                 let fingerprint = fingerprint.clone();
                 async move {
                     requests::retry_result(
-                        async {
-                            let namespace = routing::require_active_namespace(&tr, &serial).await?;
-                            if namespace != receipt.namespace {
-                                return Ok(ActiveMaterializationOutcome::BatchConflict);
-                            }
-                            if !routing::require_active_owner(&tr, namespace, &serial, owner_epoch)
-                                .await?
-                            {
-                                return Ok(ActiveMaterializationOutcome::StaleOwner);
-                            }
-                            let result = tr
-                                .get(
-                                    &op_key(namespace, receipt.request_epoch, receipt.operation_id),
-                                    false,
-                                )
-                                .await?;
-                            let Some(result) = result else {
-                                return Ok(ActiveMaterializationOutcome::NotFinalized);
-                            };
-                            if requests::terminal_result(&result, &fingerprint)?
-                                != PublishOutcome::AlreadyApplied(version)
-                            {
-                                return Ok(ActiveMaterializationOutcome::BatchConflict);
-                            }
-                            if let Some(done) = tr
-                                .get(
-                                    &compacted_batch_key(
+                        authority.finish(
+                            async {
+                                authority
+                                    .require_at(
+                                        &tr,
+                                        &serial,
+                                        owner_epoch,
+                                        batch_id,
                                         receipt.volume_id,
                                         receipt.volume_generation,
-                                    ),
-                                    false,
-                                )
-                                .await?
-                            {
-                                let (header, _) = decode_compacted_batch(&done)?;
-                                return Ok(
-                                    if header.batch_id == batch_id && header.namespace == namespace
-                                    {
-                                        ActiveMaterializationOutcome::AlreadyMaterialized
-                                    } else {
-                                        ActiveMaterializationOutcome::BatchConflict
-                                    },
-                                );
-                            }
-                            let done_key = materialized_key(
-                                namespace,
-                                receipt.request_epoch,
-                                receipt.operation_id,
-                            );
-                            if let Some(saved) = tr.get(&done_key, false).await? {
-                                return Ok(if saved.as_ref() == marker {
-                                    ActiveMaterializationOutcome::AlreadyMaterialized
-                                } else {
-                                    ActiveMaterializationOutcome::BatchConflict
-                                });
-                            }
-                            let volume = receipt.volume_id;
-                            let generation = receipt.volume_generation;
-                            let header = tr
-                                .get(&batch_key(volume, generation), false)
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
-                            let header = Header::decode(&header)?;
-                            if header.batch_id != batch_id
-                                || header.namespace != namespace
-                                || header.phase != ActiveBatchPhase::Sealed
-                                || header.owner_epoch > owner_epoch
-                                || header.scan_id != receipt.volume_scan_id
-                                || usize::from(page) >= usize::from(header.pages)
-                            {
-                                return Ok(ActiveMaterializationOutcome::BatchConflict);
-                            }
-                            let publication = tr
-                                .get(&publication_key(volume, generation), false)
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
-                            let prepared_batch = tr
-                                .get(&prepared_batch_key(volume, generation), false)
-                                .await?
-                                .ok_or(CatalogError::Corrupt("活动归并缺少整批准备证明"))?;
-                            if publication.as_ref() != prepared_batch.as_ref() {
-                                return Err(CatalogError::Corrupt("活动归并发布证明不一致"));
-                            }
-                            let raw = tr
-                                .get(&page_key(volume, generation, page), false)
-                                .await?
-                                .ok_or(CatalogError::Corrupt("活动归并批次页缺失"))?;
-                            if tr
-                                .get(&page_digest_key(volume, generation, page), false)
-                                .await?
-                                .as_deref()
-                                != Some(page_digest(&raw).as_slice())
-                            {
-                                return Err(CatalogError::Corrupt("活动归并批次页摘要不匹配"));
-                            }
-                            let page_proof = tr
-                                .get(&prepared_page_key(volume, generation, page), false)
-                                .await?
-                                .ok_or(CatalogError::Corrupt("活动归并缺少准备页证明"))?;
-                            if page_proof.as_ref() != prepared_page_value(batch_id, &raw) {
-                                return Err(CatalogError::Corrupt("活动归并准备页证明不一致"));
-                            }
-                            let finalized = tr
-                                .get(&finalized_page_key(volume, generation, page), false)
-                                .await?;
-                            if finalized.as_deref()
-                                != Some(
-                                    finalized_page_value(batch_id, &publication, &page_proof)
-                                        .as_slice(),
-                                )
-                            {
-                                return Ok(ActiveMaterializationOutcome::NotFinalized);
-                            }
-                            page_claim_keys(
-                                namespace,
-                                &raw,
-                                page_items(header, usize::from(page)),
-                            )?;
-                            let (entries, remainder) = raw[2..].as_chunks::<56>();
-                            if !remainder.is_empty()
-                                || entries.len() != page_items(header, usize::from(page))
-                                || !entries.iter().any(|entry| {
-                                    entry[..8] == receipt.request_epoch.to_be_bytes()
-                                        && entry[8..24] == receipt.operation_id.as_bytes()[..]
-                                        && entry[24..] == fingerprint
-                                })
-                            {
-                                return Err(CatalogError::Corrupt("活动归并请求不在已终结页"));
-                            }
-                            if let Some(compacted) = tr
-                                .get(&compacted_page_key(volume, generation, page), false)
-                                .await?
-                            {
-                                return Ok(
-                                    if compacted.as_ref()
-                                        == finalized_page_value(batch_id, &publication, &page_proof)
-                                    {
-                                        ActiveMaterializationOutcome::AlreadyMaterialized
-                                    } else {
-                                        ActiveMaterializationOutcome::BatchConflict
-                                    },
-                                );
-                            }
-                            let locator = TargetLocator::from_receipt(batch_id, &receipt);
-                            let Some((published, placement)) =
-                                lookup::published_receipt_at(&tr, namespace, locator).await?
-                            else {
-                                return Err(CatalogError::Corrupt("活动归并缺少已发布目标"));
-                            };
-                            let mut published = published;
-                            published.owner_epoch = receipt.owner_epoch;
-                            if published != receipt
-                                || placement.volume_id != volume
-                                || !target_matches_baseline(&tr, &receipt).await?
-                            {
-                                return Ok(ActiveMaterializationOutcome::BatchConflict);
-                            }
-                            let attributes = prepared_attributes_at(&tr, batch_id, &receipt)
-                                .await?
-                                .ok_or(CatalogError::Corrupt("活动归并缺少文件属性"))?;
-                            if Some(attributes.digest()) != receipt.metadata_digest {
-                                return Err(CatalogError::Corrupt("活动归并属性摘要不一致"));
-                            }
-                            let inode_key = node_key(namespace, receipt.file_id);
-                            attribute_objects::require_attributes(
-                                &tr,
-                                namespace,
-                                Some(&attributes),
-                            )
-                            .await?;
-                            tr.set(
-                                &child_key(namespace, receipt.parent, &receipt.name),
-                                receipt.file_id.as_bytes(),
-                            );
-                            tr.set(
-                                &inode_key,
-                                &encode_node(&Node {
-                                    kind: NodeKind::File,
-                                    directory_version: None,
-                                    parent: receipt.parent,
-                                    name: receipt.name.clone(),
-                                    attributes: Some(attributes),
-                                }),
-                            );
-                            tr.set(
-                                &head_key(namespace, receipt.file_id),
-                                &encode_head(&FileHead {
-                                    version,
-                                    size: receipt.size,
-                                    copy_id: receipt.copy_id,
-                                }),
-                            );
-                            tr.set(
-                                &copy_key(namespace, receipt.file_id, receipt.copy_id),
-                                &encode_copy(&receipt, version),
-                            );
-                            let mut volume_value = version.to_be_bytes().to_vec();
-                            volume_value.extend_from_slice(&fingerprint);
-                            tr.set(
-                                &volume_key(
-                                    volume,
-                                    receipt.volume_scan_id,
+                                        Some(&receipt),
+                                        Some(page),
+                                    )
+                                    .await?;
+                                let namespace =
+                                    routing::require_active_namespace(&tr, &serial).await?;
+                                if namespace != receipt.namespace {
+                                    return Ok(ActiveMaterializationOutcome::BatchConflict);
+                                }
+                                if !routing::require_active_owner(
+                                    &tr,
                                     namespace,
-                                    receipt.file_id,
-                                    receipt.copy_id,
-                                ),
-                                &volume_value,
-                            );
-                            tr.clear(&claim_key(&receipt));
-                            tr.clear(&path_claim_key(&receipt));
-                            tr.clear(&file_claim_key(&receipt));
-                            tr.clear(&reverse_claim_key(&receipt));
-                            tr.clear(&requests::intent_key(&receipt));
-                            tr.clear(&reservation::upgraded_key_for(&receipt));
-                            tr.clear(&prepared_key(
-                                volume,
-                                generation,
-                                receipt.request_epoch,
-                                receipt.operation_id,
-                            ));
-                            let chunks = prepared_chunk_prefix(
-                                volume,
-                                generation,
-                                receipt.request_epoch,
-                                receipt.operation_id,
-                            );
-                            tr.clear_range(&chunks, &prefix_end(&chunks));
-                            tr.set(&done_key, &marker);
-                            Ok(ActiveMaterializationOutcome::Materialized)
-                        }
-                        .await,
+                                    &serial,
+                                    owner_epoch,
+                                )
+                                .await?
+                                {
+                                    return Ok(ActiveMaterializationOutcome::StaleOwner);
+                                }
+                                let result = tr
+                                    .get(
+                                        &op_key(
+                                            namespace,
+                                            receipt.request_epoch,
+                                            receipt.operation_id,
+                                        ),
+                                        false,
+                                    )
+                                    .await?;
+                                let Some(result) = result else {
+                                    return Ok(ActiveMaterializationOutcome::NotFinalized);
+                                };
+                                if requests::terminal_result(&result, &fingerprint)?
+                                    != PublishOutcome::AlreadyApplied(version)
+                                {
+                                    return Ok(ActiveMaterializationOutcome::BatchConflict);
+                                }
+                                require_published_checkpoint_at(
+                                    &tr,
+                                    &serial,
+                                    receipt.volume_id,
+                                    receipt.volume_generation,
+                                )
+                                .await?;
+                                if let Some(done) = tr
+                                    .get(
+                                        &compacted_batch_key(
+                                            receipt.volume_id,
+                                            receipt.volume_generation,
+                                        ),
+                                        false,
+                                    )
+                                    .await?
+                                {
+                                    let (header, _) = decode_compacted_batch(&done)?;
+                                    return Ok(
+                                        if header.batch_id == batch_id
+                                            && header.namespace == namespace
+                                        {
+                                            ActiveMaterializationOutcome::AlreadyMaterialized
+                                        } else {
+                                            ActiveMaterializationOutcome::BatchConflict
+                                        },
+                                    );
+                                }
+                                let done_key = materialized_key(
+                                    namespace,
+                                    receipt.request_epoch,
+                                    receipt.operation_id,
+                                );
+                                if let Some(saved) = tr.get(&done_key, false).await? {
+                                    return Ok(if saved.as_ref() == marker {
+                                        ActiveMaterializationOutcome::AlreadyMaterialized
+                                    } else {
+                                        ActiveMaterializationOutcome::BatchConflict
+                                    });
+                                }
+                                let volume = receipt.volume_id;
+                                let generation = receipt.volume_generation;
+                                let header = tr
+                                    .get(&batch_key(volume, generation), false)
+                                    .await?
+                                    .ok_or(CatalogError::Incomplete)?;
+                                let header = Header::decode(&header)?;
+                                if header.batch_id != batch_id
+                                    || header.namespace != namespace
+                                    || header.phase != ActiveBatchPhase::Sealed
+                                    || header.owner_epoch > owner_epoch
+                                    || header.scan_id != receipt.volume_scan_id
+                                    || usize::from(page) >= usize::from(header.pages)
+                                {
+                                    return Ok(ActiveMaterializationOutcome::BatchConflict);
+                                }
+                                let publication = tr
+                                    .get(&publication_key(volume, generation), false)
+                                    .await?
+                                    .ok_or(CatalogError::Incomplete)?;
+                                let prepared_batch = tr
+                                    .get(&prepared_batch_key(volume, generation), false)
+                                    .await?
+                                    .ok_or(CatalogError::Corrupt("活动归并缺少整批准备证明"))?;
+                                if publication.as_ref() != prepared_batch.as_ref() {
+                                    return Err(CatalogError::Corrupt("活动归并发布证明不一致"));
+                                }
+                                let raw = tr
+                                    .get(&page_key(volume, generation, page), false)
+                                    .await?
+                                    .ok_or(CatalogError::Corrupt("活动归并批次页缺失"))?;
+                                if tr
+                                    .get(&page_digest_key(volume, generation, page), false)
+                                    .await?
+                                    .as_deref()
+                                    != Some(page_digest(&raw).as_slice())
+                                {
+                                    return Err(CatalogError::Corrupt("活动归并批次页摘要不匹配"));
+                                }
+                                let page_proof = tr
+                                    .get(&prepared_page_key(volume, generation, page), false)
+                                    .await?
+                                    .ok_or(CatalogError::Corrupt("活动归并缺少准备页证明"))?;
+                                if page_proof.as_ref() != prepared_page_value(batch_id, &raw) {
+                                    return Err(CatalogError::Corrupt("活动归并准备页证明不一致"));
+                                }
+                                let finalized = tr
+                                    .get(&finalized_page_key(volume, generation, page), false)
+                                    .await?;
+                                if finalized.as_deref()
+                                    != Some(
+                                        finalized_page_value(batch_id, &publication, &page_proof)
+                                            .as_slice(),
+                                    )
+                                {
+                                    return Ok(ActiveMaterializationOutcome::NotFinalized);
+                                }
+                                page_claim_keys(
+                                    namespace,
+                                    &raw,
+                                    page_items(header, usize::from(page)),
+                                )?;
+                                let (entries, remainder) = raw[2..].as_chunks::<56>();
+                                if !remainder.is_empty()
+                                    || entries.len() != page_items(header, usize::from(page))
+                                    || !entries.iter().any(|entry| {
+                                        entry[..8] == receipt.request_epoch.to_be_bytes()
+                                            && entry[8..24] == receipt.operation_id.as_bytes()[..]
+                                            && entry[24..] == fingerprint
+                                    })
+                                {
+                                    return Err(CatalogError::Corrupt("活动归并请求不在已终结页"));
+                                }
+                                if let Some(compacted) = tr
+                                    .get(&compacted_page_key(volume, generation, page), false)
+                                    .await?
+                                {
+                                    return Ok(
+                                        if compacted.as_ref()
+                                            == finalized_page_value(
+                                                batch_id,
+                                                &publication,
+                                                &page_proof,
+                                            )
+                                        {
+                                            ActiveMaterializationOutcome::AlreadyMaterialized
+                                        } else {
+                                            ActiveMaterializationOutcome::BatchConflict
+                                        },
+                                    );
+                                }
+                                let locator = TargetLocator::from_receipt(batch_id, &receipt);
+                                let Some((published, placement)) =
+                                    lookup::published_receipt_at(&tr, namespace, locator).await?
+                                else {
+                                    return Err(CatalogError::Corrupt("活动归并缺少已发布目标"));
+                                };
+                                let mut published = published;
+                                published.owner_epoch = receipt.owner_epoch;
+                                if published != receipt
+                                    || placement.volume_id != volume
+                                    || !target_matches_baseline(&tr, &receipt).await?
+                                {
+                                    return Ok(ActiveMaterializationOutcome::BatchConflict);
+                                }
+                                let attributes = prepared_attributes_at(&tr, batch_id, &receipt)
+                                    .await?
+                                    .ok_or(CatalogError::Corrupt("活动归并缺少文件属性"))?;
+                                if Some(attributes.digest()) != receipt.metadata_digest {
+                                    return Err(CatalogError::Corrupt("活动归并属性摘要不一致"));
+                                }
+                                let inode_key = node_key(namespace, receipt.file_id);
+                                attribute_objects::require_attributes(
+                                    &tr,
+                                    namespace,
+                                    Some(&attributes),
+                                )
+                                .await?;
+                                tr.set(
+                                    &child_key(namespace, receipt.parent, &receipt.name),
+                                    receipt.file_id.as_bytes(),
+                                );
+                                tr.set(
+                                    &inode_key,
+                                    &encode_node(&Node {
+                                        kind: NodeKind::File,
+                                        directory_version: None,
+                                        parent: receipt.parent,
+                                        name: receipt.name.clone(),
+                                        attributes: Some(attributes),
+                                    }),
+                                );
+                                tr.set(
+                                    &head_key(namespace, receipt.file_id),
+                                    &encode_head(&FileHead {
+                                        version,
+                                        size: receipt.size,
+                                        copy_id: receipt.copy_id,
+                                    }),
+                                );
+                                tr.set(
+                                    &copy_key(namespace, receipt.file_id, receipt.copy_id),
+                                    &encode_copy(&receipt, version),
+                                );
+                                let mut volume_value = version.to_be_bytes().to_vec();
+                                volume_value.extend_from_slice(&fingerprint);
+                                tr.set(
+                                    &volume_key(
+                                        volume,
+                                        receipt.volume_scan_id,
+                                        namespace,
+                                        receipt.file_id,
+                                        receipt.copy_id,
+                                    ),
+                                    &volume_value,
+                                );
+                                tr.clear(&claim_key(&receipt));
+                                tr.clear(&path_claim_key(&receipt));
+                                tr.clear(&file_claim_key(&receipt));
+                                tr.clear(&reverse_claim_key(&receipt));
+                                tr.clear(&requests::intent_key(&receipt));
+                                tr.clear(&reservation::upgraded_key_for(&receipt));
+                                tr.clear(&prepared_key(
+                                    volume,
+                                    generation,
+                                    receipt.request_epoch,
+                                    receipt.operation_id,
+                                ));
+                                let chunks = prepared_chunk_prefix(
+                                    volume,
+                                    generation,
+                                    receipt.request_epoch,
+                                    receipt.operation_id,
+                                );
+                                tr.clear_range(&chunks, &prefix_end(&chunks));
+                                tr.set(&done_key, &marker);
+                                Ok(ActiveMaterializationOutcome::Materialized)
+                            }
+                            .await,
+                            &[
+                                ActiveMaterializationOutcome::Materialized,
+                                ActiveMaterializationOutcome::AlreadyMaterialized,
+                            ],
+                        ),
                     )
                 }
             })
@@ -1606,6 +2579,52 @@ impl ManagedCatalog {
         batch_id: Uuid,
         page: u16,
     ) -> Result<ActiveCompactionOutcome> {
+        self.finish_materialized_active_batch_page_with_authority(
+            serial,
+            owner_epoch,
+            volume,
+            generation,
+            batch_id,
+            page,
+            PublicationAuthority::Ordinary,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_materialized_active_batch_page_with_authority<'a>(
+        &'a self,
+        serial: &'a str,
+        owner_epoch: u64,
+        volume: Uuid,
+        generation: u64,
+        batch_id: Uuid,
+        page: u16,
+        authority: PublicationAuthority<'a>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<ActiveCompactionOutcome>> + 'a>>
+    {
+        Box::pin(self.finish_materialized_active_batch_page_in(
+            serial,
+            owner_epoch,
+            volume,
+            generation,
+            batch_id,
+            page,
+            authority,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_materialized_active_batch_page_in(
+        &self,
+        serial: &str,
+        owner_epoch: u64,
+        volume: Uuid,
+        generation: u64,
+        batch_id: Uuid,
+        page: u16,
+        authority: PublicationAuthority<'_>,
+    ) -> Result<ActiveCompactionOutcome> {
         control::validate_physical_serial(serial)?;
         if owner_epoch == 0 || volume.is_nil() || generation == 0 || batch_id.is_nil() {
             return Err(CatalogError::Invalid("活动归并页身份无效"));
@@ -1616,127 +2635,157 @@ impl ManagedCatalog {
                 let serial = serial.clone();
                 async move {
                     requests::retry_result(
-                        async {
-                            let namespace = routing::require_active_namespace(&tr, &serial).await?;
-                            if !routing::require_active_owner(&tr, namespace, &serial, owner_epoch)
+                        authority.finish(
+                            async {
+                                authority
+                                    .require_at(
+                                        &tr,
+                                        &serial,
+                                        owner_epoch,
+                                        batch_id,
+                                        volume,
+                                        generation,
+                                        None,
+                                        Some(page),
+                                    )
+                                    .await?;
+                                let namespace =
+                                    routing::require_active_namespace(&tr, &serial).await?;
+                                if !routing::require_active_owner(
+                                    &tr,
+                                    namespace,
+                                    &serial,
+                                    owner_epoch,
+                                )
                                 .await?
-                            {
-                                return Ok(ActiveCompactionOutcome::StaleOwner);
-                            }
-                            let placement = control::verified_placement(&tr, volume)
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
-                            if placement.namespace != namespace
-                                || placement.library_serial != serial
-                            {
-                                return Ok(ActiveCompactionOutcome::BatchConflict);
-                            }
-                            let header = tr
-                                .get(&batch_key(volume, generation), false)
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
-                            let header = Header::decode(&header)?;
-                            if header.batch_id != batch_id
-                                || header.namespace != namespace
-                                || header.phase != ActiveBatchPhase::Sealed
-                                || header.owner_epoch > owner_epoch
-                                || usize::from(page) >= usize::from(header.pages)
-                            {
-                                return Ok(ActiveCompactionOutcome::BatchConflict);
-                            }
-                            let publication = tr
-                                .get(&publication_key(volume, generation), false)
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
-                            if tr
-                                .get(&prepared_batch_key(volume, generation), false)
-                                .await?
-                                .as_deref()
-                                != Some(publication.as_ref())
-                            {
-                                return Err(CatalogError::Corrupt("活动归并页发布证明不一致"));
-                            }
-                            let raw = tr
-                                .get(&page_key(volume, generation, page), false)
-                                .await?
-                                .ok_or(CatalogError::Corrupt("活动归并页原清单缺失"))?;
-                            if tr
-                                .get(&page_digest_key(volume, generation, page), false)
-                                .await?
-                                .as_deref()
-                                != Some(page_digest(&raw).as_slice())
-                            {
-                                return Err(CatalogError::Corrupt("活动归并页摘要不一致"));
-                            }
-                            let page_proof = tr
-                                .get(&prepared_page_key(volume, generation, page), false)
-                                .await?
-                                .ok_or(CatalogError::Corrupt("活动归并页准备证明缺失"))?;
-                            if page_proof.as_ref() != prepared_page_value(batch_id, &raw) {
-                                return Err(CatalogError::Corrupt("活动归并页准备证明不一致"));
-                            }
-                            let finalized =
-                                finalized_page_value(batch_id, &publication, &page_proof);
-                            if tr
-                                .get(&finalized_page_key(volume, generation, page), false)
-                                .await?
-                                .as_deref()
-                                != Some(finalized.as_slice())
-                            {
-                                return Ok(ActiveCompactionOutcome::Incomplete);
-                            }
-                            let done_key = compacted_page_key(volume, generation, page);
-                            if let Some(saved) = tr.get(&done_key, false).await? {
-                                return Ok(if saved.as_ref() == finalized {
-                                    ActiveCompactionOutcome::AlreadyCompleted
-                                } else {
-                                    ActiveCompactionOutcome::BatchConflict
-                                });
-                            }
-                            page_claim_keys(
-                                namespace,
-                                &raw,
-                                page_items(header, usize::from(page)),
-                            )?;
-                            let (entries, remainder) = raw[2..].as_chunks::<56>();
-                            debug_assert!(remainder.is_empty());
-                            let mut completed = Vec::with_capacity(entries.len());
-                            for entry in entries {
-                                let epoch = read_u64(&entry[..8]);
-                                let operation = uuid_from(&entry[8..24])?;
-                                let key = materialized_key(namespace, epoch, operation);
-                                let Some(marker) = tr.get(&key, false).await? else {
-                                    return Ok(ActiveCompactionOutcome::Incomplete);
-                                };
-                                if marker.len() != 57
-                                    || marker[0] != 1
-                                    || marker[1..17] != batch_id.as_bytes()[..]
-                                    || marker[17..49] != entry[24..]
                                 {
-                                    return Err(CatalogError::Corrupt("活动归并页文件标记不一致"));
+                                    return Ok(ActiveCompactionOutcome::StaleOwner);
                                 }
-                                let version = read_u64(&marker[49..57]);
-                                if version == 0 {
-                                    return Err(CatalogError::Corrupt("活动归并页文件版本无效"));
-                                }
-                                let terminal = tr
-                                    .get(&op_key(namespace, epoch, operation), false)
+                                let placement = control::verified_placement(&tr, volume)
                                     .await?
-                                    .ok_or(CatalogError::Corrupt("归并页文件终态缺失"))?;
-                                if requests::terminal_result(&terminal, &entry[24..])?
-                                    != PublishOutcome::AlreadyApplied(version)
+                                    .ok_or(CatalogError::Incomplete)?;
+                                if placement.namespace != namespace
+                                    || placement.library_serial != serial
                                 {
-                                    return Err(CatalogError::Corrupt("归并页文件终态不一致"));
+                                    return Ok(ActiveCompactionOutcome::BatchConflict);
                                 }
-                                completed.push(key);
+                                require_published_checkpoint_at(&tr, &serial, volume, generation)
+                                    .await?;
+                                let header = tr
+                                    .get(&batch_key(volume, generation), false)
+                                    .await?
+                                    .ok_or(CatalogError::Incomplete)?;
+                                let header = Header::decode(&header)?;
+                                if header.batch_id != batch_id
+                                    || header.namespace != namespace
+                                    || header.phase != ActiveBatchPhase::Sealed
+                                    || header.owner_epoch > owner_epoch
+                                    || usize::from(page) >= usize::from(header.pages)
+                                {
+                                    return Ok(ActiveCompactionOutcome::BatchConflict);
+                                }
+                                let publication = tr
+                                    .get(&publication_key(volume, generation), false)
+                                    .await?
+                                    .ok_or(CatalogError::Incomplete)?;
+                                if tr
+                                    .get(&prepared_batch_key(volume, generation), false)
+                                    .await?
+                                    .as_deref()
+                                    != Some(publication.as_ref())
+                                {
+                                    return Err(CatalogError::Corrupt("活动归并页发布证明不一致"));
+                                }
+                                let raw = tr
+                                    .get(&page_key(volume, generation, page), false)
+                                    .await?
+                                    .ok_or(CatalogError::Corrupt("活动归并页原清单缺失"))?;
+                                if tr
+                                    .get(&page_digest_key(volume, generation, page), false)
+                                    .await?
+                                    .as_deref()
+                                    != Some(page_digest(&raw).as_slice())
+                                {
+                                    return Err(CatalogError::Corrupt("活动归并页摘要不一致"));
+                                }
+                                let page_proof = tr
+                                    .get(&prepared_page_key(volume, generation, page), false)
+                                    .await?
+                                    .ok_or(CatalogError::Corrupt("活动归并页准备证明缺失"))?;
+                                if page_proof.as_ref() != prepared_page_value(batch_id, &raw) {
+                                    return Err(CatalogError::Corrupt("活动归并页准备证明不一致"));
+                                }
+                                let finalized =
+                                    finalized_page_value(batch_id, &publication, &page_proof);
+                                if tr
+                                    .get(&finalized_page_key(volume, generation, page), false)
+                                    .await?
+                                    .as_deref()
+                                    != Some(finalized.as_slice())
+                                {
+                                    return Ok(ActiveCompactionOutcome::Incomplete);
+                                }
+                                let done_key = compacted_page_key(volume, generation, page);
+                                if let Some(saved) = tr.get(&done_key, false).await? {
+                                    return Ok(if saved.as_ref() == finalized {
+                                        ActiveCompactionOutcome::AlreadyCompleted
+                                    } else {
+                                        ActiveCompactionOutcome::BatchConflict
+                                    });
+                                }
+                                page_claim_keys(
+                                    namespace,
+                                    &raw,
+                                    page_items(header, usize::from(page)),
+                                )?;
+                                let (entries, remainder) = raw[2..].as_chunks::<56>();
+                                debug_assert!(remainder.is_empty());
+                                let mut completed = Vec::with_capacity(entries.len());
+                                for entry in entries {
+                                    let epoch = read_u64(&entry[..8]);
+                                    let operation = uuid_from(&entry[8..24])?;
+                                    let key = materialized_key(namespace, epoch, operation);
+                                    let Some(marker) = tr.get(&key, false).await? else {
+                                        return Ok(ActiveCompactionOutcome::Incomplete);
+                                    };
+                                    if marker.len() != 57
+                                        || marker[0] != 1
+                                        || marker[1..17] != batch_id.as_bytes()[..]
+                                        || marker[17..49] != entry[24..]
+                                    {
+                                        return Err(CatalogError::Corrupt(
+                                            "活动归并页文件标记不一致",
+                                        ));
+                                    }
+                                    let version = read_u64(&marker[49..57]);
+                                    if version == 0 {
+                                        return Err(CatalogError::Corrupt(
+                                            "活动归并页文件版本无效",
+                                        ));
+                                    }
+                                    let terminal = tr
+                                        .get(&op_key(namespace, epoch, operation), false)
+                                        .await?
+                                        .ok_or(CatalogError::Corrupt("归并页文件终态缺失"))?;
+                                    if requests::terminal_result(&terminal, &entry[24..])?
+                                        != PublishOutcome::AlreadyApplied(version)
+                                    {
+                                        return Err(CatalogError::Corrupt("归并页文件终态不一致"));
+                                    }
+                                    completed.push(key);
+                                }
+                                for key in completed {
+                                    tr.clear(&key);
+                                }
+                                tr.set(&done_key, &finalized);
+                                Ok(ActiveCompactionOutcome::Completed)
                             }
-                            for key in completed {
-                                tr.clear(&key);
-                            }
-                            tr.set(&done_key, &finalized);
-                            Ok(ActiveCompactionOutcome::Completed)
-                        }
-                        .await,
+                            .await,
+                            &[
+                                ActiveCompactionOutcome::Completed,
+                                ActiveCompactionOutcome::AlreadyCompleted,
+                            ],
+                        ),
                     )
                 }
             })
@@ -1754,6 +2803,46 @@ impl ManagedCatalog {
         generation: u64,
         batch_id: Uuid,
     ) -> Result<ActiveCompactionOutcome> {
+        self.seal_materialized_active_batch_with_authority(
+            serial,
+            owner_epoch,
+            volume,
+            generation,
+            batch_id,
+            PublicationAuthority::Ordinary,
+        )
+        .await
+    }
+
+    fn seal_materialized_active_batch_with_authority<'a>(
+        &'a self,
+        serial: &'a str,
+        owner_epoch: u64,
+        volume: Uuid,
+        generation: u64,
+        batch_id: Uuid,
+        authority: PublicationAuthority<'a>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<ActiveCompactionOutcome>> + 'a>>
+    {
+        Box::pin(self.seal_materialized_active_batch_in(
+            serial,
+            owner_epoch,
+            volume,
+            generation,
+            batch_id,
+            authority,
+        ))
+    }
+
+    async fn seal_materialized_active_batch_in(
+        &self,
+        serial: &str,
+        owner_epoch: u64,
+        volume: Uuid,
+        generation: u64,
+        batch_id: Uuid,
+        authority: PublicationAuthority<'_>,
+    ) -> Result<ActiveCompactionOutcome> {
         control::validate_physical_serial(serial)?;
         if owner_epoch == 0 || volume.is_nil() || generation == 0 || batch_id.is_nil() {
             return Err(CatalogError::Invalid("活动归并整批身份无效"));
@@ -1764,115 +2853,150 @@ impl ManagedCatalog {
                 let serial = serial.clone();
                 async move {
                     requests::retry_result(
-                        async {
-                            let namespace = routing::require_active_namespace(&tr, &serial).await?;
-                            if !routing::require_active_owner(&tr, namespace, &serial, owner_epoch)
+                        authority.finish(
+                            async {
+                                authority
+                                    .require_at(
+                                        &tr,
+                                        &serial,
+                                        owner_epoch,
+                                        batch_id,
+                                        volume,
+                                        generation,
+                                        None,
+                                        None,
+                                    )
+                                    .await?;
+                                let namespace =
+                                    routing::require_active_namespace(&tr, &serial).await?;
+                                if !routing::require_active_owner(
+                                    &tr,
+                                    namespace,
+                                    &serial,
+                                    owner_epoch,
+                                )
                                 .await?
-                            {
-                                return Ok(ActiveCompactionOutcome::StaleOwner);
-                            }
-                            let placement = control::verified_placement(&tr, volume)
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
-                            if placement.namespace != namespace
-                                || placement.library_serial != serial
-                            {
-                                return Ok(ActiveCompactionOutcome::BatchConflict);
-                            }
-                            let done_key = compacted_batch_key(volume, generation);
-                            if let Some(saved) = tr.get(&done_key, false).await? {
-                                let (header, _) = decode_compacted_batch(&saved)?;
-                                return Ok(
-                                    if header.batch_id == batch_id && header.namespace == namespace
-                                    {
-                                        ActiveCompactionOutcome::AlreadyCompleted
-                                    } else {
-                                        ActiveCompactionOutcome::BatchConflict
-                                    },
-                                );
-                            }
-                            let header = tr
-                                .get(&batch_key(volume, generation), false)
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
-                            let header = Header::decode(&header)?;
-                            if header.batch_id != batch_id
-                                || header.namespace != namespace
-                                || header.phase != ActiveBatchPhase::Sealed
-                                || header.owner_epoch > owner_epoch
-                            {
-                                return Ok(ActiveCompactionOutcome::BatchConflict);
-                            }
-                            let publication = tr
-                                .get(&publication_key(volume, generation), false)
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
-                            if publication.len() != PREPARED_BATCH_LEN
-                                || publication[0] != 1
-                                || publication[1..17] != batch_id.as_bytes()[..]
-                                || tr
-                                    .get(&prepared_batch_key(volume, generation), false)
-                                    .await?
-                                    .as_deref()
-                                    != Some(publication.as_ref())
-                            {
-                                return Err(CatalogError::Corrupt("活动整批归并发布证明不一致"));
-                            }
-                            let pages = usize::from(header.pages);
-                            let compacted = read_page(
-                                &tr,
-                                &compacted_page_prefix(volume, generation),
-                                None,
-                                pages + 1,
-                                false,
-                            )
-                            .await?;
-                            let finalized = read_page(
-                                &tr,
-                                &finalized_page_prefix(volume, generation),
-                                None,
-                                pages + 1,
-                                false,
-                            )
-                            .await?;
-                            if compacted.next.is_some()
-                                || finalized.next.is_some()
-                                || compacted.items.len() != pages
-                                || finalized.items.len() != pages
-                            {
-                                return Ok(ActiveCompactionOutcome::Incomplete);
-                            }
-                            for (
-                                number,
-                                (
-                                    (compacted_key, compacted_value),
-                                    (finalized_key, finalized_value),
-                                ),
-                            ) in compacted
-                                .items
-                                .iter()
-                                .zip(finalized.items.iter())
-                                .enumerate()
-                            {
-                                if compacted_key
-                                    != &compacted_page_key(volume, generation, number as u16)
-                                    || finalized_key
-                                        != &finalized_page_key(volume, generation, number as u16)
-                                    || compacted_value != finalized_value
-                                    || compacted_value.len() != PREPARED_PAGE_LEN
-                                    || compacted_value[0] != 1
-                                    || compacted_value[1..17] != batch_id.as_bytes()[..]
                                 {
-                                    return Err(CatalogError::Corrupt("活动归并页完成证明不一致"));
+                                    return Ok(ActiveCompactionOutcome::StaleOwner);
                                 }
+                                let placement = control::verified_placement(&tr, volume)
+                                    .await?
+                                    .ok_or(CatalogError::Incomplete)?;
+                                if placement.namespace != namespace
+                                    || placement.library_serial != serial
+                                {
+                                    return Ok(ActiveCompactionOutcome::BatchConflict);
+                                }
+                                require_published_checkpoint_at(&tr, &serial, volume, generation)
+                                    .await?;
+                                let done_key = compacted_batch_key(volume, generation);
+                                if let Some(saved) = tr.get(&done_key, false).await? {
+                                    let (header, _) = decode_compacted_batch(&saved)?;
+                                    return Ok(
+                                        if header.batch_id == batch_id
+                                            && header.namespace == namespace
+                                        {
+                                            ActiveCompactionOutcome::AlreadyCompleted
+                                        } else {
+                                            ActiveCompactionOutcome::BatchConflict
+                                        },
+                                    );
+                                }
+                                let header = tr
+                                    .get(&batch_key(volume, generation), false)
+                                    .await?
+                                    .ok_or(CatalogError::Incomplete)?;
+                                let header = Header::decode(&header)?;
+                                if header.batch_id != batch_id
+                                    || header.namespace != namespace
+                                    || header.phase != ActiveBatchPhase::Sealed
+                                    || header.owner_epoch > owner_epoch
+                                {
+                                    return Ok(ActiveCompactionOutcome::BatchConflict);
+                                }
+                                let publication = tr
+                                    .get(&publication_key(volume, generation), false)
+                                    .await?
+                                    .ok_or(CatalogError::Incomplete)?;
+                                if publication.len() != PREPARED_BATCH_LEN
+                                    || publication[0] != 1
+                                    || publication[1..17] != batch_id.as_bytes()[..]
+                                    || tr
+                                        .get(&prepared_batch_key(volume, generation), false)
+                                        .await?
+                                        .as_deref()
+                                        != Some(publication.as_ref())
+                                {
+                                    return Err(CatalogError::Corrupt(
+                                        "活动整批归并发布证明不一致",
+                                    ));
+                                }
+                                let pages = usize::from(header.pages);
+                                let compacted = read_page(
+                                    &tr,
+                                    &compacted_page_prefix(volume, generation),
+                                    None,
+                                    pages + 1,
+                                    false,
+                                )
+                                .await?;
+                                let finalized = read_page(
+                                    &tr,
+                                    &finalized_page_prefix(volume, generation),
+                                    None,
+                                    pages + 1,
+                                    false,
+                                )
+                                .await?;
+                                if compacted.next.is_some()
+                                    || finalized.next.is_some()
+                                    || compacted.items.len() != pages
+                                    || finalized.items.len() != pages
+                                {
+                                    return Ok(ActiveCompactionOutcome::Incomplete);
+                                }
+                                for (
+                                    number,
+                                    (
+                                        (compacted_key, compacted_value),
+                                        (finalized_key, finalized_value),
+                                    ),
+                                ) in compacted
+                                    .items
+                                    .iter()
+                                    .zip(finalized.items.iter())
+                                    .enumerate()
+                                {
+                                    if compacted_key
+                                        != &compacted_page_key(volume, generation, number as u16)
+                                        || finalized_key
+                                            != &finalized_page_key(
+                                                volume,
+                                                generation,
+                                                number as u16,
+                                            )
+                                        || compacted_value != finalized_value
+                                        || compacted_value.len() != PREPARED_PAGE_LEN
+                                        || compacted_value[0] != 1
+                                        || compacted_value[1..17] != batch_id.as_bytes()[..]
+                                    {
+                                        return Err(CatalogError::Corrupt(
+                                            "活动归并页完成证明不一致",
+                                        ));
+                                    }
+                                }
+                                tr.set(&done_key, &compacted_batch_value(header, &publication));
+                                tr.clear(&publication_key(volume, generation));
+                                tr.clear(&prepared_batch_key(volume, generation));
+                                tr.clear(&batch_key(volume, generation));
+                                Ok(ActiveCompactionOutcome::Completed)
                             }
-                            tr.set(&done_key, &compacted_batch_value(header, &publication));
-                            tr.clear(&publication_key(volume, generation));
-                            tr.clear(&prepared_batch_key(volume, generation));
-                            tr.clear(&batch_key(volume, generation));
-                            Ok(ActiveCompactionOutcome::Completed)
-                        }
-                        .await,
+                            .await,
+                            &[
+                                ActiveCompactionOutcome::Completed,
+                                ActiveCompactionOutcome::AlreadyCompleted,
+                            ],
+                        ),
                     )
                 }
             })
@@ -1891,6 +3015,52 @@ impl ManagedCatalog {
         batch_id: Uuid,
         page: u16,
     ) -> Result<ActiveCompactionOutcome> {
+        self.cleanup_materialized_active_batch_page_with_authority(
+            serial,
+            owner_epoch,
+            volume,
+            generation,
+            batch_id,
+            page,
+            PublicationAuthority::Ordinary,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cleanup_materialized_active_batch_page_with_authority<'a>(
+        &'a self,
+        serial: &'a str,
+        owner_epoch: u64,
+        volume: Uuid,
+        generation: u64,
+        batch_id: Uuid,
+        page: u16,
+        authority: PublicationAuthority<'a>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<ActiveCompactionOutcome>> + 'a>>
+    {
+        Box::pin(self.cleanup_materialized_active_batch_page_in(
+            serial,
+            owner_epoch,
+            volume,
+            generation,
+            batch_id,
+            page,
+            authority,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn cleanup_materialized_active_batch_page_in(
+        &self,
+        serial: &str,
+        owner_epoch: u64,
+        volume: Uuid,
+        generation: u64,
+        batch_id: Uuid,
+        page: u16,
+        authority: PublicationAuthority<'_>,
+    ) -> Result<ActiveCompactionOutcome> {
         control::validate_physical_serial(serial)?;
         if owner_epoch == 0 || volume.is_nil() || generation == 0 || batch_id.is_nil() {
             return Err(CatalogError::Invalid("活动归并清理页身份无效"));
@@ -1901,83 +3071,109 @@ impl ManagedCatalog {
                 let serial = serial.clone();
                 async move {
                     requests::retry_result(
-                        async {
-                            let namespace = routing::require_active_namespace(&tr, &serial).await?;
-                            if !routing::require_active_owner(&tr, namespace, &serial, owner_epoch)
+                        authority.finish(
+                            async {
+                                authority
+                                    .require_at(
+                                        &tr,
+                                        &serial,
+                                        owner_epoch,
+                                        batch_id,
+                                        volume,
+                                        generation,
+                                        None,
+                                        Some(page),
+                                    )
+                                    .await?;
+                                let namespace =
+                                    routing::require_active_namespace(&tr, &serial).await?;
+                                if !routing::require_active_owner(
+                                    &tr,
+                                    namespace,
+                                    &serial,
+                                    owner_epoch,
+                                )
                                 .await?
-                            {
-                                return Ok(ActiveCompactionOutcome::StaleOwner);
-                            }
-                            let placement = control::verified_placement(&tr, volume)
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
-                            if placement.namespace != namespace
-                                || placement.library_serial != serial
-                            {
-                                return Ok(ActiveCompactionOutcome::BatchConflict);
-                            }
-                            let done = tr
-                                .get(&compacted_batch_key(volume, generation), false)
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
-                            let (header, publication) = decode_compacted_batch(&done)?;
-                            if header.batch_id != batch_id
-                                || header.namespace != namespace
-                                || usize::from(page) >= usize::from(header.pages)
-                            {
-                                return Ok(ActiveCompactionOutcome::BatchConflict);
-                            }
-                            let page_key = page_key(volume, generation, page);
-                            let digest_key = page_digest_key(volume, generation, page);
-                            let prepared_key = prepared_page_key(volume, generation, page);
-                            let finalized_key = finalized_page_key(volume, generation, page);
-                            let compacted_key = compacted_page_key(volume, generation, page);
-                            let raw = tr.get(&page_key, false).await?;
-                            let digest = tr.get(&digest_key, false).await?;
-                            let prepared = tr.get(&prepared_key, false).await?;
-                            let finalized = tr.get(&finalized_key, false).await?;
-                            let compacted = tr.get(&compacted_key, false).await?;
-                            let Some(compacted) = compacted else {
-                                return if raw.is_none()
-                                    && digest.is_none()
-                                    && prepared.is_none()
-                                    && finalized.is_none()
                                 {
-                                    Ok(ActiveCompactionOutcome::AlreadyCompleted)
-                                } else {
-                                    Err(CatalogError::Corrupt("活动归并清理页部分缺失"))
+                                    return Ok(ActiveCompactionOutcome::StaleOwner);
+                                }
+                                let placement = control::verified_placement(&tr, volume)
+                                    .await?
+                                    .ok_or(CatalogError::Incomplete)?;
+                                if placement.namespace != namespace
+                                    || placement.library_serial != serial
+                                {
+                                    return Ok(ActiveCompactionOutcome::BatchConflict);
+                                }
+                                require_published_checkpoint_at(&tr, &serial, volume, generation)
+                                    .await?;
+                                let done = tr
+                                    .get(&compacted_batch_key(volume, generation), false)
+                                    .await?
+                                    .ok_or(CatalogError::Incomplete)?;
+                                let (header, publication) = decode_compacted_batch(&done)?;
+                                if header.batch_id != batch_id
+                                    || header.namespace != namespace
+                                    || usize::from(page) >= usize::from(header.pages)
+                                {
+                                    return Ok(ActiveCompactionOutcome::BatchConflict);
+                                }
+                                let page_key = page_key(volume, generation, page);
+                                let digest_key = page_digest_key(volume, generation, page);
+                                let prepared_key = prepared_page_key(volume, generation, page);
+                                let finalized_key = finalized_page_key(volume, generation, page);
+                                let compacted_key = compacted_page_key(volume, generation, page);
+                                let raw = tr.get(&page_key, false).await?;
+                                let digest = tr.get(&digest_key, false).await?;
+                                let prepared = tr.get(&prepared_key, false).await?;
+                                let finalized = tr.get(&finalized_key, false).await?;
+                                let compacted = tr.get(&compacted_key, false).await?;
+                                let Some(compacted) = compacted else {
+                                    return if raw.is_none()
+                                        && digest.is_none()
+                                        && prepared.is_none()
+                                        && finalized.is_none()
+                                    {
+                                        Ok(ActiveCompactionOutcome::AlreadyCompleted)
+                                    } else {
+                                        Err(CatalogError::Corrupt("活动归并清理页部分缺失"))
+                                    };
                                 };
-                            };
-                            let (Some(raw), Some(digest), Some(prepared), Some(finalized)) =
-                                (raw, digest, prepared, finalized)
-                            else {
-                                return Err(CatalogError::Corrupt("活动归并清理页证明缺失"));
-                            };
-                            page_claim_keys(
-                                namespace,
-                                &raw,
-                                page_items(header, usize::from(page)),
-                            )?;
-                            if digest.as_ref() != page_digest(&raw)
-                                || prepared.as_ref() != prepared_page_value(batch_id, &raw)
-                                || finalized.as_ref()
-                                    != finalized_page_value(batch_id, publication, &prepared)
-                                || compacted.as_ref() != finalized.as_ref()
-                            {
-                                return Err(CatalogError::Corrupt("活动归并清理页证明不一致"));
+                                let (Some(raw), Some(digest), Some(prepared), Some(finalized)) =
+                                    (raw, digest, prepared, finalized)
+                                else {
+                                    return Err(CatalogError::Corrupt("活动归并清理页证明缺失"));
+                                };
+                                page_claim_keys(
+                                    namespace,
+                                    &raw,
+                                    page_items(header, usize::from(page)),
+                                )?;
+                                if digest.as_ref() != page_digest(&raw)
+                                    || prepared.as_ref() != prepared_page_value(batch_id, &raw)
+                                    || finalized.as_ref()
+                                        != finalized_page_value(batch_id, publication, &prepared)
+                                    || compacted.as_ref() != finalized.as_ref()
+                                {
+                                    return Err(CatalogError::Corrupt("活动归并清理页证明不一致"));
+                                }
+                                for key in [
+                                    page_key,
+                                    digest_key,
+                                    prepared_key,
+                                    finalized_key,
+                                    compacted_key,
+                                ] {
+                                    tr.clear(&key);
+                                }
+                                Ok(ActiveCompactionOutcome::Completed)
                             }
-                            for key in [
-                                page_key,
-                                digest_key,
-                                prepared_key,
-                                finalized_key,
-                                compacted_key,
-                            ] {
-                                tr.clear(&key);
-                            }
-                            Ok(ActiveCompactionOutcome::Completed)
-                        }
-                        .await,
+                            .await,
+                            &[
+                                ActiveCompactionOutcome::Completed,
+                                ActiveCompactionOutcome::AlreadyCompleted,
+                            ],
+                        ),
                     )
                 }
             })
@@ -2063,6 +3259,46 @@ impl ManagedCatalog {
         receipt: &CommitReceipt,
         attributes: &NodeAttributes,
     ) -> Result<ActivePreparationOutcome> {
+        self.prepare_observed_active_file_with_authority(
+            serial,
+            owner_epoch,
+            batch_id,
+            receipt,
+            attributes,
+            PublicationAuthority::Ordinary,
+        )
+        .await
+    }
+
+    fn prepare_observed_active_file_with_authority<'a>(
+        &'a self,
+        serial: &'a str,
+        owner_epoch: u64,
+        batch_id: Uuid,
+        receipt: &'a CommitReceipt,
+        attributes: &'a NodeAttributes,
+        authority: PublicationAuthority<'a>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<ActivePreparationOutcome>> + 'a>>
+    {
+        Box::pin(self.prepare_observed_active_file_in(
+            serial,
+            owner_epoch,
+            batch_id,
+            receipt,
+            attributes,
+            authority,
+        ))
+    }
+
+    async fn prepare_observed_active_file_in(
+        &self,
+        serial: &str,
+        owner_epoch: u64,
+        batch_id: Uuid,
+        receipt: &CommitReceipt,
+        attributes: &NodeAttributes,
+        authority: PublicationAuthority<'_>,
+    ) -> Result<ActivePreparationOutcome> {
         control::validate_physical_serial(serial)?;
         validate_receipt(receipt)?;
         if owner_epoch == 0 || batch_id.is_nil() || serial != receipt.library_serial {
@@ -2090,8 +3326,16 @@ impl ManagedCatalog {
         }
         let fingerprint = receipt_fingerprint(receipt);
         let prepared = prepared_value(batch_id, &fingerprint, attributes);
-        self.upload_attributes(receipt.namespace, attributes)
-            .await?;
+        match authority {
+            PublicationAuthority::Ordinary => {
+                self.upload_attributes(receipt.namespace, attributes)
+                    .await?
+            }
+            PublicationAuthority::Original(context) => {
+                self.upload_original_checkpoint_attributes(context, receipt, attributes)
+                    .await?
+            }
+        }
         let inline = (bytes.len() <= INLINE_LIMIT).then(|| bytes.to_vec());
         let manifest = attributes.manifest();
         let item_key = prepared_key(
@@ -2111,126 +3355,144 @@ impl ManagedCatalog {
                 let inline = inline.clone();
                 async move {
                     requests::retry_result(
-                        async {
-                            if !routing::require_active_owner(
-                                &tr,
-                                receipt.namespace,
-                                &serial,
-                                owner_epoch,
-                            )
-                            .await?
-                            {
-                                return Ok(ActivePreparationOutcome::StaleOwner);
-                            }
-                            let placement = control::verified_placement(&tr, receipt.volume_id)
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
-                            if placement.namespace != receipt.namespace
-                                || placement.library_serial != serial
-                            {
-                                return Ok(ActivePreparationOutcome::BatchConflict);
-                            }
-                            if !sealed_for_index(
-                                &tr,
-                                receipt.namespace,
-                                receipt.volume_id,
-                                receipt.volume_generation,
-                                batch_id,
-                                owner_epoch,
-                                receipt.volume_scan_id,
-                            )
-                            .await?
-                            {
-                                return Ok(ActivePreparationOutcome::BatchConflict);
-                            }
-                            let Some((observed_batch, _)) = active_volume::observed_batch_at(
-                                &tr,
-                                &serial,
-                                receipt.volume_id,
-                                receipt.volume_generation,
-                            )
-                            .await?
-                            else {
-                                return Ok(ActivePreparationOutcome::IndexNotObserved);
-                            };
-                            if observed_batch != batch_id {
-                                return Ok(ActivePreparationOutcome::BatchConflict);
-                            }
-                            if !target_claims_match(&tr, &receipt, batch_id).await? {
-                                return Ok(ActivePreparationOutcome::RequestConflict);
-                            }
-                            let intent = tr.get(&requests::intent_key(&receipt), false).await?;
-                            let Some(intent) = intent else {
-                                return Ok(ActivePreparationOutcome::RequestConflict);
-                            };
-                            if requests::matching_permit(&intent, &receipt)?.is_none()
-                                || tr
-                                    .get(
-                                        &op_key(
-                                            receipt.namespace,
-                                            receipt.request_epoch,
-                                            receipt.operation_id,
-                                        ),
-                                        false,
+                        authority.finish(
+                            async {
+                                authority
+                                    .require_at(
+                                        &tr,
+                                        &serial,
+                                        owner_epoch,
+                                        batch_id,
+                                        receipt.volume_id,
+                                        receipt.volume_generation,
+                                        Some(&receipt),
+                                        None,
                                     )
+                                    .await?;
+                                if !routing::require_active_owner(
+                                    &tr,
+                                    receipt.namespace,
+                                    &serial,
+                                    owner_epoch,
+                                )
+                                .await?
+                                {
+                                    return Ok(ActivePreparationOutcome::StaleOwner);
+                                }
+                                let placement = control::verified_placement(&tr, receipt.volume_id)
                                     .await?
-                                    .is_some()
-                            {
-                                return Ok(ActivePreparationOutcome::RequestConflict);
-                            }
-                            if let Some(existing) = tr.get(&item_key, false).await? {
-                                decode_prepared(&existing)?;
-                                if existing.as_ref() != prepared.as_slice() {
+                                    .ok_or(CatalogError::Incomplete)?;
+                                if placement.namespace != receipt.namespace
+                                    || placement.library_serial != serial
+                                {
                                     return Ok(ActivePreparationOutcome::BatchConflict);
                                 }
-                                upload_receipts::prepare_at(
+                                if !sealed_for_index(
+                                    &tr,
+                                    receipt.namespace,
+                                    receipt.volume_id,
+                                    receipt.volume_generation,
+                                    batch_id,
+                                    owner_epoch,
+                                    receipt.volume_scan_id,
+                                )
+                                .await?
+                                {
+                                    return Ok(ActivePreparationOutcome::BatchConflict);
+                                }
+                                let Some((observed_batch, _)) = active_volume::observed_batch_at(
+                                    &tr,
+                                    &serial,
+                                    receipt.volume_id,
+                                    receipt.volume_generation,
+                                )
+                                .await?
+                                else {
+                                    return Ok(ActivePreparationOutcome::IndexNotObserved);
+                                };
+                                if observed_batch != batch_id {
+                                    return Ok(ActivePreparationOutcome::BatchConflict);
+                                }
+                                if !target_claims_match(&tr, &receipt, batch_id).await? {
+                                    return Ok(ActivePreparationOutcome::RequestConflict);
+                                }
+                                let intent = tr.get(&requests::intent_key(&receipt), false).await?;
+                                let Some(intent) = intent else {
+                                    return Ok(ActivePreparationOutcome::RequestConflict);
+                                };
+                                if requests::matching_permit(&intent, &receipt)?.is_none()
+                                    || tr
+                                        .get(
+                                            &op_key(
+                                                receipt.namespace,
+                                                receipt.request_epoch,
+                                                receipt.operation_id,
+                                            ),
+                                            false,
+                                        )
+                                        .await?
+                                        .is_some()
+                                {
+                                    return Ok(ActivePreparationOutcome::RequestConflict);
+                                }
+                                if let Some(existing) = tr.get(&item_key, false).await? {
+                                    decode_prepared(&existing)?;
+                                    if existing.as_ref() != prepared.as_slice() {
+                                        return Ok(ActivePreparationOutcome::BatchConflict);
+                                    }
+                                    upload_receipts::prepare_at(
+                                        &tr,
+                                        &receipt,
+                                        requests::matching_permit(&intent, &receipt)?
+                                            .expect("checked permit"),
+                                        &placement.barcode,
+                                        attributes,
+                                        true,
+                                    )
+                                    .await?;
+                                    return Ok(ActivePreparationOutcome::AlreadyPrepared);
+                                }
+                                let original = upload_receipts::prepare_at(
                                     &tr,
                                     &receipt,
                                     requests::matching_permit(&intent, &receipt)?
                                         .expect("checked permit"),
                                     &placement.barcode,
                                     attributes,
-                                    true,
+                                    false,
                                 )
-                                .await?;
-                                return Ok(ActivePreparationOutcome::AlreadyPrepared);
-                            }
-                            let original = upload_receipts::prepare_at(
-                                &tr,
-                                &receipt,
-                                requests::matching_permit(&intent, &receipt)?
-                                    .expect("checked permit"),
-                                &placement.barcode,
-                                attributes,
-                                false,
-                            )
-                            .await?
-                            .expect("new preparation");
-                            if let Some(manifest) = manifest {
-                                attribute_objects::require_complete(
-                                    &tr,
-                                    receipt.namespace,
-                                    manifest,
-                                )
-                                .await?;
-                            } else if let Some(inline) = inline {
-                                let key = prepared_chunk_key(
-                                    receipt.volume_id,
-                                    receipt.volume_generation,
-                                    receipt.request_epoch,
-                                    receipt.operation_id,
-                                    0,
-                                );
-                                if tr.get(&key, false).await?.is_some() {
-                                    return Err(CatalogError::Corrupt("活动文件属性分块孤儿"));
+                                .await?
+                                .expect("new preparation");
+                                if let Some(manifest) = manifest {
+                                    attribute_objects::require_complete(
+                                        &tr,
+                                        receipt.namespace,
+                                        manifest,
+                                    )
+                                    .await?;
+                                } else if let Some(inline) = inline {
+                                    let key = prepared_chunk_key(
+                                        receipt.volume_id,
+                                        receipt.volume_generation,
+                                        receipt.request_epoch,
+                                        receipt.operation_id,
+                                        0,
+                                    );
+                                    if tr.get(&key, false).await?.is_some() {
+                                        return Err(CatalogError::Corrupt("活动文件属性分块孤儿"));
+                                    }
+                                    tr.set(&key, &inline);
                                 }
-                                tr.set(&key, &inline);
+                                original.apply(&tr);
+                                tr.set(&item_key, &prepared);
+                                Ok(ActivePreparationOutcome::Prepared)
                             }
-                            original.apply(&tr);
-                            tr.set(&item_key, &prepared);
-                            Ok(ActivePreparationOutcome::Prepared)
-                        }
-                        .await,
+                            .await,
+                            &[
+                                ActivePreparationOutcome::Prepared,
+                                ActivePreparationOutcome::AlreadyPrepared,
+                            ],
+                        ),
                     )
                 }
             })
@@ -2249,6 +3511,52 @@ impl ManagedCatalog {
         batch_id: Uuid,
         page: u16,
     ) -> Result<ActivePreparationOutcome> {
+        self.mark_observed_active_batch_page_prepared_with_authority(
+            serial,
+            owner_epoch,
+            volume,
+            generation,
+            batch_id,
+            page,
+            PublicationAuthority::Ordinary,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mark_observed_active_batch_page_prepared_with_authority<'a>(
+        &'a self,
+        serial: &'a str,
+        owner_epoch: u64,
+        volume: Uuid,
+        generation: u64,
+        batch_id: Uuid,
+        page: u16,
+        authority: PublicationAuthority<'a>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<ActivePreparationOutcome>> + 'a>>
+    {
+        Box::pin(self.mark_observed_active_batch_page_prepared_in(
+            serial,
+            owner_epoch,
+            volume,
+            generation,
+            batch_id,
+            page,
+            authority,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn mark_observed_active_batch_page_prepared_in(
+        &self,
+        serial: &str,
+        owner_epoch: u64,
+        volume: Uuid,
+        generation: u64,
+        batch_id: Uuid,
+        page: u16,
+        authority: PublicationAuthority<'_>,
+    ) -> Result<ActivePreparationOutcome> {
         control::validate_physical_serial(serial)?;
         if owner_epoch == 0 || volume.is_nil() || generation == 0 || batch_id.is_nil() {
             return Err(CatalogError::Invalid("活动准备页身份无效"));
@@ -2259,96 +3567,128 @@ impl ManagedCatalog {
                 let serial = serial.clone();
                 async move {
                     requests::retry_result(
-                        async {
-                            let namespace = routing::require_active_namespace(&tr, &serial).await?;
-                            if !routing::require_active_owner(&tr, namespace, &serial, owner_epoch)
-                                .await?
-                            {
-                                return Ok(ActivePreparationOutcome::StaleOwner);
-                            }
-                            let placement = control::verified_placement(&tr, volume)
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
-                            if placement.namespace != namespace
-                                || placement.library_serial != serial
-                            {
-                                return Ok(ActivePreparationOutcome::BatchConflict);
-                            }
-                            let header = tr
-                                .get(&batch_key(volume, generation), false)
-                                .await?
-                                .ok_or(CatalogError::Incomplete)?;
-                            let header = Header::decode(&header)?;
-                            if header.batch_id != batch_id
-                                || header.namespace != namespace
-                                || header.phase != ActiveBatchPhase::Sealed
-                                || header.owner_epoch > owner_epoch
-                                || usize::from(page) >= usize::from(header.pages)
-                            {
-                                return Ok(ActivePreparationOutcome::BatchConflict);
-                            }
-                            let Some((observed_batch, _)) =
-                                active_volume::observed_batch_at(&tr, &serial, volume, generation)
-                                    .await?
-                            else {
-                                return Ok(ActivePreparationOutcome::IndexNotObserved);
-                            };
-                            if observed_batch != batch_id {
-                                return Ok(ActivePreparationOutcome::BatchConflict);
-                            }
-                            let raw = tr
-                                .get(&page_key(volume, generation, page), false)
-                                .await?
-                                .ok_or(CatalogError::Corrupt("活动批次页缺失"))?;
-                            if tr
-                                .get(&page_digest_key(volume, generation, page), false)
-                                .await?
-                                .as_deref()
-                                != Some(page_digest(&raw).as_slice())
-                            {
-                                return Err(CatalogError::Corrupt("活动批次页摘要不匹配"));
-                            }
-                            let claims = page_claim_keys(
-                                namespace,
-                                &raw,
-                                page_items(header, usize::from(page)),
-                            )?;
-                            let (entries, remainder) = raw[2..].as_chunks::<56>();
-                            debug_assert!(remainder.is_empty());
-                            for (entry, claim) in entries.iter().zip(claims) {
-                                if tr.get(&claim, false).await?.as_deref()
-                                    != Some(batch_id.as_bytes())
-                                {
-                                    return Ok(ActivePreparationOutcome::RequestConflict);
-                                }
-                                let epoch = read_u64(&entry[..8]);
-                                let operation = uuid_from(&entry[8..24])?;
-                                let prepared = tr
-                                    .get(&prepared_key(volume, generation, epoch, operation), false)
+                        authority.finish(
+                            async {
+                                authority
+                                    .require_at(
+                                        &tr,
+                                        &serial,
+                                        owner_epoch,
+                                        batch_id,
+                                        volume,
+                                        generation,
+                                        None,
+                                        Some(page),
+                                    )
                                     .await?;
-                                let Some(prepared) = prepared else {
-                                    return Ok(ActivePreparationOutcome::PageIncomplete);
-                                };
-                                let (saved_batch, fingerprint, _) = decode_prepared(&prepared)?;
-                                if saved_batch != batch_id || fingerprint != entry[24..] {
-                                    return Err(CatalogError::Corrupt(
-                                        "活动准备记录与批次清单不一致",
-                                    ));
+                                let namespace =
+                                    routing::require_active_namespace(&tr, &serial).await?;
+                                if !routing::require_active_owner(
+                                    &tr,
+                                    namespace,
+                                    &serial,
+                                    owner_epoch,
+                                )
+                                .await?
+                                {
+                                    return Ok(ActivePreparationOutcome::StaleOwner);
                                 }
+                                let placement = control::verified_placement(&tr, volume)
+                                    .await?
+                                    .ok_or(CatalogError::Incomplete)?;
+                                if placement.namespace != namespace
+                                    || placement.library_serial != serial
+                                {
+                                    return Ok(ActivePreparationOutcome::BatchConflict);
+                                }
+                                let header = tr
+                                    .get(&batch_key(volume, generation), false)
+                                    .await?
+                                    .ok_or(CatalogError::Incomplete)?;
+                                let header = Header::decode(&header)?;
+                                if header.batch_id != batch_id
+                                    || header.namespace != namespace
+                                    || header.phase != ActiveBatchPhase::Sealed
+                                    || header.owner_epoch > owner_epoch
+                                    || usize::from(page) >= usize::from(header.pages)
+                                {
+                                    return Ok(ActivePreparationOutcome::BatchConflict);
+                                }
+                                let Some((observed_batch, index)) =
+                                    active_volume::observed_batch_at(
+                                        &tr, &serial, volume, generation,
+                                    )
+                                    .await?
+                                else {
+                                    return Ok(ActivePreparationOutcome::IndexNotObserved);
+                                };
+                                if observed_batch != batch_id {
+                                    return Ok(ActivePreparationOutcome::BatchConflict);
+                                }
+                                let raw = tr
+                                    .get(&page_key(volume, generation, page), false)
+                                    .await?
+                                    .ok_or(CatalogError::Corrupt("活动批次页缺失"))?;
+                                if tr
+                                    .get(&page_digest_key(volume, generation, page), false)
+                                    .await?
+                                    .as_deref()
+                                    != Some(page_digest(&raw).as_slice())
+                                {
+                                    return Err(CatalogError::Corrupt("活动批次页摘要不匹配"));
+                                }
+                                let claims = page_claim_keys(
+                                    namespace,
+                                    &raw,
+                                    page_items(header, usize::from(page)),
+                                )?;
+                                let (entries, remainder) = raw[2..].as_chunks::<56>();
+                                debug_assert!(remainder.is_empty());
+                                for (entry, claim) in entries.iter().zip(claims) {
+                                    if tr.get(&claim, false).await?.as_deref()
+                                        != Some(batch_id.as_bytes())
+                                    {
+                                        return Ok(ActivePreparationOutcome::RequestConflict);
+                                    }
+                                    let epoch = read_u64(&entry[..8]);
+                                    let operation = uuid_from(&entry[8..24])?;
+                                    let prepared = tr
+                                        .get(
+                                            &prepared_key(volume, generation, epoch, operation),
+                                            false,
+                                        )
+                                        .await?;
+                                    let Some(prepared) = prepared else {
+                                        return Ok(ActivePreparationOutcome::PageIncomplete);
+                                    };
+                                    let (saved_batch, fingerprint, _) = decode_prepared(&prepared)?;
+                                    if saved_batch != batch_id || fingerprint != entry[24..] {
+                                        return Err(CatalogError::Corrupt(
+                                            "活动准备记录与批次清单不一致",
+                                        ));
+                                    }
+                                }
+                                layout_requirement(header, index)
+                                    .prepare_page_at(&tr, page, &raw)
+                                    .await?;
+                                let marker = prepared_page_value(batch_id, &raw);
+                                let marker_key = prepared_page_key(volume, generation, page);
+                                if let Some(existing) = tr.get(&marker_key, false).await? {
+                                    return Ok(if existing.as_ref() == marker {
+                                        ActivePreparationOutcome::AlreadyPrepared
+                                    } else {
+                                        ActivePreparationOutcome::BatchConflict
+                                    });
+                                }
+                                tr.set(&marker_key, &marker);
+                                Ok(ActivePreparationOutcome::Prepared)
                             }
-                            let marker = prepared_page_value(batch_id, &raw);
-                            let marker_key = prepared_page_key(volume, generation, page);
-                            if let Some(existing) = tr.get(&marker_key, false).await? {
-                                return Ok(if existing.as_ref() == marker {
-                                    ActivePreparationOutcome::AlreadyPrepared
-                                } else {
-                                    ActivePreparationOutcome::BatchConflict
-                                });
-                            }
-                            tr.set(&marker_key, &marker);
-                            Ok(ActivePreparationOutcome::Prepared)
-                        }
-                        .await,
+                            .await,
+                            &[
+                                ActivePreparationOutcome::Prepared,
+                                ActivePreparationOutcome::AlreadyPrepared,
+                            ],
+                        ),
                     )
                 }
             })
@@ -2577,6 +3917,9 @@ impl ManagedCatalog {
             .await?
             .ok_or(CatalogError::Incomplete)?;
         let header = Header::decode(&header)?;
+        if header.protocol == Protocol::ReclaimGroup {
+            return Err(CatalogError::Invalid("required回收批次必须通过原group Observe入口读取恢复页"));
+        }
         if header.namespace != namespace
             || header.batch_id != batch_id
             || header.phase != ActiveBatchPhase::Sealed
@@ -2645,11 +3988,41 @@ impl ManagedCatalog {
         batch_id: Uuid,
         receipts: &[CommitReceipt],
     ) -> Result<ActiveBatchOutcome> {
+        self.stage_active_batch_in(
+            batch_id,
+            receipts,
+            control::reclaim::ReclaimProtocolContext::Single,
+        )
+        .await
+    }
+
+    pub(crate) async fn stage_reclaim_active_batch(
+        &self,
+        scope: &ReclaimGroupExecution,
+        receipts: &[CommitReceipt],
+    ) -> Result<ActiveBatchOutcome> {
+        #[cfg(test)]
+        group_route_test_hook::before_header(self, scope, receipts).await?;
+        self.stage_active_batch_in(
+            scope.batch_id(),
+            receipts,
+            control::reclaim::ReclaimProtocolContext::Group(scope),
+        )
+        .await
+    }
+
+    async fn stage_active_batch_in(
+        &self,
+        batch_id: Uuid,
+        receipts: &[CommitReceipt],
+        context: control::reclaim::ReclaimProtocolContext<'_>,
+    ) -> Result<ActiveBatchOutcome> {
         if batch_id.is_nil() || !(1..=MAX_BATCH_ITEMS).contains(&receipts.len()) {
             return Err(CatalogError::Invalid("活动批次 ID 或文件数量无效"));
         }
         let mut sorted = receipts.to_vec();
         sorted.sort_by_key(|r| (r.request_epoch, r.operation_id));
+        let original_receipts = sorted.as_slice();
         let first = &sorted[0];
         control::validate_physical_serial(&first.library_serial)?;
         let mut paths = HashSet::with_capacity(sorted.len());
@@ -2684,6 +4057,10 @@ impl ManagedCatalog {
             .map(|page| page_digest(page))
             .collect::<Vec<_>>();
         let header = Header {
+            protocol: match context {
+                control::reclaim::ReclaimProtocolContext::Single => Protocol::Single,
+                control::reclaim::ReclaimProtocolContext::Group(_) => Protocol::ReclaimGroup,
+            },
             batch_id,
             namespace: first.namespace,
             owner_epoch: first.owner_epoch,
@@ -2725,12 +4102,28 @@ impl ManagedCatalog {
                             if !next_generation(current, generation) {
                                 return Ok(ActiveBatchOutcome::GenerationConflict);
                             }
+                            control::reclaim::require_receipt_in(&tr, &representative, context)
+                                .await?;
                             control::node_attempts::require_no_pending_at(&tr, volume).await?;
                             if active_volume::recovery_active(&tr, volume).await? {
                                 return Ok(ActiveBatchOutcome::GenerationConflict);
                             }
                             if let Some(value) = tr.get(&header_key, false).await? {
                                 let saved = Header::decode(&value)?;
+                                if saved.same_manifest(header) {
+                                    if let control::reclaim::ReclaimProtocolContext::Group(scope) =
+                                        context
+                                    {
+                                        scope
+                                            .require_active_batch_binding_at(
+                                                &tr,
+                                                batch_id,
+                                                original_receipts,
+                                                header.digest,
+                                            )
+                                            .await?;
+                                    }
+                                }
                                 return Ok(if !saved.same_manifest(header) {
                                     ActiveBatchOutcome::BatchConflict
                                 } else {
@@ -2745,11 +4138,22 @@ impl ManagedCatalog {
                                     }
                                 });
                             }
-                            control::reclaim::require_receipt_at(&tr, &representative).await?;
+                            if let control::reclaim::ReclaimProtocolContext::Group(scope) = context
+                            {
+                                scope
+                                    .bind_active_batch_at(
+                                        &tr,
+                                        batch_id,
+                                        original_receipts,
+                                        header.digest,
+                                    )
+                                    .await?;
+                            }
                             tr.set(&header_key, &header.encode());
                             Ok(ActiveBatchOutcome::Staged)
                         }
-                        .await,
+                        .await
+                        .map_err(|error| control::reclaim::group_stage_error(error, context)),
                     )
                 }
             })
@@ -2758,6 +4162,10 @@ impl ManagedCatalog {
             return Ok(beginning);
         }
         for (number, (items, value)) in sorted.chunks(PAGE_ITEMS).zip(&pages).enumerate() {
+            #[cfg(test)]
+            if let control::reclaim::ReclaimProtocolContext::Group(scope) = context {
+                group_route_test_hook::before_page(self, scope, original_receipts, number).await?;
+            }
             let items = items.to_vec();
             let value = value.clone();
             let representative = representative.clone();
@@ -2811,6 +4219,20 @@ impl ManagedCatalog {
                                 };
                                 if !next_generation(current, generation) {
                                     return Ok(ActiveBatchOutcome::GenerationConflict);
+                                }
+                                control::reclaim::require_receipt_in(&tr, &representative, context)
+                                    .await?;
+                                if let control::reclaim::ReclaimProtocolContext::Group(scope) =
+                                    context
+                                {
+                                    scope
+                                        .require_active_batch_binding_at(
+                                            &tr,
+                                            batch_id,
+                                            original_receipts,
+                                            header.digest,
+                                        )
+                                        .await?;
                                 }
                                 let existing_page = tr.get(&page_key, false).await?;
                                 let existing_digest = tr.get(&digest_key, false).await?;
@@ -2915,11 +4337,16 @@ impl ManagedCatalog {
                                 tr.set(&digest_key, &digest);
                                 Ok(ActiveBatchOutcome::Staged)
                             }
-                            .await,
+                            .await
+                            .map_err(|error| control::reclaim::group_stage_error(error, context)),
                         )
                     }
                 })
                 .await??;
+            #[cfg(test)]
+            if let control::reclaim::ReclaimProtocolContext::Group(scope) = context {
+                group_route_test_hook::after_page(scope, outcome);
+            }
             if outcome != ActiveBatchOutcome::Staged {
                 return Ok(outcome);
             }
@@ -2955,6 +4382,17 @@ impl ManagedCatalog {
                             if !saved.same_manifest(header) {
                                 return Ok(ActiveBatchOutcome::BatchConflict);
                             }
+                            if let control::reclaim::ReclaimProtocolContext::Group(scope) = context
+                            {
+                                scope
+                                    .require_active_batch_binding_at(
+                                        &tr,
+                                        batch_id,
+                                        original_receipts,
+                                        header.digest,
+                                    )
+                                    .await?;
+                            }
                             match saved.phase {
                                 ActiveBatchPhase::Open => {}
                                 ActiveBatchPhase::Sealed => {
@@ -2972,6 +4410,8 @@ impl ManagedCatalog {
                             if !next_generation(current, generation) {
                                 return Ok(ActiveBatchOutcome::GenerationConflict);
                             }
+                            control::reclaim::require_receipt_in(&tr, &representative, context)
+                                .await?;
                             let prefix = page_digest_prefix(volume, generation);
                             let rows = read_page(&tr, &prefix, None, page_count + 1, false).await?;
                             if rows.next.is_some() || rows.items.len() != page_count {
@@ -2999,7 +4439,8 @@ impl ManagedCatalog {
                             );
                             Ok(ActiveBatchOutcome::Staged)
                         }
-                        .await,
+                        .await
+                        .map_err(|error| control::reclaim::group_stage_error(error, context)),
                     )
                 }
             })
@@ -3367,5 +4808,198 @@ mod tests {
         assert_eq!(page[1..17], batch.as_bytes()[..]);
         assert_ne!(page, prepared_page_value(batch, b"one file"));
         assert_ne!(page, prepared_page_value(Uuid::new_v4(), b"two files"));
+    }
+}
+
+#[cfg(test)]
+#[path = "active_batch_group_route_test_hook.rs"]
+mod group_route_test_hook;
+#[cfg(test)]
+pub(crate) use group_route_test_hook::{GroupStageRouteConflict, GroupStageRouteFault};
+#[cfg(test)]
+impl ManagedCatalog {
+    pub(crate) fn conflict_group_stage_route_once(
+        &self,
+        parent: &crate::managed_catalog::ReclaimReservation,
+        which: GroupStageRouteConflict,
+    ) -> GroupStageRouteFault {
+        group_route_test_hook::arm(parent, which)
+    }
+}
+
+/// Narrow, transaction-checked publisher for one immutable original group.
+pub(crate) struct OriginalCheckpointPublisher<'a> {
+    catalog: &'a ManagedCatalog,
+    context: &'a crate::managed_catalog::OriginalCheckpointContext,
+}
+impl ManagedCatalog {
+    pub(crate) fn original_checkpoint_publisher<'a>(
+        &'a self,
+        context: &'a crate::managed_catalog::OriginalCheckpointContext,
+    ) -> OriginalCheckpointPublisher<'a> {
+        OriginalCheckpointPublisher {
+            catalog: self,
+            context,
+        }
+    }
+}
+impl OriginalCheckpointPublisher<'_> {
+    fn require_file(&self, file: &PreparedActiveFile) -> Result<()> {
+        if !self.context.files().iter().any(|original| {
+            original.receipt == file.receipt && original.attributes == file.attributes
+        }) {
+            return Err(CatalogError::Invalid("原checkpoint准备文件改变"));
+        }
+        Ok(())
+    }
+    pub(crate) async fn require_layouts(&self) -> Result<ActivePreparationOutcome> {
+        let c = self.context;
+        self.catalog
+            .require_observed_active_body_layouts_with_authority(
+                c.library_serial(),
+                c.owner(),
+                c.current_index().volume_uuid,
+                c.current_index().generation,
+                c.batch_id(),
+                PublicationAuthority::Original(c),
+            )
+            .await
+    }
+    pub(crate) async fn stage_layout(
+        &self,
+        layout: &crate::managed_catalog::body_layouts::VerifiedCommittedBodyLayout<'_>,
+    ) -> Result<crate::managed_catalog::body_layouts::CopyLayoutBinding> {
+        self.catalog
+            .stage_original_checkpoint_body_layout(self.context, self.context.batch_id(), layout)
+            .await
+    }
+    pub(crate) async fn prepare_file(
+        &self,
+        file: &PreparedActiveFile,
+    ) -> Result<ActivePreparationOutcome> {
+        self.require_file(file)?;
+        let c = self.context;
+        self.catalog
+            .prepare_observed_active_file_with_authority(
+                c.library_serial(),
+                c.owner(),
+                c.batch_id(),
+                &file.receipt,
+                &file.attributes,
+                PublicationAuthority::Original(c),
+            )
+            .await
+    }
+    pub(crate) async fn mark_prepared_page(&self, page: u16) -> Result<ActivePreparationOutcome> {
+        let c = self.context;
+        self.catalog
+            .mark_observed_active_batch_page_prepared_with_authority(
+                c.library_serial(),
+                c.owner(),
+                c.current_index().volume_uuid,
+                c.current_index().generation,
+                c.batch_id(),
+                page,
+                PublicationAuthority::Original(c),
+            )
+            .await
+    }
+    pub(crate) async fn seal_preparation(&self) -> Result<ActivePreparationOutcome> {
+        let c = self.context;
+        self.catalog
+            .seal_observed_active_preparation_with_authority(
+                c.library_serial(),
+                c.owner(),
+                c.current_index().volume_uuid,
+                c.current_index().generation,
+                c.batch_id(),
+                PublicationAuthority::Original(c),
+            )
+            .await
+    }
+    pub(crate) async fn publish(&self) -> Result<ActivePublicationOutcome> {
+        let c = self.context;
+        self.catalog
+            .publish_observed_active_batch_with_authority(
+                c.library_serial(),
+                c.owner(),
+                c.current_index().volume_uuid,
+                c.current_index().generation,
+                c.batch_id(),
+                PublicationAuthority::Original(c),
+            )
+            .await
+    }
+    pub(crate) async fn finalize_page(&self, page: u16) -> Result<ActiveFinalizationOutcome> {
+        let c = self.context;
+        self.catalog
+            .finalize_published_active_batch_page_with_authority(
+                c.library_serial(),
+                c.owner(),
+                c.current_index().volume_uuid,
+                c.current_index().generation,
+                c.batch_id(),
+                page,
+                PublicationAuthority::Original(c),
+            )
+            .await
+    }
+    pub(crate) async fn materialize_file(
+        &self,
+        page: u16,
+        receipt: &CommitReceipt,
+    ) -> Result<ActiveMaterializationOutcome> {
+        let c = self.context;
+        self.catalog
+            .materialize_published_active_file_with_authority(
+                c.library_serial(),
+                c.owner(),
+                c.batch_id(),
+                page,
+                receipt,
+                PublicationAuthority::Original(c),
+            )
+            .await
+    }
+    pub(crate) async fn finish_page(&self, page: u16) -> Result<ActiveCompactionOutcome> {
+        let c = self.context;
+        self.catalog
+            .finish_materialized_active_batch_page_with_authority(
+                c.library_serial(),
+                c.owner(),
+                c.current_index().volume_uuid,
+                c.current_index().generation,
+                c.batch_id(),
+                page,
+                PublicationAuthority::Original(c),
+            )
+            .await
+    }
+    pub(crate) async fn seal_materialized(&self) -> Result<ActiveCompactionOutcome> {
+        let c = self.context;
+        self.catalog
+            .seal_materialized_active_batch_with_authority(
+                c.library_serial(),
+                c.owner(),
+                c.current_index().volume_uuid,
+                c.current_index().generation,
+                c.batch_id(),
+                PublicationAuthority::Original(c),
+            )
+            .await
+    }
+    pub(crate) async fn cleanup_page(&self, page: u16) -> Result<ActiveCompactionOutcome> {
+        let c = self.context;
+        self.catalog
+            .cleanup_materialized_active_batch_page_with_authority(
+                c.library_serial(),
+                c.owner(),
+                c.current_index().volume_uuid,
+                c.current_index().generation,
+                c.batch_id(),
+                page,
+                PublicationAuthority::Original(c),
+            )
+            .await
     }
 }

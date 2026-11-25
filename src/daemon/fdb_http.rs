@@ -37,6 +37,8 @@ mod queries;
 #[path = "fdb_http_upload.rs"]
 mod upload;
 pub use upload::encode_intent as encode_upload_intent;
+#[path = "fdb_http_handoff.rs"]
+mod handoff;
 #[path = "fdb_http_inventory.rs"]
 mod inventory;
 #[path = "fdb_http_lifecycle.rs"]
@@ -150,6 +152,15 @@ async fn ready(State(ctx): State<Arc<Context>>, request: Request) -> Response {
             .iter()
             .filter(|(serial, _)| scope.is_none_or(|id| id == serial.as_str()))
         {
+            match ctx.catalog.library_handoff(serial, *route, None).await {
+                Ok(Some(value))
+                    if value.phase != crate::managed_catalog::LibraryHandoffPhase::Online =>
+                {
+                    return unavailable("带库设备正在交还、已交还或正在重新加载");
+                }
+                Ok(_) => {}
+                Err(error) => return catalog_error(error),
+            }
             let Some(library) = owner.libraries.get(serial) else {
                 return unavailable("带库 owner 未配置");
             };
@@ -378,6 +389,10 @@ fn metadata_router(ctx: Arc<Context>) -> Router {
         .route(
             "/libraries/{serial}/admin/library/rescan",
             axum::routing::post(pools::rescan),
+        )
+        .route(
+            "/libraries/{serial}/admin/library/handoffs/{operation}",
+            get(handoff::status).put(handoff::submit),
         )
         .route(
             "/libraries/{serial}/admin/tapes/{barcode}/move",

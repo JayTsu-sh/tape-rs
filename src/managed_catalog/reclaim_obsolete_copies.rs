@@ -204,6 +204,7 @@ impl ManagedCatalog {
                     requests::retry_result(
                         async {
                             let record = record_at(&tr, parent, owner).await?;
+                            isolation::require_normal_mutation_at(&tr, parent, owner).await?;
                             if record["owner_epoch"] != owner {
                                 return Err(CatalogError::OwnerFenced);
                             }

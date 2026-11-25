@@ -71,6 +71,8 @@ pub(super) fn active_key(serial: &str) -> Vec<u8> {
     out
 }
 
+pub(super) const HANDOFF_ROUTE_VERSION: u8 = 2;
+
 pub(super) fn encode_active(value: ActiveLibraryRoute) -> [u8; ACTIVE_ROUTE_LEN] {
     let mut out = [0; ACTIVE_ROUTE_LEN];
     out[0] = 1;
@@ -83,7 +85,7 @@ pub(super) fn encode_active(value: ActiveLibraryRoute) -> [u8; ACTIVE_ROUTE_LEN]
 }
 
 pub(super) fn decode_active(bytes: &[u8]) -> Result<ActiveLibraryRoute> {
-    if bytes.len() != ACTIVE_ROUTE_LEN || bytes[0] != 1 {
+    if bytes.len() != ACTIVE_ROUTE_LEN || !matches!(bytes[0], 1 | HANDOFF_ROUTE_VERSION) {
         return Err(CatalogError::Corrupt("活动带库路由格式"));
     }
     let mut certificate_sha256 = [0; 32];
@@ -431,7 +433,8 @@ pub(super) async fn require_active_owner(
     if owner.len() != 8 {
         return Err(CatalogError::Corrupt("owner epoch 长度"));
     }
-    Ok(read_u64(&owner) == epoch)
+    Ok(read_u64(&owner) == epoch
+        && control::management::handoff::allows_owner(tr, namespace, serial, epoch).await?)
 }
 
 /// Resolve a runtime namespace from its physical library serial in the same
@@ -459,6 +462,9 @@ pub(super) async fn require_runtime_active_owner(
         return Err(CatalogError::Corrupt("活动 owner epoch 长度"));
     }
     if read_u64(&owner) != owner_epoch {
+        return Err(CatalogError::OwnerFenced);
+    }
+    if !control::management::handoff::allows_owner(tr, namespace, serial, owner_epoch).await? {
         return Err(CatalogError::OwnerFenced);
     }
     Ok(namespace)
@@ -508,6 +514,16 @@ impl ManagedCatalog {
                                 .ok_or(CatalogError::Incomplete)?;
                             let active = decode_active(&saved)?;
                             active_context(&tr, &serial, active).await?;
+                            if !control::management::handoff::allows_owner(
+                                &tr,
+                                active.route.namespace,
+                                &serial,
+                                epoch,
+                            )
+                            .await?
+                            {
+                                return Err(CatalogError::OwnerFenced);
+                            }
                             let key = owner_key(&serial);
                             let saved =
                                 tr.get(&key, false).await?.ok_or(CatalogError::Incomplete)?;
@@ -954,10 +970,121 @@ mod tests {
         assert_eq!(decode_active(&encoded).unwrap(), value);
         assert!(decode_active(&encoded[..72]).is_err());
         let mut corrupt = encoded;
-        corrupt[0] = 2;
+        corrupt[0] = 3;
         assert!(decode_active(&corrupt).is_err());
+        let mut protected = encoded;
+        protected[0] = 2;
+        assert_eq!(decode_active(&protected).unwrap(), value);
+        // The v1 decoder in released binaries requires this byte to be 1.
+        assert_ne!(protected[0], 1);
         corrupt = encoded;
         corrupt[65..73].fill(0);
         assert!(decode_active(&corrupt).is_err());
+    }
+
+    #[test]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；不访问设备"]
+    fn handoff_atomically_fences_legacy_route_readers() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let catalog = ManagedCatalog::open(Some(&cluster)).unwrap();
+            let namespace = Uuid::new_v4();
+            let serial = format!("HANDOFF-ROUTE-{namespace}");
+            let challenge = Uuid::new_v4();
+            let replies: Vec<_> = (1..=3).map(|id| serde_json::json!({"version":1,"library_serial":serial,"challenge":challenge.to_string(),"node_id":id,"term":7,"leader":2,"role":if id==2 {"Leader"} else {"Follower"},"members":{"1":"a:1","2":"b:2","3":"c:3"},"quiesce_index":89,"frozen_index":90,"applied_index":92,"executor_absent":true,"catalog_pending":false,"shutting_down":false,"catalog_empty":true})).collect();
+            let proof = verify_native_barriers(&serial, challenge, &replies).unwrap();
+            let route = catalog.initialize_native_library(namespace, &proof).await.unwrap();
+            let owner = route.initial_owner_epoch;
+            let request = LibraryHandoff {
+                library_serial: serial.clone(), namespace, operation: Uuid::new_v4(),
+                release: None, phase: LibraryHandoffPhase::Releasing,
+                release_key: crate::scsi::reservation::ReservationKey::new(1, owner).0,
+                release_retry_used: false, attempt_key: None, owner_epoch: owner,
+                devices: vec!["DRIVE".into(), serial.clone()], detail: None,
+            };
+            let before = catalog.db.create_trx().unwrap().get(&active_key(&serial), false).await.unwrap().unwrap();
+            assert_eq!(before[0], 1);
+            assert!(catalog.begin_library_handoff(&request, route).await.is_err());
+            assert!(catalog.library_handoff(&serial, route, None).await.unwrap().is_none());
+            assert!(catalog.enable_library_handoff_offline(&serial, Uuid::new_v4()).await.is_err());
+            catalog.enable_library_handoff_offline(&serial, namespace).await.unwrap();
+            catalog.enable_library_handoff_offline(&serial, namespace).await.unwrap();
+            // A new executor that has passed the software preflight is still
+            // in flight until it settles its exact persistent fence intent.
+            let fencing = Uuid::new_v4();
+            assert!(catalog.begin_handoff_fence(&serial, route, owner + 1, fencing).await.unwrap());
+            let busy = catalog.begin_library_handoff(&request, route).await.unwrap_err();
+            assert!(matches!(busy.domain(), CatalogError::PoolBusy));
+            assert!(catalog.finish_handoff_fence(&serial, route, owner + 1, Uuid::new_v4(), false).await.is_err());
+            catalog.finish_handoff_fence(&serial, route, owner + 1, fencing, false).await.unwrap();
+            assert_eq!(catalog.active_library_owner(&serial).await.unwrap(), Some((route, owner)));
+
+            let fencing = Uuid::new_v4();
+            assert!(catalog.begin_handoff_fence(&serial, route, owner + 1, fencing).await.unwrap());
+            catalog.finish_handoff_fence(&serial, route, owner + 1, fencing, true).await.unwrap();
+            assert_eq!(catalog.active_library_owner(&serial).await.unwrap(), Some((route, owner + 1)));
+            let stale = catalog.begin_library_handoff(&request, route).await.unwrap_err();
+            assert!(matches!(stale.domain(), CatalogError::OwnerFenced));
+            let owner = owner + 1;
+            let mut request = request;
+            request.owner_epoch = owner;
+            request.release_key = crate::scsi::reservation::ReservationKey::new(1, owner).0;
+            catalog.begin_library_handoff(&request, route).await.unwrap();
+            assert!(catalog.begin_handoff_fence(&serial, route, owner + 1, Uuid::new_v4()).await.is_err());
+            let tr = catalog.db.create_trx().unwrap();
+            let after = tr.get(&active_key(&serial), false).await.unwrap().unwrap();
+            assert_eq!(after[0], 2);
+            assert_eq!(decode_active(&after).unwrap(), route);
+            assert!(!control::management::handoff::allows_owner(&tr, namespace, &serial, owner).await.unwrap());
+            use crate::daemon::executor::{DeviceKind, DeviceProvider, ManagedDevice, verify_library_release_offline};
+            struct SimDevices<'a>(&'a str, crate::scsi::sim::SimLibrary);
+            impl DeviceProvider for SimDevices<'_> {
+                fn open_all(&self) -> crate::error::Result<Vec<ManagedDevice>> {
+                    Ok(vec![
+                        ManagedDevice { name: self.0.into(), serial: self.0.into(), kind: DeviceKind::Changer, dev: Box::new(self.1.changer_as(1)) },
+                        ManagedDevice { name: "DRIVE".into(), serial: "DRIVE".into(), kind: DeviceKind::Drive, dev: Box::new(self.1.drive_as(0, 1)) },
+                    ])
+                }
+            }
+            let sim = crate::scsi::sim::SimLibrary::new(1, 3, 0);
+            sim.enable_changer_pr();
+            let devices = SimDevices(&serial, sim);
+            assert!(verify_library_release_offline(&catalog, &serial, namespace, Uuid::new_v4(), &devices).await.is_err());
+            let released = verify_library_release_offline(&catalog, &serial, namespace, request.operation, &devices).await.unwrap();
+            assert_eq!(released.phase, LibraryHandoffPhase::Released);
+
+            // Recreate the encoding of a release written before the v2 guard.
+            let tr = catalog.db.create_trx().unwrap();
+            tr.set(&active_key(&serial), &before);
+            tr.commit().await.unwrap();
+            assert!(catalog.enable_library_handoff_offline(&serial, namespace).await.is_err());
+            let reload = Uuid::new_v4();
+            let error = catalog.begin_library_reload(&serial, route, reload, request.operation).await.unwrap_err();
+            assert!(matches!(error.domain(), CatalogError::Invalid(_)));
+            assert!(catalog.library_handoff(&serial, route, Some(reload)).await.unwrap().is_none());
+            assert!(catalog.library_handoff(&serial, route, None).await.is_err());
+            assert_eq!(catalog.library_handoff(&serial, route, Some(request.operation)).await.unwrap(), Some(released.clone()));
+
+            let tr = catalog.db.create_trx().unwrap();
+            tr.set(&active_key(&serial), &after);
+            tr.commit().await.unwrap();
+            let loading = catalog.begin_library_reload(&serial, route, reload, request.operation).await.unwrap();
+            catalog.update_library_handoff(route, &request, &released).await.unwrap();
+            assert_eq!(catalog.library_handoff(&serial, route, None).await.unwrap().unwrap().operation, reload);
+            let mut attempt = loading.clone();
+            attempt.owner_epoch = owner + 1;
+            attempt.attempt_key = Some(crate::scsi::reservation::ReservationKey::new(1, owner + 1).0);
+            catalog.update_library_handoff(route, &loading, &attempt).await.unwrap();
+            let mut blocked = attempt.clone();
+            blocked.phase = LibraryHandoffPhase::Blocked;
+            blocked.detail = Some("设备命令结果未知".into());
+            catalog.update_library_handoff(route, &attempt, &blocked).await.unwrap();
+            assert_eq!(catalog.begin_library_reload(&serial, route, reload, request.operation).await.unwrap(), blocked);
+        });
     }
 }

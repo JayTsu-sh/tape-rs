@@ -10,15 +10,25 @@ const PAGE: usize = 32;
 const MAX_ROW: usize = 48_000;
 #[path = "reclaim_source_ledger.rs"]
 mod ledger;
+#[path = "reclaim_group_only.rs"]
+pub(in crate::managed_catalog::control::reclaim) mod group_only;
+pub(crate) use group_only::{ReclaimGroupOnlyDraft, ReclaimGroupOnlyQualification};
 pub(super) use ledger::clear_reserved_at;
 #[path = "reclaim_source_coverage.rs"]
 mod coverage;
+#[cfg(test)]
+pub(in crate::managed_catalog) use coverage::group_coverage_test_key;
 pub use coverage::ReclaimCoverageProgress;
 pub(super) use coverage::completed_at as copy_coverage_complete_at;
+pub(in crate::managed_catalog) use coverage::{put_group_at, group_bundle_at, group_bundle_identity_at, require_group_absent_at};
+pub(super) use coverage::{GroupRootEvidence, group_root_bundle_at};
 pub(super) use coverage::require_complete_at as require_complete_coverage_at;
 #[path = "reclaim_source_read.rs"]
 mod read;
 pub use read::{ReclaimReadSource, ReclaimSourceRead};
+#[path = "reclaim_source_group_candidate.rs"]
+mod group_candidate;
+pub(crate) use group_candidate::ReclaimGroupCandidate;
 #[path = "reclaim_raw_source_read.rs"]
 mod raw_read;
 pub use raw_read::{ReclaimRawReadContext, ReclaimRawSourceRead};
@@ -29,6 +39,7 @@ pub use relocation::{ReclaimDataProgress, ReclaimMetadataInput};
 #[path = "reclaim_metadata_plan.rs"]
 mod metadata_plan;
 pub use metadata_plan::ReclaimMetadataPlan;
+pub(in crate::managed_catalog) use metadata_plan::TargetTree;
 #[path = "reclaim_metadata_discard.rs"]
 mod metadata_discard;
 pub use metadata_discard::{ReclaimMetadataDiscardObservation, ReclaimMetadataTailEvidence};
@@ -41,6 +52,7 @@ pub use metadata_observation::{
 #[path = "reclaim_metadata_write.rs"]
 mod metadata_write;
 pub(super) use metadata_write::require_idle_at as require_metadata_idle_at;
+pub(super) use metadata_write::isolation_checkpoint_at;
 pub use metadata_write::{
     ReclaimMetadataAdmission, ReclaimMetadataCheckpointEvidence, ReclaimMetadataDonorContext,
     ReclaimMetadataDonorEvidence, ReclaimMetadataPublication, ReclaimMetadataRecoveryEvidence,
@@ -88,6 +100,33 @@ struct Object {
 /// receipt. The private payload cannot be supplied as caller-created evidence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReclaimSourceNode(Object);
+
+pub(in crate::managed_catalog) async fn sealed_entry_node_at(
+    tr: &Transaction, parent: &ReclaimReservation, entry: &IndexEntry,
+) -> Result<ReclaimSourceNode> {
+    ledger::require_complete_at(tr, parent).await?;
+    let object = Object::capture(entry.clone())?;
+    if tr.get(&ledger::object_key(parent, object.uid), false).await?.as_deref()
+        != Some(object.encode()?.as_slice())
+    { return Err(CatalogError::Corrupt("分组原生节点与原完整Re清单不同")); }
+    Ok(ReclaimSourceNode(object))
+}
+
+pub(in crate::managed_catalog) fn native_file_md5(node: &crate::ltfs::index::FileNode) -> Result<Option<[u8; 16]>> {
+    read::expected_md5(node)
+}
+
+pub(in crate::managed_catalog) fn source_entry_fingerprint(entry: IndexEntry) -> Result<[u8; 32]> {
+    Ok(Object::capture(entry)?.sha256)
+}
+
+pub(super) fn relocated_group_root(entry: &IndexEntry, archive: &str) -> Result<IndexEntry> {
+    if !matches!(entry, IndexEntry::Directory { path, .. } if path.is_empty()) {
+        return Err(CatalogError::Invalid("回收组归档必须使用原源卷根目录"));
+    }
+    entry.validate_reclaimed_metadata().map_err(cache)?;
+    node_metadata::relocation_source(entry, archive)
+}
 
 impl ReclaimSourceNode {
     /// LTFS path without a leading slash; the empty path identifies the root.
@@ -351,6 +390,24 @@ impl<'a> ReclaimSourceInventory<'a> {
         self.summary.counts.data_bytes
     }
 
+    pub(crate) fn require_group_read_endpoint(
+        &self,
+        head: ActiveIndexIdentity,
+        dp_eod: Option<u64>,
+        ip_generation: Option<u64>,
+    ) -> Result<()> {
+        let (original_end, original_ip, _) =
+            current_proof(self.source.scope(), self.source.header())?;
+        if head.incremental
+            || head != ActiveIndexIdentity::from(self.source.construct())
+            || dp_eod != Some(original_end)
+            || ip_generation != original_ip
+        {
+            return Err(CatalogError::Invalid("回收组原源卷头、IP代次或DP EOD改变"));
+        }
+        Ok(())
+    }
+
     fn page(&self, after: Option<&str>, limit: usize) -> Result<Vec<Object>> {
         let mut rows = Vec::with_capacity(limit);
         self.source
@@ -416,4 +473,46 @@ impl ManagedCatalog {
             .await
             .map(|(_, head)| head)
     }
+}
+
+pub(super) async fn history_inventory_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+) -> Result<[u8; 32]> {
+    Ok(ledger::require_complete_at(tr, reservation)
+        .await?
+        .summary
+        .digest)
+}
+pub(super) async fn require_planning_uid_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    owner: u64,
+    node: &ReclaimSourceNode,
+) -> Result<()> {
+    coverage::require_uncovered_uid_at(tr, reservation, owner, node).await?;
+    metadata_write::require_planning_absent_at(tr, reservation, node.uid()).await
+}
+pub(super) async fn require_planning_archive_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    owner: u64,
+    file: &ReclaimFile,
+    request: &ActiveFileRequest,
+    input: &ReclaimMetadataInput,
+) -> Result<()> {
+    if relocation::metadata_input_at(tr, reservation, owner, file, request).await? != *input {
+        return Err(CatalogError::Invalid(
+            "规划目的改变原正文子请求或元数据输入",
+        ));
+    }
+    Ok(())
+}
+pub(super) async fn require_history_attempt_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    owner: u64,
+    original: &ReclaimMetadataWrite,
+) -> Result<(Uuid, Option<Uuid>, [u8; 32])> {
+    metadata_write::history_attempt_at(tr, reservation, owner, original).await
 }

@@ -58,12 +58,37 @@ struct CheckedRetirement {
     pending: Option<PendingRetirement>,
 }
 
+enum RetirementCheck<'a> {
+    Ordinary,
+    Group(&'a copy_groups::GroupRetirementPins<'a>),
+    // Read-only facts used to construct a group token. This branch never
+    // authorizes mutations and is not exposed to ordinary callers.
+    Identity,
+}
 async fn check_retirement_at(
     tr: &Transaction,
     reservation: &ReclaimReservation,
     owner: u64,
     file: &ReclaimFile,
     request: &ActiveFileRequest,
+) -> Result<CheckedRetirement> {
+    Box::pin(check_retirement_in(
+        tr,
+        reservation,
+        owner,
+        file,
+        request,
+        RetirementCheck::Ordinary,
+    ))
+    .await
+}
+async fn check_retirement_in(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    owner: u64,
+    file: &ReclaimFile,
+    request: &ActiveFileRequest,
+    context: RetirementCheck<'_>,
 ) -> Result<CheckedRetirement> {
     request.validate()?;
     let parent = record_at(tr, reservation, owner).await?;
@@ -165,7 +190,22 @@ async fn check_retirement_at(
         return Err(CatalogError::Incomplete);
     }
     let (source_scan, _) = source_state_at(tr, reservation).await?;
-    native_device::require_volume_quiescent_at(tr, ns, spec.volume).await?;
+    match context {
+        RetirementCheck::Ordinary => {
+            isolation::require_normal_mutation_at(tr, reservation, owner).await?;
+            native_device::require_volume_quiescent_at(tr, ns, spec.volume).await?
+        }
+        RetirementCheck::Group(pins) => {
+            pins.require_binding(tr, reservation, owner, file, request)
+                .await?;
+            native_device::require_group_retirement_quiescent_at(tr, pins).await?;
+        }
+        RetirementCheck::Identity => {
+            if reservation.intent()["version"] != 2 {
+                return Err(CatalogError::Invalid("分组退休identity仅供原v2只读组合"));
+            }
+        }
+    }
     let child = decode(
         &tr.get(
             &children::child_key(ns, &reservation.token(), request.operation_id)?,
@@ -252,13 +292,77 @@ pub(super) async fn retire_at(
     request: &ActiveFileRequest,
 ) -> Result<bool> {
     let checked = Box::pin(check_retirement_at(tr, reservation, owner, file, request)).await?;
+    Ok(apply_retirement(tr, checked))
+}
+fn apply_retirement(tr: &Transaction, checked: CheckedRetirement) -> bool {
     let Some(pending) = checked.pending else {
-        return Ok(false);
+        return false;
     };
     tr.set(&pending.source_key, &pending.marker);
     tr.clear(&pending.reverse);
     tr.set(&pending.retired_key, &pending.receipt);
-    Ok(true)
+    true
+}
+pub(super) async fn retire_group_member_at(
+    tr: &Transaction,
+    parent: &ReclaimReservation,
+    owner: u64,
+    file: &ReclaimFile,
+    request: &ActiveFileRequest,
+    pins: &copy_groups::GroupRetirementPins<'_>,
+) -> Result<bool> {
+    let checked = Box::pin(check_retirement_in(
+        tr,
+        parent,
+        owner,
+        file,
+        request,
+        RetirementCheck::Group(pins),
+    ))
+    .await?;
+    Ok(apply_retirement(tr, checked))
+}
+pub(super) async fn retired_group_destination_at(
+    tr: &Transaction,
+    parent: &ReclaimReservation,
+    owner: u64,
+    file: &ReclaimFile,
+    request: &ActiveFileRequest,
+    pins: &copy_groups::GroupRetirementPins<'_>,
+) -> Result<ReclaimBodyDestination> {
+    let checked = Box::pin(check_retirement_in(
+        tr,
+        parent,
+        owner,
+        file,
+        request,
+        RetirementCheck::Group(pins),
+    ))
+    .await?;
+    if checked.pending.is_some() {
+        return Err(CatalogError::Incomplete);
+    }
+    Ok(checked.destination)
+}
+/// Validate original Rv/target/source/marker facts without granting quiescence
+/// or retirement. The returned boolean reports an existing pending source.
+pub(super) async fn group_destination_identity_at(
+    tr: &Transaction,
+    parent: &ReclaimReservation,
+    owner: u64,
+    file: &ReclaimFile,
+    request: &ActiveFileRequest,
+) -> Result<(ReclaimBodyDestination, bool)> {
+    let checked = Box::pin(check_retirement_in(
+        tr,
+        parent,
+        owner,
+        file,
+        request,
+        RetirementCheck::Identity,
+    ))
+    .await?;
+    Ok((checked.destination, checked.pending.is_some()))
 }
 
 /// Read-only validation; a missing retirement is not created by this lookup.

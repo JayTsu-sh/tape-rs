@@ -206,13 +206,12 @@ impl ReclaimMetadataWriter<'_> {
                     volume.checkpoint_reclaim_metadata(task, &original, &self.recovery_budget())?;
                 }
             }
-            let current =
-                capture_complete_index_source(&TapeDrive::new(&checked), &label, self.budget)?;
+            let current = self.capture_target_history(reservation, task, &checked, &label)?;
             let raw_read = if plan
                 .observe_current(&current, Some(&original))
                 .is_ok_and(|o| o.kind() == ReclaimMetadataObservationKind::Committed)
             {
-                self.read_raw_result(&checked, &label, task, &current)?
+                self.read_raw_result(reservation, &checked, &label, task, &current)?
             } else {
                 None
             };
@@ -225,6 +224,7 @@ impl ReclaimMetadataWriter<'_> {
             )
             .map_err(catalog)?;
             checked.verify_proof()?;
+            self.publish_target_history(reservation, task, &current)?;
             Ok(ReclaimMetadataRecovery::Observed(proof))
         })
     }

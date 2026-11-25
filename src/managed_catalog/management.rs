@@ -8,6 +8,8 @@ mod pools;
 
 #[path = "management_exclusion.rs"]
 pub(super) mod exclusion;
+#[path = "library_handoff.rs"]
+pub(in crate::managed_catalog) mod handoff;
 #[path = "management_rescan.rs"]
 mod rescan;
 
@@ -232,6 +234,59 @@ fn task(bytes: &[u8], serial: &str, namespace: Uuid, epoch: u64, operation: Uuid
     moves::validate_execution(&value, &request)?;
     assigns::validate_execution(&value, &request)?;
     Ok(value)
+}
+
+pub(in crate::managed_catalog) fn read_archived_reclaim_task(
+    rows: &std::collections::BTreeMap<&[u8], &[u8]>,
+    serial: &str,
+    namespace: Uuid,
+    epoch: u64,
+    operation: Uuid,
+    owner: u64,
+) -> Result<String> {
+    let key = identity_key(namespace, serial, b'o', epoch, operation);
+    let raw = rows.get(key.as_slice()).ok_or(CatalogError::Incomplete)?;
+    let value = task(raw, serial, namespace, epoch, operation)?;
+    if value["status"] != "running"
+        || value["owner_epoch"].as_u64() != Some(owner)
+        || value["request"]["change"]["kind"] != "media-reclaim"
+    {
+        return Err(CatalogError::Corrupt("归档 reclaim 回执状态或 owner 不符"));
+    }
+    use sha2::{Digest, Sha256};
+    Ok(format!("{:x}", Sha256::digest(raw)))
+}
+
+#[cfg(test)]
+pub(in crate::managed_catalog) fn encode_archived_reclaim_fixture(
+    request: &ManagementRequest,
+    owner: u64,
+) -> (Vec<u8>, Vec<u8>) {
+    let serial = request.value()["library"].as_str().unwrap();
+    let raw = encode(&json!({
+        "version":1, "library_serial":serial, "namespace":request.namespace().to_string(),
+        "operation":request.operation().to_string(), "epoch":request.epoch(),
+        "request":request.value(), "fingerprint":request.fingerprint(), "status":"running",
+        "created_at_millis":1, "completed_at_millis":null,"owner_epoch":owner,"result":null
+    }));
+    task(
+        &raw,
+        serial,
+        request.namespace(),
+        request.epoch(),
+        request.operation(),
+    )
+    .unwrap();
+    (
+        identity_key(
+            request.namespace(),
+            serial,
+            b'o',
+            request.epoch(),
+            request.operation(),
+        ),
+        raw,
+    )
 }
 async fn require_queue(
     tr: &Transaction,

@@ -36,6 +36,11 @@ struct Grant {
 }
 
 impl Permission {
+    #[cfg(feature = "fdb")]
+    pub(super) fn device_busy(&self, round: u64) -> bool {
+        self.activity.busy(round)
+    }
+
     /// Wait for the exact busy claim before starting Serving-phase device I/O.
     pub fn begin_device_activity(&self, round: u64) -> Result<DeviceActivityGuard<'_>> {
         // Recovery is never eligible for a healthy rebalance. Its existing
@@ -197,6 +202,9 @@ impl TapeTransport for GuardedTransport {
         Ok(result)
     }
 
+    fn medium_change_token(&self) -> Option<[u8; 32]> {
+        self.inner.medium_change_token()
+    }
     fn session_epoch(&self) -> Option<u64> {
         self.inner.session_epoch()
     }

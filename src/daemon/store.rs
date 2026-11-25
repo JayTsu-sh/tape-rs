@@ -135,7 +135,7 @@ fn pb_err(e: protobuf::ProtobufError) -> TapeError {
     TapeError::Ltfs(e.to_string())
 }
 
-fn fixed_voters(conf: &ConfState) -> Result<Vec<u64>> {
+pub(crate) fn fixed_voters(conf: &ConfState) -> Result<Vec<u64>> {
     let mut members = conf.voters.clone();
     members.sort_unstable();
     if members.is_empty()

@@ -322,7 +322,7 @@ async fn head_at(tr: &Transaction, ns: Uuid, serial: &str) -> Result<u64> {
 
 // Existing control writers commit domain-error results. A notification failure
 // after their writes must instead abort the transaction, including corruption.
-pub(super) fn atomic_error(error: CatalogError) -> CatalogError {
+pub(in crate::managed_catalog) fn atomic_error(error: CatalogError) -> CatalogError {
     match error {
         CatalogError::Fdb(_) | CatalogError::Client(_) => error,
         other => CatalogError::Fdb(FdbBindingError::CustomError(Box::new(other))),

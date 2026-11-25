@@ -561,6 +561,17 @@ pub(in crate::managed_catalog) async fn require_volume_quiescent_with_claim_at(
     volume: Uuid,
     claim: Option<&[u8]>,
 ) -> Result<()> {
+    require_volume_claims_at(tr, volume, claim).await?;
+    if requests::has_namespace_holds(tr, namespace).await? {
+        return Err(CatalogError::PoolBusy);
+    }
+    Ok(())
+}
+async fn require_volume_claims_at(
+    tr: &Transaction,
+    volume: Uuid,
+    claim: Option<&[u8]>,
+) -> Result<()> {
     for kind in *b"24" {
         let mut prefix = key(kind);
         prefix.extend_from_slice(volume.as_bytes());
@@ -583,12 +594,60 @@ pub(in crate::managed_catalog) async fn require_volume_quiescent_with_claim_at(
             .await?
             .as_deref()
             != claim
-        || requests::has_namespace_holds(tr, namespace).await?
     {
         return Err(CatalogError::PoolBusy);
     }
     Ok(())
 }
+/// Only a fully checked original Selecting/Prepared group can exempt its
+/// exact retained history pins. Reservations and completion intents never
+/// receive such an exemption; ordinary maintenance keeps its strict gate.
+pub(in crate::managed_catalog) async fn require_prepared_reclaim_group_quiescent_at(
+    tr: &Transaction,
+    pins: &reclaim::PreparedGroupPins<'_>,
+) -> Result<()> {
+    pins.require_transaction(tr)?;
+    require_volume_claims_at(tr, pins.volume(), None).await?;
+    require_exact_group_history_pins_at(tr, pins.namespace(), pins.keys()).await
+}
+pub(in crate::managed_catalog) async fn require_group_retirement_quiescent_at(
+    tr: &Transaction,
+    pins: &reclaim::GroupRetirementPins<'_>,
+) -> Result<()> {
+    pins.require_transaction(tr)?;
+    require_volume_claims_at(tr, pins.source(), None).await?;
+    require_exact_group_history_pins_at(tr, pins.namespace(), pins.keys()).await
+}
+async fn require_exact_group_history_pins_at(
+    tr: &Transaction,
+    namespace: Uuid,
+    expected: &std::collections::BTreeSet<Vec<u8>>,
+) -> Result<()> {
+    for kind in *b"0I" {
+        let mut prefix = key(kind);
+        prefix.extend_from_slice(namespace.as_bytes());
+        if requests::prefix_has_rows(tr, &prefix).await? {
+            return Err(CatalogError::PoolBusy);
+        }
+    }
+    if requests::prefix_has_rows(tr, &node_hold_prefix(namespace)).await? {
+        return Err(CatalogError::PoolBusy);
+    }
+    let mut prefix = key(b'F');
+    prefix.extend_from_slice(namespace.as_bytes());
+    let rows = read_page(tr, &prefix, None, expected.len() + 1, false).await?;
+    if rows.next.is_some()
+        || rows.items.len() != expected.len()
+        || rows
+            .items
+            .iter()
+            .any(|(key, value)| !value.is_empty() || !expected.contains(key))
+    {
+        return Err(CatalogError::PoolBusy);
+    }
+    Ok(())
+}
+
 async fn verify_validation_at(
     tr: &Transaction,
     task: &NativeDeviceTask,

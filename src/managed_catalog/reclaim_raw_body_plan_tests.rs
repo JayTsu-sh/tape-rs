@@ -284,3 +284,25 @@ fn raw_body_plan_binds_data_blocks_and_requires_actual_readback_for_publication(
         }
     }
 }
+
+#[test]
+fn raw_body_budget_resolves_zero_length_alias_to_its_real_data_length() {
+    let source = setup(false);
+    let mut volume = LtfsVolume::mount(&source.device).unwrap();
+    volume.set_reservation_guard(Some(ReservationKey::new(1, 7)));
+    volume
+        .append_bytes("/.LTFSEE_DATA/raw", b"unmapped original bytes")
+        .unwrap();
+    volume.add_symlink("/alias", ".LTFSEE_DATA/raw").unwrap();
+    volume.commit().unwrap();
+    drop(volume);
+    let captured = capture(&source.device);
+    let alias = Object::capture(captured.entry_by_path("alias").unwrap().unwrap()).unwrap();
+    assert_eq!(alias.length, Some(0));
+    let inventory = ReclaimSourceInventory::from_captured(&captured).unwrap();
+    assert_eq!(
+        inventory.raw_body_length(alias.uid).unwrap(),
+        b"unmapped original bytes".len() as u64
+    );
+    assert!(inventory.raw_body_length(u64::MAX).is_err());
+}

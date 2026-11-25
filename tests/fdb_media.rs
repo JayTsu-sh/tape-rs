@@ -1331,17 +1331,12 @@ async fn run_fdb_owner_loaded_reads(
     done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     join.join().unwrap();
     let cache_dir = root.join("queued-owner-spool.fdb-extents");
-    let cached = fs::read_dir(&cache_dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "sqlite")
-        })
-        .unwrap();
-    let cached_inode = fs::metadata(&cached).unwrap().ino();
+    assert!(
+        !cache_dir.exists(),
+        "managed owner reads must not persist extent metadata"
+    );
     let _reopened = FileService::new(root.join("queued-owner-spool")).unwrap();
-    assert_eq!(fs::metadata(&cached).unwrap().ino(), cached_inode);
+    assert!(!cache_dir.exists());
     assert!(
         !trace
             .lock()
@@ -2117,7 +2112,19 @@ async fn simulated_media_commit() {
     let mut verified_bytes = Vec::new();
     verified_read.file.read_to_end(&mut verified_bytes).unwrap();
     assert_eq!(verified_bytes, bytes);
-    assert_eq!(verified_read.metadata, media_read);
+    assert_eq!(
+        verified_read.metadata,
+        tape_rs::managed_catalog::ReadMetadata::from(&media_read)
+    );
+    assert_eq!(verified_read.physical.path(), media_read.physical.path);
+    assert_eq!(
+        verified_read
+            .physical
+            .extents()
+            .collect::<tape_rs::error::Result<Vec<_>>>()
+            .unwrap(),
+        media_read.physical.extents
+    );
     assert_eq!(fs::read_dir(&read_spool).unwrap().count(), 0);
     assert!(!current.incremental, "冷读夹具首先覆盖 Full 索引");
     let automatic_cache = root.join("automatic-extents");
@@ -2145,17 +2152,14 @@ async fn simulated_media_commit() {
     let mut cold_bytes = Vec::new();
     cold_read.file.read_to_end(&mut cold_bytes).unwrap();
     assert_eq!(cold_bytes, bytes);
-    let entries: Vec<_> = fs::read_dir(&automatic_cache)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "sqlite")
-        })
-        .collect();
-    assert_eq!(entries.len(), 1);
-    let cached_path = &entries[0];
-    let cached_inode = fs::metadata(cached_path).unwrap().ino();
+    assert!(
+        !automatic_cache.exists(),
+        "managed reads must not create an extent business mirror"
+    );
+    fs::create_dir(&automatic_cache).unwrap();
+    let cached_path = automatic_cache.join(format!("extent-{}.sqlite", "0".repeat(64)));
+    fs::write(&cached_path, b"invalid cached SQLite").unwrap();
+    let cached_inode = fs::metadata(&cached_path).unwrap().ino();
     assert!(
         reader
             .read_with_cache(
@@ -2188,8 +2192,8 @@ async fn simulated_media_commit() {
         )
         .await;
     }
-    assert_eq!(fs::metadata(cached_path).unwrap().ino(), cached_inode);
-    fs::write(cached_path, b"invalid cached SQLite").unwrap();
+    assert_eq!(fs::metadata(&cached_path).unwrap().ino(), cached_inode);
+    fs::write(&cached_path, b"invalid cached SQLite").unwrap();
     assert!(
         reader
             .read_with_cache(
@@ -2198,10 +2202,11 @@ async fn simulated_media_commit() {
                 &read_spool
             )
             .await
-            .is_err()
+            .unwrap()
+            .is_some()
     );
-    assert_eq!(fs::read(cached_path).unwrap(), b"invalid cached SQLite");
-    fs::remove_file(cached_path).unwrap();
+    assert_eq!(fs::read(&cached_path).unwrap(), b"invalid cached SQLite");
+    fs::remove_file(&cached_path).unwrap();
     assert!(
         reader
             .read_with_cache(
@@ -2879,7 +2884,7 @@ async fn simulated_media_commit() {
                 .extension()
                 .is_some_and(|extension| extension == "sqlite"))
             .count(),
-        2
+        0
     );
     assert!(matches!(
         catalog

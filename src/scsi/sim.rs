@@ -179,6 +179,8 @@ impl SimQuirks {
 
 #[derive(Debug)]
 struct LibState {
+    change_scope: [u8; 16],
+    change_revision: Option<u64>,
     changer_pr: Option<PrState>,
     quirks: SimQuirks,
     serial: String,
@@ -197,6 +199,10 @@ enum ElemRef {
 }
 
 impl LibState {
+    fn invalidate_change_evidence(&mut self) {
+        self.change_revision = self.change_revision.and_then(|v| v.checked_add(1));
+    }
+
     fn resolve(&self, addr: u16) -> Option<ElemRef> {
         if addr == TRANSPORT_START {
             return Some(ElemRef::Transport);
@@ -294,6 +300,8 @@ impl SimLibrary {
             .collect();
         Self {
             state: Arc::new(Mutex::new(LibState {
+                change_scope: *uuid::Uuid::new_v4().as_bytes(),
+                change_revision: Some(0),
                 changer_pr: None,
                 quirks: SimQuirks::default(),
                 serial: "SIMLIB0000000001".to_string(),
@@ -307,12 +315,15 @@ impl SimLibrary {
 
     /// 打开已知设备偏差的模拟。
     pub fn set_quirks(&self, quirks: SimQuirks) {
-        lock(&self.state).quirks = quirks;
+        let mut st = lock(&self.state);
+        st.invalidate_change_evidence();
+        st.quirks = quirks;
     }
 
     /// 把磁带放进存储槽（0 基）。
     pub fn insert_cartridge(&self, cart: SimCartridge, slot: usize) -> Result<()> {
         let mut st = lock(&self.state);
+        st.invalidate_change_evidence();
         let target = st.storage.get(slot).ok_or_else(|| TapeError::Refused {
             reason: format!("存储槽 {} 越界", slot),
         })?;
@@ -335,6 +346,7 @@ impl SimLibrary {
     /// 测试便利：把指定磁带直接放入驱动器并装载（绕过机械手）。
     pub fn load_into_drive(&self, barcode: &str, drive: usize) -> Result<()> {
         let mut st = lock(&self.state);
+        st.invalidate_change_evidence();
         if !st.cartridges.contains_key(barcode) {
             return Err(TapeError::Refused {
                 reason: format!("未知条码 {}", barcode),
@@ -384,9 +396,9 @@ impl SimLibrary {
 
     /// 显式启用换带器 PR 模型；默认仍模拟不支持 PR 的旧设备。
     pub fn enable_changer_pr(&self) {
-        lock(&self.state)
-            .changer_pr
-            .get_or_insert_with(PrState::default);
+        let mut st = lock(&self.state);
+        st.invalidate_change_evidence();
+        st.changer_pr.get_or_insert_with(PrState::default);
     }
 
     pub fn changer_as(&self, initiator: u32) -> SimTransport {
@@ -423,6 +435,7 @@ impl SimLibrary {
     /// 位置回到 (0, 0)，所有发起方的下一条命令先收到 29/00。
     pub fn reset_drive(&self, idx: usize) {
         let mut st = lock(&self.state);
+        st.invalidate_change_evidence();
         let barcode = st.drives[idx].cartridge.clone();
         if let Some(c) = barcode.and_then(|b| st.cartridges.get_mut(&b)) {
             for p in c.partitions.iter_mut() {
@@ -439,6 +452,7 @@ impl SimLibrary {
     /// 整库掉电：所有驱动器丢弃未刷缓冲，位置回到 (0, 0)，介质保持装载。
     pub fn power_cut(&self) {
         let mut st = lock(&self.state);
+        st.invalidate_change_evidence();
         for i in 0..st.drives.len() {
             let d = st.drives[i].clone();
             if let Some(bc) = d.cartridge
@@ -462,6 +476,7 @@ impl SimLibrary {
     /// 直接修改磁带内容（用于构造异常尾部等测试场景）。
     pub fn with_cartridge_mut<F: FnOnce(&mut SimCartridge)>(&self, barcode: &str, f: F) -> bool {
         let mut st = lock(&self.state);
+        st.invalidate_change_evidence();
         match st.cartridges.get_mut(barcode) {
             Some(c) => {
                 f(c);
@@ -476,6 +491,20 @@ impl SimLibrary {
 enum Target {
     Changer,
     Drive(usize),
+}
+
+// Position/flushed-only operations preserve logical objects. All actual writes,
+// including zero WRITE FILEMARKS (which may truncate at the current position),
+// conservatively invalidate the shared content proof. Normal READ FILEMARK/ILI
+// and confirmed unsupported read attributes do not change logical content.
+fn changes_content(cdb: &[u8]) -> bool {
+    crate::scsi::transport::changes_session(cdb)
+        && !matches!(
+            cdb.first().copied(),
+            Some(
+                opcode::REWIND | opcode::SPACE_6 | opcode::LOCATE_16 | opcode::READ_ELEMENT_STATUS
+            )
+        )
 }
 
 /// 一个模拟设备节点。
@@ -555,6 +584,16 @@ impl SimTransport {
         })?;
         self.log.lock().unwrap_or_else(|e| e.into_inner()).push(op);
         if let Some(action) = self.take_fault(op) {
+            if changes_content(cdb)
+                || matches!(
+                    &action,
+                    FaultAction::HostError(_)
+                        | FaultAction::Busy
+                        | FaultAction::CheckCondition { sense_key: 6, .. }
+                )
+            {
+                lock(&self.lib).invalidate_change_evidence();
+            }
             return match action {
                 FaultAction::CheckCondition {
                     sense_key,
@@ -578,6 +617,17 @@ impl SimTransport {
             Target::Changer => changer_with_pr(&mut st, self.initiator, cdb, data_in, data_out),
             Target::Drive(i) => drive_command(&mut st, i, self.initiator, cdb, data_in, data_out),
         };
+        // One shared conservative revision covers this entire Sim library.
+        // Target writes therefore invalidate a source proof too. Increment
+        // while the same lock still protects the actual modeled mutation.
+        if changes_content(cdb)
+            || outcome.as_ref().is_err()
+            || outcome
+                .as_ref()
+                .is_ok_and(|completion| completion.sense.sense_key == 6)
+        {
+            st.invalidate_change_evidence();
+        }
         match outcome {
             Ok(Completion {
                 status,
@@ -590,6 +640,22 @@ impl SimTransport {
 }
 
 impl TapeTransport for SimTransport {
+    fn medium_change_token(&self) -> Option<[u8; 32]> {
+        let st = lock(&self.lib);
+        let Target::Drive(drive) = self.target else {
+            return None;
+        };
+        let loaded = st.drives.get(drive)?;
+        if !loaded.loaded || loaded.cartridge.is_none() {
+            return None;
+        }
+        let mut token = [0; 32];
+        token[..16].copy_from_slice(&st.change_scope);
+        token[16..24].copy_from_slice(&st.change_revision?.to_be_bytes());
+        token[24..].copy_from_slice(&(u64::try_from(drive).ok()?).to_be_bytes());
+        Some(token)
+    }
+
     fn session_epoch(&self) -> Option<u64> {
         Some(
             self.session_epoch
@@ -1569,6 +1635,100 @@ mod tests {
         lib.load_into_drive("T00001L8", 0).unwrap();
         let dev = lib.drive(0);
         (lib, dev)
+    }
+
+    #[test]
+    fn shared_medium_change_token_covers_other_handles_and_library_events() {
+        let (lib, dev) = one_drive();
+        lib.set_quirks(SimQuirks {
+            vcr_never_changes: true,
+            ..Default::default()
+        });
+        let other = lib.drive(0);
+        let epoch = dev.session_epoch();
+        let before = dev.medium_change_token().unwrap();
+        assert_eq!(other.medium_change_token(), Some(before));
+        let mut rows = [0; 1024];
+        lib.changer()
+            .execute_read(
+                &cdb::read_element_status(0, 0, 4, 1024, true, true),
+                &mut rows,
+                1000,
+            )
+            .unwrap();
+        assert_eq!(
+            dev.medium_change_token(),
+            Some(before),
+            "成功只读库存查询不改变介质证明"
+        );
+        let vcr = lib.cartridge("T00001L8").unwrap().vcr;
+        other
+            .execute_write(&[0x0a, 0, 0, 0, 1, 0], b"x", 1000)
+            .unwrap();
+        assert_eq!(
+            lib.cartridge("T00001L8").unwrap().vcr,
+            vcr,
+            "即使VCR固定共享证明也覆盖WRITE"
+        );
+        assert_eq!(dev.session_epoch(), epoch, "句柄epoch未覆盖其他句柄");
+        let after = dev.medium_change_token().unwrap();
+        assert_ne!(after, before, "共享介质证明必须覆盖其他句柄写入");
+        assert_eq!(other.medium_change_token(), Some(after));
+        read_pos(&dev);
+        assert_eq!(
+            dev.medium_change_token(),
+            Some(after),
+            "成功只读位置查询不失效"
+        );
+        dev.execute_no_data(&cdb::rewind(), 0).unwrap();
+        dev.execute_no_data(&cdb::locate_16(0, 0, true, false), 0)
+            .unwrap();
+        assert_eq!(
+            dev.medium_change_token(),
+            Some(after),
+            "纯定位不改变逻辑内容证明"
+        );
+        other.execute_no_data(&cdb::write_filemarks(1), 0).unwrap();
+        let with_filemark = dev.medium_change_token();
+        other.execute_no_data(&cdb::rewind(), 0).unwrap();
+        let mut data = [0; 1];
+        other
+            .execute_read(&cdb::read_6(false, 1), &mut data, 0)
+            .unwrap();
+        assert_eq!(
+            dev.medium_change_token(),
+            with_filemark,
+            "正常FILEMARK不改变内容证明"
+        );
+        other.execute_no_data(&cdb::rewind(), 0).unwrap();
+        other.execute_no_data(&cdb::write_filemarks(0), 0).unwrap();
+        assert_ne!(
+            dev.medium_change_token(),
+            with_filemark,
+            "0FM也可能截断，保守使证明失效"
+        );
+        lib.reset_drive(0);
+        let reset = dev.medium_change_token().unwrap();
+        assert_ne!(reset, after);
+        lib.power_cut();
+        let power = dev.medium_change_token().unwrap();
+        assert_ne!(power, reset);
+        lib.with_cartridge_mut("T00001L8", |cart| cart.write_protected = true);
+        assert_ne!(dev.medium_change_token(), Some(power));
+        let (_, separate) = one_drive();
+        assert_ne!(
+            dev.medium_change_token(),
+            separate.medium_change_token(),
+            "不同介质模型作用域不得相撞"
+        );
+        lock(&lib.state).change_revision = Some(u64::MAX);
+        lib.with_cartridge_mut("T00001L8", |_| {});
+        assert!(
+            dev.medium_change_token().is_none(),
+            "revision溢出永久关闭证明"
+        );
+        lib.power_cut();
+        assert!(dev.medium_change_token().is_none());
     }
 
     fn read_pos(dev: &SimTransport) -> (u8, u32) {

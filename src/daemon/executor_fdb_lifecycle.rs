@@ -2697,10 +2697,20 @@ mod tests {
         .await;
     }
 
+    mod reclaim_load_readiness {
+        include!("executor_fdb_reclaim_load_tests.rs");
+    }
+    include!("executor_fdb_reclaim_history_tests.rs");
+    include!("executor_fdb_reclaim_raw_spool_tests.rs");
+    include!("executor_fdb_reclaim_permit_tests.rs");
+    include!("executor_fdb_reclaim_group_happy_tests.rs");
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum NativeParentCase {
         Default,
         Unassign,
+        RawBodySingleRead,
+        RawBodyBudget,
         ChildHa,
         FinishHa,
         CancelledHa,
@@ -2712,6 +2722,17 @@ mod tests {
         StaleQueued,
         VendorDvcid,
         LongHistory,
+        SourceCaptureReuse,
+        SourceHistoryHints,
+        SourceVcrUnsupported,
+        StallDiagnostics,
+        SourceSessionInvalidation,
+        SourceOtherHandleChange,
+        SourceOtherHandleStableVcr,
+        SourceFreshTokenGap,
+        SourcePostVcrGap,
+        SourceNoChangeEvidence,
+        SourceErrorRecovery,
         LongHistoryT2,
         LongHistoryIp,
     }
@@ -2719,7 +2740,10 @@ mod tests {
         fn long_history(self) -> bool {
             matches!(
                 self,
-                Self::LongHistory | Self::LongHistoryT2 | Self::LongHistoryIp
+                Self::LongHistory
+                    | Self::SourceCaptureReuse
+                    | Self::LongHistoryT2
+                    | Self::LongHistoryIp
             )
         }
     }
@@ -2764,6 +2788,156 @@ mod tests {
             catalog,
             &cluster,
             NativeParentCase::LongHistory,
+        ))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 同一源卷分页封存复用完整历史捕获"]
+    async fn native_reclaim_source_inventory_pages_reuse_unchanged_history() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::SourceCaptureReuse,
+        ))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 明确不支持VCR时保留原完整源捕获路径"]
+    async fn native_reclaim_source_without_vcr_continues_without_retained_capture() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::SourceVcrUnsupported,
+        ))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；原父任务诊断CAS不覆盖真实依赖或重复更新时间"]
+    async fn native_reclaim_stall_diagnostic_preserves_other_dependencies() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::StallDiagnostics,
+        ))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 源捕获的定位/缺epoch/失权反例"]
+    async fn native_reclaim_source_capture_rejects_changed_epoch_and_lost_owner() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::SourceSessionInvalidation,
+        ))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 同initiator另一句柄写源且VCR固定"]
+    async fn native_reclaim_source_rejects_other_handle_write_with_constant_vcr() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::SourceOtherHandleChange,
+        ))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 固定VCR下已保存可信token再由另一句柄写源"]
+    async fn native_reclaim_source_rejects_other_handle_write_after_trusted_capture() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::SourceOtherHandleStableVcr,
+        ))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 完整capture返回后首次token采样前另handle写源"]
+    async fn native_reclaim_fresh_capture_rejects_write_before_end_token() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::SourceFreshTokenGap,
+        ))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim post VCR明确unsupported不能豁免另handle写源"]
+    async fn native_reclaim_fresh_capture_rejects_write_with_post_vcr_unsupported() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::SourcePostVcrGap,
+        ))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 无可信变化证明时完整捕获且不留缓存"]
+    async fn native_reclaim_source_without_change_evidence_uses_full_capture() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::SourceNoChangeEvidence,
+        ))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 原源读取故障后原parent恢复清理诊断"]
+    async fn native_reclaim_source_dependency_uses_existing_recovery_checkpoint_after_restart() {
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        Box::pin(native_reclaim_parent_case(
+            catalog,
+            &cluster,
+            NativeParentCase::SourceErrorRecovery,
         ))
         .await;
     }
@@ -3454,9 +3628,8 @@ mod tests {
             let permit = fixture.permit.clone();
             let round = fixture.owner.round;
             let thread = std::thread::spawn(move || {
-                // This long-history Sim case has no ownership change. Model
-                // the production Raft thread renewing the same majority lease
-                // while one guarded device phase runs longer than 60 seconds.
+                // These Sim cases have no ownership change. Model the Raft
+                // thread renewing the same lease during a long device phase.
                 while !flag.load(std::sync::atomic::Ordering::Acquire) {
                     permit.renew(
                         round,
@@ -3487,7 +3660,11 @@ mod tests {
         cluster: &str,
         case: NativeParentCase,
     ) {
-        let unassign = case == NativeParentCase::Unassign;
+        let raw_spool_case = matches!(
+            case,
+            NativeParentCase::RawBodySingleRead | NativeParentCase::RawBodyBudget
+        );
+        let unassign = case == NativeParentCase::Unassign || raw_spool_case;
         let interrupt_child = matches!(
             case,
             NativeParentCase::ChildHa | NativeParentCase::FinishHa | NativeParentCase::CancelledHa
@@ -3502,9 +3679,8 @@ mod tests {
             Fixture::with_drives(2),
         ))
         .await;
-        let _heartbeat = case
-            .long_history()
-            .then(|| ParentPermitHeartbeat::new(&fixture));
+        let _heartbeat =
+            (case.long_history() || raw_spool_case).then(|| ParentPermitHeartbeat::new(&fixture));
         if case == NativeParentCase::VendorDvcid {
             fixture.lib.set_quirks(crate::scsi::sim::SimQuirks {
                 dvcid_vendor_model: true,
@@ -3539,6 +3715,23 @@ mod tests {
                 .add_symlink("/links/empty/native", "../../data")
                 .unwrap();
         }
+        if matches!(
+            case,
+            NativeParentCase::SourceCaptureReuse
+                | NativeParentCase::SourceHistoryHints
+                | NativeParentCase::SourceSessionInvalidation
+                | NativeParentCase::SourceOtherHandleChange
+                | NativeParentCase::SourceOtherHandleStableVcr
+                | NativeParentCase::SourceNoChangeEvidence
+                | NativeParentCase::SourceErrorRecovery
+        ) {
+            // Root, body and these directories exceed the real 32-node seal
+            // page. The next parent advance must continue the original page
+            // without moving or changing the source medium in between.
+            for i in 0..32 {
+                volume.create_directory(&format!("/empty-{i:02}")).unwrap();
+            }
+        }
         if unassign {
             volume
                 .append_bytes("/.LTFSEE_DATA/orphan", b"unmapped original bytes")
@@ -3557,7 +3750,10 @@ mod tests {
                 .unwrap();
         }
         volume.commit().unwrap();
-        if case == NativeParentCase::LongHistory {
+        if matches!(
+            case,
+            NativeParentCase::LongHistory | NativeParentCase::SourceCaptureReuse
+        ) {
             for i in 0..70 {
                 volume
                     .set_node_xattr(
@@ -3578,6 +3774,15 @@ mod tests {
             .index()
             .find_file(".LTFSEE_DATA/orphan")
             .map(|f| f.meta.file_uid);
+        let raw_body_position = raw_spool_case.then(|| {
+            let file = volume.index().find_file(".LTFSEE_DATA/orphan").unwrap();
+            assert_eq!(file.extents.len(), 1);
+            let extent = &file.extents[0];
+            assert_eq!(extent.partition, volume.label().data_partition);
+            assert_eq!(extent.byte_offset, 0);
+            assert_eq!(extent.byte_count, b"unmapped original bytes".len() as u64);
+            (1, extent.start_block)
+        });
         drop(volume);
         let request = |change: Value| {
             ManagementRequest::parse(json!({"version":1,"library":control.serial,"namespace":control.route.route.namespace.to_string(),"epoch":1,"operation":uuid::Uuid::new_v4().to_string(),"change":change})).unwrap()
@@ -3737,6 +3942,186 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        if case == NativeParentCase::StallDiagnostics {
+            let commands = fixture.commands.lock().unwrap().clone();
+            let original_status = catalog
+                .reserved_reclaim_status(&parent, fixture.owner.round)
+                .await
+                .unwrap();
+            assert!(
+                catalog
+                    .reclaim_source_coverage_progress(&parent, fixture.owner.round)
+                    .await
+                    .is_err(),
+                "缺少完整封存清单时不能制造源覆盖进度"
+            );
+            assert!(
+                catalog
+                    .reclaim_source_coverage_progress(&parent, fixture.owner.round + 1)
+                    .await
+                    .is_err(),
+                "其他owner不能读原coverage进度"
+            );
+            let first_event = catalog
+                .record_reclaim_failure(&parent, fixture.owner.round, "same actual error")
+                .await
+                .unwrap();
+            let snapshot = catalog
+                .reclaim_dependency_snapshot(&parent, fixture.owner.round)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(snapshot.2, first_event);
+            let second_event = catalog
+                .record_reclaim_failure(&parent, fixture.owner.round, "same actual error")
+                .await
+                .unwrap();
+            assert_ne!(first_event, second_event, "新同文事件仍有新token");
+            assert!(
+                !catalog
+                    .clear_reclaim_dependency_if_unchanged(
+                        &parent,
+                        fixture.owner.round,
+                        first_event
+                    )
+                    .await
+                    .unwrap(),
+                "原snapshot不能清同期新同文错误"
+            );
+            assert!(
+                catalog
+                    .clear_reclaim_dependency_if_unchanged(
+                        &parent,
+                        fixture.owner.round + 1,
+                        second_event
+                    )
+                    .await
+                    .is_err(),
+                "旧snapshot不是其他owner的清理授权"
+            );
+            assert!(
+                catalog
+                    .clear_reclaim_dependency_if_unchanged(
+                        &parent,
+                        fixture.owner.round,
+                        second_event
+                    )
+                    .await
+                    .unwrap()
+            );
+            let reason = "测试范围：原父/封存/覆盖/元数据汇总检查点未变";
+            assert!(
+                catalog
+                    .update_reclaim_dependency_if(&parent, fixture.owner.round, None, Some(reason))
+                    .await
+                    .unwrap()
+            );
+            let first = catalog
+                .management_task(
+                    &control.serial,
+                    control.route,
+                    original.epoch(),
+                    original.operation(),
+                )
+                .await
+                .unwrap()
+                .unwrap()["progress"]["dependency"]
+                .clone();
+            for _ in 0..210 {
+                assert!(
+                    !catalog
+                        .update_reclaim_dependency_if(
+                            &parent,
+                            fixture.owner.round,
+                            None,
+                            Some(reason),
+                        )
+                        .await
+                        .unwrap()
+                );
+            }
+            let same = catalog
+                .management_task(
+                    &control.serial,
+                    control.route,
+                    original.epoch(),
+                    original.operation(),
+                )
+                .await
+                .unwrap()
+                .unwrap()["progress"]["dependency"]
+                .clone();
+            assert_eq!(same, first, "重复观察不能改写原诊断或observed_at");
+            catalog
+                .set_reclaim_dependency(&parent, fixture.owner.round, Some("实际设备依赖不可用"))
+                .await
+                .unwrap();
+            for next in [None, Some(reason)] {
+                assert!(
+                    !catalog
+                        .update_reclaim_dependency_if(
+                            &parent,
+                            fixture.owner.round,
+                            Some(reason),
+                            next,
+                        )
+                        .await
+                        .unwrap(),
+                    "进度诊断不能清除或覆盖实际依赖"
+                );
+            }
+            let dependency = catalog
+                .management_task(
+                    &control.serial,
+                    control.route,
+                    original.epoch(),
+                    original.operation(),
+                )
+                .await
+                .unwrap()
+                .unwrap()["progress"]["dependency"]
+                .clone();
+            assert_eq!(dependency["reason"], "实际设备依赖不可用");
+            assert!(
+                catalog
+                    .update_reclaim_dependency_if(
+                        &parent,
+                        fixture.owner.round + 1,
+                        Some("实际设备依赖不可用"),
+                        None,
+                    )
+                    .await
+                    .is_err(),
+                "非原owner不能更新诊断"
+            );
+            catalog
+                .set_reclaim_dependency(&parent, fixture.owner.round, None)
+                .await
+                .unwrap();
+            assert!(
+                catalog
+                    .update_reclaim_dependency_if(&parent, fixture.owner.round, None, Some(reason))
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                catalog
+                    .update_reclaim_dependency_if(&parent, fixture.owner.round, Some(reason), None)
+                    .await
+                    .unwrap(),
+                "真实汇总进度变化后可以只清理自己的原诊断"
+            );
+            assert_eq!(
+                catalog
+                    .reserved_reclaim_status(&parent, fixture.owner.round)
+                    .await
+                    .unwrap(),
+                original_status,
+                "诊断不能改变原parent、phase或children"
+            );
+            assert_eq!(*fixture.commands.lock().unwrap(), commands);
+            return;
+        }
         let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let history_fault = matches!(
             case,
@@ -3801,8 +4186,166 @@ mod tests {
         let finish_interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut deleted_reference_waits = 0;
         let mut deleted_fault_checked = false;
+        let source_trace = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let no_source_epoch = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let raw_body_reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let raw_body_physical_reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        if raw_spool_case {
+            install_raw_body_counter(
+                &mut fixture,
+                &target.barcode,
+                raw_body_position.unwrap(),
+                raw_body_reads.clone(),
+                raw_body_physical_reads.clone(),
+            );
+        }
+        let mut raw_budget_hook = (case == NativeParentCase::RawBodyBudget).then(|| {
+            super::super::fdb_reclaim_spool_test_hook::install(
+                &parent,
+                orphan.unwrap(),
+                fixture.commands.clone(),
+                raw_body_reads.clone(),
+            )
+        });
+        let mut raw_budget_recovered = false;
+        if case == NativeParentCase::SourceVcrUnsupported {
+            let current = inventory(&fixture.owner.devices).unwrap();
+            let target_drive = current
+                .drives
+                .iter()
+                .find(|d| {
+                    d.loaded
+                        .as_ref()
+                        .is_some_and(|(barcode, _)| barcode == &target.barcode)
+                })
+                .expect("assigned target remains loaded")
+                .dev;
+            let source_drive = (0..fixture.lib.drive_count())
+                .find(|index| *index != target_drive)
+                .unwrap();
+            let inner = std::mem::replace(
+                &mut fixture.owner.devices[source_drive].dev,
+                Box::new(fixture.lib.drive_as(source_drive, 1)),
+            );
+            fixture.owner.devices[source_drive].dev = Box::new(UnsupportedSourceVcr {
+                inner,
+                rejected: std::sync::atomic::AtomicU64::new(0),
+            });
+        }
+        if matches!(case, NativeParentCase::SourceErrorRecovery) {
+            let current = inventory(&fixture.owner.devices).unwrap();
+            let target_drive = current
+                .drives
+                .iter()
+                .find(|d| d.loaded.as_ref().is_some_and(|(b, _)| b == &target.barcode))
+                .unwrap()
+                .dev;
+            let source_drive = (0..fixture.lib.drive_count())
+                .find(|d| *d != target_drive)
+                .unwrap();
+            let inner = std::mem::replace(
+                &mut fixture.owner.devices[source_drive].dev,
+                Box::new(fixture.lib.drive_as(source_drive, 1)),
+            );
+            fixture.owner.devices[source_drive].dev = Box::new(SourceReadFailure {
+                inner,
+                fail: std::sync::atomic::AtomicBool::new(true),
+                failures: std::sync::atomic::AtomicU64::new(0),
+            });
+        }
+        let fresh_capture_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if matches!(
+            case,
+            NativeParentCase::SourceFreshTokenGap | NativeParentCase::SourcePostVcrGap
+        ) {
+            let current = inventory(&fixture.owner.devices).unwrap();
+            let target_drive = current
+                .drives
+                .iter()
+                .find(|d| d.loaded.as_ref().is_some_and(|(b, _)| b == &target.barcode))
+                .unwrap()
+                .dev;
+            let source_drive = (0..fixture.lib.drive_count())
+                .find(|d| *d != target_drive)
+                .unwrap();
+            let inner = std::mem::replace(
+                &mut fixture.owner.devices[source_drive].dev,
+                Box::new(fixture.lib.drive_as(source_drive, 1)),
+            );
+            fixture.owner.devices[source_drive].dev = Box::new(FreshCaptureMutation {
+                inner,
+                lib: fixture.lib.clone(),
+                drive: source_drive,
+                key: fixture.owner.key,
+                post_vcr: case == NativeParentCase::SourcePostVcrGap,
+                token_calls: std::sync::atomic::AtomicUsize::new(0),
+                armed: std::sync::atomic::AtomicBool::new(false),
+                rejected: std::sync::atomic::AtomicU64::new(0),
+                fired: fresh_capture_fired.clone(),
+            });
+        }
+        if matches!(
+            case,
+            NativeParentCase::SourceCaptureReuse
+                | NativeParentCase::SourceHistoryHints
+                | NativeParentCase::SourceSessionInvalidation
+                | NativeParentCase::SourceOtherHandleChange
+                | NativeParentCase::SourceOtherHandleStableVcr
+                | NativeParentCase::SourceFreshTokenGap
+                | NativeParentCase::SourcePostVcrGap
+                | NativeParentCase::SourceNoChangeEvidence
+                | NativeParentCase::SourceErrorRecovery
+        ) {
+            for index in 0..fixture.lib.drive_count() {
+                let inner = std::mem::replace(
+                    &mut fixture.owner.devices[index].dev,
+                    Box::new(fixture.lib.drive_as(index, 1)),
+                );
+                fixture.owner.devices[index].dev = Box::new(ParentSourceTrace {
+                    inner,
+                    drive: index,
+                    commands: source_trace.clone(),
+                    no_epoch: no_source_epoch.clone(),
+                    trusted_change_evidence: !matches!(
+                        case,
+                        NativeParentCase::SourceNoChangeEvidence
+                            | NativeParentCase::SourceHistoryHints
+                    ),
+                });
+            }
+        }
+        if matches!(
+            case,
+            NativeParentCase::SourceOtherHandleStableVcr
+                | NativeParentCase::SourceFreshTokenGap
+                | NativeParentCase::SourcePostVcrGap
+        ) {
+            // Establish the constant-VCR quirk before the original capture, so
+            // its token changes later only because of the alternate handle.
+            fixture.lib.set_quirks(crate::scsi::sim::SimQuirks {
+                vcr_never_changes: true,
+                ..Default::default()
+            });
+        }
+        let fresh_parent_before = if matches!(
+            case,
+            NativeParentCase::SourceFreshTokenGap | NativeParentCase::SourcePostVcrGap
+        ) {
+            Some(
+                catalog
+                    .reserved_reclaim_status(&parent, fixture.owner.round)
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let reclaim_stage_started = Instant::now();
         for step in 0..64 {
-            if ((unassign || interrupt_child) && step == 1) || (interrupt_finish && step == 2) {
+            let trace_start = source_trace.lock().unwrap().len();
+            if ((case == NativeParentCase::Unassign || interrupt_child) && step == 1)
+                || (interrupt_finish && step == 2)
+            {
                 let round = fixture.owner.round + 100;
                 let permit = Arc::new(Permission::default());
                 permit.renew(
@@ -4015,6 +4558,9 @@ mod tests {
                 }
             }
             renew_native_parent_permit(&fixture);
+            let healthy_default = (case == NativeParentCase::Default).then(|| {
+                HealthyParentPermit::new(fixture.permit.clone(), fixture.owner.round, &control)
+            });
             let result = Box::pin(fdb_reclaim::advance(
                 &mut fixture.owner,
                 &fixture.permit,
@@ -4022,6 +4568,39 @@ mod tests {
                 &status,
             ))
             .await;
+            if let Some(healthy_default) = healthy_default {
+                let report = healthy_default.finish();
+                eprintln!(
+                    "DEFAULT_HEALTHY_QUORUM step={step} renewals={} failure={:?}",
+                    report.renewals, report.failure
+                );
+                assert!(report.failure.is_none(), "健康多数派模拟已停止: {report:?}");
+            }
+            if raw_budget_hook.as_ref().is_some_and(|hook| hook.fired()) {
+                assert!(
+                    matches!(&result, Err(ReadError::Lost(reason)) if reason.contains("文件超过下载暂存单次上限")),
+                    "must fail in the real download_file admission: {result:?}"
+                );
+                let hook = raw_budget_hook.take().unwrap();
+                Box::pin(recover_raw_spool_budget_failure(
+                    &mut fixture,
+                    &control,
+                    &parent,
+                    &original,
+                    hook,
+                    &source.barcode,
+                ))
+                .await;
+                install_raw_body_counter(
+                    &mut fixture,
+                    &target.barcode,
+                    raw_body_position.unwrap(),
+                    raw_body_reads.clone(),
+                    raw_body_physical_reads.clone(),
+                );
+                raw_budget_recovered = true;
+                continue;
+            }
             if history_fault && !history_fault_seen && result.is_err() {
                 assert!(
                     history_fault_fired.load(std::sync::atomic::Ordering::SeqCst),
@@ -4130,7 +4709,314 @@ mod tests {
                 fixture.permit.close(fixture.owner.round);
                 continue;
             }
+            if matches!(
+                case,
+                NativeParentCase::SourceFreshTokenGap | NativeParentCase::SourcePostVcrGap
+            ) && step == 0
+            {
+                assert!(
+                    fresh_capture_fired.load(std::sync::atomic::Ordering::SeqCst),
+                    "精确边界上的另handle实际修改已触发"
+                );
+                let current = inventory(&fixture.owner.devices).unwrap();
+                let source_drive = current
+                    .drives
+                    .iter()
+                    .find(|d| d.loaded.as_ref().is_some_and(|(b, _)| b == &source.barcode))
+                    .unwrap()
+                    .dev;
+                let target_writes = source_trace.lock().unwrap()[trace_start..]
+                    .iter()
+                    .filter(|(d, cdb)| {
+                        *d != source_drive && matches!(cdb.first(), Some(0x0a | 0x10 | 0x8d))
+                    })
+                    .count();
+                let metadata = catalog
+                    .reclaim_metadata_checkpoint(&parent, fixture.owner.round)
+                    .await
+                    .unwrap();
+                let coverage = catalog
+                    .reclaim_source_coverage_progress(&parent, fixture.owner.round)
+                    .await;
+                let parent_state = catalog
+                    .reserved_reclaim_status(&parent, fixture.owner.round)
+                    .await
+                    .unwrap();
+                eprintln!(
+                    "fresh capture interposer {:?}: target_writes={target_writes}, metadata_planned={}, coverage_admitted={}, parent={parent_state}, result={result:?}",
+                    if case == NativeParentCase::SourceFreshTokenGap {
+                        "end-token"
+                    } else {
+                        "post-vcr-unsupported"
+                    },
+                    metadata.is_some(),
+                    coverage.is_ok()
+                );
+                assert!(
+                    result.is_err(),
+                    "完整capture过程源变化必须先拒绝: {result:?}"
+                );
+                assert_eq!(target_writes, 0, "完整capture变化未结清不能写目标");
+                assert!(metadata.is_none(), "不能建立metadata q/attempt");
+                assert!(coverage.is_err(), "不能发布源封存/覆盖清单");
+                assert_eq!(
+                    &parent_state,
+                    fresh_parent_before.as_ref().unwrap(),
+                    "拒绝变化前不能推进原parent/children/退休状态"
+                );
+                assert!(
+                    catalog
+                        .reclaim_format_plan(&parent, fixture.owner.round)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                return;
+            }
+            if case == NativeParentCase::SourceVcrUnsupported && step == 0 {
+                let current = inventory(&fixture.owner.devices).unwrap();
+                let source_drive = current
+                    .drives
+                    .iter()
+                    .find(|d| {
+                        d.loaded
+                            .as_ref()
+                            .is_some_and(|(barcode, _)| barcode == &source.barcode)
+                    })
+                    .expect("original source stays loaded")
+                    .dev;
+                let reader = super::super::super::fdb_read::ActiveMediaReader {
+                    catalog: &catalog,
+                    device: fixture.owner.devices[source_drive].dev.as_ref(),
+                    serial: &control.serial,
+                    route: control.route,
+                    key: fixture.owner.key,
+                    permission: &fixture.permit,
+                    storage: control.storage,
+                };
+                let before = reader.device.session_epoch().unwrap();
+                let captured = reader
+                    .capture_reclaim_source(&parent, fixture.owner.files.spool_dir())
+                    .await
+                    .expect("原无缓存完整捕获在不支持VCR时仍可核验源卷");
+                assert_eq!(captured.header().volume_uuid, source.volume_id.unwrap());
+                assert!(reader.device.session_epoch().unwrap() > before);
+                assert!(
+                    result.is_ok(),
+                    "明确不支持VCR只能禁用缓存，不能阻断原完整捕获: {result:?}"
+                );
+                assert!(fixture.owner.fdb_reclaim_source_session.is_none());
+                assert!(
+                    catalog
+                        .reclaim_format_plan(&parent, fixture.owner.round)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                return;
+            }
+            if matches!(case, NativeParentCase::SourceErrorRecovery) && step == 0 {
+                assert!(
+                    matches!(result, Err(ReadError::Lost(_))),
+                    "注入源READ POSITION host error必须走真实Lost边界: {result:?}"
+                );
+                let task = catalog
+                    .management_task(
+                        &control.serial,
+                        control.route,
+                        original.epoch(),
+                        original.operation(),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(task["progress"]["dependency"]["reason"].as_str().is_some());
+                eprintln!(
+                    "source recovery original failure: {}",
+                    task["progress"]["dependency"]
+                );
+                // Match the production Lost boundary: the old permission is
+                // closed, ownership is fenced anew, and the old Active is
+                // destroyed before the next original-parent advance.
+                fixture.permit.close(fixture.owner.round);
+                let round = fixture.owner.round + 100;
+                let permit = Arc::new(Permission::default());
+                permit.renew(
+                    round,
+                    Phase::Fencing,
+                    Instant::now() + Duration::from_secs(60),
+                );
+                let adopted = takeover(
+                    &Provider {
+                        lib: fixture.lib.clone(),
+                        commands: fixture.commands.clone(),
+                    },
+                    &fixture.opts,
+                    round,
+                    Some(&permit),
+                    fixture.owner.files.clone(),
+                )
+                .unwrap();
+                drop(std::mem::replace(&mut fixture.owner, adopted));
+                fixture.permit = permit;
+                fixture.permit.renew(
+                    round,
+                    Phase::Execution,
+                    Instant::now() + Duration::from_secs(60),
+                );
+                catalog
+                    .claim_active_owner_epoch(&control.serial, round)
+                    .await
+                    .unwrap();
+                assert!(fixture.owner.fdb_reclaim_source_session.is_none());
+                continue;
+            }
             assert!(result.is_ok(), "parent step {step}: {result:?}");
+            if case == NativeParentCase::SourceHistoryHints && step == 0 {
+                Box::pin(verify_source_history_hints(
+                    &fixture,
+                    &control,
+                    &parent,
+                    &source.barcode,
+                    &source_trace,
+                    cluster,
+                ))
+                .await;
+                return;
+            }
+            if case == NativeParentCase::SourceErrorRecovery && step == 1 {
+                let task = catalog
+                    .management_task(
+                        &control.serial,
+                        control.route,
+                        original.epoch(),
+                        original.operation(),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    task["progress"]["dependency"].is_null(),
+                    "原源读取错误已恢复且原封存游标已持久推进时应清旧诊断: {}",
+                    task["progress"]["dependency"]
+                );
+                return;
+            }
+            if case == NativeParentCase::SourceNoChangeEvidence {
+                assert!(
+                    fixture.owner.fdb_reclaim_source_session.is_none(),
+                    "缺少可靠变化能力不能保留缓存"
+                );
+                if step == 1 {
+                    let current = inventory(&fixture.owner.devices).unwrap();
+                    let source_drive = current
+                        .drives
+                        .iter()
+                        .find(|d| d.loaded.as_ref().is_some_and(|(b, _)| b == &source.barcode))
+                        .unwrap()
+                        .dev;
+                    assert!(
+                        source_trace.lock().unwrap()[trace_start..].iter().any(
+                            |(drive, cdb)| *drive == source_drive
+                                && cdb.first() == Some(&0x92)
+                                && cdb[3] == 1
+                                && u64::from_be_bytes(cdb[4..12].try_into().unwrap()) == 5
+                        ),
+                        "无可信变化能力的下一轮仍完整核验历史"
+                    );
+                    return;
+                }
+            }
+            if matches!(
+                case,
+                NativeParentCase::SourceOtherHandleChange
+                    | NativeParentCase::SourceOtherHandleStableVcr
+            ) && step == 0
+            {
+                Box::pin(verify_source_other_handle_change(
+                    &mut fixture,
+                    &control,
+                    &status,
+                    &parent,
+                    &source.barcode,
+                    &source_trace,
+                    case == NativeParentCase::SourceOtherHandleStableVcr,
+                ))
+                .await;
+                return;
+            }
+            if case == NativeParentCase::SourceSessionInvalidation && step == 0 {
+                verify_source_session_invalidation(
+                    &mut fixture,
+                    &control,
+                    &parent,
+                    &source.barcode,
+                    &source_trace,
+                    &no_source_epoch,
+                )
+                .await;
+                return;
+            }
+            if case == NativeParentCase::SourceCaptureReuse && step == 1 {
+                let current = inventory(&fixture.owner.devices).unwrap();
+                let source_drive = current
+                    .drives
+                    .iter()
+                    .find(|d| {
+                        d.loaded
+                            .as_ref()
+                            .is_some_and(|(barcode, _)| barcode == &source.barcode)
+                    })
+                    .expect("original source stays loaded")
+                    .dev;
+                let commands = source_trace.lock().unwrap();
+                let source_commands: Vec<_> = commands[trace_start..]
+                    .iter()
+                    .filter(|(drive, _)| *drive == source_drive)
+                    .map(|(_, cdb)| cdb)
+                    .collect();
+                let oldest_history_reads = source_commands
+                    .iter()
+                    .filter(|cdb| {
+                        cdb.first() == Some(&0x92)
+                            && cdb[3] == 1
+                            && u64::from_be_bytes(cdb[4..12].try_into().unwrap()) == 5
+                    })
+                    .count();
+                let holder_checks = source_commands
+                    .iter()
+                    .filter(|cdb| cdb.first() == Some(&0x5e))
+                    .count();
+                println!(
+                    "source inventory page 2: source_commands={}, oldest_history_reads={oldest_history_reads}, holder_checks={holder_checks}",
+                    source_commands.len()
+                );
+                assert!(holder_checks > 0, "复用捕获仍须实际核验设备执行权");
+                assert_eq!(
+                    oldest_history_reads, 0,
+                    "原源未变化的第二封存页不能重扫70代完整历史"
+                );
+                assert_eq!(fixture.formats(), 2, "分页捕获不能初始化原源卷");
+                let task = catalog
+                    .management_task(
+                        &control.serial,
+                        control.route,
+                        original.epoch(),
+                        original.operation(),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(task["status"], "running");
+                assert!(
+                    catalog
+                        .reclaim_format_plan(&parent, fixture.owner.round)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                return;
+            }
             let task = catalog
                 .management_task(
                     &control.serial,
@@ -4153,6 +5039,11 @@ mod tests {
                 );
             }
             if task["status"] == "succeeded" {
+                let reclaim_stage_elapsed = reclaim_stage_started.elapsed();
+                eprintln!(
+                    "RECLAIM_STAGE_SECONDS={:.6}",
+                    reclaim_stage_elapsed.as_secs_f64()
+                );
                 assert!(step > 0);
                 let done = catalog
                     .reclaim_format_result(&parent, fixture.owner.round)
@@ -4381,6 +5272,37 @@ mod tests {
                 let mut body = Vec::new();
                 std::io::Read::read_to_end(&mut file, &mut body).unwrap();
                 assert_eq!(body, b"layout-source");
+                if raw_spool_case {
+                    if case == NativeParentCase::RawBodyBudget {
+                        assert!(
+                            raw_budget_recovered && raw_budget_hook.is_none(),
+                            "must reach and restore the exact raw UID budget fault"
+                        );
+                    }
+                    let elapsed = reclaim_stage_elapsed;
+                    eprintln!(
+                        "C1 parent advance stage (excludes fixture setup) elapsed={elapsed:?} fault_injected={raw_budget_recovered}"
+                    );
+                    if case == NativeParentCase::RawBodySingleRead
+                        && elapsed > Duration::from_secs(180)
+                    {
+                        eprintln!(
+                            "performance warning: small-data reclaim advance stage exceeded the 180-second target: {elapsed:?}"
+                        );
+                    }
+                    let count = raw_body_reads.load(std::sync::atomic::Ordering::SeqCst);
+                    let physical =
+                        raw_body_physical_reads.load(std::sync::atomic::Ordering::SeqCst);
+                    assert!(physical >= count);
+                    eprintln!(
+                        "raw orphan source primary reads={count}, physical payload reads={physical}, audit gap reads={}; complete parent, target cold read and original coverage/FORMAT verified",
+                        physical - count
+                    );
+                    assert_eq!(
+                        count, 1,
+                        "未映射raw正文应由首次核验spool直接交原writer，不能从源磁带读第二次"
+                    );
+                }
                 return;
             }
         }
@@ -4875,7 +5797,7 @@ mod tests {
         assert_eq!(actual, b"layout-source");
         assert_eq!(copied, verified.metadata.head.version);
         catalog
-            .verify_reclaim_file(
+            .verify_reclaim_file_metadata(
                 &parent,
                 round,
                 &file,
@@ -4912,6 +5834,548 @@ mod tests {
         );
     }
 
+    async fn verify_source_other_handle_change(
+        fixture: &mut Fixture,
+        control: &FdbOwnerControl,
+        status: &SharedStatus,
+        parent: &crate::managed_catalog::ReclaimReservation,
+        barcode: &str,
+        trace: &Arc<std::sync::Mutex<Vec<(usize, Vec<u8>)>>>,
+        quirk_already_fixed: bool,
+    ) {
+        let current = inventory(&fixture.owner.devices).unwrap();
+        let source = current
+            .drives
+            .iter()
+            .find(|d| d.loaded.as_ref().is_some_and(|(b, _)| b == barcode))
+            .unwrap()
+            .dev;
+        assert!(
+            fixture.owner.fdb_reclaim_source_session.is_some(),
+            "原封存第一页保留完整源捕获"
+        );
+        let original = control
+            .catalog
+            .reclaim_source_head(parent, fixture.owner.round)
+            .await
+            .unwrap();
+        let reader = fixture.owner.devices[source].dev.as_ref();
+        let epoch = reader.session_epoch();
+        let before_vcr = crate::ltfs::mam::Mam::with_partition(reader, 0)
+            .read_vcr()
+            .unwrap();
+        assert!(
+            before_vcr
+                .as_ref()
+                .is_some_and(|v| crate::ltfs::mam::vcr_is_valid(v))
+        );
+        if !quirk_already_fixed {
+            // Preserve the original actual-RED fixture's timing.
+            fixture.lib.set_quirks(crate::scsi::sim::SimQuirks {
+                vcr_never_changes: true,
+                ..Default::default()
+            });
+        }
+        let before_write_token = reader.medium_change_token();
+        if quirk_already_fixed {
+            let saved_token = fixture
+                .owner
+                .fdb_reclaim_source_session
+                .as_ref()
+                .unwrap()
+                .test_change_token();
+            assert!(saved_token.is_some());
+            assert_eq!(
+                before_write_token, saved_token,
+                "quirk配置完成且写入前仍是已保存的共享变化证明"
+            );
+        }
+        // Same I_T nexus and PR holder, distinct handle-local epoch. Deliberate
+        // Sim-only external mutation; never publish it into the original FDB head.
+        let alternate = fixture.lib.drive_as(source, 1);
+        let mut volume = LtfsVolume::mount(&alternate).unwrap();
+        volume.set_reservation_guard(Some(fixture.owner.key));
+        volume
+            .append_bytes("/other-handle-change", b"new source metadata and body")
+            .unwrap();
+        volume.commit().unwrap();
+        assert!(volume.index().generation > original.generation);
+        drop(volume);
+        if quirk_already_fixed {
+            assert_ne!(
+                reader.medium_change_token(),
+                before_write_token,
+                "只有另handle写入后共享变化证明才失效"
+            );
+        }
+        assert_eq!(
+            reader.session_epoch(),
+            epoch,
+            "别的句柄写带不改变本句柄epoch"
+        );
+        assert_eq!(
+            crate::ltfs::mam::Mam::with_partition(reader, 0)
+                .read_vcr()
+                .unwrap(),
+            before_vcr,
+            "已建模固定VCR设备"
+        );
+        assert_eq!(
+            control
+                .catalog
+                .reclaim_source_head(parent, fixture.owner.round)
+                .await
+                .unwrap(),
+            original,
+            "FDB原卷头未被外部写更新"
+        );
+        let before = trace.lock().unwrap().len();
+        renew_native_parent_permit(fixture);
+        let result = Box::pin(fdb_reclaim::advance(
+            &mut fixture.owner,
+            &fixture.permit,
+            control,
+            status,
+        ))
+        .await;
+        let target_writes = trace.lock().unwrap()[before..]
+            .iter()
+            .filter(|(drive, cdb)| {
+                *drive != source && matches!(cdb.first(), Some(0x0a | 0x10 | 0x8d))
+            })
+            .count();
+        eprintln!(
+            "same-initiator alternate handle: original_epoch={epoch:?}, target_writes={target_writes}, result={result:?}"
+        );
+        assert!(
+            result.is_err(),
+            "源物理头已变而FDB头不变时必须拒绝沿旧捕获继续: {result:?}"
+        );
+        assert_eq!(target_writes, 0, "未核实已改变源不能新增目标写");
+        assert!(fixture.owner.fdb_reclaim_source_session.is_none());
+        assert!(
+            control
+                .catalog
+                .reclaim_format_plan(parent, fixture.owner.round)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    async fn verify_source_session_invalidation(
+        fixture: &mut Fixture,
+        control: &FdbOwnerControl,
+        parent: &crate::managed_catalog::ReclaimReservation,
+        barcode: &str,
+        trace: &Arc<std::sync::Mutex<Vec<(usize, Vec<u8>)>>>,
+        no_epoch: &std::sync::atomic::AtomicBool,
+    ) {
+        let current = inventory(&fixture.owner.devices).unwrap();
+        let source = current
+            .drives
+            .iter()
+            .find(|drive| {
+                drive
+                    .loaded
+                    .as_ref()
+                    .is_some_and(|(loaded, _)| loaded == barcode)
+            })
+            .unwrap()
+            .dev;
+        let reader = super::super::super::fdb_read::ActiveMediaReader {
+            catalog: &control.catalog,
+            device: fixture.owner.devices[source].dev.as_ref(),
+            serial: &control.serial,
+            route: control.route,
+            key: fixture.owner.key,
+            permission: &fixture.permit,
+            storage: control.storage,
+        };
+        let saved = fixture
+            .owner
+            .fdb_reclaim_source_session
+            .take()
+            .expect("原封存第一页保留完整源捕获");
+        let identity = saved.captured().identity().unwrap();
+        let oldest_reads = |start: usize| {
+            trace.lock().unwrap()[start..]
+                .iter()
+                .filter(|(drive, cdb)| {
+                    *drive == source
+                        && cdb.first() == Some(&0x92)
+                        && cdb[3] == 1
+                        && u64::from_be_bytes(cdb[4..12].try_into().unwrap()) == 5
+                })
+                .count()
+        };
+        let before = trace.lock().unwrap().len();
+        let same = reader
+            .capture_reclaim_source_session(parent, fixture.owner.files.spool_dir(), Some(saved))
+            .await
+            .unwrap();
+        assert_eq!(oldest_reads(before), 0, "同epoch复用不重扫历史");
+        assert_eq!(same.captured().identity().unwrap(), identity);
+
+        // A normal, successful LOCATE changes the transport epoch even if it
+        // neither writes nor changes the source head or VCR.
+        TapeDrive::new(reader.device).locate(1, 5, true).unwrap();
+        let before = trace.lock().unwrap().len();
+        let recaptured = reader
+            .capture_reclaim_source_session(parent, fixture.owner.files.spool_dir(), Some(same))
+            .await
+            .unwrap();
+        assert!(oldest_reads(before) > 0, "变更epoch必须重新完整捕获");
+        assert_eq!(recaptured.captured().identity().unwrap(), identity);
+
+        no_epoch.store(true, std::sync::atomic::Ordering::SeqCst);
+        let before = trace.lock().unwrap().len();
+        let unsupported = reader
+            .capture_reclaim_source_session(
+                parent,
+                fixture.owner.files.spool_dir(),
+                Some(recaptured),
+            )
+            .await
+            .unwrap();
+        assert!(oldest_reads(before) > 0, "无epoch仍走原完整捕获");
+        assert!(
+            reader
+                .finish_reclaim_source_session(parent, unsupported)
+                .await
+                .unwrap()
+                .is_none(),
+            "无epoch不能保存可复用证明"
+        );
+        no_epoch.store(false, std::sync::atomic::Ordering::SeqCst);
+        let saved = reader
+            .capture_reclaim_source_session(parent, fixture.owner.files.spool_dir(), None)
+            .await
+            .unwrap();
+        let saved = reader
+            .finish_reclaim_source_session(parent, saved)
+            .await
+            .unwrap()
+            .unwrap();
+        let parent_before = control
+            .catalog
+            .reserved_reclaim_status(parent, fixture.owner.round)
+            .await
+            .unwrap();
+        fixture.lib.reset_drive(source);
+        let before = trace.lock().unwrap().len();
+        assert!(
+            reader
+                .capture_reclaim_source_session(
+                    parent,
+                    fixture.owner.files.spool_dir(),
+                    Some(saved),
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            trace.lock().unwrap()[before..]
+                .iter()
+                .all(|(_, cdb)| cdb.first() == Some(&0x5e)),
+            "复位/PR丢失后只能核对预留，不能沿旧捕获定位、读取或写带"
+        );
+        let before = trace.lock().unwrap().len();
+        fixture.permit.close(fixture.owner.round);
+        assert!(
+            reader
+                .capture_reclaim_source_session(parent, fixture.owner.files.spool_dir(), None)
+                .await
+                .is_err()
+        );
+        assert_eq!(trace.lock().unwrap().len(), before, "失权后不再发CDB");
+        assert_eq!(
+            control
+                .catalog
+                .reserved_reclaim_status(parent, fixture.owner.round)
+                .await
+                .unwrap(),
+            parent_before
+        );
+        assert!(fixture.owner.fdb_reclaim_source_session.is_none());
+    }
+
+    struct FreshCaptureMutation {
+        inner: Box<dyn TapeTransport + Send>,
+        lib: SimLibrary,
+        drive: usize,
+        key: ReservationKey,
+        post_vcr: bool,
+        token_calls: std::sync::atomic::AtomicUsize,
+        armed: std::sync::atomic::AtomicBool,
+        rejected: std::sync::atomic::AtomicU64,
+        fired: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl FreshCaptureMutation {
+        fn mutate(&self) {
+            assert!(
+                !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst),
+                "只注入一次外部修改"
+            );
+            let alternate = self.lib.drive_as(self.drive, 1);
+            let mut volume = LtfsVolume::mount(&alternate).unwrap();
+            volume.set_reservation_guard(Some(self.key));
+            volume
+                .append_bytes(
+                    "/capture-boundary-mutation",
+                    b"same-initiator external source change",
+                )
+                .unwrap();
+            volume.commit().unwrap();
+        }
+    }
+    impl TapeTransport for FreshCaptureMutation {
+        fn execute_no_data(
+            &self,
+            cdb: &[u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            self.inner.execute_no_data(cdb, timeout)
+        }
+        fn execute_write(
+            &self,
+            cdb: &[u8],
+            data: &[u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            self.inner.execute_write(cdb, data, timeout)
+        }
+        fn execute_read(
+            &self,
+            cdb: &[u8],
+            data: &mut [u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            if self.post_vcr
+                && self.armed.load(std::sync::atomic::Ordering::SeqCst)
+                && cdb.first() == Some(&0x8c)
+                && cdb.get(8..10) == Some(&[0, 9])
+                && !self.fired.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                self.mutate();
+                self.rejected
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut raw = [0; 18];
+                raw[0] = 0x70;
+                raw[2] = 5;
+                raw[7] = 10;
+                raw[12] = 0x24;
+                return crate::scsi::device::finish_command(
+                    2,
+                    crate::scsi::sense::SenseInfo::from_bytes(&raw),
+                    0,
+                    0,
+                    self.identity(),
+                );
+            }
+            self.inner.execute_read(cdb, data, timeout)
+        }
+        fn medium_change_token(&self) -> Option<[u8; 32]> {
+            if self
+                .token_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 1
+            {
+                if self.post_vcr {
+                    self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+                } else {
+                    self.mutate();
+                }
+            }
+            self.inner.medium_change_token()
+        }
+        fn session_epoch(&self) -> Option<u64> {
+            self.inner.session_epoch().and_then(|e| {
+                e.checked_add(self.rejected.load(std::sync::atomic::Ordering::SeqCst))
+            })
+        }
+        fn execution_guard(&self) -> Option<(u64, usize)> {
+            self.inner.execution_guard()
+        }
+        fn identity(&self) -> &str {
+            self.inner.identity()
+        }
+    }
+
+    struct SourceReadFailure {
+        inner: Box<dyn TapeTransport + Send>,
+        fail: std::sync::atomic::AtomicBool,
+        failures: std::sync::atomic::AtomicU64,
+    }
+    impl TapeTransport for SourceReadFailure {
+        fn execute_no_data(
+            &self,
+            cdb: &[u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            self.inner.execute_no_data(cdb, timeout)
+        }
+        fn execute_write(
+            &self,
+            cdb: &[u8],
+            data: &[u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            self.inner.execute_write(cdb, data, timeout)
+        }
+        fn execute_read(
+            &self,
+            cdb: &[u8],
+            data: &mut [u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            if cdb.first() == Some(&0x34)
+                && self.fail.swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.failures
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(TapeError::ScsiHost(3));
+            }
+            self.inner.execute_read(cdb, data, timeout)
+        }
+        fn session_epoch(&self) -> Option<u64> {
+            self.inner.session_epoch().and_then(|e| {
+                e.checked_add(self.failures.load(std::sync::atomic::Ordering::SeqCst))
+            })
+        }
+        fn execution_guard(&self) -> Option<(u64, usize)> {
+            self.inner.execution_guard()
+        }
+        fn identity(&self) -> &str {
+            self.inner.identity()
+        }
+    }
+
+    struct UnsupportedSourceVcr {
+        inner: Box<dyn TapeTransport + Send>,
+        rejected: std::sync::atomic::AtomicU64,
+    }
+    impl TapeTransport for UnsupportedSourceVcr {
+        fn execute_no_data(
+            &self,
+            cdb: &[u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            self.inner.execute_no_data(cdb, timeout)
+        }
+        fn execute_read(
+            &self,
+            cdb: &[u8],
+            buffer: &mut [u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            if cdb.first() == Some(&0x8c) && cdb.get(8..10) == Some(&[0, 9]) {
+                self.rejected
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut sense = [0; 18];
+                sense[0] = 0x70;
+                sense[2] = 5;
+                sense[7] = 10;
+                sense[12] = 0x24;
+                return crate::scsi::device::finish_command(
+                    2,
+                    crate::scsi::sense::SenseInfo::from_bytes(&sense),
+                    0,
+                    0,
+                    self.identity(),
+                );
+            }
+            self.inner.execute_read(cdb, buffer, timeout)
+        }
+        fn execute_write(
+            &self,
+            cdb: &[u8],
+            buffer: &[u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            self.inner.execute_write(cdb, buffer, timeout)
+        }
+        fn medium_change_token(&self) -> Option<[u8; 32]> {
+            self.inner.medium_change_token()
+        }
+        fn session_epoch(&self) -> Option<u64> {
+            self.inner.session_epoch().and_then(|epoch| {
+                epoch.checked_add(self.rejected.load(std::sync::atomic::Ordering::SeqCst))
+            })
+        }
+        fn execution_guard(&self) -> Option<(u64, usize)> {
+            self.inner.execution_guard()
+        }
+        fn identity(&self) -> &str {
+            self.inner.identity()
+        }
+    }
+
+    struct ParentSourceTrace {
+        inner: Box<dyn TapeTransport + Send>,
+        drive: usize,
+        commands: Arc<std::sync::Mutex<Vec<(usize, Vec<u8>)>>>,
+        no_epoch: Arc<std::sync::atomic::AtomicBool>,
+        trusted_change_evidence: bool,
+    }
+    impl ParentSourceTrace {
+        fn record(&self, cdb: &[u8]) {
+            self.commands
+                .lock()
+                .unwrap()
+                .push((self.drive, cdb.to_vec()));
+        }
+    }
+    impl TapeTransport for ParentSourceTrace {
+        fn execute_no_data(
+            &self,
+            cdb: &[u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            self.record(cdb);
+            self.inner.execute_no_data(cdb, timeout)
+        }
+        fn execute_read(
+            &self,
+            cdb: &[u8],
+            buffer: &mut [u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            self.record(cdb);
+            if fdb_reclaim::observe_group_read_for_test(&self.commands, self.drive, cdb) {
+                return Err(TapeError::ScsiHost(0x21));
+            }
+            self.inner.execute_read(cdb, buffer, timeout)
+        }
+        fn execute_write(
+            &self,
+            cdb: &[u8],
+            buffer: &[u8],
+            timeout: u32,
+        ) -> Result<crate::scsi::device::ScsiResult> {
+            self.record(cdb);
+            self.inner.execute_write(cdb, buffer, timeout)
+        }
+        fn medium_change_token(&self) -> Option<[u8; 32]> {
+            self.trusted_change_evidence
+                .then(|| self.inner.medium_change_token())
+                .flatten()
+        }
+        fn session_epoch(&self) -> Option<u64> {
+            if self.no_epoch.load(std::sync::atomic::Ordering::SeqCst) {
+                None
+            } else {
+                self.inner.session_epoch()
+            }
+        }
+        fn execution_guard(&self) -> Option<(u64, usize)> {
+            self.inner.execution_guard()
+        }
+        fn identity(&self) -> &str {
+            self.inner.identity()
+        }
+    }
+
     struct Recorded {
         inner: Box<dyn TapeTransport + Send>,
         kind: DeviceKind,
@@ -4943,6 +6407,9 @@ mod tests {
         ) -> Result<crate::scsi::device::ScsiResult> {
             self.commands.lock().unwrap().push((self.kind, cdb[0]));
             self.inner.execute_write(cdb, buffer, timeout)
+        }
+        fn medium_change_token(&self) -> Option<[u8; 32]> {
+            self.inner.medium_change_token()
         }
         fn session_epoch(&self) -> Option<u64> {
             self.inner.session_epoch()
@@ -9261,7 +10728,7 @@ mod tests {
             let media = read.metadata.copy.media.as_ref().unwrap();
             assert!(media.ee_alias);
             assert_ne!(read.metadata.copy.ltfs_file_uid, media.logical_file_uid);
-            assert_eq!(read.metadata.physical.path, ".LTFSEE_DATA/blob");
+            assert_eq!(read.physical.path(), ".LTFSEE_DATA/blob");
             assert_eq!(evidence.sha256(), <[u8; 32]>::from(Sha256::digest(&bytes)));
             let mut actual = Vec::new();
             read.file.read_to_end(&mut actual).unwrap();
@@ -9393,6 +10860,25 @@ mod tests {
                     &RecoveryBudget::default(),
                 )
                 .unwrap();
+                // Materialize only this test oracle for the existing explicit
+                // negative-proof API; managed reads retain a sealed fd plan.
+                let verified_legacy = crate::managed_catalog::ResolvedRead {
+                    id: verified.metadata.id,
+                    head: verified.metadata.head.clone(),
+                    copy: verified.metadata.copy.clone(),
+                    placement: verified.metadata.placement.clone(),
+                    attributes: verified.metadata.attributes.clone(),
+                    physical: crate::catalog::volume_extents::CachedFile {
+                        path: verified.physical.path().to_owned(),
+                        length: verified.physical.length(),
+                        symlink: None,
+                        extents: verified
+                            .physical
+                            .extents()
+                            .collect::<crate::error::Result<Vec<_>>>()
+                            .unwrap(),
+                    },
+                };
                 let no_io = fixture.drive_log();
                 assert!(
                     inventory
@@ -9400,13 +10886,13 @@ mod tests {
                             &reserved,
                             &intent.request(),
                             &source_copy,
-                            (&verified.metadata, verified.verified_head),
+                            (&verified_legacy, verified.verified_head),
                             &recorded
                         )
                         .is_err()
                 );
                 for case in 0..8 {
-                    let mut bad = verified.metadata.clone();
+                    let mut bad = verified_legacy.clone();
                     match case {
                         0 => bad.copy.ltfs_file_uid = u64::MAX,
                         1 => bad.physical.path.push_str("-wrong"),
@@ -9443,7 +10929,7 @@ mod tests {
                                 &reserved,
                                 &intent.request(),
                                 &bad,
-                                (&verified.metadata, verified.verified_head),
+                                (&verified_legacy, verified.verified_head),
                                 &captured_target
                             )
                             .is_err()
@@ -9452,7 +10938,7 @@ mod tests {
                 assert_eq!(fixture.drive_log(), no_io, "拒绝证明不触碰设备");
             }
             catalog
-                .verify_reclaim_file(
+                .verify_reclaim_file_metadata(
                     &reserved,
                     fixture.owner.round,
                     &file,
@@ -13132,7 +14618,7 @@ mod tests {
         wrong.sha256[0] ^= 1;
         assert!(
             catalog
-                .verify_reclaim_file(
+                .verify_reclaim_file_metadata(
                     &reserved,
                     fixture.owner.round,
                     &scanned,
@@ -13240,7 +14726,7 @@ mod tests {
         tr.commit().await.unwrap();
         assert!(
             catalog
-                .verify_reclaim_file(
+                .verify_reclaim_file_metadata(
                     &reserved,
                     fixture.owner.round,
                     &scanned,
@@ -13257,7 +14743,7 @@ mod tests {
         tr.set(&terminal_key, &original_terminal);
         tr.commit().await.unwrap();
         let done = catalog
-            .verify_reclaim_file(
+            .verify_reclaim_file_metadata(
                 &reserved,
                 fixture.owner.round,
                 &scanned,
@@ -13280,7 +14766,7 @@ mod tests {
         tr.commit().await.unwrap();
         assert!(
             catalog
-                .verify_reclaim_file(
+                .verify_reclaim_file_metadata(
                     &reserved,
                     fixture.owner.round,
                     &scanned,
@@ -13342,7 +14828,7 @@ mod tests {
         );
         assert_eq!(
             catalog
-                .verify_reclaim_file(
+                .verify_reclaim_file_metadata(
                     &reserved,
                     fixture.owner.round,
                     &scanned,
@@ -15738,7 +17224,7 @@ mod tests {
         );
         assert_eq!(
             catalog
-                .verify_reclaim_file(
+                .verify_reclaim_file_metadata(
                     &reserved,
                     fixture.owner.round,
                     &scanned,

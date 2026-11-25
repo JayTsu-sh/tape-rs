@@ -112,6 +112,10 @@ fn identity_key(namespace: Uuid, serial: &str, kind: u8, epoch: u64, operation: 
     out.extend_from_slice(operation.as_bytes());
     out
 }
+
+pub(in crate::managed_catalog) fn pending_library_prefix(namespace: Uuid, serial: &str) -> Vec<u8> {
+    library_prefix(namespace, serial, b'q')
+}
 fn global_pending_key(namespace: Uuid, serial: &str, epoch: u64, operation: Uuid) -> Vec<u8> {
     let mut out = namespace_prefix(namespace, b'p');
     out.extend_from_slice(&epoch.to_be_bytes());

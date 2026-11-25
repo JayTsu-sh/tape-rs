@@ -194,6 +194,15 @@ pub(super) fn source_body(actual: &CapturedIndexSource, uid: u64) -> Result<(Ind
 }
 
 impl ReclaimSourceInventory<'_> {
+    /// Budget only: use the actual resolved data UID for EE aliases. This is
+    /// not a read proof, and the later uncached read still validates its context.
+    pub(crate) fn raw_body_length(&self, uid: u64) -> Result<u64> {
+        source_body(self.source, uid)?
+            .1
+            .length
+            .ok_or(CatalogError::Corrupt("原始正文缺少封存长度"))
+    }
+
     pub(crate) fn is_ee_alias(&self, node: &ReclaimSourceNode) -> Result<bool> {
         let entry = self
             .source

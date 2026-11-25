@@ -1,6 +1,5 @@
-//! Owner-fenced reads from an exact local extent cache. No public HTTP route
-//! uses this primitive yet; the returned anonymous file is published only
-//! after the medium, file digest and final ownership checks succeed.
+//! Owner-fenced managed reads through sealed physical plans. The anonymous
+//! body escapes only after medium, digest and final catalog checks succeed.
 
 use std::fs::File;
 use std::io::{Read, Seek, Write};
@@ -10,19 +9,21 @@ use md5::Md5;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::catalog::volume_extents::{ExpectedIndex, VolumeExtentCache};
 use crate::error::{Result, TapeError};
 use crate::ltfs::label::LtfsLabel;
 use crate::ltfs::recovery::{
-    RecoveryBudget, capture_complete_index_source, capture_recorded_index_source,
-    verify_dp_ip_head_with_evidence,
+    RecoveryBudget, capture_complete_index_source, capture_recorded_construct_source,
+    capture_recorded_index_source, verify_dp_ip_head_with_evidence,
 };
-use crate::ltfs::volume::{CommittedIndexConstruct, read_cached_file_to_writer, read_label_only};
+use crate::ltfs::volume::{
+    CommittedIndexConstruct, read_cached_file_to_writer, read_extent_plan_to_writer,
+    read_label_only,
+};
 use crate::managed_catalog::{
     ActiveFileRequest, ActiveIndexIdentity, ActiveLibraryRoute, ActiveLoadedVolumeHead,
-    ActiveReadSource, ContentDigest, ManagedCatalog, ReclaimFile, ReclaimFileMetadata,
-    ReclaimNodeMetadata, ReclaimNodeReadRequest, ReclaimReservation, ReclaimSourceInventory,
-    ReclaimSourceRead, ResolvedRead,
+    ActiveReadSource, ContentDigest, ManagedCatalog, ReadMetadata, ReclaimFile,
+    ReclaimFileMetadata, ReclaimNodeMetadata, ReclaimNodeReadRequest, ReclaimReservation,
+    ReclaimSourceInventory, ReclaimSourceRead, VerifiedExistingCopyLayout, VerifiedPhysicalPlan,
 };
 use crate::scsi::reservation::{ReservationKey, verify_holder};
 use crate::scsi::transport::TapeTransport;
@@ -30,18 +31,26 @@ use crate::tape::commands::TapeDrive;
 
 use super::permission::{Permission, Phase};
 pub use crate::local_read_storage::ReadStorageBudget;
-use crate::local_read_storage::{
-    CacheBuild, CachePin, download_file, reclaim_cache_space, retry_after_space_reclaim,
-};
+use crate::local_read_storage::{download_file, reclaim_cache_space, retry_after_space_reclaim};
 
 #[path = "fdb_read_session.rs"]
 mod session;
 pub(crate) use session::ReadSession;
 #[path = "fdb_reclaim_raw_read.rs"]
 mod raw_reclaim;
+#[path = "fdb_reclaim_source_session.rs"]
+mod reclaim_session;
+pub(crate) use reclaim_session::ReclaimSourceSession;
+
+#[path = "fdb_reclaim_group_read.rs"]
+mod group_read;
+pub(crate) use group_read::ReclaimGroupMemberReadback;
+#[path = "fdb_reclaim_source_group_read.rs"]
+mod source_group_read;
 
 pub struct ActiveMediaRead {
-    pub metadata: ResolvedRead,
+    pub metadata: ReadMetadata,
+    pub physical: VerifiedPhysicalPlan,
     /// Exact current medium head proved by this read. The file's historical
     /// source may predate it and must not be substituted as a health proof.
     pub verified_head: crate::managed_catalog::ActiveIndexIdentity,
@@ -71,6 +80,11 @@ enum ReadTarget<'a> {
 enum ReadAuthority<'a> {
     Published,
     Reclaim(&'a ReclaimReservation, Uuid),
+}
+
+struct VerifiedMediaBounds {
+    full_dp_eod: Option<u64>,
+    ip_generation: Option<u64>,
 }
 impl<'a> ReadTarget<'a> {
     fn authority(self, volume: Uuid) -> ReadAuthority<'a> {
@@ -199,10 +213,11 @@ impl ActiveMediaReader<'_> {
             .await
             .map_err(|e| TapeError::Catalog(e.to_string()))?;
         let evidence = inventory
-            .bind_verified_read(
+            .bind_verified_read_plan(
                 reservation,
                 file,
                 &read.metadata,
+                &read.physical,
                 read.verified_head,
                 sha.finalize().into(),
                 md5,
@@ -283,7 +298,7 @@ impl ActiveMediaReader<'_> {
             || capture_complete_index_source(&TapeDrive::new(reader.device), &label, &budget),
             || reclaim_cache_space(cache_dir, self.storage),
         )?;
-        let (_, head) = reader
+        let (_, head, _) = reader
             .verify_media_head(
                 &read.metadata.placement.barcode,
                 read.metadata.copy.volume_id,
@@ -305,11 +320,11 @@ impl ActiveMediaReader<'_> {
         }
         self.check_device_owner()?;
         let evidence = inventory
-            .bind_verified_metadata(
+            .bind_verified_metadata_plan(
                 reservation,
                 request,
                 source.source().copy(),
-                (&read.metadata, read.verified_head),
+                (&read.metadata, &read.physical, read.verified_head),
                 &captured,
             )
             .map_err(|e| TapeError::Catalog(e.to_string()))?;
@@ -389,7 +404,7 @@ impl ActiveMediaReader<'_> {
             ..*self
         };
         self.check_device_owner()?;
-        let (label, before) = reader
+        let (label, before, _) = reader
             .verify_media_head(&placement.barcode, volume, spool_dir, authority, || {
                 reclaim_cache_space(cache_dir, self.storage)
             })
@@ -405,7 +420,7 @@ impl ActiveMediaReader<'_> {
             || capture_complete_index_source(&TapeDrive::new(reader.device), &label, &budget),
             || reclaim_cache_space(cache_dir, self.storage),
         )?;
-        let (_, after) = reader
+        let (_, after, _) = reader
             .verify_media_head(&placement.barcode, volume, spool_dir, authority, || {
                 reclaim_cache_space(cache_dir, self.storage)
             })
@@ -451,7 +466,7 @@ impl ActiveMediaReader<'_> {
         Ok(observations)
     }
 
-    fn check_device_owner(&self) -> Result<()> {
+    fn check_device_permission(&self) -> Result<()> {
         let round = self.key.round();
         if !self.key.is_ours()
             || !(self.permission.allows(round, Phase::Execution)
@@ -463,6 +478,11 @@ impl ActiveMediaReader<'_> {
                 "FDB 读取缺少当前轮次的多数派许可设备守护".into(),
             ));
         }
+        Ok(())
+    }
+
+    fn check_device_owner(&self) -> Result<()> {
+        self.check_device_permission()?;
         verify_holder(self.device, self.key)
     }
 
@@ -489,18 +509,24 @@ impl ActiveMediaReader<'_> {
         match authority {
             ReadAuthority::Published => self.check_readable().await,
             ReadAuthority::Reclaim(parent, volume) => {
-                if parent.namespace() != self.route.route.namespace
-                    || parent.serial() != self.serial
-                {
-                    return Err(TapeError::Catalog("回收读取授权不属于当前带库".into()));
-                }
-                self.catalog
-                    .require_reclaim_read_lane(parent, self.key.round(), volume)
-                    .await
-                    .map_err(|e| TapeError::Catalog(e.to_string()))?;
+                self.check_reclaim_read_lane(parent, volume).await?;
                 self.check_device_owner()
             }
         }
+    }
+
+    async fn check_reclaim_read_lane(
+        &self,
+        parent: &ReclaimReservation,
+        volume: Uuid,
+    ) -> Result<()> {
+        if parent.namespace() != self.route.route.namespace || parent.serial() != self.serial {
+            return Err(TapeError::Catalog("回收读取授权不属于当前带库".into()));
+        }
+        self.catalog
+            .require_reclaim_read_lane(parent, self.key.round(), volume)
+            .await
+            .map_err(|e| TapeError::Catalog(e.to_string()))
     }
 
     async fn verify_media_head(
@@ -510,7 +536,22 @@ impl ActiveMediaReader<'_> {
         spool_dir: &Path,
         authority: ReadAuthority<'_>,
         reclaim: impl FnOnce() -> Result<bool>,
-    ) -> Result<(LtfsLabel, ActiveLoadedVolumeHead)> {
+    ) -> Result<(LtfsLabel, ActiveLoadedVolumeHead, VerifiedMediaBounds)> {
+        self.verify_media_head_with_prior_label(
+            barcode, volume, spool_dir, authority, reclaim, None,
+        )
+        .await
+    }
+
+    async fn verify_media_head_with_prior_label(
+        &self,
+        barcode: &str,
+        volume: Uuid,
+        spool_dir: &Path,
+        authority: ReadAuthority<'_>,
+        reclaim: impl FnOnce() -> Result<bool>,
+        prior_label: Option<&LtfsLabel>,
+    ) -> Result<(LtfsLabel, ActiveLoadedVolumeHead, VerifiedMediaBounds)> {
         let head = self
             .catalog
             .active_loaded_volume_head(self.serial, barcode, self.route, self.key.round())
@@ -523,7 +564,10 @@ impl ActiveMediaReader<'_> {
                 barcode: barcode.into(),
             });
         }
-        let label = read_label_only(self.device)?;
+        let label = match prior_label {
+            Some(label) => label.clone(),
+            None => read_label_only(self.device)?,
+        };
         if label.volume_uuid != head.volume_id || label.volume_uuid != volume {
             return Err(TapeError::Catalog(
                 "FDB 读取介质标签与文件副本不一致".into(),
@@ -551,6 +595,22 @@ impl ActiveMediaReader<'_> {
             },
             reclaim,
         )?;
+        let label = if prior_label.is_some() {
+            // The source group already has a bracketed label from its first
+            // endpoint. Finish DP and IP reads before rereading it on P0.
+            let current = read_label_only(self.device)?;
+            if current.volume_uuid != label.volume_uuid {
+                return Err(TapeError::Catalog(
+                    "FDB 读取介质标签与文件副本不一致".into(),
+                ));
+            }
+            if current.to_xml()? != label.to_xml()? {
+                return Err(TapeError::Catalog("回收组首尾实际源卷标签不同".into()));
+            }
+            current
+        } else {
+            label
+        };
         self.catalog
             .verify_active_index_predecessors(
                 self.serial,
@@ -566,12 +626,18 @@ impl ActiveMediaReader<'_> {
             .await
             .map_err(|error| TapeError::Catalog(error.to_string()))?;
         self.check_readable_for(authority).await?;
-        Ok((label, head))
+        Ok((
+            label,
+            head,
+            VerifiedMediaBounds {
+                full_dp_eod: proof.full_dp_eod,
+                ip_generation: proof.ip_generation,
+            },
+        ))
     }
 
-    /// Build a missing exact-index cache after proving the current medium
-    /// head. Existing caches are never overwritten, including corrupt ones.
-    /// The executor must serialize both cache rebuilding and content reads.
+    /// Read through the FDB layout or freshly capture its original source.
+    /// The compatibility cache argument is never used to serve metadata.
     pub async fn read_with_cache(
         &self,
         path: &[u8],
@@ -630,90 +696,15 @@ impl ActiveMediaReader<'_> {
         cache_dir: &Path,
         spool_dir: &Path,
     ) -> Result<Option<ActiveMediaRead>> {
-        self.check_device_owner()?;
-        let source = target.resolve(self).await?;
-        let Some(source) = source else {
-            return Ok(None);
-        };
-        require_pool(pool, source.placement().pool_id)?;
-        let authority = target.authority(source.copy().volume_id);
-        let cache_path = cache_dir.join(cache_name(source.source, source.baseline.as_ref()));
-        let _cache_pin = match CachePin::open(&cache_path) {
-            Ok(pin) => pin,
-            Err(TapeError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                let (label, head) = self
-                    .verify_media_head(
-                        &source.placement().barcode,
-                        source.source.volume_uuid,
-                        spool_dir,
-                        authority,
-                        || reclaim_cache_space(cache_dir, self.storage),
-                    )
-                    .await?;
-                let mut storage = CacheBuild::new(cache_dir, self.storage)?;
-                if let Some(identity) = source
-                    .baseline
-                    .as_ref()
-                    .filter(|identity| identity.head().incremental)
-                {
-                    let mut budget = RecoveryBudget::default();
-                    budget.index_scratch.directory = spool_dir.to_path_buf();
-                    budget.index_scratch.max_bytes = self.storage.index_bytes;
-                    budget.index_scratch.headroom_bytes = self.storage.headroom_bytes;
-                    let captured = capture_recorded_index_source(
-                        &TapeDrive::new(self.device),
-                        &label,
-                        identity,
-                        &budget,
-                    )?;
-                    VolumeExtentCache::build_captured(&captured, &cache_path, &mut storage)?;
-                } else {
-                    VolumeExtentCache::build_managed_from_media(
-                        &TapeDrive::new(self.device),
-                        &label,
-                        &RecoveryBudget::default(),
-                        &cache_path,
-                        ExpectedIndex {
-                            volume_uuid: source.source.volume_uuid,
-                            generation: source.source.generation,
-                            location: source.source.location,
-                            sha256: source.source.sha256,
-                        },
-                        source.source.incremental,
-                        &mut storage,
-                    )?;
-                }
-                storage.finish()?;
-                let pin = CachePin::open(&cache_path)?;
-                self.check_device_owner()?;
-                let final_source = target.resolve(self).await?;
-                let final_head = self
-                    .catalog
-                    .active_loaded_volume_head(
-                        self.serial,
-                        &source.placement().barcode,
-                        self.route,
-                        self.key.round(),
-                    )
-                    .await
-                    .map_err(|error| TapeError::Catalog(error.to_string()))?;
-                if final_source.as_ref() != Some(&source) || final_head != Some(head) {
-                    return Err(TapeError::Catalog(
-                        "FDB 文件或卷头在缓存重建期间改变".into(),
-                    ));
-                }
-                self.check_readable_for(authority).await?;
-                pin
-            }
-            Err(error) => return Err(error),
-        };
-        self.read_scoped(target, pool, &cache_path, spool_dir, Some(cache_dir))
+        // The cache directory is retained in the public API for compatible
+        // storage reclamation, never as a source of managed business metadata.
+        self.read_scoped(target, pool, cache_dir, spool_dir, Some(cache_dir))
             .await
     }
 
     /// Read one published file into an unlinked 0600 temporary file. No bytes
     /// escape before checksum and final route/epoch/copy/head checks pass.
-    /// A cache miss is an error; rebuilding a cache is a separate owner task.
+    /// A missing layout requires fresh verification of the original source.
     pub async fn read(
         &self,
         path: &[u8],
@@ -734,46 +725,136 @@ impl ActiveMediaReader<'_> {
         &self,
         target: ReadTarget<'_>,
         pool: Option<Uuid>,
-        cache_path: &Path,
+        _cache_path: &Path,
         spool_dir: &Path,
         managed_cache: Option<&Path>,
     ) -> Result<Option<ActiveMediaRead>> {
         self.check_device_owner()?;
-        let _cache_pin = CachePin::open(cache_path)?;
-        let plan = target
-            .resolve(self)
-            .await?
-            .map(|source| source.plan_read(cache_path))
-            .transpose()
-            .map_err(|error| TapeError::Catalog(error.to_string()))?;
-        let Some(plan) = plan else {
+        let Some(mut source) = target.resolve(self).await? else {
             return Ok(None);
         };
-        require_pool(pool, plan.read.placement.pool_id)?;
-        let authority = target.authority(plan.read.copy.volume_id);
+        if (source.layout_binding().is_none() || source.needs_marker_upgrade())
+            && !source.has_existing_snapshot()
+        {
+            self.catalog
+                .materialize_legacy_layout_source(
+                    self.serial,
+                    self.route,
+                    self.key.round(),
+                    &source,
+                )
+                .await
+                .map_err(|e| TapeError::Catalog(e.to_string()))?;
+            let refreshed = target
+                .resolve(self)
+                .await?
+                .ok_or_else(|| TapeError::Catalog("原读取副本在归并后消失".into()))?;
+            if !source.same_selection(&refreshed) || !refreshed.has_existing_snapshot() {
+                return Err(TapeError::Catalog(
+                    "原读取副本在归并期间改变或缺少真实 R".into(),
+                ));
+            }
+            source = refreshed;
+        }
+        let metadata = source.metadata();
+        require_pool(pool, metadata.placement.pool_id)?;
+        let authority = target.authority(metadata.copy.volume_id);
         let reclaim = || match managed_cache {
             Some(directory) => reclaim_cache_space(directory, self.storage),
             None => Ok(false),
         };
         let file = retry_after_space_reclaim(
-            || download_file(spool_dir, plan.read.copy.size, self.storage),
+            || download_file(spool_dir, metadata.copy.size, self.storage),
             reclaim,
         )?;
-        let (label, head) = self
+        let (label, head, _) = self
             .verify_media_head(
-                &plan.read.placement.barcode,
-                plan.source.volume_uuid,
+                &metadata.placement.barcode,
+                source.source.volume_uuid,
                 spool_dir,
                 authority,
                 reclaim,
             )
             .await?;
 
-        if let Some(identity) = plan
-            .baseline
-            .as_ref()
-            .filter(|identity| identity.head().incremental)
+        if source.layout_binding().is_none() || source.needs_marker_upgrade() {
+            let mut budget = RecoveryBudget::default();
+            budget.index_scratch.directory = spool_dir.to_path_buf();
+            budget.index_scratch.max_bytes = self.storage.index_bytes;
+            budget.index_scratch.headroom_bytes = self.storage.headroom_bytes;
+            let captured = if let Some(identity) = &source.baseline {
+                capture_recorded_index_source(
+                    &TapeDrive::new(self.device),
+                    &label,
+                    identity,
+                    &budget,
+                )?
+            } else {
+                capture_recorded_construct_source(
+                    &TapeDrive::new(self.device),
+                    &label,
+                    CommittedIndexConstruct {
+                        volume_uuid: source.source.volume_uuid,
+                        generation: source.source.generation,
+                        location: source.source.location,
+                        sha256: source.source.sha256,
+                        incremental: source.source.incremental,
+                    },
+                    &budget,
+                )?
+            };
+            self.check_device_owner()?;
+            let proof = if source.is_retained() {
+                VerifiedExistingCopyLayout::from_retained_captured(&source, &captured, &label)
+            } else {
+                VerifiedExistingCopyLayout::from_captured(&source, &captured, &label)
+            }
+            .map_err(|e| TapeError::Catalog(e.to_string()))?;
+            let attached = self
+                .catalog
+                .backfill_existing_body_layout(self.serial, self.route, self.key.round(), &proof)
+                .await
+                .map_err(|e| TapeError::Catalog(e.to_string()))?;
+            self.check_device_owner()?;
+            let refreshed = target
+                .resolve(self)
+                .await?
+                .ok_or_else(|| TapeError::Catalog("回填后原读取副本消失".into()))?;
+            if !source.same_selection(&refreshed) || refreshed.layout_binding() != Some(&attached) {
+                return Err(TapeError::Catalog("回填后原读取副本或绑定改变".into()));
+            }
+            source = refreshed;
+        }
+        let binding = source
+            .layout_binding()
+            .ok_or_else(|| TapeError::Catalog("原副本缺少完整 FDB 正文布局".into()))?;
+        let temporary = retry_after_space_reclaim(
+            || {
+                download_file(
+                    spool_dir,
+                    binding.encoded_bytes(),
+                    ReadStorageBudget {
+                        download_bytes: self.storage.index_bytes,
+                        ..self.storage
+                    },
+                )
+            },
+            reclaim,
+        )?;
+        let physical = source
+            .prepare_body_plan(self.catalog, temporary, self.storage.index_bytes)
+            .await?;
+        if physical.volume() != source.source.volume_uuid
+            || physical.uid() != metadata.copy.ltfs_file_uid
+            || physical.length() != metadata.copy.size
+            || physical.block_size() != label.blocksize
+            || physical.partitions() != [label.index_partition, label.data_partition]
         {
+            return Err(TapeError::Catalog("正文布局与实际介质或副本不一致".into()));
+        }
+        if let Some(identity) = source.baseline.as_ref().filter(|identity| {
+            identity.head().incremental || ActiveIndexIdentity::from(identity.head()) != head.index
+        }) {
             crate::ltfs::recovery::verify_recorded_source_constructs(
                 &TapeDrive::new(self.device),
                 &label,
@@ -785,14 +866,21 @@ impl ActiveMediaReader<'_> {
 
         let mut writer = DigestingFile {
             file,
-            remaining: plan.read.copy.size,
-            digest: match plan.read.copy.content_digest {
+            remaining: metadata.copy.size,
+            digest: match metadata.copy.content_digest {
                 ContentDigest::Unknown => ReadDigest::Unknown,
                 ContentDigest::Md5(_) => ReadDigest::Md5(Md5::new()),
                 ContentDigest::Sha256(_) => ReadDigest::Sha256(Sha256::new()),
             },
         };
-        read_cached_file_to_writer(self.device, &label, &plan.read.physical, &mut writer)?;
+        read_extent_plan_to_writer(
+            self.device,
+            &label,
+            physical.path(),
+            physical.length(),
+            physical.extents(),
+            &mut writer,
+        )?;
         if writer.remaining != 0 {
             return Err(TapeError::Catalog("FDB 文件读取长度不足".into()));
         }
@@ -801,33 +889,29 @@ impl ActiveMediaReader<'_> {
             ReadDigest::Md5(hash) => ContentDigest::Md5(hash.finalize().into()),
             ReadDigest::Sha256(hash) => ContentDigest::Sha256(hash.finalize().into()),
         };
-        if actual != plan.read.copy.content_digest {
+        if actual != metadata.copy.content_digest {
             return Err(TapeError::Catalog("FDB 文件读取摘要不符".into()));
         }
         self.check_device_owner()?;
-        let final_plan = target
-            .resolve(self)
-            .await?
-            .map(|source| source.plan_read(cache_path))
-            .transpose()
-            .map_err(|error| TapeError::Catalog(error.to_string()))?;
+        let final_source = target.resolve(self).await?;
         let final_head = self
             .catalog
             .active_loaded_volume_head(
                 self.serial,
-                &plan.read.placement.barcode,
+                &metadata.placement.barcode,
                 self.route,
                 self.key.round(),
             )
             .await
             .map_err(|error| TapeError::Catalog(error.to_string()))?;
-        if final_plan.as_ref() != Some(&plan) || final_head != Some(head) {
+        if final_source.as_ref() != Some(&source) || final_head != Some(head) {
             return Err(TapeError::Catalog("FDB 文件或卷头在读取期间改变".into()));
         }
         self.check_readable_for(authority).await?;
         writer.file.rewind()?;
         Ok(Some(ActiveMediaRead {
-            metadata: plan.read,
+            metadata,
+            physical,
             verified_head: head.index,
             file: writer.file,
         }))
@@ -841,29 +925,6 @@ fn require_pool(expected: Option<Uuid>, actual: Uuid) -> Result<()> {
         });
     }
     Ok(())
-}
-
-fn cache_name(
-    source: ActiveIndexIdentity,
-    baseline: Option<&crate::ltfs::recovery::IndexSourceIdentity>,
-) -> String {
-    let mut hash = Sha256::new();
-    if let Some(identity) = baseline.filter(|identity| identity.head().incremental) {
-        hash.update(b"tape-rs/complete-replay-cache/1");
-        hash.update(identity.fingerprint());
-    }
-    hash.update(source.volume_uuid.as_bytes());
-    hash.update(source.generation.to_be_bytes());
-    hash.update((source.location.partition as u32).to_be_bytes());
-    hash.update(source.location.start_block.to_be_bytes());
-    hash.update(source.sha256);
-    hash.update([u8::from(source.incremental)]);
-    let digest: String = hash
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    format!("extent-{digest}.sqlite")
 }
 
 enum ReadDigest {

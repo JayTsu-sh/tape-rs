@@ -62,10 +62,26 @@ pub(super) async fn cleanup_completed_page_at(
                 "回收清理不能移除未结清或其他作用域的子请求",
             ));
         }
-        keys.push((key, reverse));
+        let parent_epoch = reservation.intent["epoch"]
+            .as_u64()
+            .ok_or(CatalogError::Corrupt("回收父代次"))?;
+        let parent_operation = Uuid::parse_str(
+            reservation.intent["operation"]
+                .as_str()
+                .ok_or(CatalogError::Corrupt("回收父操作"))?,
+        )
+        .map_err(|_| CatalogError::Corrupt("回收父操作 UUID"))?;
+        keys.push((key, reverse, parent_epoch, parent_operation, operation));
     }
     let cleared = !keys.is_empty();
-    for (key, reverse) in keys {
+    for (key, reverse, parent_epoch, parent_operation, operation) in keys {
+        crate::managed_catalog::body_layouts::clear_retained_child_at(
+            tr,
+            reservation.namespace(),
+            parent_epoch,
+            parent_operation,
+            operation,
+        );
         tr.clear(&key);
         tr.clear(&reverse);
     }
@@ -543,10 +559,93 @@ pub(in crate::managed_catalog) async fn require_request_at(
     request: &ActiveFileRequest,
     owner: u64,
 ) -> Result<()> {
+    require_request_in(tr, request, owner, ReclaimProtocolContext::Single).await
+}
+
+pub(in crate::managed_catalog) async fn require_request_in(
+    tr: &Transaction,
+    request: &ActiveFileRequest,
+    owner: u64,
+    context: ReclaimProtocolContext<'_>,
+) -> Result<()> {
     if let Some(pool) = request.pool_id {
         require_metadata_copy_idle_at(tr, request.namespace, pool).await?;
+        if let Some((saved, _)) = child_at(tr, request.namespace, pool, request.request_epoch, request.operation_id, owner).await? {
+            require_child_protocol_at(tr, &saved, owner, context).await?;
+        } else if matches!(context, ReclaimProtocolContext::Group(_)) {
+            return Err(CatalogError::Invalid("分组写入缺少原回收子请求"));
+        }
+    } else if matches!(context, ReclaimProtocolContext::Group(_)) {
+        return Err(CatalogError::Invalid("分组写入缺少原pool作用域"));
     }
     require_request_identity_at(tr, request, owner).await
+}
+
+async fn require_child_protocol_at(
+    tr: &Transaction,
+    child: &ActiveFileIntent,
+    owner: u64,
+    context: ReclaimProtocolContext<'_>,
+) -> Result<()> {
+    match context {
+        ReclaimProtocolContext::Group(scope) => scope.require_request_at(tr,&child.request(),owner).await,
+        ReclaimProtocolContext::Single => {
+            if parent_for_stored_child_at(tr,child,owner).await?.intent()["version"] != 1 {
+                return Err(CatalogError::Invalid("v2回收子请求必须使用原typed分组执行范围"));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Restore an already validated original child, without admitting a new write.
+/// Callers decide Single, fresh Group, or proof-only publication semantics.
+pub(super) async fn parent_for_stored_child_at(
+    tr: &Transaction, child: &ActiveFileIntent, owner: u64,
+) -> Result<ReclaimReservation> {
+    let token = pool_gate_at(tr,child.namespace,child.pool_id.ok_or(CatalogError::Incomplete)?)
+        .await?.ok_or(CatalogError::Incomplete)?;
+    let mut journal = domain(child.namespace,b'j');
+    journal.extend_from_slice(&token["epoch"].as_u64().ok_or(CatalogError::Incomplete)?.to_be_bytes());
+    journal.extend_from_slice(node_mutation::id(token["operation"].as_str().ok_or(CatalogError::Incomplete)?)?.as_bytes());
+    let raw = tr.get(&journal,false).await?.ok_or(CatalogError::Incomplete)?;
+    let saved = decode(&raw)?;
+    validate_parent_intent(&saved["intent"])?;
+    let route = routing::decode_active(&tr.get(&routing::active_key(&child.library_serial),false).await?.ok_or(CatalogError::Incomplete)?)?;
+    let parent = ReclaimReservation { intent:saved["intent"].clone(),route };
+    record_at(tr,&parent,owner).await?;
+    if parent.namespace() != child.namespace || parent.serial() != child.library_serial
+        || Some(parent.spec().pool()) != child.pool_id || parent.token() != token {
+        return Err(CatalogError::Corrupt("原子请求与父协议作用域不同"));
+    }
+    Ok(parent)
+}
+
+pub(super) async fn parent_for_receipt_at(
+    tr: &Transaction, receipt: &CommitReceipt,
+) -> Result<Option<(ReclaimReservation,ActiveFileIntent)>> {
+    let identity = tr.get(&identity_key(receipt.namespace,receipt.operation_id),false).await?;
+    let Some(pool) = receipt.pool_id else {
+        if identity.is_some() { return Err(CatalogError::Corrupt("原回收收据删除了pool作用域")); }
+        return Ok(None);
+    };
+    let Some(token) = pool_gate_at(tr,receipt.namespace,pool).await? else {
+        if identity.is_some() { return Err(CatalogError::Corrupt("原回收收据缺少父屏障")); }
+        return Ok(None);
+    };
+    let mut journal = domain(receipt.namespace,b'j');
+    journal.extend_from_slice(&token["epoch"].as_u64().ok_or(CatalogError::Incomplete)?.to_be_bytes());
+    journal.extend_from_slice(node_mutation::id(token["operation"].as_str().ok_or(CatalogError::Incomplete)?)?.as_bytes());
+    let raw = tr.get(&journal,false).await?.ok_or(CatalogError::Incomplete)?;
+    let saved = decode(&raw)?;
+    let owner = saved["owner_epoch"].as_u64().filter(|owner| *owner>0).ok_or(CatalogError::Incomplete)?;
+    let (child,_) = child_at(tr,receipt.namespace,pool,receipt.request_epoch,receipt.operation_id,owner)
+        .await?.ok_or(CatalogError::Incomplete)?;
+    if !reservation::matches_receipt(&child,receipt) {
+        return Err(CatalogError::Invalid("回收发布收据不是原子请求"));
+    }
+    let parent = parent_for_stored_child_at(tr,&child,owner).await?;
+    Ok(Some((parent,child)))
 }
 
 pub(super) async fn require_request_identity_at(
@@ -575,6 +674,14 @@ pub(in crate::managed_catalog) async fn require_intent_at(
     tr: &Transaction,
     intent: &ActiveFileIntent,
 ) -> Result<Option<u16>> {
+    require_intent_in(tr, intent, ReclaimProtocolContext::Single).await
+}
+
+pub(in crate::managed_catalog) async fn require_intent_in(
+    tr: &Transaction,
+    intent: &ActiveFileIntent,
+    context: ReclaimProtocolContext<'_>,
+) -> Result<Option<u16>> {
     if let Some(pool) = intent.pool_id {
         require_metadata_copy_idle_at(tr, intent.namespace, pool).await?;
     }
@@ -590,6 +697,7 @@ pub(in crate::managed_catalog) async fn require_intent_at(
         .await?
     {
         saved.owner_epoch = intent.owner_epoch;
+        require_child_protocol_at(tr,&saved,intent.owner_epoch,context).await?;
         if saved != *intent {
             return Err(CatalogError::Invalid("回收复制物理目标或完整请求改变"));
         }
@@ -603,12 +711,23 @@ pub(in crate::managed_catalog) async fn require_intent_at(
         }
         return Ok(Some(permit));
     }
+    if matches!(context,ReclaimProtocolContext::Group(_)) {
+        return Err(CatalogError::Invalid("分组写入缺少原回收子请求"));
+    }
     Ok(None)
 }
 
 pub(in crate::managed_catalog) async fn require_receipt_at(
     tr: &Transaction,
     receipt: &CommitReceipt,
+) -> Result<()> {
+    require_receipt_in(tr, receipt, ReclaimProtocolContext::Single).await
+}
+
+pub(in crate::managed_catalog) async fn require_receipt_in(
+    tr: &Transaction,
+    receipt: &CommitReceipt,
+    context: ReclaimProtocolContext<'_>,
 ) -> Result<()> {
     if let Some(pool) = receipt.pool_id
         && let Some((saved, _)) = child_at(
@@ -620,11 +739,257 @@ pub(in crate::managed_catalog) async fn require_receipt_at(
             receipt.owner_epoch,
         )
         .await?
-        && !reservation::matches_receipt(&saved, receipt)
     {
-        return Err(CatalogError::Invalid("回收复制收据与封存请求不一致"));
+        require_child_protocol_at(tr,&saved,receipt.owner_epoch,context).await?;
+        if !reservation::matches_receipt(&saved, receipt) {
+            return Err(CatalogError::Invalid("回收复制收据与封存请求不一致"));
+        }
+        return Ok(());
+    }
+    if matches!(context,ReclaimProtocolContext::Group(_)) {
+        return Err(CatalogError::Invalid("分组收据缺少原回收子请求"));
     }
     Ok(())
+}
+
+/// An opaque active-child read authority. Only the actual checked child
+/// transaction below constructs it; original R bytes never come from a caller.
+#[derive(Clone, Debug)]
+pub(crate) struct RetainedLedgerAuthority(std::sync::Arc<RetainedLedgerData>);
+#[derive(Debug)]
+struct RetainedLedgerData {
+    reservation: ReclaimReservation,
+    request: ActiveFileRequest,
+    owner: u64,
+    original_copy: Vec<u8>,
+    original_head: Vec<u8>,
+    head: FileHead,
+    copy: PhysicalCopy,
+    proof: ReclaimSourceRead,
+    rows: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    destination: Option<ReclaimBodyDestination>,
+}
+impl PartialEq for RetainedLedgerAuthority {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.reservation.fingerprint() == other.0.reservation.fingerprint()
+            && self.0.owner == other.0.owner
+            && self.0.request == other.0.request
+            && self.0.original_copy == other.0.original_copy
+            && self.0.original_head == other.0.original_head
+            && self.0.rows == other.0.rows
+            && self.0.destination == other.0.destination
+            && self.0.proof == other.0.proof
+    }
+}
+impl Eq for RetainedLedgerAuthority {}
+impl RetainedLedgerAuthority {
+    pub(crate) fn owner(&self) -> u64 {
+        self.0.owner
+    }
+    pub(crate) fn serial(&self) -> &str {
+        self.0.reservation.serial()
+    }
+    pub(crate) fn route(&self) -> ActiveLibraryRoute {
+        self.0.reservation.route
+    }
+    pub(crate) fn matches_selection(
+        &self,
+        namespace: Uuid,
+        file: Uuid,
+        head: &FileHead,
+        copy: &PhysicalCopy,
+    ) -> bool {
+        namespace == self.namespace()
+            && file == self.0.request.file_id
+            && head == &self.0.head
+            && copy == &self.0.copy
+    }
+    pub(crate) fn original_record(&self) -> &[u8] {
+        &self.0.original_copy
+    }
+    #[cfg(test)]
+    pub(in crate::managed_catalog) fn test_dependency_keys(&self) -> [Vec<u8>; 3] {
+        // Return the exact keys already captured by this private factory:
+        // child, reverse child identity, and retirement receipt.
+        [
+            self.0.rows[0].0.clone(),
+            self.0.rows[4].0.clone(),
+            self.0.rows[3].0.clone(),
+        ]
+    }
+    #[cfg(test)]
+    pub(in crate::managed_catalog) async fn test_cleanup_page_at(
+        &self,
+        tr: &Transaction,
+    ) -> Result<bool> {
+        // Kernel only. The production caller's completion/claim gates remain
+        // mandatory; this delegate never constructs a completion receipt.
+        cleanup_completed_page_at(tr, &self.0.reservation).await
+    }
+    pub(crate) fn namespace(&self) -> Uuid {
+        self.0.reservation.namespace()
+    }
+    pub(crate) fn scope_identity(&self) -> (u64, Uuid, Uuid, Uuid, Uuid) {
+        (
+            self.0.reservation.intent["epoch"]
+                .as_u64()
+                .expect("validated epoch"),
+            Uuid::parse_str(
+                self.0.reservation.intent["operation"]
+                    .as_str()
+                    .expect("validated operation"),
+            )
+            .expect("validated UUID"),
+            self.0.request.operation_id,
+            self.0.request.file_id,
+            self.0.head.copy_id,
+        )
+    }
+    pub(crate) fn require_at<'a>(
+        &'a self,
+        tr: &'a Transaction,
+        owner: u64,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<()>> + 'a>> {
+        Box::pin(async move {
+            if owner != self.0.owner {
+                return Err(CatalogError::OwnerFenced);
+            }
+            let current =
+                capture_retained_ledger_at(tr, &self.0.reservation, owner, &self.0.request).await?;
+            if &current != self {
+                return Err(CatalogError::Incomplete);
+            }
+            Ok(())
+        })
+    }
+}
+
+fn capture_retained_ledger_at<'a>(
+    tr: &'a Transaction,
+    reservation: &'a ReclaimReservation,
+    owner: u64,
+    request: &'a ActiveFileRequest,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<RetainedLedgerAuthority>> + 'a>> {
+    Box::pin(async move {
+        request.validate()?;
+        let parent = record_at(tr, reservation, owner).await?;
+        if parent["owner_epoch"] != owner {
+            return Err(CatalogError::OwnerFenced);
+        }
+        if parent["phase"] != "copying" {
+            return Err(CatalogError::Invalid("保留源布局只允许未完成的复制父任务"));
+        }
+        let spec = reservation.spec();
+        if request.namespace != reservation.namespace() || request.pool_id != Some(spec.pool) {
+            return Err(CatalogError::Invalid("回收读取不属于原池"));
+        }
+        let (saved, _) = child_at(
+            tr,
+            request.namespace,
+            spec.pool,
+            request.request_epoch,
+            request.operation_id,
+            owner,
+        )
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+        if saved.request() != *request {
+            return Err(CatalogError::Invalid("回收读取原请求改变"));
+        }
+        let source_child_key = child_key(
+            request.namespace,
+            &reservation.token(),
+            request.operation_id,
+        )?;
+        let raw = tr
+            .get(&source_child_key, false)
+            .await?
+            .ok_or(CatalogError::Incomplete)?;
+        let child = decode(&raw)?;
+        let original_head = serde_json::from_value::<Vec<u8>>(child["source_head"].clone())
+            .map_err(|_| CatalogError::Corrupt("回收原文件头"))?;
+        let original_copy = serde_json::from_value::<Vec<u8>>(child["source_copy"].clone())
+            .map_err(|_| CatalogError::Corrupt("回收原副本"))?;
+        let head = decode_head(&original_head)?;
+        let copy = copy_records::decode_copy(&original_copy)?;
+        let proof = ReclaimSourceRead::require_source(
+            &child["source_read"],
+            &reservation.fingerprint(),
+            &head,
+            &copy,
+            &saved,
+        )?;
+        source_state_at(tr, reservation).await?;
+        let current_key = copy_key(request.namespace, request.file_id, head.copy_id);
+        let current = tr
+            .get(&current_key, false)
+            .await?
+            .ok_or(CatalogError::Incomplete)?;
+        let reverse = volume_key(
+            copy.volume_id,
+            copy.volume_scan_id,
+            request.namespace,
+            request.file_id,
+            head.copy_id,
+        );
+        let reverse_value = tr.get(&reverse, false).await?;
+        let file = ReclaimFile::from_request(request)?;
+        let mut retired_key = walk::verification_key(reservation, &file);
+        retired_key[domain(request.namespace, b'v').len() - 1] = b'x';
+        let retired = tr.get(&retired_key, false).await?;
+        let destination = if current.as_ref() == original_copy {
+            if retired.is_some()
+                || !reverse_value
+                    .as_deref()
+                    .is_some_and(|v| v.len() == 40 && read_u64(v) == copy.version)
+            {
+                return Err(CatalogError::Corrupt("保留 Live 源 R/V/x 不一致"));
+            }
+            None
+        } else {
+            // Existing strict read-only checker binds marker, empty V, exact x,
+            // original source SHA and the complete actual target readback proof.
+            Some(retirement::retired_destination_at(tr, reservation, owner, &file, request).await?)
+        };
+        let mut rows = vec![
+            (source_child_key, Some(raw.to_vec())),
+            (current_key, Some(current.to_vec())),
+            (reverse, reverse_value.map(|v| v.to_vec())),
+            (retired_key, retired.map(|v| v.to_vec())),
+        ];
+        for key in [
+            identity_key(request.namespace, request.operation_id),
+            head_key(request.namespace, request.file_id),
+            history_pin_key(request),
+            reservation.journal_key(),
+        ] {
+            let value = tr.get(&key, false).await?;
+            rows.push((key, value.map(|v| v.to_vec())));
+        }
+        if rows.len() > 16
+            || rows
+                .iter()
+                .any(|(_, v)| v.as_ref().is_some_and(|v| v.len() > 100_000))
+            || original_copy.len() > 100_000
+            || original_head.len() > 100_000
+        {
+            return Err(CatalogError::Corrupt("保留源授权快照超过边界"));
+        }
+        Ok(RetainedLedgerAuthority(std::sync::Arc::new(
+            RetainedLedgerData {
+                reservation: reservation.clone(),
+                request: request.clone(),
+                owner,
+                original_copy,
+                original_head,
+                head,
+                copy,
+                proof,
+                rows,
+                destination,
+            },
+        )))
+    })
 }
 
 pub(super) async fn read_source_at(
@@ -633,75 +998,27 @@ pub(super) async fn read_source_at(
     owner: u64,
     request: &ActiveFileRequest,
 ) -> Result<ReclaimReadSource> {
-    request.validate()?;
-    let parent = record_at(tr, reservation, owner).await?;
-    if parent["owner_epoch"] != owner {
-        return Err(CatalogError::OwnerFenced);
-    }
-    let spec = reservation.spec();
-    if request.namespace != reservation.namespace() || request.pool_id != Some(spec.pool) {
-        return Err(CatalogError::Invalid("回收读取不属于原池"));
-    }
-    let (saved, _) = child_at(
-        tr,
-        request.namespace,
-        spec.pool,
-        request.request_epoch,
-        request.operation_id,
-        owner,
-    )
-    .await?
-    .ok_or(CatalogError::Incomplete)?;
-    if saved.request() != *request {
-        return Err(CatalogError::Invalid("回收读取原请求改变"));
-    }
-    let raw = tr
-        .get(
-            &child_key(
-                request.namespace,
-                &reservation.token(),
-                request.operation_id,
-            )?,
-            false,
-        )
+    let authority = capture_retained_ledger_at(tr, reservation, owner, request).await?;
+    let placement = control::verified_placement(tr, reservation.spec().volume)
         .await?
         .ok_or(CatalogError::Incomplete)?;
-    let child = decode(&raw)?;
-    let head = decode_head(
-        &serde_json::from_value::<Vec<u8>>(child["source_head"].clone())
-            .map_err(|_| CatalogError::Corrupt("回收原文件头"))?,
-    )?;
-    let copy = copy_records::decode_copy(
-        &serde_json::from_value::<Vec<u8>>(child["source_copy"].clone())
-            .map_err(|_| CatalogError::Corrupt("回收原副本"))?,
-    )?;
-    let proof = ReclaimSourceRead::require_source(
-        &child["source_read"],
-        &reservation.fingerprint(),
-        &head,
-        &copy,
-        &saved,
-    )?;
-    source_state_at(tr, reservation).await?;
-    let placement = control::verified_placement(tr, spec.volume)
-        .await?
-        .ok_or(CatalogError::Incomplete)?;
-    let path = pool_catalog_path(spec.pool, &request.ltfs_path()?.into_bytes())?;
-    let source = lookup::read_source_at(
+    let path = pool_catalog_path(reservation.spec().pool, &request.ltfs_path()?.into_bytes())?;
+    let source = lookup::read_retained_source_at(
         tr,
         reservation.serial(),
         &path,
         ResolvedPath::File {
             id: request.file_id,
-            head,
-            copy: Box::new(copy),
+            head: authority.0.head.clone(),
+            copy: Box::new(authority.0.copy.clone()),
             placement,
             attributes: None,
             object_metadata: None,
         },
+        authority.clone(),
     )
     .await?;
-    Ok(ReclaimReadSource::new(source, proof))
+    Ok(ReclaimReadSource::new(source, authority.0.proof.clone()))
 }
 
 impl ManagedCatalog {
@@ -737,84 +1054,19 @@ impl ManagedCatalog {
                 "回收复制必须保留原池及版本并写入其他磁带",
             ));
         }
-        self.db.run(|tr, _| {
-            let source = source.clone();
-            Box::pin(async move { requests::retry_result(async {
-                let mut parent = record_at(&tr, reservation, owner).await?;
-                if parent["phase"] == "reformatting" { return Err(CatalogError::Invalid("源卷已进入格式化阶段，不能再准备迁移正文")); }
-                if parent["owner_epoch"] != owner { return Err(CatalogError::OwnerFenced); }
-                source::require_metadata_idle_at(&tr, reservation).await?;
-                require_parent_pool_at(&tr, reservation).await?;
-                let (_, source_index) = source_state_at(&tr, reservation).await?;
-                let mut source_index_bytes = Vec::new(); active_volume::encode_index(&mut source_index_bytes, source_index);
-                if source_read.index() != source_index_bytes { return Err(CatalogError::Invalid("回收源实读卷头与封存源不同")); }
-                let read_value = source_read.value()?;
-                let reverse = identity_key(reservation.namespace(), spec.operation_id);
-                let original = tr.get(&reverse, false).await?;
-                let epoch = if let Some(raw) = &original {
-                    original_epoch(raw, &reservation.token())?
-                } else {
-                    requests::window(&tr, reservation.namespace()).await?.accepting
-                };
-                let key = child_key(reservation.namespace(), &reservation.token(), spec.operation_id)?;
-                if let Some(raw) = tr.get(&key, false).await? {
-                    if decode(&raw)?["source_read"] != read_value { return Err(CatalogError::Invalid("回收复制重试改变原源实读证明")); }
-                    let (mut saved, _) = child_at(&tr, reservation.namespace(), source.pool, epoch, spec.operation_id, owner).await?
-                        .ok_or(CatalogError::Corrupt("回收子请求失去池屏障"))?;
-                    if saved.ltfs_path()?.as_bytes() != spec.path || saved.expected_size != spec.size
-                        || saved.expected_digest != spec.digest || saved.expected_version != spec.expected_version
-                        || saved.barcode_constraint.as_deref() != Some(destination) {
-                        return Err(CatalogError::Invalid("回收复制重试改变原请求"));
-                    }
-                    saved.owner_epoch = owner;
-                    return Ok(saved);
-                }
-                if original.is_some() { return Err(CatalogError::Corrupt("回收复制反向身份缺少原子请求")); }
-                let path = pool_catalog_path(source.pool, &spec.path)?;
-                let Some(ResolvedPath::File { id, head, copy, placement, .. }) = lookup::resolve_active_path_at_mode(
-                    &tr, reservation.namespace(), lookup::path_components(&path)?, false).await? else {
-                    return Err(CatalogError::Invalid("回收源路径不存在或不是文件"));
-                };
-                if copy.volume_id != source.volume || placement.barcode != source.barcode
-                    || placement.pool_id != source.pool || Some(head.version) != spec.expected_version
-                    || copy.size != spec.size || matches!(copy.content_digest, ContentDigest::Sha256(_)) && copy.content_digest != spec.digest {
-                    return Err(CatalogError::Invalid("回收源身份、大小或内容摘要改变"));
-                }
-                let intent = upload::prepare_upload_at(&tr, reservation.namespace(), reservation.serial(), owner, destination, spec).await?;
-                upload_retry::identity_at(&tr,reservation,&ReclaimFile::from_request(&intent.request())?).await?;
-                if intent.file_id != id || intent.request_epoch != epoch { return Err(CatalogError::Invalid("回收原文件 inode 或请求代次改变")); }
-                ReclaimSourceRead::require_source(&read_value, &reservation.fingerprint(), &head, &copy, &intent)?;
-                let copy_raw = tr.get(&copy_key(reservation.namespace(), id, head.copy_id), false).await?
-                    .ok_or(CatalogError::Corrupt("回收原副本丢失"))?;
-                if copy_records::decode_copy(&copy_raw)? != *copy { return Err(CatalogError::Corrupt("回收原副本与路径不一致")); }
-                let pin = history_pin_key(&intent.request());
-                if tr.get(&pin, false).await?.is_some() { return Err(CatalogError::Invalid("回收子请求的历史引用身份已被使用")); }
-                let mut value = json!({"version":1,"parent":reservation.token(),"epoch":epoch,"operation":spec.operation_id.to_string(),"attempt":reservation::encode(&intent,0),"source_head":encode_head(&head),"source_copy":copy_raw.to_vec(),"source_read":read_value});
-                value["fingerprint"] = json!(child_fingerprint(&value));
-                let raw = value.to_string();
-                if raw.len() > 47_000 { return Err(CatalogError::Invalid("回收复制检查点过大")); }
-                let count = parent["children"].as_u64().and_then(|n| n.checked_add(1))
-                    .ok_or(CatalogError::Corrupt("回收子请求计数溢出"))?;
-                parent["children"] = json!(count);
-                parent["phase"] = json!("copying");
-                let parent_bytes = parent.to_string();
-                // Reserve the bounded budget in the first epoch, but do not
-                // create Q until mounted-media recovery has completed. Nothing
-                // fallible follows these quota mutations.
-                let Some(permit) = maintenance::reserve_identity(&tr, intent.namespace, epoch, spec.operation_id).await? else {
-                    return Err(CatalogError::PoolBusy);
-                };
-                value["attempt"] = json!(reservation::encode(&intent, permit));
-                value["fingerprint"] = json!(child_fingerprint(&value));
-                let raw = value.to_string();
-                let identity = identity_value(&value);
-                tr.set(&key, raw.as_bytes());
-                tr.set(&reverse, &identity);
-                tr.set(&pin, &[]);
-                tr.set(&reservation.journal_key(), parent_bytes.as_bytes());
-                Ok(intent)
-            }.await) })
-        }).await?
+        if reservation.intent()["version"] != 1 {
+            return Err(CatalogError::Invalid("组父任务必须使用原成员专用准备入口"));
+        }
+        self.db
+            .run(|tr, _| {
+                Box::pin(async move {
+                    requests::retry_result(
+                        prepare_upload_at(&tr, reservation, owner, destination, spec, source_read)
+                            .await,
+                    )
+                })
+            })
+            .await?
     }
 
     pub async fn check_active_upload_gate(
@@ -822,6 +1074,20 @@ impl ManagedCatalog {
         route: ActiveLibraryRoute,
         owner: u64,
         request: &ActiveFileRequest,
+    ) -> Result<()> {
+        self.check_active_upload_gate_in(route,owner,request,ReclaimProtocolContext::Single).await
+    }
+
+    pub(crate) async fn check_reclaim_upload_gate(
+        &self, route: ActiveLibraryRoute, owner: u64, request: &ActiveFileRequest,
+        scope: &ReclaimGroupExecution,
+    ) -> Result<()> {
+        self.check_active_upload_gate_in(route,owner,request,ReclaimProtocolContext::Group(scope)).await
+    }
+
+    async fn check_active_upload_gate_in(
+        &self, route: ActiveLibraryRoute, owner: u64, request: &ActiveFileRequest,
+        context: ReclaimProtocolContext<'_>,
     ) -> Result<()> {
         request.validate()?;
         let tr = self.db.create_trx()?;
@@ -833,7 +1099,7 @@ impl ManagedCatalog {
         if let Some(pool) = request.pool_id {
             require_pool_library(&tr, ns, pool, &request.library_serial).await?;
         }
-        require_request_at(&tr, request, owner).await
+        require_request_in(&tr, request, owner,context).await
     }
 
     /// Return the sealed first physical attempt, without selecting another
@@ -868,4 +1134,240 @@ impl ManagedCatalog {
         }
         Ok(saved)
     }
+}
+
+/// Same transaction kernel for the original source/pin/quota/child rows.
+/// Group callers add their member edge in this very transaction and abort any
+/// domain error after mutations with notifications::atomic_error.
+pub(super) async fn prepare_upload_at(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    owner: u64,
+    destination: &str,
+    spec: &ActiveUploadSpec,
+    source_read: &ReclaimSourceRead,
+) -> Result<ActiveFileIntent> {
+    let source = reservation.spec();
+    if spec.pool_id != source.pool
+        || destination == source.barcode
+        || spec.expected_version.is_none()
+    {
+        return Err(CatalogError::Invalid(
+            "回收复制必须保留原池及版本并写入其他磁带",
+        ));
+    }
+    let mut parent = record_at(tr, reservation, owner).await?;
+    if parent["phase"] == "reformatting" {
+        return Err(CatalogError::Invalid(
+            "源卷已进入格式化阶段，不能再准备迁移正文",
+        ));
+    }
+    if parent["owner_epoch"] != owner {
+        return Err(CatalogError::OwnerFenced);
+    }
+    source::require_metadata_idle_at(tr, reservation).await?;
+    require_parent_pool_at(tr, reservation).await?;
+    let (_, source_index) = source_state_at(tr, reservation).await?;
+    let mut source_index_bytes = Vec::new();
+    active_volume::encode_index(&mut source_index_bytes, source_index);
+    if source_read.index() != source_index_bytes {
+        return Err(CatalogError::Invalid("回收源实读卷头与封存源不同"));
+    }
+    let read_value = source_read.value()?;
+    let reverse = identity_key(reservation.namespace(), spec.operation_id);
+    let original = tr.get(&reverse, false).await?;
+    let epoch = if let Some(raw) = &original {
+        original_epoch(raw, &reservation.token())?
+    } else {
+        requests::window(tr, reservation.namespace())
+            .await?
+            .accepting
+    };
+    let key = child_key(
+        reservation.namespace(),
+        &reservation.token(),
+        spec.operation_id,
+    )?;
+    if let Some(raw) = tr.get(&key, false).await? {
+        if decode(&raw)?["source_read"] != read_value {
+            return Err(CatalogError::Invalid("回收复制重试改变原源实读证明"));
+        }
+        let (mut saved, _) = child_at(
+            tr,
+            reservation.namespace(),
+            source.pool,
+            epoch,
+            spec.operation_id,
+            owner,
+        )
+        .await?
+        .ok_or(CatalogError::Corrupt("回收子请求失去池屏障"))?;
+        if saved.ltfs_path()?.as_bytes() != spec.path
+            || saved.expected_size != spec.size
+            || saved.expected_digest != spec.digest
+            || saved.expected_version != spec.expected_version
+            || saved.barcode_constraint.as_deref() != Some(destination)
+        {
+            return Err(CatalogError::Invalid("回收复制重试改变原请求"));
+        }
+        saved.owner_epoch = owner;
+        return Ok(saved);
+    }
+    if original.is_some() {
+        return Err(CatalogError::Corrupt("回收复制反向身份缺少原子请求"));
+    }
+    let path = pool_catalog_path(source.pool, &spec.path)?;
+    let Some(ResolvedPath::File {
+        id,
+        head,
+        copy,
+        placement,
+        ..
+    }) = lookup::resolve_active_path_at_mode(
+        tr,
+        reservation.namespace(),
+        lookup::path_components(&path)?,
+        false,
+    )
+    .await?
+    else {
+        return Err(CatalogError::Invalid("回收源路径不存在或不是文件"));
+    };
+    if copy.volume_id != source.volume
+        || placement.barcode != source.barcode
+        || placement.pool_id != source.pool
+        || Some(head.version) != spec.expected_version
+        || copy.size != spec.size
+        || matches!(copy.content_digest, ContentDigest::Sha256(_))
+            && copy.content_digest != spec.digest
+    {
+        return Err(CatalogError::Invalid("回收源身份、大小或内容摘要改变"));
+    }
+    let intent = upload::prepare_upload_at(
+        tr,
+        reservation.namespace(),
+        reservation.serial(),
+        owner,
+        destination,
+        spec,
+    )
+    .await?;
+    upload_retry::identity_at(
+        tr,
+        reservation,
+        &ReclaimFile::from_request(&intent.request())?,
+    )
+    .await?;
+    if intent.file_id != id || intent.request_epoch != epoch {
+        return Err(CatalogError::Invalid("回收原文件 inode 或请求代次改变"));
+    }
+    ReclaimSourceRead::require_source(
+        &read_value,
+        &reservation.fingerprint(),
+        &head,
+        &copy,
+        &intent,
+    )?;
+    let copy_raw = tr
+        .get(&copy_key(reservation.namespace(), id, head.copy_id), false)
+        .await?
+        .ok_or(CatalogError::Corrupt("回收原副本丢失"))?;
+    if copy_records::decode_copy(&copy_raw)? != *copy {
+        return Err(CatalogError::Corrupt("回收原副本与路径不一致"));
+    }
+    let pin = history_pin_key(&intent.request());
+    if tr.get(&pin, false).await?.is_some() {
+        return Err(CatalogError::Invalid("回收子请求的历史引用身份已被使用"));
+    }
+    let mut value = json!({"version":1,"parent":reservation.token(),"epoch":epoch,"operation":spec.operation_id.to_string(),"attempt":reservation::encode(&intent,0),"source_head":encode_head(&head),"source_copy":copy_raw.to_vec(),"source_read":read_value});
+    value["fingerprint"] = json!(child_fingerprint(&value));
+    let raw = value.to_string();
+    if raw.len() > 47_000 {
+        return Err(CatalogError::Invalid("回收复制检查点过大"));
+    }
+    let count = parent["children"]
+        .as_u64()
+        .and_then(|n| n.checked_add(1))
+        .ok_or(CatalogError::Corrupt("回收子请求计数溢出"))?;
+    parent["children"] = json!(count);
+    parent["phase"] = json!("copying");
+    let parent_bytes = parent.to_string();
+    // Reserve the bounded budget in the first epoch, but do not
+    // create Q until mounted-media recovery has completed. Nothing
+    // fallible follows these quota mutations.
+    let Some(permit) =
+        maintenance::reserve_identity(tr, intent.namespace, epoch, spec.operation_id).await?
+    else {
+        return Err(CatalogError::PoolBusy);
+    };
+    value["attempt"] = json!(reservation::encode(&intent, permit));
+    value["fingerprint"] = json!(child_fingerprint(&value));
+    let raw = value.to_string();
+    let identity = identity_value(&value);
+    tr.set(&key, raw.as_bytes());
+    tr.set(&reverse, &identity);
+    tr.set(&pin, &[]);
+    tr.set(&reservation.journal_key(), parent_bytes.as_bytes());
+    Ok(intent)
+}
+
+/// Same original child/source ledger as the legacy reader, without granting
+/// the generic single-member write lane to a grouped v2 request.
+pub(super) async fn require_group_child_at(
+    tr: &Transaction,
+    parent: &ReclaimReservation,
+    owner: u64,
+    operation: Uuid,
+    epoch: u64,
+) -> Result<(ActiveFileIntent, ReclaimSourceRead)> {
+    let record = record_at(tr, parent, owner).await?;
+    if record["owner_epoch"] != owner {
+        return Err(CatalogError::OwnerFenced);
+    }
+    let (original, _) = child_at(
+        tr,
+        parent.namespace(),
+        parent.spec().pool(),
+        epoch,
+        operation,
+        owner,
+    )
+    .await?
+    .ok_or(CatalogError::Incomplete)?;
+    let raw = tr
+        .get(
+            &child_key(parent.namespace(), &parent.token(), operation)?,
+            false,
+        )
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+    let child = decode(&raw)?;
+    let head = decode_head(
+        &serde_json::from_value::<Vec<u8>>(child["source_head"].clone())
+            .map_err(|_| CatalogError::Corrupt("组原child文件头编码"))?,
+    )?;
+    let copy = copy_records::decode_copy(
+        &serde_json::from_value::<Vec<u8>>(child["source_copy"].clone())
+            .map_err(|_| CatalogError::Corrupt("组原child副本编码"))?,
+    )?;
+    let proof = ReclaimSourceRead::require_source(
+        &child["source_read"],
+        &parent.fingerprint(),
+        &head,
+        &copy,
+        &original,
+    )?;
+    Ok((original, proof))
+}
+
+/// Read the exact legacy reverse-identity key in the caller's transaction.
+pub(super) async fn has_original_identity_at(
+    tr: &Transaction,
+    namespace: Uuid,
+    operation: Uuid,
+) -> Result<bool> {
+    Ok(tr
+        .get(&identity_key(namespace, operation), false)
+        .await?
+        .is_some())
 }

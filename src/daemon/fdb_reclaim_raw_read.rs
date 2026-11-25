@@ -5,16 +5,16 @@ use crate::catalog::volume_extents::CachedFile;
 use crate::daemon::executor::fdb_operation_guard::Guard;
 use crate::managed_catalog::ReclaimRawSourceRead;
 
-struct StreamHash<'a, W> {
-    out: &'a mut W,
-    remaining: u64,
-    sha: Sha256,
-    md5: Option<Md5>,
+pub(super) struct StreamHash<'a, W> {
+    pub(super) out: &'a mut W,
+    pub(super) remaining: u64,
+    pub(super) sha: Sha256,
+    pub(super) md5: Option<Md5>,
 }
 impl<W: Write> Write for StreamHash<'_, W> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         if bytes.len() as u64 > self.remaining {
-            return Err(std::io::Error::other("原始正文超过封存长度"));
+            return Err(std::io::Error::other("回收正文超过封存长度"));
         }
         let n = self.out.write(bytes)?;
         self.remaining -= n as u64;
@@ -192,10 +192,16 @@ impl ActiveMediaReader<'_> {
         budget.index_scratch.directory = scratch.into();
         budget.index_scratch.max_bytes = self.storage.index_bytes;
         budget.index_scratch.headroom_bytes = self.storage.headroom_bytes;
-        let captured = crate::ltfs::recovery::capture_complete_index_source(
+        let hint = self
+            .catalog
+            .load_reclaim_full_history_hint(reservation, self.key.round(), &budget.index_scratch)
+            .await
+            .map_err(error)?;
+        let captured = crate::ltfs::recovery::capture_complete_index_source_with_history_hint(
             &TapeDrive::new(&checked),
             &label,
             &budget,
+            hint,
         )?;
         if crate::managed_catalog::ActiveIndexIdentity::from(captured.construct()) != original {
             return Err(error("回收源实际索引与原 FDB 卷头不同"));

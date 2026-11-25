@@ -6,6 +6,50 @@
 
 use super::*;
 
+#[derive(Clone, Copy)]
+enum AttributeUploadAuthority<'a> {
+    Namespace,
+    Original {
+        context: &'a crate::managed_catalog::OriginalCheckpointContext,
+        receipt: &'a CommitReceipt,
+    },
+}
+impl AttributeUploadAuthority<'_> {
+    fn require_at<'a>(
+        &'a self,
+        tr: &'a Transaction,
+        namespace: Uuid,
+        attributes: &'a NodeAttributes,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<()>> + 'a>> {
+        Box::pin(async move {
+            let Self::Original { context, receipt } = self else {
+                return Ok(());
+            };
+            if context.namespace() != namespace
+                || receipt.metadata_digest != Some(attributes.digest())
+            {
+                return Err(CatalogError::Invalid("原checkpoint属性命名空间或摘要改变"));
+            }
+            if context.require_publishing_at(tr).await?
+                != crate::managed_catalog::OriginalCheckpointPublication::Sealed
+            {
+                return Err(CatalogError::Invalid(
+                    "原checkpoint已发布后不得补写准备属性",
+                ));
+            }
+            context
+                .require_member_at(tr, context.batch_id(), receipt, context.current_index())
+                .await
+        })
+    }
+    fn finish<T>(&self, result: Result<T>) -> Result<T> {
+        match self {
+            Self::Namespace => result,
+            Self::Original { .. } => result.map_err(control::notifications::atomic_error),
+        }
+    }
+}
+
 const CHUNKS_PER_TRANSACTION: usize = 4;
 const PROGRESS_LEN: usize = 9;
 
@@ -405,7 +449,71 @@ impl ManagedCatalog {
         namespace: Uuid,
         attributes: &NodeAttributes,
     ) -> Result<()> {
-        self.upload_object_metadata(namespace, attributes).await?;
+        self.upload_attributes_with_authority(
+            namespace,
+            attributes,
+            AttributeUploadAuthority::Namespace,
+        )
+        .await
+    }
+    pub(super) fn upload_original_checkpoint_attributes<'a>(
+        &'a self,
+        context: &'a crate::managed_catalog::OriginalCheckpointContext,
+        receipt: &'a CommitReceipt,
+        attributes: &'a NodeAttributes,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<()>> + 'a>> {
+        self.upload_attributes_with_authority(
+            context.namespace(),
+            attributes,
+            AttributeUploadAuthority::Original { context, receipt },
+        )
+    }
+    fn upload_attributes_with_authority<'a>(
+        &'a self,
+        namespace: Uuid,
+        attributes: &'a NodeAttributes,
+        authority: AttributeUploadAuthority<'a>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<()>> + 'a>> {
+        Box::pin(self.upload_attributes_in(namespace, attributes, authority))
+    }
+    async fn upload_attributes_in(
+        &self,
+        namespace: Uuid,
+        attributes: &NodeAttributes,
+        authority: AttributeUploadAuthority<'_>,
+    ) -> Result<()> {
+        match authority {
+            AttributeUploadAuthority::Namespace => {
+                self.upload_object_metadata(namespace, attributes).await?
+            }
+            AttributeUploadAuthority::Original { .. } => {
+                self.db
+                    .run(|tr, _| async move {
+                        requests::retry_result(
+                            authority.finish(
+                                async {
+                                    authority.require_at(&tr, namespace, attributes).await?;
+                                    let state = tr.get(&namespace_key(namespace), false).await?;
+                                    if !matches!(
+                                        state.as_deref().map(decode_namespace_state).transpose()?,
+                                        Some(
+                                            NamespaceState::Building
+                                                | NamespaceState::Ready
+                                                | NamespaceState::Active
+                                        )
+                                    ) {
+                                        return Err(CatalogError::Incomplete);
+                                    }
+                                    object_metadata::ensure_at(&tr, namespace, attributes).await?;
+                                    Ok(())
+                                }
+                                .await,
+                            ),
+                        )
+                    })
+                    .await??;
+            }
+        }
         let Some(manifest) = attributes.manifest() else {
             return Ok(());
         };
@@ -427,57 +535,62 @@ impl ManagedCatalog {
                             512_000,
                         ))?;
                         requests::retry_result(
-                            async {
-                                let saved = tr.get(&marker, false).await?;
-                                let first = saved
-                                    .as_deref()
-                                    .map(|value| decode_progress(value, manifest))
-                                    .transpose()?
-                                    .unwrap_or(0);
-                                if first == manifest.chunks {
-                                    return Ok(first);
-                                }
-                                let state = tr.get(&namespace_key(namespace), false).await?;
-                                if !matches!(
-                                    state.as_deref().map(decode_namespace_state).transpose()?,
-                                    Some(
-                                        NamespaceState::Building
-                                            | NamespaceState::Ready
-                                            | NamespaceState::Active
-                                    )
-                                ) {
-                                    return Err(CatalogError::Incomplete);
-                                }
-                                if first > expected {
-                                    return Ok(first);
-                                }
-                                if first < expected {
-                                    return Err(CatalogError::Corrupt("LTFS 属性对象上传进度倒退"));
-                                }
-                                let end = (usize::from(first) + CHUNKS_PER_TRANSACTION)
-                                    .min(usize::from(manifest.chunks))
-                                    as u16;
-                                for index in first..end {
-                                    let start = usize::from(index) * CHUNK_SIZE;
-                                    let chunk =
-                                        &bytes[start..(start + CHUNK_SIZE).min(bytes.len())];
-                                    let key = chunk_key(namespace, manifest, index);
-                                    if let Some(saved) = tr.get(&key, false).await? {
-                                        if saved.as_ref() != chunk {
-                                            return Err(CatalogError::Corrupt(
-                                                "LTFS 属性对象分块与重试冲突",
-                                            ));
-                                        }
-                                    } else {
-                                        tr.set(&key, chunk);
+                            authority.finish(
+                                async {
+                                    authority.require_at(&tr, namespace, attributes).await?;
+                                    let saved = tr.get(&marker, false).await?;
+                                    let first = saved
+                                        .as_deref()
+                                        .map(|value| decode_progress(value, manifest))
+                                        .transpose()?
+                                        .unwrap_or(0);
+                                    if first == manifest.chunks {
+                                        return Ok(first);
                                     }
+                                    let state = tr.get(&namespace_key(namespace), false).await?;
+                                    if !matches!(
+                                        state.as_deref().map(decode_namespace_state).transpose()?,
+                                        Some(
+                                            NamespaceState::Building
+                                                | NamespaceState::Ready
+                                                | NamespaceState::Active
+                                        )
+                                    ) {
+                                        return Err(CatalogError::Incomplete);
+                                    }
+                                    if first > expected {
+                                        return Ok(first);
+                                    }
+                                    if first < expected {
+                                        return Err(CatalogError::Corrupt(
+                                            "LTFS 属性对象上传进度倒退",
+                                        ));
+                                    }
+                                    let end = (usize::from(first) + CHUNKS_PER_TRANSACTION)
+                                        .min(usize::from(manifest.chunks))
+                                        as u16;
+                                    for index in first..end {
+                                        let start = usize::from(index) * CHUNK_SIZE;
+                                        let chunk =
+                                            &bytes[start..(start + CHUNK_SIZE).min(bytes.len())];
+                                        let key = chunk_key(namespace, manifest, index);
+                                        if let Some(saved) = tr.get(&key, false).await? {
+                                            if saved.as_ref() != chunk {
+                                                return Err(CatalogError::Corrupt(
+                                                    "LTFS 属性对象分块与重试冲突",
+                                                ));
+                                            }
+                                        } else {
+                                            tr.set(&key, chunk);
+                                        }
+                                    }
+                                    tr.set(&marker, &progress(manifest, end));
+                                    #[cfg(test)]
+                                    assert!(tr.get_approximate_size().await? < 512_000);
+                                    Ok(end)
                                 }
-                                tr.set(&marker, &progress(manifest, end));
-                                #[cfg(test)]
-                                assert!(tr.get_approximate_size().await? < 512_000);
-                                Ok(end)
-                            }
-                            .await,
+                                .await,
+                            ),
                         )
                     }
                 })

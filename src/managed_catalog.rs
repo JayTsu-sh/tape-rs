@@ -8,6 +8,10 @@ use foundationdb::{Database, FdbBindingError, KeySelector, RangeOption, Transact
 use uuid::Uuid;
 
 mod attribute_objects;
+mod body_layouts;
+pub(crate) use body_layouts::{
+    BodyLayout, CommittedLayoutSource, CopyLayoutBinding, VerifiedExistingCopyLayout,
+};
 mod upload_receipts;
 pub use upload_receipts::{ActiveUploadReceipt, UploadReceiptOutcome};
 mod attributes;
@@ -20,6 +24,8 @@ pub use active_volume::{
     ActiveIndexIdentity, ActiveIndexOutcome, ActiveLoadedVolumeHead, ActiveRecoveryOutcome,
 };
 mod active_batch;
+#[cfg(test)]
+pub(crate) use active_batch::GroupStageRouteConflict;
 pub use active_batch::{
     ActiveBatchOutcome, ActiveBatchPhase, ActiveBatchRecoveryPage, ActiveBatchStatus,
     ActiveCompactionOutcome, ActiveFinalizationOutcome, ActiveMaterializationOutcome,
@@ -34,7 +40,16 @@ use copy_records::{
     StoredCopy, decode_copy, decode_stored_copy, encode_physical_copy, encode_reclaimed_copy,
 };
 mod control;
+pub use control::management::handoff::{LibraryHandoff, LibraryHandoffPhase};
 pub use control::notifications::tape_inventory_state;
+pub(crate) use control::reclaim::{
+    OriginalObservationPermit, ReclaimExecutionGate,
+    ReclaimGroupOnlyDraft, ReclaimGroupOnlyQualification,
+    OriginalAttemptObservation, OriginalCheckpointContext, OriginalCheckpointPublication,
+    DestinationHistoryContext, ReclaimCopyGroup, ReclaimCopyGroupAdmission, ReclaimCopyGroupChoice,
+    ReclaimCopyGroupLimits, ReclaimCopyGroupSelection, RetainedLedgerAuthority,
+    ReclaimGroupExecution, ReclaimGroupObservation, ReclaimGroupMemberReadContext, ReclaimIndexAugmentation, ReclaimIndexIntent,
+};
 use control::tape_monitor;
 pub use tape_monitor::{
     TapeCapacity, TapeMediaFault, TapeMonitorError, TapeMonitorRecord, TapeMonitorSample,
@@ -76,10 +91,14 @@ pub use upload::ActiveUploadSpec;
 mod routing;
 mod s3_rename;
 mod s3_upload;
+#[cfg(test)]
+pub(crate) use native_init::archived_reclaim_fixture_rows;
+pub(crate) use native_init::{ArchivedNativeExpectation, verify_archived_native_source};
 pub use native_init::{VerifiedNativeBarrier, verify_native_barriers};
 pub use s3_rename::S3RenameInput;
 mod staged_import;
 mod staged_sources;
+pub use body_layouts::{PhysicalPlanProvenance, PlanExtents, VerifiedPhysicalPlan};
 pub use cleanup::PurgeProgress;
 pub use control::{
     ActivePoolCreation, AssignExecution, AssignPhase, AssignPlan, AutomaticMediaAction,
@@ -134,7 +153,7 @@ pub use import_spool::{
     ImportPage, ImportSpool, ImportSpoolStats,
 };
 pub use index_evidence::{ImportSourceBinding, LocalVolumeSources, SourceOutcome};
-pub use lookup::{ActiveReadSource, ResolvedActiveRead, ResolvedPath, ResolvedRead};
+pub use lookup::{ActiveReadSource, ReadMetadata, ResolvedActiveRead, ResolvedPath, ResolvedRead};
 pub use maintenance::{
     HistoryReference, MaintenanceBlocker, MaintenanceDiagnosis, MaintenanceStatus, PendingRequestId,
 };
@@ -151,6 +170,14 @@ pub use staged_import::{StagedImportEntry, StagedImportSummary, StagedSourceData
 pub use staged_sources::StagedSourceSummary;
 
 const PREFIX: &[u8] = b"tape-rs/catalog/22/";
+// Immutable committed-body layouts, copy bindings and optional batch constraints.
+const BODY_LAYOUT_KIND: u8 = 0x80;
+// Complete recorded-history scheduling hints; never physical read authority.
+const FULL_HISTORY_HINT_KIND: u8 = 0x81;
+// Subtype below the management @/namespace/R domain, not a catalog root kind.
+pub(super) const RECLAIM_COPY_GROUP_DOMAIN: u8 = 0x82;
+// Explicit group-only qualification; disjoint from group operation history.
+pub(super) const RECLAIM_GROUP_ONLY_DOMAIN: u8 = 0x83;
 const MAX_PAGE: usize = 1000;
 const MAX_NAME: usize = 255;
 const MAX_POOL_PATH_BYTES: usize = 2048;
@@ -181,6 +208,8 @@ pub enum CatalogError {
     Incomplete,
     #[error("池或带库正在执行互斥操作")]
     PoolBusy,
+    #[error("带库存在未结清操作: {0:?}")]
+    LibraryHandoffBusy(Vec<Uuid>),
     #[error("管理任务队列已满，请稍后重试")]
     ManagementQueueFull,
     #[error("池正在接入介质，目录暂不可用")]

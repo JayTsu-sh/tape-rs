@@ -11,6 +11,7 @@ use uuid::Uuid;
 mod conditions;
 pub use conditions::UploadCondition;
 mod inventory;
+mod library_handoff;
 mod listing;
 pub mod management;
 mod notifications;

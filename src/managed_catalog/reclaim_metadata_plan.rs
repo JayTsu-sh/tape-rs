@@ -231,6 +231,9 @@ impl ReclaimMetadataPlan {
     pub fn source_uid(&self) -> u64 {
         self.0.source.uid
     }
+    pub(in crate::managed_catalog) fn is_source_root(&self) -> bool {
+        self.0.source.path.is_empty()
+    }
     pub fn volume(&self) -> Uuid {
         Uuid::parse_str(&self.0.volume).expect("validated metadata volume")
     }
@@ -906,13 +909,13 @@ impl ReclaimSourceInventory<'_> {
 }
 
 /// Canonical path-ordered stream; no tree or path set is retained in memory.
-pub(super) struct TargetTree {
+pub(in crate::managed_catalog) struct TargetTree {
     hash: Sha256,
     previous: Option<String>,
     pub(super) objects: u64,
 }
 impl TargetTree {
-    pub(super) fn new(volume: Uuid) -> Self {
+    pub(in crate::managed_catalog) fn new(volume: Uuid) -> Self {
         let mut hash = Sha256::new();
         hash.update(b"tape-rs/reclaim-metadata-target-tree/1");
         hash.update(volume.as_bytes());
@@ -944,7 +947,13 @@ impl TargetTree {
         self.previous = Some(object.path.clone());
         Ok(())
     }
-    pub(super) fn finish(self) -> [u8; 32] {
+    pub(in crate::managed_catalog) fn add_entry(&mut self, entry: IndexEntry) -> Result<()> {
+        self.add(&Object::capture(entry)?)
+    }
+    pub(in crate::managed_catalog) fn objects(&self) -> u64 {
+        self.objects
+    }
+    pub(in crate::managed_catalog) fn finish(self) -> [u8; 32] {
         self.hash.finalize().into()
     }
 }

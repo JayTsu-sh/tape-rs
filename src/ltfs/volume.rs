@@ -337,21 +337,50 @@ pub(crate) fn read_cached_file_to_writer<W: Write>(
     )
 }
 
+/// Read a sealed, repeatable extent stream without collecting its records.
+/// The first pass validates the full shape before any tape command is issued.
 #[cfg(feature = "fdb")]
-pub(crate) fn read_cached_file_sequential_to_writer<W: Write>(
+pub(crate) fn read_extent_plan_to_writer<W, I>(
     device: &dyn crate::scsi::transport::TapeTransport,
     label: &LtfsLabel,
-    file: &crate::catalog::volume_extents::CachedFile,
+    path: &str,
+    length: u64,
+    extents: I,
     w: &mut W,
-) -> Result<u64> {
-    if file.symlink.is_some() {
-        return Err(TapeError::Ltfs("顺序读取计划不能指向符号链接".into()));
-    }
-    read_extents_positioned(
+) -> Result<u64>
+where
+    W: Write,
+    I: Iterator<Item = Result<Extent>> + Clone,
+{
+    read_extent_stream_positioned(
         &TapeDrive::new(device),
         label.blocksize,
         [label.index_partition, label.data_partition],
-        (&file.path, file.length, &file.extents),
+        (path, length, extents),
+        w,
+        &std::cell::RefCell::new(None),
+        ReadPositioning::Locate,
+    )
+}
+
+#[cfg(feature = "fdb")]
+pub(crate) fn read_extent_plan_sequential_to_writer<W, I>(
+    device: &dyn crate::scsi::transport::TapeTransport,
+    label: &LtfsLabel,
+    path: &str,
+    length: u64,
+    extents: I,
+    w: &mut W,
+) -> Result<u64>
+where
+    W: Write,
+    I: Iterator<Item = Result<Extent>> + Clone,
+{
+    read_extent_stream_positioned(
+        &TapeDrive::new(device),
+        label.blocksize,
+        [label.index_partition, label.data_partition],
+        (path, length, extents),
         w,
         &std::cell::RefCell::new(None),
         ReadPositioning::Forward,
@@ -394,16 +423,38 @@ fn read_extents_positioned<W: Write>(
     positioning: ReadPositioning,
 ) -> Result<u64> {
     let (path, length, extents) = file;
-    if extents.is_empty() {
-        if length != 0 {
-            return Err(TapeError::Ltfs(format!("文件 {} 缺少数据 extent", path)));
-        }
-        return Ok(0);
-    }
+    read_extent_stream_positioned(
+        drive,
+        block_size,
+        partitions,
+        (path, length, extents.iter().cloned().map(Ok)),
+        w,
+        read_buffer,
+        positioning,
+    )
+}
+
+fn read_extent_stream_positioned<W, I>(
+    drive: &TapeDrive<'_>,
+    block_size: u32,
+    partitions: [char; 2],
+    file: (&str, u64, I),
+    w: &mut W,
+    read_buffer: &std::cell::RefCell<Option<crate::scsi::buffer::TransferBuffer>>,
+    positioning: ReadPositioning,
+) -> Result<u64>
+where
+    W: Write,
+    I: Iterator<Item = Result<Extent>> + Clone,
+{
+    let (path, length, extents) = file;
 
     // 只支持从 0 开始、按索引顺序连续的布局；先核验全部 extent，避免输出错误前缀。
     let mut expected_offset = 0u64;
-    for ext in extents {
+    let mut any = false;
+    for ext in extents.clone() {
+        let ext = ext?;
+        any = true;
         partition_char_to_num(ext.partition, partitions)?;
         if ext.file_offset != expected_offset {
             return Err(TapeError::Ltfs(format!(
@@ -424,6 +475,12 @@ fn read_extents_positioned<W: Write>(
             )));
         }
     }
+    if !any {
+        if length != 0 {
+            return Err(TapeError::Ltfs(format!("文件 {} 缺少数据 extent", path)));
+        }
+        return Ok(0);
+    }
     if expected_offset != length {
         return Err(TapeError::Ltfs(format!(
             "文件 {} 的 extent 长度不符: 索引 {}，extent {}",
@@ -440,6 +497,7 @@ fn read_extents_positioned<W: Write>(
         .as_mut_slice();
 
     for ext in extents {
+        let ext = ext?;
         let partition = partition_char_to_num(ext.partition, partitions)?;
         match positioning {
             ReadPositioning::Locate => drive.locate_if_needed(partition, ext.start_block)?,
@@ -525,7 +583,24 @@ impl<'a> LtfsVolume<'a> {
     /// 其他状态执行历史链核验。需要完整历史审计时用 `mount_with_budget`。
     /// 视图取 DP 末索引（可能比 IP 新）。尾部非完整时以只读挂载，不自动修复。
     pub fn mount(device: &'a dyn crate::scsi::transport::TapeTransport) -> Result<Self> {
-        Self::mount_inner(device, &RecoveryBudget::default(), false)
+        Self::mount_inner(device, None, &RecoveryBudget::default(), false, false)
+    }
+
+    /// Same append-safety checks as mount, with a smaller per-construct cap
+    /// while the other reclaim drive is using its share of the index budget.
+    #[cfg(feature = "fdb")]
+    pub(crate) fn mount_for_reclaim_preflight(
+        device: &'a dyn crate::scsi::transport::TapeTransport,
+        label: LtfsLabel,
+        head: CommittedIndexConstruct,
+        dp_eod: u64,
+        max_index_bytes: usize,
+    ) -> Result<Self> {
+        let budget = RecoveryBudget {
+            max_index_bytes,
+            ..RecoveryBudget::default()
+        };
+        Self::mount_inner(device, Some((label, head, dp_eod)), &budget, false, true)
     }
 
     /// 使用指定搜索预算执行完整历史链核验（不走正常挂载的 Full 快速路径）。
@@ -533,19 +608,24 @@ impl<'a> LtfsVolume<'a> {
         device: &'a dyn crate::scsi::transport::TapeTransport,
         budget: &RecoveryBudget,
     ) -> Result<Self> {
-        Self::mount_inner(device, budget, true)
+        Self::mount_inner(device, None, budget, true, false)
     }
 
     fn mount_inner(
         device: &'a dyn crate::scsi::transport::TapeTransport,
+        preflight: Option<(LtfsLabel, CommittedIndexConstruct, u64)>,
         budget: &RecoveryBudget,
         verify_history: bool,
+        preserve_capacity_error: bool,
     ) -> Result<Self> {
         let drive = TapeDrive::new(device);
         let mam = Mam::new(device);
 
         // 1. 读 P0 label
-        let label = read_label_only(device)?;
+        let (label, preflight_dp) = match preflight {
+            Some((label, head, eod)) => (label, Some((head, eod))),
+            None => (read_label_only(device)?, None),
+        };
         let block_size = label.blocksize;
         info!(
             "LTFS label: version={} uuid={} blocksize={} compression={}",
@@ -556,7 +636,13 @@ impl<'a> LtfsVolume<'a> {
         let report = if verify_history {
             recovery::recover(device, &label, budget)?
         } else {
-            recovery::recover_for_mount(device, &label, budget)?
+            recovery::recover_for_mount(
+                device,
+                &label,
+                budget,
+                preserve_capacity_error,
+                preflight_dp,
+            )?
         };
         if let Some(reason) = report.restricted_reason() {
             return Err(TapeError::RecoveryRestricted { reason });
@@ -698,6 +784,19 @@ impl<'a> LtfsVolume<'a> {
             return None;
         }
         Some(pending)
+    }
+
+    /// Read-only input to the persisted reclaim augmentation planner. The
+    /// working tree and append boundary are provisional until the original S4.
+    #[cfg(feature = "fdb")]
+    pub(crate) fn reclaim_pending_index(&self) -> Result<(&LtfsIndex, u64)> {
+        self.ensure_writable()?;
+        if !self.dirty {
+            return Err(TapeError::Ltfs("回收批次尚无待提交正文".into()));
+        }
+        let index_start = self.p1_write_head.checked_add(1)
+            .ok_or_else(|| TapeError::Ltfs("回收批次索引位置溢出".into()))?;
+        Ok((&self.working, index_start))
     }
 
     /// 为 P0 与 P1 写入 VCI（各自的最新索引位置）。驱动器不提供 VCR 时跳过并记录。
@@ -1668,6 +1767,45 @@ impl<'a> LtfsVolume<'a> {
         }
         self.working
             .reference_reclaimed_body(path, uid, body, source)?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Stage archive references to this original batch's pending donors. The
+    /// typed recipe carries no CDB authority; the caller must persist it before
+    /// entry and independently prove the complete final index before publish.
+    #[cfg(feature = "fdb")]
+    pub(crate) fn stage_reclaim_pending_references(
+        &mut self,
+        plan: &crate::managed_catalog::ReclaimIndexAugmentation,
+    ) -> Result<()> {
+        self.ensure_writable()?;
+        let previous = plan.previous().map_err(|e| TapeError::Catalog(e.to_string()))?;
+        let first_uid = plan.first_archive_uid().map_err(|e| TapeError::Catalog(e.to_string()))?;
+        if crate::managed_catalog::ActiveIndexIdentity::from(self.committed_construct) != previous
+            || self.p1_write_head.checked_add(1) != Some(plan.index_start())
+            || self.working.highest_file_uid.checked_add(1) != Some(first_uid) {
+            return Err(TapeError::Ltfs("回收待提交引用改变原卷头、追加边界或UID".into()));
+        }
+        // Check all donors before mutating the working namespace. The old
+        // committed-donor interface retains its original stricter semantics.
+        for reference in plan.references() {
+            if self.pending_file_node(reference.donor_path) != Some(reference.donor)
+                || self.working.find_file(reference.archive).is_some() {
+                return Err(TapeError::Ltfs("回收待提交引用的原正文或归档位置改变".into()));
+            }
+        }
+        if let Some((path, uid, source)) = plan
+            .archive_root()
+            .map_err(|e| TapeError::Catalog(e.to_string()))?
+        {
+            self.working.reference_reclaimed_node(&path, uid, &source)?;
+        }
+        for reference in plan.references() {
+            self.working.reference_reclaimed_body(
+                reference.archive, reference.archive_uid, reference.donor, reference.source,
+            )?;
+        }
         self.dirty = true;
         Ok(())
     }

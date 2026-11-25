@@ -314,6 +314,32 @@ pub(super) async fn observed_at(
     Ok((scan, current))
 }
 
+/// Raw current observation and original/current generation rows, from the
+/// caller's single read version. Keep the key construction in this module.
+pub(super) async fn body_layout_snapshot_rows_at(
+    tr: &Transaction,
+    serial: &str,
+    source: ActiveIndexIdentity,
+) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
+    let (_, current) = observed_at(tr, serial, source.volume_uuid).await?;
+    let mut keys = vec![
+        observed_key(source.volume_uuid),
+        generation_key(source.volume_uuid, source.generation),
+        generation_key(source.volume_uuid, current.generation),
+    ];
+    keys.sort();
+    keys.dedup();
+    let mut rows = Vec::with_capacity(keys.len());
+    for key in keys {
+        let value = tr.get(&key, false).await?;
+        if value.as_ref().is_some_and(|value| value.len() > 100_000) {
+            return Err(CatalogError::Corrupt("正文布局卷观察快照值过长"));
+        }
+        rows.push((key, value.map(|value| value.to_vec())));
+    }
+    Ok(rows)
+}
+
 fn file_count_key(volume: Uuid, generation: u64) -> Vec<u8> {
     let mut key = generation_key(volume, generation);
     key.push(b'f');
@@ -384,7 +410,10 @@ pub(super) async fn observed_batch_at(
 ) -> Result<Option<(Uuid, ActiveIndexIdentity)>> {
     Ok(
         match observed_history_at(tr, serial, volume, generation).await? {
-            Some((IndexKind::FileBatch(id), index)) => Some((id, index)),
+            Some((IndexKind::FileBatch(id), index)) => {
+                active_batch::require_stored_checkpoint_at(tr,id,index,None).await?;
+                Some((id,index))
+            },
             _ => None,
         },
     )
@@ -409,7 +438,10 @@ pub(super) async fn observed_completed_batch_at(
         return Err(CatalogError::Corrupt("已完成批次与导入基线索引身份不一致"));
     }
     Ok(match kind {
-        IndexKind::FileBatch(id) => Some((id, index)),
+        IndexKind::FileBatch(id) => {
+            active_batch::require_stored_checkpoint_at(tr,id,index,None).await?;
+            Some((id,index))
+        },
         _ => None,
     })
 }
@@ -927,6 +959,7 @@ impl ManagedCatalog {
                                     ));
                                 }
                                 if saved_previous == previous && saved_current == current {
+                                    active_batch::require_stored_checkpoint_at(&tr,batch_id,current,Some(file_count)).await?;
                                     if tr
                                         .get(&file_count_key(volume, current.generation), false)
                                         .await?
@@ -965,11 +998,11 @@ impl ManagedCatalog {
                                     return Ok(ActiveIndexOutcome::BatchConflict);
                                 }
                             }
-                            if !active_batch::sealed_for_index(
+                            if !active_batch::sealed_for_checkpoint(
                                 &tr,
                                 placement.namespace,
                                 volume,
-                                current.generation,
+                                (current,file_count),
                                 batch_id,
                                 owner_epoch,
                                 scan.id,

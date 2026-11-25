@@ -78,6 +78,12 @@ pub struct SgProvider {
 
 impl DeviceProvider for SgProvider {
     fn open_all(&self) -> Result<Vec<ManagedDevice>> {
+        self.open_paths(enumerate_sg_nodes()?)
+    }
+}
+
+impl SgProvider {
+    fn open_paths(&self, paths: Vec<std::path::PathBuf>) -> Result<Vec<ManagedDevice>> {
         let mut wanted: Vec<(String, DeviceKind)> = self
             .drive_serials
             .iter()
@@ -95,7 +101,7 @@ impl DeviceProvider for SgProvider {
             .map(crate::scsi::inquiry::normalize_fc_target_port)
             .transpose()?;
         let mut found = Vec::new();
-        for path in enumerate_sg_nodes()? {
+        for path in paths {
             let Some(p) = path.to_str() else { continue };
             // 被别的进程独占的设备（例如 IBM LTFS 自己的驱动器）会立即返回忙，跳过
             let Ok(dev) = ScsiDevice::open(p) else {
@@ -145,6 +151,37 @@ impl DeviceProvider for SgProvider {
     }
 }
 
+/// Offline handoff runs outside the owner's service device allowlist.
+/// Consult sysfs before opening any SG path, then still confirm VPD on the handle.
+#[cfg(feature = "fdb")]
+pub struct OfflineSgProvider(pub SgProvider);
+
+#[cfg(feature = "fdb")]
+impl DeviceProvider for OfflineSgProvider {
+    fn open_all(&self) -> Result<Vec<ManagedDevice>> {
+        let provider = &self.0;
+        let expected_port = provider
+            .changer_target_port
+            .as_deref()
+            .map(crate::scsi::inquiry::normalize_fc_target_port)
+            .transpose()?;
+        let mut selected = Vec::new();
+        for path in enumerate_sg_nodes()? {
+            let Some(serial) = crate::scsi::inquiry::sysfs_unit_serial(&path) else {
+                continue;
+            };
+            if provider.changer_serial.as_deref() == Some(serial.as_str()) {
+                if crate::scsi::inquiry::fc_target_port(&path)? == expected_port {
+                    selected.push(path);
+                }
+            } else if provider.drive_serials.contains(&serial) {
+                selected.push(path);
+            }
+        }
+        provider.open_paths(selected)
+    }
+}
+
 #[derive(Debug)]
 pub enum ExecRequest {
     /// 由 Raft 循环安装本进程许可；必须在任何接管之前发送。
@@ -164,6 +201,13 @@ pub enum ExecRequest {
         spec: Box<crate::managed_catalog::ActiveUploadSpec>,
         barcode: Option<String>,
         reply: Sender<std::result::Result<crate::managed_catalog::ActiveFileIntent, ReadError>>,
+    },
+    #[cfg(feature = "fdb")]
+    LibraryHandoff {
+        round: u64,
+        operation: uuid::Uuid,
+        deadline: Instant,
+        reply: Sender<std::result::Result<crate::managed_catalog::LibraryHandoff, ReadError>>,
     },
     /// 显式 FDB 上传，身份由调用方保留用于结果未定重试。只有 FDB writer 接受。
     #[cfg(feature = "fdb")]
@@ -348,6 +392,11 @@ mod fdb_nodes;
 #[path = "executor_fdb_reclaim.rs"]
 mod fdb_reclaim;
 #[cfg(feature = "fdb")]
+pub(in crate::daemon) use fdb_reclaim::{OriginalAttemptProbeIo, FreshReclaimGroupIo, ObserveReclaimGroupIo};
+#[cfg(all(test, feature = "fdb"))]
+#[path = "executor_fdb_reclaim_spool_test_hook.rs"]
+mod fdb_reclaim_spool_test_hook;
+#[cfg(feature = "fdb")]
 #[path = "executor_fdb_rename.rs"]
 mod fdb_rename;
 #[cfg(feature = "fdb")]
@@ -384,6 +433,11 @@ mod fdb_observations_fixture;
 #[cfg(feature = "fdb")]
 #[path = "executor_fdb_preflight.rs"]
 mod fdb_preflight;
+#[cfg(feature = "fdb")]
+#[path = "executor_library_handoff.rs"]
+mod library_handoff;
+#[cfg(feature = "fdb")]
+pub use library_handoff::verify_library_release_offline;
 
 struct Active {
     #[cfg(feature = "fdb")]
@@ -392,6 +446,10 @@ struct Active {
     fdb_reads: std::collections::BTreeMap<usize, fdb_loading::Mount>,
     #[cfg(feature = "fdb")]
     fdb_read_session: Option<super::fdb_read::ReadSession>,
+    #[cfg(feature = "fdb")]
+    fdb_reclaim_source_session: Option<Box<super::fdb_read::ReclaimSourceSession>>,
+    #[cfg(feature = "fdb")]
+    fdb_reclaim_format_source: Option<Box<fdb_reclaim::PreparedReclaimFormatSource>>,
     #[cfg(feature = "fdb")]
     fdb_pending_import: std::collections::BTreeSet<String>,
     files: Arc<FileService>,
@@ -417,6 +475,9 @@ struct Active {
     /// 刚放弃回收的带和放弃后过了几个周期：状态里的 `reclaiming` 要等 TapeState 应用后才消失，
     /// 这期间不要再拿它开工
     reclaim_given_up: Option<(String, u32)>,
+    /// FDB media-reclaim：原 operation、汇总检查点摘要及连续未变轮数。
+    #[cfg(feature = "fdb")]
+    reclaim_copy_stall: Option<(String, [u8; 32], u32)>,
 }
 
 /// 正在进行的回收。状态在 Raft 里（磁带状态 `reclaiming`），这里只是本轮的工作现场：
@@ -448,6 +509,9 @@ const RECLAIM_START_ATTEMPTS: u32 = 5;
 const RECLAIM_GIVE_UP_GRACE: u32 = 10;
 /// 搬完之后最多等目录应用这么多个工作周期（默认 3 秒一个，约 5 分钟）。
 const RECLAIM_MAX_WAITS: u32 = 100;
+/// FDB media-reclaim：连续这么多轮汇总检查点未变时记录诊断，不终止任务。
+#[cfg(feature = "fdb")]
+const RECLAIM_COPY_STALL_ROUNDS: u32 = 200;
 
 pub fn run(
     provider: Box<dyn DeviceProvider>,
@@ -538,6 +602,10 @@ pub fn run(
             files = target;
         }
         match received {
+            #[cfg(feature = "fdb")]
+            Ok(ExecRequest::LibraryHandoff { reply, .. }) => {
+                let _ = reply.send(Err(ReadError::Failed("带库交还需要 FDB 执行器".into())));
+            }
             #[cfg(feature = "fdb")]
             Ok(ExecRequest::FdbWrite { reply, .. }) => {
                 let _ = reply.send(Err(ReadError::Failed("旧目录执行器禁止 FDB 上传".into())));
@@ -902,7 +970,7 @@ fn run_fdb_owner_inner(
     control: FdbOwnerControl,
     writable: bool,
 ) {
-    use crate::managed_catalog::ActiveOwnerOutcome;
+    use crate::managed_catalog::{ActiveOwnerOutcome, LibraryHandoffPhase as HandoffPhase};
 
     let provider: Arc<dyn DeviceProvider> = Arc::from(provider);
     struct ProbeStop(Arc<std::sync::atomic::AtomicBool>);
@@ -931,7 +999,45 @@ fn run_fdb_owner_inner(
     let mut next_node_check = Instant::now();
     let mut next_statistics_check = Instant::now();
     let mut deferred_request = None;
+    let mut reload: Option<crate::managed_catalog::LibraryHandoff> = None;
+    let mut previously_handed_off = false;
+    let release_in_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release_checkpoint =
+        library_handoff::ReleaseReceipt::checkpoint_path(&files, &control, opts.node_id);
+    let mut release_receipt =
+        match library_handoff::ReleaseReceipt::restore(&release_checkpoint, &control, opts.node_id)
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                warn!("带库 {} 交还检查点无法恢复: {error}", control.serial);
+                None
+            }
+        };
     loop {
+        if let Some(owner) = active.as_mut().filter(|owner| !owner.serving)
+            && let Some(request) = reload.as_ref()
+            && permission
+                .as_ref()
+                .is_some_and(|p| p.allows(owner.round, super::permission::Phase::Serving))
+            && status
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .executor_ready
+        {
+            let mut online = request.clone();
+            online.phase = HandoffPhase::Online;
+            match runtime.block_on(control.catalog.update_library_handoff(
+                control.route,
+                request,
+                &online,
+            )) {
+                Ok(()) => {
+                    reload = None;
+                    owner.serving = true;
+                }
+                Err(error) => warn!("带库 {} 加载终态暂不能确认: {error}", control.serial),
+            }
+        }
         if writable
             && !observations.busy()
             && let Some(owner) = active.as_mut().filter(|owner| {
@@ -952,7 +1058,7 @@ fn run_fdb_owner_inner(
                 .await?;
                 if fdb_reclaim::advance(
                     owner,
-                    permission.as_deref().expect("Serving permit checked"),
+                    permission.as_ref().expect("Serving permit checked"),
                     &control,
                     &status,
                 )
@@ -1126,6 +1232,11 @@ fn run_fdb_owner_inner(
         }
         if Instant::now() >= next_fence_check {
             next_fence_check = Instant::now() + Duration::from_secs(1);
+            if let Some(receipt) = release_receipt.as_mut()
+                && runtime.block_on(receipt.poll(&control, &release_checkpoint))
+            {
+                release_receipt = None;
+            }
             let checked = active.as_ref().filter(|owner| owner.serving).map(|owner| {
                 let result = (|| -> Result<()> {
                     let permit = permission.as_ref().ok_or_else(|| {
@@ -1309,20 +1420,51 @@ fn run_fdb_owner_inner(
                     files.set_permission(attached.clone());
                     permission = Some(attached);
                     let (provider, tx, stop) = (provider.clone(), tx.clone(), probe_stop.0.clone());
+                    let (catalog, serial, route) = (
+                        control.catalog.clone(),
+                        control.serial.clone(),
+                        control.route,
+                    );
+                    let releasing = release_in_progress.clone();
+                    let node = opts.node_id;
                     let interval = opts.interval.min(Duration::from_secs(1));
                     std::thread::spawn(move || {
+                        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                        else {
+                            return;
+                        };
                         while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-                            let event = match provider.probe() {
-                                Ok(drives) => ExecEvent::Capability {
+                            if releasing.load(std::sync::atomic::Ordering::Acquire) {
+                                std::thread::sleep(interval);
+                                continue;
+                            }
+                            let probe = rt.block_on(async {
+                                tokio::time::timeout(
+                                    Duration::from_secs(2),
+                                    catalog.library_handoff(&serial, route, None),
+                                )
+                                .await
+                            });
+                            let enabled = matches!(probe, Ok(Ok(row)) if row.as_ref().is_none_or(|row| match row.phase {
+                                HandoffPhase::Online => true,
+                                HandoffPhase::Loading => row.attempt_key.is_none_or(|key| ReservationKey(key).node() == node),
+                                _ => false,
+                            }));
+                            let event = match enabled.then(|| provider.probe()).transpose() {
+                                Ok(Some(drives)) => ExecEvent::Capability {
                                     drives,
                                     eligible: true,
                                 },
-                                Err(_) => ExecEvent::Capability {
+                                _ => ExecEvent::Capability {
                                     drives: 0,
                                     eligible: false,
                                 },
                             };
-                            if tx.send(event).is_err() {
+                            if !releasing.load(std::sync::atomic::Ordering::Acquire)
+                                && tx.send(event).is_err()
+                            {
                                 break;
                             }
                             std::thread::sleep(interval);
@@ -1333,6 +1475,8 @@ fn run_fdb_owner_inner(
             ExecRequest::Takeover { round } => {
                 files.close_all("FDB owner 正在接管");
                 active = None;
+                reload = None;
+                previously_handed_off = false;
                 if permission.is_none() {
                     let _ = tx.send(ExecEvent::FenceFailed {
                         round,
@@ -1340,6 +1484,7 @@ fn run_fdb_owner_inner(
                     });
                     continue;
                 }
+                let mut reload_cleanup_confirmed = false;
                 let result = runtime
                     .block_on(fdb_preflight::check(
                         &control,
@@ -1348,12 +1493,92 @@ fn run_fdb_owner_inner(
                         round,
                     ))
                     .and_then(|()| {
-                        takeover(
+                        let record = runtime
+                            .block_on(control.catalog.library_handoff(
+                                &control.serial,
+                                control.route,
+                                None,
+                            ))
+                            .map_err(|e| TapeError::Catalog(e.to_string()))?;
+                        previously_handed_off = record
+                            .as_ref()
+                            .is_some_and(|row| row.phase == HandoffPhase::Online);
+                        if record.as_ref().is_some_and(|row| match row.phase {
+                            HandoffPhase::Online => false,
+                            HandoffPhase::Loading => row.attempt_key.is_some(),
+                            _ => true,
+                        }) {
+                            return Err(TapeError::NotReady(
+                                "带库已交还或原尝试须由发起节点续接".into(),
+                            ));
+                        }
+                        takeover_with(
                             provider.as_ref(),
                             &opts,
                             round,
                             permission.as_ref(),
                             files.clone(),
+                            |devices, key| match record {
+                                Some(original) if original.phase == HandoffPhase::Loading => {
+                                    reload = Some(original.clone());
+                                    library_handoff::preflight_reload(devices, &original)?;
+                                    let mut attempt = original.clone();
+                                    attempt.owner_epoch = round;
+                                    attempt.attempt_key = Some(key.0);
+                                    attempt.detail = None;
+                                    runtime
+                                        .block_on(control.catalog.update_library_handoff(
+                                            control.route,
+                                            &original,
+                                            &attempt,
+                                        ))
+                                        .map_err(|e| TapeError::Catalog(e.to_string()))?;
+                                    reload = Some(attempt);
+                                    let result = library_handoff::isolate_reload(devices, key);
+                                    if result
+                                        .as_ref()
+                                        .is_err_and(library_handoff::reload_can_clear)
+                                    {
+                                        reload_cleanup_confirmed =
+                                            library_handoff::clear_reload(devices, key).is_ok();
+                                    }
+                                    result
+                                }
+                                Some(row) if row.phase != HandoffPhase::Online => {
+                                    Err(TapeError::NotReady("库已交还或交还尚未结清".into()))
+                                }
+                                _ => {
+                                    let attempt = uuid::Uuid::new_v4();
+                                    let protected = runtime
+                                        .block_on(control.catalog.begin_handoff_fence(
+                                            &control.serial,
+                                            control.route,
+                                            round,
+                                            attempt,
+                                        ))
+                                        .map_err(|error| TapeError::Catalog(error.to_string()))?;
+                                    let result = isolate_devices(devices, key, false);
+                                    if protected
+                                        && (result.is_ok()
+                                            || result
+                                                .as_ref()
+                                                .is_err_and(library_handoff::reload_can_clear))
+                                    {
+                                        runtime
+                                            .block_on(control.catalog.finish_handoff_fence(
+                                                &control.serial,
+                                                control.route,
+                                                round,
+                                                attempt,
+                                                result.is_ok(),
+                                            ))
+                                            .map_err(|error| {
+                                                TapeError::Catalog(error.to_string())
+                                            })?;
+                                    }
+                                    result
+                                }
+                            },
                         )
                     });
                 match result {
@@ -1362,6 +1587,14 @@ fn run_fdb_owner_inner(
                         let _ = tx.send(ExecEvent::Fenced { round });
                     }
                     Err(error) => {
+                        if let Some(request) = reload.take() {
+                            runtime.block_on(library_handoff::record_reload_failure(
+                                &control,
+                                &request,
+                                &error,
+                                reload_cleanup_confirmed,
+                            ));
+                        }
                         if let Some(permit) = permission.as_ref() {
                             permit.close(round);
                         }
@@ -1428,6 +1661,30 @@ fn run_fdb_owner_inner(
                             return Err(TapeError::Catalog("FDB owner 已由更新轮次持有".into()));
                         }
                     }
+                    if reload.is_some() {
+                        // 外部应用可能改写了卷。此轮仅发布库存，卷读写按既有索引证明逐个核验。
+                        library_handoff::health(&owner.devices)?;
+                        runtime
+                            .block_on(fdb_inventory::refresh(owner, permit, &control, &opts))
+                            .map_err(|e| TapeError::Catalog(e.to_string()))?;
+                        return Ok(0);
+                    }
+                    // Unknown originals are fenced before cleanup, mechanical
+                    // observation, cache access or generic media recovery.
+                    if runtime
+                        .block_on(fdb_reclaim::recovery_barrier(owner, &control))
+                        .map_err(|e| TapeError::Catalog(e.to_string()))?
+                    {
+                        if writable {
+                            match runtime.block_on(Box::pin(fdb_reclaim::advance(
+                                owner, permit, &control, &status,
+                            ))) {
+                                Ok(_) | Err(ReadError::Busy(_)) => {}
+                                Err(error) => return Err(TapeError::Catalog(error.to_string())),
+                            }
+                        }
+                        return Ok(0);
+                    }
                     if writable {
                         runtime
                             .block_on(fdb_reclaim::cleanup(owner, permit, &control, true))
@@ -1485,6 +1742,12 @@ fn run_fdb_owner_inner(
                             Ok(false) => {}
                             Err(error) => return Err(TapeError::Catalog(error.to_string())),
                         }
+                    }
+                    if runtime
+                        .block_on(fdb_reclaim::recovery_barrier(owner, &control))
+                        .map_err(|e| TapeError::Catalog(e.to_string()))?
+                    {
+                        return Ok(0);
                     }
                     let cache_dir = files.extent_cache_dir();
                     if cache_dir.exists() {
@@ -1631,15 +1894,28 @@ fn run_fdb_owner_inner(
                             );
                             let device: &dyn TapeTransport = &checked;
                             let drive = TapeDrive::new(device);
-                            let label = crate::ltfs::volume::read_label_only(device)?;
-                            if label.volume_uuid != head.volume_id
-                                || head.index.volume_uuid != head.volume_id
-                            {
-                                return Err(TapeError::Catalog(format!(
-                                    "已装载磁带 {} 的标签、FDB 卷和索引身份不一致",
-                                    barcode
-                                )));
-                            }
+                            let label =
+                                crate::ltfs::volume::read_label_only(device).and_then(|label| {
+                                    if label.volume_uuid != head.volume_id
+                                        || head.index.volume_uuid != head.volume_id
+                                    {
+                                        return Err(TapeError::Catalog(format!(
+                                            "已装载磁带 {barcode} 的标签、FDB 卷和索引身份不一致"
+                                        )));
+                                    }
+                                    Ok(label)
+                                });
+                            let label = match label {
+                                Ok(label) => label,
+                                Err(error) if previously_handed_off && !ownership_lost(&error) => {
+                                    checked.verify_proof()?;
+                                    drop(checked);
+                                    owner.fdb_pending_import.insert(barcode.clone());
+                                    warn!("带库交还后，磁带 {barcode} 暂停读写: {error}");
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            };
                             if runtime
                                 .block_on(control.catalog.loaded_native_refresh_pending(
                                     &control.serial,
@@ -1834,7 +2110,7 @@ fn run_fdb_owner_inner(
                 })();
                 match result {
                     Ok(verified_volumes) => {
-                        owner.serving = true;
+                        owner.serving = reload.is_none();
                         let _ = tx.send(ExecEvent::Serving {
                             round,
                             summary: format!(
@@ -1845,6 +2121,13 @@ fn run_fdb_owner_inner(
                         });
                     }
                     Err(error) => {
+                        if let Some(request) = reload.take() {
+                            let cleared = library_handoff::reload_can_clear(&error)
+                                && library_handoff::clear_reload(&owner.devices, owner.key).is_ok();
+                            runtime.block_on(library_handoff::record_reload_failure(
+                                &control, &request, &error, cleared,
+                            ));
+                        }
                         let reason = format!("FDB owner 恢复失败: {error}");
                         if let Some(permit) = permission.as_ref() {
                             permit.close(round);
@@ -1865,6 +2148,84 @@ fn run_fdb_owner_inner(
                     files.close_all(&reason);
                     active = None;
                 }
+            }
+            ExecRequest::LibraryHandoff {
+                round,
+                operation,
+                deadline,
+                reply,
+            } => {
+                let activity = permission
+                    .as_ref()
+                    .filter(|_| {
+                        active
+                            .as_ref()
+                            .is_some_and(|owner| owner.serving && owner.round == round)
+                            && !observations.busy()
+                            && Instant::now() < deadline
+                    })
+                    .and_then(|permit| permit.begin_device_activity(round).ok());
+                if activity.is_none() {
+                    let _ = reply.send(Err(ReadError::Busy("带库 owner 或设备巡检尚忙".into())));
+                    continue;
+                }
+                release_in_progress.store(true, std::sync::atomic::Ordering::Release);
+                let result = match (active.as_ref(), permission.as_deref()) {
+                    (Some(owner), Some(permit))
+                        if owner.serving && owner.round == round && !observations.busy() =>
+                    {
+                        runtime
+                            .block_on(library_handoff::prepare(owner, permit, &control, operation))
+                    }
+                    _ => Err(ReadError::Busy("带库 owner 或设备巡检尚忙".into())),
+                };
+                let releasing = result
+                    .as_ref()
+                    .ok()
+                    .filter(|r| {
+                        r.phase == HandoffPhase::Releasing
+                            && r.owner_epoch == round
+                            && r.detail.is_none()
+                    })
+                    .cloned();
+                let lost = match &result {
+                    Err(ReadError::Lost(reason)) => Some(reason.clone()),
+                    _ => None,
+                };
+                let _ = reply.send(result);
+                if let Some(reason) = lost {
+                    files.close_all(&reason);
+                    active = None;
+                    if let Some(permit) = permission.as_deref() {
+                        permit.close(round);
+                    }
+                    let _ = tx.send(ExecEvent::Lost { round, reason });
+                }
+                if let Some(request) = releasing {
+                    files.close_all("带库正在交还");
+                    let owner = active.take().expect("交还原执行器");
+                    let result = library_handoff::release(&owner, &request);
+                    drop(owner);
+                    if let Some(permit) = permission.as_deref() {
+                        permit.close(round);
+                    }
+                    let operation = request.operation;
+                    let mut receipt = library_handoff::ReleaseReceipt::new(request, result);
+                    if let Err(error) = receipt.persist(&release_checkpoint, &control) {
+                        warn!(
+                            "带库 {} 交还 {operation} 本地检查点保存失败: {error}",
+                            control.serial
+                        );
+                    }
+                    if !runtime.block_on(receipt.poll(&control, &release_checkpoint)) {
+                        release_receipt = Some(receipt);
+                    }
+                    let _ = tx.send(ExecEvent::Lost {
+                        round,
+                        reason: "带库交还已停止设备服务".into(),
+                    });
+                }
+                release_in_progress.store(false, std::sync::atomic::Ordering::Release);
             }
             ExecRequest::Shutdown { done } => {
                 files.close_all("FDB owner 正在停机");
@@ -2475,6 +2836,10 @@ fn process_all_uploads(
                 #[cfg(feature = "fdb")]
                 fdb_read_session: None,
                 #[cfg(feature = "fdb")]
+                fdb_reclaim_source_session: None,
+                #[cfg(feature = "fdb")]
+                fdb_reclaim_format_source: None,
+                #[cfg(feature = "fdb")]
                 fdb_pending_import: Default::default(),
                 #[cfg(feature = "fdb")]
                 fdb_monitor: Default::default(),
@@ -2495,6 +2860,8 @@ fn process_all_uploads(
                 reclaim: None,
                 reclaim_failures: 0,
                 reclaim_given_up: None,
+                #[cfg(feature = "fdb")]
+                reclaim_copy_stall: None,
             };
             jobs.push((
                 di,
@@ -2638,6 +3005,19 @@ fn takeover(
     permission: Option<&Arc<Permission>>,
     files: Arc<FileService>,
 ) -> Result<Active> {
+    takeover_with(provider, opts, round, permission, files, |devices, key| {
+        isolate_devices(devices, key, permission.is_none())
+    })
+}
+
+fn takeover_with(
+    provider: &dyn DeviceProvider,
+    opts: &ExecOptions,
+    round: u64,
+    permission: Option<&Arc<Permission>>,
+    files: Arc<FileService>,
+    isolate: impl FnOnce(&[ManagedDevice], ReservationKey) -> Result<()>,
+) -> Result<Active> {
     let key = ReservationKey::new(opts.node_id, round);
     let mut devices = provider.open_all()?;
     if let Some(permission) = permission {
@@ -2646,7 +3026,48 @@ fn takeover(
             d.dev = Box::new(GuardedTransport::new(inner, permission.clone(), round));
         }
     }
-    for d in &devices {
+    isolate(&devices, key)?;
+    Ok(Active {
+        #[cfg(feature = "fdb")]
+        fdb_reads: Default::default(),
+        #[cfg(feature = "fdb")]
+        fdb_read_session: None,
+        #[cfg(feature = "fdb")]
+        fdb_reclaim_source_session: None,
+        #[cfg(feature = "fdb")]
+        fdb_reclaim_format_source: None,
+        #[cfg(feature = "fdb")]
+        fdb_pending_import: Default::default(),
+        #[cfg(feature = "fdb")]
+        fdb_monitor: Default::default(),
+        files,
+        writers: Vec::new(),
+        next_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        density_support: Default::default(),
+        deferred: Default::default(),
+        management: None,
+        round,
+        key,
+        devices,
+        serving: false,
+        drive: None,
+        write_session: None,
+        read: None,
+        seq: 0,
+        reclaim: None,
+        reclaim_failures: 0,
+        reclaim_given_up: None,
+        #[cfg(feature = "fdb")]
+        reclaim_copy_stall: None,
+    })
+}
+
+fn isolate_devices(
+    devices: &[ManagedDevice],
+    key: ReservationKey,
+    allow_unsupported_changer: bool,
+) -> Result<()> {
+    for d in devices {
         match reservation::fence(d.dev.as_ref(), key)? {
             FenceOutcome::Fenced { before, .. } => {
                 info!(
@@ -2655,7 +3076,9 @@ fn takeover(
                     before.holder.map(|h| h.0)
                 );
             }
-            FenceOutcome::Unsupported if d.kind == DeviceKind::Changer && permission.is_none() => {
+            FenceOutcome::Unsupported
+                if d.kind == DeviceKind::Changer && allow_unsupported_changer =>
+            {
                 warn!("执行线程: 换带器 {} 不支持持久预留，降级为库存核对", d.name);
             }
             FenceOutcome::Unsupported => {
@@ -2680,33 +3103,7 @@ fn takeover(
             }
         }
     }
-    Ok(Active {
-        #[cfg(feature = "fdb")]
-        fdb_reads: Default::default(),
-        #[cfg(feature = "fdb")]
-        fdb_read_session: None,
-        #[cfg(feature = "fdb")]
-        fdb_pending_import: Default::default(),
-        #[cfg(feature = "fdb")]
-        fdb_monitor: Default::default(),
-        files,
-        writers: Vec::new(),
-        next_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        density_support: Default::default(),
-        deferred: Default::default(),
-        management: None,
-        round,
-        key,
-        devices,
-        serving: false,
-        drive: None,
-        write_session: None,
-        read: None,
-        seq: 0,
-        reclaim: None,
-        reclaim_failures: 0,
-        reclaim_given_up: None,
-    })
+    Ok(())
 }
 
 // 仅用于转移 Box 所有权，不会执行设备命令。

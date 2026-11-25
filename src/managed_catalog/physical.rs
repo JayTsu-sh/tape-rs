@@ -93,7 +93,7 @@ pub fn prepare_committed_active_file(
     prepare_file_node(path, intent, file)
 }
 
-fn prepare_file_node(
+pub(in crate::managed_catalog) fn prepare_file_node(
     path: &str,
     intent: &ActiveFileIntent,
     file: &FileNode,

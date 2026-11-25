@@ -1,7 +1,7 @@
 //! SCSI 通用设备封装，通过 SG_IO ioctl 发送原始 CDB
 
 use std::fs::OpenOptions;
-use std::os::unix::io::{AsRawFd, OwnedFd};
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -66,6 +66,67 @@ pub struct ScsiDevice {
     session_epoch: AtomicU64,
 }
 
+/// 只给内部诊断使用。保留本次 ioctl 的返回值，不存储缓冲区指针。
+#[derive(Debug, serde::Serialize)]
+pub(super) struct RawCompletion {
+    pub status: u8,
+    pub masked_status: u8,
+    pub msg_status: u8,
+    pub host_status: u16,
+    pub driver_status: u16,
+    pub info: u32,
+    pub duration_ms: u32,
+    pub sb_len_wr: u8,
+    pub sense_bytes: Vec<u8>,
+    pub resid: i32,
+    pub requested_len: u32,
+}
+
+impl RawCompletion {
+    fn from_header(hdr: &SgIoHdr, sense_buf: &[u8], requested_len: u32) -> Self {
+        let sense_len = usize::from(hdr.sb_len_wr).min(sense_buf.len());
+        Self {
+            status: hdr.status,
+            masked_status: hdr.masked_status,
+            msg_status: hdr.msg_status,
+            host_status: hdr.host_status,
+            driver_status: hdr.driver_status,
+            info: hdr.info,
+            duration_ms: hdr.duration,
+            sb_len_wr: hdr.sb_len_wr,
+            sense_bytes: sense_buf[..sense_len].to_vec(),
+            resid: hdr.resid,
+            requested_len,
+        }
+    }
+}
+
+pub(super) struct ReadOnlyCapture(ScsiDevice);
+
+impl ReadOnlyCapture {
+    pub(super) fn fd(&self) -> BorrowedFd<'_> {
+        self.0.fd.as_fd()
+    }
+
+    pub(super) fn read_capture(
+        &self,
+        cdb: &[u8],
+        buf: &mut [u8],
+        timeout_ms: u32,
+    ) -> (Option<RawCompletion>, Result<ScsiResult>) {
+        let mut raw = None;
+        let result = self.0.execute_raw_inner(
+            cdb,
+            Direction::FromDevice,
+            buf.as_mut_ptr() as u64,
+            buf.len(),
+            timeout_ms,
+            Some(&mut raw),
+        );
+        (raw, result)
+    }
+}
+
 /// 打开后、发出任何命令前配置；申请失败或不足仍可由 sg 动态分配间接缓冲。
 fn configure_reserved_buffer(fd: &OwnedFd, path: &str) {
     let requested: i32 = 1024 * 1024;
@@ -111,7 +172,38 @@ impl ScsiDevice {
         // 与 LTFS sg 后端一致，按 fd 预留 1MiB，覆盖常用 512KiB 记录。
         // 仅调整内核缓冲，不改变介质/驱动模式或全机 allow_dio。
         configure_reserved_buffer(&fd, path);
-        Ok(Self {
+        Ok(Self::with_fd(fd, path))
+    }
+
+    pub(super) fn open_capture_readonly(path: &str) -> Result<ReadOnlyCapture> {
+        use nix::libc;
+        use nix::sys::stat::{SFlag, fstat, major};
+        use std::os::unix::fs::OpenOptionsExt;
+        let fd = OwnedFd::from(
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path)?,
+        );
+        let stat = fstat(fd.as_raw_fd())?;
+        if SFlag::from_bits_truncate(stat.st_mode) != SFlag::S_IFCHR || major(stat.st_rdev) != 21 {
+            return Err(TapeError::Refused {
+                reason: format!("{path} 打开的句柄不是 SCSI generic 字符设备"),
+            });
+        }
+        let flags = nix::fcntl::fcntl(fd.as_raw_fd(), nix::fcntl::FcntlArg::F_GETFL)?;
+        let flags = nix::fcntl::OFlag::from_bits_truncate(flags) & !nix::fcntl::OFlag::O_NONBLOCK;
+        nix::fcntl::fcntl(fd.as_raw_fd(), nix::fcntl::FcntlArg::F_SETFL(flags))?;
+        if pending_io(fd.as_raw_fd())? {
+            return Err(TapeError::Refused {
+                reason: format!("{path} 的新只读句柄存在未完成的 SG 请求"),
+            });
+        }
+        Ok(ReadOnlyCapture(Self::with_fd(fd, path)))
+    }
+
+    fn with_fd(fd: OwnedFd, path: &str) -> Self {
+        Self {
             fd,
             path: path.to_string(),
             direct: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -120,7 +212,7 @@ impl ScsiDevice {
             command: Mutex::new(()),
             failed: AtomicBool::new(false),
             session_epoch: AtomicU64::new(0),
-        })
+        }
     }
 
     /// 获取设备路径
@@ -154,6 +246,18 @@ impl ScsiDevice {
         dxferp: u64,
         dxfer_len: usize,
         timeout_ms: u32,
+    ) -> Result<ScsiResult> {
+        self.execute_raw_inner(cdb, direction, dxferp, dxfer_len, timeout_ms, None)
+    }
+
+    fn execute_raw_inner(
+        &self,
+        cdb: &[u8],
+        direction: Direction,
+        dxferp: u64,
+        dxfer_len: usize,
+        timeout_ms: u32,
+        capture: Option<&mut Option<RawCompletion>>,
     ) -> Result<ScsiResult> {
         let _command = self.command.lock().unwrap_or_else(|e| e.into_inner());
         if self.failed.load(Ordering::Relaxed) {
@@ -207,6 +311,10 @@ impl ScsiDevice {
                 self.path, cdb, wall_us, error
             );
             return Err(error.into());
+        }
+
+        if let Some(capture) = capture {
+            *capture = Some(RawCompletion::from_header(&hdr, &sense_buf, dxfer_len));
         }
 
         debug!(
@@ -420,6 +528,34 @@ pub(crate) fn finish_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_capture_keeps_unmapped_status_and_signed_residual() {
+        let hdr = SgIoHdr {
+            status: 2,
+            masked_status: 1,
+            msg_status: 3,
+            host_status: 7,
+            driver_status: 8,
+            info: 1,
+            duration: 32,
+            sb_len_wr: 3,
+            resid: -9,
+            ..Default::default()
+        };
+        let completion = RawCompletion::from_header(&hdr, &[0x72, 6, 0x29, 0xff], 4096);
+        assert_eq!(completion.status, 2);
+        assert_eq!(completion.masked_status, 1);
+        assert_eq!(completion.msg_status, 3);
+        assert_eq!(completion.host_status, 7);
+        assert_eq!(completion.driver_status, 8);
+        assert_eq!(completion.info, 1);
+        assert_eq!(completion.duration_ms, 32);
+        assert_eq!(completion.sb_len_wr, 3);
+        assert_eq!(completion.sense_bytes, [0x72, 6, 0x29]);
+        assert_eq!(completion.resid, -9);
+        assert_eq!(completion.requested_len, 4096);
+    }
 
     #[test]
     fn command_error_preserves_current_versus_deferred_diagnostics() {

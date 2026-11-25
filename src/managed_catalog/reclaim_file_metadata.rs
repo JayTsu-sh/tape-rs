@@ -129,9 +129,60 @@ impl ReclaimSourceInventory<'_> {
         target: (&ResolvedRead, ActiveIndexIdentity),
         captured: &CapturedIndexSource,
     ) -> Result<ReclaimFileMetadata> {
+        self.bind_metadata(
+            reservation,
+            request,
+            source,
+            (
+                &ReadMetadata::from(target.0),
+                lookup::PhysicalReadView::Cached(&target.0.physical),
+                target.1,
+            ),
+            captured,
+        )
+    }
+
+    pub(crate) fn bind_verified_metadata_plan(
+        &self,
+        reservation: &ReclaimReservation,
+        request: &ActiveFileRequest,
+        source: &PhysicalCopy,
+        target: (&ReadMetadata, &VerifiedPhysicalPlan, ActiveIndexIdentity),
+        captured: &CapturedIndexSource,
+    ) -> Result<ReclaimFileMetadata> {
+        if target.1.volume() != target.0.copy.volume_id
+            || target.1.uid() != target.0.copy.ltfs_file_uid
+        {
+            return Err(CatalogError::Invalid("目的读取计划与副本身份不同"));
+        }
+        self.bind_metadata(
+            reservation,
+            request,
+            source,
+            (
+                target.0,
+                lookup::PhysicalReadView::Sealed(target.1),
+                target.2,
+            ),
+            captured,
+        )
+    }
+
+    fn bind_metadata(
+        &self,
+        reservation: &ReclaimReservation,
+        request: &ActiveFileRequest,
+        source: &PhysicalCopy,
+        target: (
+            &ReadMetadata,
+            lookup::PhysicalReadView<'_>,
+            ActiveIndexIdentity,
+        ),
+        captured: &CapturedIndexSource,
+    ) -> Result<ReclaimFileMetadata> {
         request.validate()?;
         current_proof(captured.scope(), captured.header())?;
-        let (read, verified_head) = target;
+        let (read, physical, verified_head) = target;
         let spec = reservation.spec();
         let ContentDigest::Sha256(sha) = request.expected_digest else {
             return Err(CatalogError::Incomplete);
@@ -159,7 +210,7 @@ impl ReclaimSourceInventory<'_> {
             || read.placement.namespace != reservation.namespace()
             || read.placement.pool_id != spec.pool
             || read.placement.library_serial != reservation.serial()
-            || read.physical.symlink.is_some()
+            || physical.symlink()
             || read.copy.media.is_some()
         {
             return Err(CatalogError::Invalid("元数据证明与原请求或目的实读不符"));
@@ -227,10 +278,10 @@ impl ReclaimSourceInventory<'_> {
             return Err(CatalogError::Invalid("目的元数据对象不是文件"));
         };
         if target_path != request.ltfs_path()?.trim_start_matches('/')
-            || target_path != &read.physical.path
-            || target_node.length != read.physical.length
+            || target_path != physical.path()
+            || target_node.length != physical.length()
             || target_node.length != read.copy.size
-            || target_node.extents != read.physical.extents
+            || !physical.matches_extents(&target_node.extents)?
         {
             return Err(CatalogError::Invalid("目的元数据与实际读取位置不一致"));
         }

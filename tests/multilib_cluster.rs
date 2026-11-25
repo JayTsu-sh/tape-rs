@@ -120,24 +120,11 @@ fn service_addresses() -> (HashMap<u64, String>, HashMap<u64, TcpListener>) {
 }
 
 #[test]
-fn service_addresses_keep_both_http_and_s3_reservations_until_handoff() {
+fn service_addresses_stay_reserved_until_handoff() {
     let (http, mut http_reserved) = service_addresses();
-    let (s3, mut s3_reserved) = service_addresses();
-    // Simulate another planned service/process trying to claim a selected port.
-    // With a retained lease it cannot; with the old released probe it can.
-    let competitor = TcpListener::bind(&s3[&1]).ok();
-    drop(s3_reserved.remove(&1));
-    let live =
-        TcpListener::bind(&s3[&1]).expect("service lost its reserved address before startup");
-    assert!(competitor.is_none());
-    for address in http.values().chain(
-        s3.iter()
-            .filter(|(id, _)| **id != 1)
-            .map(|(_, address)| address),
-    ) {
+    for address in http.values() {
         assert!(TcpListener::bind(address).is_err());
     }
-    drop(live);
     drop(http_reserved.remove(&1));
     assert!(TcpListener::bind(&http[&1]).is_ok());
 }
@@ -166,7 +153,6 @@ fn one_cluster_two_owners_and_fixed_http_entry_preserve_library_isolation() {
             (id, lib)
         })
         .collect();
-    let (s3_addresses, mut s3_reserved) = service_addresses();
     let mut statuses = HashMap::<(u64, String), SharedStatus>::new();
     let mut flags = HashMap::new();
     let mut joins = Vec::new();
@@ -269,14 +255,6 @@ fn one_cluster_two_owners_and_fixed_http_entry_preserve_library_isolation() {
             });
         }
         let gateway = contexts.remove(GATEWAY).unwrap();
-        drop(s3_reserved.remove(&id));
-        tape_rs::daemon::s3::serve(
-            &s3_addresses[&id],
-            contexts.clone(),
-            gateway.clone(),
-            s3_addresses.clone(),
-        )
-        .unwrap();
         drop(http_reserved.remove(&id));
         gateway::serve(
             &addresses[&id],
@@ -351,8 +329,9 @@ fn one_cluster_two_owners_and_fixed_http_entry_preserve_library_isolation() {
             && owner("55L3A7802K19LL01") != owner("55L3A78011W9LL01")
             && owner(GATEWAY) == Some(3)
     });
+    let endpoint = &addresses[&3];
     // ExecutorReady 先于后续 Serving ReadIndex 许可，等待实际可服务状态。
-    wait(|| exchange(&s3_addresses[&3], "GET", "/", &[]).0 == 200);
+    wait(|| exchange(endpoint, "GET", "/readyz", &[]).0 == 200);
     // 两库允许相同池名、UUID、条码和路径，目录与介质内容分别归属。
     let admin = |library: &str, cmd: Command| {
         let (reply, rx) = mpsc::channel();
@@ -384,7 +363,6 @@ fn one_cluster_two_owners_and_fixed_http_entry_preserve_library_isolation() {
             },
         );
     }
-    let endpoint = &addresses[&3];
     // 新建/分配池的控制日志先提交，实际装带与准入随后就绪。
     for library in ["55L3A7802K19LL01", "55L3A78011W9LL01"] {
         wait(|| {
@@ -498,73 +476,6 @@ fn one_cluster_two_owners_and_fixed_http_entry_preserve_library_isolation() {
         );
     }
     flags[&(1, "55L3A78011W9LL01")].store(false, Ordering::SeqCst);
-    // 同名、同 UUID 池投影为不同 bucket；固定节点 3 的 S3 入口分别转发到 owner 1/2。
-    let mut s3_buckets = Vec::new();
-    for (library, data) in [
-        ("55L3A7802K19LL01", b"S3 library A".as_slice()),
-        ("55L3A78011W9LL01", b"S3 library B".as_slice()),
-    ] {
-        let bucket = tape_rs::daemon::s3::bucket_name(library, "same-uuid");
-        assert!(!s3_buckets.contains(&bucket));
-        s3_buckets.push(bucket.clone());
-        wait(|| {
-            let put = exchange(
-                &s3_addresses[&3],
-                "PUT",
-                &format!("/{bucket}/s3-only"),
-                data,
-            );
-            assert!(
-                put.0 == 200 || put.0 == 503,
-                "{}: {}",
-                put.0,
-                String::from_utf8_lossy(&put.1)
-            );
-            put.0 == 200
-        });
-        assert_eq!(
-            exchange(&s3_addresses[&3], "GET", &format!("/{bucket}/s3-only"), &[]),
-            (200, data.to_vec())
-        );
-        assert_eq!(
-            exchange(
-                endpoint,
-                "GET",
-                &format!("/libraries/{library}/pools/same-uuid/files/s3-only"),
-                &[]
-            ),
-            (200, data.to_vec())
-        );
-    }
-    assert_eq!(
-        exchange(
-            &s3_addresses[&3],
-            "DELETE",
-            &format!("/{}/s3-only", s3_buckets[0]),
-            &[]
-        )
-        .0,
-        204
-    );
-    assert_eq!(
-        exchange(
-            &s3_addresses[&3],
-            "GET",
-            &format!("/{}/s3-only", s3_buckets[0]),
-            &[]
-        )
-        .0,
-        404
-    );
-    assert_eq!(
-        exchange(
-            &s3_addresses[&3],
-            "GET",
-            &format!("/{}/s3-only", s3_buckets[1]),
-            &[]
-        ),
-        (200, b"S3 library B".to_vec())
-    );
     for library in ["55L3A7802K19LL01", "55L3A78011W9LL01"] {
         for method in ["GET", "POST", "DELETE"] {
             assert_eq!(

@@ -334,6 +334,25 @@ enum LibraryCmd {
     },
     /// 显式刷新当前库的设备库存
     Rescan(lifecycle::Rescan),
+    /// 将整座带库交给外部应用，保留驱动器内的磁带
+    Unload(LibraryHandoffArgs),
+    /// 外部应用停止使用后，引用交还回执重新取得整座带库
+    Load {
+        #[command(flatten)]
+        request: LibraryHandoffArgs,
+        #[arg(long)]
+        release: uuid::Uuid,
+    },
+    /// 按原操作 ID 查询带库交还或加载状态
+    HandoffStatus(LibraryHandoffArgs),
+}
+
+#[derive(clap::Args)]
+struct LibraryHandoffArgs {
+    #[arg(long)]
+    namespace: uuid::Uuid,
+    #[arg(long)]
+    operation: uuid::Uuid,
 }
 
 #[derive(Subcommand)]
@@ -973,6 +992,45 @@ fn main() {
                     args.library.as_deref(),
                     command,
                 )?;
+            }
+            Cmd::Library {
+                cmd: LibraryCmd::Unload(request),
+            } => {
+                let serial = args.library.as_deref().ok_or("带库交还须指定 --library")?;
+                let client = tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?;
+                let receipt =
+                    client.unload_library(serial, request.namespace, request.operation)?;
+                let failed = receipt["phase"] == "failed";
+                print_json(receipt);
+                if failed {
+                    return Err("带库交还失败，详情见回执".into());
+                }
+            }
+            Cmd::Library {
+                cmd: LibraryCmd::Load { request, release },
+            } => {
+                let serial = args.library.as_deref().ok_or("带库加载须指定 --library")?;
+                let client = tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?;
+                print_json(client.reload_library(
+                    serial,
+                    request.namespace,
+                    request.operation,
+                    release,
+                )?);
+            }
+            Cmd::Library {
+                cmd: LibraryCmd::HandoffStatus(request),
+            } => {
+                let serial = args
+                    .library
+                    .as_deref()
+                    .ok_or("查询交还状态须指定 --library")?;
+                let client = tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?;
+                print_json(
+                    client
+                        .library_handoff_status(serial, request.namespace, request.operation)?
+                        .ok_or("找不到原交还或加载回执")?,
+                );
             }
             Cmd::Drive { cmd } => match cmd {
                 DriveCmd::List => {

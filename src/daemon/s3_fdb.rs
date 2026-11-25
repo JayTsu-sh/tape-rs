@@ -923,16 +923,8 @@ mod tests {
         assert!(cursor(&t, "bucket", Uuid::new_v4(), "a", "/").is_err());
         assert!(cursor(&t, "bucket", ns, "b", "/").is_err());
         assert!(cursor(&t, "bucket", ns, "a", "").is_err());
-        assert!(
-            cursor(
-                &encode_token("bucket", "a", "/", "a/b"),
-                "bucket",
-                ns,
-                "a",
-                "/"
-            )
-            .is_err()
-        );
+        let legacy = URL_SAFE_NO_PAD.encode(br#"[1,"bucket","a","/","a/b"]"#);
+        assert!(cursor(&legacy, "bucket", ns, "a", "/").is_err());
         assert!(cursor("broken", "bucket", ns, "a", "/").is_err());
         assert_ne!(tag(ns, Uuid::nil(), 1), tag(ns, Uuid::nil(), 2));
     }

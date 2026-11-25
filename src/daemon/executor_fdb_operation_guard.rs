@@ -66,6 +66,7 @@ pub(in crate::daemon) struct Guard<'a, F> {
     inner: &'a dyn TapeTransport,
     authority: F,
     lost: Mutex<Option<String>>,
+    latch_unit_attention: bool,
 }
 
 impl<'a, F: Fn() -> Result<()>> Guard<'a, F> {
@@ -74,6 +75,19 @@ impl<'a, F: Fn() -> Result<()>> Guard<'a, F> {
             inner,
             authority,
             lost: Mutex::new(None),
+            latch_unit_attention: false,
+        }
+    }
+
+    /// A read that brackets several tape operations with one pair of
+    /// observations must abandon the entire observation on Unit Attention.
+    pub(in crate::daemon) fn new_bracketed_read(
+        inner: &'a dyn TapeTransport,
+        authority: F,
+    ) -> Self {
+        Self {
+            latch_unit_attention: true,
+            ..Self::new(inner, authority)
         }
     }
 
@@ -113,7 +127,9 @@ impl<'a, F: Fn() -> Result<()>> Guard<'a, F> {
         self.check()?;
         let result = operation();
         if let Err(error) = &result
-            && !confirmed_response(cdb, error)
+            && (!confirmed_response(cdb, error)
+                || self.latch_unit_attention
+                    && matches!(error, TapeError::ScsiCommand { sense_key: 6, .. }))
             && let Ok(mut lost) = self.lost.lock()
         {
             *lost = Some(format!("原设备命令结果未确认: {error}"));
@@ -142,6 +158,9 @@ impl<F: Fn() -> Result<()>> TapeTransport for Guard<'_, F> {
     }
     fn identity(&self) -> &str {
         self.inner.identity()
+    }
+    fn medium_change_token(&self) -> Option<[u8; 32]> {
+        self.inner.medium_change_token()
     }
     fn session_epoch(&self) -> Option<u64> {
         self.inner.session_epoch()
@@ -237,6 +256,11 @@ mod tests {
                 known,
                 "opcode={opcode:x}, key={key}, response={response:x}, length={length}"
             );
+            if key == 6 && known {
+                let bracketed = Guard::new_bracketed_read(&device, || Ok(()));
+                assert!(bracketed.execute_no_data(&[opcode], 100).is_err());
+                assert!(bracketed.verify_proof().is_err());
+            }
         }
     }
 

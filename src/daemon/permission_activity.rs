@@ -42,6 +42,12 @@ pub struct DeviceActivityGuard<'a> {
     tracked: bool,
 }
 impl ActivityRegistry {
+    #[cfg(feature = "fdb")]
+    pub(super) fn busy(&self, round: u64) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.round == round && state.depth != 0
+    }
+
     pub(super) fn recovering(&self, round: u64) -> DeviceActivityGuard<'_> {
         DeviceActivityGuard {
             registry: self,

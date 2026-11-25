@@ -377,6 +377,43 @@ struct RowHeader {
     sha256: [u8; 32],
 }
 
+/// Exact immutable row identity, read with the complete checked payload.
+/// A staged DTO alone cannot construct this snapshot. Large row bodies remain
+/// chunked; the final transaction compares this bounded original header.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct StagedRowSnapshot {
+    namespace: Uuid,
+    ordinal: u64,
+    raw: Vec<u8>,
+    sha256: [u8; 32],
+}
+
+impl StagedRowSnapshot {
+    pub(super) fn digest(&self) -> [u8; 32] {
+        self.sha256
+    }
+
+    pub(super) fn namespace(&self) -> Uuid {
+        self.namespace
+    }
+
+    pub(super) fn ordinal(&self) -> u64 {
+        self.ordinal
+    }
+
+    pub(super) async fn require_at(&self, tr: &super::Transaction) -> Result<()> {
+        if tr
+            .get(&row_key(self.namespace, self.ordinal), false)
+            .await?
+            .as_deref()
+            != Some(self.raw.as_slice())
+        {
+            return Err(CatalogError::Incomplete);
+        }
+        Ok(())
+    }
+}
+
 impl RowHeader {
     fn encode(self) -> [u8; ROW_HEADER_LEN] {
         let mut out = [0; ROW_HEADER_LEN];
@@ -1282,6 +1319,42 @@ impl ManagedCatalog {
         namespace: Uuid,
         ordinal: u64,
     ) -> Result<Option<DecodedEntry>> {
+        Ok(self
+            .read_staged_entry_snapshot(namespace, ordinal)
+            .await?
+            .map(|(entry, _)| entry))
+    }
+
+    /// Internal actual-row entry point for source-bound layout staging. No
+    /// public caller-supplied DTO or header can mint the returned snapshot.
+    pub(super) async fn staged_layout_entry(
+        &self,
+        namespace: Uuid,
+        ordinal: u64,
+    ) -> Result<Option<(StagedImportEntry, StagedRowSnapshot)>> {
+        self.read_staged_entry_snapshot(namespace, ordinal)
+            .await?
+            .map(
+                |((path, attributes, source_file_uids, source_data), snapshot)| {
+                    Ok((
+                        StagedImportEntry {
+                            path,
+                            current_attributes: attributes.ok_or(CatalogError::Incomplete)?,
+                            source_file_uids: source_file_uids.ok_or(CatalogError::Incomplete)?,
+                            source_data,
+                        },
+                        snapshot,
+                    ))
+                },
+            )
+            .transpose()
+    }
+
+    async fn read_staged_entry_snapshot(
+        &self,
+        namespace: Uuid,
+        ordinal: u64,
+    ) -> Result<Option<(DecodedEntry, StagedRowSnapshot)>> {
         let tr = self.db.create_trx()?;
         let Some(raw) = tr.get(&row_key(namespace, ordinal), true).await? else {
             return Ok(None);
@@ -1317,7 +1390,16 @@ impl ManagedCatalog {
             }
             data
         };
-        decode_entry(&data).map(Some)
+        let entry = decode_entry(&data)?;
+        Ok(Some((
+            entry,
+            StagedRowSnapshot {
+                namespace,
+                ordinal,
+                raw: raw.to_vec(),
+                sha256: header.sha256,
+            },
+        )))
     }
 
     async fn begin_stage(&self, namespace: Uuid, audit: DirectoryAudit) -> Result<()> {

@@ -141,6 +141,51 @@ impl ReclaimSourceInventory<'_> {
         sha256: [u8; 32],
         md5: Option<[u8; 16]>,
     ) -> Result<ReclaimSourceRead> {
+        self.bind_read(
+            reservation,
+            file,
+            &ReadMetadata::from(read),
+            lookup::PhysicalReadView::Cached(&read.physical),
+            verified_head,
+            sha256,
+            md5,
+        )
+    }
+
+    pub(crate) fn bind_verified_read_plan(
+        &self,
+        reservation: &ReclaimReservation,
+        file: &ReclaimFile,
+        read: &ReadMetadata,
+        plan: &VerifiedPhysicalPlan,
+        verified_head: ActiveIndexIdentity,
+        sha256: [u8; 32],
+        md5: Option<[u8; 16]>,
+    ) -> Result<ReclaimSourceRead> {
+        if plan.volume() != read.copy.volume_id || plan.uid() != read.copy.ltfs_file_uid {
+            return Err(CatalogError::Invalid("回收读取计划与副本身份不同"));
+        }
+        self.bind_read(
+            reservation,
+            file,
+            read,
+            lookup::PhysicalReadView::Sealed(plan),
+            verified_head,
+            sha256,
+            md5,
+        )
+    }
+
+    fn bind_read(
+        &self,
+        reservation: &ReclaimReservation,
+        file: &ReclaimFile,
+        read: &ReadMetadata,
+        physical: lookup::PhysicalReadView<'_>,
+        verified_head: ActiveIndexIdentity,
+        sha256: [u8; 32],
+        md5: Option<[u8; 16]>,
+    ) -> Result<ReclaimSourceRead> {
         let mut index = Vec::new();
         active_volume::encode_index(&mut index, verified_head);
         let spec = reservation.spec();
@@ -156,8 +201,8 @@ impl ReclaimSourceInventory<'_> {
             || read.copy.version != read.head.version
             || read.head.size != file.size()
             || read.copy.size != file.size()
-            || read.physical.length != file.size()
-            || read.physical.symlink.is_some()
+            || physical.length() != file.size()
+            || physical.symlink()
             || read.copy.media.as_ref().is_some_and(|m| m.native_symlink)
         {
             return Err(CatalogError::Invalid(
@@ -180,8 +225,8 @@ impl ReclaimSourceInventory<'_> {
         // Native rename may change the current path, but LTFS body locations
         // must match exactly. EE aliases use their data UID, never link UID.
         if node.symlink.is_some()
-            || node.length != read.physical.length
-            || node.extents != read.physical.extents
+            || node.length != physical.length()
+            || !physical.matches_extents(&node.extents)?
         {
             return Err(CatalogError::Invalid(
                 "当前源对象的正文 extent 与实读来源不同",

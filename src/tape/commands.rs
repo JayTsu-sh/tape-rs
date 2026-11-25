@@ -139,6 +139,14 @@ impl<'a> TapeDrive<'a> {
         self.locate(partition, block, true)
     }
 
+    pub(crate) fn position_matches(&self, partition: u8, block: u64) -> Result<bool> {
+        Ok(short_position_matches(
+            &self.read_position_data()?,
+            partition,
+            block,
+        ))
+    }
+
     /// Read through a small forward gap (including filemarks) instead of
     /// stopping streaming with LOCATE. IBM GA32-0928-08 Table 99 counts each
     /// filemark as one logical object. Unreliable/large/backward positions use

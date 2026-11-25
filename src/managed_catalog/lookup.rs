@@ -33,6 +33,59 @@ pub struct ResolvedRead {
     pub attributes: Option<NodeAttributes>,
 }
 
+/// Managed metadata from the catalog snapshot; physical extents live in a
+/// separately verified, bounded read plan rather than a local business mirror.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadMetadata {
+    pub id: Uuid,
+    pub head: FileHead,
+    pub copy: PhysicalCopy,
+    pub placement: VolumePlacement,
+    pub attributes: Option<NodeAttributes>,
+}
+
+impl From<&ResolvedRead> for ReadMetadata {
+    fn from(read: &ResolvedRead) -> Self {
+        Self {
+            id: read.id,
+            head: read.head.clone(),
+            copy: read.copy.clone(),
+            placement: read.placement.clone(),
+            attributes: read.attributes.clone(),
+        }
+    }
+}
+
+pub(super) enum PhysicalReadView<'a> {
+    Cached(&'a CachedFile),
+    Sealed(&'a VerifiedPhysicalPlan),
+}
+impl PhysicalReadView<'_> {
+    pub(super) fn path(&self) -> &str {
+        match self {
+            Self::Cached(file) => &file.path,
+            Self::Sealed(plan) => plan.path(),
+        }
+    }
+    pub(super) fn length(&self) -> u64 {
+        match self {
+            Self::Cached(file) => file.length,
+            Self::Sealed(plan) => plan.length(),
+        }
+    }
+    pub(super) fn symlink(&self) -> bool {
+        matches!(self, Self::Cached(file) if file.symlink.is_some())
+    }
+    pub(super) fn matches_extents(&self, expected: &[crate::ltfs::index::Extent]) -> Result<bool> {
+        match self {
+            Self::Cached(file) => Ok(file.extents == expected),
+            Self::Sealed(plan) => plan
+                .matches_extents(expected)
+                .map_err(|error| CatalogError::Cache(error.to_string())),
+        }
+    }
+}
+
 /// A file plan and the exact index construct that supplies its extents.
 /// The caller must still verify the medium and owner/PR before tape I/O.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,6 +101,11 @@ pub struct ResolvedActiveRead {
 pub struct ActiveReadSource {
     resolved: ResolvedPath,
     path: Vec<u8>,
+    layout: Option<CopyLayoutBinding>,
+    marker_upgrade: bool,
+    snapshot: Option<std::sync::Arc<body_layouts::CopyReadSnapshot>>,
+    location: body_layouts::BindingLocation,
+    ledger: Option<RetainedLedgerAuthority>,
     pub source: ActiveIndexIdentity,
     pub baseline: Option<crate::ltfs::recovery::IndexSourceIdentity>,
 }
@@ -65,6 +123,144 @@ impl ActiveReadSource {
             ResolvedPath::File { placement, .. } => placement,
             ResolvedPath::Directory { .. } => unreachable!("source lookup accepts files only"),
         }
+    }
+
+    pub(crate) fn metadata(&self) -> ReadMetadata {
+        let ResolvedPath::File {
+            id,
+            head,
+            copy,
+            placement,
+            attributes,
+            ..
+        } = &self.resolved
+        else {
+            unreachable!("source lookup accepts files only")
+        };
+        ReadMetadata {
+            id: *id,
+            head: head.clone(),
+            copy: (**copy).clone(),
+            placement: placement.clone(),
+            attributes: attributes.clone(),
+        }
+    }
+
+    pub(crate) fn layout_binding(&self) -> Option<&CopyLayoutBinding> {
+        self.layout.as_ref()
+    }
+
+    pub(crate) fn needs_marker_upgrade(&self) -> bool {
+        self.marker_upgrade
+    }
+
+    pub(in crate::managed_catalog) fn existing_snapshot(
+        &self,
+    ) -> Option<&std::sync::Arc<body_layouts::CopyReadSnapshot>> {
+        self.snapshot.as_ref()
+    }
+
+    pub(crate) fn has_existing_snapshot(&self) -> bool {
+        self.snapshot.is_some()
+    }
+
+    pub(in crate::managed_catalog) fn retained_authority(
+        &self,
+    ) -> Option<&RetainedLedgerAuthority> {
+        self.ledger.as_ref()
+    }
+    pub(crate) fn is_retained(&self) -> bool {
+        self.ledger.is_some()
+    }
+    pub(crate) async fn prepare_body_plan(
+        &self,
+        catalog: &ManagedCatalog,
+        file: std::fs::File,
+        maximum_bytes: u64,
+    ) -> crate::error::Result<VerifiedPhysicalPlan> {
+        let binding = self
+            .layout
+            .as_ref()
+            .ok_or_else(|| crate::error::TapeError::Catalog("缺少 FDB 正文布局绑定".into()))?;
+        catalog
+            .prepare_body_read_plan_at(binding, &self.location, file, maximum_bytes)
+            .await
+    }
+
+    pub(crate) fn same_selection(&self, other: &Self) -> bool {
+        self.resolved == other.resolved && self.path == other.path && self.source == other.source
+    }
+
+    /// Resolve the original body from a freshly verified recorded source.
+    /// This never accepts an extent cache as proof of the on-tape contents.
+    pub(crate) fn captured_body(
+        &self,
+        captured: &crate::ltfs::recovery::CapturedIndexSource,
+    ) -> Result<(String, crate::ltfs::index::FileNode)> {
+        if ActiveIndexIdentity::from(captured.construct()) != self.source
+            || self.baseline.as_ref().is_some_and(|identity| {
+                captured
+                    .identity()
+                    .as_ref()
+                    .map_or(true, |actual| actual != identity)
+            })
+        {
+            return Err(CatalogError::Corrupt("实读正文来源不是原已记录索引"));
+        }
+        let copy = self.copy();
+        let crate::ltfs::index::IndexEntry::File { path, node } = captured
+            .entry_by_uid(copy.ltfs_file_uid)
+            .map_err(|error| CatalogError::Cache(error.to_string()))?
+            .ok_or(CatalogError::Incomplete)?
+        else {
+            return Err(CatalogError::Corrupt("正文 UID 不是普通文件"));
+        };
+        if node.symlink.is_some() || node.length != copy.size {
+            return Err(CatalogError::Corrupt("正文 UID 类型或长度与副本不同"));
+        }
+        if let Some(media) = &copy.media {
+            if media.native_symlink || path != media.physical_path {
+                return Err(CatalogError::Corrupt("实读正文与原生副本数据路径不同"));
+            }
+            let crate::ltfs::index::IndexEntry::File {
+                path: logical_path,
+                node: logical,
+            } = captured
+                .entry_by_uid(media.logical_file_uid)
+                .map_err(|error| CatalogError::Cache(error.to_string()))?
+                .ok_or(CatalogError::Incomplete)?
+            else {
+                return Err(CatalogError::Corrupt("原生逻辑 UID 不是文件"));
+            };
+            if media.ee_alias != logical.symlink.is_some()
+                || self
+                    .metadata()
+                    .attributes
+                    .as_ref()
+                    .and_then(NodeAttributes::meta)
+                    .is_some_and(|meta| meta.file_uid != media.logical_file_uid)
+            {
+                return Err(CatalogError::Corrupt("原生逻辑来源类型或 UID 不同"));
+            }
+            if let Some(target) = &logical.symlink {
+                if import_spool::resolve_ee_alias_target(&logical_path, target)
+                    .map_err(|error| CatalogError::Cache(error.to_string()))?
+                    != path
+                {
+                    return Err(CatalogError::Corrupt("EE 别名不指向原始正文"));
+                }
+            } else if logical_path != path || media.logical_file_uid != copy.ltfs_file_uid {
+                return Err(CatalogError::Corrupt("原生普通文件与正文身份不同"));
+            }
+        } else {
+            let logical = std::str::from_utf8(&self.path)
+                .map_err(|_| CatalogError::Invalid("LTFS 路径必须为 UTF-8"))?;
+            let prefix = format!("/{}/", self.placement().pool_id);
+            if logical.strip_prefix(&prefix).is_none() {
+                return Err(CatalogError::Corrupt("活动副本缺少池内路径"));
+            }
+        }
+        Ok((path, node))
     }
 
     /// An ordinary immutable body may also be proved by the currently verified
@@ -124,6 +320,63 @@ impl ActiveReadSource {
                 extents: node.extents,
             },
             attributes,
+        })
+    }
+
+    /// The projection is selected at the same FDB read version as the copy.
+    /// Loading checks immutable chunks and rechecks the exact binding afterward.
+    pub(crate) async fn body_layout(
+        &self,
+        catalog: &ManagedCatalog,
+        maximum_bytes: u64,
+    ) -> Result<Option<BodyLayout<'static>>> {
+        match &self.layout {
+            Some(binding) => catalog.load_body_layout(binding, maximum_bytes).await,
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn plan_from_layout(&self, layout: &BodyLayout<'_>) -> Result<ResolvedActiveRead> {
+        let ResolvedPath::File {
+            id,
+            head,
+            copy,
+            placement,
+            attributes,
+            ..
+        } = self.resolved.clone()
+        else {
+            return Err(CatalogError::Invalid("目录不能作为正文布局读取"));
+        };
+        let binding = self.layout.as_ref().ok_or(CatalogError::Incomplete)?;
+        if !binding.matches_copy(placement.namespace, id, head.copy_id, &copy, self.source)
+            || layout.volume() != copy.volume_id
+            || layout.uid() != copy.ltfs_file_uid
+            || layout.length() != copy.size
+            || layout.manifest()?.digest() != binding.layout_digest()
+        {
+            return Err(CatalogError::Corrupt("正文布局与当前读取副本不一致"));
+        }
+        Ok(ResolvedActiveRead {
+            read: ResolvedRead {
+                id,
+                head,
+                copy: *copy,
+                placement,
+                attributes,
+                physical: CachedFile {
+                    path: binding
+                        .path()
+                        .strip_prefix('/')
+                        .ok_or(CatalogError::Corrupt("正文布局物理路径缺少卷根"))?
+                        .to_owned(),
+                    length: layout.length(),
+                    symlink: None,
+                    extents: layout.extents().to_vec(),
+                },
+            },
+            source: self.source,
+            baseline: self.baseline.clone(),
         })
     }
 
@@ -387,6 +640,83 @@ impl ManagedCatalog {
             .await?
             .expect("resolved path");
         Ok(Some(ActiveReadSource { resolved, ..source }))
+    }
+
+    /// Finish only the original published SDK overlay. Its actual saved page
+    /// and receipt drive the existing finalization/materialization protocol.
+    pub(crate) async fn materialize_legacy_layout_source(
+        &self,
+        serial: &str,
+        route: ActiveLibraryRoute,
+        owner: u64,
+        source: &ActiveReadSource,
+    ) -> Result<()> {
+        let metadata = source.metadata();
+        let tr = self.db.create_trx()?;
+        let namespace = routing::require_runtime_active_owner(&tr, serial, route, owner).await?;
+        let (locator, receipt, _) = published_file_receipt_at(&tr, namespace, metadata.id)
+            .await?
+            .ok_or(CatalogError::Incomplete)?;
+        if receipt.copy_id != metadata.head.copy_id
+            || locator.volume != metadata.copy.volume_id
+            || locator.generation != source.source.generation
+        {
+            return Err(CatalogError::Incomplete);
+        }
+        active_batch::require_declared_layout_at(&tr, locator, &receipt, source.source).await?;
+        drop(tr);
+        let status = self
+            .active_batch_status(serial, locator.volume, locator.generation)
+            .await?
+            .ok_or(CatalogError::Incomplete)?;
+        if !status.published || status.batch_id != locator.batch_id || status.pages > 512 {
+            return Err(CatalogError::Incomplete);
+        }
+        for page in 0..status.pages {
+            let original = self
+                .sealed_active_batch_page(
+                    serial,
+                    owner,
+                    locator.volume,
+                    locator.generation,
+                    locator.batch_id,
+                    page,
+                )
+                .await?;
+            if !original
+                .files
+                .iter()
+                .any(|(saved, _)| receipt_fingerprint(saved) == receipt_fingerprint(&receipt))
+            {
+                continue;
+            }
+            match self
+                .finalize_published_active_batch_page(
+                    serial,
+                    owner,
+                    locator.volume,
+                    locator.generation,
+                    locator.batch_id,
+                    page,
+                )
+                .await?
+            {
+                ActiveFinalizationOutcome::Finalized
+                | ActiveFinalizationOutcome::AlreadyFinalized => {}
+                ActiveFinalizationOutcome::StaleOwner => return Err(CatalogError::OwnerFenced),
+                _ => return Err(CatalogError::Incomplete),
+            }
+            return match self
+                .materialize_published_active_file(serial, owner, locator.batch_id, page, &receipt)
+                .await?
+            {
+                ActiveMaterializationOutcome::Materialized
+                | ActiveMaterializationOutcome::AlreadyMaterialized => Ok(()),
+                ActiveMaterializationOutcome::StaleOwner => Err(CatalogError::OwnerFenced),
+                _ => Err(CatalogError::Incomplete),
+            };
+        }
+        Err(CatalogError::Incomplete)
     }
 
     /// A readable managed namespace can answer `None` only after its import
@@ -1212,7 +1542,28 @@ pub(super) async fn read_source_at(
     path: &[u8],
     resolved: ResolvedPath,
 ) -> Result<ActiveReadSource> {
+    read_source_core_at(tr, serial, path, resolved, None).await
+}
+pub(super) async fn read_retained_source_at(
+    tr: &Transaction,
+    serial: &str,
+    path: &[u8],
+    resolved: ResolvedPath,
+    authority: RetainedLedgerAuthority,
+) -> Result<ActiveReadSource> {
+    authority.require_at(tr, authority.owner()).await?;
+    read_source_core_at(tr, serial, path, resolved, Some(authority)).await
+}
+pub(super) async fn read_source_core_at(
+    tr: &Transaction,
+    serial: &str,
+    path: &[u8],
+    resolved: ResolvedPath,
+    ledger: Option<RetainedLedgerAuthority>,
+) -> Result<ActiveReadSource> {
     let ResolvedPath::File {
+        id,
+        ref head,
         ref copy,
         ref placement,
         ..
@@ -1227,7 +1578,7 @@ pub(super) async fn read_source_at(
     if copy.volume_scan_id != baseline.id || copy.volume_generation < baseline.generation {
         return Err(CatalogError::Corrupt("活动文件副本与导入基线不一致"));
     }
-    let (source, baseline_source) = if copy.volume_generation == baseline.generation {
+    let (source, mut baseline_source) = if copy.volume_generation == baseline.generation {
         let identity = index_evidence::require_identity(tr, copy.volume_id, baseline).await?;
         (identity.head().into(), Some(identity))
     } else {
@@ -1242,8 +1593,108 @@ pub(super) async fn read_source_at(
         (index, None)
     };
 
+    let original_baseline = baseline_source.clone();
+    let global = body_layouts::binding_at(tr, placement.namespace, id, head.copy_id).await?;
+    let marker_upgrade = global.is_some()
+        && !body_layouts::has_required_copy_at(tr, placement.namespace, id, head.copy_id).await?;
+    if global.is_none() || marker_upgrade {
+        if let Some((locator, receipt, _)) =
+            published_file_receipt_at(tr, placement.namespace, id).await?
+        {
+            if receipt.copy_id == head.copy_id {
+                active_batch::require_declared_layout_at(tr, locator, &receipt, source).await?;
+            }
+        }
+    }
+    let raw_copy = tr
+        .get(&copy_key(placement.namespace, id, head.copy_id), false)
+        .await?;
+    if let Some(authority) = &ledger {
+        if !authority.matches_selection(placement.namespace, id, head, copy) {
+            return Err(CatalogError::Corrupt("保留读取与原 child 选择不同"));
+        }
+    } else if raw_copy
+        .as_deref()
+        .map(decode_stored_copy)
+        .transpose()?
+        .is_some_and(|copy| matches!(copy, StoredCopy::Reclaimed { .. }))
+    {
+        return Err(CatalogError::Invalid("退休副本读取缺少原保留账本授权"));
+    }
+    let (layout, scoped) = if global.is_none() {
+        match &ledger {
+            Some(authority) => (
+                body_layouts::retained_binding_at(tr, authority).await?,
+                true,
+            ),
+            None => (None, false),
+        }
+    } else {
+        (global, false)
+    };
+    let original_raw = ledger
+        .as_ref()
+        .map(RetainedLedgerAuthority::original_record)
+        .or(raw_copy.as_deref());
+    if let Some(binding) = &layout {
+        if !binding.matches_copy(placement.namespace, id, head.copy_id, copy, source)
+            || !binding.matches_raw_copy(original_raw)
+        {
+            return Err(CatalogError::Corrupt("正文布局绑定与原读取副本不同"));
+        }
+        if let Some(identity) = binding.source_identity() {
+            if baseline_source
+                .as_ref()
+                .is_some_and(|original| original != identity)
+            {
+                return Err(CatalogError::Corrupt("LB2 来源链与原导入基线不同"));
+            }
+            baseline_source = Some(identity.clone());
+        }
+    }
+    let snapshot = if let Some(authority) = &ledger {
+        Some(
+            body_layouts::CopyReadSnapshot::capture_retained_at(
+                tr,
+                serial,
+                &resolved,
+                source,
+                original_baseline,
+                baseline,
+                authority.clone(),
+            )
+            .await?,
+        )
+    } else if layout.is_none() || marker_upgrade {
+        body_layouts::CopyReadSnapshot::capture_at(
+            tr,
+            serial,
+            &resolved,
+            source,
+            original_baseline,
+            baseline,
+        )
+        .await?
+    } else {
+        None
+    };
+    let location = if let Some(authority) = &ledger {
+        body_layouts::BindingLocation::Retained {
+            snapshot: snapshot.as_ref().ok_or(CatalogError::Incomplete)?.clone(),
+            authority: authority.clone(),
+            scoped,
+        }
+    } else {
+        body_layouts::BindingLocation::Ordinary
+    };
+
     Ok(ActiveReadSource {
         resolved,
+        layout,
+        marker_upgrade,
+        snapshot,
+        location,
+        ledger,
         path: path.to_vec(),
         source,
         baseline: baseline_source,

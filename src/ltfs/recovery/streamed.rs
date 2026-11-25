@@ -2,6 +2,8 @@
 //! callbacks remain provisional until the complete proof returns successfully.
 use std::io::{BufReader, Read, Write};
 
+use super::history::{FullHistoryDirectory, FullHistoryEntry, FullHistoryManifest, HistoryBuilder};
+use super::source::HeadPayload;
 use super::*;
 use crate::ltfs::index::IndexEntry;
 use crate::ltfs::index_equivalence::FullIndexComparison;
@@ -159,14 +161,20 @@ fn full_at(
     budget: &RecoveryBudget,
     mut emit: impl FnMut(IndexEntry) -> Result<()>,
     output: Option<&mut dyn Write>,
+    forward: bool,
 ) -> Result<StreamedConstruct> {
-    drive.locate(1, start, true)?;
+    if !forward {
+        drive.locate(1, start, true)?;
+    }
     let mut reader = ConstructReader::new(
         drive,
         start,
         label.blocksize as usize,
         budget.max_index_bytes,
     )?;
+    if forward {
+        drive.read_forward_to(1, start, &mut reader.buf)?;
+    }
     let parsed = if let Some(output) = output {
         LtfsIndex::scan_full_reader(
             BufReader::new(CaptureReader {
@@ -239,22 +247,102 @@ pub fn capture_full_recovery(
     budget: &RecoveryBudget,
     output: &mut dyn Write,
 ) -> Result<StreamedFullRecovery> {
+    capture_full_recovery_collect(drive, label, budget, output, false).map(|(proof, _)| proof)
+}
+
+pub(super) fn capture_full_recovery_collect(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    budget: &RecoveryBudget,
+    output: &mut dyn Write,
+    collect_history: bool,
+) -> Result<(StreamedFullRecovery, Option<FullHistoryDirectory>)> {
+    capture_full_recovery_from_drive(drive, label, budget, output, collect_history, false)
+}
+
+pub(super) fn verify_complete_full_recovery(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    budget: &RecoveryBudget,
+) -> Result<(StreamedFullRecovery, FullHistoryManifest)> {
+    let complete = budget.clone().with_complete_full_history();
+    let (proof, directory) = capture_full_recovery_from_drive(
+        drive,
+        label,
+        &complete,
+        &mut std::io::sink(),
+        true,
+        true,
+    )?;
+    let Some(directory) = directory.filter(|_| !proof.history_truncated) else {
+        return Err(TapeError::RecoveryRestricted {
+            reason: "回收组尾捕获缺少完整 Full 历史".into(),
+        });
+    };
+    Ok((proof, directory.manifest()))
+}
+
+fn capture_full_recovery_from_drive(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    budget: &RecoveryBudget,
+    output: &mut dyn Write,
+    collect_history: bool,
+    require_stable_eod: bool,
+) -> Result<(StreamedFullRecovery, Option<FullHistoryDirectory>)> {
     let (start, closing, eod) = clean_dp_head_position(drive)?;
-    let comparison = FullIndexComparison::new(&budget.index_scratch)?;
-    let mut head = full_at(
+    let storage = FullAuditStorage::new(budget, collect_history)?;
+    let head = full_at(
         drive,
         label,
         start,
         budget,
-        |entry| comparison.record(false, entry),
+        |entry| storage.comparison().record(false, entry),
         Some(output),
+        false,
     )?;
     if head.next.checked_sub(1) != Some(closing) || head.next != eod {
         return Err(TapeError::RecoveryRestricted {
             reason: "DP Full 构造未紧邻数据分区 EOD".into(),
         });
     }
+    audit_full_history(drive, label, budget, storage, head, eod, require_stable_eod)
+}
+
+pub(super) fn capture_full_recovery_from_payload(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    budget: &RecoveryBudget,
+    payload: &HeadPayload,
+    collect_history: bool,
+) -> Result<(StreamedFullRecovery, Option<FullHistoryDirectory>)> {
+    let storage = FullAuditStorage::new(budget, collect_history)?;
+    // The Full replay holds the same streamed child-free entries from the
+    // verified current construct, without any delta application.
+    payload
+        .replay
+        .for_each_payload(|entry| storage.comparison().record(false, entry))?;
+    let head = StreamedConstruct {
+        index: payload.head.clone(),
+        sha256: payload.construct.sha256,
+        next: payload.eod,
+        bytes: payload.bytes,
+    };
+    audit_full_history(drive, label, budget, storage, head, payload.eod, true)
+}
+
+fn audit_full_history(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    budget: &RecoveryBudget,
+    storage: FullAuditStorage,
+    mut head: StreamedConstruct,
+    eod: u64,
+    require_stable_eod: bool,
+) -> Result<(StreamedFullRecovery, Option<FullHistoryDirectory>)> {
+    let comparison = storage.comparison();
     comparison.validate_highest_uid(false, head.index.highest_file_uid)?;
+    storage.record(&head)?;
     let construct = CommittedIndexConstruct {
         volume_uuid: label.volume_uuid,
         generation: head.index.generation,
@@ -286,8 +374,10 @@ pub fn capture_full_recovery(
             budget,
             |entry| comparison.record(true, entry),
             None,
+            false,
         )?;
         comparison.validate_highest_uid(true, prior.index.highest_file_uid)?;
+        storage.record(&prior)?;
         if prior.index.generation > head.index.generation {
             return Err(TapeError::RecoveryRestricted {
                 reason: "Full 历史代数倒置".into(),
@@ -305,14 +395,241 @@ pub fn capture_full_recovery(
         head = prior;
         depth += 1;
     }
-    drop(comparison);
-    let ip_generation = verify_dp_ip_head(drive, label, construct, budget)?;
-    Ok(StreamedFullRecovery {
-        construct,
-        source_bytes,
-        dp_eod: eod,
-        ip_generation,
-        history_depth: depth,
-        history_truncated: truncated,
-    })
+    let directory = storage.finish(label, construct, eod, !truncated)?;
+    let mut ip_budget = budget.clone();
+    ip_budget.index_scratch.max_bytes = budget.index_scratch.max_bytes.saturating_sub(
+        directory
+            .as_ref()
+            .map_or(0, FullHistoryDirectory::reserved_bytes),
+    );
+    let dp_ip = verify_dp_ip_head_with_evidence(drive, label, construct, &ip_budget)?;
+    if require_stable_eod && dp_ip.full_dp_eod != Some(eod) {
+        return Err(TapeError::RecoveryRestricted {
+            reason: "Full 历史核验期间 DP 构造结束位置或 EOD 改变".into(),
+        });
+    }
+    Ok((
+        StreamedFullRecovery {
+            construct,
+            source_bytes,
+            dp_eod: eod,
+            ip_generation: dp_ip.ip_generation,
+            history_depth: depth,
+            history_truncated: truncated,
+        },
+        directory,
+    ))
+}
+
+pub(super) fn capture_full_recovery_from_hint(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    budget: &RecoveryBudget,
+    hint: &FullHistoryDirectory,
+    collect_history: bool,
+) -> Result<Option<(StreamedFullRecovery, Option<FullHistoryDirectory>)>> {
+    read_full_recovery_from_schedule(drive, label, budget, hint, collect_history, true)
+}
+
+/// The schedule came from the exact earlier physical capture. A mismatch
+/// invalidates the readback, even if a newly discovered head would be usable.
+pub(super) fn verify_scheduled_full_recovery(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    budget: &RecoveryBudget,
+    schedule: &FullHistoryDirectory,
+) -> Result<StreamedFullRecovery> {
+    read_full_recovery_from_schedule(drive, label, budget, schedule, false, true)?
+        .map(|(proof, _)| proof)
+        .ok_or_else(|| TapeError::RecoveryRestricted {
+            reason: "回收组正文读后实际卷头、历史或EOD/closing改变".into(),
+        })
+}
+
+/// None means the schedule disagreed with valid, freshly read facts.
+/// Parsing, media, guard and local IO errors are preserved.
+fn read_full_recovery_from_schedule(
+    drive: &TapeDrive<'_>,
+    label: &LtfsLabel,
+    budget: &RecoveryBudget,
+    hint: &FullHistoryDirectory,
+    collect_history: bool,
+    require_stable_eod: bool,
+) -> Result<Option<(StreamedFullRecovery, Option<FullHistoryDirectory>)>> {
+    let manifest = hint.manifest();
+    let (start, closing, eod) = clean_dp_head_position(drive)?;
+    if manifest.dp_eod != eod || manifest.head.location.start_block != start {
+        return Ok(None);
+    }
+    let storage = FullAuditStorage::new(budget, collect_history)?;
+    let comparison = storage.comparison();
+    let mut prior: Option<StreamedConstruct> = None;
+    let mut count = 0u64;
+    let mut sha = Sha256::new();
+    let mut mismatch = false;
+    let read = hint.for_each_entry(|expected| {
+        let successor = prior.is_some();
+        let actual = full_at(
+            drive,
+            label,
+            expected.start_block,
+            budget,
+            |entry| comparison.record(successor, entry),
+            None,
+            true,
+        )?;
+        comparison.validate_highest_uid(successor, actual.index.highest_file_uid)?;
+        let observed = FullHistoryEntry {
+            generation: actual.index.generation,
+            start_block: actual.index.self_location.start_block,
+            sha256: actual.sha256,
+            end_block: actual.next,
+            previous: actual.index.previous_location,
+        };
+        if let Some(prior) = &prior {
+            if actual.index.previous_location != Some(prior.index.self_location)
+                || actual.index.self_location.start_block <= prior.index.self_location.start_block
+                || actual.index.generation < prior.index.generation
+            {
+                mismatch = true;
+                return Err(TapeError::Refused {
+                    reason: "Full 历史调度提示未覆盖真实相邻回指，重新发现".into(),
+                });
+            }
+            if actual.index.generation == prior.index.generation {
+                if !same_full_view(&actual.index, &prior.index) {
+                    return Err(TapeError::RecoveryRestricted {
+                        reason: "同代历史 Full 逻辑头不一致".into(),
+                    });
+                }
+                comparison.require_equal()?;
+            }
+            // The just-read successor becomes the left-hand comparison view.
+            // Logical equality is symmetric; every adjacent same-generation
+            // pair gets the exact original full-node comparison.
+            comparison.advance_history()?;
+        } else if actual
+            .index
+            .previous_location
+            .is_some_and(|p| p.partition == label.data_partition)
+        {
+            mismatch = true;
+            return Err(TapeError::Refused {
+                reason: "Full 历史调度提示遗漏最早前驱，重新发现".into(),
+            });
+        }
+        // A valid construct that disagrees is a schedule mismatch. The
+        // caller decides whether this permits discovery or rejects readback.
+        if observed != expected {
+            mismatch = true;
+            return Err(TapeError::Refused {
+                reason: "Full 历史调度提示与实读构造不符，重新发现".into(),
+            });
+        }
+        storage.record(&actual)?;
+        sha.update(observed.to_bytes());
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| TapeError::RecoveryRestricted {
+                reason: "完整 Full 历史计数溢出".into(),
+            })?;
+        prior = Some(actual);
+        Ok(())
+    });
+    if let Err(error) = read {
+        return if mismatch { Ok(None) } else { Err(error) };
+    }
+    let Some(head) = prior else {
+        return Ok(None);
+    };
+    let construct = CommittedIndexConstruct {
+        volume_uuid: label.volume_uuid,
+        generation: head.index.generation,
+        location: head.index.self_location,
+        sha256: head.sha256,
+        incremental: false,
+    };
+    if count != manifest.entries
+        || <[u8; 32]>::from(sha.finalize()) != manifest.entries_sha256
+        || construct != manifest.head
+        || head.next != eod
+        || head.next.checked_sub(1) != Some(closing)
+    {
+        return Ok(None);
+    }
+    let depth = u32::try_from(count - 1).map_err(|_| TapeError::RecoveryRestricted {
+        reason: "完整 Full 历史超出可计数深度".into(),
+    })?;
+    let source_bytes = head.bytes;
+    let directory = storage.finish(label, construct, eod, true)?;
+    let mut ip_budget = budget.clone();
+    ip_budget.index_scratch.max_bytes = budget.index_scratch.max_bytes.saturating_sub(
+        directory
+            .as_ref()
+            .map_or(0, FullHistoryDirectory::reserved_bytes),
+    );
+    let dp_ip = verify_dp_ip_head_with_evidence(drive, label, construct, &ip_budget)?;
+    if require_stable_eod && dp_ip.full_dp_eod != Some(eod) {
+        return Err(TapeError::RecoveryRestricted {
+            reason: "Full 历史核验期间 DP 构造结束位置或 EOD 改变".into(),
+        });
+    }
+    Ok(Some((
+        StreamedFullRecovery {
+            construct,
+            source_bytes,
+            dp_eod: eod,
+            ip_generation: dp_ip.ip_generation,
+            history_depth: depth,
+            history_truncated: false,
+        },
+        directory,
+    )))
+}
+
+enum FullAuditStorage {
+    Comparison(FullIndexComparison),
+    History(HistoryBuilder),
+}
+impl FullAuditStorage {
+    fn new(budget: &RecoveryBudget, collect_history: bool) -> Result<Self> {
+        if collect_history {
+            Ok(Self::History(HistoryBuilder::new(&budget.index_scratch)?))
+        } else {
+            Ok(Self::Comparison(FullIndexComparison::new(
+                &budget.index_scratch,
+            )?))
+        }
+    }
+
+    fn comparison(&self) -> &FullIndexComparison {
+        match self {
+            Self::Comparison(comparison) => comparison,
+            Self::History(builder) => &builder.comparison,
+        }
+    }
+    fn record(&self, construct: &StreamedConstruct) -> Result<()> {
+        if let Self::History(builder) = self {
+            builder.record(FullHistoryEntry {
+                generation: construct.index.generation,
+                start_block: construct.index.self_location.start_block,
+                sha256: construct.sha256,
+                end_block: construct.next,
+                previous: construct.index.previous_location,
+            })?;
+        }
+        Ok(())
+    }
+    fn finish(
+        self,
+        label: &LtfsLabel,
+        head: CommittedIndexConstruct,
+        eod: u64,
+        complete: bool,
+    ) -> Result<Option<FullHistoryDirectory>> {
+        match self {
+            Self::History(builder) if complete => builder.finish(label, head, eod).map(Some),
+            _ => Ok(None),
+        }
+    }
 }

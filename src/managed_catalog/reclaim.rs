@@ -6,15 +6,49 @@ use sha2::{Digest, Sha256};
 
 #[path = "reclaim_children.rs"]
 mod children;
+#[path = "reclaim_copy_groups.rs"]
+mod copy_groups;
+pub(in crate::managed_catalog) use copy_groups::PreparedGroupPins;
+pub(in crate::managed_catalog) use copy_groups::isolation;
+pub(crate) use copy_groups::{
+    OriginalObservationPermit, ReclaimExecutionGate,
+    OriginalAttemptObservation, OriginalCheckpointContext, OriginalCheckpointPublication,
+    ReclaimCopyGroup, ReclaimCopyGroupAdmission, ReclaimCopyGroupChoice, ReclaimCopyGroupLimits,
+    ReclaimCopyGroupSelection,
+    ReclaimGroupExecution, ReclaimGroupObservation, ReclaimGroupMemberReadContext, ReclaimIndexAugmentation, ReclaimIndexIntent,
+};
+#[derive(Clone, Copy)]
+pub(in crate::managed_catalog) enum ReclaimProtocolContext<'a> {
+    Single,
+    Group(&'a ReclaimGroupExecution),
+}
+pub(in crate::managed_catalog) fn group_stage_error(
+    error: CatalogError,
+    context: ReclaimProtocolContext<'_>,
+) -> CatalogError {
+    match context {
+        ReclaimProtocolContext::Single => error,
+        ReclaimProtocolContext::Group(_) => notifications::atomic_error(error),
+    }
+}
+pub(in crate::managed_catalog) use copy_groups::require_index_checkpoint_at;
+pub(in crate::managed_catalog) use copy_groups::require_index_publication_at;
+pub(in crate::managed_catalog) use copy_groups::require_no_group_recovery_at;
+pub(in crate::managed_catalog) use copy_groups::{
+    GroupCoverageMode, GroupFileReference, GroupRetirementPins, group_member_coverage_at,
+    group_member_coverage_in_at,
+};
 #[path = "reclaim_obsolete_copies.rs"]
 mod obsolete_copies;
 #[path = "reclaim_prepared_cancel.rs"]
 mod prepared_cancel;
 #[path = "reclaim_upload_retry.rs"]
 mod upload_retry;
+pub(crate) use children::RetainedLedgerAuthority;
 pub(super) use children::require_write_group_lane_at;
 pub(in crate::managed_catalog) use children::{
-    require_intent_at, require_receipt_at, require_request_at,
+    require_intent_at, require_intent_in, require_receipt_at, require_receipt_in,
+    require_request_at, require_request_in,
 };
 pub use obsolete_copies::ReclaimObsoleteProgress;
 #[path = "reclaim_walk.rs"]
@@ -25,9 +59,15 @@ mod recovery;
 #[path = "reclaim_retirement.rs"]
 mod retirement;
 pub use retirement::ReclaimBodyDestination;
+#[path = "reclaim_destination_history.rs"]
+mod destination_history;
+#[path = "reclaim_history_hints.rs"]
+mod history_hints;
+pub(crate) use destination_history::DestinationHistoryContext;
 #[path = "reclaim_source.rs"]
 mod source;
 pub(in crate::managed_catalog) use source::require_publication_at as require_metadata_publication_at;
+pub(crate) use source::{ReclaimGroupOnlyDraft, ReclaimGroupOnlyQualification};
 pub use source::{
     ReclaimCoverageProgress, ReclaimDataProgress, ReclaimFileMetadata, ReclaimFormatSourceEvidence,
     ReclaimMetadataAdmission, ReclaimMetadataCheckpointEvidence, ReclaimMetadataCommitEvidence,
@@ -96,6 +136,9 @@ impl ReclaimReservation {
     }
     pub fn spec(&self) -> ReclaimSpec {
         ReclaimSpec::parse(&self.intent["change"]).expect("validated reclaim identity")
+    }
+    pub(crate) fn groups_archive_root(&self) -> bool {
+        self.intent["group_index_protocol"] == 3
     }
     pub(crate) fn namespace(&self) -> Uuid {
         self.route.route.namespace
@@ -247,11 +290,68 @@ pub(super) async fn require_pool_write_at(tr: &Transaction, ns: Uuid, pool: Uuid
     Ok(())
 }
 
+/// The derived intent is immutable; client ManagementRequest remains v1.
+fn validate_parent_intent(intent: &Value) -> Result<ReclaimSpec> {
+    let fields = [
+        "version",
+        "library",
+        "namespace",
+        "epoch",
+        "operation",
+        "change",
+        "scan",
+        "scan_generation",
+        "index",
+    ];
+    let group_protocol = intent.get("group_index_protocol");
+    if !intent.as_object().is_some_and(|m| {
+        m.len() == fields.len() + usize::from(group_protocol.is_some())
+            && fields.iter().all(|key| m.contains_key(*key))
+    }) || !matches!(intent["version"].as_u64(), Some(1 | 2))
+        || group_protocol.is_some_and(|value| value.as_u64() != Some(3))
+        || !intent["epoch"].as_u64().is_some_and(|epoch| epoch > 0)
+        || !intent["scan_generation"]
+            .as_u64()
+            .is_some_and(|generation| generation > 0)
+    {
+        return Err(CatalogError::Corrupt("回收原父意图协议或字段无效"));
+    }
+    validate_physical_serial(
+        intent["library"]
+            .as_str()
+            .ok_or(CatalogError::Corrupt("回收原library无效"))?,
+    )?;
+    for field in ["namespace", "operation", "scan"] {
+        node_mutation::id(
+            intent[field]
+                .as_str()
+                .ok_or(CatalogError::Corrupt("回收原UUID无效"))?,
+        )?;
+    }
+    let spec = ReclaimSpec::parse(&intent["change"])?;
+    if spec.group_only() && intent["version"] != 2 || group_protocol.is_some() && !spec.group_only()
+    {
+        return Err(CatalogError::Corrupt(
+            "group-only原父任务必须使用已保存v2协议",
+        ));
+    }
+    let index: Vec<u8> = serde_json::from_value(intent["index"].clone())
+        .map_err(|_| CatalogError::Corrupt("回收原索引编码无效"))?;
+    active_volume::decode_index(spec.volume(), &index)?;
+    Ok(spec)
+}
+fn parent_journal_key(ns: Uuid, epoch: u64, operation: Uuid) -> Vec<u8> {
+    let mut key = domain(ns, b'j');
+    key.extend_from_slice(&epoch.to_be_bytes());
+    key.extend_from_slice(operation.as_bytes());
+    key
+}
 async fn record_at(
     tr: &Transaction,
     reservation: &ReclaimReservation,
     owner: u64,
 ) -> Result<Value> {
+    validate_parent_intent(&reservation.intent)?;
     routing::require_runtime_active_owner(tr, reservation.serial(), reservation.route, owner)
         .await?;
     let value = decode(
@@ -292,6 +392,7 @@ async fn record_at(
     management::exclusion::LibraryTaskClaim::for_reclaim(&reservation.token())?
         .require_owned(tr)
         .await?;
+    walk::require_protocol_at(tr, reservation).await?;
     Ok(value)
 }
 
@@ -325,7 +426,55 @@ async fn reserve_at(
     operation: Uuid,
     spec: &ReclaimSpec,
 ) -> Result<ReclaimReservation> {
+    reserve_at_version(tr, serial, route, owner, (epoch, operation), spec, 1).await
+}
+async fn reserve_at_version(
+    tr: &Transaction,
+    serial: &str,
+    route: ActiveLibraryRoute,
+    owner: u64,
+    identity: (u64, Uuid),
+    spec: &ReclaimSpec,
+    fresh_version: u8,
+) -> Result<ReclaimReservation> {
+    let (epoch, operation) = identity;
+    if !matches!(fresh_version, 1 | 2) {
+        return Err(CatalogError::Invalid("回收fresh协议无效"));
+    }
     let ns = routing::require_runtime_active_owner(tr, serial, route, owner).await?;
+    // Restore the saved protocol/index before looking at today's scan. A retry
+    // cannot upgrade a child0/no-walk v1 or manufacture a new identity for v2.
+    if let Some(raw) = tr
+        .get(&parent_journal_key(ns, epoch, operation), false)
+        .await?
+    {
+        let saved = decode(&raw)?;
+        let intent = saved["intent"].clone();
+        let saved_spec = validate_parent_intent(&intent)?;
+        if intent["library"] != serial
+            || intent["namespace"] != ns.to_string()
+            || intent["epoch"] != epoch
+            || intent["operation"] != operation.to_string()
+            || saved_spec.to_json() != spec.to_json()
+        {
+            return Err(CatalogError::Invalid("回收重放改变原请求身份"));
+        }
+        let reservation = ReclaimReservation { route, intent };
+        if reservation.intent()["version"]==2 {
+            copy_groups::group_layout_marker_at(tr,&reservation).await?;
+        }
+        let mut value = record_at(tr, &reservation, owner).await?;
+        if value["owner_epoch"]
+            .as_u64()
+            .is_none_or(|saved| saved > owner)
+        {
+            return Err(CatalogError::OwnerFenced);
+        }
+        source_state_at(tr, &reservation).await?;
+        value["owner_epoch"] = json!(owner);
+        tr.set(&reservation.journal_key(), value.to_string().as_bytes());
+        return Ok(reservation);
+    }
     require_pool_library(tr, ns, spec.pool, serial).await?;
     let assignment = ManagedCatalog::verified_assignment(tr, serial, &spec.barcode)
         .await?
@@ -334,22 +483,13 @@ async fn reserve_at(
     let (scan, index) = active_volume::observed_at(tr, serial, spec.volume).await?;
     let mut index_bytes = Vec::new();
     active_volume::encode_index(&mut index_bytes, index);
-    let reservation = ReclaimReservation {
-        route,
-        intent: json!({"version":1,"library":serial,"namespace":ns.to_string(),"epoch":epoch,"operation":operation.to_string(),"change":spec.to_json(),"scan":scan.id.to_string(),"scan_generation":scan.generation,"index":index_bytes}),
-    };
-    if tr.get(&reservation.journal_key(), false).await?.is_some() {
-        let mut value = record_at(tr, &reservation, owner).await?;
-        if value["owner_epoch"]
-            .as_u64()
-            .is_none_or(|saved| saved > owner)
-        {
-            return Err(CatalogError::OwnerFenced);
-        }
-        value["owner_epoch"] = json!(owner);
-        tr.set(&reservation.journal_key(), value.to_string().as_bytes());
-        return Ok(reservation);
+    let grouped_root = spec.group_only() && fresh_version == 1;
+    let fresh_version = if spec.group_only() { 2 } else { fresh_version };
+    let mut intent = json!({"version":fresh_version,"library":serial,"namespace":ns.to_string(),"epoch":epoch,"operation":operation.to_string(),"change":spec.to_json(),"scan":scan.id.to_string(),"scan_generation":scan.generation,"index":index_bytes});
+    if grouped_root {
+        intent["group_index_protocol"] = json!(3);
     }
+    let reservation = ReclaimReservation { route, intent };
     let window = management::window(tr, ns).await?;
     if epoch != window.accepting {
         return Err(CatalogError::Invalid("回收管理请求代次已关闭"));
@@ -362,12 +502,22 @@ async fn reserve_at(
     {
         return Err(CatalogError::PoolBusy);
     }
+    let group_walk = if fresh_version == 2 {
+        copy_groups::initialize_layout_at(tr,&reservation).await?;
+        copy_groups::require_no_unsettled_at(tr, &reservation).await?;
+        Some(walk::prepare_initial_group_at(tr, &reservation).await?)
+    } else {
+        None
+    };
     let value = json!({"version":1,"intent":reservation.intent,"fingerprint":reservation.fingerprint(),"owner_epoch":owner,"phase":"reserved","children":0});
     tr.set(&reservation.journal_key(), value.to_string().as_bytes());
     tr.set(
         &gate_key(ns, spec.pool),
         reservation.token().to_string().as_bytes(),
     );
+    if let Some((key, raw)) = group_walk {
+        tr.set(&key, &raw);
+    }
     claim.acquire(tr);
     Ok(reservation)
 }
@@ -439,6 +589,7 @@ impl ManagedCatalog {
                             owner,
                         )
                         .await?;
+                        isolation::require_settled_disposition_at(&tr, reservation).await?;
                         if management::has_task_at(
                             &tr,
                             reservation.namespace(),
@@ -486,6 +637,8 @@ impl ManagedCatalog {
                         let claim = management::exclusion::LibraryTaskClaim::for_reclaim(
                             &reservation.token(),
                         )?;
+                        copy_groups::require_no_unsettled_at(&tr, reservation).await?;
+                        destination_history::clear_parent_at(&tr, reservation, owner).await?;
                         walk::clear_reserved_at(&tr, reservation).await?;
                         source::clear_reserved_at(&tr, reservation);
                         mechanics::clear_finished_at(&tr, reservation);
@@ -496,7 +649,8 @@ impl ManagedCatalog {
                         claim.release(&tr);
                         Ok(())
                     }
-                    .await,
+                    .await
+                    .map_err(notifications::atomic_error),
                 )
             })
             .await?
@@ -510,6 +664,7 @@ pub struct ReclaimSpec {
     volume: Uuid,
     revision: u64,
     unassign: bool,
+    group_only: bool,
 }
 
 impl ReclaimSpec {
@@ -528,6 +683,10 @@ impl ReclaimSpec {
     pub fn unassign(&self) -> bool {
         self.unassign
     }
+    /// Explicit bounded benchmark mode; absence retains the original v1 path.
+    pub fn group_only(&self) -> bool {
+        self.group_only
+    }
 
     pub fn parse(value: &Value) -> Result<Self> {
         const FIELDS: &[&str] = &[
@@ -540,7 +699,10 @@ impl ReclaimSpec {
             "unassign",
         ];
         if !value.as_object().is_some_and(|fields| {
-            fields.len() == FIELDS.len() && fields.keys().all(|key| FIELDS.contains(&key.as_str()))
+            (fields.len() == FIELDS.len()
+                || fields.len() == FIELDS.len() + 1 && value["mode"] == "group-only")
+                && fields.keys().all(|key| FIELDS.contains(&key.as_str()) || key == "mode")
+                && (!fields.contains_key("mode") || value["mode"] == "group-only")
         }) || value["kind"] != "media-reclaim"
             || value["confirm_format"] != true
             || !value["unassign"].is_boolean()
@@ -573,12 +735,17 @@ impl ReclaimSpec {
             volume: id("volume")?,
             revision,
             unassign: value["unassign"].as_bool().expect("validated boolean"),
+            group_only: value.get("mode").is_some(),
         })
     }
 
     pub fn to_json(&self) -> Value {
-        json!({"kind":"media-reclaim","pool":self.pool.to_string(),"barcode":self.barcode,
-            "volume":self.volume.to_string(),"revision":self.revision,"confirm_format":true,"unassign":self.unassign})
+        let mut value = json!({"kind":"media-reclaim","pool":self.pool.to_string(),"barcode":self.barcode,
+            "volume":self.volume.to_string(),"revision":self.revision,"confirm_format":true,"unassign":self.unassign});
+        if self.group_only {
+            value["mode"] = json!("group-only");
+        }
+        value
     }
 
     pub fn require_assignment(
@@ -608,6 +775,7 @@ impl ReclaimSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("reclaim_group_only_mode_tests.rs");
 
     fn request() -> Value {
         json!({"kind":"media-reclaim","pool":Uuid::new_v4().to_string(),"barcode":"RECLAIML8",

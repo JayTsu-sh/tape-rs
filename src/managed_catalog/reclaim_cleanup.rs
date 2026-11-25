@@ -82,6 +82,7 @@ impl ManagedCatalog {
                                 owner,
                             )
                             .await?;
+                            isolation::require_normal_mutation_at(&tr, reservation, owner).await?;
                             result_at(&tr, reservation)
                                 .await?
                                 .ok_or(CatalogError::Incomplete)?;
