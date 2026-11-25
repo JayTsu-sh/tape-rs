@@ -55,7 +55,12 @@ async fn request(
     let status = response.status().as_u16();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     connection.abort();
-    (status, serde_json::from_slice(&bytes).unwrap())
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, value)
 }
 #[test]
 #[ignore = "需要显式隔离FDB_TEST_CLUSTER；原生池HTTP/异步队列，不访问设备"]
@@ -201,6 +206,7 @@ async fn run_pool_api(cluster: &str) {
         ..(*readonly).clone()
     });
     let (b, tb) = serve(owner.clone()).await;
+    logical_library_creation(&catalog, &serial, route, &b, &namespace).await;
     let rescan = json!({"version":1,"library":serial,"namespace":namespace,"epoch":1,"operation":Uuid::new_v4().to_string(),"change":{"kind":"library-rescan"}});
     let rescan_path = format!("{root}/library/rescan");
     assert_eq!(
@@ -943,4 +949,188 @@ async fn run_pool_api(cluster: &str) {
     drop(http);
     tokio::time::sleep(Duration::from_millis(350)).await;
     std::fs::remove_dir_all(spool).unwrap();
+}
+
+async fn logical_library_creation(
+    catalog: &ManagedCatalog,
+    serial: &str,
+    route: ActiveLibraryRoute,
+    address: &str,
+    namespace: &str,
+) {
+    let base = format!("/libraries/{serial}/admin/logical-libraries");
+    let id = Uuid::new_v4();
+    let create = json!({"version":1,"id":id,"name":"archive-a","resources":{"drives":["SIMDRV0000"],
+        "storage_slots":[1001],"ie_slots":[101]}});
+    let create_body = create.to_string();
+    let (code, error) = request(
+        address,
+        "POST",
+        &base,
+        Some(namespace),
+        create_body.as_bytes(),
+    )
+    .await;
+    assert_eq!(code, 412, "缺少本轮库存时须停止分配: {error}");
+    assert_eq!(error["error"], "inventory_unavailable");
+    let epoch = route.initial_owner_epoch;
+    let observation = json!({"library_serial":serial,"owner":2,"round":epoch,
+        "observed_at": crate::ltfs::label::ltfs_time_now(),"volumes":[],
+        "drives":[{"serial":"SIMDRV0000","address":1,"barcode":null}],
+        "num_of_slots":2,"num_of_ieslots":1,"slot_layout":{"storage_start":1001,"ie_start":101},
+        "scsi_vendor_id":"SIM","scsi_product_id":"SIM-CHANGER","scsi_firmware_revision":"0001"});
+    let mut incomplete = observation.clone();
+    incomplete.as_object_mut().unwrap().remove("slot_layout");
+    catalog
+        .record_active_library_inventory(serial, route, epoch, &incomplete)
+        .await
+        .unwrap();
+    assert_eq!(
+        request(
+            address,
+            "POST",
+            &base,
+            Some(namespace),
+            create_body.as_bytes()
+        )
+        .await
+        .0,
+        412
+    );
+    catalog
+        .record_active_library_inventory(serial, route, epoch, &observation)
+        .await
+        .unwrap();
+    let (code, created) = request(
+        address,
+        "POST",
+        &base,
+        Some(namespace),
+        create_body.as_bytes(),
+    )
+    .await;
+    assert_eq!(code, 201, "{created}");
+    assert_eq!(created["logical_library"]["id"], id.to_string());
+    let (code, listed) = request(address, "GET", &base, Some(namespace), b"").await;
+    assert_eq!(code, 200);
+    assert_eq!(listed["items"], json!([created["logical_library"]]));
+    assert_eq!(
+        listed["unallocated_resources"]["storage_slots"],
+        json!([1002])
+    );
+    assert_eq!(listed["inventory"]["status"], "current");
+
+    // Exercise the same public operation through the blocking Rust SDK.
+    let endpoint = address.to_owned();
+    let scoped_serial = serial.to_owned();
+    let ns = Uuid::parse_str(namespace).unwrap();
+    let detail = tokio::task::spawn_blocking(move || {
+        crate::client::fdb::FdbClient::new([endpoint])
+            .unwrap()
+            .logical_library(&scoped_serial, ns, "archive-a")
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(detail["logical_library"], created["logical_library"]);
+    assert_eq!(
+        detail["inventory"]["observation"]["drives"][0]["serial"],
+        "SIMDRV0000"
+    );
+
+    let competing = |name| {
+        json!({"version":1,"id":Uuid::new_v4(),"name":name,
+        "resources":{"drives":[],"storage_slots":[1002],"ie_slots":[]}})
+    };
+    let left = competing("archive-b").to_string();
+    let right = competing("archive-c").to_string();
+    let (left, right) = tokio::join!(
+        request(address, "POST", &base, Some(namespace), left.as_bytes()),
+        request(address, "POST", &base, Some(namespace), right.as_bytes()),
+    );
+    let mut codes = [left.0, right.0];
+    codes.sort_unstable();
+    assert_eq!(codes, [201, 409], "{left:?} {right:?}");
+
+    let mut wrong_type = competing("wrong-type");
+    wrong_type["resources"]["storage_slots"] = json!([101]);
+    assert_eq!(
+        request(
+            address,
+            "POST",
+            &base,
+            Some(namespace),
+            wrong_type.to_string().as_bytes()
+        )
+        .await
+        .0,
+        400
+    );
+    let mut duplicate = competing("duplicate");
+    duplicate["resources"]["storage_slots"] = json!([1002, 1002]);
+    assert_eq!(
+        request(
+            address,
+            "POST",
+            &base,
+            Some(namespace),
+            duplicate.to_string().as_bytes()
+        )
+        .await
+        .0,
+        400
+    );
+
+    let mut stale = observation.clone();
+    stale["observed_at"] = json!((chrono::Utc::now() - chrono::TimeDelta::minutes(5)).to_rfc3339());
+    catalog
+        .record_active_library_inventory(serial, route, epoch, &stale)
+        .await
+        .unwrap();
+    let (code, listed) = request(address, "GET", &base, Some(namespace), b"").await;
+    assert_eq!(code, 200);
+    assert_eq!(listed["items"].as_array().unwrap().len(), 2);
+    assert_eq!(listed["inventory"]["status"], "stale");
+    assert!(listed["unallocated_resources"].is_null());
+    assert_eq!(
+        request(
+            address,
+            "POST",
+            &base,
+            Some(namespace),
+            competing("stale").to_string().as_bytes()
+        )
+        .await
+        .0,
+        412
+    );
+    assert_eq!(
+        request(
+            address,
+            "POST",
+            &base,
+            Some(namespace),
+            create_body.as_bytes()
+        )
+        .await,
+        (200, created)
+    );
+    let mut changed = create;
+    changed["name"] = json!("changed-original");
+    assert_eq!(
+        request(
+            address,
+            "POST",
+            &base,
+            Some(namespace),
+            changed.to_string().as_bytes()
+        )
+        .await
+        .0,
+        409
+    );
+    catalog
+        .record_active_library_inventory(serial, route, epoch, &observation)
+        .await
+        .unwrap();
 }

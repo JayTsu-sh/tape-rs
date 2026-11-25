@@ -13,6 +13,9 @@ pub use management_request::ManagementRequest;
 
 #[path = "library_observations.rs"]
 mod library_observations;
+#[path = "logical_libraries.rs"]
+mod logical_libraries;
+pub(crate) use logical_libraries::Creation as LogicalLibraryCreation;
 
 #[path = "management_queries.rs"]
 mod management_queries;

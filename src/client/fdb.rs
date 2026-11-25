@@ -13,6 +13,7 @@ pub use conditions::UploadCondition;
 mod inventory;
 mod library_handoff;
 mod listing;
+mod logical_libraries;
 pub mod management;
 mod notifications;
 pub use management::PreparedManagement;
@@ -280,6 +281,12 @@ impl FdbClient {
         let maximum =
             if route.starts_with("/v1/fdb/nodes/") || route.starts_with("/v1/fdb/renames/") {
                 8 << 20
+            } else if route
+                .strip_prefix("/libraries/")
+                .and_then(|path| path.split_once('/'))
+                .is_some_and(|(_, path)| path == "admin/logical-libraries")
+            {
+                crate::logical_library::MAX_REQUEST_BYTES
             } else {
                 16 * 1024
             };

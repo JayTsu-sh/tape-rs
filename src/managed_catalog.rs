@@ -100,6 +100,7 @@ mod staged_import;
 mod staged_sources;
 pub use body_layouts::{PhysicalPlanProvenance, PlanExtents, VerifiedPhysicalPlan};
 pub use cleanup::PurgeProgress;
+pub(crate) use control::LogicalLibraryCreation;
 pub use control::{
     ActivePoolCreation, AssignExecution, AssignPhase, AssignPlan, AutomaticMediaAction,
     AutomaticMediaCommand, AutomaticMediaPlan, ControlOutcome, ManagementRequest, MoveExecution,

@@ -24,6 +24,8 @@ use super::{
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+#[path = "fdb_http_logical_libraries.rs"]
+mod logical_libraries;
 #[path = "fdb_http_notify.rs"]
 mod notify;
 
@@ -408,6 +410,14 @@ fn metadata_router(ctx: Arc<Context>) -> Router {
             get(queries::tape),
         )
         .route("/libraries/{serial}/admin/context", get(pools::context))
+        .route(
+            "/libraries/{serial}/admin/logical-libraries",
+            get(logical_libraries::list).post(logical_libraries::create),
+        )
+        .route(
+            "/libraries/{serial}/admin/logical-libraries/{selector}",
+            get(logical_libraries::show),
+        )
         .route(
             "/libraries/{serial}/admin/pools",
             get(pools::list).post(pools::create),

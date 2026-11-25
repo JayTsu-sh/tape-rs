@@ -222,10 +222,10 @@ pub(super) async fn show(
     }
 }
 
-struct Serving {
+pub(super) struct Serving {
     library: Arc<HttpContext>,
     node: u64,
-    round: u64,
+    pub(super) round: u64,
     local: bool,
 }
 fn serving(
@@ -293,7 +293,7 @@ fn live(owner: &Serving, expected: ActiveLibraryRoute) -> bool {
 }
 // Dropping an in-flight FDB transaction is not evidence that it did not commit.
 // Stop retries on permission loss; the original UUID/ledger remains the recovery key.
-async fn permitted<T>(
+pub(super) async fn permitted<T>(
     owner: &Serving,
     expected: ActiveLibraryRoute,
     future: impl std::future::Future<Output = Result<T, CatalogError>>,
@@ -322,7 +322,7 @@ async fn permitted<T>(
         }
     }
 }
-async fn writer(
+pub(super) async fn writer(
     ctx: &Context,
     serial: &str,
     expected: ActiveLibraryRoute,
@@ -361,9 +361,16 @@ async fn writer(
     ))
 }
 async fn body<T: serde::de::DeserializeOwned>(request: Request) -> Result<T, Box<Response>> {
+    body_with_limit(request, 4096).await
+}
+
+pub(super) async fn body_with_limit<T: serde::de::DeserializeOwned>(
+    request: Request,
+    limit: usize,
+) -> Result<T, Box<Response>> {
     let bytes = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        axum::body::to_bytes(request.into_body(), 4096),
+        axum::body::to_bytes(request.into_body(), limit),
     )
     .await
     .map_err(|_| {
@@ -372,7 +379,7 @@ async fn body<T: serde::de::DeserializeOwned>(request: Request) -> Result<T, Box
             json!({"error":"body_timeout","detail":"管理请求体读取超时"}),
         )
     })?
-    .map_err(|_| bad("管理请求体读取失败或超过4KiB"))?;
+    .map_err(|_| bad("管理请求体读取失败或超过大小上限"))?;
     serde_json::from_slice(&bytes).map_err(|_| bad("管理JSON字段无效、重复或超出类型范围"))
 }
 fn canonical_id(text: &str) -> Result<Uuid, Box<Response>> {

@@ -9,6 +9,8 @@ mod fdb_rename;
 mod inventory;
 #[path = "ltfsctl/lifecycle.rs"]
 mod lifecycle;
+#[path = "ltfsctl/logical_library.rs"]
+mod logical_library;
 #[path = "ltfsctl/notify.rs"]
 mod notify;
 #[path = "ltfsctl/pool.rs"]
@@ -122,6 +124,11 @@ enum Cmd {
     Pool {
         #[command(subcommand)]
         cmd: pool::Command,
+    },
+    /// 创建和查看物理带库内的逻辑带库
+    LogicalLibrary {
+        #[command(subcommand)]
+        cmd: logical_library::Command,
     },
     /// 磁带归属
     Tape {
@@ -956,6 +963,12 @@ fn main() {
                 reading::list(&client, library, pool, dir.as_deref())?;
             }
             Cmd::Pool { cmd } => pool::run(
+                &tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?,
+                args.library.as_deref(),
+                args.pool.as_deref(),
+                cmd,
+            )?,
+            Cmd::LogicalLibrary { cmd } => logical_library::run(
                 &tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?,
                 args.library.as_deref(),
                 args.pool.as_deref(),

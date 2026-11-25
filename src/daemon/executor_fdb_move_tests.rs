@@ -37,6 +37,13 @@ fn original_move_plan_rejects_inaccessible_disabled_exceptional_or_occupied_elem
         .unwrap();
     let r = request("ieslot");
     let original = snapshot(&lib);
+    assert_eq!(
+        original.observation["slot_layout"],
+        json!({
+            "storage_start": original.map.storage_start,
+            "ie_start": original.map.ie_start,
+        })
+    );
     let plan = original.plan(&r, None).unwrap();
     assert_eq!(plan.source.address, original.map.storage_start);
     assert_eq!(plan.destination.address, original.map.ie_start);

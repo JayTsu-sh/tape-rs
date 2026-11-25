@@ -20,7 +20,7 @@ fn known_query(request: &Request, allowed: &[&str]) -> Result<(), Box<Response>>
     }
     Ok(())
 }
-fn scoped(
+pub(super) fn scoped(
     ctx: &Context,
     serial: &str,
     request: &Request,
