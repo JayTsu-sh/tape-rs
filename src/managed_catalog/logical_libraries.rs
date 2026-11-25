@@ -771,12 +771,47 @@ impl Inventory {
                     .into_iter()
                     .flatten()
                     .any(|volume| {
-                        volume["source_address"]
-                            .as_u64()
-                            .and_then(|n| u16::try_from(n).ok())
-                            .is_some_and(|source| removed.storage_slots.contains(&source))
+                        // 磁带已在存储槽时，设备的来源地址只记录上一次移动。
+                        volume["element_type"]
+                            != crate::changer::element::ElementType::Storage as u8
+                            && volume["source_address"]
+                                .as_u64()
+                                .and_then(|n| u16::try_from(n).ok())
+                                .is_some_and(|source| removed.storage_slots.contains(&source))
                     })
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn returned_cartridge_does_not_occupy_its_previous_storage_slot() {
+        let removed = LogicalLibraryResources {
+            drives: Vec::new(),
+            storage_slots: vec![1008],
+            ie_slots: Vec::new(),
+        };
+        let mut inventory = Inventory {
+            observation: Some(json!({"drives":[],"volumes":[
+                {"barcode":"L00284L8","element_type":2,"address":1004,"source_address":1008}
+            ]})),
+            resources: None,
+            status: "current",
+        };
+        assert!(!inventory.has_occupied_resource(&removed));
+
+        let volume = &mut inventory.observation.as_mut().unwrap()["volumes"][0];
+        volume["element_type"] = json!(3);
+        volume["address"] = json!(102);
+        assert!(inventory.has_occupied_resource(&removed));
+
+        let volume = &mut inventory.observation.as_mut().unwrap()["volumes"][0];
+        volume["element_type"] = json!(2);
+        volume["address"] = json!(1008);
+        assert!(inventory.has_occupied_resource(&removed));
     }
 }
 
