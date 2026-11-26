@@ -812,6 +812,20 @@ impl ManagedCatalog {
                                 }
                                 return Ok(PublishOutcome::Registered);
                             }
+                            // Reclaim children settle an already admitted operation. New
+                            // client reservations must be fenced in this transaction.
+                            if sealed_reclaim.is_none() {
+                                let pool = intent
+                                    .pool_id
+                                    .ok_or(CatalogError::Invalid("业务请求缺少池"))?;
+                                control::logical_libraries::require_business_pool_at(
+                                    &tr,
+                                    intent.namespace,
+                                    &intent.library_serial,
+                                    pool,
+                                )
+                                .await?;
+                            }
                             if tr.get(&requests::intent_key(&stub), false).await?.is_some() {
                                 return Ok(PublishOutcome::OperationConflict);
                             }

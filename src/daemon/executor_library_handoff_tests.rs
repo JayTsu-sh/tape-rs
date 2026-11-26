@@ -160,6 +160,13 @@ async fn logical_activation_requires_original_release_and_stable_inventory() {
     sim.insert_cartridge(SimCartridge::blank("ORIGN0L8", 1 << 20), 0)
         .unwrap();
     let provider = Devices(&serial, sim);
+    let devices = provider.open_all().unwrap();
+    let saved_inventory = management::observe_devices(&devices, 2, epoch).unwrap();
+    catalog
+        .record_active_library_inventory(&serial, route, epoch, &saved_inventory)
+        .await
+        .unwrap();
+    drop(devices);
     let operation = Uuid::new_v4();
     let release = LibraryHandoff {
         library_serial: serial.clone(),
@@ -185,7 +192,12 @@ async fn logical_activation_requires_original_release_and_stable_inventory() {
             &provider,
         )
     };
-    assert!(activate(None).await.is_err());
+    let blocked = activate(None).await.unwrap();
+    assert_eq!(blocked["pools"][0]["id"], json!(pool.id));
+    assert_eq!(blocked["inventory_provenance"], "persisted_observation");
+    assert_eq!(blocked["resources"]["drives"], json!(["SIMDRV0000"]));
+    assert!(!blocked["blocking_reasons"].as_array().unwrap().is_empty());
+    assert!(blocked["plan_sha256"].is_null());
     catalog
         .begin_library_handoff(&release, route)
         .await
@@ -199,7 +211,9 @@ async fn logical_activation_requires_original_release_and_stable_inventory() {
     let external = provider.1.drive_as(0, 3);
     let external_key = ReservationKey(0x1234);
     reservation::reserve_for_reload(&external, external_key).unwrap();
-    assert!(activate(None).await.is_err());
+    let blocked = activate(None).await.unwrap();
+    assert_eq!(blocked["pools"][0]["id"], json!(pool.id));
+    assert!(blocked["plan_sha256"].is_null());
     reservation::clear_reload_registration(&external, external_key).unwrap();
 
     let preview = activate(None).await.unwrap();

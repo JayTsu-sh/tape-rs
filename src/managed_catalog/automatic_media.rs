@@ -184,6 +184,13 @@ impl ManagedCatalog {
                                 let granted = saved == *proposed;
                                 return Ok((saved, granted));
                             }
+                            logical_libraries::require_business_pool_at(
+                                &tr,
+                                ns,
+                                serial,
+                                canonical_uuid(&plan.pool)?,
+                            )
+                            .await?;
                             native_device::require_library_available(&tr, ns, serial).await?;
                             tr.set(&gate(ns, serial), &encoded(proposed)?);
                             original(&tr, serial, route, owner, proposed).await?;

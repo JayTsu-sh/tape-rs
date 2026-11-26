@@ -76,6 +76,34 @@ async fn request_scoped(
     };
     (status, value)
 }
+
+#[test]
+#[ignore = "需要显式隔离FDB_TEST_CLUSTER；仅回环HTTP，不访问设备"]
+fn native_pool_discovery_rejects_before_logical_activation() {
+    let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+    let _network = unsafe { foundationdb::boot() };
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let catalog = Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());
+        let ns = Uuid::new_v4();
+        let serial = format!("PREACT-{ns}");
+        let challenge = Uuid::new_v4();
+        let replies = (1..=3).map(|id| json!({"version":1,"library_serial":serial,"challenge":challenge.to_string(),"node_id":id,"term":7,"leader":2,"role":if id==2{"Leader"}else{"Follower"},"members":{"1":"a:1","2":"b:2","3":"c:3"},"quiesce_index":89,"frozen_index":90,"applied_index":92,"executor_absent":true,"catalog_pending":false,"shutting_down":false,"catalog_empty":true})).collect::<Vec<_>>();
+        let proof = crate::managed_catalog::verify_native_barriers(&serial, challenge, &replies).unwrap();
+        let route = catalog.initialize_native_library(ns, &proof).await.unwrap();
+        let ctx = Arc::new(Context {
+            catalog, routes: BTreeMap::from([(serial.clone(), route)]), owner: None,
+            upload_budget: None, notify_streams: Arc::new(Semaphore::new(1)),
+            notify_requests: Arc::new(Semaphore::new(1)), admin_requests: Arc::new(Semaphore::new(32)),
+        });
+        let (address, server) = serve(ctx).await;
+        let path = format!("/libraries/{serial}/admin/pools");
+        for logical in [None, Some(Uuid::new_v4())] {
+            let (status, _) = request_scoped(&address, "GET", &path, Some(&ns.to_string()), logical, b"").await;
+            assert_eq!(status, 400);
+        }
+        server.abort();
+    });
+}
 #[test]
 #[ignore = "需要显式隔离FDB_TEST_CLUSTER；原生池HTTP/异步队列，不访问设备"]
 fn native_pool_metadata_routes_read_current_catalog_without_legacy_projection() {
@@ -126,10 +154,7 @@ async fn run_pool_api(cluster: &str) {
         b"",
     )
     .await;
-    assert_eq!(code, 200);
-    assert_eq!(list["items"], json!([]));
-    assert_eq!(list["namespace"], namespace);
-    assert!(list["next"].is_null());
+    assert_eq!(code, 400, "{list}");
     assert_eq!(
         request(&a, "GET", &format!("{root}/pools"), None, b"")
             .await
@@ -220,7 +245,16 @@ async fn run_pool_api(cluster: &str) {
         ..(*readonly).clone()
     });
     let (b, tb) = serve(owner.clone()).await;
-    let logical = logical_library_creation(&catalog, &serial, route, &b, &namespace).await;
+    catalog
+        .enable_logical_business_fixture(&serial)
+        .await
+        .unwrap();
+    let (logical, assignment_pool) =
+        logical_library_creation(&catalog, &serial, route, &b, &namespace).await;
+    let scoped =
+        async |address: &str, method: &str, path: &str, namespace: Option<&str>, body: &[u8]| {
+            request_scoped(address, method, path, namespace, Some(logical), body).await
+        };
     let rescan = json!({"version":1,"library":serial,"namespace":namespace,"epoch":1,"operation":Uuid::new_v4().to_string(),"change":{"kind":"library-rescan"}});
     let rescan_path = format!("{root}/library/rescan");
     assert_eq!(
@@ -314,7 +348,7 @@ async fn run_pool_api(cluster: &str) {
         (202, cancelled)
     );
 
-    let assignment = json!({"version":1,"library":serial,"namespace":namespace,"epoch":1,"operation":Uuid::new_v4().to_string(),"change":{"kind":"media-assign","pool":Uuid::new_v4().to_string(),"volume":Uuid::new_v4().to_string(),"barcode":"TEST01L8","confirm_format":true,"force_format":false}});
+    let assignment = json!({"version":1,"library":serial,"namespace":namespace,"epoch":1,"operation":Uuid::new_v4().to_string(),"change":{"kind":"media-assign","pool":assignment_pool,"logical_library":logical,"volume":Uuid::new_v4().to_string(),"barcode":"TEST01L8","confirm_format":true,"force_format":false}});
     let assign_path = format!("{root}/tapes/TEST01L8/assign");
     assert_eq!(
         request(
@@ -596,7 +630,7 @@ async fn run_pool_api(cluster: &str) {
         400
     );
     assert_eq!(
-        request(&b, "GET", &format!("{root}/pools"), Some(&namespace), b"")
+        scoped(&b, "GET", &format!("{root}/pools"), Some(&namespace), b"")
             .await
             .0,
         200
@@ -626,7 +660,7 @@ async fn run_pool_api(cluster: &str) {
 
     let id = Uuid::new_v4();
     let body=json!({"version":1,"id":id.to_string(),"name":"归档","file_limit":100,"created_at_millis":1_793_405_000_123u64,"policy":{"media_restriction":"none","mount_limit":0,"low_space_warning_enabled":true,"low_space_warning_threshold":0,"no_space_warning_enabled":true}}).to_string();
-    let result = request(
+    let result = scoped(
         &b,
         "POST",
         &format!("{root}/pools"),
@@ -636,7 +670,7 @@ async fn run_pool_api(cluster: &str) {
     .await;
     assert_eq!(result.0, 201, "{result:?}");
     assert_eq!(
-        request(
+        scoped(
             &b,
             "POST",
             &format!("{root}/pools"),
@@ -668,7 +702,7 @@ async fn run_pool_api(cluster: &str) {
     });
     let (c, tc) = serve(entry).await;
     assert_eq!(
-        request(
+        scoped(
             &c,
             "POST",
             &format!("{root}/pools"),
@@ -681,7 +715,7 @@ async fn run_pool_api(cluster: &str) {
     );
     remote.status.lock().unwrap().executor_ready = false;
     assert_eq!(
-        request(
+        scoped(
             &c,
             "POST",
             &format!("{root}/pools"),
@@ -695,11 +729,11 @@ async fn run_pool_api(cluster: &str) {
     tc.abort();
     let poolpath = format!("{root}/pools/{id}");
     assert_eq!(
-        request(&a, "GET", &poolpath, Some(&namespace), b"").await.1["pool"]["name"],
+        scoped(&a, "GET", &poolpath, Some(&namespace), b"").await.1["pool"]["name"],
         "归档"
     );
     assert_eq!(
-        request(
+        scoped(
             &a,
             "GET",
             &format!("{root}/pools/%E5%BD%92%E6%A1%A3"),
@@ -713,7 +747,7 @@ async fn run_pool_api(cluster: &str) {
     let mut conflict: Value = serde_json::from_str(&body).unwrap();
     conflict["id"] = json!(Uuid::new_v4().to_string());
     assert_eq!(
-        request(
+        scoped(
             &b,
             "POST",
             &format!("{root}/pools"),
@@ -726,14 +760,14 @@ async fn run_pool_api(cluster: &str) {
     );
     let make = |change: Value| json!({"version":1,"library":serial,"namespace":namespace,"epoch":1,"operation":Uuid::new_v4().to_string(),"change":change});
     let intent = make(
-        json!({"kind":"pool","id":id.to_string(),"revision":1,"patch":{"media_restriction":"L8"}}),
+        json!({"kind":"pool","logical_library":logical,"id":id.to_string(),"revision":1,"patch":{"media_restriction":"L8"}}),
     );
     // Reject duplicate fields, unsupported kinds, wrong resource and scopes before enqueue.
     let duplicate = intent
         .to_string()
         .replace("\"revision\":1", "\"revision\":1,\"revision\":2");
     assert_eq!(
-        request(
+        scoped(
             &b,
             "PATCH",
             &poolpath,
@@ -747,11 +781,11 @@ async fn run_pool_api(cluster: &str) {
     for bad in [
         make(json!({"kind":"library-rescan"})),
         make(
-            json!({"kind":"pool","id":Uuid::new_v4().to_string(),"revision":1,"patch":{"name":"wrong"}}),
+            json!({"kind":"pool","logical_library":logical,"id":Uuid::new_v4().to_string(),"revision":1,"patch":{"name":"wrong"}}),
         ),
     ] {
         assert_eq!(
-            request(
+            scoped(
                 &b,
                 "PATCH",
                 &poolpath,
@@ -766,7 +800,7 @@ async fn run_pool_api(cluster: &str) {
     let mut wrong = intent.clone();
     wrong["library"] = json!("OTHER");
     assert_eq!(
-        request(
+        scoped(
             &b,
             "PATCH",
             &poolpath,
@@ -777,7 +811,7 @@ async fn run_pool_api(cluster: &str) {
         .0,
         400
     );
-    let queued = request(
+    let queued = scoped(
         &b,
         "PATCH",
         &poolpath,
@@ -799,7 +833,7 @@ async fn run_pool_api(cluster: &str) {
     let saved = tr.get(&namekey, false).await.unwrap().unwrap().to_vec();
     tr.set(&namekey, b"corrupt-index");
     tr.commit().await.unwrap();
-    let broken = request(&a, "GET", &poolpath, Some(&namespace), b"").await;
+    let broken = scoped(&a, "GET", &poolpath, Some(&namespace), b"").await;
     assert_eq!(broken.0, 500, "{broken:?}");
     assert_eq!(broken.1["retryable"], false);
     assert!(broken.1["detail"].as_str().unwrap().contains("索引"));
@@ -825,7 +859,7 @@ async fn run_pool_api(cluster: &str) {
         "queued"
     );
     assert_eq!(
-        request(
+        scoped(
             &b,
             "POST",
             &format!("{root}/pools"),
@@ -848,7 +882,7 @@ async fn run_pool_api(cluster: &str) {
         request(&a, "GET", &taskpath, Some(&namespace), b"").await.1["status"],
         "succeeded"
     );
-    let replay = request(
+    let replay = scoped(
         &b,
         "PATCH",
         &poolpath,
@@ -859,13 +893,14 @@ async fn run_pool_api(cluster: &str) {
     assert_eq!(replay.0, 202);
     assert_eq!(replay.1["status"], "succeeded");
     assert_eq!(
-        request(&a, "GET", &poolpath, Some(&namespace), b"").await.1["pool"]["revision"],
+        scoped(&a, "GET", &poolpath, Some(&namespace), b"").await.1["pool"]["revision"],
         2
     );
-    let stale =
-        make(json!({"kind":"pool","id":id.to_string(),"revision":1,"patch":{"file_limit":321}}));
+    let stale = make(
+        json!({"kind":"pool","logical_library":logical,"id":id.to_string(),"revision":1,"patch":{"file_limit":321}}),
+    );
     assert_eq!(
-        request(
+        scoped(
             &b,
             "PATCH",
             &poolpath,
@@ -890,9 +925,11 @@ async fn run_pool_api(cluster: &str) {
             .unwrap()["status"],
         "failed"
     );
-    let deletion = make(json!({"kind":"pool-delete","id":id.to_string(),"revision":2}));
+    let deletion = make(
+        json!({"kind":"pool-delete","logical_library":logical,"id":id.to_string(),"revision":2}),
+    );
     assert_eq!(
-        request(
+        scoped(
             &b,
             "DELETE",
             &poolpath,
@@ -915,13 +952,15 @@ async fn run_pool_api(cluster: &str) {
     );
     pools::poll(&owner, &serial, &mut after).await.unwrap();
     assert_eq!(
-        request(&a, "GET", &poolpath, Some(&namespace), b"").await.0,
+        scoped(&a, "GET", &poolpath, Some(&namespace), b"").await.0,
         200
     );
     // A distinct delete is applied by the actual background worker, without any SCSI receiver.
-    let deletion = make(json!({"kind":"pool-delete","id":id.to_string(),"revision":2}));
+    let deletion = make(
+        json!({"kind":"pool-delete","logical_library":logical,"id":id.to_string(),"revision":2}),
+    );
     assert_eq!(
-        request(
+        scoped(
             &b,
             "DELETE",
             &poolpath,
@@ -935,7 +974,7 @@ async fn run_pool_api(cluster: &str) {
     pools::start_worker(&owner).unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if request(&a, "GET", &poolpath, Some(&namespace), b"").await.0 == 404 {
+            if scoped(&a, "GET", &poolpath, Some(&namespace), b"").await.0 == 404 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -945,7 +984,7 @@ async fn run_pool_api(cluster: &str) {
     .unwrap();
     // Retired original create cannot resurrect the pool.
     assert_eq!(
-        request(
+        scoped(
             &b,
             "POST",
             &format!("{root}/pools"),
@@ -954,7 +993,11 @@ async fn run_pool_api(cluster: &str) {
         )
         .await
         .0,
-        409
+        200
+    );
+    assert_eq!(
+        scoped(&a, "GET", &poolpath, Some(&namespace), b"").await.0,
+        404
     );
     ta.abort();
     tb.abort();
@@ -971,7 +1014,7 @@ async fn logical_library_creation(
     route: ActiveLibraryRoute,
     address: &str,
     namespace: &str,
-) -> Uuid {
+) -> (Uuid, Uuid) {
     let base = format!("/libraries/{serial}/admin/logical-libraries");
     let id = Uuid::new_v4();
     let create = json!({"version":1,"id":id,"name":"archive-a","resources":{"drives":["SIMDRV0000"],
@@ -1043,7 +1086,9 @@ async fn logical_library_creation(
     assert_eq!(created["logical_library"]["id"], id.to_string());
     let (code, listed) = request(address, "GET", &base, Some(namespace), b"").await;
     assert_eq!(code, 200);
-    assert_eq!(listed["items"], json!([created["logical_library"]]));
+    let mut entry = created["logical_library"].clone();
+    entry["reconciliation"] = Value::Null;
+    assert_eq!(listed["items"], json!([entry]));
     assert_eq!(
         listed["unallocated_resources"]["storage_slots"],
         json!([1002])
@@ -1120,7 +1165,7 @@ async fn logical_library_creation(
     );
     assert_eq!(
         request(address, "GET", &path, Some(namespace), b"").await.0,
-        404
+        400
     );
     assert_eq!(
         request_scoped(
@@ -1390,6 +1435,42 @@ async fn logical_library_creation(
         .record_active_library_inventory(serial, route, epoch, &empty)
         .await
         .unwrap();
+    let unrelated = Uuid::new_v4();
+    let related = Uuid::new_v4();
+    let move_path = format!("/libraries/{serial}/admin/tapes/TEST01L8/move");
+    for (operation, logical) in [(unrelated, id), (related, other)] {
+        let movement = json!({"version":1,"library":serial,"namespace":namespace,"epoch":1,
+            "operation":operation,"change":{"kind":"media-move","pool":null,"volume":null,
+                "revision":null,"barcode":"TEST01L8","destination":"ieslot","logical_library":logical}});
+        assert_eq!(
+            request(
+                address,
+                "POST",
+                &move_path,
+                Some(namespace),
+                movement.to_string().as_bytes(),
+            )
+            .await
+            .0,
+            202
+        );
+    }
+    assert_eq!(
+        request(
+            address,
+            "PATCH",
+            &target,
+            Some(namespace),
+            edit_body.as_bytes(),
+        )
+        .await
+        .0,
+        503
+    );
+    catalog
+        .cancel_management(serial, route, epoch, 1, related)
+        .await
+        .unwrap();
     let (status, changed) = request(
         address,
         "PATCH",
@@ -1399,6 +1480,10 @@ async fn logical_library_creation(
     )
     .await;
     assert_eq!(status, 200, "{changed}");
+    catalog
+        .cancel_management(serial, route, epoch, 1, unrelated)
+        .await
+        .unwrap();
     assert_eq!(changed["logical_library"]["revision"], 2);
     let status_path = format!("{target}/changes/{op}");
     assert_eq!(
@@ -1536,5 +1621,8 @@ async fn logical_library_creation(
         matches!((creation.0, deletion.0), (201, 409) | (400, 200)),
         "{creation:?} {deletion:?}"
     );
-    id
+    (
+        id,
+        Uuid::parse_str(second_pool["pool"]["id"].as_str().unwrap()).unwrap(),
+    )
 }

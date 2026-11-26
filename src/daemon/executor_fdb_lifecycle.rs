@@ -5348,6 +5348,10 @@ mod tests {
             Fixture::with_media(2, false),
         ))
         .await;
+        catalog
+            .enable_logical_business_fixture(&control.serial)
+            .await
+            .unwrap();
         let epoch = fixture.owner.round;
         let logical = uuid::Uuid::new_v4();
         let (map, _) = management::elements(&fixture.owner.devices).unwrap();
@@ -7568,7 +7572,8 @@ mod tests {
         };
         let (map, _) = management::elements(&fixture.owner.devices).unwrap();
         let home = map.storage_start;
-        let other_slot = home + 1;
+        let second_home = home + 1;
+        let other_slot = home + 2;
         let mut drives = fixture
             .owner
             .devices
@@ -7591,7 +7596,7 @@ mod tests {
                 "assigned-resources",
                 LogicalLibraryResources {
                     drives: vec![drive.clone()],
-                    storage_slots: vec![home],
+                    storage_slots: vec![home, second_home],
                     ie_slots: vec![],
                 },
             ),
@@ -7629,6 +7634,10 @@ mod tests {
             .unwrap();
         pool.id = Uuid::new_v4();
         pool.name = "logical-test-pool".into();
+        catalog
+            .enable_logical_business_fixture(&control.serial)
+            .await
+            .unwrap();
         catalog
             .create_admin_pool(&control.serial, control.route, epoch, Some(logical), &pool)
             .await
@@ -7827,6 +7836,135 @@ mod tests {
         });
         let rx = serve_file_upload(&mut fixture, &control, &status, rx).await;
         upload.await.unwrap();
+
+        // A cold executor read must evict the other managed volume using its
+        // persisted home when the changer omits the drive's source address.
+        Box::pin(fdb_loading::unload(
+            &mut fixture.owner,
+            &fixture.permit,
+            &control,
+            selected,
+            &['m'],
+        ))
+        .await
+        .unwrap();
+        fixture
+            .lib
+            .insert_cartridge(SimCartridge::blank("LIFE02L8", 128 << 20), 1)
+            .unwrap();
+        let second_volume = Uuid::new_v4();
+        let second_assign = request(json!({"kind":"media-assign","pool":pool.id,
+            "barcode":"LIFE02L8","volume":second_volume,"confirm_format":true,
+            "force_format":false,"logical_library":logical}));
+        let assigned = execute(&mut fixture, &control, &status, &second_assign).await;
+        assert_eq!(assigned["status"], "succeeded", "{assigned}");
+        let second_assignment = catalog
+            .tape_assignment(&control.serial, "LIFE02L8")
+            .await
+            .unwrap()
+            .unwrap();
+        let second_return = request(json!({"kind":"media-move","pool":pool.id,
+            "barcode":"LIFE02L8","volume":second_volume,"revision":second_assignment.revision,
+            "destination":"homeslot","logical_library":logical}));
+        let returned = execute(&mut fixture, &control, &status, &second_return).await;
+        assert_eq!(returned["status"], "succeeded", "{returned}");
+        let second_head = catalog
+            .active_loaded_volume_head(&control.serial, "LIFE02L8", control.route, epoch)
+            .await
+            .unwrap()
+            .unwrap();
+        let second_placement = catalog
+            .volume_placement(second_volume)
+            .await
+            .unwrap()
+            .unwrap();
+        let second_drive = Box::pin(fdb_loading::select_write(
+            &mut fixture.owner,
+            &fixture.permit,
+            &control,
+            &status,
+            &second_placement,
+            second_head.index,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(second_drive, selected);
+        assert_eq!(
+            catalog
+                .native_device_home(
+                    &control.serial,
+                    control.route,
+                    epoch,
+                    "LIFE02L8",
+                    Some(second_volume)
+                )
+                .await
+                .unwrap(),
+            Some(second_home)
+        );
+
+        let scoped_path =
+            crate::managed_catalog::pool_catalog_path(pool.id, b"/cold-read").unwrap();
+        let scoped_path = std::str::from_utf8(&scoped_path).unwrap();
+        fixture.lib.set_drive_source_address(0, Some(home));
+        let before = fixture.commands.lock().unwrap().len();
+        let conflict = Box::pin(read_fdb(
+            &mut fixture.owner,
+            Some(&fixture.permit),
+            &control,
+            &status,
+            scoped_path,
+            Some(&pool.id.to_string()),
+        ))
+        .await;
+        let error = conflict.expect_err("来源槽冲突时不能退带");
+        assert!(
+            matches!(error, ReadError::Lost(ref detail) if detail.contains("持久 home")),
+            "{error:?}"
+        );
+        assert!(
+            !fixture.commands.lock().unwrap()[before..]
+                .iter()
+                .any(
+                    |(kind, opcode)| (*kind == DeviceKind::Drive && *opcode == 0x1b)
+                        || (*kind == DeviceKind::Changer && *opcode == 0xa5)
+                )
+        );
+        assert!(
+            catalog
+                .automatic_media_pending(&control.serial, control.route, epoch)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        fixture.lib.set_drive_source_address(0, None);
+        let mut body = Box::pin(read_fdb(
+            &mut fixture.owner,
+            Some(&fixture.permit),
+            &control,
+            &status,
+            scoped_path,
+            Some(&pool.id.to_string()),
+        ))
+        .await
+        .unwrap();
+        let mut actual = Vec::new();
+        std::io::Read::read_to_end(&mut body, &mut actual).unwrap();
+        assert_eq!(actual, bytes);
+        let (_, rows) = management::elements(&fixture.owner.devices).unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| row.address == second_home
+                    && row.volume_tag.as_deref() == Some("LIFE02L8"))
+        );
+        assert!(
+            catalog
+                .automatic_media_pending(&control.serial, control.route, epoch)
+                .await
+                .unwrap()
+                .is_none()
+        );
         Box::pin(fdb_loading::unload(
             &mut fixture.owner,
             &fixture.permit,
@@ -8117,7 +8255,10 @@ mod tests {
         let other_volume = Uuid::new_v4();
         fixture
             .lib
-            .insert_cartridge(SimCartridge::blank("LIFE01L8", 128 << 20), 1)
+            .insert_cartridge(
+                SimCartridge::blank("LIFE01L8", 128 << 20),
+                usize::from(other_slot - map.storage_start),
+            )
             .unwrap();
         let other_index = fixture
             .owner

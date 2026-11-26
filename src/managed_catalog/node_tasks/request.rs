@@ -96,6 +96,13 @@ impl ManagedCatalog {
         if let Some(task) = known_at(&preflight, route, owner, request, &object).await? {
             return Ok(task);
         }
+        control::logical_libraries::require_business_pool_at(
+            &preflight,
+            c.namespace,
+            &c.library_serial,
+            c.pool,
+        )
+        .await?;
         require_request_pool(&preflight, request).await?;
         drop(preflight);
         self.upload_node_plan_object(route, owner, &object, &mut bytes.as_slice())
@@ -115,6 +122,13 @@ impl ManagedCatalog {
                             {
                                 return Ok(task);
                             }
+                            control::logical_libraries::require_business_pool_at(
+                                &tr,
+                                c.namespace,
+                                &c.library_serial,
+                                c.pool,
+                            )
+                            .await?;
                             require_request_pool(&tr, request).await?;
                             node_plan_objects::require_sealed_at(&tr, object).await?;
                             let task = NodeMutationTask {

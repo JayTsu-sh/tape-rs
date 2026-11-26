@@ -79,7 +79,7 @@ impl ReclaimLayout {
         raw.extend_from_slice(&sum);
         Ok(raw)
     }
-    fn decode(raw: &[u8]) -> Result<Self> {
+    pub(super) fn decode(raw: &[u8]) -> Result<Self> {
         if !(32..=4128).contains(&raw.len()) {
             return Err(CatalogError::Corrupt("回收布局长度无效"));
         }

@@ -135,8 +135,8 @@ impl ManagedCatalog {
         checked_pool(&tr, namespace, serial, saved).await
     }
 
-    /// UUID and namespace are supplied by the caller before sending the request.
-    /// Repeats never replace metadata, timestamps, roots or existing contents.
+    /// Populate an unbound catalog pool for a pre-activation import or fixture.
+    /// Runtime pool creation goes through the scoped administration method.
     pub async fn create_active_pool(
         &self,
         serial: &str,
@@ -144,11 +144,24 @@ impl ManagedCatalog {
         epoch: u64,
         pool: &PoolRecord,
     ) -> Result<ActivePoolCreation> {
-        self.create_admin_pool(serial, route, epoch, None, pool)
+        self.publish_active_pool(serial, route, epoch, None, pool)
             .await
     }
 
     pub(crate) async fn create_admin_pool(
+        &self,
+        serial: &str,
+        route: ActiveLibraryRoute,
+        epoch: u64,
+        logical: Option<Uuid>,
+        pool: &PoolRecord,
+    ) -> Result<ActivePoolCreation> {
+        let logical = logical.ok_or(CatalogError::Invalid("创建池须指定逻辑带库 UUID"))?;
+        self.publish_active_pool(serial, route, epoch, Some(logical), pool)
+            .await
+    }
+
+    async fn publish_active_pool(
         &self,
         serial: &str,
         route: ActiveLibraryRoute,
@@ -168,6 +181,7 @@ impl ManagedCatalog {
                             routing::require_runtime_active_owner(&tr, serial, route, epoch)
                                 .await?;
                         if let Some(logical) = logical {
+                            logical_libraries::require_business_route_at(&tr, serial).await?;
                             let receipt =
                                 pool_create_receipt_key(namespace, serial, logical, pool.id);
                             if let Some(raw) = tr.get(&receipt, false).await? {

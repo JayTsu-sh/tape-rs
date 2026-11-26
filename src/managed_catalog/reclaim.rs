@@ -111,6 +111,30 @@ pub use mechanics::{
     ReclaimMediaPreparation,
 };
 
+pub(super) async fn require_resources_idle_at(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    overlaps: impl Fn(&str, u16) -> bool,
+) -> Result<()> {
+    if let Some(raw) = tr.get(&layout::gate(ns, serial), false).await? {
+        let layout = ReclaimLayout::decode(&raw)?;
+        if [&layout.source, &layout.destination]
+            .iter()
+            .any(|binding| overlaps(&binding.drive_serial, binding.home))
+        {
+            return Err(CatalogError::PoolBusy);
+        }
+    }
+    if let Some(raw) = tr.get(&mechanics::gate(ns, serial), false).await? {
+        let command = ReclaimMediaCommand::decode(&raw)?;
+        if overlaps(&command.plan().drive_serial, command.plan().home) {
+            return Err(CatalogError::PoolBusy);
+        }
+    }
+    Ok(())
+}
+
 fn domain(ns: Uuid, kind: u8) -> Vec<u8> {
     let mut key = management::prefix(ns, b'R');
     key.push(kind);

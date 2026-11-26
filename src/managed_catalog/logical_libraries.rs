@@ -53,12 +53,42 @@ pub(super) async fn require_explicit_scope_at(tr: &Transaction, serial: &str) ->
         .get(&routing::active_key(serial), false)
         .await?
         .ok_or(CatalogError::Incomplete)?;
-    if route.first() == Some(&routing::LOGICAL_ROUTE_VERSION) {
+    routing::decode_active(&route)?;
+    if route[0] == routing::LOGICAL_ROUTE_VERSION {
         return Err(CatalogError::Invalid(
             "已启用逻辑带库，业务请求须指定逻辑带库 UUID",
         ));
     }
     Ok(())
+}
+
+pub(in crate::managed_catalog) async fn require_business_route_at(
+    tr: &Transaction,
+    serial: &str,
+) -> Result<()> {
+    let route = tr
+        .get(&routing::active_key(serial), false)
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+    routing::decode_active(&route)?;
+    if route[0] != routing::LOGICAL_ROUTE_VERSION {
+        return Err(CatalogError::Invalid("物理带库尚未启用逻辑带库业务"));
+    }
+    Ok(())
+}
+
+pub(in crate::managed_catalog) async fn require_business_pool_at(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    pool: Uuid,
+) -> Result<()> {
+    require_business_route_at(tr, serial).await?;
+    require_pool_library(tr, ns, pool, serial).await?;
+    let logical = pool_library_at(tr, ns, serial, pool)
+        .await?
+        .ok_or(CatalogError::Invalid("业务池缺少逻辑带库归属"))?;
+    require_library_at(tr, ns, serial, logical).await
 }
 
 fn drive_key(prefix: &[u8], drive: &str) -> Vec<u8> {
@@ -153,10 +183,10 @@ pub(super) async fn require_pool_scope_at(
     if pool_library_at(tr, ns, serial, pool).await? != logical {
         return Err(CatalogError::Invalid("介质请求的池不属于指定逻辑带库范围"));
     }
-    if let Some(logical) = logical {
-        reconciliation::require_ready(tr, ns, serial, logical).await?;
+    match logical {
+        Some(logical) => reconciliation::require_ready(tr, ns, serial, logical).await,
+        None => require_explicit_scope_at(tr, serial).await,
     }
-    Ok(())
 }
 
 pub(in crate::managed_catalog) async fn require_pool_inventory_ready_at(
@@ -178,6 +208,8 @@ pub(super) async fn mechanical_resources_at(
     request: &ManagementRequest,
 ) -> Result<Option<LogicalLibraryResources>> {
     let change = &request.value()["change"];
+    // New requests are gated at durable admission. An original, already
+    // admitted request may still need observation and settlement before cutover.
     let logical = request.logical_library();
     if let Some(pool) = change["pool"].as_str() {
         let pool = Uuid::parse_str(pool).expect("validated pool");
@@ -185,16 +217,16 @@ pub(super) async fn mechanical_resources_at(
     } else if let Some(id) = logical {
         reconciliation::require_ready(tr, ns, serial, id).await?;
     }
-    let Some(id) = logical else {
+    let Some(logical) = logical else {
         require_explicit_scope_at(tr, serial).await?;
         return Ok(None);
     };
     let raw = tr
-        .get(&by_id(at(ns, serial, b'l'), id), false)
+        .get(&by_id(at(ns, serial, b'l'), logical), false)
         .await?
         .ok_or(CatalogError::Invalid("目标逻辑带库不存在"))?;
-    revision_at(tr, ns, serial, id).await?;
-    Ok(Some(decode(id, &raw)?.resources))
+    revision_at(tr, ns, serial, logical).await?;
+    Ok(Some(decode(logical, &raw)?.resources))
 }
 
 pub(super) async fn require_mechanical_locations(
@@ -476,6 +508,22 @@ fn ensure_subset(
 }
 
 impl ManagedCatalog {
+    #[cfg(test)]
+    pub(crate) async fn enable_logical_business_fixture(&self, serial: &str) -> Result<()> {
+        let tr = self.db.create_trx()?;
+        let key = routing::active_key(serial);
+        let mut raw = tr
+            .get(&key, false)
+            .await?
+            .ok_or(CatalogError::Incomplete)?
+            .to_vec();
+        routing::decode_active(&raw)?;
+        raw[0] = routing::LOGICAL_ROUTE_VERSION;
+        tr.set(&key, &raw);
+        tr.commit().await.expect("提交测试带库的逻辑路由");
+        Ok(())
+    }
+
     pub(crate) async fn active_mechanical_resources(
         &self,
         serial: &str,
@@ -509,6 +557,14 @@ impl ManagedCatalog {
         let tr = self.db.create_trx()?;
         let ns = routing::require_expected_active_namespace(&tr, serial, Some(route)).await?;
         let mut scopes = Vec::with_capacity(pools.len());
+        let raw = tr
+            .get(&routing::active_key(serial), false)
+            .await?
+            .ok_or(CatalogError::Incomplete)?;
+        routing::decode_active(&raw)?;
+        if raw[0] != routing::LOGICAL_ROUTE_VERSION {
+            return Ok(vec![None; pools.len()]);
+        }
         let mut verified = BTreeSet::new();
         for pool in pools {
             let logical = pool_library_at(&tr, ns, serial, pool.id).await?;
@@ -531,15 +587,12 @@ impl ManagedCatalog {
     ) -> Result<()> {
         let tr = self.db.create_trx()?;
         let ns = routing::require_expected_active_namespace(&tr, serial, Some(route)).await?;
-        if pool_library_at(&tr, ns, serial, pool).await? != logical {
+        require_business_route_at(&tr, serial).await?;
+        let logical = logical.ok_or(CatalogError::Invalid("业务请求须指定逻辑带库 UUID"))?;
+        if pool_library_at(&tr, ns, serial, pool).await? != Some(logical) {
             return Err(CatalogError::Invalid("池不属于请求的逻辑带库范围"));
         }
-        if let Some(logical) = logical {
-            require_library_at(&tr, ns, serial, logical).await?;
-        } else {
-            require_explicit_scope_at(&tr, serial).await?;
-        }
-        Ok(())
+        require_library_at(&tr, ns, serial, logical).await
     }
     pub(crate) async fn create_logical_library(
         &self,
@@ -586,8 +639,14 @@ impl ManagedCatalog {
                                 return Ok(Creation::InventoryUnavailable);
                             };
                             ensure_subset(&request.resources, physical)?;
-                            native_device::require_library_available(&tr, ns, serial).await?;
-                            management::require_no_queued_tasks(&tr, ns, serial).await?;
+                            require_resources_available(
+                                &tr,
+                                ns,
+                                serial,
+                                request.id,
+                                &[&request.resources],
+                            )
+                            .await?;
                             if !resources_idle(&tr, ns, serial, &inventory, &request.resources)
                                 .await?
                             {
@@ -608,6 +667,13 @@ impl ManagedCatalog {
                                     }
                                 }
                             }
+                            reconciliation::establish_layout(
+                                &tr,
+                                ns,
+                                serial,
+                                inventory.observation.as_ref().expect("current inventory"),
+                            )
+                            .await?;
                             for key in &resources {
                                 tr.set(key, request.id.as_bytes());
                             }
@@ -759,6 +825,36 @@ async fn resources_idle(
         && !management::moves::has_home_in(tr, ns, serial, &resources.storage_slots).await?)
 }
 
+async fn require_resources_available(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    logical: Uuid,
+    resources: &[&LogicalLibraryResources],
+) -> Result<()> {
+    management::require_logical_resources_available(tr, ns, serial, logical, resources).await?;
+    let overlaps = |drive: &str, home: Option<u16>| {
+        resources.iter().any(|part| {
+            part.drives.iter().any(|id| id == drive)
+                || home.is_some_and(|home| part.storage_slots.contains(&home))
+        })
+    };
+    if let Some(command) = automatic_media::pending_at(tr, ns, serial).await? {
+        let plan = &command.plan;
+        use automatic_media::AutomaticMediaAction;
+        let home = match plan.action {
+            AutomaticMediaAction::Load => None,
+            AutomaticMediaAction::MoveIn => Some(plan.source),
+            AutomaticMediaAction::UnloadMove => Some(plan.destination),
+        };
+        if overlaps(&plan.drive_serial, home) {
+            return Err(CatalogError::PoolBusy);
+        }
+    }
+    reclaim::require_resources_idle_at(tr, ns, serial, |drive, home| overlaps(drive, Some(home)))
+        .await
+}
+
 impl Inventory {
     fn has_occupied_resource(&self, removed: &LogicalLibraryResources) -> bool {
         let view = self.view(Some(removed));
@@ -890,17 +986,16 @@ impl ManagedCatalog {
                     let Some(physical) = inventory.resources.as_ref() else { return Ok(Change::InventoryUnavailable) };
                     ensure_subset(&old.resources, physical)?;
                     ensure_subset(&result_record.resources, physical)?;
-                    native_device::require_library_available(&tr, ns, serial).await?;
-                    management::require_no_queued_tasks(&tr, ns, serial).await?;
                     let removed = removed_resources(&old.resources, replacement.as_ref().map(|r| &r.resources));
+                    let added = replacement.as_ref()
+                        .map(|next| removed_resources(&next.resources, Some(&old.resources)))
+                        .unwrap_or_default();
+                    require_resources_available(&tr, ns, serial, id, &[&removed, &added]).await?;
                     if !resources_idle(&tr, ns, serial, &inventory, &removed).await? {
                         return Ok(Change::Conflict("待释放资源仍有介质占用或 home 引用"));
                     }
-                    if let Some(replacement) = replacement {
-                        let added = removed_resources(&replacement.resources, Some(&old.resources));
-                        if !resources_idle(&tr, ns, serial, &inventory, &added).await? {
-                            return Ok(Change::Conflict("待加入资源仍有介质占用或 home 引用"));
-                        }
+                    if !resources_idle(&tr, ns, serial, &inventory, &added).await? {
+                        return Ok(Change::Conflict("待加入资源仍有介质占用或 home 引用"));
                     }
                 }
 

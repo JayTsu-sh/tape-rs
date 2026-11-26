@@ -1,6 +1,80 @@
 use super::*;
 use std::collections::BTreeMap;
 
+// The numeric address alone is not an identity: a changed start address can
+// leave old addresses in range while changing their logical slot numbers.
+fn layout(observation: &Value) -> Value {
+    let mut drives: Vec<_> = observation["drives"]
+        .as_array()
+        .expect("validated drives")
+        .iter()
+        .map(|d| {
+            (
+                d["address"].as_u64().expect("validated address"),
+                d["serial"].as_str().expect("validated serial").to_owned(),
+            )
+        })
+        .collect();
+    drives.sort();
+    json!({"version":1,"slot_layout":observation["slot_layout"],
+        "num_of_slots":observation["num_of_slots"],"num_of_ieslots":observation["num_of_ieslots"],"drives":drives})
+}
+
+fn scoped_layout_changed(
+    original: &Value,
+    current: &Value,
+    resources: &LogicalLibraryResources,
+) -> bool {
+    let drive_row = |layout: &Value, serial: &str| {
+        layout["drives"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|drive| drive[1] == serial)
+            .and_then(|drive| drive[0].as_u64())
+    };
+    (!resources.storage_slots.is_empty()
+        && (original["slot_layout"]["storage_start"] != current["slot_layout"]["storage_start"]
+            || original["num_of_slots"] != current["num_of_slots"]))
+        || (!resources.ie_slots.is_empty()
+            && (original["slot_layout"]["ie_start"] != current["slot_layout"]["ie_start"]
+                || original["num_of_ieslots"] != current["num_of_ieslots"]))
+        || resources
+            .drives
+            .iter()
+            .any(|id| drive_row(original, id) != drive_row(current, id))
+}
+
+pub(super) async fn establish_layout(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    observation: &Value,
+) -> Result<()> {
+    let key = at(ns, serial, b'B');
+    let current = layout(observation);
+    if let Some(raw) = tr.get(&key, false).await? {
+        let original: Value =
+            serde_json::from_slice(&raw).map_err(|_| CatalogError::Corrupt("原始元素布局损坏"))?;
+        if original != current {
+            return Err(CatalogError::Invalid("当前元素布局与原始布局不符"));
+        }
+    } else {
+        // Never infer a baseline for an already configured legacy library.
+        if !read_page(tr, &at(ns, serial, b'l'), None, 1, false)
+            .await?
+            .items
+            .is_empty()
+        {
+            return Err(CatalogError::Invalid(
+                "缺少可信的原始元素布局，须先受控核验",
+            ));
+        }
+        tr.set(&key, current.to_string().as_bytes());
+    }
+    Ok(())
+}
+
 async fn definitions_at(
     tr: &Transaction,
     ns: Uuid,
@@ -92,27 +166,68 @@ pub(in crate::managed_catalog) async fn reconcile_after_acquire(
     let blocked = at(ns, serial, b'R');
     match handoff.phase {
         LibraryHandoffPhase::Loading if handoff.owner_epoch == owner => {}
-        LibraryHandoffPhase::Online
-            if !read_page(tr, &blocked, None, 1, false)
-                .await?
-                .items
-                .is_empty() => {}
+        LibraryHandoffPhase::Online => {}
         _ => return Ok(()),
+    }
+    if observation["slot_layout"].is_null() {
+        if !requests::prefix_has_rows(tr, &at(ns, serial, b'l')).await? {
+            return Ok(());
+        }
+        return Err(CatalogError::Incomplete);
+    }
+    let current = layout(observation);
+    let layout_key = at(ns, serial, b'B');
+    let mut original: Option<Value> = tr
+        .get(&layout_key, false)
+        .await?
+        .map(|raw| serde_json::from_slice(&raw))
+        .transpose()
+        .map_err(|_| CatalogError::Corrupt("原始元素布局损坏"))?;
+    if handoff.phase == LibraryHandoffPhase::Online
+        && original.as_ref() == Some(&current)
+        && !requests::prefix_has_rows(tr, &blocked).await?
+    {
+        return Ok(());
     }
     let definitions = definitions_at(tr, ns, serial).await?;
     if definitions.is_empty() {
         tr.clear_range(&blocked, &prefix_end(&blocked));
         return Ok(());
     }
-    if observation["slot_layout"].is_null() {
-        return Err(CatalogError::Incomplete);
-    }
-
     let actual = observed_resources(observation);
+    // Qualify the previous owner's inventory against the activation receipt.
+    // Pin that map before comparing the first acquire, where drives may have
+    // moved while the library was released.
+    if original.is_none()
+        && handoff.phase == LibraryHandoffPhase::Loading
+        && let Some(release) = handoff.release
+        && let Some(release) = management::handoff::read_at(tr, ns, serial, Some(release)).await?
+        && release.phase == LibraryHandoffPhase::Released
+        && let (Some(previous), _) = library_observations::observations_at(tr, ns, serial).await?
+        && previous["round"].as_u64() == Some(release.owner_epoch)
+        && !previous["slot_layout"].is_null()
+        && let Some(resources) = activation::original_activation_resources(tr, ns, serial).await?
+    {
+        let mut original_resources = observed_resources(&previous);
+        original_resources.drives.sort_unstable();
+        if original_resources == resources {
+            let prior_layout = layout(&previous);
+            tr.set(&layout_key, prior_layout.to_string().as_bytes());
+            original = Some(prior_layout);
+        }
+    }
     let prefix = at(ns, serial, b'r');
     let mut claims = BTreeMap::new();
     let mut conflicts = BTreeMap::new();
     for record in &definitions {
+        let layout_conflict = match &original {
+            Some(layout) => scoped_layout_changed(layout, &current, &record.resources)
+                .then_some("当前元素布局或驱动器身份与原始布局不符"),
+            None => Some("缺少可信的原始元素布局，须先受控核验"),
+        };
+        if let Some(detail) = layout_conflict {
+            conflicts.insert(record.id, detail.to_owned());
+        }
         if ensure_subset(&record.resources, &actual).is_err() {
             conflicts.insert(record.id, "当前库存缺少已分配的驱动器或槽位".to_owned());
         }
@@ -224,6 +339,24 @@ mod tests {
         sim::{SimCartridge, SimLibrary},
     };
 
+    #[test]
+    fn layout_tracks_slot_indices_and_drive_identity() {
+        let original = json!({"slot_layout":{"storage_start":1000,"ie_start":100},
+            "num_of_slots":4,"num_of_ieslots":1,
+            "drives":[{"address":1,"serial":"A"},{"address":2,"serial":"B"}]});
+        let mut shifted = original.clone();
+        shifted["slot_layout"]["storage_start"] = json!(999);
+        shifted["num_of_slots"] = json!(5);
+        assert_ne!(layout(&original), layout(&shifted));
+        let mut swapped = original.clone();
+        swapped["drives"][0]["serial"] = json!("B");
+        swapped["drives"][1]["serial"] = json!("A");
+        assert_ne!(layout(&original), layout(&swapped));
+        let mut reordered = original.clone();
+        reordered["drives"].as_array_mut().unwrap().reverse();
+        assert_eq!(layout(&original), layout(&reordered));
+    }
+
     #[tokio::test]
     #[ignore = "需要隔离 FDB_TEST_CLUSTER；使用模拟库存及设备交还回执"]
     async fn acquire_reconciles_external_move_before_exposing_logical_pools() {
@@ -247,6 +380,10 @@ mod tests {
             .unwrap();
         catalog
             .enable_library_handoff_offline(&serial, ns)
+            .await
+            .unwrap();
+        catalog
+            .enable_logical_business_fixture(&serial)
             .await
             .unwrap();
         let owner = route.initial_owner_epoch;
@@ -317,6 +454,19 @@ mod tests {
         }
         let barcode = "MOVED0L8";
         let tr = catalog.db.create_trx().unwrap();
+        // Simulate the previous activation format, whose receipt captured the
+        // full resource set before any later logical allocation.
+        let activation = Uuid::new_v4();
+        let original_resources = observed_resources(&observation(owner));
+        tr.set(
+            &by_id(at(ns, &serial, b'E'), activation),
+            json!({"library_serial":serial,"namespace":ns,"operation":activation,
+                "status":"enabled","logical_library":{"id":activation,"name":"default",
+                    "revision":1,"resources":original_resources}})
+            .to_string()
+            .as_bytes(),
+        );
+        tr.clear(&at(ns, &serial, b'B'));
         tr.set(
             &assignment_key(&serial, barcode),
             &encode_assignment(ns, scopes[0].1, None),
@@ -394,6 +544,31 @@ mod tests {
                 .is_err()
         );
 
+        let mut shifted_acquire = observation(next_owner);
+        shifted_acquire["slot_layout"]["storage_start"] = json!(storage - 1);
+        shifted_acquire["num_of_slots"] = json!(map.storage_count + 1);
+        shifted_acquire["drives"][0]["address"] = json!(map.dt_start + 1);
+        catalog
+            .record_active_library_inventory(&serial, route, next_owner, &shifted_acquire)
+            .await
+            .unwrap();
+        let tr = catalog.db.create_trx().unwrap();
+        let pinned = tr
+            .get(&at(ns, &serial, b'B'), false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&pinned).unwrap(),
+            layout(&observation(owner))
+        );
+        for (logical, _) in &scopes {
+            let conflict = conflict_at(&tr, ns, &serial, *logical)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(conflict["detail"].as_str().unwrap().contains("布局"));
+        }
         catalog
             .record_active_library_inventory(&serial, route, next_owner, &observation(next_owner))
             .await
@@ -437,6 +612,34 @@ mod tests {
             .check_active_pool_gate(&serial, route, next_owner, scopes[0].1)
             .await
             .unwrap();
+        // All allocated addresses remain present, but their logical indices shift.
+        let mut shifted = observation(next_owner);
+        shifted["slot_layout"]["storage_start"] = json!(storage - 1);
+        shifted["num_of_slots"] = json!(map.storage_count + 1);
+        catalog
+            .record_active_library_inventory(&serial, route, next_owner, &shifted)
+            .await
+            .unwrap();
+        for (_, pool) in &scopes {
+            assert!(matches!(
+                catalog
+                    .check_active_pool_gate(&serial, route, next_owner, *pool)
+                    .await
+                    .unwrap_err()
+                    .domain(),
+                CatalogError::LogicalInventoryBlocked(_)
+            ));
+        }
+        catalog
+            .record_active_library_inventory(&serial, route, next_owner, &observation(next_owner))
+            .await
+            .unwrap();
+        for (_, pool) in &scopes {
+            catalog
+                .check_active_pool_gate(&serial, route, next_owner, *pool)
+                .await
+                .unwrap();
+        }
         let original = catalog
             .library_handoff(&serial, route, Some(release.operation))
             .await

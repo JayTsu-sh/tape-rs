@@ -234,6 +234,47 @@ pub async fn activate_logical_library_offline(
     expected_plan: Option<&str>,
     provider: &dyn DeviceProvider,
 ) -> Result<serde_json::Value> {
+    match activate_logical_library_offline_checked(
+        catalog,
+        serial,
+        namespace,
+        operation,
+        release,
+        expected_plan,
+        provider,
+    )
+    .await
+    {
+        Err(error)
+            if expected_plan.is_none()
+                && !operation.is_nil()
+                && !release.is_nil()
+                && operation != release =>
+        {
+            catalog
+                .preview_blocked_logical_activation(
+                    serial,
+                    namespace,
+                    operation,
+                    release,
+                    &error.to_string(),
+                )
+                .await
+                .map_err(|e| TapeError::Catalog(e.to_string()))
+        }
+        result => result,
+    }
+}
+
+async fn activate_logical_library_offline_checked(
+    catalog: &crate::managed_catalog::ManagedCatalog,
+    serial: &str,
+    namespace: uuid::Uuid,
+    operation: uuid::Uuid,
+    release: uuid::Uuid,
+    expected_plan: Option<&str>,
+    provider: &dyn DeviceProvider,
+) -> Result<serde_json::Value> {
     if operation.is_nil()
         || release.is_nil()
         || operation == release

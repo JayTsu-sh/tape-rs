@@ -949,6 +949,22 @@ async fn unload_inner(
     } else {
         None
     };
+    let automatic_home = if maintenance.is_none() && intake.is_none() {
+        let persisted = control
+            .catalog
+            .native_device_home(
+                &control.serial,
+                control.route,
+                owner.round,
+                barcode,
+                Some(mount.volume),
+            )
+            .await
+            .map_err(lost)?;
+        automatic_home(*home, persisted)?
+    } else {
+        None
+    };
     let destination = maintenance
         .map(|(_, home)| home)
         .or(intake_destination)
@@ -956,7 +972,8 @@ async fn unload_inner(
         .or_else(|| {
             (maintenance.is_none() && intake.is_none())
                 .then(|| {
-                    home.filter(|home| inventory.empty_slots.contains(home))
+                    automatic_home
+                        .filter(|home| inventory.empty_slots.contains(home))
                         .or_else(|| {
                             logical
                                 .is_none()
@@ -1044,6 +1061,16 @@ async fn unload_inner(
     }
     owner.fdb_reads.remove(&drive);
     Ok(())
+}
+
+fn automatic_home(
+    reported: Option<u16>,
+    persisted: Option<u16>,
+) -> std::result::Result<Option<u16>, ReadError> {
+    if matches!((reported, persisted), (Some(reported), Some(saved)) if reported != saved) {
+        return Err(lost("驱动器报告的原槽位与持久 home 冲突"));
+    }
+    Ok(reported.or(persisted))
 }
 
 pub(super) async fn select(
@@ -1545,6 +1572,22 @@ pub(super) async fn recovery_load(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_home_reconciles_reported_and_persisted_evidence() {
+        for (reported, persisted, expected) in [
+            (None, None, None),
+            (Some(100), None, Some(100)),
+            (None, Some(100), Some(100)),
+            (Some(100), Some(100), Some(100)),
+        ] {
+            assert_eq!(automatic_home(reported, persisted).unwrap(), expected);
+        }
+        assert!(matches!(
+            automatic_home(Some(100), Some(101)),
+            Err(ReadError::Lost(_))
+        ));
+    }
 
     #[test]
     fn tape_policy_requires_explicit_native_flags_and_ignores_legacy_markers() {

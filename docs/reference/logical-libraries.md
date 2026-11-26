@@ -70,6 +70,8 @@ S3 通过 `ListBuckets` 查找逻辑带库下的 pool 名称。应用也可用 R
 
 ## 首次启用已有物理带库
 
+未启用的物理带库只开放管理和监控。首次切换前，在原版本结清已有的业务请求及未知设备动作，然后进入维护窗口。启用后的 pool、文件及介质业务都使用显式逻辑库范围。
+
 在维护窗口停发新的业务，确认全部任务结清。完成整库交还并保存回执 UUID。停止所有能够访问该物理库的执行器，确认此前发出的设备命令已经结清。候选版本要在所有节点准备完毕。离线命令要求原设备组的 PR 注册与持有者均已清空，并加载当前完整库存。
 
 在任一停机成员上，用其原 `--id`、`--listen`、`--peer`、`--data-dir`、`--libraries-config` 和 `--fdb-cluster-file` 参数运行以下命令，保留生成的启用 UUID 和预览的 `plan_sha256`。
@@ -81,5 +83,9 @@ ltfsd <原节点参数> --activate-logical-library-offline LIBRARY \
 ```
 
 核对预览中的 pool 与资源后，追加 `--commit-logical-library-plan PLAN_SHA256`。命令重新采集库存并核对摘要，然后用同一 FDB 事务发布 `default`、资源和既有 pool 的归属、启用状态及回执。`default` 使用启用 UUID。原有 pool、卷和文件保持原身份，物理资源先归入 `default`。之后可释放当前为空闲且无 home 引用的资源，并划分给新的逻辑库。
+
+执行节点仍在线、设备访问无法核实或原任务未结清时，预览仍列出 pool、阻塞原因和可用的历史库存。`inventory_provenance` 标明库存来源，此时 `plan_sha256` 为空。排除阻塞后按原 UUID 重新预览，提交时重新核验设备、库存、任务和计划。
+
+首次配置或启用时保存槽位起始地址、数量及驱动器地址和序列号的对应关系。重新取得设备后，受布局变化影响的逻辑库暂停业务，即使旧地址仍在当前范围内。恢复原布局并核对完整库存后恢复业务。已经启用、但尚未保存原始布局的物理库，在升级前先重扫库存并整库交还。升级后重新取得设备时，系统用原启用回执核验交还前的库存，再以该布局核对当前设备。
 
 同一 UUID 和计划可查询原结果。HTTP 使用 `GET /libraries/{serial}/admin/logical-libraries/activation/{operation}`，携带 `x-tapers-catalog-namespace`。启用后使用支持逻辑库的版本启动全部成员，使用原交还 UUID 重新加载，并用 `default` 范围读回原文件核对摘要。新的路由版本要求显式逻辑库范围，也使旧执行器无法通过原路由准入。[逻辑带库 ADR](../adr/0003-logical-library-resource-boundary.md)

@@ -271,6 +271,14 @@ fn lock(m: &Mutex<LibState>) -> MutexGuard<'_, LibState> {
 }
 
 impl SimLibrary {
+    /// Override the source address reported for a simulated drive element.
+    #[cfg(all(test, feature = "fdb"))]
+    pub(crate) fn set_drive_source_address(&self, drive: usize, source: Option<u16>) {
+        let mut state = lock(&self.state);
+        state.invalidate_change_evidence();
+        state.drives[drive].source_address = source;
+    }
+
     /// 为调度测试设置真实设备可读密度及 WRTOK；不改变磁带内容。
     pub fn set_drive_densities(&self, drive: usize, densities: Vec<(u8, bool)>) {
         lock(&self.state).drives[drive].densities = densities;

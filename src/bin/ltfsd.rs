@@ -462,7 +462,15 @@ fn main() {
                 .iter()
                 .find(|entry| entry.changer_serial == *serial)
                 .ok_or_else(|| TapeError::NotReady("配置中不存在目标带库".into()))?;
-            require_handoff_peers_offline(&peers)?;
+            let peer_check = require_handoff_peers_offline(&peers);
+            let offline_blocker = if args.activate_logical_library_offline.is_some()
+                && args.commit_logical_library_plan.is_none()
+            {
+                peer_check.err()
+            } else {
+                peer_check?;
+                None
+            };
             let cluster = args
                 .fdb_cluster_file
                 .as_ref()
@@ -476,24 +484,39 @@ fn main() {
                 .enable_all()
                 .build()?;
             if args.activate_logical_library_offline.is_some() {
-                let provider = tape_rs::daemon::executor::OfflineSgProvider(
-                    tape_rs::daemon::executor::SgProvider {
-                        changer_serial: Some(library.changer_serial.clone()),
-                        changer_target_port: library.changer_target_port.clone(),
-                        drive_serials: library.drive_serials.clone(),
-                    },
-                );
-                let value = runtime.block_on(
-                    tape_rs::daemon::executor::activate_logical_library_offline(
-                        &catalog,
-                        serial,
-                        args.logical_library_namespace.unwrap(),
-                        args.logical_library_operation.unwrap(),
-                        args.logical_library_release.unwrap(),
-                        args.commit_logical_library_plan.as_deref(),
-                        &provider,
-                    ),
-                )?;
+                let namespace = args.logical_library_namespace.unwrap();
+                let operation = args.logical_library_operation.unwrap();
+                let release = args.logical_library_release.unwrap();
+                let value = if let Some(error) = offline_blocker {
+                    runtime
+                        .block_on(catalog.preview_blocked_logical_activation(
+                            serial,
+                            namespace,
+                            operation,
+                            release,
+                            &error.to_string(),
+                        ))
+                        .map_err(|e| TapeError::Catalog(e.to_string()))?
+                } else {
+                    let provider = tape_rs::daemon::executor::OfflineSgProvider(
+                        tape_rs::daemon::executor::SgProvider {
+                            changer_serial: Some(library.changer_serial.clone()),
+                            changer_target_port: library.changer_target_port.clone(),
+                            drive_serials: library.drive_serials.clone(),
+                        },
+                    );
+                    runtime.block_on(
+                        tape_rs::daemon::executor::activate_logical_library_offline(
+                            &catalog,
+                            serial,
+                            namespace,
+                            operation,
+                            release,
+                            args.commit_logical_library_plan.as_deref(),
+                            &provider,
+                        ),
+                    )?
+                };
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&value).expect("启用结果可编码")

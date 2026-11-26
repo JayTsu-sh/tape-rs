@@ -5,6 +5,38 @@ fn receipt_key(ns: Uuid, serial: &str, operation: Uuid) -> Vec<u8> {
     by_id(at(ns, serial, b'E'), operation)
 }
 
+/// Existing activation receipts retain the complete typed slot ranges and
+/// verified drive serials, independent of later edits to the default library.
+pub(super) async fn original_activation_resources(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+) -> Result<Option<LogicalLibraryResources>> {
+    let prefix = at(ns, serial, b'E');
+    let page = read_page(tr, &prefix, None, 1, false).await?;
+    if page.next.is_some() {
+        return Err(CatalogError::Corrupt("带库存在多个启用回执"));
+    }
+    let Some((key, _)) = page.items.first() else {
+        return Ok(None);
+    };
+    let operation = uuid_from(&key[prefix.len()..])?;
+    let value = receipt_at(tr, ns, serial, operation)
+        .await?
+        .ok_or(CatalogError::Corrupt("启用回执索引与内容不符"))?;
+    let logical = &value["logical_library"];
+    if operation.is_nil()
+        || logical["id"] != json!(operation)
+        || logical["name"] != "default"
+        || logical["revision"] != 1
+    {
+        return Err(CatalogError::Corrupt("启用回执缺少原默认逻辑带库"));
+    }
+    let resources = serde_json::from_value(logical["resources"].clone())
+        .map_err(|_| CatalogError::Corrupt("启用回执资源编码无效"))?;
+    Ok(Some(resources))
+}
+
 async fn receipt_at(
     tr: &Transaction,
     ns: Uuid,
@@ -38,6 +70,61 @@ fn check_original(value: Value, release: Uuid, expected_plan: Option<&str>) -> R
 }
 
 impl ManagedCatalog {
+    /// Produce an advisory preview without opening hardware or accepting a commit.
+    pub async fn preview_blocked_logical_activation(
+        &self,
+        serial: &str,
+        namespace: Uuid,
+        operation: Uuid,
+        release: Uuid,
+        reason: &str,
+    ) -> Result<Value> {
+        if operation.is_nil() || release.is_nil() || operation == release {
+            return Err(CatalogError::Invalid("原启用或交还 UUID 无效"));
+        }
+        let tr = self.db.create_trx()?;
+        let ns = routing::require_expected_active_namespace(&tr, serial, None).await?;
+        if ns != namespace {
+            return Err(CatalogError::Invalid("启用请求命名空间已改变"));
+        }
+        if let Some(saved) = receipt_at(&tr, ns, serial, operation).await? {
+            return check_original(saved, release, None);
+        }
+        let mut reasons = vec![reason.to_owned()];
+        if let Err(error) = management::handoff::require_drained_at(&tr, ns, serial).await {
+            let detail = error.to_string();
+            if !reasons.iter().any(|reason| reason.ends_with(&detail)) {
+                reasons.push(detail);
+            }
+        }
+        let prefix = pool_prefix(ns);
+        let rows = read_page(&tr, &prefix, None, MAX_RESOURCES, false).await?;
+        if rows.next.is_some() {
+            return Err(CatalogError::Invalid("物理带库的池数量超过一次迁移容量"));
+        }
+        let mut pools = Vec::new();
+        for (key, raw) in rows.items {
+            let pool = decode_pool(uuid_from(&key[prefix.len()..])?, &raw)?;
+            if pool.library_serial != serial {
+                continue;
+            }
+            require_pool_library(&tr, ns, pool.id, serial).await?;
+            active_pools::require_indexes(&tr, ns, &pool).await?;
+            pools.push(json!({"id":pool.id,"name":pool.name,"revision":pool.revision}));
+        }
+        let (inventory, _) = library_observations::observations_at(&tr, ns, serial).await?;
+        let resources = inventory
+            .as_ref()
+            .filter(|v| !v["slot_layout"].is_null())
+            .map(observed_resources);
+        Ok(
+            json!({"version":1,"library_serial":serial,"namespace":ns,"operation":operation,
+            "release":release,"status":"preview","blocking_reasons":reasons,
+            "inventory_provenance":if inventory.is_some() {"persisted_observation"} else {"unavailable"},
+            "inventory":inventory,"resources":resources,"pools":pools,"pool_count":pools.len(),
+            "plan_sha256":null}),
+        )
+    }
     pub(crate) async fn find_original_logical_activation(
         &self,
         serial: &str,
@@ -160,6 +247,7 @@ impl ManagedCatalog {
                         let pool_list: Vec<_> = pools.iter().map(|p| json!({"id":p.id,"name":p.name,"revision":p.revision})).collect();
                         let mut report = json!({"version":1,"library_serial":serial,"namespace":ns,"operation":operation,
                             "status":"preview","release":release.operation,"logical_library":definition(logical, 1),
+                            "inventory_provenance":"fresh_device", "blocking_reasons":[],
                             "pools":pool_list,"pool_count":pools.len()});
                         let plan = format!("{:x}", Sha256::digest(serde_json::to_vec(&json!({"report":report,"inventory":observation}))
                             .expect("已校验预览记录可编码")));
@@ -168,6 +256,8 @@ impl ManagedCatalog {
                         if expected_plan != plan {
                             return Err(CatalogError::Invalid("库存或待迁移池已改变，请核对原操作 UUID 后重新预览"));
                         }
+
+                        reconciliation::establish_layout(&tr, ns, serial, observation).await?;
 
                         for key in resource_keys(&at(ns, serial, b'r'), &logical.resources) {
                             tr.set(&key, logical.id.as_bytes());

@@ -6,14 +6,15 @@ async fn read_pool(
     tr: &Transaction,
     ns: Uuid,
     serial: &str,
-    logical: Option<Uuid>,
+    logical: Uuid,
     id: Uuid,
 ) -> Result<Option<PoolRecord>> {
     let Some(raw) = tr.get(&pool_key(ns, id), false).await? else {
         return Ok(None);
     };
     let pool = decode_pool(id, &raw)?;
-    if pool.library_serial != serial || pool_library_at(tr, ns, serial, id).await? != logical {
+    if pool.library_serial != serial || pool_library_at(tr, ns, serial, id).await? != Some(logical)
+    {
         return Ok(None);
     }
     require_pool_library(tr, ns, id, serial).await?;
@@ -31,11 +32,9 @@ impl ManagedCatalog {
     ) -> Result<Option<PoolRecord>> {
         let tr = self.db.create_trx()?;
         let ns = routing::require_expected_active_namespace(&tr, serial, Some(route)).await?;
-        if let Some(logical) = logical {
-            require_library_at(&tr, ns, serial, logical).await?;
-        } else {
-            logical_libraries::require_explicit_scope_at(&tr, serial).await?;
-        }
+        logical_libraries::require_business_route_at(&tr, serial).await?;
+        let logical = logical.ok_or(CatalogError::Invalid("池查询须指定逻辑带库 UUID"))?;
+        require_library_at(&tr, ns, serial, logical).await?;
         if let Ok(id) = Uuid::parse_str(selector) {
             if id.is_nil() || id.to_string() != selector {
                 return Err(CatalogError::Invalid("池 UUID 须规范且非零"));
@@ -63,13 +62,10 @@ impl ManagedCatalog {
     ) -> Result<Page<PoolRecord>> {
         let tr = self.db.create_trx()?;
         let ns = routing::require_expected_active_namespace(&tr, serial, Some(route)).await?;
-        let prefix = if let Some(logical) = logical {
-            require_library_at(&tr, ns, serial, logical).await?;
-            pool_membership_prefix(ns, serial, logical)
-        } else {
-            logical_libraries::require_explicit_scope_at(&tr, serial).await?;
-            pool_prefix(ns)
-        };
+        logical_libraries::require_business_route_at(&tr, serial).await?;
+        let logical = logical.ok_or(CatalogError::Invalid("池列表须指定逻辑带库 UUID"))?;
+        require_library_at(&tr, ns, serial, logical).await?;
+        let prefix = pool_membership_prefix(ns, serial, logical);
         if !(1..=100).contains(&limit)
             || after.is_some_and(|key| !key.starts_with(&prefix) || key.len() != prefix.len() + 16)
         {
@@ -79,25 +75,11 @@ impl ManagedCatalog {
         let mut items = Vec::with_capacity(page.items.len());
         for (key, raw) in page.items {
             let id = uuid_from(&key[prefix.len()..])?;
-            match logical {
-                Some(_) => {
-                    let pool = read_pool(&tr, ns, serial, logical, id).await?;
-                    if !raw.is_empty() || pool.is_none() {
-                        return Err(CatalogError::Corrupt("逻辑带库的池索引与主记录不符"));
-                    }
-                    items.extend(pool);
-                }
-                None => {
-                    let pool = decode_pool(id, &raw)?;
-                    if pool.library_serial == serial
-                        && pool_library_at(&tr, ns, serial, id).await?.is_none()
-                    {
-                        require_pool_library(&tr, ns, id, serial).await?;
-                        active_pools::require_indexes(&tr, ns, &pool).await?;
-                        items.push(pool);
-                    }
-                }
+            let pool = read_pool(&tr, ns, serial, logical, id).await?;
+            if !raw.is_empty() || pool.is_none() {
+                return Err(CatalogError::Corrupt("逻辑带库的池索引与主记录不符"));
             }
+            items.extend(pool);
         }
         Ok(Page {
             items,

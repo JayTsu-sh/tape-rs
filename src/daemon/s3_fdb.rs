@@ -107,10 +107,10 @@ async fn buckets(s: &FdbS3) -> S3Result<BTreeMap<String, Bucket>> {
                 .await
                 .map_err(catalog_error)?;
             for (pool, logical_library) in page.items.into_iter().zip(logical) {
-                let name = match logical_library {
-                    Some(logical) => logical_bucket_name(serial, logical, pool.id),
-                    None => bucket_name(serial, &pool.id.to_string()),
+                let Some(logical) = logical_library else {
+                    continue;
                 };
+                let name = logical_bucket_name(serial, logical, pool.id);
                 let bucket = Bucket {
                     serial: serial.clone(),
                     pool: pool.id,

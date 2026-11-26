@@ -43,6 +43,7 @@ impl ManagedCatalog {
         let tr = self.db.create_trx()?;
         let namespace =
             routing::require_runtime_active_owner(&tr, serial, route, owner_epoch).await?;
+        logical_libraries::require_business_pool_at(&tr, namespace, serial, spec.pool_id).await?;
         control::require_pool_writable_at(&tr, namespace, spec.pool_id).await?;
         logical_libraries::require_pool_inventory_ready_at(&tr, namespace, serial, spec.pool_id)
             .await?;
