@@ -438,12 +438,22 @@ fn main() {
         .write(true)
         .open(args.data_dir.join("ltfsd.lock"))
         .expect("打开进程锁");
-    let _instance_lock =
-        nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
-            .unwrap_or_else(|(_, e)| {
-                eprintln!("该数据目录已有 ltfsd 实例：{e}");
+    #[cfg(feature = "fdb")]
+    let activation_preview = args.activate_logical_library_offline.is_some()
+        && args.commit_logical_library_plan.is_none();
+    #[cfg(not(feature = "fdb"))]
+    let activation_preview = false;
+    let (_instance_lock, _preview_lock_blocker) =
+        match nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => (Some(lock), None),
+            Err((_, error)) if activation_preview => {
+                (None, Some(format!("该数据目录已有 ltfsd 实例：{error}")))
+            }
+            Err((_, error)) => {
+                eprintln!("该数据目录已有 ltfsd 实例：{error}");
                 std::process::exit(2)
-            });
+            }
+        };
     #[cfg(feature = "fdb")]
     if let Some(serial) = args
         .enable_library_handoff_offline
@@ -463,10 +473,8 @@ fn main() {
                 .find(|entry| entry.changer_serial == *serial)
                 .ok_or_else(|| TapeError::NotReady("配置中不存在目标带库".into()))?;
             let peer_check = require_handoff_peers_offline(&peers);
-            let offline_blocker = if args.activate_logical_library_offline.is_some()
-                && args.commit_logical_library_plan.is_none()
-            {
-                peer_check.err()
+            let offline_blocker = if activation_preview {
+                _preview_lock_blocker.or_else(|| peer_check.err().map(|e| e.to_string()))
             } else {
                 peer_check?;
                 None
@@ -490,11 +498,7 @@ fn main() {
                 let value = if let Some(error) = offline_blocker {
                     runtime
                         .block_on(catalog.preview_blocked_logical_activation(
-                            serial,
-                            namespace,
-                            operation,
-                            release,
-                            &error.to_string(),
+                            serial, namespace, operation, release, &error,
                         ))
                         .map_err(|e| TapeError::Catalog(e.to_string()))?
                 } else {
