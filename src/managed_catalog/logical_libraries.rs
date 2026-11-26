@@ -77,18 +77,30 @@ pub(in crate::managed_catalog) async fn require_business_route_at(
     Ok(())
 }
 
+pub(super) async fn require_business_scope_at(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    logical: Option<Uuid>,
+) -> Result<()> {
+    match logical {
+        Some(id) => {
+            require_business_route_at(tr, serial).await?;
+            require_library_at(tr, ns, serial, id).await
+        }
+        None => require_explicit_scope_at(tr, serial).await,
+    }
+}
+
 pub(in crate::managed_catalog) async fn require_business_pool_at(
     tr: &Transaction,
     ns: Uuid,
     serial: &str,
     pool: Uuid,
 ) -> Result<()> {
-    require_business_route_at(tr, serial).await?;
     require_pool_library(tr, ns, pool, serial).await?;
-    let logical = pool_library_at(tr, ns, serial, pool)
-        .await?
-        .ok_or(CatalogError::Invalid("业务池缺少逻辑带库归属"))?;
-    require_library_at(tr, ns, serial, logical).await
+    let logical = pool_library_at(tr, ns, serial, pool).await?;
+    require_business_scope_at(tr, ns, serial, logical).await
 }
 
 fn drive_key(prefix: &[u8], drive: &str) -> Vec<u8> {
@@ -302,10 +314,14 @@ pub(in crate::managed_catalog) fn pool_binding_key(ns: Uuid, serial: &str, pool:
 pub(super) fn pool_create_receipt_key(
     ns: Uuid,
     serial: &str,
-    logical: Uuid,
+    logical: Option<Uuid>,
     pool: Uuid,
 ) -> Vec<u8> {
-    by_id(by_id(at(ns, serial, b'P'), logical), pool)
+    // Logical library IDs are nonzero, so nil identifies the physical scope.
+    by_id(
+        by_id(at(ns, serial, b'P'), logical.unwrap_or(Uuid::nil())),
+        pool,
+    )
 }
 
 pub(in crate::managed_catalog) fn pool_membership_prefix(
@@ -548,12 +564,12 @@ impl ManagedCatalog {
         pool_resources_at(&tr, ns, serial, pool).await
     }
 
-    pub(crate) async fn active_pool_logical_libraries(
+    pub(crate) async fn active_pool_business_scopes(
         &self,
         serial: &str,
         route: ActiveLibraryRoute,
-        pools: &[PoolRecord],
-    ) -> Result<Vec<Option<Uuid>>> {
+        pools: Vec<PoolRecord>,
+    ) -> Result<Vec<(PoolRecord, Option<Uuid>)>> {
         let tr = self.db.create_trx()?;
         let ns = routing::require_expected_active_namespace(&tr, serial, Some(route)).await?;
         let mut scopes = Vec::with_capacity(pools.len());
@@ -563,17 +579,17 @@ impl ManagedCatalog {
             .ok_or(CatalogError::Incomplete)?;
         routing::decode_active(&raw)?;
         if raw[0] != routing::LOGICAL_ROUTE_VERSION {
-            return Ok(vec![None; pools.len()]);
+            return Ok(pools.into_iter().map(|pool| (pool, None)).collect());
         }
         let mut verified = BTreeSet::new();
         for pool in pools {
-            let logical = pool_library_at(&tr, ns, serial, pool.id).await?;
-            if let Some(id) = logical
-                && verified.insert(id)
-            {
+            let Some(id) = pool_library_at(&tr, ns, serial, pool.id).await? else {
+                continue;
+            };
+            if verified.insert(id) {
                 require_library_at(&tr, ns, serial, id).await?;
             }
-            scopes.push(logical);
+            scopes.push((pool, Some(id)));
         }
         Ok(scopes)
     }
@@ -587,12 +603,11 @@ impl ManagedCatalog {
     ) -> Result<()> {
         let tr = self.db.create_trx()?;
         let ns = routing::require_expected_active_namespace(&tr, serial, Some(route)).await?;
-        require_business_route_at(&tr, serial).await?;
-        let logical = logical.ok_or(CatalogError::Invalid("业务请求须指定逻辑带库 UUID"))?;
-        if pool_library_at(&tr, ns, serial, pool).await? != Some(logical) {
+        require_business_scope_at(&tr, ns, serial, logical).await?;
+        if pool_library_at(&tr, ns, serial, pool).await? != logical {
             return Err(CatalogError::Invalid("池不属于请求的逻辑带库范围"));
         }
-        require_library_at(&tr, ns, serial, logical).await
+        require_pool_library(&tr, ns, pool, serial).await
     }
     pub(crate) async fn create_logical_library(
         &self,

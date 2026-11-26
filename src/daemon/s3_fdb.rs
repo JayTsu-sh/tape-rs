@@ -101,16 +101,16 @@ async fn buckets(s: &FdbS3) -> S3Result<BTreeMap<String, Bucket>> {
             if all.len() + page.items.len() > 4096 {
                 return Err(unavailable("S3 bucket 列表超过本入口上限"));
             }
-            let logical = s
+            let scopes = s
                 .catalog
-                .active_pool_logical_libraries(serial, *route, &page.items)
+                .active_pool_business_scopes(serial, *route, page.items)
                 .await
                 .map_err(catalog_error)?;
-            for (pool, logical_library) in page.items.into_iter().zip(logical) {
-                let Some(logical) = logical_library else {
-                    continue;
+            for (pool, logical_library) in scopes {
+                let name = match logical_library {
+                    Some(logical) => logical_bucket_name(serial, logical, pool.id),
+                    None => bucket_name(serial, &pool.id.to_string()),
                 };
-                let name = logical_bucket_name(serial, logical, pool.id);
                 let bucket = Bucket {
                     serial: serial.clone(),
                     pool: pool.id,

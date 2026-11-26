@@ -55,19 +55,19 @@ pub(super) fn library<'a>(
 pub(super) fn submit(
     client: &FdbClient,
     library: &str,
-    logical: Uuid,
+    logical: Option<Uuid>,
     input: ManagementIntent,
     path: PathBuf,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     match ManagementRequestFile::load(&path) {
         Ok(saved) => {
-            if !saved.matches_pool_scope(library, Some(logical), &input) {
+            if !saved.matches_pool_scope(library, logical, &input) {
                 return Err("请求文件的物理库、逻辑库或参数不同；禁止覆盖原请求".into());
             }
         }
         Err(tape_rs::client::ClientError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             client
-                .prepare_pool_management(library, Some(logical), input)?
+                .prepare_pool_management(library, logical, input)?
                 .save_new(&path)?;
         }
         Err(e) => return Err(e.into()),
@@ -80,7 +80,7 @@ pub(super) fn submit(
 fn items(
     client: &FdbClient,
     library: &str,
-    logical: Uuid,
+    logical: Option<Uuid>,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let context = client.management_context(library)?;
     let ns = context["namespace"].as_str().ok_or("缺少目录命名空间")?;
@@ -88,7 +88,7 @@ fn items(
     let mut seen = std::collections::HashSet::new();
     let mut items = Vec::new();
     loop {
-        let page = client.pool_page_in_scope(library, ns, Some(logical), after.as_deref())?;
+        let page = client.pool_page_in_scope(library, ns, logical, after.as_deref())?;
         items.extend(page["items"].as_array().ok_or("分页清单无效")?.clone());
         after = page["next"].as_str().map(str::to_owned);
         if let Some(cursor) = &after {
@@ -124,9 +124,9 @@ pub fn run(
     command: Command,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let library = library(serial, pool)?;
-    let logical = logical
-        .filter(|id| !id.is_nil())
-        .ok_or("池管理必须通过 --logical-library 指定逻辑带库 UUID")?;
+    if logical.is_some_and(|id| id.is_nil()) {
+        return Err("逻辑带库 UUID 不能为零".into());
+    }
     let result = match command {
         Command::Create {
             name,
@@ -167,7 +167,7 @@ pub fn run(
             client.pool_in_scope(
                 library,
                 context["namespace"].as_str().ok_or("缺少命名空间")?,
-                Some(logical),
+                logical,
                 &selector,
             )?
         }

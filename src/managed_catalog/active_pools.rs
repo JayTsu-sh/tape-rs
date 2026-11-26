@@ -144,7 +144,7 @@ impl ManagedCatalog {
         epoch: u64,
         pool: &PoolRecord,
     ) -> Result<ActivePoolCreation> {
-        self.publish_active_pool(serial, route, epoch, None, pool)
+        self.publish_active_pool(serial, route, epoch, None, false, pool)
             .await
     }
 
@@ -156,8 +156,7 @@ impl ManagedCatalog {
         logical: Option<Uuid>,
         pool: &PoolRecord,
     ) -> Result<ActivePoolCreation> {
-        let logical = logical.ok_or(CatalogError::Invalid("创建池须指定逻辑带库 UUID"))?;
-        self.publish_active_pool(serial, route, epoch, Some(logical), pool)
+        self.publish_active_pool(serial, route, epoch, logical, true, pool)
             .await
     }
 
@@ -167,10 +166,14 @@ impl ManagedCatalog {
         route: ActiveLibraryRoute,
         epoch: u64,
         logical: Option<Uuid>,
+        admin: bool,
         pool: &PoolRecord,
     ) -> Result<ActivePoolCreation> {
         validate_pool(pool)?;
-        if pool.library_serial != serial || pool.revision != 1 {
+        if pool.library_serial != serial
+            || pool.revision != 1
+            || logical.is_some_and(|id| id.is_nil())
+        {
             return Err(CatalogError::Invalid("新池带库或初始修订号无效"));
         }
         self.db
@@ -180,18 +183,20 @@ impl ManagedCatalog {
                         let namespace =
                             routing::require_runtime_active_owner(&tr, serial, route, epoch)
                                 .await?;
+                        let receipt = admin
+                            .then(|| pool_create_receipt_key(namespace, serial, logical, pool.id));
+                        if let Some(receipt) = &receipt
+                            && let Some(raw) = tr.get(receipt, false).await?
+                        {
+                            let original = decode_pool(pool.id, &raw)?;
+                            return Ok(if original == *pool {
+                                ActivePoolCreation::AlreadyExists(original)
+                            } else {
+                                ActivePoolCreation::IdConflict
+                            });
+                        }
                         if let Some(logical) = logical {
                             logical_libraries::require_business_route_at(&tr, serial).await?;
-                            let receipt =
-                                pool_create_receipt_key(namespace, serial, logical, pool.id);
-                            if let Some(raw) = tr.get(&receipt, false).await? {
-                                let original = decode_pool(pool.id, &raw)?;
-                                return Ok(if original == *pool {
-                                    ActivePoolCreation::AlreadyExists(original)
-                                } else {
-                                    ActivePoolCreation::IdConflict
-                                });
-                            }
                             require_library_at(&tr, namespace, serial, logical).await?;
                         } else {
                             logical_libraries::require_explicit_scope_at(&tr, serial).await?;
@@ -216,7 +221,7 @@ impl ManagedCatalog {
                             if saved.library_serial != serial {
                                 return Ok(ActivePoolCreation::IdConflict);
                             }
-                            if logical.is_some()
+                            if admin
                                 || pool_library_at(&tr, namespace, serial, pool.id)
                                     .await?
                                     .is_some()
@@ -296,10 +301,9 @@ impl ManagedCatalog {
                             }
                             tr.set(&binding, logical.as_bytes());
                             tr.set(&member, b"");
-                            tr.set(
-                                &pool_create_receipt_key(namespace, serial, logical, pool.id),
-                                &encoded,
-                            );
+                        }
+                        if let Some(receipt) = receipt {
+                            tr.set(&receipt, &encoded);
                         }
                         tr.set(&record, &encoded);
                         tr.set(&named, pool.id.as_bytes());

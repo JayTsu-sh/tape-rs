@@ -79,7 +79,7 @@ async fn request_scoped(
 
 #[test]
 #[ignore = "需要显式隔离FDB_TEST_CLUSTER；仅回环HTTP，不访问设备"]
-fn native_pool_discovery_rejects_before_logical_activation() {
+fn native_pool_discovery_uses_physical_scope_before_logical_activation() {
     let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
     let _network = unsafe { foundationdb::boot() };
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
@@ -97,10 +97,10 @@ fn native_pool_discovery_rejects_before_logical_activation() {
         });
         let (address, server) = serve(ctx).await;
         let path = format!("/libraries/{serial}/admin/pools");
-        for logical in [None, Some(Uuid::new_v4())] {
-            let (status, _) = request_scoped(&address, "GET", &path, Some(&ns.to_string()), logical, b"").await;
-            assert_eq!(status, 400);
-        }
+        let (status, page) = request(&address, "GET", &path, Some(&ns.to_string()), b"").await;
+        assert_eq!(status, 200, "{page}");
+        assert_eq!(page["items"], json!([]));
+        assert_eq!(request_scoped(&address, "GET", &path, Some(&ns.to_string()), Some(Uuid::new_v4()), b"").await.0, 400);
         server.abort();
     });
 }
@@ -154,7 +154,8 @@ async fn run_pool_api(cluster: &str) {
         b"",
     )
     .await;
-    assert_eq!(code, 400, "{list}");
+    assert_eq!(code, 200, "{list}");
+    assert_eq!(list["items"], json!([]));
     assert_eq!(
         request(&a, "GET", &format!("{root}/pools"), None, b"")
             .await
@@ -245,10 +246,122 @@ async fn run_pool_api(cluster: &str) {
         ..(*readonly).clone()
     });
     let (b, tb) = serve(owner.clone()).await;
+    let physical_pool = Uuid::new_v4();
+    let body = json!({"version":1,"id":physical_pool,"name":"physical-pool","file_limit":100,
+        "created_at_millis":1_793_405_000_123_u64,"policy":{"media_restriction":"none","mount_limit":0,
+        "low_space_warning_enabled":true,"low_space_warning_threshold":0,"no_space_warning_enabled":true}})
+        .to_string();
+    let pools_path = format!("{root}/pools");
+    for expected in [201, 200] {
+        let (code, receipt) =
+            request(&b, "POST", &pools_path, Some(&namespace), body.as_bytes()).await;
+        assert_eq!(code, expected, "{receipt}");
+        assert_eq!(receipt["pool"]["id"], json!(physical_pool));
+    }
+    let (code, page) = request(&a, "GET", &pools_path, Some(&namespace), b"").await;
+    assert_eq!(code, 200, "{page}");
+    assert_eq!(page["items"][0]["id"], json!(physical_pool));
+    let (code, details) = request(
+        &a,
+        "GET",
+        &format!("{pools_path}/physical-pool"),
+        Some(&namespace),
+        b"",
+    )
+    .await;
+    assert_eq!(code, 200, "{details}");
+    assert_eq!(details["pool"]["id"], json!(physical_pool));
+    let address = a.clone();
+    let library = serial.clone();
+    tokio::task::spawn_blocking(move || {
+        let client = crate::client::fdb::FdbClient::new([address.as_str()]).unwrap();
+        let directory = client.stat(&library, physical_pool, "/").unwrap().unwrap();
+        assert_eq!(directory["kind"], "directory");
+        let scoped = client.with_logical_library(Uuid::new_v4()).unwrap();
+        assert!(scoped.stat(&library, physical_pool, "/").unwrap().is_none());
+    })
+    .await
+    .unwrap();
+    let pool_path = format!("{pools_path}/{physical_pool}");
+    let mut physical_cursor = None;
+    for (method, change) in [
+        (
+            "PATCH",
+            json!({"kind":"pool","id":physical_pool,"revision":1,"patch":{"file_limit":101}}),
+        ),
+        (
+            "DELETE",
+            json!({"kind":"pool-delete","id":physical_pool,"revision":2}),
+        ),
+    ] {
+        let operation = Uuid::new_v4();
+        let intent = json!({"version":1,"library":serial,"namespace":namespace,"epoch":1,
+            "operation":operation,"change":change});
+        let (code, task) = request(
+            &b,
+            method,
+            &pool_path,
+            Some(&namespace),
+            intent.to_string().as_bytes(),
+        )
+        .await;
+        assert_eq!(code, 202, "{task}");
+        pools::poll(&owner, &serial, &mut physical_cursor)
+            .await
+            .unwrap();
+        let (code, finished) = request(
+            &a,
+            "GET",
+            &format!("{root}/tasks/1/{operation}"),
+            Some(&namespace),
+            b"",
+        )
+        .await;
+        assert_eq!(code, 200, "{finished}");
+        assert_eq!(finished["status"], "succeeded", "{finished}");
+    }
+    assert_eq!(
+        request(&a, "GET", &pool_path, Some(&namespace), b"")
+            .await
+            .0,
+        404
+    );
+    let (code, receipt) = request(&b, "POST", &pools_path, Some(&namespace), body.as_bytes()).await;
+    assert_eq!(code, 200, "{receipt}");
+    assert_eq!(receipt["pool"]["revision"], 1);
+    assert_eq!(
+        request(&a, "GET", &pool_path, Some(&namespace), b"")
+            .await
+            .0,
+        404
+    );
     catalog
         .enable_logical_business_fixture(&serial)
         .await
         .unwrap();
+    let (code, receipt) = request(&b, "POST", &pools_path, Some(&namespace), body.as_bytes()).await;
+    assert_eq!(code, 200, "{receipt}");
+    assert_eq!(receipt["pool"]["id"], json!(physical_pool));
+    let mut new_pool: Value = serde_json::from_str(&body).unwrap();
+    new_pool["id"] = json!(Uuid::new_v4());
+    assert_eq!(
+        request(
+            &b,
+            "POST",
+            &pools_path,
+            Some(&namespace),
+            new_pool.to_string().as_bytes()
+        )
+        .await
+        .0,
+        400
+    );
+    assert_eq!(
+        request(&a, "GET", &pools_path, Some(&namespace), b"")
+            .await
+            .0,
+        400
+    );
     let (logical, assignment_pool) =
         logical_library_creation(&catalog, &serial, route, &b, &namespace).await;
     let scoped =

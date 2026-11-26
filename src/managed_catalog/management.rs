@@ -529,13 +529,12 @@ impl ManagedCatalog {
             if request.epoch()!=w.accepting {return Err(CatalogError::Invalid("管理请求代次已关闭"));}
             let change = &request.value()["change"];
             if matches!(change["kind"].as_str(), Some("pool" | "pool-delete")) {
-                logical_libraries::require_business_route_at(&tr, serial).await?;
                 pools::require_scope(&tr, ns, serial, change).await?;
             }
             if matches!(change["kind"].as_str(),
                 Some("media-assign" | "media-move" | "media-unassign" | "media-validate" | "media-online" | "media-import" | "tape" | "media-reclaim"))
             {
-                logical_libraries::require_business_route_at(&tr, serial).await?;
+                logical_libraries::require_business_scope_at(&tr, ns, serial, request.logical_library()).await?;
                 logical_libraries::mechanical_resources_at(&tr, ns, serial, request).await?;
             }
             let queued=read_page(&tr,&library_prefix(ns,serial,b'q'),None,MAX_QUEUED,false).await?;

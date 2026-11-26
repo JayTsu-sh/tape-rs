@@ -1,6 +1,6 @@
 # FDB 原生池管理
 
-`ltfsctl pool` 和 `ltfsctl task` 使用 `/libraries/{真实changer序列号}/admin/...`，必须显式指定 `--library`，不接受全局 `--pool`。池、任务和通知以 FDB 为事实源。文件内容仍属于阶段性的 owner 只读服务；池创建不分配、不格式化磁带。
+`ltfsctl pool` 和 `ltfsctl task` 使用 `/libraries/{真实changer序列号}/admin/...`，必须显式指定 `--library`。物理库启用逻辑带库后，`ltfsctl pool` 还须指定 `--logical-library UUID`，HTTP 池请求使用 `x-tapers-logical-library` 头。尚未启用逻辑带库时，下面的命令直接操作物理库下的池。池、任务和通知以 FDB 为事实源。
 
 ```bash
 ltfsctl -e NODE:7411 --library SERIAL pool create archive --request create.json
@@ -15,7 +15,7 @@ ltfsctl -e NODE:7411 --library SERIAL pool delete archive --request delete.json
 ltfsctl -e NODE:7411 --library SERIAL task show --request delete.json
 ```
 
-`create` 是原子创建，返回池记录。`set`、`delete` 返回持久任务；202 或 queued 不代表成功，须查询至 succeeded、failed 或 cancelled。删除要求目录为空、没有磁带归属或活动文件写入。取消仅适用于 queued。任务窗口轮换、历史清理和运行中设备任务取消尚未开放。
+当前 `create` 原子创建空池，返回池记录。`set` 和 `delete` 返回持久任务，需查询至 succeeded、failed 或 cancelled。删除要求目录为空、没有磁带归属或活动文件写入。取消仅适用于 queued。任务窗口轮换、历史清理和运行中设备任务取消尚未开放。
 
 写命令在第一次提交前以独占创建、0600、文件和父目录 fsync 保存请求文件。重复执行同一命令和相同参数时使用同一文件，沿用原 namespace、池 UUID、修订号、任务 epoch/operation；不会重新解析池名或更新修订号。不同参数、损坏或不完整文件直接拒绝，不覆盖、不修复。文件只保存请求身份，不缓存任务状态。保留这些文件供超时、断网和接管后恢复；不要为了重试而删除文件或改用新文件。
 
