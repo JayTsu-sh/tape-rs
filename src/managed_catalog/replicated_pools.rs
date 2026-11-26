@@ -312,8 +312,10 @@ impl ManagedCatalog {
                                 owner,
                                 member.logical_library,
                                 &pool_record(input, member),
-                                &member.tapes,
-                                member.confirm_format,
+                                selected_pool::TapeSelection {
+                                    barcodes: &member.tapes,
+                                    confirm_format: member.confirm_format,
+                                },
                                 Some(input.id),
                             )
                             .await?;

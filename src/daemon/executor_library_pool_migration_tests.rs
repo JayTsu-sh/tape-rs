@@ -754,7 +754,11 @@ fn replicated_pool_resumes_after_owner_change_and_conflict_with_body_proof() {
         &a,
         0,
         "REPA01L8",
-        &[("/collision", b"A-side"), ("/same", b"shared")],
+        &[
+            ("/collision", b"A-side"),
+            ("/same", b"shared"),
+            ("/tree", b"file"),
+        ],
     );
     seed(
         &a,
@@ -766,7 +770,11 @@ fn replicated_pool_resumes_after_owner_change_and_conflict_with_body_proof() {
         &b,
         0,
         "REPB01L8",
-        &[("/collision", b"B-side"), ("/same", b"shared")],
+        &[
+            ("/collision", b"B-side"),
+            ("/same", b"shared"),
+            ("/tree/child", b"child"),
+        ],
     );
     b.insert_cartridge(SimCartridge::blank("REPB02L8", 128 << 20), 1)
         .unwrap();
@@ -946,6 +954,26 @@ fn replicated_pool_resumes_after_owner_change_and_conflict_with_body_proof() {
     client
         .resolve_replicated_pool_conflict(request.id, &choice)
         .unwrap();
+    let structural = wait(&|status| status["conflict"]["path"] == "/tree");
+    let choice_file = ResolveReplicatedPoolConflict {
+        version: 1,
+        path: "/tree".into(),
+        volume_uuid: uuid_a,
+        revision: structural["conflict"]["revision"].as_u64().unwrap(),
+    };
+    assert!(matches!(
+        client.resolve_replicated_pool_conflict(request.id, &choice_file),
+        Err(ClientError::Rejected { status: 400, .. })
+    ));
+    client
+        .resolve_replicated_pool_conflict(
+            request.id,
+            &ResolveReplicatedPoolConflict {
+                volume_uuid: uuid_b,
+                ..choice_file
+            },
+        )
+        .unwrap();
     let completed = wait(&|status| status["status"] == "succeeded");
     assert_eq!(completed, client.create_replicated_pool(&request).unwrap());
     assert_eq!(
@@ -990,6 +1018,11 @@ fn replicated_pool_resumes_after_owner_change_and_conflict_with_body_proof() {
         .unwrap();
     assert_eq!(last_page["items"][0]["path"], "/same");
     assert_eq!(last_page["items"][0]["replica_count"], 2);
+    assert_eq!(last_page["items"][1]["kind"], "directory");
+    let descendants = client
+        .replicated_pool_files(request.id, last_page["next"].as_str(), 10)
+        .unwrap();
+    assert_eq!(descendants["items"][0]["path"], "/tree/child");
 
     let member_a = &request.members[0];
     let attempt = root.join("delete-member.json");

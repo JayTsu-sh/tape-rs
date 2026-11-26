@@ -122,18 +122,32 @@ pub(in crate::managed_catalog::control) async fn record_at(
         let head: Head = decode(&raw)?;
         if head.source.content != source.content && original_version.is_none() {
             let conflict_key = path_key(id, b'c', path);
-            if tr.get(&conflict_key, false).await?.is_none() {
-                let revision = head
-                    .resolution_revision
-                    .checked_add(1)
-                    .ok_or(CatalogError::Corrupt("多副本冲突修订号耗尽"))?;
-                tr.set(
-                    &conflict_key,
-                    &encode(&Conflict {
-                        revision,
-                        sources: [head.source, source.clone()],
-                    })?,
-                );
+            match tr.get(&conflict_key, false).await? {
+                Some(raw) if source.content.kind == Kind::Directory => {
+                    let mut conflict: Conflict = decode(&raw)?;
+                    if conflict
+                        .sources
+                        .iter()
+                        .all(|copy| copy.content.kind != Kind::Directory)
+                    {
+                        conflict.sources[1] = source.clone();
+                        tr.set(&conflict_key, &encode(&conflict)?);
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    let revision = head
+                        .resolution_revision
+                        .checked_add(1)
+                        .ok_or(CatalogError::Corrupt("多副本冲突修订号耗尽"))?;
+                    tr.set(
+                        &conflict_key,
+                        &encode(&Conflict {
+                            revision,
+                            sources: [head.source, source.clone()],
+                        })?,
+                    );
+                }
             }
         }
     } else {
@@ -235,9 +249,14 @@ pub(super) async fn resolve_at(
     }
     if source.content.kind != Kind::Directory {
         let descendants = path_key(id, b'h', &format!("{path}/"));
-        if requests::prefix_has_rows(tr, &descendants).await? {
+        if original
+            .sources
+            .iter()
+            .any(|copy| copy.content.kind == Kind::Directory)
+            || requests::prefix_has_rows(tr, &descendants).await?
+        {
             return Err(CatalogError::Invalid(
-                "此路径下仍有导入文件，请保留目录来源",
+                "此路径包含目录来源，请保留目录及其文件",
             ));
         }
     }

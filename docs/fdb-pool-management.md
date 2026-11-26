@@ -1,6 +1,6 @@
 # FDB 原生池管理
 
-`ltfsctl pool` 和 `ltfsctl task` 使用 `/libraries/{真实changer序列号}/admin/...`，必须显式指定 `--library`。物理库启用逻辑带库后，`ltfsctl pool` 还须指定 `--logical-library UUID`，HTTP 池请求使用 `x-tapers-logical-library` 头。尚未启用逻辑带库时，下面的命令直接操作物理库下的池。池、任务和通知以 FDB 为事实源。
+普通池管理与 `ltfsctl task` 使用 `/libraries/{真实changer序列号}/admin/...`，必须显式指定 `--library`。物理库启用逻辑带库后，`ltfsctl pool` 还须指定 `--logical-library UUID`，HTTP 池请求使用 `x-tapers-logical-library` 头。尚未启用逻辑带库时，下面的命令直接操作物理库下的池。池、任务和通知以 FDB 为事实源。
 
 ```bash
 ltfsctl -e NODE:7411 --library SERIAL pool create archive --request create.json
@@ -119,6 +119,6 @@ ltfsctl -e NODE:7411 pool replicated resolve POOL_UUID --path /报告.pdf --revi
 
 已有 LTFS 文件逐个读回验证，卷和文件内容保留。文件清单分页给出正文 SHA-256 和按底层池计数的 `replica_count`，创建期间不会补写历史副本。指定 `confirm_format: true` 的成员只可初始化经实读核实的空白磁带。已有 LTFS 卷上的池标记须缺失或与对应底层池相符。
 
-同路径内容冲突时，详情的 `conflict` 给出路径、修订号和两盘来源。管理员选定保留卷后提交该路径和原修订号，原任务继续。另一盘的原文件仍保存在原卷。底层池文件写入和独立删除受保护，当前多副本池提供管理入口。
+同路径内容冲突时，详情的 `conflict` 给出路径、修订号和两盘来源。管理员选定保留卷后提交该路径和原修订号，原任务继续。另一盘的原文件仍保存在原卷。目录与文件占用同一路径时，保留目录及其中的文件。底层池文件写入和独立删除受保护，当前多副本池提供管理入口。
 
 HTTP 使用 `POST /admin/replicated-pools` 提交请求，`GET /admin/replicated-pools/{id}` 查询原任务。导入文件使用 `GET /admin/replicated-pools/{id}/files?limit=100`，下一页的 `after` 是上一页 `next` 路径的无填充 Base64URL。冲突通过 `POST /admin/replicated-pools/{id}/resolve` 提交 `version`、`path`、`revision` 和 `volume_uuid`。

@@ -251,7 +251,19 @@ impl ManagedCatalog {
                             }
                             return receipt(ns, pool, &saved);
                         }
-                        admit_at(&tr, ns, owner, logical, pool, tapes, confirm_format, None).await
+                        admit_at(
+                            &tr,
+                            ns,
+                            owner,
+                            logical,
+                            pool,
+                            TapeSelection {
+                                barcodes: tapes,
+                                confirm_format,
+                            },
+                            None,
+                        )
+                        .await
                     }
                     .await
                     .map_err(notifications::atomic_error),
@@ -261,16 +273,24 @@ impl ManagedCatalog {
     }
 }
 
+pub(super) struct TapeSelection<'a> {
+    pub barcodes: &'a [String],
+    pub confirm_format: bool,
+}
+
 pub(super) async fn admit_at(
     tr: &Transaction,
     ns: Uuid,
     owner: u64,
     logical: Option<Uuid>,
     pool: &PoolRecord,
-    tapes: &[String],
-    confirm_format: bool,
+    selection: TapeSelection<'_>,
     replicated: Option<Uuid>,
 ) -> Result<Value> {
+    let TapeSelection {
+        barcodes: tapes,
+        confirm_format,
+    } = selection;
     let serial = pool.library_serial.as_str();
     management::moves::require_readable_at(tr, ns, serial).await?;
     management::require_selected_tapes_idle(tr, ns, serial, tapes).await?;
@@ -333,13 +353,13 @@ pub(super) async fn admit_at(
     if read_page(tr, &prefix, None, 100, false).await?.items.len() >= 100 {
         return Err(CatalogError::ManagementQueueFull);
     }
-    if replicated.is_some() {
-        if !matches!(
+    if replicated.is_some()
+        && !matches!(
             active_pools::create_pool_at(tr, ns, logical, true, true, pool).await?,
             ActivePoolCreation::Created(_)
-        ) {
-            return Err(CatalogError::PoolBusy);
-        }
+        )
+    {
+        return Err(CatalogError::PoolBusy);
     }
     tr.set(&id_key(ns, pool.id), &raw);
     tr.set(&pending_key(ns, serial, pool.id), b"");
