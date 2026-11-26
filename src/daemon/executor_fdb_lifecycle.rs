@@ -7590,6 +7590,10 @@ mod tests {
 
         let logical = Uuid::new_v4();
         let other_logical = Uuid::new_v4();
+        catalog
+            .enable_logical_business_fixture(&control.serial)
+            .await
+            .unwrap();
         for (id, name, resources) in [
             (
                 logical,
@@ -7634,10 +7638,6 @@ mod tests {
             .unwrap();
         pool.id = Uuid::new_v4();
         pool.name = "logical-test-pool".into();
-        catalog
-            .enable_logical_business_fixture(&control.serial)
-            .await
-            .unwrap();
         catalog
             .create_admin_pool(&control.serial, control.route, epoch, Some(logical), &pool)
             .await

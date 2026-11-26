@@ -245,6 +245,9 @@ fn original_mechanical_checkpoint_survives_ack_loss_and_takeover_without_duplica
     runtime
         .block_on(catalog.record_active_library_inventory(&serial, route, round, &observed))
         .unwrap();
+    runtime
+        .block_on(catalog.enable_logical_business_fixture(&serial))
+        .unwrap();
     for (id, name, storage, ie, drives) in [
         (
             logical,

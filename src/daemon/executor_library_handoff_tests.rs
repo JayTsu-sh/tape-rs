@@ -7,6 +7,9 @@ use serde_json::{Value, json};
 use std::sync::{Mutex, atomic::AtomicBool, mpsc};
 use uuid::Uuid;
 
+#[path = "executor_library_pool_migration_tests.rs"]
+mod pool_migration;
+
 #[test]
 fn reload_transport_error_cannot_authorize_registration_cleanup() {
     let sim = SimLibrary::new(1, 3, 0);
@@ -96,7 +99,10 @@ fn wait_phase(client: &FdbClient, serial: &str, ns: Uuid, id: Uuid, phase: &str)
 #[tokio::test]
 #[ignore = "需要隔离 FDB_TEST_CLUSTER；设备均为 SimLibrary"]
 async fn logical_activation_requires_original_release_and_stable_inventory() {
-    use crate::managed_catalog::{ActivePoolCreation, LibraryHandoffPhase, PoolPolicy, PoolRecord};
+    use crate::logical_library::{CreateLogicalLibrary, LogicalLibraryResources};
+    use crate::managed_catalog::{
+        ActivePoolCreation, LibraryHandoffPhase, LogicalLibraryCreation, PoolPolicy, PoolRecord,
+    };
     struct Devices<'a>(&'a str, SimLibrary);
     impl DeviceProvider for Devices<'_> {
         fn open_all(&self) -> Result<Vec<ManagedDevice>> {
@@ -150,7 +156,7 @@ async fn logical_activation_requires_original_release_and_stable_inventory() {
     };
     assert_eq!(
         catalog
-            .create_active_pool(&serial, route, epoch, &pool)
+            .create_admin_pool(&serial, route, epoch, None, &pool)
             .await
             .unwrap(),
         ActivePoolCreation::Created(pool.clone())
@@ -162,11 +168,36 @@ async fn logical_activation_requires_original_release_and_stable_inventory() {
     let provider = Devices(&serial, sim);
     let devices = provider.open_all().unwrap();
     let saved_inventory = management::observe_devices(&devices, 2, epoch).unwrap();
+    let storage_start = saved_inventory["slot_layout"]["storage_start"]
+        .as_u64()
+        .unwrap() as u16;
     catalog
         .record_active_library_inventory(&serial, route, epoch, &saved_inventory)
         .await
         .unwrap();
     drop(devices);
+    let before_activation = catalog
+        .create_logical_library(
+            &serial,
+            route,
+            epoch,
+            CreateLogicalLibrary {
+                version: 1,
+                id: Uuid::new_v4(),
+                name: "premature".into(),
+                resources: LogicalLibraryResources {
+                    drives: vec![],
+                    storage_slots: vec![storage_start + 1],
+                    ie_slots: vec![],
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(before_activation, LogicalLibraryCreation::Conflict(detail) if detail.contains("离线启用")),
+        "{before_activation:?}"
+    );
     let operation = Uuid::new_v4();
     let release = LibraryHandoff {
         library_serial: serial.clone(),

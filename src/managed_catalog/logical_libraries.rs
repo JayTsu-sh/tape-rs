@@ -48,13 +48,17 @@ fn by_name(mut key: Vec<u8>, name: &str) -> Vec<u8> {
     key
 }
 
-pub(super) async fn require_explicit_scope_at(tr: &Transaction, serial: &str) -> Result<()> {
+async fn logical_business_enabled_at(tr: &Transaction, serial: &str) -> Result<bool> {
     let route = tr
         .get(&routing::active_key(serial), false)
         .await?
         .ok_or(CatalogError::Incomplete)?;
     routing::decode_active(&route)?;
-    if route[0] == routing::LOGICAL_ROUTE_VERSION {
+    Ok(route[0] == routing::LOGICAL_ROUTE_VERSION)
+}
+
+pub(super) async fn require_explicit_scope_at(tr: &Transaction, serial: &str) -> Result<()> {
+    if logical_business_enabled_at(tr, serial).await? {
         return Err(CatalogError::Invalid(
             "已启用逻辑带库，业务请求须指定逻辑带库 UUID",
         ));
@@ -66,12 +70,7 @@ pub(in crate::managed_catalog) async fn require_business_route_at(
     tr: &Transaction,
     serial: &str,
 ) -> Result<()> {
-    let route = tr
-        .get(&routing::active_key(serial), false)
-        .await?
-        .ok_or(CatalogError::Incomplete)?;
-    routing::decode_active(&route)?;
-    if route[0] != routing::LOGICAL_ROUTE_VERSION {
+    if !logical_business_enabled_at(tr, serial).await? {
         return Err(CatalogError::Invalid("物理带库尚未启用逻辑带库业务"));
     }
     Ok(())
@@ -776,6 +775,11 @@ impl ManagedCatalog {
                                 } else {
                                     Creation::Conflict("同一逻辑带库 UUID 已绑定不同的原请求")
                                 });
+                            }
+                            if !logical_business_enabled_at(&tr, serial).await? {
+                                return Ok(Creation::Conflict(
+                                    "物理带库尚未启用逻辑带库，请先离线启用并保留原池",
+                                ));
                             }
                             let primary = by_id(at(ns, serial, b'l'), request.id);
                             if tr.get(&primary, false).await?.is_some() {
