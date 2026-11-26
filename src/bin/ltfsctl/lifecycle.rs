@@ -243,9 +243,9 @@ fn run(
         if !matches!(action, Action::Move { .. }) {
             return Err("该操作必须指定 --pool 池名称或 UUID".into());
         }
-        let page = client.list_pools(&library, 100, None)?;
+        let context = client.management_context(&library)?;
         (
-            page["namespace"]
+            context["namespace"]
                 .as_str()
                 .ok_or("namespace 缺失")?
                 .parse::<Uuid>()?,
@@ -491,8 +491,8 @@ pub fn rescan(
     let (path, directory) = paths(command.request, libraries.len())?;
     let mut saved = Vec::new();
     for library in libraries {
-        let page = client.list_pools(&library, 100, None)?;
-        let namespace = page["namespace"]
+        let context = client.management_context(&library)?;
+        let namespace = context["namespace"]
             .as_str()
             .ok_or("namespace 缺失")?
             .parse::<Uuid>()?;
