@@ -182,6 +182,26 @@ pub(crate) async fn require_app_pool_readable(
     require_pool_readable(tr, ns, pool).await?;
     replicated_pools::require_independent_at(tr, ns, pool).await
 }
+pub(super) async fn replica_origin_target_at(
+    tr: &Transaction,
+    source: &replicated_pools::files::Source,
+    path: &str,
+) -> Result<String> {
+    let scan = tr
+        .get(&ready_volume_key(source.volume_uuid), false)
+        .await?
+        .map(|raw| decode_ready_volume(&raw).map(|(scan, _)| scan.id))
+        .transpose()?;
+    refresh::replica_origin_at(
+        tr,
+        source.namespace,
+        source.volume_uuid,
+        scan,
+        source.file_uid,
+        path,
+    )
+    .await
+}
 fn encode(value: &Value) -> Vec<u8> {
     value.to_string().into_bytes()
 }

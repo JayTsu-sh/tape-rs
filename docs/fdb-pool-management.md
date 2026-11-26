@@ -119,6 +119,35 @@ ltfsctl -e NODE:7411 pool replicated resolve POOL_UUID --path /报告.pdf --revi
 
 已有 LTFS 文件逐个读回验证，卷和文件内容保留。文件清单分页给出正文 SHA-256 和按底层池计数的 `replica_count`，创建期间不会补写历史副本。指定 `confirm_format: true` 的成员只可初始化经实读核实的空白磁带。已有 LTFS 卷上的池标记须缺失或与对应底层池相符。
 
-同路径内容冲突时，详情的 `conflict` 给出路径、修订号和两盘来源。管理员选定保留卷后提交该路径和原修订号，原任务继续。另一盘的原文件仍保存在原卷。目录与文件占用同一路径时，保留目录及其中的文件。底层池文件写入和独立删除受保护，当前多副本池提供管理入口。
+同路径内容冲突时，详情的 `conflict` 给出路径、修订号和两盘来源。管理员选定保留卷后提交该路径和原修订号，原任务继续。另一盘的原文件仍保存在原卷。目录与文件占用同一路径时，保留目录及其中的文件。底层池的独立文件写入和删除受保护。应用通过多副本池的文件接口访问已发布版本。
 
-HTTP 使用 `POST /admin/replicated-pools` 提交请求，`GET /admin/replicated-pools/{id}` 查询原任务。导入文件使用 `GET /admin/replicated-pools/{id}/files?limit=100`，下一页的 `after` 是上一页 `next` 路径的无填充 Base64URL。冲突通过 `POST /admin/replicated-pools/{id}/resolve` 提交 `version`、`path`、`revision` 和 `volume_uuid`。
+HTTP 使用 `POST /admin/replicated-pools` 提交请求，`GET /admin/replicated-pools/{id}` 查询原任务。已发布文件使用 `GET /admin/replicated-pools/{id}/files?limit=100`，下一页的 `after` 是上一页 `next` 路径的无填充 Base64URL。冲突通过 `POST /admin/replicated-pools/{id}/resolve` 提交 `version`、`path`、`revision` 和 `volume_uuid`。
+
+### 多副本池的原生文件接口
+
+每次归档先保存一份原请求 JSON。`operation` 是新操作的 UUID。新文件的 `previous` 为 null，覆盖时填写当前已发布版本。`size` 是正文的字节数，`sha256` 是 64 位十六进制摘要。路径使用池内绝对路径，根目录和已有的导入目录可承载新文件。
+
+```json
+{
+  "operation": "eb81c5b8-2417-48d8-bb03-3cc0534648e2",
+  "path": "/report.txt",
+  "previous": null,
+  "size": 5,
+  "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+}
+```
+
+```sh
+ltfsctl -e NODE:7411 pool replicated archive POOL_UUID --request archive.json --source report.txt
+ltfsctl -e NODE:7411 pool replicated archive-status POOL_UUID OPERATION_UUID
+ltfsctl -e NODE:7411 pool replicated stat POOL_UUID /report.txt
+ltfsctl -e NODE:7411 pool replicated get POOL_UUID /report.txt saved.txt
+ltfsctl -e NODE:7411 pool replicated get POOL_UUID /report.txt from-member.txt --member MEMBER_UUID
+ltfsctl -e NODE:7411 pool replicated archive-cancel POOL_UUID OPERATION_UUID
+```
+
+`committed` 确认每个成员已持久提交完整版本。覆盖期间旧版本持续可读。如某个成员或其正文暂存不可用，请保留请求 JSON 和原正文，用同一请求恢复。任一成员已有可读提交时，可省略 `--source`，从该成员读回并校验正文后继续其余成员。取消会等待结果未定的设备写入结清，保留已确认的成员回执。已发布版本使用相同版本的健康副本读回。下载校验正文长度和 SHA-256 后才发布本地文件。原归档文件的底层路径按操作隔离，覆盖前和已取消的条目继续占用底层卷空间。
+
+HTTP 使用 `POST /v1/fdb/replicated-pools/{id}/archives` 受理 JSON。每个底层池通过 `PUT /v1/fdb/replicated-pools/{id}/archives/{operation}/members/{member}` 上传完整正文和明确的 `Content-Length`。查询 `GET /v1/fdb/replicated-pools/{id}/archives/{operation}` 可恢复原成员和父提交回执。对同一路径发 `DELETE` 请求取消。已确认成员的恢复正文用 `GET` 请求相应的成员上传地址。
+
+读文件使用 `GET /v1/fdb/replicated-pools/{id}/file?path=BASE64URL`。可传 `version` 固定发布版本，传 `member` 固定验收成员。`GET /v1/fdb/replicated-pools/{id}/stat?path=BASE64URL` 返回 `file_version`、长度、摘要和副本数。`path` 使用 UTF-8 字节的无填充 Base64URL。Rust SDK 在 `FdbClient` 暴露同样的归档、查询、取消和下载操作。

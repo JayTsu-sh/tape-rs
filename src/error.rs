@@ -73,6 +73,9 @@ pub enum TapeError {
     #[error("Refused: {reason}")]
     Refused { reason: String },
 
+    #[error("磁带副本正文校验失败: {0}")]
+    ReadIntegrity(&'static str),
+
     #[error("Invalid response: expected {expected} bytes, got {actual}")]
     InvalidResponse { expected: usize, actual: usize },
 

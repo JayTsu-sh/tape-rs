@@ -541,7 +541,7 @@ impl Copy<'_> {
             let Some(crate::managed_catalog::ResolvedPath::File { copy: logical, .. }) = self
                 .control
                 .catalog
-                .resolve_active_path_for_route(&self.control.serial, &full, self.control.route)
+                .resolve_reclaim_file(self.parent, owner.round, &full)
                 .await
                 .map_err(parent_error)?
             else {

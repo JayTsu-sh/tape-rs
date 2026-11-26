@@ -282,10 +282,28 @@ async fn require_metadata_copy_idle_at(tr: &Transaction, ns: Uuid, pool: Uuid) -
 
 /// Preserve all unrelated pool/device interlocks while allowing this exact
 /// parent's own fixed layout. This never grants a new write or erase attempt.
+async fn require_reclaim_file_path(
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    owner: u64,
+    components: &[&[u8]],
+) -> Result<()> {
+    if components.first().copied() != Some(reservation.spec().pool().to_string().as_bytes()) {
+        return Err(CatalogError::Invalid("回收文件路径与原池不同"));
+    }
+    routing::require_runtime_active_owner(tr, reservation.serial(), reservation.route, owner)
+        .await?;
+    let state = record_at(tr, reservation, owner).await?;
+    if !matches!(state["phase"].as_str(), Some("reserved" | "copying")) {
+        return Err(CatalogError::Invalid("原回收任务不可继续访问文件"));
+    }
+    require_parent_pool_at(tr, reservation).await
+}
+
 async fn require_parent_pool_at(tr: &Transaction, reservation: &ReclaimReservation) -> Result<()> {
     let ns = reservation.namespace();
     let pool = reservation.spec().pool();
-    replicated_pools::require_independent_at(tr, ns, pool).await?;
+    replicated_pools::require_reclaim_at(tr, ns, pool, reservation.spec().unassign()).await?;
     native_media::require_pool_readable(tr, ns, pool).await?;
     if node_tasks::held_task_at(tr, ns, pool).await?.is_some() {
         return Err(CatalogError::PoolBusy);
@@ -308,7 +326,11 @@ async fn require_parent_pool_at(tr: &Transaction, reservation: &ReclaimReservati
     Ok(())
 }
 
-pub(super) async fn require_pool_write_at(tr: &Transaction, ns: Uuid, pool: Uuid) -> Result<()> {
+pub(in crate::managed_catalog) async fn require_pool_write_at(
+    tr: &Transaction,
+    ns: Uuid,
+    pool: Uuid,
+) -> Result<()> {
     if pool_gate_at(tr, ns, pool).await?.is_some() {
         return Err(CatalogError::PoolBusy);
     }
@@ -521,7 +543,9 @@ async fn reserve_at_version(
     if epoch != window.accepting {
         return Err(CatalogError::Invalid("回收管理请求代次已关闭"));
     }
-    require_pool_writable_at(tr, ns, spec.pool).await?;
+    replicated_pools::require_reclaim_at(tr, ns, spec.pool, spec.unassign()).await?;
+    require_pool_mutation_barriers_at(tr, ns, spec.pool).await?;
+    require_pool_write_at(tr, ns, spec.pool).await?;
     management::exclusion::require_available_at(tr, ns, serial).await?;
     let claim = management::exclusion::LibraryTaskClaim::for_reclaim(&reservation.token())?;
     if requests::has_namespace_holds(tr, ns).await?
@@ -578,6 +602,42 @@ impl ManagedCatalog {
                 })
             })
             .await?
+    }
+
+    pub(crate) async fn resolve_reclaim_file(
+        &self,
+        reservation: &ReclaimReservation,
+        owner: u64,
+        full_path: &[u8],
+    ) -> Result<Option<ResolvedPath>> {
+        let tr = self.db.create_trx()?;
+        let components = lookup::path_components(full_path)?;
+        require_reclaim_file_path(&tr, reservation, owner, &components).await?;
+        lookup::resolve_active_path_at(&tr, reservation.namespace(), components).await
+    }
+
+    pub(crate) async fn resolve_reclaim_file_source(
+        &self,
+        reservation: &ReclaimReservation,
+        owner: u64,
+        full_path: &[u8],
+    ) -> Result<Option<ActiveReadSource>> {
+        let tr = self.db.create_trx()?;
+        let components = lookup::path_components(full_path)?;
+        require_reclaim_file_path(&tr, reservation, owner, &components).await?;
+        let Some(resolved) =
+            lookup::resolve_active_path_at(&tr, reservation.namespace(), components).await?
+        else {
+            return Ok(None);
+        };
+        if !matches!(&resolved, ResolvedPath::File { placement, .. }
+            if placement.pool_id == reservation.spec().pool())
+        {
+            return Err(CatalogError::Invalid("回收文件不属于原底层池"));
+        }
+        lookup::read_source_at(&tr, reservation.serial(), full_path, resolved)
+            .await
+            .map(Some)
     }
 
     pub async fn reserved_reclaim_status(

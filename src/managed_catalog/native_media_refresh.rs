@@ -1155,3 +1155,45 @@ pub(super) async fn rollback(
     .await?;
     Ok(true)
 }
+
+pub(super) async fn replica_origin_at(
+    tr: &Transaction,
+    ns: Uuid,
+    volume: Uuid,
+    scan: Option<Uuid>,
+    uid: u64,
+    source: &str,
+) -> Result<String> {
+    if let Some(scan) = scan {
+        let mut key = origin_prefix(ns, volume, scan);
+        key.extend_from_slice(&uid.to_be_bytes());
+        if let Some(raw) = tr.get(&key, false).await? {
+            let origin: Origin = parse(&raw)?;
+            if origin.version == 1 && origin.source_path == source {
+                return Ok(origin.target);
+            }
+        }
+    }
+    // #49 recorded the body UID. EE aliases need the logical origin. Its
+    // original mapping also remains when a reclaimed volume is retired.
+    let mut prefix = base_key(ns, volume);
+    prefix.push(b'o');
+    let mut after = None;
+    let mut found = None;
+    loop {
+        let page = read_page(tr, &prefix, after.as_deref(), 256, false).await?;
+        for (_, raw) in page.items {
+            let origin: Origin = parse(&raw)?;
+            if origin.version == 1 && origin.source_path == source {
+                if found.as_ref().is_some_and(|prior| prior != &origin.target) {
+                    return Err(bad());
+                }
+                found = Some(origin.target);
+            }
+        }
+        let Some(next) = page.next else {
+            return found.ok_or(CatalogError::MediaUnavailable);
+        };
+        after = Some(next);
+    }
+}

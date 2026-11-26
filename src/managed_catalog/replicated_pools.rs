@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
+#[path = "replicated_archive.rs"]
+pub(in crate::managed_catalog) mod archive;
 #[path = "replicated_pool_files.rs"]
 pub(super) mod files;
 
@@ -130,6 +132,23 @@ pub(in crate::managed_catalog::control) async fn require_independent_at(
         return Err(CatalogError::Invalid(
             "多副本池底层池不能独立变更或访问文件",
         ));
+    }
+    Ok(())
+}
+
+pub(in crate::managed_catalog) async fn require_reclaim_at(
+    tr: &Transaction,
+    ns: Uuid,
+    pool: Uuid,
+    unassign: bool,
+) -> Result<()> {
+    if let Some(id) = parent_at(tr, ns, pool).await? {
+        let parent = read_at(tr, id).await?.ok_or(CatalogError::Incomplete)?;
+        if !parent.published || unassign {
+            return Err(CatalogError::Invalid(
+                "多副本池只允许已发布成员在本池内回收",
+            ));
+        }
     }
     Ok(())
 }
@@ -273,6 +292,11 @@ async fn view_at(tr: &Transaction, creation: &Creation, current_scope: bool) -> 
 }
 
 impl ManagedCatalog {
+    pub(crate) async fn require_independent_file_pool(&self, ns: Uuid, pool: Uuid) -> Result<()> {
+        let tr = self.db.create_trx()?;
+        require_independent_at(&tr, ns, pool).await
+    }
+
     pub(crate) async fn admit_replicated_pool(
         &self,
         input: &CreateReplicatedPool,

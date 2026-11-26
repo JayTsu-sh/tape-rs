@@ -838,9 +838,6 @@ impl ManagedCatalog {
                             if tr.get(&requests::intent_key(&stub), false).await?.is_some() {
                                 return Ok(PublishOutcome::OperationConflict);
                             }
-                            if intent.request_epoch != w.accepting && sealed_reclaim.is_none() {
-                                return Ok(PublishOutcome::RequestEpochClosed);
-                            }
                             if !active_batch::target_matches_baseline(&tr, &stub).await? {
                                 return Ok(PublishOutcome::VersionConflict);
                             }
@@ -861,7 +858,22 @@ impl ManagedCatalog {
                                     return Ok(PublishOutcome::BatchClaimed);
                                 }
                             }
-                            let permit = match sealed_reclaim {
+                            let archive_permit = if sealed_reclaim.is_none() {
+                                control::replicated_pools::archive::take_permit(
+                                    &tr,
+                                    &intent.request(),
+                                )
+                                .await?
+                            } else {
+                                None
+                            };
+                            if intent.request_epoch != w.accepting
+                                && sealed_reclaim.is_none()
+                                && archive_permit.is_none()
+                            {
+                                return Ok(PublishOutcome::RequestEpochClosed);
+                            }
+                            let permit = match sealed_reclaim.or(archive_permit) {
                                 Some(permit) => permit,
                                 None => {
                                     let Some(permit) = maintenance::reserve_identity(

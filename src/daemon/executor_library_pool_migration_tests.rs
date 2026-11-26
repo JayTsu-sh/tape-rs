@@ -18,6 +18,7 @@ struct OwnerFixture {
     status: SharedStatus,
     permit: Arc<Permission>,
     server: tokio::task::JoinHandle<()>,
+    http: Arc<HttpContext>,
     worker: std::thread::JoinHandle<()>,
 }
 
@@ -26,7 +27,7 @@ impl OwnerFixture {
         let grant = |phase| {
             assert!(
                 self.permit
-                    .renew(round, phase, Instant::now() + Duration::from_secs(60))
+                    .renew(round, phase, Instant::now() + Duration::from_secs(180))
             );
         };
         grant(Phase::Fencing);
@@ -113,7 +114,7 @@ fn start_owner(
     let router = fdb_http::writer_router(
         catalog.clone(),
         [(serial.to_owned(), route)].into(),
-        [(serial.to_owned(), context)].into(),
+        [(serial.to_owned(), context.clone())].into(),
         Default::default(),
         Default::default(),
     )
@@ -135,6 +136,7 @@ fn start_owner(
         status,
         permit,
         server,
+        http: context,
         worker,
     }
 }
@@ -151,6 +153,10 @@ fn run_management(
         .save_new(request)
         .unwrap();
     client.submit_management(request).unwrap();
+    wait_management(client, request)
+}
+
+fn wait_management(client: &FdbClient, request: &Path) -> Value {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let task = client.management_request_status(request, false).unwrap();
@@ -1200,8 +1206,349 @@ fn replicated_pool_resumes_after_owner_change_and_conflict_with_body_proof() {
             std::thread::sleep(Duration::from_millis(25));
         }
     }
+    verify_replica_archive(
+        &rt,
+        &catalog,
+        &root,
+        &request,
+        [&owner_a, &owner_b],
+        [route_a, route_b],
+        (&a, logical, slot),
+    );
+
     owner_a.stop();
     owner_b.stop();
     http.abort();
     std::fs::remove_dir_all(root).unwrap();
+}
+
+fn verify_replica_archive(
+    rt: &tokio::runtime::Runtime,
+    catalog: &Arc<ManagedCatalog>,
+    root: &Path,
+    pool: &crate::replicated_pool::CreateReplicatedPool,
+    owners: [&OwnerFixture; 2],
+    routes: [ActiveLibraryRoute; 2],
+    (sim, logical, other_slot): (&SimLibrary, Uuid, u16),
+) {
+    use crate::replicated_pool::ReplicatedArchive;
+    let drop_reply = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let drop_next = drop_reply.clone();
+    let router = fdb_http::writer_router(
+        catalog.clone(),
+        pool.members
+            .iter()
+            .zip(routes)
+            .map(|(member, route)| (member.library_serial.clone(), route))
+            .collect(),
+        pool.members
+            .iter()
+            .zip(owners)
+            .map(|(member, owner)| (member.library_serial.clone(), owner.http.clone()))
+            .collect(),
+        Default::default(),
+        Default::default(),
+    )
+    .unwrap()
+    .layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let drop_reply = drop_next.clone();
+            async move {
+                use axum::response::IntoResponse;
+                let inject = request.method() == axum::http::Method::PUT
+                    && request.uri().path().contains("/archives/");
+                let response = next.run(request).await;
+                if inject
+                    && response.status().is_success()
+                    && drop_reply.swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return axum::http::StatusCode::GATEWAY_TIMEOUT.into_response();
+                }
+                response
+            }
+        },
+    ));
+    let listener = rt
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let client = FdbClient::new([listener.local_addr().unwrap().to_string()])
+        .unwrap()
+        .with_timeouts(Duration::ZERO, Duration::from_secs(25));
+    let server = rt.spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let parent = pool.id;
+    let a = pool.members[0].pool_id;
+    let b = pool.members[1].pool_id;
+    let download = |path: &str, member, expected: &[u8]| {
+        let out = root.join(Uuid::new_v4().to_string());
+        assert_eq!(
+            client
+                .download_replicated_new(parent, path, member, &out)
+                .unwrap(),
+            expected.len() as u64
+        );
+        assert_eq!(std::fs::read(&out).unwrap(), expected);
+        std::fs::remove_file(out).unwrap();
+    };
+    download("/collision", Some(b), b"B-side");
+    let path = "/zz-archive";
+    let input = |body: &[u8], previous| ReplicatedArchive {
+        operation: Uuid::new_v4(),
+        path: path.into(),
+        previous,
+        size: body.len() as u64,
+        sha256: Sha256::digest(body).into(),
+    };
+    let first = input(b"version one", None);
+    let body = root.join("archive-body");
+    std::fs::write(&body, b"version one").unwrap();
+    assert_eq!(
+        client.admit_replicated_archive(parent, &first).unwrap()["status"],
+        "waiting"
+    );
+    assert!(client.replicated_file_stat(parent, path).unwrap().is_none());
+    assert!(matches!(
+        client.archive_replicated(parent, &first, None),
+        Err(ClientError::Indeterminate(_))
+    ));
+    assert!(
+        client
+            .admit_replicated_archive(parent, &input(b"collides", None))
+            .is_err()
+    );
+    std::fs::write(&body, b"wrong bytes").unwrap();
+    assert!(matches!(
+        client.upload_replicated_member(parent, &first, a, &std::fs::File::open(&body).unwrap()),
+        Err(ClientError::Rejected { status: 422, .. })
+    ));
+    std::fs::write(&body, b"version one").unwrap();
+    drop_reply.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        client
+            .upload_replicated_member(parent, &first, a, &std::fs::File::open(&body).unwrap())
+            .unwrap()["status"],
+        "waiting"
+    );
+    assert!(client.replicated_file_stat(parent, path).unwrap().is_none());
+    std::fs::remove_file(&body).unwrap();
+    drop_reply.store(true, std::sync::atomic::Ordering::SeqCst);
+    let committed = client.archive_replicated(parent, &first, None).unwrap();
+    assert!(!drop_reply.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(committed["status"], "committed");
+    assert_eq!(committed["file_version"], 1);
+    assert_eq!(
+        committed,
+        client.admit_replicated_archive(parent, &first).unwrap()
+    );
+    assert_eq!(
+        committed,
+        client
+            .replicated_archive_status(parent, first.operation)
+            .unwrap()
+    );
+    for member in [a, b] {
+        download(path, Some(member), b"version one");
+    }
+
+    let next = input(b"replacement", Some(1));
+    std::fs::write(&body, b"replacement").unwrap();
+    client.admit_replicated_archive(parent, &next).unwrap();
+    owners[0].status.lock().unwrap().executor_ready = false;
+    download(path, None, b"version one");
+    let partial = client
+        .upload_replicated_member(parent, &next, b, &std::fs::File::open(&body).unwrap())
+        .unwrap();
+    assert_eq!(partial["status"], "waiting");
+    assert!(partial["members"][0]["commit"].is_null());
+    assert_eq!(
+        client.replicated_file_stat(parent, path).unwrap().unwrap()["file_version"],
+        1
+    );
+    download(path, None, b"version one");
+    owners[0].status.lock().unwrap().executor_ready = true;
+    assert_eq!(
+        client.archive_replicated(parent, &next, None).unwrap()["file_version"],
+        2
+    );
+    for member in [a, b] {
+        download(path, Some(member), b"replacement");
+    }
+
+    let archived = client
+        .replicated_archive_status(parent, next.operation)
+        .unwrap();
+    let tape = archived["members"][0]["commit"]["barcode"]
+        .as_str()
+        .unwrap();
+    use crate::scsi::sim::LogicalObject;
+    let change_copy = |from: &[u8], to: &[u8]| {
+        let mut changed = 0;
+        assert!(sim.with_cartridge_mut(tape, |cartridge| {
+            for record in cartridge
+                .partitions
+                .iter_mut()
+                .flat_map(|part| &mut part.objects)
+            {
+                if let LogicalObject::Record(bytes) = record
+                    && bytes.starts_with(from)
+                {
+                    bytes[..from.len()].copy_from_slice(to);
+                    changed += 1;
+                }
+            }
+        }));
+        assert_eq!(changed, 1);
+    };
+    change_copy(b"replacement", b"bad payload");
+    let corrupt = root.join("archive-corrupt-copy");
+    assert!(
+        client
+            .download_replicated_new(parent, path, Some(a), &corrupt)
+            .is_err()
+    );
+    assert!(!corrupt.exists());
+    download(path, None, b"replacement");
+    change_copy(b"bad payload", b"replacement");
+    let serial = &pool.members[0].library_serial;
+    let manager = &owners[0].client;
+    let movement = |destination: &str, name: &str| {
+        let row = manager.tape_inventory_entry(serial, None, tape).unwrap();
+        let assignment = &row["tape"]["assignment"];
+        let saved = root.join(name);
+        manager.prepare_control(serial, pool.members[0].namespace, json!({
+            "kind":"media-move","pool":a,"barcode":tape,"volume":assignment["volume"],
+            "revision":assignment["revision"],"destination":destination,"logical_library":logical,
+        })).unwrap().save_new(&saved).unwrap();
+        manager.submit_management(&saved).unwrap();
+        wait_management(manager, &saved)
+    };
+    let exported = movement("ieslot", "replica-to-ie.json");
+    let home = exported["result"]["home_address"].as_u64().unwrap() as u16;
+    assert_ne!(exported["result"]["to"], json!(home));
+    download(path, None, b"replacement");
+    assert_eq!(
+        movement("homeslot", "replica-ie-home.json")["result"]["to"],
+        json!(home)
+    );
+    download(path, Some(a), b"replacement");
+    movement("homeslot", "replica-after-cold-home.json");
+
+    let next_round = std::cell::Cell::new(routes[0].initial_owner_epoch + 2);
+    // External moves are observed while reacquiring the library from the
+    // original release receipt, which also fences every device first.
+    let external_move = |source, target| {
+        let ns = pool.members[0].namespace;
+        let release = Uuid::new_v4();
+        let (_, round) = rt
+            .block_on(catalog.active_library_owner(serial))
+            .unwrap()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (reply, received) = mpsc::channel();
+            owners[0]
+                .send
+                .send(ExecRequest::LibraryHandoff {
+                    round,
+                    operation: release,
+                    deadline,
+                    reply,
+                })
+                .unwrap();
+            match received.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Ok(result)
+                    if result.phase == crate::managed_catalog::LibraryHandoffPhase::Releasing =>
+                {
+                    break;
+                }
+                Err(ReadError::Busy(_)) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100))
+                }
+                result => panic!("交还原模拟设备失败，操作 {release}: {result:?}"),
+            }
+        }
+        wait_phase(manager, serial, ns, release, "released");
+        let transport = sim.changer();
+        let mut changer = MediumChanger::new(&transport);
+        changer.load_address_map().unwrap();
+        changer.move_medium(source, target).unwrap();
+        let acquire = Uuid::new_v4();
+        manager
+            .acquire_library(serial, ns, acquire, release)
+            .unwrap();
+        let round = next_round.get();
+        owners[0].take_over(round);
+        owners[0]
+            .status
+            .lock()
+            .unwrap()
+            .executor
+            .as_mut()
+            .unwrap()
+            .round = round;
+        wait_phase(manager, serial, ns, acquire, "online");
+        next_round.set(round + 1);
+    };
+    external_move(home, other_slot);
+    let fault = manager
+        .logical_library(serial, pool.members[0].namespace, &logical.to_string())
+        .unwrap();
+    assert!(fault.to_string().contains(tape), "{fault}");
+    let blocked_input = input(b"replacement", Some(2));
+    client
+        .admit_replicated_archive(parent, &blocked_input)
+        .unwrap();
+    let write_result = client.upload_replicated_member(
+        parent,
+        &blocked_input,
+        a,
+        &std::fs::File::open(&body).unwrap(),
+    );
+    assert!(
+        matches!(&write_result,
+        Err(ClientError::Indeterminate(message)) if message.contains(tape)),
+        "{write_result:?}"
+    );
+    download(path, None, b"replacement");
+    assert_eq!(
+        client
+            .upload_replicated_member(
+                parent,
+                &blocked_input,
+                b,
+                &std::fs::File::open(&body).unwrap()
+            )
+            .unwrap()["status"],
+        "waiting"
+    );
+    external_move(other_slot, home);
+    let resumed = client
+        .archive_replicated(parent, &blocked_input, None)
+        .unwrap();
+    assert_eq!(resumed["status"], "committed");
+    assert_eq!(resumed["file_version"], 3);
+    download(path, Some(a), b"replacement");
+
+    let aborted = input(b"replacement", Some(3));
+    client.admit_replicated_archive(parent, &aborted).unwrap();
+    client
+        .upload_replicated_member(parent, &aborted, a, &std::fs::File::open(&body).unwrap())
+        .unwrap();
+    let cancelled = client
+        .cancel_replicated_archive(parent, aborted.operation)
+        .unwrap();
+    assert_eq!(cancelled["status"], "cancelled");
+    assert!(!cancelled["members"][0]["commit"].is_null());
+    assert_eq!(
+        client.replicated_file_stat(parent, path).unwrap().unwrap()["file_version"],
+        3
+    );
+    let reuse = input(b"replacement", Some(3));
+    client.admit_replicated_archive(parent, &reuse).unwrap();
+    assert_eq!(
+        client
+            .cancel_replicated_archive(parent, reuse.operation)
+            .unwrap()["status"],
+        "cancelled"
+    );
+    server.abort();
 }

@@ -40,7 +40,10 @@ pub use native_device::NativeDeviceTask;
 #[path = "active_pools.rs"]
 mod active_pools;
 #[path = "replicated_pools.rs"]
-mod replicated_pools;
+pub(super) mod replicated_pools;
+pub(crate) use replicated_pools::archive::ReplicaUpload;
+pub(crate) use replicated_pools::files::ReplicaFile;
+pub use replicated_pools::files::ReplicaRead;
 #[path = "scoped_pools.rs"]
 mod scoped_pools;
 #[path = "selected_pool.rs"]
@@ -113,7 +116,9 @@ pub use node_tasks::{
     NodeMutationTask, NodeMutationTaskKind, NodeMutationTaskOutcome, NodeMutationTaskState,
     NodeMutationTaskStatus,
 };
-pub(super) use node_tasks::{node_hold_prefix, require_pool_writable_at};
+pub(super) use node_tasks::{
+    node_hold_prefix, require_pool_mutation_barriers_at, require_pool_writable_at,
+};
 #[path = "node_attempts.rs"]
 pub(super) mod node_attempts;
 #[path = "node_claims.rs"]

@@ -56,12 +56,7 @@ async fn select_group(
                 let selected = context
                     .control
                     .catalog
-                    .resolve_active_read_source_for_owner(
-                        &context.control.serial,
-                        &full,
-                        context.control.route,
-                        owner.round,
-                    )
+                    .resolve_reclaim_file_source(context.parent, owner.round, &full)
                     .await
                     .map_err(parent_error)?
                     .ok_or_else(|| lost("原组候选源文件已丢失"))?;

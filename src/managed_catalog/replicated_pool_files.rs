@@ -20,7 +20,7 @@ pub(in crate::managed_catalog::control) struct Content {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(in crate::managed_catalog::control) struct Source {
+pub(in crate::managed_catalog) struct Source {
     pub library_serial: String,
     pub namespace: Uuid,
     pub pool_id: Uuid,
@@ -37,7 +37,7 @@ pub(in crate::managed_catalog::control) struct Source {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Head {
+struct ImportedHead {
     source: Source,
     resolution_revision: u64,
 }
@@ -119,7 +119,7 @@ pub(in crate::managed_catalog::control) async fn record_at(
     let original_version = tr.get(&version_key, false).await?;
     let head_key = path_key(id, b'h', path);
     if let Some(raw) = tr.get(&head_key, false).await? {
-        let head: Head = decode(&raw)?;
+        let head: ImportedHead = decode(&raw)?;
         if head.source.content != source.content && original_version.is_none() {
             let conflict_key = path_key(id, b'c', path);
             match tr.get(&conflict_key, false).await? {
@@ -153,7 +153,7 @@ pub(in crate::managed_catalog::control) async fn record_at(
     } else {
         tr.set(
             &head_key,
-            &encode(&Head {
+            &encode(&ImportedHead {
                 source: source.clone(),
                 resolution_revision: 0,
             })?,
@@ -203,7 +203,7 @@ fn source_view(source: &Source) -> Value {
     })
 }
 
-fn hex(digest: &[u8; 32]) -> String {
+pub(super) fn hex(digest: &[u8; 32]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -227,7 +227,7 @@ pub(super) async fn resolve_at(
         .get(&key, false)
         .await?
         .ok_or(CatalogError::Invalid("导入路径不存在"))?;
-    let head: Head = decode(&raw)?;
+    let head: ImportedHead = decode(&raw)?;
     let conflict = path_key(id, b'c', path);
     let raw = tr
         .get(&conflict, false)
@@ -262,7 +262,7 @@ pub(super) async fn resolve_at(
     }
     tr.set(
         &key,
-        &encode(&Head {
+        &encode(&ImportedHead {
             source,
             resolution_revision: choice.revision,
         })?,
@@ -291,6 +291,13 @@ pub(super) async fn page(
     for (key, raw) in page.items {
         let path = path_suffix(&prefix, &key)?;
         let head: Head = decode(&raw)?;
+        let head = match head {
+            Head::Archived { archive } => {
+                items.push(archive_info(path, &archive));
+                continue;
+            }
+            Head::Imported(head) => head,
+        };
         let version = tr
             .get(&version_key(id, path, &head.source.content), false)
             .await?
@@ -302,7 +309,7 @@ pub(super) async fn page(
             return Err(CatalogError::Corrupt("导入路径的版本与来源不符"));
         }
         items.push(json!({
-            "path":path,"kind":version.content.kind,"size":version.content.length,
+            "path":path,"kind":version.content.kind,"size":version.content.length,"file_version":1,
             "sha256":hex(&version.content.sha256),"replica_count":version.pool_ids.len(),
             "pool_ids":version.pool_ids,
         }));
@@ -311,4 +318,258 @@ pub(super) async fn page(
         "version":1,"id":id,"items":items,
         "next":page.next.as_deref().map(|next| path_suffix(&prefix, next)).transpose()?,
     }))
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum Head {
+    Imported(ImportedHead),
+    Archived { archive: archive::Published },
+}
+
+async fn head(tr: &Transaction, id: Uuid, path: &str) -> Result<Option<Head>> {
+    tr.get(&path_key(id, b'h', path), false)
+        .await?
+        .map(|raw| decode(&raw))
+        .transpose()
+}
+
+pub(super) async fn require_write_path(
+    tr: &Transaction,
+    id: Uuid,
+    path: &str,
+    previous: Option<u64>,
+) -> Result<()> {
+    let current = match head(tr, id, path).await? {
+        None => None,
+        Some(Head::Imported(record)) if record.source.content.kind == Kind::File => Some(1),
+        Some(Head::Archived { archive }) => Some(archive.version),
+        _ => return Err(CatalogError::Invalid("多副本归档目标不是普通文件")),
+    };
+    if current != previous {
+        return Err(CatalogError::Invalid("多副本池路径已存在或版本不匹配"));
+    }
+    // Parents are imported directories or the implicit pool root.
+    let (parent, _) = path
+        .rsplit_once('/')
+        .ok_or(CatalogError::Invalid("归档路径无效"))?;
+    if !parent.is_empty()
+        && !matches!(head(tr, id, parent).await?, Some(Head::Imported(record))
+            if record.source.content.kind == Kind::Directory)
+    {
+        return Err(CatalogError::Invalid("多副本归档父目录不存在"));
+    }
+    Ok(())
+}
+
+pub(super) async fn publish_archive(
+    tr: &Transaction,
+    id: Uuid,
+    input: &crate::replicated_pool::ReplicatedArchive,
+    archive: archive::Published,
+) -> Result<()> {
+    require_write_path(tr, id, &input.path, input.previous).await?;
+    tr.set(
+        &path_key(id, b'h', &input.path),
+        &encode(&Head::Archived { archive })?,
+    );
+    Ok(())
+}
+
+fn archive_info(path: &str, archive: &archive::Published) -> Value {
+    json!({"path":path,"kind":"file","file_version":archive.version,"size":archive.size,
+        "sha256":hex(&archive.sha256),"replica_count":archive.members.len(),
+        "pool_ids":archive.members.iter().map(|member| member.pool_id).collect::<Vec<_>>()})
+}
+
+#[derive(Clone, Debug)]
+pub struct ReplicaRead {
+    pub(crate) serial: String,
+    pub(crate) pool: Uuid,
+    ns: Uuid,
+    owner_path: String,
+    candidate: ReplicaCopy,
+    pub(crate) size: u64,
+    pub(crate) digest: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+enum ReplicaCopy {
+    Imported(Box<Source>),
+    Archived(archive::CommittedMember),
+}
+
+pub(crate) struct ReplicaFile {
+    pub info: Value,
+    pub copies: Vec<ReplicaRead>,
+}
+
+fn archived_file(
+    creation: &Creation,
+    path: &str,
+    archive: archive::Published,
+) -> Result<ReplicaFile> {
+    let info = archive_info(path, &archive);
+    let mut copies = Vec::with_capacity(archive.members.len());
+    for copy in archive.members {
+        let member = super::archive::member_in(creation, copy.pool_id)?;
+        copies.push(ReplicaRead {
+            serial: member.library_serial.clone(),
+            pool: member.pool_id,
+            ns: member.namespace,
+            owner_path: super::archive::member_path(creation.input.id, archive.operation),
+            candidate: ReplicaCopy::Archived(copy),
+            size: archive.size,
+            digest: archive.sha256,
+        });
+    }
+    Ok(ReplicaFile { info, copies })
+}
+
+impl ManagedCatalog {
+    pub(crate) async fn replica_file(
+        &self,
+        parent: Uuid,
+        path: &str,
+        routes: &BTreeMap<String, ActiveLibraryRoute>,
+    ) -> Result<Option<ReplicaFile>> {
+        pool_catalog_path(parent, path.as_bytes())?;
+        let tr = self.db.create_trx()?;
+        let creation = archive::require_published(&tr, parent, routes).await?;
+        let Some(head) = head(&tr, parent, path).await? else {
+            return Ok(None);
+        };
+        let head = match head {
+            Head::Archived { archive } => return archived_file(&creation, path, archive).map(Some),
+            Head::Imported(head) => head,
+        };
+        let content = &head.source.content;
+        let mut prefix = keyed_source(parent, path, Uuid::nil());
+        prefix.truncate(prefix.len() - 16);
+        let page = read_page(&tr, &prefix, None, super::MAX_TAPES, false).await?;
+        let mut copies = Vec::new();
+        let mut pools = BTreeSet::new();
+        if page.next.is_some() {
+            return Err(CatalogError::Corrupt("导入副本集合超过原磁带清单上限"));
+        }
+        for (_, raw) in page.items {
+            let (saved_path, source): (String, Source) = decode(&raw)?;
+            if saved_path != path {
+                return Err(CatalogError::Corrupt("导入副本来源路径不一致"));
+            }
+            if source.content == *content {
+                pools.insert(source.pool_id);
+                if content.kind == Kind::File {
+                    copies.push(ReplicaRead {
+                        serial: source.library_serial.clone(),
+                        pool: source.pool_id,
+                        ns: source.namespace,
+                        owner_path: path.to_owned(),
+                        candidate: ReplicaCopy::Imported(Box::new(source)),
+                        size: content.length,
+                        digest: content.sha256,
+                    });
+                }
+            }
+        }
+        Ok(Some(ReplicaFile {
+            info: json!({"path":path,"kind":content.kind,"file_version":1,"size":content.length,
+                "sha256":hex(&content.sha256),"replica_count":pools.len(),"pool_ids":pools}),
+            copies,
+        }))
+    }
+
+    pub(crate) async fn replica_recovery_file(
+        &self,
+        parent: Uuid,
+        operation: Uuid,
+        routes: &BTreeMap<String, ActiveLibraryRoute>,
+    ) -> Result<Option<ReplicaFile>> {
+        let tr = self.db.create_trx()?;
+        let creation = archive::require_published(&tr, parent, routes).await?;
+        archive::recovery_version(&tr, parent, operation)
+            .await?
+            .map(|archive| archived_file(&creation, "/", archive))
+            .transpose()
+    }
+
+    pub(crate) async fn resolve_replica_read(
+        &self,
+        selection: &ReplicaRead,
+        route: ActiveLibraryRoute,
+        owner: u64,
+    ) -> Result<ActiveReadSource> {
+        let tr = self.db.create_trx()?;
+        let ns =
+            routing::require_runtime_active_owner(&tr, &selection.serial, route, owner).await?;
+        if ns != selection.ns || parent_at(&tr, ns, selection.pool).await?.is_none() {
+            return Err(CatalogError::OwnerFenced);
+        }
+        logical_libraries::require_pool_inventory_ready_at(
+            &tr,
+            ns,
+            &selection.serial,
+            selection.pool,
+        )
+        .await?;
+        native_media::require_pool_readable(&tr, ns, selection.pool).await?;
+        let projected = match &selection.candidate {
+            ReplicaCopy::Archived(_) => selection.owner_path.clone(),
+            ReplicaCopy::Imported(source) => {
+                native_media::replica_origin_target_at(&tr, source, &selection.owner_path).await?
+            }
+        };
+        let path = pool_catalog_path(selection.pool, projected.as_bytes())?;
+        let resolved = lookup::resolve_active_path_at(&tr, ns, lookup::path_components(&path)?)
+            .await?
+            .ok_or(CatalogError::MediaUnavailable)?;
+        let ResolvedPath::File {
+            id,
+            head,
+            copy,
+            placement,
+            ..
+        } = &resolved
+        else {
+            return Err(CatalogError::MediaUnavailable);
+        };
+        if placement.pool_id != selection.pool || copy.size != selection.size {
+            return Err(CatalogError::Corrupt("读取副本的归属或长度失配"));
+        }
+        let digest_matches = copy.content_digest == ContentDigest::Sha256(selection.digest);
+        let is_original = match &selection.candidate {
+            ReplicaCopy::Archived(original) => {
+                *id == original.file_id && head.copy_id == original.copy_id
+            }
+            ReplicaCopy::Imported(original) => {
+                copy.volume_id == original.volume_uuid
+                    && copy.volume_generation == original.generation
+                    && copy.ltfs_file_uid == original.file_uid
+                    && copy.media.as_ref().is_some_and(|media| {
+                        media.physical_path == original.physical_path
+                            && media.version == original.tape_version
+                    })
+            }
+        };
+        let member_inode = match &selection.candidate {
+            ReplicaCopy::Archived(original) => original.file_id,
+            ReplicaCopy::Imported(_) => {
+                import_materialize::import_inode(ns, selection.pool, &projected)
+            }
+        };
+        if *id != member_inode
+            || !is_original && !digest_matches
+            || matches!(selection.candidate, ReplicaCopy::Archived(_)) && !digest_matches
+        {
+            return Err(CatalogError::Corrupt("当前副本与原归档或导入来源不符"));
+        }
+        let source = lookup::read_source_at(&tr, &selection.serial, &path, resolved).await?;
+        if let ReplicaCopy::Imported(original) = &selection.candidate
+            && is_original
+            && source.source.sha256 != original.index_sha256
+        {
+            return Err(CatalogError::Corrupt("导入副本原索引摘要不符"));
+        }
+        Ok(source)
+    }
 }

@@ -459,15 +459,9 @@ fn checked_device<'a>(
                         if !automatic {
                             intake_guard(owner, permit, control, target.intake).await?;
                         }
-                        if let Some((path, source)) = target.read {
-                            if control
-                                .catalog
-                                .resolve_active_read_source_for_owner(
-                                    &control.serial,
-                                    path.as_bytes(),
-                                    control.route,
-                                    owner.round,
-                                )
+                        if let Some((file, source)) = target.read {
+                            if file
+                                .resolve(control, owner.round)
                                 .await
                                 .map_err(lost)?
                                 .as_ref()
@@ -1089,7 +1083,71 @@ pub(super) async fn select(
         Target {
             placement: source.placement(),
             index: source.source,
-            read: Some((path, source)),
+            read: Some((ReadSelection::Path(path), source)),
+            writable: false,
+            intake: None,
+        },
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ReadSelection<'a> {
+    Path(&'a str),
+    Replica(&'a crate::managed_catalog::ReplicaRead),
+}
+
+impl ReadSelection<'_> {
+    pub(super) async fn resolve(
+        self,
+        control: &FdbOwnerControl,
+        round: u64,
+    ) -> crate::managed_catalog::Result<Option<ActiveReadSource>> {
+        match self {
+            Self::Path(path) => {
+                control
+                    .catalog
+                    .resolve_active_read_source_for_owner(
+                        &control.serial,
+                        path.as_bytes(),
+                        control.route,
+                        round,
+                    )
+                    .await
+            }
+            Self::Replica(selection) => {
+                if selection.serial != control.serial {
+                    return Err(crate::managed_catalog::CatalogError::Invalid(
+                        "副本不属于当前库",
+                    ));
+                }
+                control
+                    .catalog
+                    .resolve_replica_read(selection, control.route, round)
+                    .await
+                    .map(Some)
+            }
+        }
+    }
+}
+
+pub(super) async fn select_replica(
+    owner: &mut Active,
+    permit: &Permission,
+    control: &FdbOwnerControl,
+    status: &SharedStatus,
+    selection: &crate::managed_catalog::ReplicaRead,
+    source: &ActiveReadSource,
+) -> std::result::Result<usize, ReadError> {
+    select_target(
+        owner,
+        permit,
+        control,
+        status,
+        Target {
+            placement: source.placement(),
+            index: source.source,
+            read: Some((ReadSelection::Replica(selection), source)),
             writable: false,
             intake: None,
         },
@@ -1125,7 +1183,7 @@ pub(super) async fn select_write(
 struct Target<'a> {
     placement: &'a VolumePlacement,
     index: ActiveIndexIdentity,
-    read: Option<(&'a str, &'a ActiveReadSource)>,
+    read: Option<(ReadSelection<'a>, &'a ActiveReadSource)>,
     writable: bool,
     intake: Option<&'a crate::managed_catalog::NativeMediaImport>,
 }
@@ -1410,15 +1468,9 @@ async fn select_target(
         empty.unwrap_or(victim)
     };
     intake_guard(owner, permit, control, target.intake).await?;
-    if let Some((path, source)) = target.read {
-        if control
-            .catalog
-            .resolve_active_read_source_for_owner(
-                &control.serial,
-                path.as_bytes(),
-                control.route,
-                owner.round,
-            )
+    if let Some((file, source)) = target.read {
+        if file
+            .resolve(control, owner.round)
             .await
             .map_err(lost)?
             .as_ref()

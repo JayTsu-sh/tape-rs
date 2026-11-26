@@ -31,6 +31,8 @@ mod notify;
 
 #[path = "fdb_http_pools.rs"]
 mod pools;
+#[path = "fdb_http_replica_files.rs"]
+mod replica_files;
 #[path = "fdb_http_replicated_pools.rs"]
 mod replicated_pools;
 
@@ -261,6 +263,10 @@ async fn require_file_pool_scope(
     let logical = pools::logical_scope(headers)?;
     let pool = uuid::Uuid::parse_str(pool).expect("content scope validates UUID");
     check_file_pool_scope(ctx, serial, route, pool, logical).await?;
+    ctx.catalog
+        .require_independent_file_pool(route.route.namespace, pool)
+        .await
+        .map_err(|error| Box::new(catalog_error(error)))?;
     Ok(logical)
 }
 
@@ -683,11 +689,13 @@ fn owner_router_inner(
     } else {
         get(content)
     };
-    let router = metadata_router(ctx.clone()).merge(
-        Router::new()
-            .route("/v1/fdb/files/{serial}", files)
-            .with_state(ctx.clone()),
-    );
+    let router = metadata_router(ctx.clone())
+        .merge(replica_files::router(ctx.clone()))
+        .merge(
+            Router::new()
+                .route("/v1/fdb/files/{serial}", files)
+                .with_state(ctx.clone()),
+        );
     if upload_budget.is_some() {
         Ok(router.merge(
             Router::new()

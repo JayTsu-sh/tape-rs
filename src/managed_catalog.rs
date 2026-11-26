@@ -101,6 +101,7 @@ mod staged_import;
 mod staged_sources;
 pub use body_layouts::{PhysicalPlanProvenance, PlanExtents, VerifiedPhysicalPlan};
 pub use cleanup::PurgeProgress;
+pub use control::ReplicaRead;
 pub use control::{
     ActivePoolCreation, AssignExecution, AssignPhase, AssignPlan, AutomaticMediaAction,
     AutomaticMediaCommand, AutomaticMediaPlan, ControlOutcome, ManagementRequest, MoveExecution,
@@ -140,6 +141,7 @@ pub use control::{
     ReclaimSourceRead, ReclaimSpec, ReclaimWalk, TapeAssignment, VolumePlacement,
 };
 pub(crate) use control::{LogicalLibraryChange, LogicalLibraryCreation};
+pub(crate) use control::{ReplicaFile, ReplicaUpload};
 pub use cutover::{
     FrozenSnapshotIdentity, VerifiedNodeExport, inspect_frozen_snapshot, verify_node_export,
 };
@@ -262,7 +264,7 @@ pub fn pool_catalog_path(pool: Uuid, path: &[u8]) -> Result<Vec<u8>> {
 
 /// Preferred checksum carried by the LTFS index. `Unknown` does not prove
 /// that the file's content has been verified.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ContentDigest {
     Unknown,
     Md5([u8; 16]),

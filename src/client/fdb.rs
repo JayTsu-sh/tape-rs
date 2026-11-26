@@ -25,6 +25,7 @@ pub use receipts::CommittedUpload;
 pub use renames::{PreparedRename, RenameCondition, RenameJournal, RenameSpec};
 mod pools;
 mod reading;
+mod replica_files;
 mod replicated_pools;
 mod upload_ack;
 mod upload_intent;

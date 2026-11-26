@@ -390,6 +390,15 @@ pub(in crate::managed_catalog) async fn require_pool_without_reclaim_at(
     pool: Uuid,
 ) -> Result<()> {
     native_media::require_app_pool_readable(tr, namespace, pool).await?;
+    require_pool_mutation_barriers_at(tr, namespace, pool).await
+}
+
+pub(in crate::managed_catalog) async fn require_pool_mutation_barriers_at(
+    tr: &Transaction,
+    namespace: Uuid,
+    pool: Uuid,
+) -> Result<()> {
+    native_media::require_pool_readable(tr, namespace, pool).await?;
     if let Some(raw) = tr.get(&pool_key(namespace, pool), false).await? {
         let record = decode_pool(pool, &raw)?;
         native_device::require_library_available(tr, namespace, &record.library_serial).await?;

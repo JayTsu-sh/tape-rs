@@ -596,6 +596,10 @@ fn reject(request: ExecRequest, events: &Sender<ExecEvent>) {
         ExecRequest::Read { reply, .. } => {
             let _ = reply.send(Err(ReadError::Failed(reason)));
         }
+        #[cfg(feature = "fdb")]
+        ExecRequest::FdbReplicaRead { reply, .. } => {
+            let _ = reply.send(Err(ReadError::Failed("控制面节点不能读带".into())));
+        }
         ExecRequest::ReadTo { reply, .. } => {
             let _ = reply.send(Err(ReadError::Failed(reason)));
         }

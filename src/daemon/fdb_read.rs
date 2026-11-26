@@ -23,7 +23,8 @@ use crate::managed_catalog::{
     ActiveFileRequest, ActiveIndexIdentity, ActiveLibraryRoute, ActiveLoadedVolumeHead,
     ActiveReadSource, ContentDigest, ManagedCatalog, ReadMetadata, ReclaimFile,
     ReclaimFileMetadata, ReclaimNodeMetadata, ReclaimNodeReadRequest, ReclaimReservation,
-    ReclaimSourceInventory, ReclaimSourceRead, VerifiedExistingCopyLayout, VerifiedPhysicalPlan,
+    ReclaimSourceInventory, ReclaimSourceRead, ReplicaRead, VerifiedExistingCopyLayout,
+    VerifiedPhysicalPlan,
 };
 use crate::scsi::reservation::{ReservationKey, verify_holder};
 use crate::scsi::transport::TapeTransport;
@@ -72,6 +73,7 @@ pub struct ActiveMediaReader<'a> {
 #[derive(Clone, Copy)]
 enum ReadTarget<'a> {
     Published(&'a [u8]),
+    Replica(&'a ReplicaRead),
     ReclaimSource(&'a ReclaimReservation, &'a ReclaimFile, &'a [u8]),
     ReclaimDestination(&'a ReclaimReservation, &'a [u8]),
     Reclaim(&'a ReclaimReservation, &'a ActiveFileRequest),
@@ -89,7 +91,7 @@ struct VerifiedMediaBounds {
 impl<'a> ReadTarget<'a> {
     fn authority(self, volume: Uuid) -> ReadAuthority<'a> {
         match self {
-            Self::Published(_) => ReadAuthority::Published,
+            Self::Published(_) | Self::Replica(_) => ReadAuthority::Published,
             Self::ReclaimSource(parent, _, _)
             | Self::ReclaimDestination(parent, _)
             | Self::Reclaim(parent, _) => ReadAuthority::Reclaim(parent, volume),
@@ -97,12 +99,8 @@ impl<'a> ReadTarget<'a> {
     }
     async fn resolve(self, reader: &ActiveMediaReader<'_>) -> Result<Option<ActiveReadSource>> {
         let result = match self {
-            Self::Published(path)
-            | Self::ReclaimSource(_, _, path)
-            | Self::ReclaimDestination(_, path) => {
-                if matches!(self, Self::Published(_)) {
-                    reader.check_readable().await?;
-                }
+            Self::Published(path) => {
+                reader.check_readable().await?;
                 reader
                     .catalog
                     .resolve_active_read_source_for_owner(
@@ -112,6 +110,20 @@ impl<'a> ReadTarget<'a> {
                         reader.key.round(),
                     )
                     .await
+            }
+            Self::ReclaimSource(parent, _, path) | Self::ReclaimDestination(parent, path) => {
+                reader
+                    .catalog
+                    .resolve_reclaim_file_source(parent, reader.key.round(), path)
+                    .await
+            }
+            Self::Replica(selection) => {
+                reader.check_readable().await?;
+                reader
+                    .catalog
+                    .resolve_replica_read(selection, reader.route, reader.key.round())
+                    .await
+                    .map(Some)
             }
             Self::Reclaim(reservation, request) => reader
                 .catalog
@@ -263,7 +275,7 @@ impl ActiveMediaReader<'_> {
         .map_err(|e| TapeError::Catalog(e.to_string()))?;
         let current = self
             .catalog
-            .resolve_active_read_source_for_owner(self.serial, &path, self.route, self.key.round())
+            .resolve_reclaim_file_source(reservation, self.key.round(), &path)
             .await
             .map_err(|e| TapeError::Catalog(e.to_string()))?
             .ok_or_else(|| TapeError::Catalog("回收目的文件不存在".into()))?;
@@ -659,6 +671,21 @@ impl ActiveMediaReader<'_> {
             .await
     }
 
+    pub(crate) async fn read_replica(
+        &self,
+        selection: &ReplicaRead,
+        cache_dir: &Path,
+        spool_dir: &Path,
+    ) -> Result<Option<ActiveMediaRead>> {
+        self.read_target_with_cache(
+            ReadTarget::Replica(selection),
+            Some(selection.pool),
+            cache_dir,
+            spool_dir,
+        )
+        .await
+    }
+
     pub async fn read_reclaim_with_cache(
         &self,
         reservation: &ReclaimReservation,
@@ -884,7 +911,7 @@ impl ActiveMediaReader<'_> {
             &mut writer,
         )?;
         if writer.remaining != 0 {
-            return Err(TapeError::Catalog("FDB 文件读取长度不足".into()));
+            return Err(read_integrity(target, "FDB 文件读取长度不足"));
         }
         let actual = match writer.digest {
             ReadDigest::Unknown => ContentDigest::Unknown,
@@ -892,7 +919,7 @@ impl ActiveMediaReader<'_> {
             ReadDigest::Sha256(hash) => ContentDigest::Sha256(hash.finalize().into()),
         };
         if actual != metadata.copy.content_digest {
-            return Err(TapeError::Catalog("FDB 文件读取摘要不符".into()));
+            return Err(read_integrity(target, "FDB 文件读取摘要不符"));
         }
         self.check_device_owner()?;
         let final_source = target.resolve(self).await?;
@@ -909,6 +936,14 @@ impl ActiveMediaReader<'_> {
         if final_source.as_ref() != Some(&source) || final_head != Some(head) {
             return Err(TapeError::Catalog("FDB 文件或卷头在读取期间改变".into()));
         }
+        if let ReadTarget::Replica(selection) = target {
+            writer.file.rewind()?;
+            let mut hash = Sha256::new();
+            let length = std::io::copy(&mut writer.file, &mut hash)?;
+            if length != selection.size || <[u8; 32]>::from(hash.finalize()) != selection.digest {
+                return Err(TapeError::ReadIntegrity("多副本文件正文摘要或长度不匹配"));
+            }
+        }
         self.check_readable_for(authority).await?;
         writer.file.rewind()?;
         Ok(Some(ActiveMediaRead {
@@ -917,6 +952,14 @@ impl ActiveMediaReader<'_> {
             verified_head: head.index,
             file: writer.file,
         }))
+    }
+}
+
+fn read_integrity(target: ReadTarget<'_>, reason: &'static str) -> TapeError {
+    if matches!(target, ReadTarget::Replica(_)) {
+        TapeError::ReadIntegrity(reason)
+    } else {
+        TapeError::Catalog(reason.into())
     }
 }
 

@@ -164,7 +164,11 @@ pub(super) async fn child_at(
                 "回收复制子身份已保留，原父屏障不存在",
             ));
         }
-        node_tasks::require_pool_without_reclaim_at(tr, ns, pool).await?;
+        if replicated_pools::archive::authorize_child_epoch(tr, ns, pool, epoch, operation).await? {
+            node_tasks::require_pool_mutation_barriers_at(tr, ns, pool).await?;
+        } else {
+            node_tasks::require_pool_without_reclaim_at(tr, ns, pool).await?;
+        }
         return Ok(None);
     };
     let raw = tr
@@ -744,11 +748,13 @@ pub(super) async fn require_request_identity_at(
             owner,
         )
         .await?
-        && saved.request() != *request
     {
-        return Err(CatalogError::Invalid("回收复制必须复用封存的完整原请求"));
+        if saved.request() != *request {
+            return Err(CatalogError::Invalid("回收复制必须复用封存的完整原请求"));
+        }
+        return Ok(());
     }
-    Ok(())
+    replicated_pools::archive::authorize_request(tr, request).await
 }
 
 pub(in crate::managed_catalog) async fn require_intent_at(
@@ -795,6 +801,7 @@ pub(in crate::managed_catalog) async fn require_intent_in(
     if matches!(context, ReclaimProtocolContext::Group(_)) {
         return Err(CatalogError::Invalid("分组写入缺少原回收子请求"));
     }
+    replicated_pools::archive::authorize_request(tr, &intent.request()).await?;
     Ok(None)
 }
 
