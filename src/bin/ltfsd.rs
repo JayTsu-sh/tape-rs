@@ -1375,6 +1375,7 @@ fn run_libraries(
                 contexts.clone(),
                 gateway.clone(),
                 s3_peer_addrs(&args, &peers),
+                client_addrs.clone(),
                 mode.writable,
                 mode.storage,
             )?;

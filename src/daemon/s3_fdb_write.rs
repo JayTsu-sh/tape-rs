@@ -105,7 +105,11 @@ fn file_version(
         )),
     }
 }
-fn conditions(headers: &HeaderMap, namespace: Uuid, current: Option<(Uuid, u64)>) -> S3Result<()> {
+pub(super) fn conditions(
+    headers: &HeaderMap,
+    namespace: Uuid,
+    current: Option<(Uuid, u64)>,
+) -> S3Result<()> {
     let etag = current.map(|(id, version)| tag(namespace, id, version));
     if header_text(headers, "if-none-match")? == Some("*") && current.is_some() {
         return Err(precondition());
@@ -311,25 +315,28 @@ impl UploadHeaders {
     }
 }
 
-async fn put(
-    s: &FdbS3,
-    serial: &str,
-    pool: Uuid,
-    path: &str,
-    round: u64,
+pub(super) struct StagedUpload {
+    pub file: std::fs::File,
+    pub length: u64,
+    pub digest: [u8; 32],
+    pub md5: String,
+    pub checksum: UploadChecksum,
+    pub saved: BTreeMap<String, String>,
+}
+
+pub(super) async fn stage(
+    context: &HttpContext,
+    storage: super::super::super::fdb_read::ReadStorageBudget,
     req: Request,
-) -> S3Result<Response> {
+) -> S3Result<StagedUpload> {
     let mut headers = UploadHeaders::parse(req.headers())?;
-    if headers.length > s.storage.download_bytes {
+    if headers.length > storage.download_bytes {
         return Err(S3Error::new(413, "EntityTooLarge", "上传超过本地暂存预算"));
     }
-    let before = resolve(s, serial, pool, path).await?;
-    let original = file_version(before.as_ref(), serial, pool)?;
-    conditions(req.headers(), s.routes[serial].route.namespace, original)?;
     let file = crate::local_read_storage::download_file(
-        s.libraries[serial].files.spool_dir(),
+        context.files.spool_dir(),
         headers.length,
-        s.storage,
+        storage,
     )
     .map_err(|err| unavailable(format!("上传暂存不可用：{err}")))?;
     let mut file = tokio::fs::File::from_std(file);
@@ -338,7 +345,7 @@ async fn put(
     let mut sha = Sha256::new();
     let mut md5 = Md5::new();
     let mut crc32 = crc32fast::Hasher::new();
-    let deadline = tokio::time::Instant::now() + s.libraries[serial].wait_timeout;
+    let deadline = tokio::time::Instant::now() + context.wait_timeout;
     while let Some(frame) = tokio::time::timeout_at(deadline, body.frame())
         .await
         .map_err(|_| S3Error::new(408, "RequestTimeout", "上传正文超时"))?
@@ -397,6 +404,35 @@ async fn put(
         .await
         .map_err(|err| unavailable(err.to_string()))?;
     let file = file.into_std().await;
+    Ok(StagedUpload {
+        file,
+        length,
+        digest,
+        md5: format!("{md5:x}"),
+        checksum: headers.checksum,
+        saved: headers.saved,
+    })
+}
+
+async fn put(
+    s: &FdbS3,
+    serial: &str,
+    pool: Uuid,
+    path: &str,
+    round: u64,
+    req: Request,
+) -> S3Result<Response> {
+    let before = resolve(s, serial, pool, path).await?;
+    let original = file_version(before.as_ref(), serial, pool)?;
+    conditions(req.headers(), s.routes[serial].route.namespace, original)?;
+    let StagedUpload {
+        file,
+        length,
+        digest,
+        md5,
+        checksum,
+        saved,
+    } = stage(&s.libraries[serial], s.storage, req).await?;
     parents(s, serial, pool, path, round).await?;
     check_owner(s, serial, round).await?;
     let spec = ActiveUploadSpec {
@@ -437,12 +473,12 @@ async fn put(
     let metadata = FileMetadata::replacement(vec![
         Xattr {
             key: XATTR_MD5.into(),
-            value: format!("{md5:x}"),
+            value: md5,
             base64: false,
         },
         Xattr {
             key: HEADERS_XATTR.into(),
-            value: STANDARD.encode(serde_json::to_vec(&headers.saved).expect("string map")),
+            value: STANDARD.encode(serde_json::to_vec(&saved).expect("string map")),
             base64: true,
         },
     ]);
@@ -484,7 +520,7 @@ async fn put(
             .parse()
             .expect("ETag"),
     );
-    if let Some((name, value)) = headers.checksum.header() {
+    if let Some((name, value)) = checksum.header() {
         response
             .headers_mut()
             .insert(name, value.parse().expect("digest"));

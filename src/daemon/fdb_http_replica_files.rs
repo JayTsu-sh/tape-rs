@@ -7,11 +7,12 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-const BASE: &str = "/v1/fdb/replicated-pools";
+pub(in crate::daemon) const BASE: &str = "/v1/fdb/replicated-pools";
 
 pub(super) fn router(ctx: Arc<Context>) -> Router {
     Router::new()
         .route("/v1/fdb/replicated-pools/{id}/stat", get(stat))
+        .route("/v1/fdb/replicated-pools/{id}/children", get(children))
         .route("/v1/fdb/replicated-pools/{id}/file", get(content))
         .route(
             "/v1/fdb/replicated-pools/{id}/archives",
@@ -149,7 +150,7 @@ fn destination<'a>(ctx: &'a Context, serial: &str) -> Option<(&'a OwnerRuntime, 
     Some((owner, dest))
 }
 
-async fn upload_member(
+pub(in crate::daemon) async fn upload_member(
     State(ctx): State<Arc<Context>>,
     Path((id, operation, member)): Path<(Uuid, Uuid, Uuid)>,
     request: Request,
@@ -371,7 +372,50 @@ async fn stat(State(ctx): State<Arc<Context>>, Path(id): Path<Uuid>, request: Re
         Err(reason) => return invalid(reason),
     };
     match ctx.catalog.replica_file(id, &path, &ctx.routes).await {
-        Ok(Some(file)) => reply(StatusCode::OK, file.info),
+        Ok(Some(mut file)) => {
+            file.info["id"] = json!(id);
+            reply(StatusCode::OK, file.info)
+        }
+        Ok(None) => not_found(),
+        Err(problem) => error(problem),
+    }
+}
+
+async fn children(
+    State(ctx): State<Arc<Context>>,
+    Path(id): Path<Uuid>,
+    request: Request,
+) -> Response {
+    let Ok(_permit) = ctx.admin_requests.clone().try_acquire_owned() else {
+        return unavailable("http_busy");
+    };
+    let path = match path(&request) {
+        Ok(path) => path,
+        Err(reason) => return invalid(reason),
+    };
+    let after = match query_value(&request, "after").and_then(|after| {
+        after
+            .map(|value| {
+                if value.len() > 512 {
+                    return Err("目录游标过长");
+                }
+                URL_SAFE_NO_PAD
+                    .decode(value)
+                    .ok()
+                    .and_then(|raw| String::from_utf8(raw).ok())
+                    .ok_or("目录游标无效")
+            })
+            .transpose()
+    }) {
+        Ok(after) => after,
+        Err(reason) => return invalid(reason),
+    };
+    match ctx
+        .catalog
+        .replica_children(id, &path, after.as_deref(), &ctx.routes)
+        .await
+    {
+        Ok(Some(value)) => reply(StatusCode::OK, value),
         Ok(None) => not_found(),
         Err(problem) => error(problem),
     }
@@ -385,9 +429,15 @@ async fn content(
     if request.method() != axum::http::Method::GET {
         return invalid("副本正文需要 GET");
     }
-    if request.headers().contains_key(header::RANGE) {
-        return invalid("多副本原生读取需要完整正文");
-    }
+    let range = match request
+        .headers()
+        .get(header::RANGE)
+        .map(|value| value.to_str())
+        .transpose()
+    {
+        Ok(range) => range,
+        Err(_) => return invalid("Range 无效"),
+    };
     let path = match path(&request) {
         Ok(path) => path,
         Err(reason) => return invalid(reason),
@@ -427,7 +477,7 @@ async fn content(
             URL_SAFE_NO_PAD.encode(&path)
         )
     };
-    read_file(&ctx, file, member, forwarded, route).await
+    read_file(&ctx, file, member, forwarded, range, route).await
 }
 
 async fn recovery_content(
@@ -449,17 +499,18 @@ async fn recovery_content(
         Err(problem) => return error(problem),
     };
     let forwarded = request.headers().contains_key("x-tapers-forwarded");
-    read_file(&ctx, file, Some(member), forwarded, |pool| {
+    read_file(&ctx, file, Some(member), forwarded, None, |pool| {
         format!("{BASE}/{id}/archives/{operation}/members/{pool}")
     })
     .await
 }
 
-async fn read_file(
+pub(in crate::daemon) async fn read_file(
     ctx: &Context,
     file: ReplicaFile,
     member: Option<Uuid>,
     forwarded: bool,
+    range: Option<&str>,
     route: impl Fn(Uuid) -> String,
 ) -> Response {
     let mut proxied = std::collections::BTreeSet::new();
@@ -481,16 +532,17 @@ async fn read_file(
                 let pool = selection.pool;
                 match read_member(library, selection, permit).await {
                     Ok((file, permit)) => {
-                        return with_version(held_file(file, None, permit), &version);
+                        return with_version(held_file(file, range, permit), &version);
                     }
                     Err(reason) => failures.push(format!("{pool}: {reason}")),
                 }
             }
             Destination::Peer(addr, library) if !forwarded && proxied.insert(selection.pool) => {
-                let request = Request::builder()
-                    .uri(route(selection.pool))
-                    .body(Body::empty())
-                    .expect("internal read URI");
+                let mut request = Request::builder().uri(route(selection.pool));
+                if let Some(range) = range {
+                    request = request.header(header::RANGE, range);
+                }
+                let request = request.body(Body::empty()).expect("internal read URI");
                 let response = forward(
                     request,
                     addr,
@@ -499,7 +551,12 @@ async fn read_file(
                     library.wait_timeout,
                 )
                 .await;
-                if response.status() == StatusCode::OK {
+                if matches!(response.status().as_u16(), 200 | 206 | 416)
+                    && response
+                        .headers()
+                        .get("x-tapers-file-version")
+                        .is_some_and(|value| value == &version)
+                {
                     return response;
                 }
                 failures.push(format!("{}: HTTP {}", selection.pool, response.status()));

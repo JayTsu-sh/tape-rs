@@ -1232,6 +1232,8 @@ fn verify_replica_archive(
     (sim, logical, other_slot): (&SimLibrary, Uuid, u16),
 ) {
     use crate::replicated_pool::ReplicatedArchive;
+    use nix::libc;
+    use std::sync::atomic::Ordering;
     let drop_reply = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let drop_next = drop_reply.clone();
     let router = fdb_http::writer_router(
@@ -1271,10 +1273,95 @@ fn verify_replica_archive(
     let listener = rt
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
         .unwrap();
-    let client = FdbClient::new([listener.local_addr().unwrap().to_string()])
+    let address = listener.local_addr().unwrap().to_string();
+    let client = FdbClient::new([address.clone()])
         .unwrap()
         .with_timeouts(Duration::ZERO, Duration::from_secs(25));
     let server = rt.spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let drop_s3 = Arc::new(AtomicBool::new(false));
+    let drop_s3_response = drop_s3.clone();
+    let s3_router = crate::daemon::s3::fdb_router(
+        catalog.clone(),
+        pool.members
+            .iter()
+            .zip(routes)
+            .map(|(member, route)| (member.library_serial.clone(), route))
+            .collect(),
+        pool.members
+            .iter()
+            .zip(owners)
+            .map(|(member, owner)| (member.library_serial.clone(), owner.http.clone()))
+            .collect(),
+        owners[0].http.clone(),
+        Default::default(),
+        true,
+    )
+    .layer(axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let drop = drop_s3_response.clone();
+            async move {
+                use axum::response::IntoResponse;
+                let put = req.method() == "PUT";
+                let response = next.run(req).await;
+                if put && response.status().is_success() && drop.swap(false, Ordering::SeqCst) {
+                    return axum::http::StatusCode::GATEWAY_TIMEOUT.into_response();
+                }
+                response
+            }
+        },
+    ));
+    let listener = rt
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let s3_addr = listener.local_addr().unwrap();
+    let s3_server = rt.spawn(async move { axum::serve(listener, s3_router).await.unwrap() });
+    let bucket = format!("/replica-{}", pool.id);
+    let s3 = |method: &str, key: &str, headers: &[(&str, &str)], body: &[u8]| {
+        rt.block_on(async {
+            use http_body_util::BodyExt;
+            let stream = tokio::net::TcpStream::connect(s3_addr).await.unwrap();
+            let (mut sender, connection) =
+                hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+                    .await
+                    .unwrap();
+            tokio::spawn(connection);
+            let mut req = hyper::Request::builder()
+                .method(method)
+                .uri(format!("{bucket}{key}"));
+            for (name, value) in headers {
+                req = req.header(*name, *value);
+            }
+            if method == "PUT" {
+                req = req.header("content-length", body.len());
+            }
+            let response = sender
+                .send_request(req.body(axum::body::Body::from(body.to_vec())).unwrap())
+                .await
+                .unwrap();
+            let (parts, body) = response.into_parts();
+            (
+                parts.status.as_u16(),
+                parts.headers,
+                body.collect().await.unwrap().to_bytes(),
+            )
+        })
+    };
+    let open_fuse = |label: &str, journal: Option<&Path>| {
+        let cache = root.join(label);
+        std::fs::create_dir(&cache).unwrap();
+        crate::tapefs::TapeFs::new(
+            crate::tapefs::ReplicatedBackend::new(
+                FdbClient::new([address.clone()])
+                    .unwrap()
+                    .with_timeouts(Duration::ZERO, Duration::from_secs(25)),
+                pool.id,
+                journal,
+            )
+            .unwrap(),
+            cache,
+        )
+        .unwrap()
+    };
     let parent = pool.id;
     let a = pool.members[0].pool_id;
     let b = pool.members[1].pool_id;
@@ -1289,6 +1376,27 @@ fn verify_replica_archive(
         assert_eq!(std::fs::read(&out).unwrap(), expected);
         std::fs::remove_file(out).unwrap();
     };
+    // The imported version was proved and listed before the physical member
+    // was assigned to the default logical library.
+    download("/same", Some(a), b"shared");
+    let migrated = s3("GET", "/same", &[], b"");
+    assert_eq!(migrated.0, 200);
+    assert_eq!(&migrated.2[..], b"shared");
+    let mount = open_fuse("app-after-scope-change", None);
+    let same = mount.lookup(crate::tapefs::ROOT_INO, "same").unwrap();
+    let fh = mount.open(same.ino, libc::O_RDONLY).unwrap();
+    assert_eq!(mount.read(fh, 0, 99).unwrap(), b"shared");
+    mount.release(fh);
+    let grouped = s3("GET", "?list-type=2&prefix=tre&delimiter=%2F", &[], b"");
+    assert_eq!(grouped.0, 200);
+    assert!(
+        std::str::from_utf8(&grouped.2)
+            .unwrap()
+            .contains("<CommonPrefixes><Prefix>tree/</Prefix></CommonPrefixes>")
+    );
+    let tree = mount.lookup(crate::tapefs::ROOT_INO, "tree").unwrap();
+    assert_eq!(mount.readdir(tree.ino).unwrap()[0].0, "child");
+    drop(mount);
     download("/collision", Some(b), b"B-side");
     let path = "/zz-archive";
     let input = |body: &[u8], previous| ReplicatedArchive {
@@ -1348,6 +1456,147 @@ fn verify_replica_archive(
     for member in [a, b] {
         download(path, Some(member), b"version one");
     }
+
+    let operation = Uuid::new_v4().to_string();
+    let headers = [
+        ("x-tapers-operation", operation.as_str()),
+        ("if-none-match", "*"),
+        ("x-amz-meta-source", "sim-s3"),
+        ("content-type", "text/plain"),
+    ];
+    drop_s3.store(true, Ordering::SeqCst);
+    let first_s3 = s3("PUT", "/app-file", &headers, b"from s3 v1");
+    assert_eq!(first_s3.0, 504, "{:?}", first_s3.2);
+    let s3_receipt = client
+        .replicated_archive_status(parent, operation.parse().unwrap())
+        .unwrap();
+    assert_eq!(s3_receipt["status"], "committed");
+    assert_eq!(s3_receipt["file_version"], 1);
+    let replay = s3("PUT", "/app-file", &headers, b"from s3 v1");
+    assert_eq!(replay.0, 200, "{:?}", replay.2);
+    assert_eq!(s3("PUT", "/app-file", &headers, b"different").0, 409);
+    let original_tag = replay.1["etag"].to_str().unwrap();
+    let head = s3("HEAD", "/app-file", &[], b"");
+    assert_eq!(head.0, 200);
+    assert_eq!(head.1["x-amz-meta-source"], "sim-s3");
+    assert_eq!(head.1["content-length"], "10");
+    let range = s3("GET", "/app-file", &[("range", "bytes=5-6")], b"");
+    assert_eq!(range.0, 206);
+    assert_eq!(&range.2[..], b"s3");
+    let page = s3("GET", "?list-type=2&max-keys=1&prefix=app", &[], b"");
+    assert_eq!(page.0, 200);
+    assert!(
+        std::str::from_utf8(&page.2)
+            .unwrap()
+            .contains("<Key>app-file</Key>")
+    );
+    let journal = root.join("app-journal");
+    let fuse = open_fuse("app-fuse", Some(&journal));
+    let entries = fuse.readdir(crate::tapefs::ROOT_INO).unwrap();
+    assert!(entries.iter().any(|(name, _, _)| name == "app-file"));
+    let attr = fuse.lookup(crate::tapefs::ROOT_INO, "app-file").unwrap();
+    let opened = fuse.open(attr.ino, libc::O_RDONLY).unwrap();
+    assert_eq!(fuse.read(opened, 0, 99).unwrap(), b"from s3 v1");
+    fuse.release(opened);
+    let opened = fuse.open(attr.ino, libc::O_WRONLY | libc::O_TRUNC).unwrap();
+    fuse.write(opened, 0, b"from fuse v2").unwrap();
+    owners[0].status.lock().unwrap().executor_ready = false;
+    assert!(fuse.fsync(opened).is_err());
+    let operations: Vec<_> = std::fs::read_dir(&journal).unwrap().collect();
+    assert_eq!(operations.len(), 1);
+    let saved = operations.into_iter().next().unwrap().unwrap().path();
+    let fuse_operation = saved
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let partial = client
+        .replicated_archive_status(parent, fuse_operation)
+        .unwrap();
+    assert_eq!(partial["status"], "waiting");
+    assert!(partial["members"][0]["commit"].is_null());
+    let fallback = s3("GET", "/app-file", &[], b"");
+    assert_eq!(fallback.0, 200);
+    assert_eq!(&fallback.2[..], b"from s3 v1");
+    assert_eq!(fallback.1["etag"], original_tag);
+    assert!(saved.join("payload").is_file());
+    drop(fuse);
+    owners[0].status.lock().unwrap().executor_ready = true;
+    drop_reply.store(true, Ordering::SeqCst);
+    let remount = open_fuse("app-remount", Some(&journal));
+    assert!(!drop_reply.load(Ordering::SeqCst));
+    let fuse_receipt = client
+        .replicated_archive_status(parent, fuse_operation)
+        .unwrap();
+    assert_eq!(fuse_receipt["status"], "committed");
+    assert_eq!(fuse_receipt["file_version"], 2);
+    assert!(saved.join("committed").is_file());
+    assert!(!saved.join("payload").exists());
+    let second_s3 = s3("GET", "/app-file", &[], b"");
+    assert_eq!(second_s3.0, 200);
+    assert_ne!(second_s3.1["etag"], original_tag);
+    assert_eq!(&second_s3.2[..], b"from fuse v2");
+
+    let (_, created) = remount
+        .create(crate::tapefs::ROOT_INO, "app-fuse-created", true)
+        .unwrap();
+    remount.write(created, 0, b"fuse create").unwrap();
+    remount.fsync(created).unwrap();
+    remount.release(created);
+    assert_eq!(
+        &s3("GET", "/app-fuse-created", &[], b"").2[..],
+        b"fuse create"
+    );
+    let page = s3("GET", "?list-type=2&max-keys=1&prefix=app", &[], b"");
+    let xml = std::str::from_utf8(&page.2).unwrap();
+    let (_, token) = xml.split_once("<NextContinuationToken>").unwrap();
+    let (token, _) = token.split_once("</NextContinuationToken>").unwrap();
+    let next_page = s3(
+        "GET",
+        &format!("?list-type=2&max-keys=1&prefix=app&continuation-token={token}"),
+        &[],
+        b"",
+    );
+    let xml = std::str::from_utf8(&next_page.2).unwrap();
+    assert_eq!(next_page.0, 200);
+    assert!(
+        xml.contains("<Key>app-fuse-created</Key>")
+            && xml.contains("<IsTruncated>false</IsTruncated>")
+    );
+    let next_tag = second_s3.1["etag"].to_str().unwrap();
+    let next_op = Uuid::new_v4().to_string();
+    let next_headers = [
+        ("x-tapers-operation", next_op.as_str()),
+        ("if-match", next_tag),
+    ];
+    owners[0].status.lock().unwrap().executor_ready = false;
+    let unavailable = s3("PUT", "/app-file", &next_headers, b"from s3 v3");
+    assert_eq!(unavailable.0, 503);
+    assert_eq!(unavailable.1["x-tapers-operation"], next_op);
+    assert_eq!(
+        client
+            .replicated_archive_status(parent, next_op.parse().unwrap())
+            .unwrap()["status"],
+        "waiting"
+    );
+    assert_eq!(s3("GET", "/app-file", &[], b"").2[..], *b"from fuse v2");
+    owners[0].status.lock().unwrap().executor_ready = true;
+    assert_eq!(s3("PUT", "/app-file", &next_headers, b"from s3 v3").0, 200);
+    let cold_app = |label| {
+        let mount = open_fuse(label, None);
+        let attr = mount.lookup(crate::tapefs::ROOT_INO, "app-file").unwrap();
+        let read = mount.open(attr.ino, libc::O_RDONLY).unwrap();
+        assert_eq!(mount.read(read, 0, 99).unwrap(), b"from s3 v3");
+        mount.release(read);
+        let response = s3("GET", "/app-file", &[], b"");
+        assert_eq!(response.0, 200);
+        assert_eq!(&response.2[..], b"from s3 v3");
+    };
+    cold_app("app-cold");
+    download("/app-file", Some(a), b"from s3 v3");
+    download("/app-file", Some(b), b"from s3 v3");
 
     let next = input(b"replacement", Some(1));
     std::fs::write(&body, b"replacement").unwrap();
@@ -1489,6 +1738,21 @@ fn verify_replica_archive(
         next_round.set(round + 1);
     };
     external_move(home, other_slot);
+    cold_app("app-conflict-cold");
+    let app_fault_op = Uuid::new_v4().to_string();
+    let blocked = s3(
+        "PUT",
+        "/app-conflict-wait",
+        &[("x-tapers-operation", &app_fault_op)],
+        b"fault",
+    );
+    assert_eq!(blocked.0, 503);
+    assert_eq!(
+        client
+            .replicated_archive_status(parent, app_fault_op.parse().unwrap())
+            .unwrap()["status"],
+        "waiting"
+    );
     let fault = manager
         .logical_library(serial, pool.members[0].namespace, &logical.to_string())
         .unwrap();
@@ -1521,6 +1785,17 @@ fn verify_replica_archive(
         "waiting"
     );
     external_move(other_slot, home);
+    assert_eq!(
+        s3(
+            "PUT",
+            "/app-conflict-wait",
+            &[("x-tapers-operation", &app_fault_op)],
+            b"fault"
+        )
+        .0,
+        200
+    );
+    cold_app("app-after-managed-move");
     let resumed = client
         .archive_replicated(parent, &blocked_input, None)
         .unwrap();
@@ -1550,5 +1825,6 @@ fn verify_replica_archive(
             .unwrap()["status"],
         "cancelled"
     );
+    s3_server.abort();
     server.abort();
 }

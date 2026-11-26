@@ -41,7 +41,7 @@ pub use native_device::NativeDeviceTask;
 mod active_pools;
 #[path = "replicated_pools.rs"]
 pub(super) mod replicated_pools;
-pub(crate) use replicated_pools::archive::ReplicaUpload;
+pub(crate) use replicated_pools::archive::{ReplicaObjectMetadata, ReplicaUpload};
 pub(crate) use replicated_pools::files::ReplicaFile;
 pub use replicated_pools::files::ReplicaRead;
 #[path = "scoped_pools.rs"]

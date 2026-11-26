@@ -432,3 +432,41 @@ impl ManagedCatalog {
             .await?
     }
 }
+
+impl ManagedCatalog {
+    pub(crate) async fn replica_bucket_exists(
+        &self,
+        pool: Uuid,
+        routes: &BTreeMap<String, ActiveLibraryRoute>,
+    ) -> Result<bool> {
+        let tr = self.db.create_trx()?;
+        Ok(read_at(&tr, pool).await?.is_some_and(|creation| {
+            creation.published && require_configured(&creation.input, routes).is_ok()
+        }))
+    }
+
+    pub(crate) async fn replicated_buckets(
+        &self,
+        routes: &BTreeMap<String, ActiveLibraryRoute>,
+        after: Option<&[u8]>,
+    ) -> Result<Page<(Uuid, u64)>> {
+        let tr = self.db.create_trx()?;
+        let prefix = domain(b'i');
+        let page = read_page(&tr, &prefix, after, 100, false).await?;
+        let mut items = Vec::new();
+        for (key, raw) in page.items {
+            let id = uuid_from(&key[prefix.len()..])?;
+            let creation: Creation = decode(&raw)?;
+            if creation.input.id != id || validate(&creation.input).is_err() {
+                return Err(CatalogError::Corrupt("多副本池记录与原请求身份不符"));
+            }
+            if creation.published && require_configured(&creation.input, routes).is_ok() {
+                items.push((id, creation.input.created_at_millis));
+            }
+        }
+        Ok(Page {
+            items,
+            next: page.next,
+        })
+    }
+}

@@ -141,7 +141,7 @@ pub use control::{
     ReclaimSourceRead, ReclaimSpec, ReclaimWalk, TapeAssignment, VolumePlacement,
 };
 pub(crate) use control::{LogicalLibraryChange, LogicalLibraryCreation};
-pub(crate) use control::{ReplicaFile, ReplicaUpload};
+pub(crate) use control::{ReplicaFile, ReplicaObjectMetadata, ReplicaUpload};
 pub use cutover::{
     FrozenSnapshotIdentity, VerifiedNodeExport, inspect_frozen_snapshot, verify_node_export,
 };

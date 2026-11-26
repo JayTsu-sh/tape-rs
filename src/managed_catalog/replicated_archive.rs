@@ -16,12 +16,23 @@ pub(in crate::managed_catalog) struct CommittedMember {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ReplicaObjectMetadata {
+    pub headers: BTreeMap<String, String>,
+    pub if_match: Option<String>,
+    pub if_none_match: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Published {
     pub operation: Uuid,
     pub version: u64,
     pub size: u64,
     pub sha256: [u8; 32],
     pub members: Vec<CommittedMember>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object: Option<ReplicaObjectMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified: Option<i64>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -47,6 +58,10 @@ struct Job {
     version: u64,
     state: State,
     children: Vec<Child>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    object: Option<ReplicaObjectMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    modified: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -258,6 +273,16 @@ impl ManagedCatalog {
         input: &ReplicatedArchive,
         routes: &BTreeMap<String, ActiveLibraryRoute>,
     ) -> Result<Value> {
+        self.admit_replica_object(parent, input, None, routes).await
+    }
+
+    pub(crate) async fn admit_replica_object(
+        &self,
+        parent: Uuid,
+        input: &ReplicatedArchive,
+        object: Option<&ReplicaObjectMetadata>,
+        routes: &BTreeMap<String, ActiveLibraryRoute>,
+    ) -> Result<Value> {
         pool_catalog_path(parent, input.path.as_bytes())?;
         if input.operation.is_nil()
             || input.path == "/"
@@ -273,7 +298,9 @@ impl ManagedCatalog {
                     async {
                         let creation = require_published(&tr, parent, routes).await?;
                         if let Some(old) = job_at(&tr, parent, input.operation).await? {
-                            return if old.input == *input {
+                            return if old.input == *input
+                                && object.is_none_or(|object| old.object.as_ref() == Some(object))
+                            {
                                 Ok(view(parent, &creation, &old))
                             } else {
                                 Err(CatalogError::IdempotencyMismatch)
@@ -312,6 +339,8 @@ impl ManagedCatalog {
                             version: input.previous.unwrap_or(0) + 1,
                             state: State::Waiting,
                             children,
+                            object: object.cloned(),
+                            modified: Some(chrono::Utc::now().timestamp()),
                         };
                         tr.set(&claim, input.operation.as_bytes());
                         tr.set(&job_key(parent, input.operation), &encode(&job)?);
@@ -508,6 +537,8 @@ impl ManagedCatalog {
                                     version: job.version,
                                     size: job.input.size,
                                     sha256: job.input.sha256,
+                                    object: job.object.clone(),
+                                    modified: job.modified,
                                     members: job
                                         .children
                                         .iter()
@@ -568,7 +599,7 @@ fn view(parent: Uuid, creation: &Creation, job: &Job) -> Value {
     })).collect::<Vec<_>>();
     json!({"id":parent,"operation":job.input.operation,"status":job.state,"path":job.input.path,
         "file_version":job.version,"size":job.input.size,"sha256":files::hex(&job.input.sha256),
-        "members":members})
+        "members":members,"modified":job.modified})
 }
 
 pub(super) async fn recovery_version(
@@ -587,6 +618,8 @@ pub(super) async fn recovery_version(
         version: job.version,
         size: job.input.size,
         sha256: job.input.sha256,
+        object: job.object,
+        modified: job.modified,
         members: job
             .children
             .into_iter()

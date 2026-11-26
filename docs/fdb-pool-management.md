@@ -151,3 +151,19 @@ ltfsctl -e NODE:7411 pool replicated archive-cancel POOL_UUID OPERATION_UUID
 HTTP 使用 `POST /v1/fdb/replicated-pools/{id}/archives` 受理 JSON。每个底层池通过 `PUT /v1/fdb/replicated-pools/{id}/archives/{operation}/members/{member}` 上传完整正文和明确的 `Content-Length`。查询 `GET /v1/fdb/replicated-pools/{id}/archives/{operation}` 可恢复原成员和父提交回执。对同一路径发 `DELETE` 请求取消。已确认成员的恢复正文用 `GET` 请求相应的成员上传地址。
 
 读文件使用 `GET /v1/fdb/replicated-pools/{id}/file?path=BASE64URL`。可传 `version` 固定发布版本，传 `member` 固定验收成员。`GET /v1/fdb/replicated-pools/{id}/stat?path=BASE64URL` 返回 `file_version`、长度、摘要和副本数。`path` 使用 UTF-8 字节的无填充 Base64URL。Rust SDK 在 `FdbClient` 暴露同样的归档、查询、取消和下载操作。
+
+### S3 和 FUSE
+
+启用 `ltfsd --fdb-s3 --s3-listen 0.0.0.0:PORT --s3-port PORT` 后，`ListBuckets` 会列出已发布的多副本池。bucket 名为 `replica-POOL_UUID`，使用父池 UUID。S3 支持列举、HEAD、GET 和单次 PUT。可在池根目录或已导入的目录内创建文件。
+
+```sh
+curl --fail-with-body --upload-file report.txt \
+  -H 'X-Tapers-Operation: OPERATION_UUID' -H 'If-None-Match: *' \
+  http://NODE:7402/replica-POOL_UUID/report.txt
+curl --fail-with-body http://NODE:7402/replica-POOL_UUID/report.txt -o saved.txt
+tape-fuse -e NODE:7411 --replicated-pool POOL_UUID --cache-dir CACHE MOUNTPOINT
+```
+
+S3 覆盖可用 `If-Match` 固定原对象的 ETag。PUT 前生成并保存 `X-Tapers-Operation` UUID，保留原路径、正文、条件头及对象元数据。收到 503、504 或连接中断时，可用原 UUID 查询 `ltfsctl pool replicated archive-status`，或提交完全相同的 PUT 继续。源正文丢失时，可通过原生归档接口从已验证的成员恢复。
+
+FUSE 默认只读。添加 `--fdb-journal-dir JOURNAL` 启用常规文件创建和覆盖。日志目录由单次挂载独占，权限须为 0700。文件关闭或 `fsync` 成功表示所有底层池均已确认。挂载中断后用同一日志目录恢复原 UUID 和正文。归档等待期间，其他客户端仍可从可用副本读取上一个已发布版本。多副本入口当前支持归档和读取，删除、重命名及目录修改返回不支持。

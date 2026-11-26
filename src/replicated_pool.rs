@@ -80,3 +80,13 @@ mod hex_digest {
         Ok(digest)
     }
 }
+
+pub(crate) fn inode(pool: Uuid, path: &str) -> Uuid {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::new()
+        .chain_update(b"tape-rs/replica-inode/1")
+        .chain_update(pool.as_bytes())
+        .chain_update(path.as_bytes())
+        .finalize();
+    Uuid::from_bytes(hash[..16].try_into().expect("SHA-256"))
+}

@@ -33,13 +33,16 @@ struct Args {
     #[arg(long, conflicts_with = "library_changer")]
     pool: Option<String>,
     /// 固定 FDB 命名空间；须指定 --library 和 UUID 格式的 --pool，默认只读
-    #[arg(long, requires_all = ["library_serial", "pool"], conflicts_with = "library_changer")]
+    #[arg(long, requires_all = ["library_serial", "pool"], conflicts_with = "library_changer", group = "fdb_mount")]
     fdb_namespace: Option<uuid::Uuid>,
+    /// 多副本池的父池 UUID，默认只读
+    #[arg(long, conflicts_with_all = ["library_serial", "pool", "fdb_namespace", "logical_library", "library_changer"], group = "fdb_mount")]
+    replicated_pool: Option<uuid::Uuid>,
     /// FDB 磁带池归属的逻辑带库 UUID
     #[arg(long, requires = "fdb_namespace", conflicts_with = "library_changer")]
     logical_library: Option<uuid::Uuid>,
     /// FDB 持久化请求日志目录（0700）；指定后恢复原操作并启用文件及节点修改
-    #[arg(long, requires = "fdb_namespace", conflicts_with = "library_changer")]
+    #[arg(long, requires = "fdb_mount", conflicts_with = "library_changer")]
     fdb_journal_dir: Option<PathBuf>,
     #[command(flatten)]
     library: tape_rs::library_cli::LibraryArgs,
@@ -565,6 +568,20 @@ fn main() {
                 .map_err(std::io::Error::other);
             mounted?;
             closed
+        } else if let Some(pool) = args.replicated_pool {
+            if args.fdb_journal_dir.is_none() {
+                config.mount_options.push(MountOption::RO);
+            }
+            let client = tape_rs::client::fdb::FdbClient::new(args.endpoints)
+                .map_err(std::io::Error::other)?;
+            let backend = tape_rs::tapefs::ReplicatedBackend::new(
+                client,
+                pool,
+                args.fdb_journal_dir.as_deref(),
+            )
+            .map_err(std::io::Error::other)?;
+            let fs = TapeFs::new(backend, args.cache_dir)?;
+            fuser::mount(Adapter::new(fs), args.mountpoint, &config)
         } else if let Some(namespace) = args.fdb_namespace {
             let serial = args
                 .library_serial
@@ -667,6 +684,41 @@ mod tests {
         let mut local = arguments;
         local.extend(["--library-changer", "/dev/sg0"]);
         assert!(Args::try_parse_from(local).is_err());
+    }
+
+    #[test]
+    fn replicated_mount_selects_only_the_parent_pool_and_accepts_a_journal() {
+        let pool = uuid::Uuid::new_v4().to_string();
+        let args = [
+            "tape-fuse",
+            "-e",
+            "127.0.0.1:7401",
+            "--replicated-pool",
+            &pool,
+            "--cache-dir",
+            "/tmp/cache",
+            "--fdb-journal-dir",
+            "/tmp/originals",
+            "/tmp/mount",
+        ];
+        let parsed = Args::try_parse_from(args).unwrap();
+        assert_eq!(parsed.replicated_pool, Some(pool.parse().unwrap()));
+        assert_eq!(
+            parsed.fdb_journal_dir,
+            Some(PathBuf::from("/tmp/originals"))
+        );
+        for option in [
+            ["--library", "SIM"],
+            ["--pool", &pool],
+            ["--fdb-namespace", &pool],
+            ["--logical-library", &pool],
+            ["--library-changer", "/dev/sg0"],
+        ] {
+            assert!(
+                Args::try_parse_from(args.into_iter().chain(option)).is_err(),
+                "{option:?}"
+            );
+        }
     }
 
     #[test]

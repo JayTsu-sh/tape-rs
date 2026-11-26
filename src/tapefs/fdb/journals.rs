@@ -4,7 +4,7 @@ use crate::client::fdb::{NodeJournal, RenameJournal, RenameSpec, UploadJournal};
 use nix::fcntl::{Flock, FlockArg};
 use std::ffi::OsStr;
 
-pub(super) struct JournalStore {
+pub(in crate::tapefs) struct JournalStore {
     directory: Flock<File>,
 }
 
@@ -15,7 +15,7 @@ pub(super) enum SavedJournal {
 }
 
 impl JournalStore {
-    pub(super) fn open(path: &Path) -> crate::client::Result<Self> {
+    pub(in crate::tapefs) fn open(path: &Path) -> crate::client::Result<Self> {
         match std::fs::DirBuilder::new().mode(0o700).create(path) {
             Ok(()) => {
                 File::open(
@@ -43,12 +43,16 @@ impl JournalStore {
         Ok(Self { directory })
     }
 
-    pub(super) fn identity(&self) -> std::io::Result<(u64, u64)> {
+    pub(in crate::tapefs) fn directory(&self) -> &File {
+        &self.directory
+    }
+
+    pub(in crate::tapefs) fn identity(&self) -> std::io::Result<(u64, u64)> {
         let metadata = self.directory.metadata()?;
         Ok((metadata.dev(), metadata.ino()))
     }
 
-    pub(super) fn entries(&self) -> std::io::Result<std::fs::ReadDir> {
+    pub(in crate::tapefs) fn entries(&self) -> std::io::Result<std::fs::ReadDir> {
         std::fs::read_dir(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))
     }
 

@@ -240,7 +240,9 @@ impl FdbClient {
     }
 
     pub fn replicated_file_stat(&self, pool: Uuid, path: &str) -> Result<Option<Value>> {
-        validate_path(path)?;
+        if path != "/" {
+            validate_path(path)?;
+        }
         let response = self.retry_request(
             "GET",
             &format!("{BASE}/{pool}/stat?path={}", URL_SAFE_NO_PAD.encode(path)),
@@ -251,7 +253,8 @@ impl FdbClient {
             return Ok(None);
         }
         let info = management::parsed(response, &[200])?;
-        if info["path"] != path
+        if info["id"] != pool.to_string()
+            || info["path"] != path
             || !info["file_version"].as_u64().is_some_and(|v| v > 0)
             || !matches!(
                 info["kind"].as_str(),
@@ -263,6 +266,53 @@ impl FdbClient {
             ));
         }
         Ok(Some(info))
+    }
+
+    pub fn replicated_children(
+        &self,
+        pool: Uuid,
+        path: &str,
+        after: Option<&str>,
+    ) -> Result<Value> {
+        if path != "/" {
+            validate_path(path)?;
+        }
+        let mut route = format!(
+            "{BASE}/{pool}/children?path={}",
+            URL_SAFE_NO_PAD.encode(path)
+        );
+        if let Some(after) = after {
+            route.push_str(&format!("&after={}", URL_SAFE_NO_PAD.encode(after)));
+        }
+        let response = self.retry_request("GET", &route, None, &[])?;
+        let page = management::parsed(response, &[200])?;
+        if page["id"] != pool.to_string() || !page["items"].is_array() {
+            return Err(ClientError::Verification("多副本目录页与原请求不符".into()));
+        }
+        Ok(page)
+    }
+
+    pub(crate) fn download_replicated_to(
+        &self,
+        pool: Uuid,
+        path: &str,
+        out: &mut File,
+    ) -> Result<u64> {
+        let info = self
+            .replicated_file_stat(pool, path)?
+            .ok_or(ClientError::NotFound)?;
+        if info["kind"] != "file" {
+            return Err(invalid("读取目标须为普通文件"));
+        }
+        let version = info["file_version"].as_u64().expect("validated version");
+        self.download_replica_body(
+            &format!(
+                "{BASE}/{pool}/file?path={}&version={version}",
+                URL_SAFE_NO_PAD.encode(path)
+            ),
+            &info,
+            out,
+        )
     }
 
     pub fn download_replicated_new(

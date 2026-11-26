@@ -379,6 +379,7 @@ pub(super) async fn publish_archive(
 fn archive_info(path: &str, archive: &archive::Published) -> Value {
     json!({"path":path,"kind":"file","file_version":archive.version,"size":archive.size,
         "sha256":hex(&archive.sha256),"replica_count":archive.members.len(),
+        "object_headers":archive.object.as_ref().map(|object| &object.headers),"modified":archive.modified,
         "pool_ids":archive.members.iter().map(|member| member.pool_id).collect::<Vec<_>>()})
 }
 
@@ -436,6 +437,12 @@ impl ManagedCatalog {
         pool_catalog_path(parent, path.as_bytes())?;
         let tr = self.db.create_trx()?;
         let creation = archive::require_published(&tr, parent, routes).await?;
+        if path == "/" {
+            return Ok(Some(ReplicaFile {
+                info: json!({"path":"/","kind":"directory","file_version":1,"size":0}),
+                copies: Vec::new(),
+            }));
+        }
         let Some(head) = head(&tr, parent, path).await? else {
             return Ok(None);
         };
@@ -572,4 +579,177 @@ impl ManagedCatalog {
         }
         Ok(source)
     }
+}
+
+impl ManagedCatalog {
+    pub(crate) async fn replica_children(
+        &self,
+        pool: Uuid,
+        path: &str,
+        after: Option<&str>,
+        routes: &BTreeMap<String, ActiveLibraryRoute>,
+    ) -> Result<Option<Value>> {
+        pool_catalog_path(pool, path.as_bytes())?;
+        if let Some(name) = after {
+            validate_name(name.as_bytes())?;
+        }
+        let tr = self.db.create_trx()?;
+        archive::require_published(&tr, pool, routes).await?;
+        if path != "/" {
+            match head(&tr, pool, path).await? {
+                None => return Ok(None),
+                Some(Head::Imported(row)) if row.source.content.kind == Kind::Directory => {}
+                _ => return Err(CatalogError::Invalid("多副本池路径不是目录")),
+            }
+        }
+        let base = task_key(pool, b'h');
+        let prefix = path_key(pool, b'h', &format!("{}/", path.trim_end_matches('/')));
+        let mut items = Vec::new();
+        let mut start = after.map(|name| [prefix.as_slice(), name.as_bytes()].concat());
+        let mut inclusive = false;
+        while items.len() <= 100 {
+            let rows = path_rows(&tr, &prefix, start.as_deref(), inclusive).await?;
+            if rows.is_empty() {
+                break;
+            }
+            for (key, row) in rows {
+                let name = path_suffix(&prefix, &key)?;
+                if let Some((child, _)) = name.split_once('/') {
+                    start = Some(prefix_end(
+                        &[prefix.as_slice(), child.as_bytes(), b"/"].concat(),
+                    ));
+                    inclusive = true;
+                    break;
+                }
+                if !name.is_empty() {
+                    items.push(head_info(path_suffix(&base, &key)?, decode(&row)?));
+                }
+                start = Some(key);
+                inclusive = false;
+                if items.len() > 100 {
+                    break;
+                }
+            }
+        }
+        let next = if items.len() > 100 {
+            items.truncate(100);
+            items
+                .last()
+                .and_then(|v| v["path"].as_str())
+                .and_then(|p| p.rsplit('/').next())
+        } else {
+            None
+        };
+        Ok(Some(json!({"id":pool,"items":items,"next":next})))
+    }
+
+    pub(crate) async fn list_replica_objects(
+        &self,
+        routes: &BTreeMap<String, ActiveLibraryRoute>,
+        query: ObjectListRequest<'_>,
+    ) -> Result<Page<ObjectEntry>> {
+        let tr = self.db.create_trx()?;
+        archive::require_published(&tr, query.pool, routes).await?;
+        let base = path_key(query.pool, b'h', "/");
+        let prefix = [base.as_slice(), query.prefix.as_bytes()].concat();
+        let mut start = Some([base.as_slice(), query.start_after.as_bytes()].concat());
+        let mut inclusive = false;
+        let mut items = Vec::new();
+        while query.max_keys > 0 && items.len() <= query.max_keys {
+            let rows = path_rows(&tr, &prefix, start.as_deref(), inclusive).await?;
+            if rows.is_empty() {
+                break;
+            }
+            for (key, raw) in rows {
+                let object_key = path_suffix(&base, &key)?;
+                let suffix = path_suffix(&prefix, &key)?;
+                let info = head_info(&format!("/{object_key}"), decode(&raw)?);
+                let is_file = info["kind"] == "file";
+                let grouping = if query.delimiter == "/" {
+                    suffix
+                        .find('/')
+                        .map(|i| &object_key[..query.prefix.len() + i + 1])
+                } else {
+                    None
+                };
+                if is_file && let Some(group) = grouping {
+                    if group > query.start_after {
+                        items.push(ObjectEntry {
+                            key: group.into(),
+                            file: None,
+                            modified: None,
+                        });
+                    }
+                    start = Some(prefix_end(&[base.as_slice(), group.as_bytes()].concat()));
+                    inclusive = true;
+                    break;
+                }
+                if is_file {
+                    let inode =
+                        crate::replicated_pool::inode(query.pool, &format!("/{object_key}"));
+                    items.push(ObjectEntry {
+                        key: object_key.into(),
+                        file: Some((
+                            inode,
+                            FileHead {
+                                version: info["file_version"].as_u64().expect("catalog version"),
+                                size: info["size"].as_u64().expect("catalog size"),
+                                copy_id: inode,
+                            },
+                        )),
+                        modified: info["modified"].as_i64(),
+                    });
+                }
+                start = Some(key);
+                inclusive = false;
+                if items.len() > query.max_keys {
+                    break;
+                }
+            }
+        }
+        let next = if items.len() > query.max_keys {
+            items.truncate(query.max_keys);
+            items.last().map(|row| row.key.as_bytes().to_vec())
+        } else {
+            None
+        };
+        Ok(Page { items, next })
+    }
+}
+
+fn head_info(path: &str, head: Head) -> Value {
+    match head {
+        Head::Imported(row) => json!({"path":path,"kind":row.source.content.kind,"file_version":1,
+            "size":row.source.content.length,"sha256":hex(&row.source.content.sha256)}),
+        Head::Archived { archive } => archive_info(path, &archive),
+    }
+}
+
+async fn path_rows(
+    tr: &Transaction,
+    prefix: &[u8],
+    start: Option<&[u8]>,
+    inclusive: bool,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let end = prefix_end(prefix);
+    if start.is_some_and(|start| start >= end.as_slice()) {
+        return Ok(Vec::new());
+    }
+    let begin = match start {
+        Some(key) if key >= prefix && !inclusive => KeySelector::first_greater_than(key.to_vec()),
+        Some(key) if key >= prefix => KeySelector::first_greater_or_equal(key.to_vec()),
+        _ => KeySelector::first_greater_or_equal(prefix.to_vec()),
+    };
+    let range = RangeOption {
+        begin,
+        end: KeySelector::first_greater_or_equal(end),
+        limit: Some(64),
+        ..RangeOption::default()
+    };
+    Ok(tr
+        .get_range(&range, 1, false)
+        .await?
+        .iter()
+        .map(|row| (row.key().to_vec(), row.value().to_vec()))
+        .collect())
 }

@@ -32,7 +32,7 @@ mod notify;
 #[path = "fdb_http_pools.rs"]
 mod pools;
 #[path = "fdb_http_replica_files.rs"]
-mod replica_files;
+pub(super) mod replica_files;
 #[path = "fdb_http_replicated_pools.rs"]
 mod replicated_pools;
 
@@ -59,7 +59,7 @@ mod objects;
 mod renames;
 
 #[derive(Clone)]
-struct Context {
+pub(super) struct Context {
     catalog: Arc<ManagedCatalog>,
     routes: BTreeMap<String, ActiveLibraryRoute>,
     owner: Option<OwnerRuntime>,
@@ -663,14 +663,14 @@ pub fn writer_router(
     owner_router_inner(catalog, routes, libraries, peers, Some(budget))
 }
 
-fn owner_router_inner(
+pub(super) fn owner_context(
     catalog: Arc<ManagedCatalog>,
     routes: BTreeMap<String, ActiveLibraryRoute>,
     libraries: BTreeMap<String, Arc<HttpContext>>,
     peers: HashMap<u64, String>,
     upload_budget: Option<super::fdb_read::ReadStorageBudget>,
-) -> std::io::Result<Router> {
-    let ctx = Arc::new(Context {
+) -> Arc<Context> {
+    Arc::new(Context {
         catalog,
         routes,
         upload_budget,
@@ -682,7 +682,17 @@ fn owner_router_inner(
             peers,
             requests: Arc::new(Semaphore::new(32)),
         }),
-    });
+    })
+}
+
+fn owner_router_inner(
+    catalog: Arc<ManagedCatalog>,
+    routes: BTreeMap<String, ActiveLibraryRoute>,
+    libraries: BTreeMap<String, Arc<HttpContext>>,
+    peers: HashMap<u64, String>,
+    upload_budget: Option<super::fdb_read::ReadStorageBudget>,
+) -> std::io::Result<Router> {
+    let ctx = owner_context(catalog, routes, libraries, peers, upload_budget);
     pools::start_worker(&ctx)?;
     let files = if upload_budget.is_some() {
         get(content).put(upload::write)

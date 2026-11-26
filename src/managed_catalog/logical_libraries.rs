@@ -797,11 +797,18 @@ impl ManagedCatalog {
             .await?
             .ok_or(CatalogError::Incomplete)?;
         routing::decode_active(&raw)?;
-        if raw[0] != routing::LOGICAL_ROUTE_VERSION {
-            return Ok(pools.into_iter().map(|pool| (pool, None)).collect());
-        }
         let mut verified = BTreeSet::new();
         for pool in pools {
+            if super::replicated_pools::parent_at(&tr, ns, pool.id)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+            if raw[0] != routing::LOGICAL_ROUTE_VERSION {
+                scopes.push((pool, None));
+                continue;
+            }
             let Some(id) = pool_library_at(&tr, ns, serial, pool.id).await? else {
                 continue;
             };

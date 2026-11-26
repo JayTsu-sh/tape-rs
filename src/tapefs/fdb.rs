@@ -4,7 +4,7 @@ use crate::client::fdb::FdbClient;
 use crate::client::{ClientError, FileStat, FileVersion};
 use serde_json::{Value, json};
 use uuid::Uuid;
-mod journals;
+pub(super) mod journals;
 mod renames;
 use journals::{JournalStore, SavedJournal};
 

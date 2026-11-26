@@ -29,7 +29,7 @@ mod replica_files;
 mod replicated_pools;
 mod upload_ack;
 mod upload_intent;
-mod upload_state;
+pub(crate) mod upload_state;
 pub use listing::ListObjectsOptions;
 pub use upload_state::UploadJournal;
 
