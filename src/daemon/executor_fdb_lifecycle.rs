@@ -377,9 +377,27 @@ async fn choose_plan(
         .await
         .map_err(lost)?;
     let home = choose_home(&map, &rows, item, prior_home, assignment.is_none())?;
+    let resources = control
+        .catalog
+        .active_mechanical_resources(&control.serial, control.route, owner.round, task.request())
+        .await
+        .map_err(lost)?;
+    if resources
+        .as_ref()
+        .is_some_and(|r| !r.storage_slots.contains(&home))
+    {
+        return Err(failed("原 home 不属于指定逻辑带库"));
+    }
     plan.source = Some(item.address);
     plan.home = Some(home);
     let source_drive = inv.drives.iter().find(|d| d.addr == item.address);
+    if source_drive.is_some_and(|drive| {
+        resources
+            .as_ref()
+            .is_some_and(|r| !r.drives.contains(&owner.devices[drive.dev].serial))
+    }) {
+        return Err(failed("磁带所在驱动器不属于指定逻辑带库"));
+    }
     if matches!(kind(task), "media-move" | "media-unassign") {
         if let Some(drive) = source_drive {
             if assignment.is_none() {
@@ -442,7 +460,11 @@ async fn choose_plan(
     }
     let mut selected = None;
     for drive in &inv.drives {
-        if !super::super::management::drive_allowed(&policy, &owner.devices[drive.dev].serial, 'g')
+        let serial = &owner.devices[drive.dev].serial;
+        if resources
+            .as_ref()
+            .is_some_and(|r| !r.drives.contains(serial))
+            || !super::super::management::drive_allowed(&policy, serial, 'g')
         {
             continue;
         }
@@ -478,8 +500,8 @@ async fn choose_plan(
             break;
         }
     }
-    let drive = selected
-        .ok_or_else(|| ReadError::Busy("没有兼容且空闲的维护驱动器；不自动淘汰其他介质".into()))?;
+    let drive =
+        selected.ok_or_else(|| ReadError::Busy("请求范围内没有兼容且空闲的维护驱动器".into()))?;
     if drive.loaded.is_none()
         && let Some(pool) = task.pool()
     {
@@ -5319,12 +5341,68 @@ mod tests {
         let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
         let _network = unsafe { foundationdb::boot() };
         let catalog = Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());
-        let (mut fixture, control, pool, status) = Box::pin(native_fixture_from(
+        use crate::logical_library::{CreateLogicalLibrary, LogicalLibraryResources};
+        let (mut fixture, control, mut pool, status) = Box::pin(native_fixture_from(
             catalog.clone(),
             None,
-            Fixture::with_drives(2),
+            Fixture::with_media(2, false),
         ))
         .await;
+        catalog
+            .enable_logical_business_fixture(&control.serial)
+            .await
+            .unwrap();
+        let epoch = fixture.owner.round;
+        let logical = uuid::Uuid::new_v4();
+        let (map, _) = management::elements(&fixture.owner.devices).unwrap();
+        let observation = management::observe_devices(&fixture.owner.devices, 2, epoch).unwrap();
+        catalog
+            .record_active_library_inventory(&control.serial, control.route, epoch, &observation)
+            .await
+            .unwrap();
+        let resources = LogicalLibraryResources {
+            drives: fixture
+                .owner
+                .devices
+                .iter()
+                .filter(|device| device.kind == DeviceKind::Drive)
+                .map(|device| device.serial.clone())
+                .collect(),
+            storage_slots: vec![map.storage_start, map.storage_start + 1],
+            ie_slots: vec![],
+        };
+        catalog
+            .create_logical_library(
+                &control.serial,
+                control.route,
+                epoch,
+                CreateLogicalLibrary {
+                    version: 1,
+                    id: logical,
+                    name: "reclaim-logical".into(),
+                    resources,
+                },
+            )
+            .await
+            .unwrap();
+        pool.id = uuid::Uuid::new_v4();
+        pool.name = "reclaim-logical-pool".into();
+        catalog
+            .create_admin_pool(&control.serial, control.route, epoch, Some(logical), &pool)
+            .await
+            .unwrap();
+        fixture
+            .lib
+            .insert_cartridge(SimCartridge::blank("LIFE00L8", 128 << 20), 0)
+            .unwrap();
+        {
+            let mut changer = MediumChanger::new(changer_device(&fixture.owner).unwrap());
+            changer.load_address_map().unwrap();
+            changer
+                .move_medium(map.storage_start, map.dt_start)
+                .unwrap();
+        }
+        TapeDrive::new(fixture.device()).load().unwrap();
         fixture.format(uuid::Uuid::new_v4());
         let mut volume = LtfsVolume::mount(fixture.device()).unwrap();
         volume
@@ -5332,7 +5410,8 @@ mod tests {
             .unwrap();
         volume.commit().unwrap();
         drop(volume);
-        let request = |change: Value| {
+        let request = |mut change: Value| {
+            change["logical_library"] = json!(logical);
             ManagementRequest::parse(json!({"version":1,"library":control.serial,"namespace":control.route.route.namespace.to_string(),"epoch":1,"operation":uuid::Uuid::new_v4().to_string(),"change":change})).unwrap()
         };
         let home = request(
@@ -5368,7 +5447,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let spec=ReclaimSpec::parse(&json!({"kind":"media-reclaim","pool":pool.id.to_string(),"barcode":source.barcode,"volume":source.volume_id.unwrap().to_string(),"revision":source.revision,"confirm_format":true,"unassign":false})).unwrap();
+        let spec=ReclaimSpec::parse(&json!({"kind":"media-reclaim","pool":pool.id.to_string(),"barcode":source.barcode,"volume":source.volume_id.unwrap().to_string(),"revision":source.revision,"confirm_format":true,"unassign":false,"logical_library":logical})).unwrap();
         let original = request(spec.to_json());
         catalog
             .admit_management(
@@ -6466,21 +6545,26 @@ mod tests {
             Self::with_drives(1)
         }
         fn with_drives(drives: usize) -> Self {
+            Self::with_media(drives, true)
+        }
+        fn with_media(drives: usize, loaded: bool) -> Self {
             let root =
                 std::env::temp_dir().join(format!("native-lifecycle-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir(&root).unwrap();
             let lib = SimLibrary::new(drives, 3, 1);
             lib.enable_changer_pr();
-            lib.insert_cartridge(SimCartridge::blank("LIFE00L8", 128 << 20), 0)
-                .unwrap();
-            // Exercise MOVE MEDIUM so READ ELEMENT STATUS carries the real
-            // source address; a direct fixture load has no trusted home.
-            let changer_device = lib.changer_as(1);
-            let mut changer = MediumChanger::new(&changer_device);
-            let map = changer.load_address_map().unwrap().clone();
-            changer
-                .move_medium(map.storage_start, map.dt_start)
-                .unwrap();
+            if loaded {
+                lib.insert_cartridge(SimCartridge::blank("LIFE00L8", 128 << 20), 0)
+                    .unwrap();
+                // Exercise MOVE MEDIUM so READ ELEMENT STATUS carries the real
+                // source address; a direct fixture load has no trusted home.
+                let changer_device = lib.changer_as(1);
+                let mut changer = MediumChanger::new(&changer_device);
+                let map = changer.load_address_map().unwrap().clone();
+                changer
+                    .move_medium(map.storage_start, map.dt_start)
+                    .unwrap();
+            }
             let permit = Arc::new(Permission::default());
             permit.renew(7, Phase::Fencing, Instant::now() + Duration::from_secs(60));
             let opts = ExecOptions {
@@ -6505,9 +6589,11 @@ mod tests {
             )
             .unwrap();
             permit.renew(7, Phase::Serving, Instant::now() + Duration::from_secs(60));
-            TapeDrive::new(owner.devices[0].dev.as_ref())
-                .load()
-                .unwrap();
+            if loaded {
+                TapeDrive::new(owner.devices[0].dev.as_ref())
+                    .load()
+                    .unwrap();
+            }
             Self {
                 root,
                 lib,
@@ -7372,6 +7458,948 @@ mod tests {
                 assert_eq!(moves.load(Ordering::SeqCst), 1);
             }
         }
+    }
+
+    async fn next_file_request(
+        rx: std::sync::mpsc::Receiver<ExecRequest>,
+    ) -> (std::sync::mpsc::Receiver<ExecRequest>, ExecRequest) {
+        tokio::task::spawn_blocking(move || {
+            let request = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            (rx, request)
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn serve_file_upload(
+        fixture: &mut Fixture,
+        control: &FdbOwnerControl,
+        status: &SharedStatus,
+        rx: std::sync::mpsc::Receiver<ExecRequest>,
+    ) -> std::sync::mpsc::Receiver<ExecRequest> {
+        let (rx, prepare) = next_file_request(rx).await;
+        let ExecRequest::FdbPrepare {
+            spec,
+            barcode,
+            reply,
+        } = prepare
+        else {
+            panic!("上传准备必须先固定原意图");
+        };
+        let intent = Box::pin(fdb_writing::prepare(
+            &fixture.owner,
+            &fixture.permit,
+            control,
+            &spec,
+            barcode.as_deref(),
+        ))
+        .await;
+        reply.send(intent).unwrap();
+        let (rx, write) = next_file_request(rx).await;
+        let ExecRequest::FdbWrite {
+            intent,
+            file,
+            reply,
+        } = write
+        else {
+            panic!("文件正文必须使用已准备的原请求");
+        };
+        let mut results = Box::pin(fdb_writing::write_batch(
+            &mut fixture.owner,
+            &fixture.permit,
+            control,
+            status,
+            vec![(*intent, file)],
+        ))
+        .await;
+        reply.send(results.pop().unwrap()).unwrap();
+        rx
+    }
+
+    async fn serve_file_read(
+        fixture: &mut Fixture,
+        control: &FdbOwnerControl,
+        status: &SharedStatus,
+        rx: std::sync::mpsc::Receiver<ExecRequest>,
+    ) -> std::sync::mpsc::Receiver<ExecRequest> {
+        let (rx, pending) = next_file_request(rx).await;
+        let ExecRequest::Scoped { pool, request, .. } = pending else {
+            panic!("HTTP 读取必须派发有 pool 范围的请求");
+        };
+        let ExecRequest::ReadTo { path, file, reply } = *request else {
+            panic!("HTTP 读取必须派发文件流");
+        };
+        drop(file);
+        let result = Box::pin(read_fdb(
+            &mut fixture.owner,
+            Some(&fixture.permit),
+            control,
+            status,
+            &path,
+            Some(&pool),
+        ))
+        .await;
+        reply.send(result).unwrap();
+        rx
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；Sim 逻辑库自动装卸，不访问实际设备"]
+    async fn logical_pool_automatic_mechanics_use_its_drive_and_original_home() {
+        use crate::daemon::{fdb_http, http::HttpContext, s3, state::Executor};
+        use crate::logical_library::{CreateLogicalLibrary, LogicalLibraryResources};
+        use crate::managed_catalog::{AutomaticMediaAction, AutomaticMediaPlan, ManagementRequest};
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        use http_body_util::BodyExt;
+        use hyper_util::rt::TokioIo;
+        use std::{collections::BTreeMap, sync::mpsc};
+        use uuid::Uuid;
+
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog =
+            Arc::new(crate::managed_catalog::ManagedCatalog::open(Some(&cluster)).unwrap());
+        let (mut fixture, control, mut pool, status) = Box::pin(native_fixture_from(
+            catalog.clone(),
+            None,
+            Fixture::with_media(2, false),
+        ))
+        .await;
+        let epoch = fixture.owner.round;
+        let request = |change| {
+            ManagementRequest::parse(json!({"version":1,"library":control.serial,
+            "namespace":control.route.route.namespace,"epoch":1,"operation":Uuid::new_v4(),"change":change})).unwrap()
+        };
+        let (map, _) = management::elements(&fixture.owner.devices).unwrap();
+        let home = map.storage_start;
+        let second_home = home + 1;
+        let other_slot = home + 2;
+        let mut drives = fixture
+            .owner
+            .devices
+            .iter()
+            .filter(|device| device.kind == DeviceKind::Drive)
+            .map(|device| device.serial.clone());
+        let drive = drives.next().unwrap();
+        let other_drive = drives.next().unwrap();
+        let observation = management::observe_devices(&fixture.owner.devices, 2, epoch).unwrap();
+        catalog
+            .record_active_library_inventory(&control.serial, control.route, epoch, &observation)
+            .await
+            .unwrap();
+
+        let logical = Uuid::new_v4();
+        let other_logical = Uuid::new_v4();
+        for (id, name, resources) in [
+            (
+                logical,
+                "assigned-resources",
+                LogicalLibraryResources {
+                    drives: vec![drive.clone()],
+                    storage_slots: vec![home, second_home],
+                    ie_slots: vec![],
+                },
+            ),
+            (
+                other_logical,
+                "other-resources",
+                LogicalLibraryResources {
+                    drives: vec![other_drive.clone()],
+                    storage_slots: vec![other_slot],
+                    ie_slots: vec![],
+                },
+            ),
+        ] {
+            assert!(matches!(
+                catalog
+                    .create_logical_library(
+                        &control.serial,
+                        control.route,
+                        epoch,
+                        CreateLogicalLibrary {
+                            version: 1,
+                            id,
+                            name: name.into(),
+                            resources
+                        }
+                    )
+                    .await
+                    .unwrap(),
+                crate::managed_catalog::LogicalLibraryCreation::Created(_)
+            ));
+        }
+        fixture
+            .lib
+            .insert_cartridge(SimCartridge::blank("LIFE00L8", 128 << 20), 0)
+            .unwrap();
+        pool.id = Uuid::new_v4();
+        pool.name = "logical-test-pool".into();
+        catalog
+            .enable_logical_business_fixture(&control.serial)
+            .await
+            .unwrap();
+        catalog
+            .create_admin_pool(&control.serial, control.route, epoch, Some(logical), &pool)
+            .await
+            .unwrap();
+        let volume = Uuid::new_v4();
+        let assign = request(
+            json!({"kind":"media-assign","pool":pool.id,"barcode":"LIFE00L8",
+            "volume":volume,"confirm_format":true,"force_format":false,
+            "logical_library":logical}),
+        );
+        let assigned = execute(&mut fixture, &control, &status, &assign).await;
+        assert_eq!(assigned["status"], "succeeded", "{assigned}");
+
+        let forbidden = AutomaticMediaPlan {
+            action: AutomaticMediaAction::MoveIn,
+            barcode: "LIFE00L8".into(),
+            volume: volume.to_string(),
+            pool: pool.id.to_string(),
+            drive_serial: drive.clone(),
+            source: other_slot,
+            destination: map.dt_start,
+            role: 'r',
+        };
+        assert!(
+            matches!(catalog.issue_automatic_media(&control.serial, control.route, epoch, &forbidden).await,
+            Err(error) if matches!(error.domain(), crate::managed_catalog::CatalogError::Invalid(_)))
+        );
+        let forbidden_drive = AutomaticMediaPlan {
+            drive_serial: other_drive.clone(),
+            source: home,
+            destination: map.dt_start + 1,
+            ..forbidden.clone()
+        };
+        assert!(
+            matches!(catalog.issue_automatic_media(&control.serial, control.route, epoch, &forbidden_drive).await,
+            Err(error) if matches!(error.domain(), crate::managed_catalog::CatalogError::Invalid(_)))
+        );
+        assert!(
+            catalog
+                .automatic_media_pending(&control.serial, control.route, epoch)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let head = catalog
+            .active_loaded_volume_head(&control.serial, "LIFE00L8", control.route, epoch)
+            .await
+            .unwrap()
+            .unwrap();
+        let placement = catalog.volume_placement(volume).await.unwrap().unwrap();
+        let selected = Box::pin(fdb_loading::select_write(
+            &mut fixture.owner,
+            &fixture.permit,
+            &control,
+            &status,
+            &placement,
+            head.index,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(fixture.owner.devices[selected].serial, drive);
+        let bytes = b"logical library cold read";
+        let file = fixture.root.join("logical-read-fixture");
+        std::fs::write(&file, bytes).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let file_service = fixture.owner.files.clone();
+        file_service.set_permission(fixture.permit.clone());
+        let http_context = |node| {
+            let mut view = status.lock().unwrap().clone();
+            view.id = node;
+            view.executor_ready = true;
+            view.catalog_frozen_index = Some(control.route.frozen_index);
+            view.executor = Some(Executor {
+                node: 1,
+                round: epoch,
+                term: 1,
+                fenced: true,
+            });
+            Arc::new(HttpContext {
+                files: file_service.clone(),
+                status: Arc::new(std::sync::Mutex::new(view)),
+                exec: std::sync::Mutex::new(tx.clone()),
+                node: std::sync::Mutex::new(mpsc::channel().0),
+                client_addrs: Default::default(),
+                wait_timeout: Duration::from_secs(15),
+            })
+        };
+        let routes = BTreeMap::from([(control.serial.clone(), control.route)]);
+        let s3_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let s3_address = s3_listener.local_addr().unwrap();
+        let s3_context = http_context(1);
+        let s3_router = s3::fdb_router(
+            catalog.clone(),
+            routes.clone(),
+            BTreeMap::from([(control.serial.clone(), s3_context.clone())]),
+            s3_context,
+            Default::default(),
+            true,
+        );
+        let s3_http = tokio::spawn(async move {
+            axum::serve(s3_listener, s3_router).await.unwrap();
+        });
+        let owner_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let owner_address = owner_listener.local_addr().unwrap().to_string();
+        let owner_router = fdb_http::writer_router(
+            catalog.clone(),
+            routes.clone(),
+            BTreeMap::from([(control.serial.clone(), http_context(1))]),
+            Default::default(),
+            control.storage,
+        )
+        .unwrap();
+        let owner_http = tokio::spawn(async move {
+            axum::serve(owner_listener, owner_router).await.unwrap();
+        });
+        let entry_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let entry_address = entry_listener.local_addr().unwrap();
+        let entry_router = fdb_http::writer_router(
+            catalog.clone(),
+            routes,
+            BTreeMap::from([(control.serial.clone(), http_context(2))]),
+            [(1, owner_address)].into(),
+            control.storage,
+        )
+        .unwrap();
+        let entry_http = tokio::spawn(async move {
+            axum::serve(entry_listener, entry_router).await.unwrap();
+        });
+        let upload_library = control.serial.clone();
+        let upload_address = entry_address.to_string();
+        let upload_namespace = control.route.route.namespace;
+        let upload_pool = pool.id;
+        let journal = fixture.root.join("scoped-upload");
+        let upload = tokio::task::spawn_blocking(move || {
+            use crate::client::fdb::{FdbClient, UploadCondition, UploadStatus};
+            let client = FdbClient::new([upload_address.as_str()])
+                .unwrap()
+                .with_logical_library(logical)
+                .unwrap();
+            let root = client
+                .stat(&upload_library, upload_pool, "/")
+                .unwrap()
+                .unwrap();
+            let condition = || UploadCondition::Create {
+                namespace: upload_namespace,
+                parent: root["id"].as_str().unwrap().parse().unwrap(),
+            };
+            for scope in [None, Some(other_logical)] {
+                let unscoped = FdbClient::new([upload_address.as_str()]).unwrap();
+                let wrong = match scope {
+                    Some(id) => unscoped.with_logical_library(id).unwrap(),
+                    None => unscoped,
+                };
+                let rejected = wrong
+                    .prepare_file(
+                        &upload_library,
+                        upload_pool,
+                        "/cold-read",
+                        &file,
+                        condition(),
+                        Some("LIFE00L8"),
+                        &journal.with_extension(Uuid::new_v4().to_string()),
+                    )
+                    .unwrap_err();
+                assert!(
+                    matches!(
+                        rejected,
+                        crate::client::ClientError::Rejected { status: 404, .. }
+                    ),
+                    "{rejected:?}"
+                );
+            }
+            client
+                .prepare_file(
+                    &upload_library,
+                    upload_pool,
+                    "/cold-read",
+                    &file,
+                    condition(),
+                    Some("LIFE00L8"),
+                    &journal,
+                )
+                .unwrap();
+            let wrong = FdbClient::new([upload_address.as_str()])
+                .unwrap()
+                .with_logical_library(other_logical)
+                .unwrap();
+            assert!(wrong.upload_saved(&journal).is_err());
+            let reopened = FdbClient::new([upload_address.as_str()]).unwrap();
+            let result = reopened.upload_saved(&journal).unwrap();
+            assert_eq!(result.details()["version"], 1);
+            assert_eq!(
+                reopened.status_saved(&journal).unwrap(),
+                UploadStatus::Committed(1)
+            );
+        });
+        let rx = serve_file_upload(&mut fixture, &control, &status, rx).await;
+        upload.await.unwrap();
+
+        // A cold executor read must evict the other managed volume using its
+        // persisted home when the changer omits the drive's source address.
+        Box::pin(fdb_loading::unload(
+            &mut fixture.owner,
+            &fixture.permit,
+            &control,
+            selected,
+            &['m'],
+        ))
+        .await
+        .unwrap();
+        fixture
+            .lib
+            .insert_cartridge(SimCartridge::blank("LIFE02L8", 128 << 20), 1)
+            .unwrap();
+        let second_volume = Uuid::new_v4();
+        let second_assign = request(json!({"kind":"media-assign","pool":pool.id,
+            "barcode":"LIFE02L8","volume":second_volume,"confirm_format":true,
+            "force_format":false,"logical_library":logical}));
+        let assigned = execute(&mut fixture, &control, &status, &second_assign).await;
+        assert_eq!(assigned["status"], "succeeded", "{assigned}");
+        let second_assignment = catalog
+            .tape_assignment(&control.serial, "LIFE02L8")
+            .await
+            .unwrap()
+            .unwrap();
+        let second_return = request(json!({"kind":"media-move","pool":pool.id,
+            "barcode":"LIFE02L8","volume":second_volume,"revision":second_assignment.revision,
+            "destination":"homeslot","logical_library":logical}));
+        let returned = execute(&mut fixture, &control, &status, &second_return).await;
+        assert_eq!(returned["status"], "succeeded", "{returned}");
+        let second_head = catalog
+            .active_loaded_volume_head(&control.serial, "LIFE02L8", control.route, epoch)
+            .await
+            .unwrap()
+            .unwrap();
+        let second_placement = catalog
+            .volume_placement(second_volume)
+            .await
+            .unwrap()
+            .unwrap();
+        let second_drive = Box::pin(fdb_loading::select_write(
+            &mut fixture.owner,
+            &fixture.permit,
+            &control,
+            &status,
+            &second_placement,
+            second_head.index,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(second_drive, selected);
+        assert_eq!(
+            catalog
+                .native_device_home(
+                    &control.serial,
+                    control.route,
+                    epoch,
+                    "LIFE02L8",
+                    Some(second_volume)
+                )
+                .await
+                .unwrap(),
+            Some(second_home)
+        );
+
+        let scoped_path =
+            crate::managed_catalog::pool_catalog_path(pool.id, b"/cold-read").unwrap();
+        let scoped_path = std::str::from_utf8(&scoped_path).unwrap();
+        fixture.lib.set_drive_source_address(0, Some(home));
+        let before = fixture.commands.lock().unwrap().len();
+        let conflict = Box::pin(read_fdb(
+            &mut fixture.owner,
+            Some(&fixture.permit),
+            &control,
+            &status,
+            scoped_path,
+            Some(&pool.id.to_string()),
+        ))
+        .await;
+        let error = conflict.expect_err("来源槽冲突时不能退带");
+        assert!(
+            matches!(error, ReadError::Lost(ref detail) if detail.contains("持久 home")),
+            "{error:?}"
+        );
+        assert!(
+            !fixture.commands.lock().unwrap()[before..]
+                .iter()
+                .any(
+                    |(kind, opcode)| (*kind == DeviceKind::Drive && *opcode == 0x1b)
+                        || (*kind == DeviceKind::Changer && *opcode == 0xa5)
+                )
+        );
+        assert!(
+            catalog
+                .automatic_media_pending(&control.serial, control.route, epoch)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        fixture.lib.set_drive_source_address(0, None);
+        let mut body = Box::pin(read_fdb(
+            &mut fixture.owner,
+            Some(&fixture.permit),
+            &control,
+            &status,
+            scoped_path,
+            Some(&pool.id.to_string()),
+        ))
+        .await
+        .unwrap();
+        let mut actual = Vec::new();
+        std::io::Read::read_to_end(&mut body, &mut actual).unwrap();
+        assert_eq!(actual, bytes);
+        let (_, rows) = management::elements(&fixture.owner.devices).unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| row.address == second_home
+                    && row.volume_tag.as_deref() == Some("LIFE02L8"))
+        );
+        assert!(
+            catalog
+                .automatic_media_pending(&control.serial, control.route, epoch)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        Box::pin(fdb_loading::unload(
+            &mut fixture.owner,
+            &fixture.permit,
+            &control,
+            selected,
+            &['m'],
+        ))
+        .await
+        .unwrap();
+        let (_, rows) = management::elements(&fixture.owner.devices).unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| row.address == home && row.volume_tag.as_deref() == Some("LIFE00L8"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.address == other_slot && !row.full)
+        );
+        let path = format!(
+            "/v1/fdb/files/{}?pool={}&path={}",
+            control.serial,
+            pool.id,
+            URL_SAFE_NO_PAD.encode(b"/cold-read")
+        );
+        let get = |scope: Option<Uuid>| {
+            let path = path.as_str();
+            async move {
+                let stream = tokio::net::TcpStream::connect(entry_address).await.unwrap();
+                let (mut sender, connection) =
+                    hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                        .await
+                        .unwrap();
+                let connection = tokio::spawn(connection);
+                let mut request =
+                    hyper::Request::get(path).header("host", entry_address.to_string());
+                if let Some(scope) = scope {
+                    request = request.header("x-tapers-logical-library", scope.to_string());
+                }
+                let response = sender
+                    .send_request(
+                        request
+                            .body(http_body_util::Empty::<bytes::Bytes>::new())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status().as_u16();
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                connection.abort();
+                (status, body)
+            }
+        };
+        let before = fixture.commands.lock().unwrap().len();
+        for scope in [None, Some(other_logical)] {
+            let (code, response) = get(scope).await;
+            assert_eq!(code, 404, "{response:?}");
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            assert_eq!(fixture.commands.lock().unwrap().len(), before);
+        }
+        let library = control.serial.clone();
+        let endpoint = entry_address.to_string();
+        let file = fixture.root.join("logical-http-download");
+        let pool_id = pool.id;
+        let download = tokio::task::spawn_blocking(move || {
+            use crate::client::fdb::FdbClient;
+            let client = FdbClient::new([endpoint.as_str()]).unwrap();
+            assert!(
+                client
+                    .stat(&library, pool_id, "/cold-read")
+                    .unwrap()
+                    .is_none()
+            );
+            let foreign = FdbClient::new([endpoint.as_str()])
+                .unwrap()
+                .with_logical_library(other_logical)
+                .unwrap();
+            assert!(
+                foreign
+                    .stat(&library, pool_id, "/cold-read")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                foreign
+                    .list_children(&library, pool_id, "/", 100, None)
+                    .is_err()
+            );
+            let client = client.with_logical_library(logical).unwrap();
+            assert_eq!(
+                client
+                    .list_children(&library, pool_id, "/", 100, None)
+                    .unwrap()["items"][0]["name"],
+                "cold-read"
+            );
+            client
+                .download_new(&library, pool_id, "/cold-read", &file)
+                .unwrap();
+            std::fs::read(file).unwrap()
+        });
+        let (body, rx) = tokio::join!(
+            download,
+            serve_file_read(&mut fixture, &control, &status, rx)
+        );
+        assert_eq!(body.unwrap(), bytes);
+
+        let s3_request = |method, path: String, body: &'static [u8]| async move {
+            let stream = tokio::net::TcpStream::connect(s3_address).await.unwrap();
+            let (mut sender, connection) =
+                hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                    .await
+                    .unwrap();
+            let connection = tokio::spawn(connection);
+            let response = sender
+                .send_request(
+                    hyper::Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("host", s3_address.to_string())
+                        .header("content-length", body.len().to_string())
+                        .body(http_body_util::Full::new(bytes::Bytes::from_static(body)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let code = response.status().as_u16();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            connection.abort();
+            (code, body)
+        };
+        for wrong in [
+            s3::bucket_name(&control.serial, &pool.id.to_string()),
+            s3::logical_bucket_name(&control.serial, other_logical, pool.id),
+        ] {
+            let (code, _) = s3_request("PUT", format!("/{wrong}/scoped-s3"), bytes).await;
+            assert_eq!(code, 404);
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        }
+        let bucket = s3::logical_bucket_name(&control.serial, logical, pool.id);
+        let object = format!("/{bucket}/scoped-s3");
+        let ((code, response), rx) = tokio::join!(
+            s3_request("PUT", object.clone(), bytes),
+            serve_file_upload(&mut fixture, &control, &status, rx)
+        );
+        assert_eq!(code, 200, "{response:?}");
+        let ((code, response), rx) = tokio::join!(
+            s3_request("GET", object, b""),
+            serve_file_read(&mut fixture, &control, &status, rx)
+        );
+        assert_eq!(code, 200, "{response:?}");
+        assert_eq!(response.as_ref(), bytes);
+        s3_http.abort();
+
+        let fuse_address = entry_address.to_string();
+        let fuse_library = control.serial.clone();
+        let fuse_namespace = control.route.route.namespace;
+        let fuse_pool = pool.id;
+        let fuse_root = fixture.root.clone();
+        let (written, rx) = tokio::join!(
+            tokio::task::spawn_blocking(move || {
+                use crate::client::fdb::FdbClient;
+                use crate::tapefs::{FdbBackend, ROOT_INO, TapeFs};
+                let foreign = FdbClient::new([fuse_address.as_str()])
+                    .unwrap()
+                    .with_logical_library(other_logical)
+                    .unwrap();
+                assert!(
+                    FdbBackend::new(foreign, fuse_library.clone(), fuse_namespace, fuse_pool)
+                        .is_err()
+                );
+                let client = FdbClient::new([fuse_address.as_str()])
+                    .unwrap()
+                    .with_logical_library(logical)
+                    .unwrap();
+                let backend = FdbBackend::new_writable(
+                    client,
+                    fuse_library,
+                    fuse_namespace,
+                    fuse_pool,
+                    &fuse_root.join("fuse-journals"),
+                )
+                .unwrap();
+                let fs = TapeFs::new(backend, fuse_root.join("fuse-write-cache")).unwrap();
+                let (_, handle) = fs.create(ROOT_INO, "scoped-fuse", true).unwrap();
+                fs.write(handle, 0, bytes).unwrap();
+                fs.fsync(handle).unwrap();
+                fs.release(handle);
+            }),
+            serve_file_upload(&mut fixture, &control, &status, rx)
+        );
+        written.unwrap();
+
+        let fuse_address = entry_address.to_string();
+        let fuse_library = control.serial.clone();
+        let fuse_root = fixture.root.clone();
+        let (body, _rx) = tokio::join!(
+            tokio::task::spawn_blocking(move || {
+                use crate::client::fdb::FdbClient;
+                use crate::tapefs::{FdbBackend, ROOT_INO, TapeFs};
+                let client = FdbClient::new([fuse_address.as_str()])
+                    .unwrap()
+                    .with_logical_library(logical)
+                    .unwrap();
+                let backend =
+                    FdbBackend::new(client, fuse_library, fuse_namespace, fuse_pool).unwrap();
+                let fs = TapeFs::new(backend, fuse_root.join("fuse-read-cache")).unwrap();
+                let object = fs.lookup(ROOT_INO, "scoped-fuse").unwrap();
+                let handle = fs.open(object.ino, nix::libc::O_RDONLY).unwrap();
+                let body = fs.read(handle, 0, bytes.len() as u32).unwrap();
+                fs.release(handle);
+                body
+            }),
+            serve_file_read(&mut fixture, &control, &status, rx)
+        );
+        assert_eq!(body.unwrap(), bytes);
+        owner_http.abort();
+        entry_http.abort();
+        let (_, rows) = management::elements(&fixture.owner.devices).unwrap();
+        assert!(rows.iter().any(|row| {
+            row.drive_id.as_deref() == Some(drive.as_str())
+                && row.volume_tag.as_deref() == Some("LIFE00L8")
+        }));
+        assert!(
+            rows.iter()
+                .any(|row| row.drive_id.as_deref() == Some(other_drive.as_str()) && !row.full)
+        );
+        Box::pin(fdb_loading::unload(
+            &mut fixture.owner,
+            &fixture.permit,
+            &control,
+            selected,
+            &['r'],
+        ))
+        .await
+        .unwrap();
+
+        let assignment = catalog
+            .tape_assignment(&control.serial, "LIFE00L8")
+            .await
+            .unwrap()
+            .unwrap();
+        let change = json!({"kind":"media-validate","pool":pool.id,"barcode":"LIFE00L8",
+            "volume":volume,"revision":assignment.revision});
+        for invalid in [None, Some(other_logical)] {
+            let mut change = change.clone();
+            if let Some(id) = invalid {
+                change["logical_library"] = json!(id);
+            }
+            assert!(
+                catalog
+                    .admit_management(&control.serial, control.route, epoch, &request(change))
+                    .await
+                    .is_err()
+            );
+        }
+        let mut scoped = change;
+        scoped["logical_library"] = json!(logical);
+        let validation = request(scoped);
+        catalog
+            .admit_management(&control.serial, control.route, epoch, &validation)
+            .await
+            .unwrap();
+        let task = catalog
+            .start_native_device_task(
+                &control.serial,
+                control.route,
+                epoch,
+                validation.epoch(),
+                validation.operation(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut forbidden = choose_plan(&fixture.owner, &fixture.permit, &control, &task)
+            .await
+            .unwrap();
+        assert_eq!(forbidden.drive_serial.as_deref(), Some(drive.as_str()));
+        forbidden.destination = Some(map.dt_start + 1);
+        forbidden.drive_serial = Some(other_drive.clone());
+        assert!(matches!(
+            catalog
+                .checkpoint_native_device_task(&task, epoch, "ready", "planned", &json!(forbidden), None)
+                .await,
+            Err(error) if matches!(error.domain(), CatalogError::Invalid(_))
+        ));
+        let done = execute(&mut fixture, &control, &status, &validation).await;
+        assert_eq!(done["status"], "succeeded", "{done}");
+
+        let other_volume = Uuid::new_v4();
+        fixture
+            .lib
+            .insert_cartridge(
+                SimCartridge::blank("LIFE01L8", 128 << 20),
+                usize::from(other_slot - map.storage_start),
+            )
+            .unwrap();
+        let other_index = fixture
+            .owner
+            .devices
+            .iter()
+            .position(|device| device.serial == other_drive)
+            .unwrap();
+        {
+            let mut changer = MediumChanger::new(changer_device(&fixture.owner).unwrap());
+            changer.load_address_map().unwrap();
+            changer.move_medium(other_slot, map.dt_start + 1).unwrap();
+            let device = fixture.owner.devices[other_index].dev.as_ref();
+            TapeDrive::new(device).load().unwrap();
+            mkltfs(
+                device,
+                &MkltfsOptions {
+                    volume_id: "LIFE01".into(),
+                    volume_uuid: Some(other_volume),
+                    block_size: fixture.opts.block_size,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            TapeDrive::new(device).unload().unwrap();
+            changer.move_medium(map.dt_start + 1, other_slot).unwrap();
+        }
+        let other_pool = crate::managed_catalog::PoolRecord {
+            id: Uuid::new_v4(),
+            name: "other-logical-test-pool".into(),
+            ..pool
+        };
+        catalog
+            .create_admin_pool(
+                &control.serial,
+                control.route,
+                epoch,
+                Some(other_logical),
+                &other_pool,
+            )
+            .await
+            .unwrap();
+        let change = json!({"kind":"media-import","pool":other_pool.id,"barcode":"LIFE01L8",
+            "volume":other_volume,"path":"/","merge_tapes":true,"logical_library":logical});
+        assert!(
+            catalog
+                .admit_management(
+                    &control.serial,
+                    control.route,
+                    epoch,
+                    &request(change.clone())
+                )
+                .await
+                .is_err()
+        );
+        let mut change = change;
+        change["logical_library"] = json!(other_logical);
+        let import_request = request(change);
+        catalog
+            .admit_management(&control.serial, control.route, epoch, &import_request)
+            .await
+            .unwrap();
+        let intake = catalog
+            .start_native_media(
+                &control.serial,
+                control.route,
+                epoch,
+                import_request.epoch(),
+                import_request.operation(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let wrong = crate::managed_catalog::NativeMediaLoadPlan {
+            source: other_slot,
+            destination: map.dt_start,
+            drive_serial: drive,
+            home: Some(other_slot),
+            eviction: None,
+        };
+        assert!(matches!(
+            catalog.prepare_native_media_load(&intake, epoch, &wrong).await,
+            Err(error) if matches!(error.domain(), CatalogError::Invalid(_))
+        ));
+        let imported = execute(&mut fixture, &control, &status, &import_request).await;
+        assert_eq!(imported["status"], "succeeded", "{imported}");
+        assert_eq!(
+            catalog
+                .volume_placement(other_volume)
+                .await
+                .unwrap()
+                .unwrap()
+                .pool_id,
+            other_pool.id,
+        );
+        assert_eq!(fixture.lib.loaded_barcode(1).as_deref(), Some("LIFE01L8"));
+
+        let source = catalog
+            .tape_assignment(&control.serial, "LIFE00L8")
+            .await
+            .unwrap()
+            .unwrap();
+        let reclaim = request(
+            json!({"kind":"media-reclaim","pool":source.pool_id,"barcode":source.barcode,
+            "volume":source.volume_id,"revision":source.revision,"confirm_format":true,
+            "unassign":false,"logical_library":logical}),
+        );
+        catalog
+            .admit_management(&control.serial, control.route, epoch, &reclaim)
+            .await
+            .unwrap();
+        let parent = catalog
+            .start_reclaim_management(
+                &control.serial,
+                control.route,
+                epoch,
+                reclaim.epoch(),
+                reclaim.operation(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let before_reclaim = fixture.commands.lock().unwrap().len();
+        assert!(matches!(
+            super::super::fdb_reclaim::advance(
+                &mut fixture.owner,
+                &fixture.permit,
+                &control,
+                &status,
+            ).await,
+            Err(ReadError::Busy(reason)) if reason.contains("至少需要两个维护驱动器")
+        ));
+        assert_eq!(fixture.commands.lock().unwrap().len(), before_reclaim);
+        assert!(
+            catalog
+                .reclaim_dependency_snapshot(&parent, epoch)
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .contains("至少需要两个维护驱动器")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

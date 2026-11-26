@@ -437,7 +437,9 @@ mod fdb_preflight;
 #[path = "executor_library_handoff.rs"]
 mod library_handoff;
 #[cfg(feature = "fdb")]
-pub use library_handoff::verify_library_release_offline;
+pub(crate) use library_handoff::OfflineLogicalLibraryInventory;
+#[cfg(feature = "fdb")]
+pub use library_handoff::{activate_logical_library_offline, verify_library_release_offline};
 
 struct Active {
     #[cfg(feature = "fdb")]
@@ -1666,7 +1668,10 @@ fn run_fdb_owner_inner(
                         library_handoff::health(&owner.devices)?;
                         runtime
                             .block_on(fdb_inventory::refresh(owner, permit, &control, &opts))
-                            .map_err(|e| TapeError::Catalog(e.to_string()))?;
+                            .map_err(|error| match error {
+                                ReadError::Busy(reason) => TapeError::NotReady(reason),
+                                error => TapeError::Catalog(error.to_string()),
+                            })?;
                         return Ok(0);
                     }
                     // Unknown originals are fenced before cleanup, mechanical

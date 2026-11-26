@@ -76,6 +76,13 @@ pub(super) async fn list(
         Ok(v) => v,
         Err(e) => return invalid(e),
     };
+    let logical = match pools::logical_scope(request.headers()) {
+        Ok(logical) => logical,
+        Err(error) => return *error,
+    };
+    if let Err(error) = check_file_pool_scope(&ctx, &serial, route, pool, logical).await {
+        return *error;
+    }
     match ctx
         .catalog
         .list_active_objects_for_route(

@@ -853,6 +853,7 @@ impl ManagedCatalog {
             let (request,mut task)=management::task_for_identity(&tr,serial,route.route.namespace,epoch,operation).await?;
             if !matches!(request.value()["change"]["kind"].as_str(),Some("media-import")){return Err(CatalogError::Invalid("不是原生介质任务"));}
             if !matches!(task["status"].as_str(),Some("queued"|"running")){return Ok(None);}
+            logical_libraries::mechanical_resources_at(&tr,route.route.namespace,serial,&request).await?;
             let mut import=NativeMediaImport{request,route,refresh:None};
             if task["status"]=="queued" {
                 let pool=decode_pool(import.pool(),&tr.get(&pool_key(route.route.namespace,import.pool()),false).await?.ok_or(CatalogError::Invalid("目标池不存在"))?)?;

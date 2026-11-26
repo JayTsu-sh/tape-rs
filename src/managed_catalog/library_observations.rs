@@ -34,6 +34,12 @@ struct Drive {
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SlotLayout {
+    storage_start: u16,
+    ie_start: u16,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Observation {
     library_serial: String,
     owner: u64,
@@ -46,6 +52,8 @@ struct Observation {
     scsi_vendor_id: String,
     scsi_product_id: String,
     scsi_firmware_revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slot_layout: Option<SlotLayout>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -156,6 +164,36 @@ fn normalize(value: &mut Observation, serial: &str, owner: u64) -> Result<()> {
             _ => return Err(CatalogError::Invalid("驱动器装载状态与完整库存观测不一致")),
         }
     }
+    if let Some(layout) = &value.slot_layout {
+        let (storage, ie) = (
+            u32::from(layout.storage_start)
+                ..u32::from(layout.storage_start) + u32::from(value.num_of_slots),
+            u32::from(layout.ie_start)
+                ..u32::from(layout.ie_start) + u32::from(value.num_of_ieslots),
+        );
+        if storage.end > u32::from(u16::MAX) + 1
+            || ie.end > u32::from(u16::MAX) + 1
+            || !storage.is_empty()
+                && !ie.is_empty()
+                && storage.start < ie.end
+                && ie.start < storage.end
+            || usize::from(value.num_of_slots)
+                + usize::from(value.num_of_ieslots)
+                + value.drives.len()
+                > crate::logical_library::MAX_RESOURCES
+            || value.drives.iter().any(|drive| {
+                let address = u32::from(drive.address);
+                storage.contains(&address) || ie.contains(&address)
+            })
+            || value.volumes.iter().any(|medium| {
+                let address = u32::from(medium.address);
+                (medium.element_type == 2) != storage.contains(&address)
+                    || (medium.element_type == 3) != ie.contains(&address)
+            })
+        {
+            return Err(CatalogError::Invalid("带库槽位布局与库存元素不符"));
+        }
+    }
     value.volumes.sort_by_key(|v| v.address);
     value.drives.sort_by_key(|d| d.address);
     Ok(())
@@ -179,22 +217,30 @@ fn input(serial: &str, owner: u64, value: &Value) -> Result<Observation> {
     let drives = value["drives"]
         .as_array()
         .ok_or(CatalogError::Invalid("库存drives必须是数组"))?;
-    if !fields(
-        value,
-        &[
-            "library_serial",
-            "owner",
-            "round",
-            "observed_at",
-            "volumes",
-            "drives",
-            "num_of_slots",
-            "num_of_ieslots",
-            "scsi_vendor_id",
-            "scsi_product_id",
-            "scsi_firmware_revision",
-        ],
-    ) || !number(&value["num_of_slots"], u16::MAX.into())
+    let mut names = vec![
+        "library_serial",
+        "owner",
+        "round",
+        "observed_at",
+        "volumes",
+        "drives",
+        "num_of_slots",
+        "num_of_ieslots",
+        "scsi_vendor_id",
+        "scsi_product_id",
+        "scsi_firmware_revision",
+    ];
+    if let Some(layout) = value.get("slot_layout") {
+        if !fields(layout, &["storage_start", "ie_start"])
+            || !number(&layout["storage_start"], u16::MAX.into())
+            || !number(&layout["ie_start"], u16::MAX.into())
+        {
+            return Err(CatalogError::Invalid("带库库存槽位布局无效"));
+        }
+        names.push("slot_layout");
+    }
+    if !fields(value, &names)
+        || !number(&value["num_of_slots"], u16::MAX.into())
         || !number(&value["num_of_ieslots"], u16::MAX.into())
         || [
             ("scsi_vendor_id", 8),
@@ -244,10 +290,13 @@ fn input(serial: &str, owner: u64, value: &Value) -> Result<Observation> {
     Ok(observation)
 }
 fn inventory_view(observation: &Observation) -> Value {
-    let physical = json!({"volumes":observation.volumes,"drives":observation.drives,
+    let mut physical = json!({"volumes":observation.volumes,"drives":observation.drives,
         "num_of_slots":observation.num_of_slots,"num_of_ieslots":observation.num_of_ieslots,
         "scsi_vendor_id":observation.scsi_vendor_id,"scsi_product_id":observation.scsi_product_id,
         "scsi_firmware_revision":observation.scsi_firmware_revision});
+    if let Some(layout) = &observation.slot_layout {
+        physical["slot_layout"] = json_value(layout);
+    }
     json!({"num_of_volumes":observation.volumes.len(),"num_of_drives":observation.drives.len(),
         "snapshot_sha256":format!("{:x}",Sha256::digest(physical.to_string()))})
 }
@@ -331,14 +380,18 @@ async fn monitor_at(tr: &Transaction, ns: Uuid, serial: &str) -> Result<Option<M
     .await?;
     Ok(record)
 }
+async fn observation_at(tr: &Transaction, ns: Uuid, serial: &str) -> Result<Option<Value>> {
+    Ok(inventory_at(tr, ns, serial)
+        .await?
+        .map(|r| json_value(&r.observation)))
+}
+
 pub(super) async fn observations_at(
     tr: &Transaction,
     ns: Uuid,
     serial: &str,
 ) -> Result<(Option<Value>, Option<Value>)> {
-    let inventory = inventory_at(tr, ns, serial)
-        .await?
-        .map(|r| json_value(&r.observation));
+    let inventory = observation_at(tr, ns, serial).await?;
     let monitor = monitor_at(tr, ns, serial).await?.map(|r| json_value(&r));
     Ok((inventory, monitor))
 }
@@ -379,6 +432,10 @@ pub(super) async fn rescan_result_at(
     Ok(result)
 }
 
+pub(super) fn canonical_inventory(serial: &str, owner: u64, value: &Value) -> Result<Value> {
+    input(serial, owner, value).map(|observation| json_value(&observation))
+}
+
 pub(super) async fn record_inventory_at(
     tr: &Transaction,
     serial: &str,
@@ -395,6 +452,7 @@ pub(super) async fn record_inventory_at(
     };
     let raw = encode(&record)?;
     let old = inventory_at(tr, ns, serial).await?;
+    logical_libraries::reconcile_after_acquire(tr, ns, serial, owner, value).await?;
     let before = old.as_ref().map(|r| inventory_view(&r.observation));
     notifications::changed_at(
         tr,
@@ -460,9 +518,7 @@ impl ManagedCatalog {
     ) -> Result<Option<Value>> {
         let tr = self.db.create_trx()?;
         let ns = routing::require_expected_active_namespace(&tr, serial, Some(route)).await?;
-        Ok(inventory_at(&tr, ns, serial)
-            .await?
-            .map(|r| json_value(&r.observation)))
+        observation_at(&tr, ns, serial).await
     }
     /// Record a completed monitor attempt. The actual periodic device poller is
     /// separate; an absent error must only be supplied after a successful poll.

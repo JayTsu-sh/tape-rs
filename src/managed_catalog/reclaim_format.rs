@@ -377,6 +377,7 @@ async fn gates_after_parent_at(
     source::group_only::require_ready_at(tr,reservation,owner,None).await?;
     mechanics::require_parent_idle_at(tr, reservation).await?;
     if let Some(layout) = layout::at(tr, reservation).await? {
+        layout.require_resource_scope_at(tr, reservation).await?;
         let destination = tape_monitor::read_at(
             tr,
             reservation.namespace(),
@@ -394,6 +395,8 @@ async fn gates_after_parent_at(
         {
             return Err(CatalogError::MediaUnavailable);
         }
+    } else if reservation.spec().logical_library().is_some() {
+        return Err(CatalogError::Invalid("逻辑带库回收缺少原驱动器布局"));
     }
     upload_recovery::require_idle_at(tr, reservation).await?;
     copy_groups::require_no_unsettled_at(tr, reservation).await?;

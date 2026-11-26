@@ -60,6 +60,43 @@ struct Args {
     #[cfg(feature = "fdb")]
     #[arg(long, requires = "enable_library_handoff_offline", value_name = "UUID")]
     verify_release_operation: Option<uuid::Uuid>,
+    /// 已完成整库交还并停止所有成员后，预览现有 pool 的离线迁移
+    #[cfg(feature = "fdb")]
+    #[arg(long, value_name = "SERIAL", requires_all = ["fdb_cluster_file", "libraries_config", "logical_library_namespace", "logical_library_operation", "logical_library_release"],
+        conflicts_with_all = ["enable_library_handoff_offline", "fdb_control_only", "fdb_metadata_readonly", "fdb_owner_mode", "expand_libraries_offline", "replace_drive_offline", "remove_drive_offline"])]
+    activate_logical_library_offline: Option<String>,
+    /// 首次启用的当前 FDB namespace
+    #[cfg(feature = "fdb")]
+    #[arg(
+        long,
+        requires = "activate_logical_library_offline",
+        value_name = "UUID"
+    )]
+    logical_library_namespace: Option<uuid::Uuid>,
+    /// 首次启用的原操作 UUID，同时用作默认逻辑带库 UUID
+    #[cfg(feature = "fdb")]
+    #[arg(
+        long,
+        requires = "activate_logical_library_offline",
+        value_name = "UUID"
+    )]
+    logical_library_operation: Option<uuid::Uuid>,
+    /// 已完成的原交还操作 UUID
+    #[cfg(feature = "fdb")]
+    #[arg(
+        long,
+        requires = "activate_logical_library_offline",
+        value_name = "UUID"
+    )]
+    logical_library_release: Option<uuid::Uuid>,
+    /// 确认提交刚预览的计划，传入原 plan_sha256
+    #[cfg(feature = "fdb")]
+    #[arg(
+        long,
+        requires = "activate_logical_library_offline",
+        value_name = "SHA256"
+    )]
+    commit_logical_library_plan: Option<String>,
     /// 显式无业务控制副本：只观察原 Frozen 空目录，永不打开设备或暂存区
     #[cfg(feature = "fdb")]
     #[arg(long, requires_all = ["fdb_cluster_file", "libraries_config", "control_binding"],
@@ -401,14 +438,28 @@ fn main() {
         .write(true)
         .open(args.data_dir.join("ltfsd.lock"))
         .expect("打开进程锁");
-    let _instance_lock =
-        nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
-            .unwrap_or_else(|(_, e)| {
-                eprintln!("该数据目录已有 ltfsd 实例：{e}");
-                std::process::exit(2)
-            });
     #[cfg(feature = "fdb")]
-    if let Some(serial) = &args.enable_library_handoff_offline {
+    let activation_preview = args.activate_logical_library_offline.is_some()
+        && args.commit_logical_library_plan.is_none();
+    #[cfg(not(feature = "fdb"))]
+    let activation_preview = false;
+    let (_instance_lock, _preview_lock_blocker) =
+        match nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => (Some(lock), None),
+            Err((_, error)) if activation_preview => {
+                (None, Some(format!("该数据目录已有 ltfsd 实例：{error}")))
+            }
+            Err((_, error)) => {
+                eprintln!("该数据目录已有 ltfsd 实例：{error}");
+                std::process::exit(2)
+            }
+        };
+    #[cfg(feature = "fdb")]
+    if let Some(serial) = args
+        .enable_library_handoff_offline
+        .as_ref()
+        .or(args.activate_logical_library_offline.as_ref())
+    {
         let result = (|| -> tape_rs::error::Result<()> {
             use tape_rs::daemon::multilib::LibrariesConfig;
             use tape_rs::error::TapeError;
@@ -421,7 +472,13 @@ fn main() {
                 .iter()
                 .find(|entry| entry.changer_serial == *serial)
                 .ok_or_else(|| TapeError::NotReady("配置中不存在目标带库".into()))?;
-            require_handoff_peers_offline(&peers)?;
+            let peer_check = require_handoff_peers_offline(&peers);
+            let offline_blocker = if activation_preview {
+                _preview_lock_blocker.or_else(|| peer_check.err().map(|e| e.to_string()))
+            } else {
+                peer_check?;
+                None
+            };
             let cluster = args
                 .fdb_cluster_file
                 .as_ref()
@@ -431,10 +488,46 @@ fn main() {
             let _network = unsafe { foundationdb::boot() };
             let catalog = tape_rs::managed_catalog::ManagedCatalog::open(Some(cluster))
                 .map_err(|e| TapeError::Catalog(e.to_string()))?;
-            let namespace = args.handoff_namespace.unwrap();
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
+            if args.activate_logical_library_offline.is_some() {
+                let namespace = args.logical_library_namespace.unwrap();
+                let operation = args.logical_library_operation.unwrap();
+                let release = args.logical_library_release.unwrap();
+                let value = if let Some(error) = offline_blocker {
+                    runtime
+                        .block_on(catalog.preview_blocked_logical_activation(
+                            serial, namespace, operation, release, &error,
+                        ))
+                        .map_err(|e| TapeError::Catalog(e.to_string()))?
+                } else {
+                    let provider = tape_rs::daemon::executor::OfflineSgProvider(
+                        tape_rs::daemon::executor::SgProvider {
+                            changer_serial: Some(library.changer_serial.clone()),
+                            changer_target_port: library.changer_target_port.clone(),
+                            drive_serials: library.drive_serials.clone(),
+                        },
+                    );
+                    runtime.block_on(
+                        tape_rs::daemon::executor::activate_logical_library_offline(
+                            &catalog,
+                            serial,
+                            namespace,
+                            operation,
+                            release,
+                            args.commit_logical_library_plan.as_deref(),
+                            &provider,
+                        ),
+                    )?
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).expect("启用结果可编码")
+                );
+                return Ok(());
+            }
+            let namespace = args.handoff_namespace.unwrap();
             if let Some(operation) = args.verify_release_operation {
                 let provider = tape_rs::daemon::executor::OfflineSgProvider(
                     tape_rs::daemon::executor::SgProvider {
@@ -454,12 +547,15 @@ fn main() {
                 .map_err(|e| TapeError::Catalog(e.to_string()))
         })();
         match result {
-            Ok(()) if args.verify_release_operation.is_none() => {
+            Ok(())
+                if args.enable_library_handoff_offline.is_some()
+                    && args.verify_release_operation.is_none() =>
+            {
                 println!("带库 {serial} 的交还协议已启用")
             }
             Ok(()) => {}
             Err(error) => {
-                eprintln!("离线启用带库交还失败：{error}");
+                eprintln!("带库离线操作失败：{error}");
                 std::process::exit(2);
             }
         }

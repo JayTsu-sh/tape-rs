@@ -158,6 +158,7 @@ impl FdbClient {
 
     /// Original complete S4 result; None means this original upload is unconfirmed.
     pub fn upload_receipt(&self, request: &PreparedUpload) -> Result<Option<Value>> {
+        self.require_upload_scope(request.value["logical_library"].as_str())?;
         let response = self.retry_request(
             "GET",
             &request.route("upload-receipts"),

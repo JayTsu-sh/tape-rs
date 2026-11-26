@@ -119,7 +119,21 @@ async fn original(
     {
         return Err(CatalogError::OwnerFenced);
     }
-    Ok(())
+    let plan = &command.plan;
+    let storage = match plan.action {
+        AutomaticMediaAction::Load => None,
+        AutomaticMediaAction::MoveIn => Some(plan.source),
+        AutomaticMediaAction::UnloadMove => Some(plan.destination),
+    };
+    logical_libraries::require_automatic_resource_claims(
+        tr,
+        ns,
+        serial,
+        assignment.pool_id,
+        &plan.drive_serial,
+        storage,
+    )
+    .await
 }
 impl ManagedCatalog {
     pub async fn automatic_media_pending(
@@ -170,9 +184,17 @@ impl ManagedCatalog {
                                 let granted = saved == *proposed;
                                 return Ok((saved, granted));
                             }
+                            logical_libraries::require_business_pool_at(
+                                &tr,
+                                ns,
+                                serial,
+                                canonical_uuid(&plan.pool)?,
+                            )
+                            .await?;
                             native_device::require_library_available(&tr, ns, serial).await?;
                             tr.set(&gate(ns, serial), &encoded(proposed)?);
                             original(&tr, serial, route, owner, proposed).await?;
+                            logical_libraries::note_mechanical_observation_stale(&tr, ns, serial);
                             Ok((proposed.clone(), true))
                         }
                         .await
@@ -204,6 +226,11 @@ impl ManagedCatalog {
                 requests::retry_result(
                     async {
                         original(&tr, serial, route, owner, command).await?;
+                        logical_libraries::note_mechanical_observation_stale(
+                            &tr,
+                            route.route.namespace,
+                            serial,
+                        );
                         tr.clear(&gate(route.route.namespace, serial));
                         Ok(())
                     }

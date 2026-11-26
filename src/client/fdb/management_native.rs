@@ -49,11 +49,17 @@ impl PreparedManagement {
         if matches!(value["change"]["kind"].as_str(), Some("media-import")) {
             let change = &value["change"];
             let fields = ["kind", "pool", "barcode", "volume", "path", "merge_tapes"];
+            let scoped = change.get("logical_library").is_some();
             if !change.as_object().is_some_and(|v| {
-                v.len() == fields.len() && v.keys().all(|k| fields.contains(&k.as_str()))
+                v.len() == fields.len() + usize::from(scoped)
+                    && v.keys()
+                        .all(|k| fields.contains(&k.as_str()) || scoped && k == "logical_library")
             }) || !change["merge_tapes"].is_boolean()
             {
                 return Err(invalid("导入请求必须固定 path 与 merge_tapes 等完整字段"));
+            }
+            if scoped {
+                validate_logical_library(change)?;
             }
             let path = change["path"]
                 .as_str()
@@ -61,6 +67,9 @@ impl PreparedManagement {
             if path != "/" {
                 validate_path(path)?;
             }
+        }
+        if value["change"]["kind"] == "tape" && value["change"].get("logical_library").is_some() {
+            validate_logical_library(&value["change"])?;
         }
         validate_device_change(&value["change"])?;
         let library = value["library"]
@@ -81,6 +90,7 @@ impl PreparedManagement {
             version: 1,
             library: self.library().into(),
             namespace: self.namespace().into(),
+            logical_library: None,
             input: ManagementIntent::Native {
                 change: self.value["change"].clone(),
             },
@@ -214,6 +224,14 @@ pub(super) fn verify_task_for_request(request: &Value, value: &Value) -> Result<
     Ok(())
 }
 
+fn validate_logical_library(change: &Value) -> Result<()> {
+    let id = reading::uuid_field(change, "logical_library", false)?;
+    if change["logical_library"] != id.to_string() {
+        return Err(invalid("逻辑带库 UUID 必须规范化"));
+    }
+    Ok(())
+}
+
 fn validate_device_change(change: &Value) -> Result<()> {
     let Some(kind) = change["kind"].as_str() else {
         return Err(invalid("缺少操作类型"));
@@ -252,11 +270,24 @@ fn validate_device_change(change: &Value) -> Result<()> {
     };
     if !change.as_object().is_some_and(|v| {
         let group_only = kind == "media-reclaim" && change["mode"] == "group-only";
-        v.len() == fields.len() + usize::from(group_only)
-            && v.keys().all(|k| fields.contains(&k.as_str()) || group_only && k == "mode")
+        let scoped = matches!(
+            kind,
+            "media-move"
+                | "media-assign"
+                | "media-unassign"
+                | "media-validate"
+                | "media-online"
+                | "media-reclaim"
+        ) && change.get("logical_library").is_some();
+        v.len() == fields.len() + usize::from(group_only) + usize::from(scoped)
+            && v.keys().all(|k| fields.contains(&k.as_str()) || group_only && k == "mode"
+                || scoped && k == "logical_library")
     })
     {
         return Err(invalid("设备管理请求字段无效"));
+    }
+    if change.get("logical_library").is_some() {
+        validate_logical_library(change)?;
     }
     if kind == "library-rescan" {
         return Ok(());

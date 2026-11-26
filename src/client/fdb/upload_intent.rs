@@ -7,6 +7,7 @@ pub(super) struct OriginalUpload {
     version: u8,
     pub library: String,
     pub pool: Uuid,
+    pub logical_library: Option<String>,
     pub path: String,
     pub namespace: Uuid,
     pub parent: Option<Uuid>,
@@ -20,10 +21,14 @@ pub(super) struct OriginalUpload {
 
 impl OriginalUpload {
     fn value(&self) -> Value {
-        serde_json::json!({"version":self.version,"library":self.library,"pool":self.pool.to_string(),
+        let mut value = serde_json::json!({"version":self.version,"library":self.library,"pool":self.pool.to_string(),
             "path":self.path,"namespace":self.namespace.to_string(),"parent":self.parent.map(|id|id.to_string()),"inode":self.inode.map(|id|id.to_string()),
             "previous":self.previous,"operation":self.operation.to_string(),"size":self.size,"sha256":self.sha256,
-            "barcode":self.barcode})
+            "barcode":self.barcode});
+        if let Some(logical) = &self.logical_library {
+            value["logical_library"] = serde_json::json!(logical);
+        }
+        value
     }
 
     fn parse(value: &Value) -> Result<Self> {
@@ -42,10 +47,11 @@ impl OriginalUpload {
             "sha256",
             "barcode",
         ];
-        if !value
-            .as_object()
-            .is_some_and(|v| v.len() == fields.len() && fields.iter().all(|k| v.contains_key(*k)))
-            || value["version"] != 2
+        let scoped = value.get("logical_library").is_some();
+        if !value.as_object().is_some_and(|v| {
+            v.len() == fields.len() + usize::from(scoped)
+                && fields.iter().all(|k| v.contains_key(*k))
+        }) || value["version"] != 2
         {
             return Err(bad());
         }
@@ -62,6 +68,9 @@ impl OriginalUpload {
             version: 2,
             library: text("library")?.into(),
             pool: id("pool")?,
+            logical_library: scoped
+                .then(|| text("logical_library").map(str::to_owned))
+                .transpose()?,
             path: text("path")?.into(),
             namespace: id("namespace")?,
             parent: if value["parent"].is_null() {
@@ -95,6 +104,7 @@ impl OriginalUpload {
     pub fn new(
         library: &str,
         pool: Uuid,
+        logical_library: Option<&str>,
         path: &str,
         source: &Path,
         condition: UploadCondition,
@@ -142,6 +152,7 @@ impl OriginalUpload {
             version: 2,
             library: library.into(),
             pool,
+            logical_library: logical_library.map(str::to_owned),
             path: path.into(),
             namespace,
             parent,
@@ -177,6 +188,10 @@ impl OriginalUpload {
         Client::new(Vec::<String>::new()).with_library(&self.library)?;
         if self.version != 2
             || self.pool.is_nil()
+            || self
+                .logical_library
+                .as_deref()
+                .is_some_and(|id| !valid_logical_library(id))
             || self.operation.is_nil()
             || self.size == u64::MAX
             || self.sha256.len() != 64
@@ -200,6 +215,7 @@ impl OriginalUpload {
         let identity = prepared.identity();
         if prepared.value["library"] != self.library
             || prepared.value["pool"] != self.pool.to_string()
+            || prepared.value["logical_library"].as_str() != self.logical_library.as_deref()
             || prepared.value["path"] != URL_SAFE_NO_PAD.encode(&self.path)
             || identity["operation"] != self.operation.to_string()
             || identity["size"] != self.size
@@ -221,6 +237,9 @@ impl OriginalUpload {
             version: 2,
             library: prepared.value["library"].as_str().unwrap().into(),
             pool: Uuid::parse_str(prepared.value["pool"].as_str().unwrap()).unwrap(),
+            logical_library: prepared.value["logical_library"]
+                .as_str()
+                .map(str::to_owned),
             path: String::from_utf8(
                 URL_SAFE_NO_PAD
                     .decode(prepared.value["path"].as_str().unwrap())

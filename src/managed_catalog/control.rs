@@ -13,6 +13,11 @@ pub use management_request::ManagementRequest;
 
 #[path = "library_observations.rs"]
 mod library_observations;
+#[path = "logical_libraries.rs"]
+pub(super) mod logical_libraries;
+pub(crate) use logical_libraries::{
+    Change as LogicalLibraryChange, Creation as LogicalLibraryCreation,
+};
 
 #[path = "management_queries.rs"]
 mod management_queries;
@@ -34,6 +39,8 @@ pub use native_device::NativeDeviceTask;
 
 #[path = "active_pools.rs"]
 mod active_pools;
+#[path = "scoped_pools.rs"]
+mod scoped_pools;
 pub use active_pools::ActivePoolCreation;
 #[path = "pool_roots.rs"]
 mod pool_roots;

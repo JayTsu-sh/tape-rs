@@ -8,6 +8,32 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 const NS: &str = "x-tapers-catalog-namespace";
+const LOGICAL_LIBRARY: &str = "x-tapers-logical-library";
+
+fn verify_logical_scope(value: &Value, logical: Option<Uuid>) -> Result<()> {
+    if value["logical_library"] != json!(logical) {
+        return Err(ClientError::Verification(
+            "管理响应的逻辑带库范围不符".into(),
+        ));
+    }
+    Ok(())
+}
+fn pool_headers(namespace: &str, logical: Option<Uuid>) -> Result<Vec<(&'static str, String)>> {
+    let mut headers = vec![(NS, namespace.to_owned())];
+    if let Some(logical) = logical {
+        if logical.is_nil() {
+            return Err(invalid("逻辑带库 UUID 不能为零"));
+        }
+        headers.push((LOGICAL_LIBRARY, logical.to_string()));
+    }
+    Ok(headers)
+}
+fn header_refs<'a>(headers: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
+    headers
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect()
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum ManagementIntent {
@@ -45,6 +71,8 @@ pub struct ManagementRequestFile {
     version: u8,
     library: String,
     namespace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    logical_library: Option<Uuid>,
     input: ManagementIntent,
     request: Value,
     fingerprint: String,
@@ -146,11 +174,29 @@ fn unknown(checkpoint: &Path, error: ClientError) -> ClientError {
 }
 impl ManagementRequestFile {
     fn digest(&self) -> String {
-        format!("{:x}", sha2::Sha256::digest(serde_json::to_vec(&json!({"version":self.version,"library":self.library,"namespace":self.namespace,"input":self.input,"request":self.request})).expect("JSON serializes")))
+        let mut value = json!({"version":self.version,"library":self.library,"namespace":self.namespace,"input":self.input,"request":self.request});
+        if let Some(logical) = self.logical_library {
+            value["logical_library"] = json!(logical);
+        }
+        format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&value).expect("JSON serializes"))
+        )
     }
     fn validate(&self) -> Result<()> {
         base(&self.library)?;
         uuid(&self.namespace)?;
+        if self.logical_library.is_some_and(|id| {
+            id.is_nil()
+                || !matches!(
+                    self.input,
+                    ManagementIntent::Create { .. }
+                        | ManagementIntent::Set { .. }
+                        | ManagementIntent::Delete { .. }
+                )
+        }) {
+            return Err(invalid("逻辑带库作用域仅适用于池管理，且 UUID 不能为零"));
+        }
         if self.version != 1 || self.fingerprint != self.digest() {
             return Err(invalid("管理请求文件版本或校验不符"));
         }
@@ -311,6 +357,9 @@ impl ManagementRequestFile {
         if let Some(patch) = patch {
             change["patch"] = patch;
         }
+        if let Some(logical) = self.logical_library {
+            change["logical_library"] = json!(logical);
+        }
         Ok(
             json!({"version":1,"library":self.library,"namespace":self.namespace,"epoch":self.request["epoch"],"operation":self.request["operation"],"change":change}),
         )
@@ -319,7 +368,15 @@ impl ManagementRequestFile {
         self.library == library
     }
     pub fn matches(&self, library: &str, input: &ManagementIntent) -> bool {
-        self.library == library && &self.input == input
+        self.matches_pool_scope(library, None, input)
+    }
+    pub fn matches_pool_scope(
+        &self,
+        library: &str,
+        logical: Option<Uuid>,
+        input: &ManagementIntent,
+    ) -> bool {
+        self.library == library && self.logical_library == logical && &self.input == input
     }
     /// Never overwrite a checkpoint, including a partial checkpoint after an I/O failure.
     pub fn save_new(&self, path: &Path) -> Result<()> {
@@ -380,7 +437,20 @@ impl FdbClient {
         Ok(value)
     }
     pub fn pool_page(&self, library: &str, namespace: &str, after: Option<&str>) -> Result<Value> {
-        self.metadata_page(library, namespace, "pools", after)
+        self.pool_page_in_scope(library, namespace, None, after)
+    }
+    pub fn pool_page_in_scope(
+        &self,
+        library: &str,
+        namespace: &str,
+        logical: Option<Uuid>,
+        after: Option<&str>,
+    ) -> Result<Value> {
+        let page = self.metadata_page(library, namespace, "pools", logical, after)?;
+        for pool in page["items"].as_array().expect("validated page") {
+            check_pool(pool, library)?;
+        }
+        Ok(page)
     }
     pub fn management_page(
         &self,
@@ -388,7 +458,7 @@ impl FdbClient {
         namespace: &str,
         after: Option<&str>,
     ) -> Result<Value> {
-        let value = self.metadata_page(library, namespace, "tasks", after)?;
+        let value = self.metadata_page(library, namespace, "tasks", None, after)?;
         for record in value["items"].as_array().expect("validated page") {
             scope(record, library, namespace)?;
             let request = PreparedManagement::parse(record["request"].clone())?;
@@ -401,6 +471,7 @@ impl FdbClient {
         library: &str,
         namespace: &str,
         kind: &str,
+        logical: Option<Uuid>,
         after: Option<&str>,
     ) -> Result<Value> {
         uuid(namespace)?;
@@ -412,10 +483,16 @@ impl FdbClient {
                 .unwrap_or_default()
         );
         let value = parsed(
-            self.retry_request("GET", &route, None, &[(NS, namespace)])?,
+            self.retry_request(
+                "GET",
+                &route,
+                None,
+                &header_refs(&pool_headers(namespace, logical)?),
+            )?,
             &[200],
         )?;
         scope(&value, library, namespace)?;
+        verify_logical_scope(&value, logical)?;
         if !value["items"].is_array()
             || !(value["next"].is_null() || value["next"].as_str().is_some_and(|s| !s.is_empty()))
             || value.get("next").is_none()
@@ -425,6 +502,15 @@ impl FdbClient {
         Ok(value)
     }
     pub fn pool(&self, library: &str, namespace: &str, selector: &str) -> Result<Value> {
+        self.pool_in_scope(library, namespace, None, selector)
+    }
+    pub fn pool_in_scope(
+        &self,
+        library: &str,
+        namespace: &str,
+        logical: Option<Uuid>,
+        selector: &str,
+    ) -> Result<Value> {
         uuid(namespace)?;
         if !name(selector) {
             return Err(invalid("池选择器无效"));
@@ -434,11 +520,12 @@ impl FdbClient {
                 "GET",
                 &format!("{}/pools/{}", base(library)?, encode_query(selector)),
                 None,
-                &[(NS, namespace)],
+                &header_refs(&pool_headers(namespace, logical)?),
             )?,
             &[200],
         )?;
         scope(&value, library, namespace)?;
+        verify_logical_scope(&value, logical)?;
         check_pool(&value["pool"], library)?;
         Ok(value)
     }
@@ -447,6 +534,25 @@ impl FdbClient {
         library: &str,
         input: ManagementIntent,
     ) -> Result<ManagementRequestFile> {
+        self.prepare_pool_management(library, None, input)
+    }
+    pub fn prepare_pool_management(
+        &self,
+        library: &str,
+        logical: Option<Uuid>,
+        input: ManagementIntent,
+    ) -> Result<ManagementRequestFile> {
+        if logical.is_some_and(|id| {
+            id.is_nil()
+                || !matches!(
+                    input,
+                    ManagementIntent::Create { .. }
+                        | ManagementIntent::Set { .. }
+                        | ManagementIntent::Delete { .. }
+                )
+        }) {
+            return Err(invalid("逻辑带库作用域仅适用于池管理，且 UUID 不能为零"));
+        }
         // Validate command parameters before contacting the server.
         match &input {
             ManagementIntent::Native { .. } => {
@@ -530,7 +636,7 @@ impl FdbClient {
                 json!({"version":1,"id":Uuid::new_v4().to_string(),"name":name,"file_limit":file_limit,"created_at_millis":time as u64,"policy":defaults()})
             }
             ManagementIntent::Set { selector, .. } | ManagementIntent::Delete { selector } => {
-                let pool = self.pool(library, &namespace, selector)?;
+                let pool = self.pool_in_scope(library, &namespace, logical, selector)?;
                 let mut change = json!({"kind":"pool-delete","id":pool["pool"]["id"],"revision":pool["pool"]["revision"]});
                 if let ManagementIntent::Set {
                     attribute, value, ..
@@ -539,6 +645,9 @@ impl FdbClient {
                     change["kind"] = json!("pool");
                     change["patch"] = patch(attribute, value)?;
                 }
+                if let Some(logical) = logical {
+                    change["logical_library"] = json!(logical);
+                }
                 json!({"version":1,"library":library,"namespace":namespace,"epoch":context["window"]["accepting"],"operation":Uuid::new_v4().to_string(),"change":change})
             }
         };
@@ -546,6 +655,7 @@ impl FdbClient {
             version: 1,
             library: library.into(),
             namespace,
+            logical_library: logical,
             input,
             request,
             fingerprint: String::new(),
@@ -619,12 +729,10 @@ impl FdbClient {
             ),
         };
         let bytes = serde_json::to_vec(&p.request).expect("JSON serializes");
-        let response = self.retry_request(
-            method,
-            &route,
-            Some(&bytes),
-            &[(NS, &p.namespace), ("content-type", "application/json")],
-        );
+        let mut headers = pool_headers(&p.namespace, p.logical_library)?;
+        headers.push(("content-type", "application/json".into()));
+        let headers = header_refs(&headers);
+        let response = self.retry_request(method, &route, Some(&bytes), &headers);
         let response = response.map_err(|e| unknown(checkpoint, e))?;
         if !statuses.contains(&response.status) {
             return Err(if (200..300).contains(&response.status) {
@@ -643,6 +751,7 @@ impl FdbClient {
             let value = parsed(response, &statuses)?;
             if matches!(p.input, ManagementIntent::Create { .. }) {
                 scope(&value, &p.library, &p.namespace)?;
+                verify_logical_scope(&value, p.logical_library)?;
                 check_pool(&value["pool"], &p.library)?;
                 for field in ["id", "name", "file_limit", "created_at_millis", "policy"] {
                     if value["pool"][field] != p.request[field] {
@@ -665,9 +774,10 @@ impl FdbClient {
             if cancel {
                 return Err(invalid("池创建是原子事务，没有可取消的异步任务"));
             }
-            return self.pool(
+            return self.pool_in_scope(
                 &p.library,
                 &p.namespace,
+                p.logical_library,
                 p.request["id"].as_str().expect("validated id"),
             );
         }
@@ -781,6 +891,7 @@ mod tests {
             version: 1,
             library: "LIB 中文".into(),
             namespace: Uuid::new_v4().to_string(),
+            logical_library: None,
             input: ManagementIntent::Create {
                 name: "归档".into(),
                 file_limit: 100,

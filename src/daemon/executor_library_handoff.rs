@@ -219,6 +219,126 @@ pub async fn verify_library_release_offline(
     Ok(verified)
 }
 
+pub(crate) struct OfflineLogicalLibraryInventory {
+    pub(crate) release: LibraryHandoff,
+    pub(crate) observation: serde_json::Value,
+}
+
+/// 在原设备组已交还且所有执行器离线时，预览或提交一次性迁移。
+pub async fn activate_logical_library_offline(
+    catalog: &crate::managed_catalog::ManagedCatalog,
+    serial: &str,
+    namespace: uuid::Uuid,
+    operation: uuid::Uuid,
+    release: uuid::Uuid,
+    expected_plan: Option<&str>,
+    provider: &dyn DeviceProvider,
+) -> Result<serde_json::Value> {
+    match activate_logical_library_offline_checked(
+        catalog,
+        serial,
+        namespace,
+        operation,
+        release,
+        expected_plan,
+        provider,
+    )
+    .await
+    {
+        Err(error)
+            if expected_plan.is_none()
+                && !operation.is_nil()
+                && !release.is_nil()
+                && operation != release =>
+        {
+            catalog
+                .preview_blocked_logical_activation(
+                    serial,
+                    namespace,
+                    operation,
+                    release,
+                    &error.to_string(),
+                )
+                .await
+                .map_err(|e| TapeError::Catalog(e.to_string()))
+        }
+        result => result,
+    }
+}
+
+async fn activate_logical_library_offline_checked(
+    catalog: &crate::managed_catalog::ManagedCatalog,
+    serial: &str,
+    namespace: uuid::Uuid,
+    operation: uuid::Uuid,
+    release: uuid::Uuid,
+    expected_plan: Option<&str>,
+    provider: &dyn DeviceProvider,
+) -> Result<serde_json::Value> {
+    if operation.is_nil()
+        || release.is_nil()
+        || operation == release
+        || expected_plan.is_some_and(|sha| {
+            sha.len() != 64
+                || !sha
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        })
+    {
+        return Err(TapeError::NotReady(
+            "原启用、交还 UUID 或计划摘要无效".into(),
+        ));
+    }
+    let catalog_error = |error: CatalogError| TapeError::Catalog(error.to_string());
+    let route = catalog
+        .active_library_route(serial)
+        .await
+        .map_err(catalog_error)?
+        .filter(|route| route.route.namespace == namespace)
+        .ok_or_else(|| TapeError::NotReady("启用逻辑带库的原 namespace 不符".into()))?;
+    if let Some(receipt) = catalog
+        .find_original_logical_activation(serial, route, operation, release, expected_plan)
+        .await
+        .map_err(catalog_error)?
+    {
+        return Ok(receipt);
+    }
+    let original = catalog
+        .library_handoff(serial, route, None)
+        .await
+        .map_err(catalog_error)?
+        .filter(|row| row.operation == release && row.phase == Phase::Released)
+        .ok_or_else(|| TapeError::NotReady("须先确认原整库交还已完成".into()))?;
+    let devices = provider.open_all()?;
+    if scope(&devices, serial)? != original.devices {
+        return Err(TapeError::NotReady("当前设备组与原交还设备组不符".into()));
+    }
+    let ensure_unreserved = || -> Result<()> {
+        for device in &devices {
+            let status = reservation::read_handoff_status(device.dev.as_ref())?;
+            if !status.keys.is_empty() || status.holder.is_some() {
+                return Err(TapeError::NotReady(format!(
+                    "{} 仍有持有者或注册，暂不能启用逻辑带库",
+                    device.serial
+                )));
+            }
+        }
+        Ok(())
+    };
+    ensure_unreserved()?;
+    let node = ReservationKey(original.release_key).node();
+    let observation = management::observe_devices(&devices, node, original.owner_epoch)?;
+    ensure_unreserved()?;
+    let proof = OfflineLogicalLibraryInventory {
+        release: original,
+        observation,
+    };
+    catalog
+        .publish_logical_library_activation(route, &proof, operation, expected_plan)
+        .await
+        .map_err(catalog_error)
+}
+
 pub(super) fn release(owner: &Active, original: &LibraryHandoff) -> Result<()> {
     if owner.key.0 != original.release_key || owner.round != original.owner_epoch {
         return Err(TapeError::NotReady("交还执行器与原意图不符".into()));

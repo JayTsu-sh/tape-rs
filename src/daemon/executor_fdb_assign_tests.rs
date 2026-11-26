@@ -572,7 +572,7 @@ fn assignment_format_unknown_keeps_original_uuid_without_reformatting() {
         }
         if case == 0 {
             let snapshot = Snapshot::capture(&context()).unwrap();
-            let original_plan = plan(&snapshot, &request, pool.revision, &status).unwrap();
+            let original_plan = plan(&snapshot, &request, pool.revision, &status, None).unwrap();
             runtime
                 .block_on(catalog.prepare_media_assign(
                     &serial,

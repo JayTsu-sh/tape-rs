@@ -24,6 +24,8 @@ use super::{
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+#[path = "fdb_http_logical_libraries.rs"]
+mod logical_libraries;
 #[path = "fdb_http_notify.rs"]
 mod notify;
 
@@ -247,6 +249,40 @@ async fn ready(State(ctx): State<Arc<Context>>, request: Request) -> Response {
     )
 }
 
+async fn require_file_pool_scope(
+    ctx: &Context,
+    serial: &str,
+    route: ActiveLibraryRoute,
+    pool: &str,
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<uuid::Uuid>, Box<Response>> {
+    let logical = pools::logical_scope(headers)?;
+    let pool = uuid::Uuid::parse_str(pool).expect("content scope validates UUID");
+    check_file_pool_scope(ctx, serial, route, pool, logical).await?;
+    Ok(logical)
+}
+
+async fn check_file_pool_scope(
+    ctx: &Context,
+    serial: &str,
+    route: ActiveLibraryRoute,
+    pool: uuid::Uuid,
+    logical: Option<uuid::Uuid>,
+) -> Result<(), Box<Response>> {
+    ctx.catalog
+        .require_logical_pool_scope(serial, route, pool, logical)
+        .await
+        .map_err(|error| {
+            Box::new(match error.domain() {
+                CatalogError::Invalid(_) => reply(
+                    StatusCode::NOT_FOUND,
+                    json!({"error":"pool_not_found","detail":"池不属于请求的逻辑带库范围"}),
+                ),
+                _ => catalog_error(error),
+            })
+        })
+}
+
 async fn stat(
     State(ctx): State<Arc<Context>>,
     Path(serial): Path<String>,
@@ -259,6 +295,11 @@ async fn stat(
         Ok(scope) => scope,
         Err(error) => return invalid(error),
     };
+    if let Err(error) =
+        require_file_pool_scope(&ctx, &serial, expected, &pool, request.headers()).await
+    {
+        return *error;
+    }
     let path = match crate::managed_catalog::pool_catalog_path(
         uuid::Uuid::parse_str(&pool).expect("validated pool"),
         path.as_bytes(),
@@ -325,6 +366,11 @@ async fn children(
         Ok(scope) => scope,
         Err(error) => return invalid(error),
     };
+    if let Err(error) =
+        require_file_pool_scope(&ctx, &serial, expected, &pool, request.headers()).await
+    {
+        return *error;
+    }
     let path = match crate::managed_catalog::pool_catalog_path(
         uuid::Uuid::parse_str(&pool).expect("validated pool"),
         path.as_bytes(),
@@ -408,6 +454,24 @@ fn metadata_router(ctx: Arc<Context>) -> Router {
             get(queries::tape),
         )
         .route("/libraries/{serial}/admin/context", get(pools::context))
+        .route(
+            "/libraries/{serial}/admin/logical-libraries",
+            get(logical_libraries::list).post(logical_libraries::create),
+        )
+        .route(
+            "/libraries/{serial}/admin/logical-libraries/{selector}",
+            get(logical_libraries::show)
+                .patch(logical_libraries::replace)
+                .delete(logical_libraries::delete),
+        )
+        .route(
+            "/libraries/{serial}/admin/logical-libraries/{selector}/changes/{operation}",
+            get(logical_libraries::change_status),
+        )
+        .route(
+            "/libraries/{serial}/admin/logical-libraries/activation/{operation}",
+            get(logical_libraries::activation_status),
+        )
         .route(
             "/libraries/{serial}/admin/pools",
             get(pools::list).post(pools::create),
@@ -722,6 +786,11 @@ async fn content(
     let Ok(permit) = owner.requests.clone().try_acquire_owned() else {
         return unavailable("http_busy");
     };
+    if let Err(error) =
+        require_file_pool_scope(&ctx, &serial, route, &pool, request.headers()).await
+    {
+        return *error;
+    }
     let status = library
         .status
         .lock()

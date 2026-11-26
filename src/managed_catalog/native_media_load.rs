@@ -91,6 +91,58 @@ fn validate_plan(plan: &NativeMediaLoadPlan) -> Result<()> {
     }
     Ok(())
 }
+async fn require_plan_scope(
+    tr: &Transaction,
+    import: &NativeMediaImport,
+    plan: &NativeMediaLoadPlan,
+) -> Result<()> {
+    use management::moves::{MoveLocation, MoveLocationKind};
+    let request = import.request();
+    let ns = request.namespace();
+    let serial = import.serial();
+    let expected = request.logical_library();
+    let moving = plan.source != plan.destination;
+    if expected.is_some() && plan.home.is_none()
+        || moving && plan.home.is_some_and(|home| home != plan.source)
+    {
+        return Err(CatalogError::Invalid("索引导入要求可信且相符的原归位槽"));
+    }
+    let drive = MoveLocation {
+        address: plan.destination,
+        kind: MoveLocationKind::Drive,
+        drive_serial: Some(plan.drive_serial.clone()),
+    };
+    logical_libraries::require_mechanical_locations(
+        tr,
+        ns,
+        serial,
+        request,
+        &[&drive],
+        if moving { Some(plan.source) } else { plan.home },
+    )
+    .await?;
+    if let Some(eviction) = &plan.eviction {
+        if logical_libraries::pool_library_at(tr, ns, serial, eviction.pool).await? != expected {
+            return Err(CatalogError::Invalid("导入退带计划跨逻辑带库"));
+        }
+        let victim = MoveLocation {
+            address: eviction.source,
+            kind: MoveLocationKind::Drive,
+            drive_serial: Some(eviction.drive_serial.clone()),
+        };
+        logical_libraries::require_mechanical_locations(
+            tr,
+            ns,
+            serial,
+            request,
+            &[&victim],
+            Some(eviction.home),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 async fn read_at(tr: &Transaction, import: &NativeMediaImport) -> Result<Option<Record>> {
     let Some(raw) = tr.get(&key(import), false).await? else {
         return Ok(None);
@@ -178,7 +230,11 @@ impl ManagedCatalog {
         owner: u64,
     ) -> Result<Option<NativeMediaLoadProgress>> {
         let tr = self.db.create_trx()?;
-        Ok(active_at(&tr, import, owner).await?.1.map(progress))
+        let (_, record) = active_at(&tr, import, owner).await?;
+        if let Some(record) = &record {
+            require_plan_scope(&tr, import, &record.plan).await?;
+        }
+        Ok(record.map(progress))
     }
 
     /// 固定原驱动器、地址和 home；重建的调用方只能取回同一计划。
@@ -194,6 +250,7 @@ impl ManagedCatalog {
                 requests::retry_result(
                     async {
                         let (state, saved) = active_at(&tr, import, owner).await?;
+                        require_plan_scope(&tr, import, plan).await?;
                         if let Some(saved) = saved {
                             if saved.plan != *plan {
                                 return Err(CatalogError::Invalid("原导入机械计划不能改目标"));
@@ -284,6 +341,7 @@ impl ManagedCatalog {
                             return Err(CatalogError::PoolImporting);
                         }
                         let mut record = record.ok_or(CatalogError::Incomplete)?;
+                        require_plan_scope(&tr, import, &record.plan).await?;
                         if record.phase == to {
                             return Ok(record.attempt.as_ref().is_some_and(|a| {
                                 a.nonce == nonce && a.owner == owner && a.command == command
@@ -300,6 +358,11 @@ impl ManagedCatalog {
                         {
                             return Err(CatalogError::Invalid("原导入机械命令阶段不符"));
                         }
+                        logical_libraries::note_mechanical_observation_stale(
+                            &tr,
+                            import.request().namespace(),
+                            import.serial(),
+                        );
                         record.phase = to;
                         record.attempt = Some(Attempt {
                             nonce,

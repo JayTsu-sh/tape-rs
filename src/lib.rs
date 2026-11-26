@@ -8,6 +8,7 @@ pub mod library;
 pub mod library_cli;
 #[cfg(feature = "fdb")]
 mod local_read_storage;
+pub mod logical_library;
 pub mod ltfs;
 #[cfg(feature = "fdb")]
 pub mod managed_catalog;

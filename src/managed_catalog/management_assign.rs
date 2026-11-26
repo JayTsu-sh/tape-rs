@@ -88,6 +88,15 @@ async fn eligible(
     let pool = decode_pool(pool_id, &raw)?;
     require_pool_library(tr, request.namespace(), pool_id, serial).await?;
     active_pools::require_indexes(tr, request.namespace(), &pool).await?;
+    logical_libraries::require_mechanical_locations(
+        tr,
+        request.namespace(),
+        serial,
+        request,
+        &[&plan.source, &plan.drive],
+        Some(plan.home_address),
+    )
+    .await?;
     if pool.revision != plan.pool_revision {
         return Err(CatalogError::Invalid("原池策略修订号已改变"));
     }
@@ -242,6 +251,7 @@ impl ManagedCatalog {
                         {
                             return Err(CatalogError::Invalid("分配阶段不能回退或跳过检查点"));
                         }
+                        logical_libraries::note_mechanical_observation_stale(&tr, ns, serial);
                         execution.phase = next;
                         execution.error = None;
                         task["execution"] = execution.value();

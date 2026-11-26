@@ -1,6 +1,10 @@
 //! Active pool metadata and its virtual root are published in one transaction.
 //! No device work is involved; media assignment is a separate operation.
 use super::*;
+use logical_libraries::{
+    pool_binding_key, pool_create_receipt_key, pool_library_at, pool_membership_key,
+    require_library_at,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ActivePoolCreation {
@@ -131,13 +135,38 @@ impl ManagedCatalog {
         checked_pool(&tr, namespace, serial, saved).await
     }
 
-    /// UUID and namespace are supplied by the caller before sending the request.
-    /// Repeats never replace metadata, timestamps, roots or existing contents.
+    /// Populate an unbound catalog pool for a pre-activation import or fixture.
+    /// Runtime pool creation goes through the scoped administration method.
     pub async fn create_active_pool(
         &self,
         serial: &str,
         route: ActiveLibraryRoute,
         epoch: u64,
+        pool: &PoolRecord,
+    ) -> Result<ActivePoolCreation> {
+        self.publish_active_pool(serial, route, epoch, None, pool)
+            .await
+    }
+
+    pub(crate) async fn create_admin_pool(
+        &self,
+        serial: &str,
+        route: ActiveLibraryRoute,
+        epoch: u64,
+        logical: Option<Uuid>,
+        pool: &PoolRecord,
+    ) -> Result<ActivePoolCreation> {
+        let logical = logical.ok_or(CatalogError::Invalid("创建池须指定逻辑带库 UUID"))?;
+        self.publish_active_pool(serial, route, epoch, Some(logical), pool)
+            .await
+    }
+
+    async fn publish_active_pool(
+        &self,
+        serial: &str,
+        route: ActiveLibraryRoute,
+        epoch: u64,
+        logical: Option<Uuid>,
         pool: &PoolRecord,
     ) -> Result<ActivePoolCreation> {
         validate_pool(pool)?;
@@ -151,6 +180,22 @@ impl ManagedCatalog {
                         let namespace =
                             routing::require_runtime_active_owner(&tr, serial, route, epoch)
                                 .await?;
+                        if let Some(logical) = logical {
+                            logical_libraries::require_business_route_at(&tr, serial).await?;
+                            let receipt =
+                                pool_create_receipt_key(namespace, serial, logical, pool.id);
+                            if let Some(raw) = tr.get(&receipt, false).await? {
+                                let original = decode_pool(pool.id, &raw)?;
+                                return Ok(if original == *pool {
+                                    ActivePoolCreation::AlreadyExists(original)
+                                } else {
+                                    ActivePoolCreation::IdConflict
+                                });
+                            }
+                            require_library_at(&tr, namespace, serial, logical).await?;
+                        } else {
+                            logical_libraries::require_explicit_scope_at(&tr, serial).await?;
+                        }
                         let record = pool_key(namespace, pool.id);
                         native_device::require_pool_metadata_available(
                             &tr, namespace, serial, pool.id,
@@ -169,6 +214,13 @@ impl ManagedCatalog {
                         if let Some(raw) = tr.get(&record, false).await? {
                             let saved = decode_pool(pool.id, &raw)?;
                             if saved.library_serial != serial {
+                                return Ok(ActivePoolCreation::IdConflict);
+                            }
+                            if logical.is_some()
+                                || pool_library_at(&tr, namespace, serial, pool.id)
+                                    .await?
+                                    .is_some()
+                            {
                                 return Ok(ActivePoolCreation::IdConflict);
                             }
                             require_pool_library(&tr, namespace, saved.id, serial).await?;
@@ -233,7 +285,23 @@ impl ManagedCatalog {
                                 .expect("initial root has metadata"),
                         )
                         .await?;
-                        tr.set(&record, &encode_pool(pool));
+                        let encoded = encode_pool(pool);
+                        if let Some(logical) = logical {
+                            let binding = pool_binding_key(namespace, serial, pool.id);
+                            let member = pool_membership_key(namespace, serial, logical, pool.id);
+                            if tr.get(&binding, false).await?.is_some()
+                                || tr.get(&member, false).await?.is_some()
+                            {
+                                return Err(CatalogError::Corrupt("新池存在孤立的逻辑带库归属"));
+                            }
+                            tr.set(&binding, logical.as_bytes());
+                            tr.set(&member, b"");
+                            tr.set(
+                                &pool_create_receipt_key(namespace, serial, logical, pool.id),
+                                &encoded,
+                            );
+                        }
+                        tr.set(&record, &encoded);
                         tr.set(&named, pool.id.as_bytes());
                         tr.set(&child, root.as_bytes());
                         tr.set(&inode, &root_node);

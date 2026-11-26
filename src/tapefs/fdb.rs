@@ -143,6 +143,7 @@ impl FdbBackend {
         if saved.library() != self.library
             || saved.namespace() != self.namespace
             || saved.pool() != self.pool
+            || saved.logical_library() != self.client.file_logical_scope()
             || saved.path() != path
             || saved.condition()? != condition
         {

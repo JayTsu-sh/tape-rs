@@ -11,6 +11,9 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Args)]
 pub struct Targets {
+    /// 逻辑带库 UUID
+    #[arg(long)]
+    logical_library: Option<Uuid>,
     /// 目标条码；恢复时省略并指定原请求文件
     barcodes: Vec<String>,
     /// 单盘原请求文件，或多盘新请求目录
@@ -73,9 +76,18 @@ pub struct Rescan {
     request: Option<PathBuf>,
 }
 enum Action {
-    Assign { yes: bool, force: bool },
-    Reclaim { yes: bool, unassign: bool, group_only: bool },
-    Move { location: Option<String> },
+    Assign {
+        yes: bool,
+        force: bool,
+    },
+    Reclaim {
+        yes: bool,
+        unassign: bool,
+        group_only: bool,
+    },
+    Move {
+        location: Option<String>,
+    },
     Unassign,
     Validate,
     Online,
@@ -101,7 +113,7 @@ impl Action {
                 | Self::Reclaim { yes: true, .. }
                 | Self::Reclaim { unassign: true, .. }
                 | Self::Reclaim { group_only: true, .. }
-                | Self::Move { location: Some(_) }
+                | Self::Move { location: Some(_), .. }
                 | Self::Policy { patch: Some(_) }
         )
     }
@@ -167,6 +179,10 @@ fn run(
     targets: Targets,
     action: Action,
 ) -> Result<()> {
+    let logical = targets.logical_library;
+    if logical.is_some_and(|id| id.is_nil()) {
+        return Err("逻辑带库 UUID 不能为零".into());
+    }
     if targets.barcodes.is_empty() {
         if action.changes_on_resume() {
             return Err("恢复任务不得覆盖原操作参数".into());
@@ -179,6 +195,7 @@ fn run(
         if v["change"]["kind"] != action.kind()
             || library.is_some_and(|s| v["library"] != s)
             || pool.is_some_and(|p| v["change"]["pool"] != p)
+            || logical.is_some_and(|id| v["change"]["logical_library"] != json!(id))
         {
             return Err("原任务类型、带库或池与选择不符".into());
         }
@@ -203,14 +220,21 @@ fn run(
                     .into(),
             );
         }
-        Action::Move { location: None } => {
+        Action::Move { location: None, .. } => {
             return Err("tape move 必须指定 -L homeslot|ieslot".into());
         }
         _ => {}
     }
     let library = super::pool::library_from_client(control, library)?;
     let (namespace, pool) = if let Some(selector) = pool {
-        let (ns, p) = super::pool::selected(client, &library, selector)?;
+        let (ns, p) = if let Some(logical) = logical {
+            let context = client.management_context(&library)?;
+            let ns = context["namespace"].as_str().ok_or("namespace 缺失")?;
+            let pool = client.pool_in_scope(&library, ns, Some(logical), selector)?;
+            (ns.parse()?, pool["pool"].clone())
+        } else {
+            super::pool::selected(client, &library, selector)?
+        };
         (
             ns,
             Some(p["id"].as_str().ok_or("池 UUID 缺失")?.parse::<Uuid>()?),
@@ -219,9 +243,9 @@ fn run(
         if !matches!(action, Action::Move { .. }) {
             return Err("该操作必须指定 --pool 池名称或 UUID".into());
         }
-        let page = client.list_pools(&library, 100, None)?;
+        let context = client.management_context(&library)?;
         (
-            page["namespace"]
+            context["namespace"]
                 .as_str()
                 .ok_or("namespace 缺失")?
                 .parse::<Uuid>()?,
@@ -237,14 +261,14 @@ fn run(
             return Err("清洗带不是数据介质，不能执行该命令".into());
         }
         let assignment = &tape["assignment"];
-        let change = match &action {
+        let mut change = match &action {
             Action::Assign { force, .. } => {
                 if !assignment.is_null() {
                     return Err("磁带已有池归属，不能 assign".into());
                 }
                 json!({"kind":action.kind(),"pool":pool.unwrap().to_string(),"barcode":barcode,"volume":Uuid::new_v4().to_string(),"confirm_format":true,"force_format":force})
             }
-            Action::Move { location } => {
+            Action::Move { location, .. } => {
                 if assignment.is_null() {
                     if pool.is_some() {
                         return Err("未分池介质移动时不得指定 --pool".into());
@@ -282,6 +306,9 @@ fn run(
                 value
             }
         };
+        if let Some(logical) = logical {
+            change["logical_library"] = json!(logical);
+        }
         let original = client.prepare_control(&library, namespace, change)?;
         let file = if directory {
             path.join(format!(
@@ -464,8 +491,8 @@ pub fn rescan(
     let (path, directory) = paths(command.request, libraries.len())?;
     let mut saved = Vec::new();
     for library in libraries {
-        let page = client.list_pools(&library, 100, None)?;
-        let namespace = page["namespace"]
+        let context = client.management_context(&library)?;
+        let namespace = context["namespace"]
             .as_str()
             .ok_or("namespace 缺失")?
             .parse::<Uuid>()?;

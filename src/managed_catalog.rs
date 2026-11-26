@@ -138,6 +138,7 @@ pub use control::{
     ReclaimSourceInventory, ReclaimSourceNode, ReclaimSourceNodeKind, ReclaimSourceProgress,
     ReclaimSourceRead, ReclaimSpec, ReclaimWalk, TapeAssignment, VolumePlacement,
 };
+pub(crate) use control::{LogicalLibraryChange, LogicalLibraryCreation};
 pub use cutover::{
     FrozenSnapshotIdentity, VerifiedNodeExport, inspect_frozen_snapshot, verify_node_export,
 };
@@ -208,6 +209,8 @@ pub enum CatalogError {
     Incomplete,
     #[error("池或带库正在执行互斥操作")]
     PoolBusy,
+    #[error("逻辑带库库存待核对: {0}")]
+    LogicalInventoryBlocked(String),
     #[error("带库存在未结清操作: {0:?}")]
     LibraryHandoffBusy(Vec<Uuid>),
     #[error("管理任务队列已满，请稍后重试")]

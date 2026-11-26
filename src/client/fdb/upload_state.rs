@@ -283,13 +283,13 @@ impl UploadJournal {
     pub(crate) fn create_in(
         parent: &File,
         name: &OsStr,
-        library: &str,
-        pool: Uuid,
+        target: (&str, Uuid, Option<&str>),
         path: &str,
         source: &Path,
         condition: UploadCondition,
     ) -> Result<Self> {
-        let original = OriginalUpload::new(library, pool, path, source, condition, None)?;
+        let (library, pool, logical) = target;
+        let original = OriginalUpload::new(library, pool, logical, path, source, condition, None)?;
         save_new_in(&original, parent.try_clone()?, name, source)?;
         let saved = Self::open_in(parent, name)?;
         if saved.original != original {
@@ -311,7 +311,27 @@ impl UploadJournal {
         barcode: Option<&str>,
         directory: &Path,
     ) -> Result<Self> {
-        let original = OriginalUpload::new(library, pool, path, source, condition, barcode)?;
+        Self::create_scoped(
+            (library, pool, None),
+            path,
+            source,
+            condition,
+            barcode,
+            directory,
+        )
+    }
+
+    pub(super) fn create_scoped(
+        target: (&str, Uuid, Option<&str>),
+        path: &str,
+        source: &Path,
+        condition: UploadCondition,
+        barcode: Option<&str>,
+        directory: &Path,
+    ) -> Result<Self> {
+        let (library, pool, logical) = target;
+        let original =
+            OriginalUpload::new(library, pool, logical, path, source, condition, barcode)?;
         save_new(&original, directory, source)?;
         let saved = Self::open_locked(directory, true)?;
         if saved.original != original {
@@ -333,6 +353,9 @@ impl UploadJournal {
     }
     pub fn pool(&self) -> Uuid {
         self.original.pool
+    }
+    pub(crate) fn logical_library(&self) -> Option<&str> {
+        self.original.logical_library.as_deref()
     }
     pub fn path(&self) -> &str {
         &self.original.path

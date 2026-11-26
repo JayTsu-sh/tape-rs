@@ -112,11 +112,51 @@ pub(super) fn clear_import_gate_at(tr: &Transaction, import: &NativeMediaImport)
         request.value()["library"].as_str().expect("library"),
     ));
 }
-fn home_key(ns: Uuid, serial: &str, barcode: &str) -> Vec<u8> {
+fn home_prefix(ns: Uuid, serial: &str) -> Vec<u8> {
     let mut out = domain(ns, b'h');
     append_component(&mut out, serial.as_bytes());
+    out
+}
+fn home_key(ns: Uuid, serial: &str, barcode: &str) -> Vec<u8> {
+    let mut out = home_prefix(ns, serial);
     append_component(&mut out, barcode.as_bytes());
     out
+}
+pub(super) async fn has_home_in(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    slots: &[u16],
+) -> Result<bool> {
+    if slots.is_empty() {
+        return Ok(false);
+    }
+    let prefix = home_prefix(ns, serial);
+    let mut after = None;
+    loop {
+        let page = read_page(tr, &prefix, after.as_deref(), 100, false).await?;
+        for (_, raw) in page.items {
+            let value: Value = serde_json::from_slice(&raw)
+                .map_err(|_| CatalogError::Corrupt("持久 home 编码"))?;
+            if value["library"] != serial
+                || value["namespace"] != ns.to_string()
+                || value["version"] != 1
+            {
+                return Err(CatalogError::Corrupt("持久 home 作用域无效"));
+            }
+            let address = value["home"]
+                .as_u64()
+                .and_then(|v| u16::try_from(v).ok())
+                .ok_or(CatalogError::Corrupt("持久 home 地址无效"))?;
+            if slots.contains(&address) {
+                return Ok(true);
+            }
+        }
+        after = page.next;
+        if after.is_none() {
+            return Ok(false);
+        }
+    }
 }
 pub(super) fn clear_home_at(tr: &Transaction, ns: Uuid, serial: &str, barcode: &str) {
     tr.clear(&home_key(ns, serial, barcode));
@@ -343,8 +383,47 @@ fn validate_plan(task: &NativeDeviceTask, plan: &Value) -> Result<()> {
     {
         return Err(CatalogError::Invalid("归槽计划必须使用固定 storage 地址"));
     }
+    if matches!(task.kind(), "media-validate" | "media-online")
+        && plan["source"] != plan["home"]
+        && plan["source"] != plan["destination"]
+        || task.kind() == "media-unassign"
+            && plan["drive_serial"].is_null()
+            && plan["source"] != plan["home"]
+    {
+        return Err(CatalogError::Invalid("维护计划的存储源必须是原 home"));
+    }
     Ok(())
 }
+
+async fn require_plan_scope(tr: &Transaction, task: &NativeDeviceTask, plan: &Value) -> Result<()> {
+    use management::moves::{MoveLocation, MoveLocationKind};
+    if !matches!(
+        task.kind(),
+        "media-unassign" | "media-validate" | "media-online"
+    ) {
+        return Ok(());
+    }
+    let on_drive = plan["drive_serial"].as_str().map(|serial| MoveLocation {
+        address: if task.kind() == "media-unassign" {
+            plan["source"].as_u64().expect("validated source") as u16
+        } else {
+            plan["destination"].as_u64().expect("validated destination") as u16
+        },
+        kind: MoveLocationKind::Drive,
+        drive_serial: Some(serial.to_owned()),
+    });
+    let home = plan["home"].as_u64().expect("validated home") as u16;
+    logical_libraries::require_mechanical_locations(
+        tr,
+        task.request.namespace(),
+        task.serial(),
+        &task.request,
+        &on_drive.iter().collect::<Vec<_>>(),
+        Some(home),
+    )
+    .await
+}
+
 fn validate_observation(task: &NativeDeviceTask, value: &Value, phase: &str) -> Result<()> {
     let keys = ["inventory", "diagnostic", "validation"];
     if encoded(value).len() > 32_000
@@ -719,6 +798,16 @@ impl ManagedCatalog {
                 "home 查询的卷或 namespace 与当前归属不符",
             ));
         }
+        Self::native_device_home_at(&tr, ns, serial, barcode, assignment.as_ref()).await
+    }
+
+    pub(in crate::managed_catalog) async fn native_device_home_at(
+        tr: &Transaction,
+        ns: Uuid,
+        serial: &str,
+        barcode: &str,
+        assignment: Option<&TapeAssignment>,
+    ) -> Result<Option<u16>> {
         let Some(raw) = tr.get(&home_key(ns, serial, barcode), false).await? else {
             return Ok(None);
         };
@@ -766,7 +855,7 @@ impl ManagedCatalog {
         {
             return Err(CatalogError::Corrupt("持久 home 的字段或介质身份不符"));
         }
-        if value["volume"] != json!(expected_volume.map(|v| v.to_string())) {
+        if value["volume"] != json!(assignment.and_then(|a| a.volume_id)) {
             return Ok(None);
         }
         if let Some(a) = assignment
@@ -835,6 +924,18 @@ impl ManagedCatalog {
                             if requests::has_namespace_holds(&tr, ns).await? {
                                 return Err(CatalogError::PoolBusy);
                             }
+                            if matches!(
+                                task.kind(),
+                                "media-unassign" | "media-validate" | "media-online"
+                            ) {
+                                logical_libraries::mechanical_resources_at(
+                                    &tr,
+                                    ns,
+                                    serial,
+                                    &task.request,
+                                )
+                                .await?;
+                            }
                             let assigned = require_assignment(&tr, &task).await?;
                             if task.kind() == "media-unassign" {
                                 require_unreferenced(
@@ -877,6 +978,9 @@ impl ManagedCatalog {
                             let value: Value = serde_json::from_slice(&raw)
                                 .map_err(|_| CatalogError::Corrupt("接任设备检查点 JSON"))?;
                             validate_state(&value, &task)?;
+                            if old_owner != owner && !value["plan"].is_null() {
+                                require_plan_scope(&tr, &task, &value["plan"]).await?;
+                            }
                             if old_owner == 0 || old_owner > owner {
                                 return Err(CatalogError::Corrupt("设备任务旧owner为零"));
                             }
@@ -951,6 +1055,7 @@ impl ManagedCatalog {
                 requests::retry_result(
                     async {
                         let mut value = read_state(&tr, task, owner).await?;
+                        require_plan_scope(&tr, task, plan).await?;
                         if matches!(task.kind(), "media-validate" | "media-online")
                             && next_phase == "verified"
                         {
@@ -982,6 +1087,13 @@ impl ManagedCatalog {
                             && matches!(next_phase, "load-issued" | "move-issued")
                         {
                             return Err(CatalogError::Invalid("已取消任务不能开始新的设备操作"));
+                        }
+                        if matches!(next_phase, "move-issued" | "load-issued") {
+                            logical_libraries::note_mechanical_observation_stale(
+                                &tr,
+                                task.request.namespace(),
+                                task.serial(),
+                            );
                         }
                         value["phase"] = json!(next_phase);
                         value["plan"] = plan.clone();

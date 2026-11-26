@@ -59,7 +59,7 @@ fn fence_key(ns: Uuid, serial: &str, epoch: u64) -> Vec<u8> {
     key
 }
 
-async fn read_at(
+pub(in crate::managed_catalog) async fn read_at(
     tr: &Transaction,
     ns: Uuid,
     serial: &str,
@@ -134,10 +134,49 @@ fn save(tr: &Transaction, value: &LibraryHandoff) {
 
 async fn require_protected_route(tr: &Transaction, serial: &str) -> Result<()> {
     let route = tr.get(&routing::active_key(serial), false).await?;
-    if route.as_deref().and_then(|raw| raw.first()) != Some(&routing::HANDOFF_ROUTE_VERSION) {
+    if !route
+        .as_deref()
+        .and_then(|raw| raw.first().copied())
+        .is_some_and(routing::supports_handoff)
+    {
         return Err(CatalogError::Invalid(
             "带库缺少离线启用的交还路由保护，须先确认旧执行器和设备命令已排空",
         ));
+    }
+    Ok(())
+}
+
+pub(in crate::managed_catalog) async fn require_drained_at(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+) -> Result<()> {
+    let mut uploads = key(b'0');
+    uploads.extend_from_slice(ns.as_bytes());
+    let mut blocking = Vec::new();
+    for prefix in [
+        library_prefix(ns, serial, b'q'),
+        control::pending_node_task_prefix(ns, serial),
+        uploads,
+    ] {
+        for (key, _) in read_page(tr, &prefix, None, 16, false).await?.items {
+            if key.len() != prefix.len() + 24 {
+                return Err(CatalogError::Corrupt("带库交还阻塞操作索引损坏"));
+            }
+            blocking.push(uuid_from(&key[prefix.len() + 8..])?);
+        }
+    }
+    if !blocking.is_empty() {
+        return Err(CatalogError::LibraryHandoffBusy(blocking));
+    }
+    exclusion::require_available_at(tr, ns, serial).await?;
+    moves::require_readable_at(tr, ns, serial).await?;
+    if !read_page(tr, &fence_prefix(ns, serial), None, 1, false)
+        .await?
+        .items
+        .is_empty()
+    {
+        return Err(CatalogError::PoolBusy);
     }
     Ok(())
 }
@@ -182,7 +221,7 @@ impl ManagedCatalog {
                             .get(&routing::active_key(serial), false)
                             .await?
                             .ok_or(CatalogError::Incomplete)?;
-                        if raw[0] != routing::HANDOFF_ROUTE_VERSION {
+                        if !routing::supports_handoff(raw[0]) {
                             return Ok(false);
                         }
                         if read_at(&tr, ns, serial, None)
@@ -298,7 +337,7 @@ impl ManagedCatalog {
                         // commands, so only here may an unresolved fence be removed.
                         let prefix = fence_prefix(namespace, serial);
                         tr.clear_range(&prefix, &prefix_end(&prefix));
-                        if saved[0] == routing::HANDOFF_ROUTE_VERSION {
+                        if routing::supports_handoff(saved[0]) {
                             return Ok(());
                         }
                         let mut upgraded = saved.to_vec();
@@ -412,35 +451,8 @@ impl ManagedCatalog {
                         {
                             return Err(CatalogError::PoolBusy);
                         }
-                        let mut uploads = key(b'0');
-                        uploads.extend_from_slice(ns.as_bytes());
-                        let mut blocking = Vec::new();
-                        for prefix in [
-                            library_prefix(ns, serial, b'q'),
-                            control::pending_node_task_prefix(ns, serial),
-                            uploads,
-                        ] {
-                            let page = read_page(&tr, &prefix, None, 16, false).await?;
-                            for (key, _) in page.items {
-                                if key.len() != prefix.len() + 24 {
-                                    return Err(CatalogError::Corrupt("带库交还阻塞操作索引损坏"));
-                                }
-                                blocking.push(uuid_from(&key[prefix.len() + 8..])?);
-                            }
-                        }
-                        if !blocking.is_empty() {
-                            return Err(CatalogError::LibraryHandoffBusy(blocking));
-                        }
-                        exclusion::require_available_at(&tr, ns, serial).await?;
-                        moves::require_readable_at(&tr, ns, serial).await?;
+                        require_drained_at(&tr, ns, serial).await?;
                         require_protected_route(&tr, serial).await?;
-                        if !read_page(&tr, &fence_prefix(ns, serial), None, 1, false)
-                            .await?
-                            .items
-                            .is_empty()
-                        {
-                            return Err(CatalogError::PoolBusy);
-                        }
                         save(&tr, original);
                         Ok(original.clone())
                     }
@@ -549,6 +561,9 @@ impl ManagedCatalog {
                         }
                         if current.as_ref() != Some(original) {
                             return Err(CatalogError::OwnerFenced);
+                        }
+                        if updated.phase == LibraryHandoffPhase::Online {
+                            logical_libraries::require_acquire_reconciliation(&tr, updated).await?;
                         }
                         save(&tr, updated);
                         Ok(())

@@ -9,6 +9,8 @@ mod fdb_rename;
 mod inventory;
 #[path = "ltfsctl/lifecycle.rs"]
 mod lifecycle;
+#[path = "ltfsctl/logical_library.rs"]
+mod logical_library;
 #[path = "ltfsctl/notify.rs"]
 mod notify;
 #[path = "ltfsctl/pool.rs"]
@@ -45,6 +47,9 @@ enum Cmd {
     },
     /// FDB 服务：查询、校验下载和持久上传
     Fdb {
+        /// 原生文件读取和上传使用的逻辑带库 UUID
+        #[arg(long)]
+        logical_library: Option<uuid::Uuid>,
         #[command(subcommand)]
         cmd: FdbCmd,
     },
@@ -120,8 +125,16 @@ enum Cmd {
     },
     /// 池管理
     Pool {
+        /// 目标逻辑带库的 UUID
+        #[arg(long, global = true)]
+        logical_library: Option<uuid::Uuid>,
         #[command(subcommand)]
         cmd: pool::Command,
+    },
+    /// 创建和查看物理带库内的逻辑带库
+    LogicalLibrary {
+        #[command(subcommand)]
+        cmd: logical_library::Command,
     },
     /// 磁带归属
     Tape {
@@ -433,11 +446,18 @@ fn main() {
             c = c.with_pool(pool.clone())?;
         }
         match args.cmd {
-            Cmd::Fdb { cmd } => {
+            Cmd::Fdb {
+                logical_library,
+                cmd,
+            } => {
                 use tape_rs::client::fdb::{
                     FdbClient, NodeCondition, PreparedManagement, UploadStatus,
                 };
                 let client = FdbClient::new(args.endpoints.clone())?;
+                let client = match logical_library {
+                    Some(logical) => client.with_logical_library(logical)?,
+                    None => client,
+                };
                 match cmd {
                     FdbCmd::Rename { cmd } => fdb_rename::run(
                         &client,
@@ -955,7 +975,17 @@ fn main() {
                 let client = tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?;
                 reading::list(&client, library, pool, dir.as_deref())?;
             }
-            Cmd::Pool { cmd } => pool::run(
+            Cmd::Pool {
+                logical_library,
+                cmd,
+            } => pool::run(
+                &tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?,
+                args.library.as_deref(),
+                args.pool.as_deref(),
+                logical_library,
+                cmd,
+            )?,
+            Cmd::LogicalLibrary { cmd } => logical_library::run(
                 &tape_rs::client::fdb::FdbClient::new(args.endpoints.clone())?,
                 args.library.as_deref(),
                 args.pool.as_deref(),

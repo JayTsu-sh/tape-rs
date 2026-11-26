@@ -531,13 +531,15 @@ fn checked_device<'a>(
                     return Err(lost("原机械操作的磁带策略已禁止访问"));
                 }
                 if let Some(drive) = drive
-                    && !roles.iter().any(|role| {
+                    && (!roles.iter().any(|role| {
                         super::super::management::drive_allowed(
                             &current,
                             &owner.devices[drive].serial,
                             *role,
                         )
-                    })
+                    }) || pool_resources(owner, control, pool).await?.is_some_and(
+                        |resources| !resources.drives.contains(&owner.devices[drive].serial),
+                    ))
                 {
                     return Err(lost("原机械操作的驱动器角色已改变"));
                 }
@@ -546,6 +548,23 @@ fn checked_device<'a>(
             .map_err(|error: ReadError| TapeError::Catalog(error.to_string()))
         },
     )
+}
+
+pub(super) async fn pool_resources(
+    owner: &Active,
+    control: &FdbOwnerControl,
+    pool: uuid::Uuid,
+) -> std::result::Result<Option<crate::logical_library::LogicalLibraryResources>, ReadError> {
+    control
+        .catalog
+        .active_logical_pool_resources(&control.serial, control.route, owner.round, pool)
+        .await
+        .map_err(|error| match error.domain() {
+            crate::managed_catalog::CatalogError::LogicalInventoryBlocked(detail) => {
+                ReadError::Busy(detail.clone())
+            }
+            _ => lost(error),
+        })
 }
 
 fn changer_index(owner: &Active) -> std::result::Result<usize, ReadError> {
@@ -882,6 +901,7 @@ async fn unload_inner(
         .as_ref()
         .filter(|(barcode, _)| barcode == &mount.barcode)
         .ok_or_else(|| lost("卸带前库存与本轮挂载身份不一致"))?;
+    let logical = pool_resources(owner, control, mount.pool).await?;
     if let Some((task, destination)) = maintenance {
         let state = control
             .catalog
@@ -929,6 +949,22 @@ async fn unload_inner(
     } else {
         None
     };
+    let automatic_home = if maintenance.is_none() && intake.is_none() {
+        let persisted = control
+            .catalog
+            .native_device_home(
+                &control.serial,
+                control.route,
+                owner.round,
+                barcode,
+                Some(mount.volume),
+            )
+            .await
+            .map_err(lost)?;
+        automatic_home(*home, persisted)?
+    } else {
+        None
+    };
     let destination = maintenance
         .map(|(_, home)| home)
         .or(intake_destination)
@@ -936,12 +972,26 @@ async fn unload_inner(
         .or_else(|| {
             (maintenance.is_none() && intake.is_none())
                 .then(|| {
-                    home.filter(|home| inventory.empty_slots.contains(home))
-                        .or_else(|| inventory.empty_slots.first().copied())
+                    automatic_home
+                        .filter(|home| inventory.empty_slots.contains(home))
+                        .or_else(|| {
+                            logical
+                                .is_none()
+                                .then(|| inventory.empty_slots.first().copied())
+                                .flatten()
+                        })
                 })
                 .flatten()
         })
         .ok_or_else(|| ReadError::Busy("没有空存储槽位可卸带".into()))?;
+    if logical.as_ref().is_some_and(|resources| {
+        !resources.drives.contains(&owner.devices[drive].serial)
+            || !resources.storage_slots.contains(&destination)
+    }) {
+        return Err(ReadError::Busy(
+            "原驱动器或 home 不属于池所在逻辑带库".into(),
+        ));
+    }
     let label = drive_io(
         owner,
         permit,
@@ -1011,6 +1061,16 @@ async fn unload_inner(
     }
     owner.fdb_reads.remove(&drive);
     Ok(())
+}
+
+fn automatic_home(
+    reported: Option<u16>,
+    persisted: Option<u16>,
+) -> std::result::Result<Option<u16>, ReadError> {
+    if matches!((reported, persisted), (Some(reported), Some(saved)) if reported != saved) {
+        return Err(lost("驱动器报告的原槽位与持久 home 冲突"));
+    }
+    Ok(reported.or(persisted))
 }
 
 pub(super) async fn select(
@@ -1137,6 +1197,7 @@ async fn select_target(
         )));
     }
     let pool = placement.pool_id.to_string();
+    let logical = pool_resources(owner, control, placement.pool_id).await?;
     let management = policy(owner, control, &[placement.pool_id], Some(barcode)).await?;
     if target.writable {
         fdb_monitor::write_allowed(owner, control, barcode, false).await?;
@@ -1157,11 +1218,14 @@ async fn select_target(
         return Err(ReadError::Failed("清洗带不能执行 LTFS 读取".into()));
     }
     let allowed = |drive: usize| {
-        super::super::management::drive_allowed(
-            &management,
-            &owner.devices[drive].serial,
-            if target.writable { 'm' } else { 'r' },
-        )
+        logical
+            .as_ref()
+            .is_none_or(|resources| resources.drives.contains(&owner.devices[drive].serial))
+            && super::super::management::drive_allowed(
+                &management,
+                &owner.devices[drive].serial,
+                if target.writable { 'm' } else { 'r' },
+            )
     };
     if let Some(slot) = inventory.drives.iter().find(|slot| {
         slot.loaded
@@ -1170,6 +1234,30 @@ async fn select_target(
     }) {
         if !allowed(slot.dev) {
             return Err(ReadError::Busy("目标驱动器没有读取资格".into()));
+        }
+        if let Some(logical) = &logical {
+            let Some((_, home)) = &slot.loaded else {
+                return Err(lost("目标驱动器库存已改变"));
+            };
+            let home = match *home {
+                Some(home) => Some(home),
+                None => control
+                    .catalog
+                    .native_device_home(
+                        &control.serial,
+                        control.route,
+                        owner.round,
+                        barcode,
+                        Some(target.index.volume_uuid),
+                    )
+                    .await
+                    .map_err(lost)?,
+            };
+            if home.is_none_or(|home| !logical.storage_slots.contains(&home)) {
+                return Err(ReadError::Busy(
+                    "已装载磁带的 home 未归属当前逻辑带库".into(),
+                ));
+            }
         }
         if target.writable {
             let checked = checked_device(owner, permit, control, slot.dev, scope);
@@ -1229,6 +1317,14 @@ async fn select_target(
         .slots
         .get(barcode)
         .ok_or_else(|| ReadError::Busy("目标磁带不在可调度存储槽位中".into()))?;
+    if logical
+        .as_ref()
+        .is_some_and(|resources| !resources.storage_slots.contains(&from))
+    {
+        return Err(ReadError::Busy(
+            "目标磁带不在所属逻辑带库的存储槽位内".into(),
+        ));
+    }
     let mut compatible = Vec::new();
     for slot in inventory.drives.iter().filter(|slot| allowed(slot.dev)) {
         let checked = checked_device(owner, permit, control, slot.dev, scope);
@@ -1290,12 +1386,8 @@ async fn select_target(
                 // retire a same-pool mount on a different-generation drive.
                 (empty.is_some() && at_limit || compatible.contains(drive))
                     && (!at_limit || mount.pool == placement.pool_id)
+                    && allowed(**drive)
                     && tape_allowed(&management, &mount.barcode)
-                    && super::super::management::drive_allowed(
-                        &management,
-                        &owner.devices[**drive].serial,
-                        if target.writable { 'm' } else { 'r' },
-                    )
             })
             .min_by_key(|(_, mount)| mount.last_used)
             .map(|(drive, _)| *drive)
@@ -1431,6 +1523,35 @@ pub(super) async fn recovery_load(
     writable: bool,
     slot: &DriveSlot,
 ) -> std::result::Result<(), ReadError> {
+    if let Some(logical) = pool_resources(owner, control, placement.pool_id).await? {
+        let home = slot
+            .loaded
+            .as_ref()
+            .filter(|(barcode, _)| barcode == &placement.barcode)
+            .ok_or_else(|| lost("恢复装载的原介质不在驱动器"))?
+            .1;
+        let home = match home {
+            Some(home) => Some(home),
+            None => control
+                .catalog
+                .native_device_home(
+                    &control.serial,
+                    control.route,
+                    owner.round,
+                    &placement.barcode,
+                    Some(index.volume_uuid),
+                )
+                .await
+                .map_err(lost)?,
+        };
+        if !logical.drives.contains(&owner.devices[slot.dev].serial)
+            || home.is_none_or(|home| !logical.storage_slots.contains(&home))
+        {
+            return Err(ReadError::Busy(
+                "恢复装载的原驱动器或 home 不属于目标逻辑带库".into(),
+            ));
+        }
+    }
     automatic::load(
         owner,
         permit,
@@ -1451,6 +1572,22 @@ pub(super) async fn recovery_load(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_home_reconciles_reported_and_persisted_evidence() {
+        for (reported, persisted, expected) in [
+            (None, None, None),
+            (Some(100), None, Some(100)),
+            (None, Some(100), Some(100)),
+            (Some(100), Some(100), Some(100)),
+        ] {
+            assert_eq!(automatic_home(reported, persisted).unwrap(), expected);
+        }
+        assert!(matches!(
+            automatic_home(Some(100), Some(101)),
+            Err(ReadError::Lost(_))
+        ));
+    }
 
     #[test]
     fn tape_policy_requires_explicit_native_flags_and_ignores_legacy_markers() {

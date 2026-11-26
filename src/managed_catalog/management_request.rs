@@ -78,6 +78,28 @@ fn patch(value: &Value, pool: bool) -> Result<()> {
     Ok(())
 }
 fn validate_change(value: &Value) -> Result<()> {
+    let unscoped;
+    let value = if matches!(
+        value["kind"].as_str(),
+        Some(
+            "media-assign"
+                | "media-move"
+                | "media-unassign"
+                | "media-validate"
+                | "media-online"
+                | "media-import"
+                | "tape"
+        )
+    ) && value.get("logical_library").is_some()
+    {
+        id(value, "logical_library")?;
+        let mut fields = value.as_object().expect("validated change").clone();
+        fields.remove("logical_library");
+        unscoped = Value::Object(fields);
+        &unscoped
+    } else {
+        value
+    };
     match text(value, "kind")? {
         "tape" => {
             fields(
@@ -198,7 +220,15 @@ fn validate_change(value: &Value) -> Result<()> {
             }
         }
         "pool" => {
-            fields(value, &["kind", "id", "revision", "patch"])?;
+            if value.get("logical_library").is_some() {
+                fields(
+                    value,
+                    &["kind", "id", "revision", "patch", "logical_library"],
+                )?;
+                id(value, "logical_library")?;
+            } else {
+                fields(value, &["kind", "id", "revision", "patch"])?;
+            }
             id(value, "id")?;
             if number(value, "revision")? == 0 {
                 return Err(CatalogError::Invalid("池修订号不能为零"));
@@ -207,7 +237,12 @@ fn validate_change(value: &Value) -> Result<()> {
             patch(&value["patch"], true)?;
         }
         "pool-delete" => {
-            fields(value, &["kind", "id", "revision"])?;
+            if value.get("logical_library").is_some() {
+                fields(value, &["kind", "id", "revision", "logical_library"])?;
+                id(value, "logical_library")?;
+            } else {
+                fields(value, &["kind", "id", "revision"])?;
+            }
             id(value, "id")?;
             if number(value, "revision")? == 0 {
                 return Err(CatalogError::Invalid("池修订号不能为零"));
@@ -281,6 +316,12 @@ impl ManagementRequest {
     pub fn value(&self) -> &Value {
         &self.value
     }
+    pub(super) fn logical_library(&self) -> Option<Uuid> {
+        self.value["change"]["logical_library"]
+            .as_str()
+            .map(|id| Uuid::parse_str(id).expect("validated logical library"))
+    }
+
     pub fn namespace(&self) -> Uuid {
         self.namespace
     }

@@ -40,16 +40,25 @@ async fn choose(
     let inventory = checked_inventory(owner, permit, control, scope)?;
     let barcode = target.placement.barcode.as_str();
     let pool = target.placement.pool_id;
+    let import = target.intake.expect("original intake");
+    let resources = control
+        .catalog
+        .active_mechanical_resources(
+            &control.serial,
+            control.route,
+            owner.round,
+            import.request(),
+        )
+        .await
+        .map_err(lost)?;
     let management = policy(owner, control, &[pool], Some(barcode)).await?;
     if !tape_allowed(&management, barcode) || inventory.cleaning.contains(barcode) {
         return Err(ReadError::Busy("导入磁带离线、在黑名单中或为清洗带".into()));
     }
     let allowed = |drive: usize| {
-        super::super::super::management::drive_allowed(
-            &management,
-            &owner.devices[drive].serial,
-            'r',
-        )
+        let serial = &owner.devices[drive].serial;
+        resources.as_ref().is_none_or(|r| r.drives.contains(serial))
+            && super::super::super::management::drive_allowed(&management, serial, 'r')
     };
     if let Some(slot) = inventory.drives.iter().find(|slot| {
         slot.loaded
@@ -64,6 +73,14 @@ async fn choose(
             .as_ref()
             .and_then(|(_, home)| *home)
             .filter(|home| inventory.empty_slots.contains(home));
+        if resources
+            .as_ref()
+            .is_some_and(|r| home.is_none_or(|home| !r.storage_slots.contains(&home)))
+        {
+            return Err(ReadError::Failed(
+                "原导入驱动器上的磁带缺少本逻辑带库的可信 home".into(),
+            ));
+        }
         return Ok(Plan {
             source: slot.addr,
             destination: slot.addr,
@@ -76,6 +93,14 @@ async fn choose(
         .slots
         .get(barcode)
         .ok_or_else(|| ReadError::Busy("导入磁带不在可调度存储槽位中".into()))?;
+    if resources
+        .as_ref()
+        .is_some_and(|r| !r.storage_slots.contains(&source))
+    {
+        return Err(ReadError::Failed(
+            "原导入磁带所在槽位超出指定逻辑带库范围".into(),
+        ));
+    }
     let mut compatible = Vec::new();
     for slot in inventory.drives.iter().filter(|slot| allowed(slot.dev)) {
         let checked = checked_device(owner, permit, control, slot.dev, scope);
@@ -129,6 +154,12 @@ async fn choose(
         .iter()
         .find(|slot| slot.loaded.is_none() && compatible.contains(&slot.dev))
         .map(|slot| slot.dev);
+    let available_home = |home: &u16| {
+        inventory.empty_slots.contains(home)
+            && resources
+                .as_ref()
+                .is_none_or(|r| r.storage_slots.contains(home))
+    };
     let (drive, eviction) = if let Some(drive) = empty.filter(|_| !at_limit) {
         (drive, None)
     } else {
@@ -140,9 +171,21 @@ async fn choose(
                     && (!at_limit || mount.pool == pool)
                     && tape_allowed(&management, &mount.barcode)
                     && allowed(**drive)
+                    && (resources.is_none()
+                        || inventory.drives.iter().any(|slot| {
+                            slot.dev == **drive
+                                && slot
+                                    .loaded
+                                    .as_ref()
+                                    .and_then(|(_, home)| *home)
+                                    .as_ref()
+                                    .is_some_and(available_home)
+                        }))
             })
             .min_by_key(|(_, mount)| mount.last_used)
-            .ok_or_else(|| ReadError::Busy("没有兼容空驱动器或可卸下的本轮受管读带".into()))?;
+            .ok_or_else(|| {
+                ReadError::Busy("请求范围内没有兼容空驱动器或可卸下的本轮受管读带".into())
+            })?;
         let slot = inventory
             .drives
             .iter()
@@ -154,8 +197,14 @@ async fn choose(
             .filter(|(loaded, _)| loaded == &mount.barcode)
             .ok_or_else(|| lost("退带原卷与实际条码不一致"))?;
         let home = home
-            .filter(|h| inventory.empty_slots.contains(h))
-            .or_else(|| inventory.empty_slots.first().copied())
+            .filter(available_home)
+            .or_else(|| {
+                if resources.is_some() {
+                    None
+                } else {
+                    inventory.empty_slots.first().copied()
+                }
+            })
             .ok_or_else(|| ReadError::Busy("没有空存储槽位可卸带".into()))?;
         (
             empty.unwrap_or(*victim),

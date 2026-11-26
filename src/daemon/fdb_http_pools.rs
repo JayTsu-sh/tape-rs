@@ -5,6 +5,7 @@ use axum::http::HeaderMap;
 use uuid::Uuid;
 
 const NAMESPACE: &str = "x-tapers-catalog-namespace";
+const LOGICAL_LIBRARY: &str = "x-tapers-logical-library";
 
 fn boxed_reply(status: StatusCode, body: Value) -> Box<Response> {
     Box::new(reply(status, body))
@@ -38,21 +39,49 @@ pub(super) fn namespace(
     }
     Ok(())
 }
-fn cursor_prefix(serial: &str, expected: ActiveLibraryRoute) -> Vec<u8> {
+pub(super) fn logical_scope(headers: &HeaderMap) -> Result<Option<Uuid>, Box<Response>> {
+    let mut values = headers.get_all(LOGICAL_LIBRARY).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(bad("逻辑带库范围不能重复"));
+    }
+    canonical_id(value.to_str().map_err(|_| bad("逻辑带库范围无效"))?).map(Some)
+}
+
+fn scoped_response(mut value: Value, logical: Option<Uuid>) -> Value {
+    if let Some(logical) = logical {
+        value["logical_library"] = json!(logical);
+    }
+    value
+}
+
+fn cursor_prefix(serial: &str, expected: ActiveLibraryRoute, logical: Option<Uuid>) -> Vec<u8> {
     let mut prefix = b"P1/".to_vec();
     prefix.extend_from_slice(&(serial.len() as u64).to_be_bytes());
     prefix.extend_from_slice(serial.as_bytes());
     prefix.extend_from_slice(expected.route.namespace.as_bytes());
+    prefix.push(u8::from(logical.is_some()));
+    if let Some(logical) = logical {
+        prefix.extend_from_slice(logical.as_bytes());
+    }
     prefix
 }
-pub(super) fn pool_cursor(serial: &str, expected: ActiveLibraryRoute, raw: &[u8]) -> String {
-    let mut bytes = cursor_prefix(serial, expected);
+pub(super) fn pool_cursor(
+    serial: &str,
+    expected: ActiveLibraryRoute,
+    logical: Option<Uuid>,
+    raw: &[u8],
+) -> String {
+    let mut bytes = cursor_prefix(serial, expected, logical);
     bytes.extend_from_slice(raw);
     URL_SAFE_NO_PAD.encode(bytes)
 }
 pub(super) fn decode_pool_cursor(
     serial: &str,
     expected: ActiveLibraryRoute,
+    logical: Option<Uuid>,
     encoded: &str,
 ) -> Result<Vec<u8>, Box<Response>> {
     if encoded.len() > 4096 {
@@ -61,12 +90,12 @@ pub(super) fn decode_pool_cursor(
     let bytes = URL_SAFE_NO_PAD
         .decode(encoded)
         .map_err(|_| bad("池分页游标无效"))?;
-    let prefix = cursor_prefix(serial, expected);
+    let prefix = cursor_prefix(serial, expected, logical);
     bytes
         .strip_prefix(prefix.as_slice())
         .filter(|v| !v.is_empty())
         .map(<[u8]>::to_vec)
-        .ok_or_else(|| bad("池分页游标的带库或命名空间不符"))
+        .ok_or_else(|| bad("池分页游标的物理库、逻辑库或命名空间不符"))
 }
 pub(super) fn failure(error: CatalogError) -> Response {
     let domain = error.domain();
@@ -129,6 +158,10 @@ pub(super) async fn list(
     if let Err(r) = namespace(request.headers(), expected) {
         return *r;
     }
+    let logical = match logical_scope(request.headers()) {
+        Ok(logical) => logical,
+        Err(error) => return *error,
+    };
     let limit = match query_value(&request, "limit") {
         Ok(None) => 100,
         Ok(Some(text)) => match text.parse::<usize>() {
@@ -139,7 +172,7 @@ pub(super) async fn list(
     };
     let after = match query_value(&request, "after") {
         Ok(None) => None,
-        Ok(Some(text)) => match decode_pool_cursor(&serial, expected, text) {
+        Ok(Some(text)) => match decode_pool_cursor(&serial, expected, logical, text) {
             Ok(raw) => Some(raw),
             Err(response) => return *response,
         },
@@ -147,7 +180,7 @@ pub(super) async fn list(
     };
     match ctx
         .catalog
-        .list_active_pools_for_route(&serial, expected, after.as_deref(), limit)
+        .admin_pool_page(&serial, expected, logical, after.as_deref(), limit)
         .await
     {
         Ok(page) => {
@@ -156,7 +189,10 @@ pub(super) async fn list(
             match items {
                 Ok(items) => reply(
                     StatusCode::OK,
-                    json!({"library_serial":serial,"namespace":expected.route.namespace.to_string(),"items":items,"next":page.next.map(|v|pool_cursor(&serial,expected,&v))}),
+                    scoped_response(
+                        json!({"library_serial":serial,"namespace":expected.route.namespace.to_string(),"items":items,"next":page.next.map(|v|pool_cursor(&serial,expected,logical,&v))}),
+                        logical,
+                    ),
                 ),
                 Err(e) => failure(e),
             }
@@ -205,12 +241,22 @@ pub(super) async fn show(
     if let Err(r) = namespace(request.headers(), expected) {
         return *r;
     }
-    let result = resolve(&ctx, &serial, expected, &selector).await;
+    let logical = match logical_scope(request.headers()) {
+        Ok(logical) => logical,
+        Err(error) => return *error,
+    };
+    let result = ctx
+        .catalog
+        .admin_pool(&serial, expected, logical, &selector)
+        .await;
     match result {
         Ok(Some(pool)) => match pool.to_json() {
             Ok(p) => reply(
                 StatusCode::OK,
-                json!({"library_serial":serial,"namespace":expected.route.namespace.to_string(),"pool":p}),
+                scoped_response(
+                    json!({"library_serial":serial,"namespace":expected.route.namespace.to_string(),"pool":p}),
+                    logical,
+                ),
             ),
             Err(e) => failure(e),
         },
@@ -218,14 +264,14 @@ pub(super) async fn show(
             StatusCode::NOT_FOUND,
             json!({"error":"pool_not_found","detail":"目标带库中没有该池"}),
         ),
-        Err(e) => *e,
+        Err(e) => failure(e),
     }
 }
 
-struct Serving {
+pub(super) struct Serving {
     library: Arc<HttpContext>,
     node: u64,
-    round: u64,
+    pub(super) round: u64,
     local: bool,
 }
 fn serving(
@@ -293,7 +339,7 @@ fn live(owner: &Serving, expected: ActiveLibraryRoute) -> bool {
 }
 // Dropping an in-flight FDB transaction is not evidence that it did not commit.
 // Stop retries on permission loss; the original UUID/ledger remains the recovery key.
-async fn permitted<T>(
+pub(super) async fn permitted<T>(
     owner: &Serving,
     expected: ActiveLibraryRoute,
     future: impl std::future::Future<Output = Result<T, CatalogError>>,
@@ -322,7 +368,7 @@ async fn permitted<T>(
         }
     }
 }
-async fn writer(
+pub(super) async fn writer(
     ctx: &Context,
     serial: &str,
     expected: ActiveLibraryRoute,
@@ -361,9 +407,16 @@ async fn writer(
     ))
 }
 async fn body<T: serde::de::DeserializeOwned>(request: Request) -> Result<T, Box<Response>> {
+    body_with_limit(request, 4096).await
+}
+
+pub(super) async fn body_with_limit<T: serde::de::DeserializeOwned>(
+    request: Request,
+    limit: usize,
+) -> Result<T, Box<Response>> {
     let bytes = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        axum::body::to_bytes(request.into_body(), 4096),
+        axum::body::to_bytes(request.into_body(), limit),
     )
     .await
     .map_err(|_| {
@@ -372,10 +425,10 @@ async fn body<T: serde::de::DeserializeOwned>(request: Request) -> Result<T, Box
             json!({"error":"body_timeout","detail":"管理请求体读取超时"}),
         )
     })?
-    .map_err(|_| bad("管理请求体读取失败或超过4KiB"))?;
+    .map_err(|_| bad("管理请求体读取失败或超过大小上限"))?;
     serde_json::from_slice(&bytes).map_err(|_| bad("管理JSON字段无效、重复或超出类型范围"))
 }
-fn canonical_id(text: &str) -> Result<Uuid, Box<Response>> {
+pub(super) fn canonical_id(text: &str) -> Result<Uuid, Box<Response>> {
     Uuid::parse_str(text)
         .ok()
         .filter(|id| !id.is_nil() && id.to_string() == text)
@@ -417,6 +470,10 @@ pub(super) async fn create(
     if let Err(r) = namespace(request.headers(), expected) {
         return *r;
     }
+    let logical = match logical_scope(request.headers()) {
+        Ok(logical) => logical,
+        Err(error) => return *error,
+    };
     let (owner, request) = match writer(&ctx, &serial, expected, request).await {
         Ok(v) => v,
         Err(r) => return *r,
@@ -457,7 +514,7 @@ pub(super) async fn create(
         &owner,
         expected,
         ctx.catalog
-            .create_active_pool(&serial, expected, owner.round, &pool),
+            .create_admin_pool(&serial, expected, owner.round, logical, &pool),
     )
     .await;
     if !live(&owner, expected) {
@@ -487,7 +544,10 @@ pub(super) async fn create(
                     } else {
                         StatusCode::OK
                     },
-                    json!({"library_serial":serial,"namespace":expected.route.namespace.to_string(),"created":created,"pool":p}),
+                    scoped_response(
+                        json!({"library_serial":serial,"namespace":expected.route.namespace.to_string(),"created":created,"pool":p}),
+                        logical,
+                    ),
                 ),
                 Err(e) => failure(e),
             }
@@ -566,6 +626,8 @@ enum MechanicalChange {
         volume: String,
         confirm_format: bool,
         force_format: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        logical_library: Option<String>,
     },
     #[serde(rename = "media-move")]
     Move {
@@ -574,6 +636,8 @@ enum MechanicalChange {
         pool: Value,
         volume: Value,
         revision: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        logical_library: Option<String>,
     },
 }
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -682,9 +746,16 @@ enum PoolChange {
         id: String,
         revision: u64,
         patch: UniquePatch,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        logical_library: Option<String>,
     },
     #[serde(rename = "pool-delete")]
-    Delete { id: String, revision: u64 },
+    Delete {
+        id: String,
+        revision: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        logical_library: Option<String>,
+    },
 }
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -715,6 +786,10 @@ async fn admit(
     if let Err(r) = namespace(request.headers(), expected) {
         return *r;
     }
+    let logical = match logical_scope(request.headers()) {
+        Ok(logical) => logical,
+        Err(error) => return *error,
+    };
     let target = match canonical_id(&id) {
         Ok(v) => v,
         Err(r) => return *r,
@@ -729,9 +804,10 @@ async fn admit(
     };
     let envelope = serde_json::to_value(envelope).expect("validated envelope serializes");
     if envelope["change"]["id"] != target.to_string()
+        || envelope["change"]["logical_library"] != json!(logical)
         || envelope["change"]["kind"] != if delete { "pool-delete" } else { "pool" }
     {
-        return invalid("请求操作或池UUID与HTTP路径不符");
+        return invalid("请求操作、池UUID或逻辑带库与HTTP范围不符");
     }
     let intent = match ManagementRequest::parse(envelope) {
         Ok(v) => v,

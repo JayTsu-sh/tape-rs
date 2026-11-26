@@ -368,6 +368,55 @@ pub(super) async fn read_task_at(
 fn task_entity(epoch: u64, operation: Uuid) -> String {
     format!("task:{epoch}:{operation}")
 }
+pub(super) async fn require_logical_resources_available(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    logical: Uuid,
+    resources: &[&crate::logical_library::LogicalLibraryResources],
+) -> Result<()> {
+    let logical = logical.to_string();
+    let overlaps = |task: &Value| {
+        let change = &task["request"]["change"];
+        if let Some(scope) = change["logical_library"].as_str() {
+            return scope == logical;
+        }
+        match change["kind"].as_str() {
+            Some("library-rescan") => false,
+            Some("drive") => resources
+                .iter()
+                .any(|part| part.drives.iter().any(|drive| change["serial"] == *drive)),
+            // A pre-migration business request has no verifiable resource scope.
+            _ => true,
+        }
+    };
+    if moves::pending_at(tr, ns, serial)
+        .await?
+        .as_ref()
+        .is_some_and(&overlaps)
+    {
+        return Err(CatalogError::PoolBusy);
+    }
+    let prefix = library_prefix(ns, serial, b'q');
+    let page = read_page(tr, &prefix, None, MAX_QUEUED, false).await?;
+    if page.next.is_some() {
+        return Err(CatalogError::Corrupt("管理队列超过上限"));
+    }
+    for (key, value) in page.items {
+        if key.len() != prefix.len() + 24 || !value.is_empty() {
+            return Err(CatalogError::Corrupt("管理队列索引编码"));
+        }
+        let epoch = read_u64(&key[prefix.len()..prefix.len() + 8]);
+        let operation = uuid_from(&key[prefix.len() + 8..])?;
+        let task = read_task_at(tr, ns, serial, epoch, operation)
+            .await?
+            .ok_or(CatalogError::Corrupt("管理队列存在孤立请求"))?;
+        if overlaps(&task) {
+            return Err(CatalogError::PoolBusy);
+        }
+    }
+    Ok(())
+}
 fn task_event_view(value: &Value) -> Value {
     let change = &value["request"]["change"];
     let pool = if matches!(change["kind"].as_str(), Some("pool" | "pool-delete")) {
@@ -478,6 +527,17 @@ impl ManagedCatalog {
                 return Ok(saved);
             }
             if request.epoch()!=w.accepting {return Err(CatalogError::Invalid("管理请求代次已关闭"));}
+            let change = &request.value()["change"];
+            if matches!(change["kind"].as_str(), Some("pool" | "pool-delete")) {
+                logical_libraries::require_business_route_at(&tr, serial).await?;
+                pools::require_scope(&tr, ns, serial, change).await?;
+            }
+            if matches!(change["kind"].as_str(),
+                Some("media-assign" | "media-move" | "media-unassign" | "media-validate" | "media-online" | "media-import" | "tape" | "media-reclaim"))
+            {
+                logical_libraries::require_business_route_at(&tr, serial).await?;
+                logical_libraries::mechanical_resources_at(&tr, ns, serial, request).await?;
+            }
             let queued=read_page(&tr,&library_prefix(ns,serial,b'q'),None,MAX_QUEUED,false).await?;
             if queued.items.len()>=MAX_QUEUED {return Err(CatalogError::ManagementQueueFull);}
             let mut value=json!({"version":1,"library_serial":serial,"namespace":ns.to_string(),
@@ -664,6 +724,103 @@ mod tests {
         out.push(b'h');
         out
     }
+
+    #[tokio::test]
+    #[ignore = "需要隔离 FDB_TEST_CLUSTER；验证启用前原搬带任务及新请求边界"]
+    async fn unactivated_library_keeps_original_move_recovery() {
+        use crate::changer::element::ElementAddressMap;
+        let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+        let _network = unsafe { foundationdb::boot() };
+        let catalog = ManagedCatalog::open(Some(&cluster)).unwrap();
+        let ns = Uuid::new_v4();
+        let serial = format!("ORIGINAL-{ns}");
+        let challenge = Uuid::new_v4();
+        let barriers: Vec<_> = (1..=3).map(|id| json!({"version":1,"library_serial":serial,
+            "challenge":challenge,"node_id":id,"term":7,"leader":2,"role":if id==2 {"Leader"} else {"Follower"},
+            "members":{"1":"a:1","2":"b:2","3":"c:3"},"quiesce_index":89,"frozen_index":90,
+            "applied_index":92,"executor_absent":true,"catalog_pending":false,"shutting_down":false,"catalog_empty":true})).collect();
+        let route = catalog
+            .initialize_native_library(
+                ns,
+                &verify_native_barriers(&serial, challenge, &barriers).unwrap(),
+            )
+            .await
+            .unwrap();
+        let owner = route.initial_owner_epoch;
+        let operation = Uuid::new_v4();
+        let intent = request(
+            ns,
+            &serial,
+            operation,
+            json!({"kind":"media-move","pool":null,
+            "volume":null,"revision":null,"barcode":"TEST01L8","destination":"ieslot"}),
+        );
+        assert!(
+            catalog
+                .admit_management(&serial, route, owner, &intent)
+                .await
+                .is_err()
+        );
+
+        let previous = json!({"version":1,"library_serial":serial,"namespace":ns,
+            "operation":operation,"epoch":1,"request":intent.value(),"fingerprint":intent.fingerprint(),
+            "status":"queued","created_at_millis":now(),"completed_at_millis":null,
+            "owner_epoch":0,"result":null,"execution":null});
+        let tr = catalog.db.create_trx().unwrap();
+        write_task(&tr, &intent, &previous).await.unwrap();
+        tr.set(&identity_key(ns, &serial, b'q', 1, operation), b"");
+        tr.commit().await.unwrap();
+        assert_eq!(
+            catalog
+                .admit_management(&serial, route, owner, &intent)
+                .await
+                .unwrap(),
+            previous
+        );
+        let plan = MovePlan {
+            version: 1,
+            barcode: "TEST01L8".into(),
+            captured_at: crate::ltfs::label::ltfs_time_now(),
+            map: ElementAddressMap {
+                transport_start: 0,
+                transport_count: 1,
+                storage_start: 1001,
+                storage_count: 1,
+                ie_start: 101,
+                ie_count: 1,
+                dt_start: 1,
+                dt_count: 1,
+            },
+            source: MoveLocation {
+                address: 1001,
+                kind: MoveLocationKind::Storage,
+                drive_serial: None,
+            },
+            destination: MoveLocation {
+                address: 101,
+                kind: MoveLocationKind::ImportExport,
+                drive_serial: None,
+            },
+            home_address: Some(1001),
+        };
+        catalog
+            .prepare_media_move(&serial, route, owner, &intent, &plan)
+            .await
+            .unwrap();
+        let checkpoint = catalog
+            .stage_media_move(&serial, route, owner, &intent, MovePhase::Moving)
+            .await
+            .unwrap();
+        assert_eq!(checkpoint["execution"]["phase"], "moving");
+        assert_eq!(
+            catalog
+                .active_library_mechanical_task(&serial, route, owner)
+                .await
+                .unwrap(),
+            Some(checkpoint)
+        );
+    }
+
     #[tokio::test]
     #[ignore = "需要隔离FDB_TEST_CLUSTER；验证管理排队/通知原子性、接管、背压和安全取消，不访问设备"]
     async fn management_intents_are_atomic_bounded_fenced_and_library_scoped() {

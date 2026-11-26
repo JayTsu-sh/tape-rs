@@ -1098,6 +1098,13 @@ impl ManagedCatalog {
         }
         if let Some(pool) = request.pool_id {
             require_pool_library(&tr, ns, pool, &request.library_serial).await?;
+            logical_libraries::require_pool_inventory_ready_at(
+                &tr,
+                ns,
+                &request.library_serial,
+                pool,
+            )
+            .await?;
         }
         require_request_in(&tr, request, owner,context).await
     }

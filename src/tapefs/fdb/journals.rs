@@ -131,8 +131,11 @@ impl JournalStore {
         UploadJournal::create_in(
             &self.directory,
             name,
-            &backend.library,
-            backend.pool,
+            (
+                &backend.library,
+                backend.pool,
+                backend.client.file_logical_scope(),
+            ),
             path,
             source,
             condition,

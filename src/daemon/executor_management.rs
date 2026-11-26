@@ -278,11 +278,37 @@ pub(super) fn observation_from_elements(
     // Keep both projections tied to the same READ ELEMENT STATUS reply.
     let inv = inventory_elements(devices, rows, true)?;
     let drives:Vec<Value>=inv.drives.iter().map(|d|json!({"serial":devices[d.dev].serial,"address":d.addr,"barcode":d.loaded.as_ref().map(|l|&l.0)})).collect();
-    Ok(
-        json!({"library_serial":devices.iter().find(|d|d.kind==DeviceKind::Changer).map(|d|&d.serial),"owner":node,"round":round,"observed_at":crate::ltfs::label::ltfs_time_now(),"volumes":volumes,"drives":drives,
+    let mut observation = json!({"library_serial":devices.iter().find(|d|d.kind==DeviceKind::Changer).map(|d|&d.serial),"owner":node,"round":round,"observed_at":crate::ltfs::label::ltfs_time_now(),"volumes":volumes,"drives":drives,
             "num_of_slots":map.storage_count,"num_of_ieslots":map.ie_count,
-            "scsi_vendor_id":descriptor.vendor,"scsi_product_id":descriptor.product,"scsi_firmware_revision":descriptor.revision}),
-    )
+            "scsi_vendor_id":descriptor.vendor,"scsi_product_id":descriptor.product,"scsi_firmware_revision":descriptor.revision});
+    // An allocation may name an empty slot. Counts alone do not prove that
+    // the corresponding descriptors were present in this observation.
+    let complete_range = |kind, start: u16, count: u16| {
+        let range = u32::from(start)..u32::from(start) + u32::from(count);
+        let elems = rows.iter().filter(|row| row.element_type == kind);
+        range.end <= u32::from(u16::MAX) + 1
+            && elems.clone().count() == usize::from(count)
+            && elems
+                .clone()
+                .all(|row| range.contains(&u32::from(row.address)))
+    };
+    if complete_range(ElementType::Storage, map.storage_start, map.storage_count)
+        && complete_range(ElementType::ImportExport, map.ie_start, map.ie_count)
+        && complete_range(ElementType::DataTransfer, map.dt_start, map.dt_count)
+        && rows.iter().all(|row| !row.full || row.volume_tag.is_some())
+        && inv.drives.iter().all(|d| {
+            rows.iter()
+                .find(|row| row.address == d.addr)
+                .and_then(|row| row.drive_serial())
+                == Some(devices[d.dev].serial.as_str())
+        })
+        && usize::from(map.storage_count) + usize::from(map.ie_count) + inv.drives.len()
+            <= crate::logical_library::MAX_RESOURCES
+    {
+        observation["slot_layout"] =
+            json!({"storage_start":map.storage_start,"ie_start":map.ie_start});
+    }
+    Ok(observation)
 }
 
 fn cancelled(status: &SharedStatus, id: u64) -> bool {
