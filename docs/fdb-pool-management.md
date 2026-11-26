@@ -17,6 +17,8 @@ ltfsctl -e NODE:7411 --library SERIAL task show --request delete.json
 
 当前 `create` 原子创建空池，返回池记录。`set` 和 `delete` 返回持久任务，需查询至 succeeded、failed 或 cancelled。删除要求目录为空、没有磁带归属或活动文件写入。取消仅适用于 queued。任务窗口轮换、历史清理和运行中设备任务取消尚未开放。
 
+用 `ltfsctl -e NODE:7411 --library SERIAL pool create archive --preview --tape ABC001L8 --tape ABC002L8` 可以在创建前检查池名称和 1 到 100 个磁带条码。预检依赖当前 owner 的完整库存。结果中的 `eligible` 表示库存位置和归属符合条件，`blocked` 会列出相关条码及原因。预检只读 FDB，磁带格式仍须在后续设备检查中确认。
+
 写命令在第一次提交前以独占创建、0600、文件和父目录 fsync 保存请求文件。重复执行同一命令和相同参数时使用同一文件，沿用原 namespace、池 UUID、修订号、任务 epoch/operation；不会重新解析池名或更新修订号。不同参数、损坏或不完整文件直接拒绝，不覆盖、不修复。文件只保存请求身份，不缓存任务状态。保留这些文件供超时、断网和接管后恢复；不要为了重试而删除文件或改用新文件。
 
 策略字段是 `name`、`file_limit`、`media_restriction`、`mount_limit`、`low_space_warning_enabled`、`low_space_warning_threshold`、`no_space_warning_enabled`。开关使用 true/false；数值阈值为 0..32767；file_limit 必须大于零；介质限制沿用 L5/L6/L7/L8/L9/M8 和支持的 IBM 介质代码，none 表示不限制。表格的 UUID、修订号、文件上限列使用固定宽度；可变宽度中文名称放在末列，控制字符转义，避免换行破坏表格。
@@ -29,6 +31,7 @@ HTTP 路由以 `/libraries/SERIAL/admin` 为前缀：
 | GET `/pools?limit=100&after=CURSOR` | 当前库池分页 |
 | GET `/pools/UUID_OR_NAME` | 池详情；UUID 不回退为名称 |
 | POST `/pools` | 固定池 UUID 的原子创建 |
+| POST `/pool-create/preview` | 只读检查名称和条码，正文包含 `version`、`name`、`file_limit`、`tapes` |
 | PATCH `/pools/UUID` | 固定管理请求身份的策略任务 |
 | DELETE `/pools/UUID` | 固定管理请求身份的删除任务 |
 | GET `/tasks?limit=100&after=CURSOR` | 当前库持久任务分页 |

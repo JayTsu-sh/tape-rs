@@ -477,6 +477,10 @@ fn metadata_router(ctx: Arc<Context>) -> Router {
             get(pools::list).post(pools::create),
         )
         .route(
+            "/libraries/{serial}/admin/pool-create/preview",
+            axum::routing::post(pools::preview_create),
+        )
+        .route(
             "/libraries/{serial}/admin/pools/{selector}",
             get(pools::show).patch(pools::set).delete(pools::delete),
         )

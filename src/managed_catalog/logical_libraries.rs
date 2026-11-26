@@ -499,6 +499,54 @@ fn observed_resources(observation: &Value) -> LogicalLibraryResources {
     }
 }
 
+fn preview_tape_location(
+    medium: &Value,
+    observation: &Value,
+    scope: &LogicalLibraryResources,
+) -> std::result::Result<u16, &'static str> {
+    let address = medium["address"].as_u64().expect("validated address") as u16;
+    let home = match medium["element_type"].as_u64() {
+        Some(2) => address,
+        Some(4) => {
+            let in_scope = observation["drives"]
+                .as_array()
+                .expect("validated drives")
+                .iter()
+                .any(|drive| {
+                    drive["address"] == address
+                        && drive["serial"]
+                            .as_str()
+                            .is_some_and(|serial| scope.drives.iter().any(|id| id == serial))
+                });
+            if !in_scope {
+                return Err("out_of_scope");
+            }
+            let home = medium["source_address"].as_u64().ok_or("home_unknown")? as u16;
+            if !scope.storage_slots.contains(&home) {
+                return Err("out_of_scope");
+            }
+            if observation["volumes"]
+                .as_array()
+                .expect("validated volumes")
+                .iter()
+                .any(|row| row["address"] == home)
+            {
+                return Err("home_occupied");
+            }
+            home
+        }
+        _ => return Err("not_in_storage"),
+    };
+    if !scope.storage_slots.contains(&home) {
+        return Err("out_of_scope");
+    }
+    let medium_type = medium["medium_type"].as_u64().map(|value| value as u8);
+    if crate::changer::element::cleaning_source(medium_type, medium["barcode"].as_str()).is_some() {
+        return Err("cleaning");
+    }
+    Ok(home)
+}
+
 fn ensure_subset(
     selected: &LogicalLibraryResources,
     physical: &LogicalLibraryResources,
@@ -524,6 +572,94 @@ fn ensure_subset(
 }
 
 impl ManagedCatalog {
+    /// Verify a proposed tape list against one read version of the current
+    /// owner's inventory. The result neither reserves media nor proves format.
+    pub(crate) async fn preview_pool_create(
+        &self,
+        serial: &str,
+        route: ActiveLibraryRoute,
+        logical: Option<Uuid>,
+        name: &str,
+        file_limit: u64,
+        tapes: &[String],
+    ) -> Result<Value> {
+        validate_pool_name(name)?;
+        if file_limit == 0 || !(1..=100).contains(&tapes.len()) {
+            return Err(CatalogError::Invalid(
+                "池文件上限须大于零，预检条码数量须在 1..=100",
+            ));
+        }
+        let mut distinct = BTreeSet::new();
+        for tape in tapes {
+            validate_barcode(tape)?;
+            if !distinct.insert(tape) {
+                return Err(CatalogError::Invalid("创建池的条码不可重复"));
+            }
+        }
+        let (_, owner) = self
+            .active_library_owner(serial)
+            .await?
+            .filter(|(actual, _)| *actual == route)
+            .ok_or(CatalogError::Incomplete)?;
+        let tr = self.db.create_trx()?;
+        let ns = routing::require_runtime_active_owner(&tr, serial, route, owner).await?;
+        require_business_scope_at(&tr, ns, serial, logical).await?;
+        let inventory = Inventory::read(&tr, ns, serial, owner).await?;
+        let physical = inventory
+            .resources
+            .as_ref()
+            .ok_or(CatalogError::Incomplete)?;
+        let observation = inventory
+            .observation
+            .as_ref()
+            .ok_or(CatalogError::Incomplete)?;
+        let logical_resources = if let Some(id) = logical {
+            reconciliation::require_ready(&tr, ns, serial, id).await?;
+            let raw = tr
+                .get(&by_id(at(ns, serial, b'l'), id), false)
+                .await?
+                .ok_or(CatalogError::Corrupt("逻辑带库定义缺失"))?;
+            let resources = decode(id, &raw)?.resources;
+            ensure_subset(&resources, physical)?;
+            Some(resources)
+        } else {
+            None
+        };
+        let scope = logical_resources.as_ref().unwrap_or(physical);
+        let name_available = tr.get(&pool_name_key(ns, name), false).await?.is_none();
+        let mut eligible = name_available;
+        let mut results = Vec::with_capacity(tapes.len());
+        let volumes = observation["volumes"]
+            .as_array()
+            .expect("validated volumes");
+        for barcode in tapes {
+            let medium = volumes
+                .iter()
+                .find(|row| row["barcode"] == barcode.as_str());
+            let location = medium
+                .ok_or("not_observed")
+                .and_then(|row| preview_tape_location(row, observation, scope));
+            let status = match location {
+                Err(reason) => reason,
+                Ok(_)
+                    if Self::verified_assignment(&tr, serial, barcode)
+                        .await?
+                        .is_some() =>
+                {
+                    "assigned"
+                }
+                Ok(_) => "eligible",
+            };
+            eligible &= status == "eligible";
+            results.push(json!({"barcode":barcode,"status":status,"home_address":location.ok()}));
+        }
+        Ok(
+            json!({"version":1,"library_serial":serial,"namespace":ns,"logical_library":logical,
+            "status":if eligible {"eligible"} else {"blocked"}, "name":name,"name_available":name_available,
+            "file_limit":file_limit,"inventory_observed_at":observation["observed_at"],"owner_epoch":owner,"tapes":results}),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) async fn enable_logical_business_fixture(&self, serial: &str) -> Result<()> {
         let tr = self.db.create_trx()?;

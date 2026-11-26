@@ -453,6 +453,60 @@ struct NewPool {
     created_at_millis: u64,
     policy: NewPolicy,
 }
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviewCreate {
+    version: u8,
+    name: String,
+    file_limit: u64,
+    tapes: Vec<String>,
+}
+
+pub(super) async fn preview_create(
+    State(ctx): State<Arc<Context>>,
+    Path(serial): Path<String>,
+    request: Request,
+) -> Response {
+    let _permit = match budget(&ctx) {
+        Ok(permit) => permit,
+        Err(response) => return *response,
+    };
+    let expected = match route(&ctx, &serial) {
+        Ok(route) => route,
+        Err(response) => return *response,
+    };
+    if let Err(response) = namespace(request.headers(), expected) {
+        return *response;
+    }
+    let logical = match logical_scope(request.headers()) {
+        Ok(logical) => logical,
+        Err(response) => return *response,
+    };
+    let input: PreviewCreate = match body_with_limit(request, 16 * 1024).await {
+        Ok(input) => input,
+        Err(response) => return *response,
+    };
+    if input.version != 1 {
+        return invalid("池创建预检请求版本无效");
+    }
+    match ctx
+        .catalog
+        .preview_pool_create(
+            &serial,
+            expected,
+            logical,
+            &input.name,
+            input.file_limit,
+            &input.tapes,
+        )
+        .await
+    {
+        Ok(preview) => reply(StatusCode::OK, preview),
+        Err(error) => failure(error),
+    }
+}
+
 pub(super) async fn create(
     State(ctx): State<Arc<Context>>,
     Path(serial): Path<String>,

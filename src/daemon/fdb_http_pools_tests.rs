@@ -91,7 +91,7 @@ fn native_pool_discovery_uses_physical_scope_before_logical_activation() {
         let proof = crate::managed_catalog::verify_native_barriers(&serial, challenge, &replies).unwrap();
         let route = catalog.initialize_native_library(ns, &proof).await.unwrap();
         let ctx = Arc::new(Context {
-            catalog, routes: BTreeMap::from([(serial.clone(), route)]), owner: None,
+            catalog: catalog.clone(), routes: BTreeMap::from([(serial.clone(), route)]), owner: None,
             upload_budget: None, notify_streams: Arc::new(Semaphore::new(1)),
             notify_requests: Arc::new(Semaphore::new(1)), admin_requests: Arc::new(Semaphore::new(32)),
         });
@@ -101,6 +101,63 @@ fn native_pool_discovery_uses_physical_scope_before_logical_activation() {
         assert_eq!(status, 200, "{page}");
         assert_eq!(page["items"], json!([]));
         assert_eq!(request_scoped(&address, "GET", &path, Some(&ns.to_string()), Some(Uuid::new_v4()), b"").await.0, 400);
+        let preview = format!("/libraries/{serial}/admin/pool-create/preview");
+        let body = |tapes: &[&str]| json!({"version":1,"name":"archive","file_limit":100,"tapes":tapes}).to_string();
+        let run_preview = async |tapes: &[&str]| request(&address, "POST", &preview, Some(&ns.to_string()), body(tapes).as_bytes()).await;
+        assert_eq!(run_preview(&["NEW001L8"]).await.0, 503);
+        let owner = route.initial_owner_epoch;
+        let mut observation = json!({"library_serial":serial,"owner":2,"round":owner,
+            "observed_at":(chrono::Utc::now()-chrono::TimeDelta::minutes(3)).to_rfc3339(),
+            "volumes":[
+                {"barcode":"NEW001L8","address":1001,"element_type":2,"medium_type":1,"source_address":null,"home_slot":1},
+                {"barcode":"CLN001L1","address":1002,"element_type":2,"medium_type":2,"source_address":null,"home_slot":2},
+                {"barcode":"IE0001L8","address":101,"element_type":3,"medium_type":1,"source_address":null,"home_slot":null}],
+            "drives":[{"serial":"SIMDRV0000","address":1,"barcode":null}],
+            "num_of_slots":3,"num_of_ieslots":1,"slot_layout":{"storage_start":1001,"ie_start":101},
+            "scsi_vendor_id":"SIM","scsi_product_id":"SIM-CHANGER","scsi_firmware_revision":"0001"});
+        catalog.record_active_library_inventory(&serial, route, owner, &observation).await.unwrap();
+        assert_eq!(run_preview(&["NEW001L8"]).await.0, 503);
+        observation["observed_at"] = json!(crate::ltfs::label::ltfs_time_now());
+        catalog.record_active_library_inventory(&serial, route, owner, &observation).await.unwrap();
+        assert_eq!(run_preview(&["NEW001L8", "NEW001L8"]).await.0, 400);
+        let (status, result) = run_preview(&["NEW001L8", "CLN001L1", "MISSING", "IE0001L8"]).await;
+        assert_eq!(status, 200, "{result}");
+        assert_eq!(result["status"], "blocked");
+        assert_eq!(result["tapes"][0]["status"], "eligible");
+        assert_eq!(result["tapes"][1]["status"], "cleaning");
+        assert_eq!(result["tapes"][2]["status"], "not_observed");
+        assert_eq!(result["tapes"][3]["status"], "not_in_storage");
+        let (status, result) = run_preview(&["NEW001L8"]).await;
+        assert_eq!(status, 200, "{result}");
+        assert_eq!(result["status"], "eligible");
+        let sdk_address = address.clone();
+        let sdk_serial = serial.clone();
+        let sdk = tokio::task::spawn_blocking(move || {
+            crate::client::fdb::FdbClient::new([sdk_address]).unwrap()
+                .preview_pool_create(&sdk_serial, &ns.to_string(), None, "archive", 100, &["NEW001L8".to_owned()])
+                .unwrap()
+        }).await.unwrap();
+        assert_eq!(sdk, result);
+        let (status, page) = request(&address, "GET", &path, Some(&ns.to_string()), b"").await;
+        assert_eq!(status, 200, "{page}");
+        assert_eq!(page["items"], json!([]));
+        let pool = crate::managed_catalog::PoolRecord {
+            id: Uuid::new_v4(), library_serial: serial.clone(), name: "archive".into(),
+            file_limit: 100, created_at_millis: 1, revision: 1, policy: Default::default(),
+        };
+        catalog.create_admin_pool(&serial, route, owner, None, &pool).await.unwrap();
+        let operation = Uuid::new_v4();
+        let import = crate::managed_catalog::ManagementRequest::parse(json!({
+            "version":1,"library":serial,"namespace":ns,"epoch":1,"operation":operation,
+            "change":{"kind":"media-import","pool":pool.id,"barcode":"NEW001L8","volume":null,"path":"/","merge_tapes":true}
+        })).unwrap();
+        catalog.admit_management(&serial, route, owner, &import).await.unwrap();
+        assert!(catalog.start_native_media(&serial, route, owner, 1, operation).await.unwrap().is_some());
+        let (status, result) = run_preview(&["NEW001L8"]).await;
+        assert_eq!(status, 200, "{result}");
+        assert_eq!(result["status"], "blocked");
+        assert_eq!(result["name_available"], false);
+        assert_eq!(result["tapes"][0]["status"], "assigned");
         server.abort();
     });
 }
@@ -1207,6 +1264,35 @@ async fn logical_library_creation(
         json!([1002])
     );
     assert_eq!(listed["inventory"]["status"], "current");
+
+    let mut with_tapes = observation.clone();
+    with_tapes["volumes"] = json!([
+        {"barcode":"LOCAL1L8","address":1001,"element_type":2,"medium_type":1,"source_address":null,"home_slot":1},
+        {"barcode":"OTHER1L8","address":1002,"element_type":2,"medium_type":1,"source_address":null,"home_slot":2},
+    ]);
+    catalog
+        .record_active_library_inventory(serial, route, epoch, &with_tapes)
+        .await
+        .unwrap();
+    let preview = format!("/libraries/{serial}/admin/pool-create/preview");
+    let proposal = json!({"version":1,"name":"scope-preview","file_limit":100,"tapes":["LOCAL1L8","OTHER1L8"]}).to_string();
+    let (code, result) = request_scoped(
+        address,
+        "POST",
+        &preview,
+        Some(namespace),
+        Some(id),
+        proposal.as_bytes(),
+    )
+    .await;
+    assert_eq!(code, 200, "{result}");
+    assert_eq!(result["status"], "blocked");
+    assert_eq!(result["tapes"][0]["status"], "eligible");
+    assert_eq!(result["tapes"][1]["status"], "out_of_scope");
+    catalog
+        .record_active_library_inventory(serial, route, epoch, &observation)
+        .await
+        .unwrap();
 
     // Exercise the same public operation through the blocking Rust SDK.
     let endpoint = address.to_owned();

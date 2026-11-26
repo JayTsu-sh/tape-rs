@@ -504,6 +504,71 @@ impl FdbClient {
     pub fn pool(&self, library: &str, namespace: &str, selector: &str) -> Result<Value> {
         self.pool_in_scope(library, namespace, None, selector)
     }
+
+    /// Check a prospective pool's tape selection against the active inventory.
+    pub fn preview_pool_create(
+        &self,
+        library: &str,
+        namespace: &str,
+        logical: Option<Uuid>,
+        name: &str,
+        file_limit: u64,
+        tapes: &[String],
+    ) -> Result<Value> {
+        uuid(namespace)?;
+        let valid = (1..=100).contains(&tapes.len())
+            && tapes.iter().all(|tape| super::queries::barcode(tape))
+            && tapes.iter().collect::<std::collections::HashSet<_>>().len() == tapes.len();
+        if !valid || file_limit == 0 {
+            return Err(invalid(
+                "池文件上限须大于零，预检须提供 1 到 100 个合法且不重复的条码",
+            ));
+        }
+        let body = json!({"version":1,"name":name,"file_limit":file_limit,"tapes":tapes});
+        let value = parsed(
+            self.retry_request(
+                "POST",
+                &format!("{}/pool-create/preview", base(library)?),
+                Some(body.to_string().as_bytes()),
+                &header_refs(&pool_headers(namespace, logical)?),
+            )?,
+            &[200],
+        )?;
+        scope(&value, library, namespace)?;
+        verify_logical_scope(&value, logical)?;
+        let bad = || ClientError::Verification("池创建预检应答与原选择不一致".into());
+        let rows = value["tapes"].as_array().ok_or_else(bad)?;
+        let name_available = value["name_available"].as_bool().ok_or_else(bad)?;
+        let rows_match = rows.len() == tapes.len()
+            && rows.iter().zip(tapes).all(|(row, barcode)| {
+                row["barcode"] == barcode.as_str()
+                    && match row["status"].as_str() {
+                        Some("eligible" | "assigned") => row["home_address"]
+                            .as_u64()
+                            .is_some_and(|address| u16::try_from(address).is_ok()),
+                        Some(
+                            "not_observed" | "not_in_storage" | "cleaning" | "out_of_scope"
+                            | "home_unknown" | "home_occupied",
+                        ) => row["home_address"].is_null(),
+                        _ => false,
+                    }
+            });
+        let eligible = name_available && rows.iter().all(|row| row["status"] == "eligible");
+        if value["version"] != 1
+            || value["name"] != name
+            || value["file_limit"] != file_limit
+            || value["status"] != if eligible { "eligible" } else { "blocked" }
+            || !rows_match
+            || value["owner_epoch"].as_u64().is_none_or(|owner| owner == 0)
+            || value["inventory_observed_at"]
+                .as_str()
+                .is_none_or(|time| chrono::DateTime::parse_from_rfc3339(time).is_err())
+        {
+            return Err(bad());
+        }
+        Ok(value)
+    }
+
     pub fn pool_in_scope(
         &self,
         library: &str,

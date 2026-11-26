@@ -10,11 +10,17 @@ use uuid::Uuid;
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// 原子创建池及其根目录；不分配或格式化磁带
+    /// 原子创建空池及根目录，或只读预检准备入池的条码
     Create {
         name: String,
         #[arg(long, default_value_t = 200_000)]
         file_limit: u64,
+        /// 只读检查池名称和磁带清单
+        #[arg(long, requires = "tapes", conflicts_with = "request")]
+        preview: bool,
+        /// 预检条码，可重复指定
+        #[arg(long = "tape", requires = "preview")]
+        tapes: Vec<String>,
         /// 首次调用前保存请求身份；重试须用相同文件和参数
         #[arg(long)]
         request: Option<PathBuf>,
@@ -131,7 +137,19 @@ pub fn run(
         Command::Create {
             name,
             file_limit,
+            preview: true,
+            tapes,
+            ..
+        } => {
+            let context = client.management_context(library)?;
+            let namespace = context["namespace"].as_str().ok_or("缺少目录命名空间")?;
+            client.preview_pool_create(library, namespace, logical, &name, file_limit, &tapes)?
+        }
+        Command::Create {
+            name,
+            file_limit,
             request,
+            ..
         } => submit(
             client,
             library,
@@ -245,6 +263,29 @@ pub(super) fn selected(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn tape_selection_requires_explicit_preview() {
+        let parse = |extra: &[&str]| {
+            let args = [
+                "ltfsctl",
+                "-e",
+                "localhost:1",
+                "pool",
+                "--library",
+                "LIB",
+                "create",
+                "archive",
+            ];
+            crate::Args::try_parse_from(args.into_iter().chain(extra.iter().copied()))
+        };
+        assert!(parse(&[]).is_ok());
+        assert!(parse(&["--preview", "--tape", "NEW001L8", "--tape", "NEW002L8"]).is_ok());
+        assert!(parse(&["--tape", "NEW001L8"]).is_err());
+        assert!(parse(&["--preview", "--tape", "NEW001L8", "--request", "plan.json"]).is_err());
+    }
+
     #[test]
     fn names_cannot_break_table_rows_and_unicode_name_is_last() {
         assert_eq!(display_name("中文\n\t\u{1b}"), "中文\\n\\t\\u{1b}");
