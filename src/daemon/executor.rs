@@ -392,7 +392,9 @@ mod fdb_nodes;
 #[path = "executor_fdb_reclaim.rs"]
 mod fdb_reclaim;
 #[cfg(feature = "fdb")]
-pub(in crate::daemon) use fdb_reclaim::{OriginalAttemptProbeIo, FreshReclaimGroupIo, ObserveReclaimGroupIo};
+pub(in crate::daemon) use fdb_reclaim::{
+    FreshReclaimGroupIo, ObserveReclaimGroupIo, OriginalAttemptProbeIo,
+};
 #[cfg(all(test, feature = "fdb"))]
 #[path = "executor_fdb_reclaim_spool_test_hook.rs"]
 mod fdb_reclaim_spool_test_hook;

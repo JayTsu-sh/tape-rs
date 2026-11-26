@@ -374,7 +374,7 @@ async fn gates_after_parent_at(
     goal: Option<&Goal>,
 ) -> Result<[u8; 32]> {
     isolation::require_normal_mutation_at(tr, reservation, owner).await?;
-    source::group_only::require_ready_at(tr,reservation,owner,None).await?;
+    source::group_only::require_ready_at(tr, reservation, owner, None).await?;
     mechanics::require_parent_idle_at(tr, reservation).await?;
     if let Some(layout) = layout::at(tr, reservation).await? {
         layout.require_resource_scope_at(tr, reservation).await?;
@@ -405,7 +405,7 @@ async fn gates_after_parent_at(
         return Err(CatalogError::Incomplete);
     }
     let coverage = source::require_complete_coverage_at(tr, reservation, owner).await?;
-    let coverage=copy_groups::require_format_audit_at(tr,reservation,coverage).await?;
+    let coverage = copy_groups::require_format_audit_at(tr, reservation, coverage).await?;
     let volume = reservation.spec().volume();
     let mut prefix = super::super::key(b'V');
     prefix.extend_from_slice(volume.as_bytes());

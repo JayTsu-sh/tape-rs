@@ -516,8 +516,8 @@ impl Copy<'_> {
         Box<impl std::future::Future<Output = std::result::Result<bool, ReadError>> + 'a>,
     > {
         Box::pin(async move {
-            if self.parent.intent()["version"]==2 {
-                return grouping::walk(self,owner).await;
+            if self.parent.intent()["version"] == 2 {
+                return grouping::walk(self, owner).await;
             }
             // Settle the original children before consuming another namespace item.
             // A crash after verify advanced the walk must not hide metadata work.
@@ -643,11 +643,21 @@ pub(super) fn step<'a>(
 ) -> std::pin::Pin<Box<impl std::future::Future<Output = std::result::Result<(), ReadError>> + 'a>>
 {
     Box::pin(async move {
-        control.catalog.require_reclaim_group_only_ready(parent,owner.round,control.storage.download_bytes,control.storage.index_bytes)
-            .await.map_err(parent_error)?;
+        control
+            .catalog
+            .require_reclaim_group_only_ready(
+                parent,
+                owner.round,
+                control.storage.download_bytes,
+                control.storage.index_bytes,
+            )
+            .await
+            .map_err(parent_error)?;
         // Q/I belong to the original physical request, possibly under the previous
         // owner. Reconcile them before creating metadata or entering a fresh writer.
-        if parent.intent()["version"]==1 && upload_recovery::step(owner, permit, control, parent, layout).await? {
+        if parent.intent()["version"] == 1
+            && upload_recovery::step(owner, permit, control, parent, layout).await?
+        {
             return Ok(());
         }
         let context = Copy {
@@ -846,17 +856,17 @@ pub(super) fn step<'a>(
                 reader(owner, permit, control, source_drive)
                     .read_reclaim_format_source(parent, owner.files.spool_dir())
                     .await
-                    .map_err(|error|lost(format!("format_source_read: {error}")))?
+                    .map_err(|error| lost(format!("format_source_read: {error}")))?
             };
             let plan_started = Instant::now();
             control
                 .catalog
                 .prepare_reclaim_format(parent, owner.round, uuid::Uuid::new_v4(), &proof)
                 .await
-                .map_err(|error|match parent_error(error) {
-                    ReadError::Busy(reason)=>ReadError::Busy(format!("prepare_format: {reason}")),
-                    ReadError::Lost(reason)=>ReadError::Lost(format!("prepare_format: {reason}")),
-                    other=>other,
+                .map_err(|error| match parent_error(error) {
+                    ReadError::Busy(reason) => ReadError::Busy(format!("prepare_format: {reason}")),
+                    ReadError::Lost(reason) => ReadError::Lost(format!("prepare_format: {reason}")),
+                    other => other,
                 })?;
             debug!(
                 "回收源初始化计划保存耗时: 操作={} 耗时={:?}",

@@ -4,8 +4,8 @@ use super::*;
 #[cfg(test)]
 #[path = "reclaim_metadata_isolation_test_hook.rs"]
 mod isolation_test_hook;
-pub(super) use publication::require_directory_history_link_at;
 use metadata_plan::Plan;
+pub(super) use publication::require_directory_history_link_at;
 #[path = "reclaim_metadata_checkpoint.rs"]
 mod checkpoint;
 #[path = "reclaim_metadata_context.rs"]
@@ -744,7 +744,7 @@ impl ManagedCatalog {
                     requests::retry_result(
                         async {
                             parent_at(&tr, reservation, owner).await?;
-                            group_only::require_ready_at(&tr,reservation,owner,None).await?;
+                            group_only::require_ready_at(&tr, reservation, owner, None).await?;
                             isolation::require_metadata_successor_at(&tr, reservation, owner, plan)
                                 .await?;
                             registry::read_at(&tr, reservation).await?;
@@ -947,7 +947,7 @@ impl ManagedCatalog {
         parent_at(&tr, reservation, owner).await?;
         let plan = original.plan();
         isolation::require_metadata_successor_at(&tr, reservation, owner, &plan).await?;
-        group_only::require_seal_at(&tr,reservation).await?;
+        group_only::require_seal_at(&tr, reservation).await?;
         let task = load_id_at(&tr, reservation, plan.source_uid(), original.id())
             .await?
             .ok_or(CatalogError::Incomplete)?;

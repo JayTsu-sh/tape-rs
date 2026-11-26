@@ -794,7 +794,9 @@ impl<'a> LtfsVolume<'a> {
         if !self.dirty {
             return Err(TapeError::Ltfs("回收批次尚无待提交正文".into()));
         }
-        let index_start = self.p1_write_head.checked_add(1)
+        let index_start = self
+            .p1_write_head
+            .checked_add(1)
             .ok_or_else(|| TapeError::Ltfs("回收批次索引位置溢出".into()))?;
         Ok((&self.working, index_start))
     }
@@ -1780,19 +1782,29 @@ impl<'a> LtfsVolume<'a> {
         plan: &crate::managed_catalog::ReclaimIndexAugmentation,
     ) -> Result<()> {
         self.ensure_writable()?;
-        let previous = plan.previous().map_err(|e| TapeError::Catalog(e.to_string()))?;
-        let first_uid = plan.first_archive_uid().map_err(|e| TapeError::Catalog(e.to_string()))?;
+        let previous = plan
+            .previous()
+            .map_err(|e| TapeError::Catalog(e.to_string()))?;
+        let first_uid = plan
+            .first_archive_uid()
+            .map_err(|e| TapeError::Catalog(e.to_string()))?;
         if crate::managed_catalog::ActiveIndexIdentity::from(self.committed_construct) != previous
             || self.p1_write_head.checked_add(1) != Some(plan.index_start())
-            || self.working.highest_file_uid.checked_add(1) != Some(first_uid) {
-            return Err(TapeError::Ltfs("回收待提交引用改变原卷头、追加边界或UID".into()));
+            || self.working.highest_file_uid.checked_add(1) != Some(first_uid)
+        {
+            return Err(TapeError::Ltfs(
+                "回收待提交引用改变原卷头、追加边界或UID".into(),
+            ));
         }
         // Check all donors before mutating the working namespace. The old
         // committed-donor interface retains its original stricter semantics.
         for reference in plan.references() {
             if self.pending_file_node(reference.donor_path) != Some(reference.donor)
-                || self.working.find_file(reference.archive).is_some() {
-                return Err(TapeError::Ltfs("回收待提交引用的原正文或归档位置改变".into()));
+                || self.working.find_file(reference.archive).is_some()
+            {
+                return Err(TapeError::Ltfs(
+                    "回收待提交引用的原正文或归档位置改变".into(),
+                ));
             }
         }
         if let Some((path, uid, source)) = plan
@@ -1803,7 +1815,10 @@ impl<'a> LtfsVolume<'a> {
         }
         for reference in plan.references() {
             self.working.reference_reclaimed_body(
-                reference.archive, reference.archive_uid, reference.donor, reference.source,
+                reference.archive,
+                reference.archive_uid,
+                reference.donor,
+                reference.source,
             )?;
         }
         self.dirty = true;

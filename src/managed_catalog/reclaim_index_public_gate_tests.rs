@@ -453,8 +453,7 @@ async fn ordinary_unstaged_receipt_remains_not_finalized() {
     volume
         .append_file(&path, &mut std::io::Cursor::new(bytes))
         .unwrap();
-    let prepared =
-        crate::managed_catalog::prepare_active_file(&volume, &path, &intent).unwrap();
+    let prepared = crate::managed_catalog::prepare_active_file(&volume, &path, &intent).unwrap();
     assert_eq!(
         c.complete_active_file(&prepared.receipt).await.unwrap(),
         PublishOutcome::Registered

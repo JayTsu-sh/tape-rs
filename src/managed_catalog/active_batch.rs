@@ -58,7 +58,11 @@ impl PublicationAuthority<'_> {
             Ok(())
         })
     }
-    fn finish<T: PartialEq + std::fmt::Debug>(&self, result: Result<T>, accepted: &[T]) -> Result<T> {
+    fn finish<T: PartialEq + std::fmt::Debug>(
+        &self,
+        result: Result<T>,
+        accepted: &[T],
+    ) -> Result<T> {
         if matches!(self, Self::Ordinary) {
             return result;
         }
@@ -212,11 +216,15 @@ impl Header {
     }
 
     fn decode(value: &[u8]) -> Result<Self> {
-        if value.len() != HEADER_LEN || !matches!(value[0],2 | 3) || value[1] > 2 {
+        if value.len() != HEADER_LEN || !matches!(value[0], 2 | 3) || value[1] > 2 {
             return Err(CatalogError::Corrupt("活动批次头版本或长度"));
         }
         let header = Self {
-            protocol: match value[0] { 2 => Protocol::Single,3 => Protocol::ReclaimGroup,_ => unreachable!("validated protocol") },
+            protocol: match value[0] {
+                2 => Protocol::Single,
+                3 => Protocol::ReclaimGroup,
+                _ => unreachable!("validated protocol"),
+            },
             batch_id: uuid_from(&value[2..18])?,
             namespace: uuid_from(&value[18..34])?,
             owner_epoch: read_u64(&value[34..42]),
@@ -267,13 +275,15 @@ pub(super) async fn unsealed_or_absent_for_recovery(
     volume: Uuid,
     generation: u64,
 ) -> Result<bool> {
-    control::reclaim::require_no_group_recovery_at(tr,volume).await?;
+    control::reclaim::require_no_group_recovery_at(tr, volume).await?;
     let Some(value) = tr.get(&batch_key(volume, generation), false).await? else {
         return Ok(true);
     };
     let header = Header::decode(&value)?;
     if header.protocol == Protocol::ReclaimGroup {
-        return Err(CatalogError::Invalid("required回收批次必须按原group/attempt恢复，不能普通收尾"));
+        return Err(CatalogError::Invalid(
+            "required回收批次必须按原group/attempt恢复，不能普通收尾",
+        ));
     }
     Ok(header.phase != ActiveBatchPhase::Sealed)
 }
@@ -999,17 +1009,34 @@ pub(super) async fn require_stored_checkpoint_at(
     index: ActiveIndexIdentity,
     file_count: Option<u64>,
 ) -> Result<()> {
-    let header = if let Some(raw) = tr.get(&batch_key(index.volume_uuid,index.generation),false).await? {
+    let header = if let Some(raw) = tr
+        .get(&batch_key(index.volume_uuid, index.generation), false)
+        .await?
+    {
         Header::decode(&raw)?
     } else {
-        let raw = tr.get(&compacted_batch_key(index.volume_uuid,index.generation),false).await?.ok_or(CatalogError::Incomplete)?;
+        let raw = tr
+            .get(
+                &compacted_batch_key(index.volume_uuid, index.generation),
+                false,
+            )
+            .await?
+            .ok_or(CatalogError::Incomplete)?;
         decode_compacted_batch(&raw)?.0
     };
     if header.batch_id != batch_id || header.phase != ActiveBatchPhase::Sealed {
         return Err(CatalogError::Invalid("已观察索引不是原封存批次"));
     }
     if header.protocol == Protocol::ReclaimGroup {
-        control::reclaim::require_index_checkpoint_at(tr,header.namespace,batch_id,header.digest,index,file_count).await?;
+        control::reclaim::require_index_checkpoint_at(
+            tr,
+            header.namespace,
+            batch_id,
+            header.digest,
+            index,
+            file_count,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1024,7 +1051,10 @@ async fn require_published_checkpoint_at(
     volume: Uuid,
     generation: u64,
 ) -> Result<()> {
-    let header = if let Some(raw) = tr.get(&compacted_batch_key(volume, generation), false).await? {
+    let header = if let Some(raw) = tr
+        .get(&compacted_batch_key(volume, generation), false)
+        .await?
+    {
         decode_compacted_batch(&raw)?.0
     } else {
         let raw = tr
@@ -1066,14 +1096,29 @@ pub(super) async fn sealed_for_index(
 }
 
 pub(super) async fn sealed_for_checkpoint(
-    tr: &Transaction, namespace: Uuid, volume: Uuid,
-    checkpoint: (ActiveIndexIdentity,u64), batch_id: Uuid, owner_epoch: u64, scan_id: Uuid,
+    tr: &Transaction,
+    namespace: Uuid,
+    volume: Uuid,
+    checkpoint: (ActiveIndexIdentity, u64),
+    batch_id: Uuid,
+    owner_epoch: u64,
+    scan_id: Uuid,
 ) -> Result<bool> {
-    let (index,count) = checkpoint;
-    if !sealed_for_index(tr,namespace,volume,index.generation,batch_id,owner_epoch,scan_id).await? {
+    let (index, count) = checkpoint;
+    if !sealed_for_index(
+        tr,
+        namespace,
+        volume,
+        index.generation,
+        batch_id,
+        owner_epoch,
+        scan_id,
+    )
+    .await?
+    {
         return Ok(false);
     }
-    require_stored_checkpoint_at(tr,batch_id,index,Some(count)).await?;
+    require_stored_checkpoint_at(tr, batch_id, index, Some(count)).await?;
     Ok(true)
 }
 
@@ -1407,7 +1452,9 @@ async fn abort_header(
     };
     let header = Header::decode(&value)?;
     if header.protocol == Protocol::ReclaimGroup {
-        return Err(CatalogError::Invalid("required回收批次不能使用普通中止或清理入口"));
+        return Err(CatalogError::Invalid(
+            "required回收批次不能使用普通中止或清理入口",
+        ));
     }
     if header.namespace != namespace || header.batch_id != batch_id {
         return Ok(Err(ActiveBatchOutcome::BatchConflict));
@@ -3918,7 +3965,9 @@ impl ManagedCatalog {
             .ok_or(CatalogError::Incomplete)?;
         let header = Header::decode(&header)?;
         if header.protocol == Protocol::ReclaimGroup {
-            return Err(CatalogError::Invalid("required回收批次必须通过原group Observe入口读取恢复页"));
+            return Err(CatalogError::Invalid(
+                "required回收批次必须通过原group Observe入口读取恢复页",
+            ));
         }
         if header.namespace != namespace
             || header.batch_id != batch_id

@@ -91,7 +91,9 @@ enum Action {
     Unassign,
     Validate,
     Online,
-    Policy { patch: Option<Value> },
+    Policy {
+        patch: Option<Value>,
+    },
 }
 impl Action {
     fn kind(&self) -> &'static str {
@@ -112,8 +114,14 @@ impl Action {
                 | Self::Assign { force: true, .. }
                 | Self::Reclaim { yes: true, .. }
                 | Self::Reclaim { unassign: true, .. }
-                | Self::Reclaim { group_only: true, .. }
-                | Self::Move { location: Some(_), .. }
+                | Self::Reclaim {
+                    group_only: true,
+                    ..
+                }
+                | Self::Move {
+                    location: Some(_),
+                    ..
+                }
                 | Self::Policy { patch: Some(_) }
         )
     }
@@ -296,7 +304,12 @@ fn run(
                 if let Action::Policy { patch } = &action {
                     value["patch"] = patch.clone().ok_or("tape set 必须指定 --patch")?;
                 }
-                if let Action::Reclaim { unassign, group_only, .. } = &action {
+                if let Action::Reclaim {
+                    unassign,
+                    group_only,
+                    ..
+                } = &action
+                {
                     value["confirm_format"] = json!(true);
                     value["unassign"] = json!(unassign);
                     if *group_only {

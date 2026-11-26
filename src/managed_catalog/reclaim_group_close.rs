@@ -79,7 +79,7 @@ async fn seal_value(
         plan: plan.fingerprint()?,
         observation: digest(b"tape-rs/reclaim-index-observed/1", &observed)?,
         binding: digest(b"tape-rs/reclaim-closed-binding/2", &binding)?,
-        attempt: group_attempt::fingerprint_at(tr,parent,group).await?,
+        attempt: group_attempt::fingerprint_at(tr, parent, group).await?,
         previous_close,
         root_coverage,
     })
@@ -357,7 +357,7 @@ pub(super) async fn audit_row_at(
                     }
                 }
                 (true, [b'w']) => {
-                    if group_attempt::raw_fingerprint(raw)?!=seal.attempt {
+                    if group_attempt::raw_fingerprint(raw)? != seal.attempt {
                         return Err(CatalogError::Corrupt("audit physical attempt摘要"));
                     }
                 }

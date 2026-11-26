@@ -43,12 +43,13 @@ mod control;
 pub use control::management::handoff::{LibraryHandoff, LibraryHandoffPhase};
 pub use control::notifications::tape_inventory_state;
 pub(crate) use control::reclaim::{
-    OriginalObservationPermit, ReclaimExecutionGate,
-    ReclaimGroupOnlyDraft, ReclaimGroupOnlyQualification,
-    OriginalAttemptObservation, OriginalCheckpointContext, OriginalCheckpointPublication,
-    DestinationHistoryContext, ReclaimCopyGroup, ReclaimCopyGroupAdmission, ReclaimCopyGroupChoice,
-    ReclaimCopyGroupLimits, ReclaimCopyGroupSelection, RetainedLedgerAuthority,
-    ReclaimGroupExecution, ReclaimGroupObservation, ReclaimGroupMemberReadContext, ReclaimIndexAugmentation, ReclaimIndexIntent,
+    DestinationHistoryContext, OriginalAttemptObservation, OriginalCheckpointContext,
+    OriginalCheckpointPublication, OriginalObservationPermit, ReclaimCopyGroup,
+    ReclaimCopyGroupAdmission, ReclaimCopyGroupChoice, ReclaimCopyGroupLimits,
+    ReclaimCopyGroupSelection, ReclaimExecutionGate, ReclaimGroupExecution,
+    ReclaimGroupMemberReadContext, ReclaimGroupObservation, ReclaimGroupOnlyDraft,
+    ReclaimGroupOnlyQualification, ReclaimIndexAugmentation, ReclaimIndexIntent,
+    RetainedLedgerAuthority,
 };
 use control::tape_monitor;
 pub use tape_monitor::{

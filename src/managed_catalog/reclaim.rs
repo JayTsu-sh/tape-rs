@@ -11,11 +11,11 @@ mod copy_groups;
 pub(in crate::managed_catalog) use copy_groups::PreparedGroupPins;
 pub(in crate::managed_catalog) use copy_groups::isolation;
 pub(crate) use copy_groups::{
-    OriginalObservationPermit, ReclaimExecutionGate,
     OriginalAttemptObservation, OriginalCheckpointContext, OriginalCheckpointPublication,
-    ReclaimCopyGroup, ReclaimCopyGroupAdmission, ReclaimCopyGroupChoice, ReclaimCopyGroupLimits,
-    ReclaimCopyGroupSelection,
-    ReclaimGroupExecution, ReclaimGroupObservation, ReclaimGroupMemberReadContext, ReclaimIndexAugmentation, ReclaimIndexIntent,
+    OriginalObservationPermit, ReclaimCopyGroup, ReclaimCopyGroupAdmission, ReclaimCopyGroupChoice,
+    ReclaimCopyGroupLimits, ReclaimCopyGroupSelection, ReclaimExecutionGate, ReclaimGroupExecution,
+    ReclaimGroupMemberReadContext, ReclaimGroupObservation, ReclaimIndexAugmentation,
+    ReclaimIndexIntent,
 };
 #[derive(Clone, Copy)]
 pub(in crate::managed_catalog) enum ReclaimProtocolContext<'a> {
@@ -67,7 +67,6 @@ pub(crate) use destination_history::DestinationHistoryContext;
 #[path = "reclaim_source.rs"]
 mod source;
 pub(in crate::managed_catalog) use source::require_publication_at as require_metadata_publication_at;
-pub(crate) use source::{ReclaimGroupOnlyDraft, ReclaimGroupOnlyQualification};
 pub use source::{
     ReclaimCoverageProgress, ReclaimDataProgress, ReclaimFileMetadata, ReclaimFormatSourceEvidence,
     ReclaimMetadataAdmission, ReclaimMetadataCheckpointEvidence, ReclaimMetadataCommitEvidence,
@@ -81,6 +80,7 @@ pub use source::{
     ReclaimRawSourceRead, ReclaimReadSource, ReclaimSourceInventory, ReclaimSourceNode,
     ReclaimSourceNodeKind, ReclaimSourceProgress, ReclaimSourceRead,
 };
+pub(crate) use source::{ReclaimGroupOnlyDraft, ReclaimGroupOnlyQualification};
 pub(in crate::managed_catalog) use source::{
     require_resolution_at as require_metadata_resolution_at,
     require_resolution_commit_at as require_metadata_resolution_commit_at,
@@ -486,8 +486,8 @@ async fn reserve_at_version(
             return Err(CatalogError::Invalid("回收重放改变原请求身份"));
         }
         let reservation = ReclaimReservation { route, intent };
-        if reservation.intent()["version"]==2 {
-            copy_groups::group_layout_marker_at(tr,&reservation).await?;
+        if reservation.intent()["version"] == 2 {
+            copy_groups::group_layout_marker_at(tr, &reservation).await?;
         }
         let mut value = record_at(tr, &reservation, owner).await?;
         if value["owner_epoch"]
@@ -529,7 +529,7 @@ async fn reserve_at_version(
         return Err(CatalogError::PoolBusy);
     }
     let group_walk = if fresh_version == 2 {
-        copy_groups::initialize_layout_at(tr,&reservation).await?;
+        copy_groups::initialize_layout_at(tr, &reservation).await?;
         copy_groups::require_no_unsettled_at(tr, &reservation).await?;
         Some(walk::prepare_initial_group_at(tr, &reservation).await?)
     } else {

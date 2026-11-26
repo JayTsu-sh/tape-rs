@@ -570,7 +570,16 @@ pub(in crate::managed_catalog) async fn require_request_in(
 ) -> Result<()> {
     if let Some(pool) = request.pool_id {
         require_metadata_copy_idle_at(tr, request.namespace, pool).await?;
-        if let Some((saved, _)) = child_at(tr, request.namespace, pool, request.request_epoch, request.operation_id, owner).await? {
+        if let Some((saved, _)) = child_at(
+            tr,
+            request.namespace,
+            pool,
+            request.request_epoch,
+            request.operation_id,
+            owner,
+        )
+        .await?
+        {
             require_child_protocol_at(tr, &saved, owner, context).await?;
         } else if matches!(context, ReclaimProtocolContext::Group(_)) {
             return Err(CatalogError::Invalid("分组写入缺少原回收子请求"));
@@ -588,10 +597,14 @@ async fn require_child_protocol_at(
     context: ReclaimProtocolContext<'_>,
 ) -> Result<()> {
     match context {
-        ReclaimProtocolContext::Group(scope) => scope.require_request_at(tr,&child.request(),owner).await,
+        ReclaimProtocolContext::Group(scope) => {
+            scope.require_request_at(tr, &child.request(), owner).await
+        }
         ReclaimProtocolContext::Single => {
-            if parent_for_stored_child_at(tr,child,owner).await?.intent()["version"] != 1 {
-                return Err(CatalogError::Invalid("v2回收子请求必须使用原typed分组执行范围"));
+            if parent_for_stored_child_at(tr, child, owner).await?.intent()["version"] != 1 {
+                return Err(CatalogError::Invalid(
+                    "v2回收子请求必须使用原typed分组执行范围",
+                ));
             }
             Ok(())
         }
@@ -601,51 +614,119 @@ async fn require_child_protocol_at(
 /// Restore an already validated original child, without admitting a new write.
 /// Callers decide Single, fresh Group, or proof-only publication semantics.
 pub(super) async fn parent_for_stored_child_at(
-    tr: &Transaction, child: &ActiveFileIntent, owner: u64,
+    tr: &Transaction,
+    child: &ActiveFileIntent,
+    owner: u64,
 ) -> Result<ReclaimReservation> {
-    let token = pool_gate_at(tr,child.namespace,child.pool_id.ok_or(CatalogError::Incomplete)?)
-        .await?.ok_or(CatalogError::Incomplete)?;
-    let mut journal = domain(child.namespace,b'j');
-    journal.extend_from_slice(&token["epoch"].as_u64().ok_or(CatalogError::Incomplete)?.to_be_bytes());
-    journal.extend_from_slice(node_mutation::id(token["operation"].as_str().ok_or(CatalogError::Incomplete)?)?.as_bytes());
-    let raw = tr.get(&journal,false).await?.ok_or(CatalogError::Incomplete)?;
+    let token = pool_gate_at(
+        tr,
+        child.namespace,
+        child.pool_id.ok_or(CatalogError::Incomplete)?,
+    )
+    .await?
+    .ok_or(CatalogError::Incomplete)?;
+    let mut journal = domain(child.namespace, b'j');
+    journal.extend_from_slice(
+        &token["epoch"]
+            .as_u64()
+            .ok_or(CatalogError::Incomplete)?
+            .to_be_bytes(),
+    );
+    journal.extend_from_slice(
+        node_mutation::id(
+            token["operation"]
+                .as_str()
+                .ok_or(CatalogError::Incomplete)?,
+        )?
+        .as_bytes(),
+    );
+    let raw = tr
+        .get(&journal, false)
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
     let saved = decode(&raw)?;
     validate_parent_intent(&saved["intent"])?;
-    let route = routing::decode_active(&tr.get(&routing::active_key(&child.library_serial),false).await?.ok_or(CatalogError::Incomplete)?)?;
-    let parent = ReclaimReservation { intent:saved["intent"].clone(),route };
-    record_at(tr,&parent,owner).await?;
-    if parent.namespace() != child.namespace || parent.serial() != child.library_serial
-        || Some(parent.spec().pool()) != child.pool_id || parent.token() != token {
+    let route = routing::decode_active(
+        &tr.get(&routing::active_key(&child.library_serial), false)
+            .await?
+            .ok_or(CatalogError::Incomplete)?,
+    )?;
+    let parent = ReclaimReservation {
+        intent: saved["intent"].clone(),
+        route,
+    };
+    record_at(tr, &parent, owner).await?;
+    if parent.namespace() != child.namespace
+        || parent.serial() != child.library_serial
+        || Some(parent.spec().pool()) != child.pool_id
+        || parent.token() != token
+    {
         return Err(CatalogError::Corrupt("原子请求与父协议作用域不同"));
     }
     Ok(parent)
 }
 
 pub(super) async fn parent_for_receipt_at(
-    tr: &Transaction, receipt: &CommitReceipt,
-) -> Result<Option<(ReclaimReservation,ActiveFileIntent)>> {
-    let identity = tr.get(&identity_key(receipt.namespace,receipt.operation_id),false).await?;
+    tr: &Transaction,
+    receipt: &CommitReceipt,
+) -> Result<Option<(ReclaimReservation, ActiveFileIntent)>> {
+    let identity = tr
+        .get(
+            &identity_key(receipt.namespace, receipt.operation_id),
+            false,
+        )
+        .await?;
     let Some(pool) = receipt.pool_id else {
-        if identity.is_some() { return Err(CatalogError::Corrupt("原回收收据删除了pool作用域")); }
+        if identity.is_some() {
+            return Err(CatalogError::Corrupt("原回收收据删除了pool作用域"));
+        }
         return Ok(None);
     };
-    let Some(token) = pool_gate_at(tr,receipt.namespace,pool).await? else {
-        if identity.is_some() { return Err(CatalogError::Corrupt("原回收收据缺少父屏障")); }
+    let Some(token) = pool_gate_at(tr, receipt.namespace, pool).await? else {
+        if identity.is_some() {
+            return Err(CatalogError::Corrupt("原回收收据缺少父屏障"));
+        }
         return Ok(None);
     };
-    let mut journal = domain(receipt.namespace,b'j');
-    journal.extend_from_slice(&token["epoch"].as_u64().ok_or(CatalogError::Incomplete)?.to_be_bytes());
-    journal.extend_from_slice(node_mutation::id(token["operation"].as_str().ok_or(CatalogError::Incomplete)?)?.as_bytes());
-    let raw = tr.get(&journal,false).await?.ok_or(CatalogError::Incomplete)?;
+    let mut journal = domain(receipt.namespace, b'j');
+    journal.extend_from_slice(
+        &token["epoch"]
+            .as_u64()
+            .ok_or(CatalogError::Incomplete)?
+            .to_be_bytes(),
+    );
+    journal.extend_from_slice(
+        node_mutation::id(
+            token["operation"]
+                .as_str()
+                .ok_or(CatalogError::Incomplete)?,
+        )?
+        .as_bytes(),
+    );
+    let raw = tr
+        .get(&journal, false)
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
     let saved = decode(&raw)?;
-    let owner = saved["owner_epoch"].as_u64().filter(|owner| *owner>0).ok_or(CatalogError::Incomplete)?;
-    let (child,_) = child_at(tr,receipt.namespace,pool,receipt.request_epoch,receipt.operation_id,owner)
-        .await?.ok_or(CatalogError::Incomplete)?;
-    if !reservation::matches_receipt(&child,receipt) {
+    let owner = saved["owner_epoch"]
+        .as_u64()
+        .filter(|owner| *owner > 0)
+        .ok_or(CatalogError::Incomplete)?;
+    let (child, _) = child_at(
+        tr,
+        receipt.namespace,
+        pool,
+        receipt.request_epoch,
+        receipt.operation_id,
+        owner,
+    )
+    .await?
+    .ok_or(CatalogError::Incomplete)?;
+    if !reservation::matches_receipt(&child, receipt) {
         return Err(CatalogError::Invalid("回收发布收据不是原子请求"));
     }
-    let parent = parent_for_stored_child_at(tr,&child,owner).await?;
-    Ok(Some((parent,child)))
+    let parent = parent_for_stored_child_at(tr, &child, owner).await?;
+    Ok(Some((parent, child)))
 }
 
 pub(super) async fn require_request_identity_at(
@@ -697,7 +778,7 @@ pub(in crate::managed_catalog) async fn require_intent_in(
         .await?
     {
         saved.owner_epoch = intent.owner_epoch;
-        require_child_protocol_at(tr,&saved,intent.owner_epoch,context).await?;
+        require_child_protocol_at(tr, &saved, intent.owner_epoch, context).await?;
         if saved != *intent {
             return Err(CatalogError::Invalid("回收复制物理目标或完整请求改变"));
         }
@@ -711,7 +792,7 @@ pub(in crate::managed_catalog) async fn require_intent_in(
         }
         return Ok(Some(permit));
     }
-    if matches!(context,ReclaimProtocolContext::Group(_)) {
+    if matches!(context, ReclaimProtocolContext::Group(_)) {
         return Err(CatalogError::Invalid("分组写入缺少原回收子请求"));
     }
     Ok(None)
@@ -740,13 +821,13 @@ pub(in crate::managed_catalog) async fn require_receipt_in(
         )
         .await?
     {
-        require_child_protocol_at(tr,&saved,receipt.owner_epoch,context).await?;
+        require_child_protocol_at(tr, &saved, receipt.owner_epoch, context).await?;
         if !reservation::matches_receipt(&saved, receipt) {
             return Err(CatalogError::Invalid("回收复制收据与封存请求不一致"));
         }
         return Ok(());
     }
-    if matches!(context,ReclaimProtocolContext::Group(_)) {
+    if matches!(context, ReclaimProtocolContext::Group(_)) {
         return Err(CatalogError::Invalid("分组收据缺少原回收子请求"));
     }
     Ok(())
@@ -1075,18 +1156,31 @@ impl ManagedCatalog {
         owner: u64,
         request: &ActiveFileRequest,
     ) -> Result<()> {
-        self.check_active_upload_gate_in(route,owner,request,ReclaimProtocolContext::Single).await
+        self.check_active_upload_gate_in(route, owner, request, ReclaimProtocolContext::Single)
+            .await
     }
 
     pub(crate) async fn check_reclaim_upload_gate(
-        &self, route: ActiveLibraryRoute, owner: u64, request: &ActiveFileRequest,
+        &self,
+        route: ActiveLibraryRoute,
+        owner: u64,
+        request: &ActiveFileRequest,
         scope: &ReclaimGroupExecution,
     ) -> Result<()> {
-        self.check_active_upload_gate_in(route,owner,request,ReclaimProtocolContext::Group(scope)).await
+        self.check_active_upload_gate_in(
+            route,
+            owner,
+            request,
+            ReclaimProtocolContext::Group(scope),
+        )
+        .await
     }
 
     async fn check_active_upload_gate_in(
-        &self, route: ActiveLibraryRoute, owner: u64, request: &ActiveFileRequest,
+        &self,
+        route: ActiveLibraryRoute,
+        owner: u64,
+        request: &ActiveFileRequest,
         context: ReclaimProtocolContext<'_>,
     ) -> Result<()> {
         request.validate()?;
@@ -1106,7 +1200,7 @@ impl ManagedCatalog {
             )
             .await?;
         }
-        require_request_in(&tr, request, owner,context).await
+        require_request_in(&tr, request, owner, context).await
     }
 
     /// Return the sealed first physical attempt, without selecting another

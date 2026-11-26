@@ -14,7 +14,7 @@ use uuid::Uuid;
 mod original_mam;
 use original_mam::read_original_mam;
 #[cfg(test)]
-#[path="executor_fdb_reclaim_probe_test_hook.rs"]
+#[path = "executor_fdb_reclaim_probe_test_hook.rs"]
 mod probe_seal_test_hook;
 #[cfg(test)]
 pub(in crate::daemon::executor) use probe_seal_test_hook::arm_original_probe_seal_for_test;
@@ -35,7 +35,9 @@ pub(super) fn record_prepared_source_used(parent: &ReclaimReservation) {
 #[path = "executor_fdb_reclaim_s4_test_hook.rs"]
 mod s4_test_hook;
 #[cfg(test)]
-pub(in crate::daemon::executor) use s4_test_hook::{arm_original_checkpoint_s4_stop_for_test, OriginalS4StopFacts};
+pub(in crate::daemon::executor) use s4_test_hook::{
+    OriginalS4StopFacts, arm_original_checkpoint_s4_stop_for_test,
+};
 
 trait CheckedTransport {
     fn transport(&self) -> &dyn crate::scsi::transport::TapeTransport;
@@ -871,10 +873,18 @@ pub(in crate::daemon) struct OriginalAttemptProbeIo<'a> {
     transport: ReadOnlyGroupTransport<'a>,
 }
 impl OriginalAttemptProbeIo<'_> {
-    pub(in crate::daemon) fn scope(&self)->&crate::managed_catalog::OriginalAttemptObservation {self.scope}
-    pub(in crate::daemon) fn key(&self)->crate::scsi::reservation::ReservationKey {self.key}
-    pub(in crate::daemon) fn transport(&self)->&dyn crate::scsi::transport::TapeTransport {&self.transport}
-    pub(in crate::daemon) fn verify(&self)->crate::error::Result<()> {self.transport.guard.verify()}
+    pub(in crate::daemon) fn scope(&self) -> &crate::managed_catalog::OriginalAttemptObservation {
+        self.scope
+    }
+    pub(in crate::daemon) fn key(&self) -> crate::scsi::reservation::ReservationKey {
+        self.key
+    }
+    pub(in crate::daemon) fn transport(&self) -> &dyn crate::scsi::transport::TapeTransport {
+        &self.transport
+    }
+    pub(in crate::daemon) fn verify(&self) -> crate::error::Result<()> {
+        self.transport.guard.verify()
+    }
 }
 
 fn original_attempt_probe_io<'a>(
@@ -884,15 +894,17 @@ fn original_attempt_probe_io<'a>(
     scope: &'a crate::managed_catalog::OriginalAttemptObservation,
     observation: Option<&'a crate::managed_catalog::OriginalObservationPermit>,
 ) -> std::result::Result<OriginalAttemptProbeIo<'a>, ReadError> {
-    if scope.owner()!=owner.round || owner.key.round()!=owner.round
-        || scope.parent().serial()!=control.serial
-        || scope.namespace()!=control.route.route.namespace {
+    if scope.owner() != owner.round
+        || owner.key.round() != owner.round
+        || scope.parent().serial() != control.serial
+        || scope.namespace() != control.route.route.namespace
+    {
         return Err(lost("原attempt只读探测必须绑定当前owner/原带库"));
     }
     if scope.parent().spec().group_only() && observation.is_none() {
         return Err(lost("group-only原探测缺一次持久观察许可"));
     }
-    let drive=device(owner,scope.destination_drive_serial())?;
+    let drive = device(owner, scope.destination_drive_serial())?;
     if owner.devices[drive].dev.session_epoch().is_none() {
         return Err(lost("原attempt设备没有可信session epoch，禁止探测"));
     }
@@ -946,7 +958,7 @@ pub(in crate::daemon::executor) async fn probe_original<'a>(
         .await
         .map_err(lost)?;
     #[cfg(test)]
-    probe_seal_test_hook::record(parent,io.transport());
+    probe_seal_test_hook::record(parent, io.transport());
     // The media finalizer already checked authority against its sealed Some
     // epoch. Only pure binding checks may follow that final physical proof.
     evidence.require_scope(&scope).map_err(lost)?;
@@ -992,8 +1004,18 @@ pub(super) fn execute<'a>(
         .await
         .map_err(lost)?;
         #[cfg(test)]
-        if s4_test_hook::after_s4(parent, scope.group().id(), pending.batch_id(), pending.previous_index(), pending.current_index(), drive, pending.files()) {
-            return Err(lost("测试仅中断原Full S4成功后的调用，保留原attempt等待接管"));
+        if s4_test_hook::after_s4(
+            parent,
+            scope.group().id(),
+            pending.batch_id(),
+            pending.previous_index(),
+            pending.current_index(),
+            drive,
+            pending.files(),
+        ) {
+            return Err(lost(
+                "测试仅中断原Full S4成功后的调用，保留原attempt等待接管",
+            ));
         }
         io.verify().map_err(lost)?;
         let batch = pending.batch_id();

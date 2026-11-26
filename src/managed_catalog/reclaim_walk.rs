@@ -434,8 +434,15 @@ pub(super) async fn advance_at(
             ResolvedPath::File { id, head, copy, .. } if id == child.id => {
                 if copy.volume_id == reservation.spec().volume {
                     let operation = source::group_only::planned_operation_at(
-                        tr, reservation, &relative, id, &head, &copy,
-                    ).await?.unwrap_or(operation);
+                        tr,
+                        reservation,
+                        &relative,
+                        id,
+                        &head,
+                        &copy,
+                    )
+                    .await?
+                    .unwrap_or(operation);
                     state.current = Some(ReclaimFile {
                         path: relative,
                         file: id.to_string(),
@@ -463,68 +470,129 @@ pub(super) async fn advance_at(
 
 /// Keep the original Rv format shared by single-file and group settlement.
 fn verification_value(
-    reservation: &ReclaimReservation, file: &ReclaimFile, request: &ActiveFileRequest,
-    verified: &ReadMetadata, index: Vec<u8>, terminal: Vec<u8>,
+    reservation: &ReclaimReservation,
+    file: &ReclaimFile,
+    request: &ActiveFileRequest,
+    verified: &ReadMetadata,
+    index: Vec<u8>,
+    terminal: Vec<u8>,
 ) -> Result<Value> {
-    Ok(json!({"version":1,"parent":reservation.fingerprint(),"request":request.fingerprint(),"file":file,
+    Ok(
+        json!({"version":1,"parent":reservation.fingerprint(),"request":request.fingerprint(),"file":file,
         "head":encode_head(&verified.head),"copy":copy_records::encode_physical_copy(&verified.copy)?,
-        "index":index,"terminal":terminal}))
+        "index":index,"terminal":terminal}),
+    )
 }
 
 /// Only the typed group settlement caller may replace walk.current with its
 /// immutable original membership edge. No counters or cursor change here.
 pub(super) async fn record_group_verification_at(
-    tr: &Transaction, reservation: &ReclaimReservation, owner: u64,
-    file: &ReclaimFile, request: &ActiveFileRequest,
-    verified: &ReadMetadata, verified_head: ActiveIndexIdentity,
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    owner: u64,
+    file: &ReclaimFile,
+    request: &ActiveFileRequest,
+    verified: &ReadMetadata,
+    verified_head: ActiveIndexIdentity,
 ) -> Result<()> {
-    if reservation.intent()["version"] != 2 || record_at(tr,reservation,owner).await?["owner_epoch"] != owner {
+    if reservation.intent()["version"] != 2
+        || record_at(tr, reservation, owner).await?["owner_epoch"] != owner
+    {
         return Err(CatalogError::OwnerFenced);
     }
-    children::require_request_identity_at(tr,request,owner).await?;
-    upload_recovery::require_child_idle_at(tr,reservation,request).await?;
-    if file.operation()!=request.operation_id || file.file_id()!=request.file_id
-        || Some(file.version())!=request.expected_version || file.path()!=request.ltfs_path()?
-        || file.size()!=request.expected_size {
+    children::require_request_identity_at(tr, request, owner).await?;
+    upload_recovery::require_child_idle_at(tr, reservation, request).await?;
+    if file.operation() != request.operation_id
+        || file.file_id() != request.file_id
+        || Some(file.version()) != request.expected_version
+        || file.path() != request.ltfs_path()?
+        || file.size() != request.expected_size
+    {
         return Err(CatalogError::Invalid("分组回读改变原成员请求"));
     }
-    let (intent,_)=children::child_at(tr,request.namespace,reservation.spec().pool(),request.request_epoch,request.operation_id,owner)
-        .await?.ok_or(CatalogError::Incomplete)?;
-    let version=file.version().checked_add(1).ok_or(CatalogError::Incomplete)?;
-    let proof_key=verification_key(reservation,file);
-    if tr.get(&proof_key,false).await?.is_some() {
+    let (intent, _) = children::child_at(
+        tr,
+        request.namespace,
+        reservation.spec().pool(),
+        request.request_epoch,
+        request.operation_id,
+        owner,
+    )
+    .await?
+    .ok_or(CatalogError::Incomplete)?;
+    let version = file
+        .version()
+        .checked_add(1)
+        .ok_or(CatalogError::Incomplete)?;
+    let proof_key = verification_key(reservation, file);
+    if tr.get(&proof_key, false).await?.is_some() {
         return Err(CatalogError::Corrupt("新分组结清前出现半套Rv记录"));
     }
-    let terminal=terminal_evidence_at(tr,request,&intent,version,None).await?;
-    if tr.get(&children::history_pin_key(request),false).await?.as_deref()!=Some(&[][..]) {
+    let terminal = terminal_evidence_at(tr, request, &intent, version, None).await?;
+    if tr
+        .get(&children::history_pin_key(request), false)
+        .await?
+        .as_deref()
+        != Some(&[][..])
+    {
         return Err(CatalogError::Corrupt("分组回读缺原成员历史pin"));
     }
-    let full=pool_catalog_path(reservation.spec().pool(),file.path().as_bytes())?;
-    let Some(ResolvedPath::File {id,head,copy,placement,..})=
-        lookup::resolve_active_path_at_mode(tr,request.namespace,lookup::path_components(&full)?,false).await?
-    else {return Err(CatalogError::Incomplete);};
-    let (_,index)=active_volume::observed_at(tr,reservation.serial(),intent.volume_id).await?;
-    if id!=verified.id || head!=verified.head || *copy!=verified.copy || placement!=verified.placement
-        || index!=verified_head || copy.volume_id!=intent.volume_id || copy.volume_generation!=intent.volume_generation
-        || copy.volume_scan_id!=intent.volume_scan_id || copy.content_digest!=intent.expected_digest
-        || copy.size!=file.size() || head.version!=version {
+    let full = pool_catalog_path(reservation.spec().pool(), file.path().as_bytes())?;
+    let Some(ResolvedPath::File {
+        id,
+        head,
+        copy,
+        placement,
+        ..
+    }) = lookup::resolve_active_path_at_mode(
+        tr,
+        request.namespace,
+        lookup::path_components(&full)?,
+        false,
+    )
+    .await?
+    else {
+        return Err(CatalogError::Incomplete);
+    };
+    let (_, index) = active_volume::observed_at(tr, reservation.serial(), intent.volume_id).await?;
+    if id != verified.id
+        || head != verified.head
+        || *copy != verified.copy
+        || placement != verified.placement
+        || index != verified_head
+        || copy.volume_id != intent.volume_id
+        || copy.volume_generation != intent.volume_generation
+        || copy.volume_scan_id != intent.volume_scan_id
+        || copy.content_digest != intent.expected_digest
+        || copy.size != file.size()
+        || head.version != version
+    {
         return Err(CatalogError::Invalid("分组目标真实回读与原副本事实不同"));
     }
-    let mut bytes=Vec::new();active_volume::encode_index(&mut bytes,verified_head);
-    let proof=verification_value(reservation,file,request,verified,bytes,terminal)?;
-    tr.set(&proof_key,proof.to_string().as_bytes());
+    let mut bytes = Vec::new();
+    active_volume::encode_index(&mut bytes, verified_head);
+    let proof = verification_value(reservation, file, request, verified, bytes, terminal)?;
+    tr.set(&proof_key, proof.to_string().as_bytes());
     Ok(())
 }
 
 /// Called only after the original Rv/retirement/Rq/member bundle passed in
 /// this transaction. A group settlement never consumes another current file.
 pub(super) async fn count_group_member_at(
-    tr: &Transaction, reservation: &ReclaimReservation, file: &ReclaimFile,
+    tr: &Transaction,
+    reservation: &ReclaimReservation,
+    file: &ReclaimFile,
 ) -> Result<ReclaimWalk> {
-    let mut state=state_at(tr,reservation).await?;
-    state.copied_files=state.copied_files.checked_add(1).ok_or(CatalogError::Invalid("回收文件计数溢出"))?;
-    state.copied_bytes=state.copied_bytes.checked_add(file.size()).ok_or(CatalogError::Invalid("回收字节计数溢出"))?;
-    tr.set(&state_key(reservation),&encode(&state)?);
+    let mut state = state_at(tr, reservation).await?;
+    state.copied_files = state
+        .copied_files
+        .checked_add(1)
+        .ok_or(CatalogError::Invalid("回收文件计数溢出"))?;
+    state.copied_bytes = state
+        .copied_bytes
+        .checked_add(file.size())
+        .ok_or(CatalogError::Invalid("回收字节计数溢出"))?;
+    tr.set(&state_key(reservation), &encode(&state)?);
     Ok(state)
 }
 
@@ -614,52 +682,133 @@ impl ManagedCatalog {
         verified: &ReadMetadata,
         verified_head: ActiveIndexIdentity,
     ) -> Result<ReclaimWalk> {
-        self.db.run(|tr,_| async move {requests::retry_result(async {
-            let parent=record_at(&tr,reservation,owner).await?;
-            if parent["owner_epoch"]!=owner {return Err(CatalogError::OwnerFenced);}
-            children::require_request_identity_at(&tr,request,owner).await?;
-            upload_recovery::require_child_idle_at(&tr,reservation,request).await?;
-            if file.operation()!=request.operation_id || file.file_id()!=request.file_id
-                || Some(file.version)!=request.expected_version || file.path!=request.ltfs_path()?
-                || file.size!=request.expected_size {
-                return Err(CatalogError::Invalid("回收验证改变原扫描文件"));
-            }
-            let (intent,_)=children::child_at(&tr,request.namespace,reservation.spec().pool,request.request_epoch,request.operation_id,owner).await?.ok_or(CatalogError::Incomplete)?;
-            let destination_version=file.version.checked_add(1).ok_or(CatalogError::Invalid("回收目标版本溢出"))?;
-            let previous=tr.get(&verification_key(reservation,file),false).await?
-                .map(|raw|decode(&raw)).transpose()?;
-            let terminal=terminal_evidence_at(&tr,request,&intent,destination_version,previous.as_ref()).await?;
-            let mut index_bytes=Vec::new(); active_volume::encode_index(&mut index_bytes,verified_head);
-            let proof=verification_value(reservation,file,request,verified,index_bytes,terminal)?;
-            let mut state=state_at(&tr,reservation).await?;
-            if let Some(old)=previous {
-                if old!=proof {return Err(CatalogError::Invalid("回收验证重试改变原证据"));}
-                return Ok(state);
-            }
-            let pin=children::history_pin_key(request);
-            if tr.get(&pin,false).await?.as_deref()!=Some(&[][..]) {
-                return Err(CatalogError::Corrupt("回收子请求的历史保留引用缺失或损坏"));
-            }
-            let full=pool_catalog_path(reservation.spec().pool,file.path.as_bytes())?;
-            let Some(ResolvedPath::File {id,head,copy,placement,..})=lookup::resolve_active_path_at_mode(&tr,request.namespace,lookup::path_components(&full)?,false).await? else {
-                return Err(CatalogError::Incomplete);
-            };
-            let (_,index)=active_volume::observed_at(&tr,reservation.serial(),intent.volume_id).await?;
-            if id!=verified.id || head!=verified.head || *copy!=verified.copy || placement!=verified.placement
-                || index!=verified_head || copy.volume_id!=intent.volume_id || copy.volume_generation!=intent.volume_generation
-                || copy.volume_scan_id!=intent.volume_scan_id || copy.content_digest!=intent.expected_digest
-                || copy.size!=file.size || head.version!=destination_version {
-                return Err(CatalogError::Invalid("回收目标实读证据与当前副本不一致"));
-            }
-            if state.current.as_ref()!=Some(file) {return Err(CatalogError::Invalid("回收验证不属于当前检查点"));}
-            state.copied_files=state.copied_files.checked_add(1).ok_or(CatalogError::Invalid("回收文件计数溢出"))?;
-            state.copied_bytes=state.copied_bytes.checked_add(file.size).ok_or(CatalogError::Invalid("回收字节计数溢出"))?;
-            state.current=None;
-            let raw=encode(&state)?;
-            tr.set(&verification_key(reservation,file),proof.to_string().as_bytes());
-            tr.set(&state_key(reservation),&raw);
-            tr.clear(&pin);
-            Ok(state)
-        }.await)}).await?
+        self.db
+            .run(|tr, _| async move {
+                requests::retry_result(
+                    async {
+                        let parent = record_at(&tr, reservation, owner).await?;
+                        if parent["owner_epoch"] != owner {
+                            return Err(CatalogError::OwnerFenced);
+                        }
+                        children::require_request_identity_at(&tr, request, owner).await?;
+                        upload_recovery::require_child_idle_at(&tr, reservation, request).await?;
+                        if file.operation() != request.operation_id
+                            || file.file_id() != request.file_id
+                            || Some(file.version) != request.expected_version
+                            || file.path != request.ltfs_path()?
+                            || file.size != request.expected_size
+                        {
+                            return Err(CatalogError::Invalid("回收验证改变原扫描文件"));
+                        }
+                        let (intent, _) = children::child_at(
+                            &tr,
+                            request.namespace,
+                            reservation.spec().pool,
+                            request.request_epoch,
+                            request.operation_id,
+                            owner,
+                        )
+                        .await?
+                        .ok_or(CatalogError::Incomplete)?;
+                        let destination_version = file
+                            .version
+                            .checked_add(1)
+                            .ok_or(CatalogError::Invalid("回收目标版本溢出"))?;
+                        let previous = tr
+                            .get(&verification_key(reservation, file), false)
+                            .await?
+                            .map(|raw| decode(&raw))
+                            .transpose()?;
+                        let terminal = terminal_evidence_at(
+                            &tr,
+                            request,
+                            &intent,
+                            destination_version,
+                            previous.as_ref(),
+                        )
+                        .await?;
+                        let mut index_bytes = Vec::new();
+                        active_volume::encode_index(&mut index_bytes, verified_head);
+                        let proof = verification_value(
+                            reservation,
+                            file,
+                            request,
+                            verified,
+                            index_bytes,
+                            terminal,
+                        )?;
+                        let mut state = state_at(&tr, reservation).await?;
+                        if let Some(old) = previous {
+                            if old != proof {
+                                return Err(CatalogError::Invalid("回收验证重试改变原证据"));
+                            }
+                            return Ok(state);
+                        }
+                        let pin = children::history_pin_key(request);
+                        if tr.get(&pin, false).await?.as_deref() != Some(&[][..]) {
+                            return Err(CatalogError::Corrupt(
+                                "回收子请求的历史保留引用缺失或损坏",
+                            ));
+                        }
+                        let full =
+                            pool_catalog_path(reservation.spec().pool, file.path.as_bytes())?;
+                        let Some(ResolvedPath::File {
+                            id,
+                            head,
+                            copy,
+                            placement,
+                            ..
+                        }) = lookup::resolve_active_path_at_mode(
+                            &tr,
+                            request.namespace,
+                            lookup::path_components(&full)?,
+                            false,
+                        )
+                        .await?
+                        else {
+                            return Err(CatalogError::Incomplete);
+                        };
+                        let (_, index) =
+                            active_volume::observed_at(&tr, reservation.serial(), intent.volume_id)
+                                .await?;
+                        if id != verified.id
+                            || head != verified.head
+                            || *copy != verified.copy
+                            || placement != verified.placement
+                            || index != verified_head
+                            || copy.volume_id != intent.volume_id
+                            || copy.volume_generation != intent.volume_generation
+                            || copy.volume_scan_id != intent.volume_scan_id
+                            || copy.content_digest != intent.expected_digest
+                            || copy.size != file.size
+                            || head.version != destination_version
+                        {
+                            return Err(CatalogError::Invalid("回收目标实读证据与当前副本不一致"));
+                        }
+                        if state.current.as_ref() != Some(file) {
+                            return Err(CatalogError::Invalid("回收验证不属于当前检查点"));
+                        }
+                        state.copied_files = state
+                            .copied_files
+                            .checked_add(1)
+                            .ok_or(CatalogError::Invalid("回收文件计数溢出"))?;
+                        state.copied_bytes = state
+                            .copied_bytes
+                            .checked_add(file.size)
+                            .ok_or(CatalogError::Invalid("回收字节计数溢出"))?;
+                        state.current = None;
+                        let raw = encode(&state)?;
+                        tr.set(
+                            &verification_key(reservation, file),
+                            proof.to_string().as_bytes(),
+                        );
+                        tr.set(&state_key(reservation), &raw);
+                        tr.clear(&pin);
+                        Ok(state)
+                    }
+                    .await,
+                )
+            })
+            .await?
     }
 }
