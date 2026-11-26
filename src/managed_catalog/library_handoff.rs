@@ -153,7 +153,7 @@ pub(in crate::managed_catalog) async fn require_drained_at(
 ) -> Result<()> {
     let mut uploads = key(b'0');
     uploads.extend_from_slice(ns.as_bytes());
-    let mut blocking = Vec::new();
+    let mut blocking = selected_pool::pending_ids_at(tr, ns, serial, 16).await?;
     for prefix in [
         library_prefix(ns, serial, b'q'),
         control::pending_node_task_prefix(ns, serial),

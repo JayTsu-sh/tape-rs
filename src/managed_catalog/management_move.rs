@@ -143,20 +143,21 @@ fn home_key(ns: Uuid, serial: &str, barcode: &str) -> Vec<u8> {
     key
 }
 
-pub(in crate::managed_catalog::control) async fn has_home_in(
+pub(in crate::managed_catalog::control) async fn home_claims_in(
     tr: &Transaction,
     ns: Uuid,
     serial: &str,
     slots: &[u16],
-) -> Result<bool> {
+) -> Result<Vec<(u16, Vec<u8>)>> {
     if slots.is_empty() {
-        return Ok(false);
+        return Ok(Vec::new());
     }
     let prefix = home_prefix(ns, serial);
+    let mut claims = Vec::new();
     let mut after = None;
     loop {
         let page = read_page(tr, &prefix, after.as_deref(), 100, false).await?;
-        for (_, raw) in page.items {
+        for (key, raw) in page.items {
             if raw.len() > 1024 {
                 return Err(CatalogError::Corrupt("搬带 home 记录过大"));
             }
@@ -168,17 +169,17 @@ pub(in crate::managed_catalog::control) async fn has_home_in(
                 .filter(|_| value["version"] == 1)
                 .ok_or(CatalogError::Corrupt("搬带 home 记录版本或地址无效"))?;
             if slots.contains(&address) {
-                return Ok(true);
+                claims.push((address, decode_name(&key[prefix.len()..])?));
             }
         }
         after = page.next;
         if after.is_none() {
-            return Ok(false);
+            return Ok(claims);
         }
     }
 }
 
-async fn home_at(
+pub(in crate::managed_catalog::control) async fn home_at(
     tr: &Transaction,
     ns: Uuid,
     serial: &str,

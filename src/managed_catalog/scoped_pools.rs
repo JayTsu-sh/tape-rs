@@ -9,6 +9,9 @@ async fn read_pool(
     logical: Option<Uuid>,
     id: Uuid,
 ) -> Result<Option<PoolRecord>> {
+    if selected_pool::is_pending_at(tr, ns, serial, id).await? {
+        return Ok(None);
+    }
     let Some(raw) = tr.get(&pool_key(ns, id), false).await? else {
         return Ok(None);
     };
@@ -73,6 +76,9 @@ impl ManagedCatalog {
         let mut items = Vec::with_capacity(page.items.len());
         for (key, raw) in page.items {
             let id = uuid_from(&key[prefix.len()..])?;
+            if selected_pool::is_pending_at(&tr, ns, serial, id).await? {
+                continue;
+            }
             let pool = read_pool(&tr, ns, serial, logical, id).await?;
             if logical.is_some() && (!raw.is_empty() || pool.is_none()) {
                 return Err(CatalogError::Corrupt("逻辑带库的池索引与主记录不符"));

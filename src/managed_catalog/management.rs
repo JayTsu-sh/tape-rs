@@ -417,6 +417,36 @@ pub(super) async fn require_logical_resources_available(
     }
     Ok(())
 }
+pub(super) async fn require_selected_tapes_idle(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    tapes: &[String],
+) -> Result<()> {
+    let prefix = library_prefix(ns, serial, b'q');
+    let page = read_page(tr, &prefix, None, MAX_QUEUED, false).await?;
+    if page.next.is_some() {
+        return Err(CatalogError::Corrupt("管理队列超过上限"));
+    }
+    for (key, value) in page.items {
+        if key.len() != prefix.len() + 24 || !value.is_empty() {
+            return Err(CatalogError::Corrupt("管理队列索引编码"));
+        }
+        let epoch = read_u64(&key[prefix.len()..prefix.len() + 8]);
+        let operation = uuid_from(&key[prefix.len() + 8..])?;
+        let task = read_task_at(tr, ns, serial, epoch, operation)
+            .await?
+            .ok_or(CatalogError::Corrupt("管理队列存在孤立请求"))?;
+        if tapes
+            .iter()
+            .any(|barcode| task["request"]["change"]["barcode"] == barcode.as_str())
+        {
+            return Err(CatalogError::PoolBusy);
+        }
+    }
+    Ok(())
+}
+
 fn task_event_view(value: &Value) -> Value {
     let change = &value["request"]["change"];
     let pool = if matches!(change["kind"].as_str(), Some("pool" | "pool-delete")) {
@@ -497,6 +527,41 @@ pub(super) async fn write_task(
     .await
 }
 
+pub(super) async fn enqueue_at(
+    tr: &Transaction,
+    serial: &str,
+    request: &ManagementRequest,
+) -> Result<Value> {
+    let ns = request.namespace();
+    let queued = read_page(
+        tr,
+        &library_prefix(ns, serial, b'q'),
+        None,
+        MAX_QUEUED,
+        false,
+    )
+    .await?;
+    if queued.items.len() >= MAX_QUEUED {
+        return Err(CatalogError::ManagementQueueFull);
+    }
+    let mut value = json!({"version":1,"library_serial":serial,"namespace":ns.to_string(),
+        "operation":request.operation().to_string(),"epoch":request.epoch(),"request":request.value(),
+        "fingerprint":request.fingerprint(),"status":"queued","created_at_millis":now(),
+        "completed_at_millis":null,"owner_epoch":0,"result":null});
+    if matches!(
+        request.value()["change"]["kind"].as_str(),
+        Some("media-move" | "media-assign")
+    ) {
+        value["execution"] = Value::Null;
+    }
+    write_task(tr, request, &value).await?;
+    tr.set(
+        &identity_key(ns, serial, b'q', request.epoch(), request.operation()),
+        b"",
+    );
+    Ok(value)
+}
+
 impl ManagedCatalog {
     pub async fn active_management_window(
         &self,
@@ -518,36 +583,61 @@ impl ManagedCatalog {
         if request.value()["library"] != serial || request.namespace() != route.route.namespace {
             return Err(CatalogError::Invalid("管理请求与带库或命名空间不符"));
         }
-        self.db.run(|tr,_|async move {requests::retry_result(async {
-            routing::require_runtime_active_owner(&tr,serial,route,owner).await?;
-            let ns=request.namespace();
-            let w=window(&tr,ns).await?;
-            if let Some(saved)=read_task_at(&tr,ns,serial,request.epoch(),request.operation()).await? {
-                if saved["fingerprint"]!=request.fingerprint() {return Err(CatalogError::Invalid("管理请求身份已由不同参数使用"));}
-                return Ok(saved);
-            }
-            if request.epoch()!=w.accepting {return Err(CatalogError::Invalid("管理请求代次已关闭"));}
-            let change = &request.value()["change"];
-            if matches!(change["kind"].as_str(), Some("pool" | "pool-delete")) {
-                pools::require_scope(&tr, ns, serial, change).await?;
-            }
-            if matches!(change["kind"].as_str(),
-                Some("media-assign" | "media-move" | "media-unassign" | "media-validate" | "media-online" | "media-import" | "tape" | "media-reclaim"))
-            {
-                logical_libraries::require_business_scope_at(&tr, ns, serial, request.logical_library()).await?;
-                logical_libraries::mechanical_resources_at(&tr, ns, serial, request).await?;
-            }
-            let queued=read_page(&tr,&library_prefix(ns,serial,b'q'),None,MAX_QUEUED,false).await?;
-            if queued.items.len()>=MAX_QUEUED {return Err(CatalogError::ManagementQueueFull);}
-            let mut value=json!({"version":1,"library_serial":serial,"namespace":ns.to_string(),
-                "operation":request.operation().to_string(),"epoch":request.epoch(),"request":request.value(),
-                "fingerprint":request.fingerprint(),"status":"queued","created_at_millis":now(),
-                "completed_at_millis":null,"owner_epoch":0,"result":null});
-            if matches!(request.value()["change"]["kind"].as_str(),Some("media-move"|"media-assign")) {value["execution"]=Value::Null;}
-            write_task(&tr,request,&value).await?;
-            tr.set(&identity_key(ns,serial,b'q',request.epoch(),request.operation()),b"");
-            Ok(value)
-        }.await)}).await?
+        self.db
+            .run(|tr, _| async move {
+                requests::retry_result(
+                    async {
+                        routing::require_runtime_active_owner(&tr, serial, route, owner).await?;
+                        let ns = request.namespace();
+                        let w = window(&tr, ns).await?;
+                        if let Some(saved) =
+                            read_task_at(&tr, ns, serial, request.epoch(), request.operation())
+                                .await?
+                        {
+                            if saved["fingerprint"] != request.fingerprint() {
+                                return Err(CatalogError::Invalid("管理请求身份已由不同参数使用"));
+                            }
+                            return Ok(saved);
+                        }
+                        if request.epoch() != w.accepting {
+                            return Err(CatalogError::Invalid("管理请求代次已关闭"));
+                        }
+                        let change = &request.value()["change"];
+                        if let Some(barcode) = change["barcode"].as_str() {
+                            selected_pool::require_tape_available(&tr, ns, serial, barcode).await?;
+                        }
+                        if matches!(change["kind"].as_str(), Some("pool" | "pool-delete")) {
+                            pools::require_scope(&tr, ns, serial, change).await?;
+                        }
+                        if matches!(
+                            change["kind"].as_str(),
+                            Some(
+                                "media-assign"
+                                    | "media-move"
+                                    | "media-unassign"
+                                    | "media-validate"
+                                    | "media-online"
+                                    | "media-import"
+                                    | "tape"
+                                    | "media-reclaim"
+                            )
+                        ) {
+                            logical_libraries::require_business_scope_at(
+                                &tr,
+                                ns,
+                                serial,
+                                request.logical_library(),
+                            )
+                            .await?;
+                            logical_libraries::mechanical_resources_at(&tr, ns, serial, request)
+                                .await?;
+                        }
+                        enqueue_at(&tr, serial, request).await
+                    }
+                    .await,
+                )
+            })
+            .await?
     }
     /// Cancel only work which has not started. Never release a running actor's resources.
     pub async fn cancel_management(
@@ -567,6 +657,11 @@ impl ManagedCatalog {
                         let mut value = read_task_at(&tr, ns, serial, epoch, operation)
                             .await?
                             .ok_or(CatalogError::Invalid("管理请求不存在"))?;
+                        if matches!(value["status"].as_str(), Some("queued" | "running"))
+                            && let Some(barcode) = value["request"]["change"]["barcode"].as_str()
+                        {
+                            selected_pool::require_tape_available(&tr, ns, serial, barcode).await?;
+                        }
                         if value["status"] == "running"
                             && value["request"]["change"]["kind"] == "media-reclaim"
                         {

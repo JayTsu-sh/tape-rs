@@ -1073,6 +1073,23 @@ fn run_fdb_owner_inner(
                     .active_library_mechanical_task(&control.serial, control.route, round)
                     .await
                     .map_err(|e| ReadError::Lost(e.to_string()))?;
+                if pending.is_none() {
+                    match control
+                        .catalog
+                        .advance_selected_pool_create(&control.serial, control.route, round)
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(error)
+                            if matches!(
+                                error.domain(),
+                                crate::managed_catalog::CatalogError::PoolBusy
+                                    | crate::managed_catalog::CatalogError::PoolImporting
+                                    | crate::managed_catalog::CatalogError::ManagementQueueFull
+                            ) => {}
+                        Err(error) => return Err(ReadError::Lost(error.to_string())),
+                    }
+                }
                 let native_pending = pending.as_ref().is_some_and(|task| {
                     matches!(
                         task["request"]["change"]["kind"].as_str(),

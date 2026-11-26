@@ -7,6 +7,7 @@ use crate::client::{
 use crate::logical_library::{
     ChangeLogicalLibrary, CreateLogicalLibrary, LogicalLibraryResources, ReplaceLogicalLibrary,
 };
+use crate::managed_catalog::ActiveLibraryRoute;
 use std::path::Path;
 
 struct OwnerFixture {
@@ -56,6 +57,85 @@ impl OwnerFixture {
             .send(ExecRequest::Shutdown { done: None })
             .unwrap();
         self.worker.join().unwrap();
+    }
+}
+
+fn start_owner(
+    rt: &tokio::runtime::Runtime,
+    root: &Path,
+    catalog: &Arc<ManagedCatalog>,
+    serial: &str,
+    route: ActiveLibraryRoute,
+    round: u64,
+    provider: impl FnOnce(Arc<Permission>) -> fdb_observations_fixture::Provider,
+) -> OwnerFixture {
+    let permit = Arc::new(Permission::default());
+    let status = fdb_observations_fixture::make_status(2, round, route.frozen_index);
+    status.lock().unwrap().executor_ready = false;
+    let (send, receive) = mpsc::channel();
+    let (events, receive_events) = mpsc::channel();
+    let files = FileService::new(root.join(format!("spool-{round}"))).unwrap();
+    let control = FdbOwnerControl {
+        catalog: catalog.clone(),
+        route,
+        serial: serial.to_owned(),
+        storage: Default::default(),
+    };
+    let fixture_provider = provider(permit.clone());
+    let owner_files = files.clone();
+    let owner_status = status.clone();
+    let worker = std::thread::Builder::new()
+        .stack_size(32 << 20)
+        .spawn(move || {
+            run_fdb_writer(
+                Box::new(fixture_provider),
+                fdb_observations_fixture::options(2),
+                receive,
+                events,
+                owner_files,
+                owner_status,
+                control,
+            );
+        })
+        .unwrap();
+    send.send(ExecRequest::AttachPermission {
+        permission: permit.clone(),
+    })
+    .unwrap();
+    let context = Arc::new(HttpContext {
+        files,
+        status: status.clone(),
+        exec: Mutex::new(send.clone()),
+        node: Mutex::new(mpsc::channel().0),
+        client_addrs: Default::default(),
+        wait_timeout: Duration::from_secs(15),
+    });
+    let router = fdb_http::writer_router(
+        catalog.clone(),
+        [(serial.to_owned(), route)].into(),
+        [(serial.to_owned(), context)].into(),
+        Default::default(),
+        Default::default(),
+    )
+    .unwrap();
+    let listener = rt
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let server = rt.spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    OwnerFixture {
+        client: FdbClient::new([address.as_str()])
+            .unwrap()
+            .with_timeouts(Duration::ZERO, Duration::from_secs(15)),
+        address,
+        send,
+        events: receive_events,
+        status,
+        permit,
+        server,
+        worker,
     }
 }
 
@@ -128,74 +208,9 @@ fn a_written_physical_pool_survives_activation_and_resource_release() {
         round,
     };
     let start = |round| {
-        let permit = Arc::new(Permission::default());
-        let status = fdb_observations_fixture::make_status(2, round, route.frozen_index);
-        status.lock().unwrap().executor_ready = false;
-        let (send, receive) = mpsc::channel();
-        let (events, receive_events) = mpsc::channel();
-        let files = FileService::new(root.join(format!("spool-{round}"))).unwrap();
-        let control = FdbOwnerControl {
-            catalog: catalog.clone(),
-            route,
-            serial: serial.clone(),
-            storage: Default::default(),
-        };
-        let fixture_provider = provider(round, permit.clone());
-        let owner_files = files.clone();
-        let owner_status = status.clone();
-        let worker = std::thread::Builder::new()
-            .stack_size(32 << 20)
-            .spawn(move || {
-                run_fdb_writer(
-                    Box::new(fixture_provider),
-                    fdb_observations_fixture::options(2),
-                    receive,
-                    events,
-                    owner_files,
-                    owner_status,
-                    control,
-                );
-            })
-            .unwrap();
-        send.send(ExecRequest::AttachPermission {
-            permission: permit.clone(),
+        start_owner(&rt, &root, &catalog, &serial, route, round, |permit| {
+            provider(round, permit)
         })
-        .unwrap();
-        let context = Arc::new(HttpContext {
-            files,
-            status: status.clone(),
-            exec: Mutex::new(send.clone()),
-            node: Mutex::new(mpsc::channel().0),
-            client_addrs: Default::default(),
-            wait_timeout: Duration::from_secs(15),
-        });
-        let router = fdb_http::writer_router(
-            catalog.clone(),
-            [(serial.clone(), route)].into(),
-            [(serial.clone(), context)].into(),
-            Default::default(),
-            Default::default(),
-        )
-        .unwrap();
-        let listener = rt
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let address = listener.local_addr().unwrap().to_string();
-        let server = rt.spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
-        OwnerFixture {
-            client: FdbClient::new([address.as_str()])
-                .unwrap()
-                .with_timeouts(Duration::ZERO, Duration::from_secs(15)),
-            address,
-            send,
-            events: receive_events,
-            status,
-            permit,
-            server,
-            worker,
-        }
     };
     let original = start(round);
     original.take_over(round);
@@ -398,5 +413,266 @@ fn a_written_physical_pool_survives_activation_and_resource_release() {
     );
 
     current.stop();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "需要隔离 FDB_TEST_CLUSTER；仅模拟设备、回环 HTTP"]
+fn selected_pool_imports_existing_contents_and_recovers_lost_format_result() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let _network = unsafe { foundationdb::boot() };
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+    let catalog = Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());
+    let ns = Uuid::new_v4();
+    let serial = format!("SELECT-{ns}");
+    let challenge = Uuid::new_v4();
+    let barriers: Vec<_> = (1..=3).map(|id| json!({"version":1,"library_serial":serial,
+        "challenge":challenge,"node_id":id,"term":7,"leader":2,"role":if id==2 {"Leader"} else {"Follower"},
+        "members":{"1":"a:1","2":"b:2","3":"c:3"},"quiesce_index":89,"frozen_index":90,
+        "applied_index":92,"executor_absent":true,"catalog_pending":false,"shutting_down":false,"catalog_empty":true})).collect();
+    let route = rt
+        .block_on(catalog.initialize_native_library(
+            ns,
+            &verify_native_barriers(&serial, challenge, &barriers).unwrap(),
+        ))
+        .unwrap();
+    rt.block_on(catalog.enable_library_handoff_offline(&serial, ns))
+        .unwrap();
+    let round = route.initial_owner_epoch;
+
+    let existing = "EXIST1L8";
+    let blank = "BLANK1L8";
+    let source_volume = Uuid::new_v4();
+    let source_body = b"selected existing LTFS bytes";
+    let seed = SimLibrary::new(1, 1, 0);
+    seed.insert_cartridge(SimCartridge::blank(existing, 128 << 20), 0)
+        .unwrap();
+    seed.load_into_drive(existing, 0).unwrap();
+    let dev = seed.drive(0);
+    crate::ltfs::mkltfs::mkltfs(
+        &dev,
+        &crate::ltfs::mkltfs::MkltfsOptions {
+            volume_uuid: Some(source_volume),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut volume = crate::ltfs::volume::LtfsVolume::mount(&dev).unwrap();
+    volume
+        .append_file("/original", &mut std::io::Cursor::new(source_body))
+        .unwrap();
+    volume.commit().unwrap();
+    drop(volume);
+    TapeDrive::new(&dev).unload().unwrap();
+
+    let sim = SimLibrary::new(1, 4, 1);
+    sim.enable_changer_pr();
+    sim.insert_cartridge(seed.cartridge(existing).unwrap(), 0)
+        .unwrap();
+    sim.insert_cartridge(SimCartridge::blank(blank, 128 << 20), 1)
+        .unwrap();
+    let root = std::env::temp_dir().join(format!("tapers-selected-pool-{ns}"));
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let drive = Arc::new(sim.drive_as(0, 2));
+    let start = |round| {
+        start_owner(&rt, &root, &catalog, &serial, route, round, |permission| {
+            fdb_observations_fixture::Provider {
+                serial: serial.clone(),
+                changer: Arc::new(sim.changer_as(2)),
+                drive: drive.clone(),
+                log: log.clone(),
+                revoke: Arc::new(AtomicBool::new(false)),
+                permission,
+                round,
+            }
+        })
+    };
+    let owner = start(round);
+    owner.take_over(round);
+    let client = &owner.client;
+    run_management(
+        client,
+        &serial,
+        ManagementIntent::LibraryRescan,
+        &root.join("rescan.json"),
+    );
+    use crate::scsi::sim::{Fault, FaultAction};
+    // The completed label and indexes must be read back after the final MAM
+    // step fails, without issuing FORMAT a second time.
+    drive.inject(Fault {
+        opcode: cdb::opcode::WRITE_ATTRIBUTE,
+        action: FaultAction::HostError(3),
+        after: 6,
+        remaining: 1,
+    });
+    let request = root.join("create.json");
+    client
+        .prepare_management(
+            &serial,
+            ManagementIntent::CreateSelected {
+                name: "selected".into(),
+                file_limit: 100,
+                tapes: vec![existing.into(), blank.into()],
+                confirm_format: true,
+            },
+        )
+        .unwrap()
+        .save_new(&request)
+        .unwrap();
+    let first = client.submit_management(&request).unwrap();
+    assert_eq!(first["status"], "queued");
+    let pool: Uuid = first["id"].as_str().unwrap().parse().unwrap();
+    let before_takeover = Instant::now() + Duration::from_secs(20);
+    while log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|op| **op == cdb::opcode::WRITE_ATTRIBUTE)
+        .count()
+        < 7
+    {
+        assert!(
+            Instant::now() < before_takeover,
+            "未到达初始化原检查点 {}，owner 事件 {:?}",
+            client.management_request_status(&request, false).unwrap(),
+            owner.events.try_iter().collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    owner.permit.close(round);
+    let interrupted = client.management_request_status(&request, false).unwrap();
+    assert_eq!(interrupted["status"], "running");
+    assert_eq!(interrupted["tapes"][0]["volume_uuid"], json!(source_volume));
+    assert_eq!(
+        interrupted["active_tape"]["progress"]["phase"],
+        "format_result_pending"
+    );
+    assert!(matches!(
+        client.pool(&serial, &ns.to_string(), "selected"),
+        Err(ClientError::Rejected { status: 404, .. })
+    ));
+    let original_format_volume = interrupted["active_tape"]["checkpoint"]["format_volume"].clone();
+    assert_eq!(
+        original_format_volume,
+        interrupted["active_tape"]["operation"]
+    );
+    owner.stop();
+
+    let owner = start(round + 1);
+    owner.take_over(round + 1);
+    let client = &owner.client;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let done = loop {
+        let task = client.management_request_status(&request, false).unwrap();
+        match task["status"].as_str().unwrap() {
+            "succeeded" => break task,
+            "queued" | "running" if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            _ => panic!(
+                "创建任务未完成：{task}，owner 事件 {:?}",
+                owner.events.try_iter().collect::<Vec<_>>()
+            ),
+        }
+    };
+    assert_eq!(done["tapes"][0]["volume_uuid"], json!(source_volume));
+    assert_eq!(done["tapes"][1]["volume_uuid"], original_format_volume);
+    assert_eq!(done["pool"]["id"], json!(pool));
+    assert_eq!(client.submit_management(&request).unwrap(), done);
+    let body = root.join("readback");
+    assert_eq!(
+        client
+            .download_new(&serial, pool, "/original", &body)
+            .unwrap(),
+        source_body.len() as u64
+    );
+    assert_eq!(std::fs::read(&body).unwrap(), source_body);
+    assert_eq!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|op| **op == cdb::opcode::FORMAT_MEDIUM)
+            .count(),
+        1
+    );
+    let interrupted_blank = "UNKN01L8";
+    sim.insert_cartridge(SimCartridge::blank(interrupted_blank, 128 << 20), 2)
+        .unwrap();
+    run_management(
+        client,
+        &serial,
+        ManagementIntent::LibraryRescan,
+        &root.join("rescan-interrupted.json"),
+    );
+    drive.inject(Fault {
+        opcode: cdb::opcode::FORMAT_MEDIUM,
+        action: FaultAction::HostError(3),
+        after: 0,
+        remaining: 1,
+    });
+    let unknown = root.join("unknown.json");
+    client
+        .prepare_management(
+            &serial,
+            ManagementIntent::CreateSelected {
+                name: "interrupted".into(),
+                file_limit: 100,
+                tapes: vec![interrupted_blank.into()],
+                confirm_format: true,
+            },
+        )
+        .unwrap()
+        .save_new(&unknown)
+        .unwrap();
+    client.submit_management(&unknown).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let checkpoint = loop {
+        let task = client.management_request_status(&unknown, false).unwrap();
+        if task["active_tape"]["checkpoint"]["detail"]
+            .as_str()
+            .is_some_and(|s| s.contains("初始化结果未知"))
+        {
+            break task;
+        }
+        assert!(Instant::now() < deadline, "未到达未知初始化检查点：{task}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(
+        checkpoint["active_tape"]["progress"]["phase"],
+        "format_result_pending"
+    );
+    owner.permit.close(round + 1);
+    owner.stop();
+
+    let owner = start(round + 2);
+    owner.take_over(round + 2);
+    std::thread::sleep(Duration::from_secs(2));
+    let retained = owner
+        .client
+        .management_request_status(&unknown, false)
+        .unwrap();
+    assert_eq!(
+        retained["active_tape"]["operation"],
+        checkpoint["active_tape"]["operation"]
+    );
+    assert_eq!(
+        retained["active_tape"]["progress"]["phase"],
+        "format_result_pending"
+    );
+    assert_eq!(retained["status"], "running");
+    assert_eq!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|op| **op == cdb::opcode::FORMAT_MEDIUM)
+            .count(),
+        2
+    );
+    owner.stop();
     std::fs::remove_dir_all(root).unwrap();
 }

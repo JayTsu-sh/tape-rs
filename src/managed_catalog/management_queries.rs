@@ -54,13 +54,22 @@ async fn tape(
             return Err(CatalogError::Corrupt("磁带归属不在当前带库命名空间"));
         }
     }
-    let assignment = ManagedCatalog::verified_assignment(tr, serial, barcode)
+    let mut assignment = ManagedCatalog::verified_assignment(tr, serial, barcode)
         .await
         .map_err(|error| match error {
             CatalogError::Invalid(detail) => CatalogError::Corrupt(detail),
             other => other,
         })?;
-    if assignment.is_none() && location.is_none() {
+    let pending = match &assignment {
+        Some(assigned) => {
+            selected_pool::is_pending_at(tr, assigned.namespace, serial, assigned.pool_id).await?
+        }
+        None => false,
+    };
+    if pending {
+        assignment = None;
+    }
+    if !pending && assignment.is_none() && location.is_none() {
         return Ok(None);
     }
     let pool = if let Some(a) = &assignment {
@@ -138,6 +147,7 @@ impl ManagedCatalog {
         let physical = volumes(&view)?;
         let prefix = if let Some(pool) = pool {
             require_pool_library(&tr, route.route.namespace, pool, serial).await?;
+            selected_pool::require_published_at(&tr, route.route.namespace, pool).await?;
             pool_library_prefix(route.route.namespace, pool, serial)
         } else {
             assignment_prefix(serial)

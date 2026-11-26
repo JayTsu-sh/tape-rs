@@ -15,9 +15,19 @@ ltfsctl -e NODE:7411 --library SERIAL pool delete archive --request delete.json
 ltfsctl -e NODE:7411 --library SERIAL task show --request delete.json
 ```
 
-当前 `create` 原子创建空池，返回池记录。`set` 和 `delete` 返回持久任务，需查询至 succeeded、failed 或 cancelled。删除要求目录为空、没有磁带归属或活动文件写入。取消仅适用于 queued。任务窗口轮换、历史清理和运行中设备任务取消尚未开放。
+未提供磁带清单时，`create` 原子创建空池并返回池记录。`set` 和 `delete` 返回持久任务，需查询至 succeeded、failed 或 cancelled。删除要求目录为空、没有磁带归属或活动文件写入。取消仅适用于 queued。任务窗口轮换、历史清理和运行中设备任务取消尚未开放。
 
 用 `ltfsctl -e NODE:7411 --library SERIAL pool create archive --preview --tape ABC001L8 --tape ABC002L8` 可以在创建前检查池名称和 1 到 100 个磁带条码。预检依赖当前 owner 的完整库存。结果中的 `eligible` 表示库存位置和归属符合条件，`blocked` 会列出相关条码及原因。预检只读 FDB，磁带格式仍须在后续设备检查中确认。
+
+磁带清单非空时，创建先原子预约名称、所有条码及归位槽，再由带库 owner 处理介质。全部介质完成后，池及其归属同时可见。已有 LTFS 卷沿用原卷 UUID 和文件内容。使用 `--confirm-format` 明确授权初始化，且必须实读证明所有分区为空。目录按现有 LTFS 导入规则处理，已有介质的池标记必须与目标池一致或缺失。
+
+```bash
+ltfsctl -e NODE:7411 --library SERIAL pool create archive \
+  --tape ABC001L8 --tape ABC002L8 --confirm-format --request create-with-tapes.json
+ltfsctl -e NODE:7411 --library SERIAL pool create-status POOL_UUID --namespace NAMESPACE_UUID
+```
+
+创建或查询逻辑带库下的池时，两条命令都传入原 `--logical-library`。超时后用原请求文件和原参数继续，或按回执中的 UUID 与 namespace 查询。回执的 `active_tape` 包括原介质子任务及其检查点。位置或初始化结果待核对时，任务保留原条码、卷 UUID 和预约。
 
 写命令在第一次提交前以独占创建、0600、文件和父目录 fsync 保存请求文件。重复执行同一命令和相同参数时使用同一文件，沿用原 namespace、池 UUID、修订号、任务 epoch/operation；不会重新解析池名或更新修订号。不同参数、损坏或不完整文件直接拒绝，不覆盖、不修复。文件只保存请求身份，不缓存任务状态。保留这些文件供超时、断网和接管后恢复；不要为了重试而删除文件或改用新文件。
 
@@ -30,8 +40,9 @@ HTTP 路由以 `/libraries/SERIAL/admin` 为前缀：
 | GET `/context` | 当前 namespace、管理请求窗口 |
 | GET `/pools?limit=100&after=CURSOR` | 当前库池分页 |
 | GET `/pools/UUID_OR_NAME` | 池详情；UUID 不回退为名称 |
-| POST `/pools` | 固定池 UUID 的原子创建 |
+| POST `/pools` | 固定池 UUID。空清单同步创建，有选中磁带时返回持久任务 |
 | POST `/pool-create/preview` | 只读检查名称和条码，正文包含 `version`、`name`、`file_limit`、`tapes` |
+| GET `/pool-create/UUID` | 查询原带磁带的建池任务及进度 |
 | PATCH `/pools/UUID` | 固定管理请求身份的策略任务 |
 | DELETE `/pools/UUID` | 固定管理请求身份的删除任务 |
 | GET `/tasks?limit=100&after=CURSOR` | 当前库持久任务分页 |
@@ -40,7 +51,7 @@ HTTP 路由以 `/libraries/SERIAL/admin` 为前缀：
 
 除 context 外必须提供且只提供一个 `x-tapers-catalog-namespace` 头。分页上限 100 是管理元数据规则；与 S3 ListObjectsV2 的上限 1000 无关。游标是原样传回的 Base64URL 字符串，不能跨库使用。
 
-创建正文严格包含 version=1、id、name、file_limit、created_at_millis 和 policy。policy 包含全部五个策略字段（不包含 name/file_limit）。PATCH/DELETE 正文是统一 v1 管理信封：
+创建正文包含 version=1、id、name、file_limit、created_at_millis 和 policy，可以附加 `tapes` 字符串数组及 `confirm_format` 布尔值。提交有磁带的合法清单后，HTTP 202 表示已受理，状态为 `succeeded` 时池才可用。policy 包含全部五个策略字段（不包含 name/file_limit）。PATCH/DELETE 正文是统一 v1 管理信封：
 
 ```json
 {"version":1,"library":"SERIAL","namespace":"NAMESPACE_UUID","epoch":1,"operation":"OPERATION_UUID","change":{"kind":"pool","id":"POOL_UUID","revision":1,"patch":{"media_restriction":"L8"}}}

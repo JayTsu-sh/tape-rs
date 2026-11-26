@@ -235,6 +235,11 @@ async fn apply_change(
             apply_pool_patch(&mut pool, &change["patch"]);
             pool.revision = revision(change)?;
             validate_pool(&pool)?;
+            if old_name != pool.name
+                && !selected_pool::name_available_at(tr, namespace, &pool.name).await?
+            {
+                return Err(CatalogError::Invalid("目标名称已由原建池请求预约"));
+            }
             let name = pool_name_key(namespace, &pool.name);
             if old_name != pool.name
                 && let Some(existing) = tr.get(&name, false).await?

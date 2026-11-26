@@ -18,7 +18,7 @@ fn refused(detail: impl Into<String>) -> TapeError {
         reason: detail.into(),
     }
 }
-fn all_partitions_blank(device: &dyn TapeTransport) -> Result<bool> {
+pub(super) fn all_partitions_blank(device: &dyn TapeTransport) -> Result<bool> {
     let drive = TapeDrive::new(device);
     let mut buffer = vec![0; crate::ltfs::volume::DEFAULT_BLOCK_SIZE as usize];
     for partition in 0..drive.defined_partitions()? {

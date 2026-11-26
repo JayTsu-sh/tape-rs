@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// 原子创建空池及根目录，或只读预检准备入池的条码
+    /// 创建空池或指定磁带的普通池
     Create {
         name: String,
         #[arg(long, default_value_t = 200_000)]
@@ -18,12 +18,21 @@ pub enum Command {
         /// 只读检查池名称和磁带清单
         #[arg(long, requires = "tapes", conflicts_with = "request")]
         preview: bool,
-        /// 预检条码，可重复指定
-        #[arg(long = "tape", requires = "preview")]
+        /// 指定磁带条码，可重复指定
+        #[arg(long = "tape")]
         tapes: Vec<String>,
+        /// 允许初始化经验证的空白磁带
+        #[arg(long, requires = "tapes", conflicts_with = "preview")]
+        confirm_format: bool,
         /// 首次调用前保存请求身份；重试须用相同文件和参数
         #[arg(long)]
         request: Option<PathBuf>,
+    },
+    /// 按原 UUID 查询指定磁带的建池任务
+    CreateStatus {
+        id: Uuid,
+        #[arg(long)]
+        namespace: Uuid,
     },
     /// 列出当前带库的全部FDB池
     List {
@@ -148,6 +157,25 @@ pub fn run(
         Command::Create {
             name,
             file_limit,
+            tapes,
+            confirm_format,
+            request,
+            ..
+        } if !tapes.is_empty() => submit(
+            client,
+            library,
+            logical,
+            ManagementIntent::CreateSelected {
+                name,
+                file_limit,
+                tapes,
+                confirm_format,
+            },
+            request_path(request)?,
+        )?,
+        Command::Create {
+            name,
+            file_limit,
             request,
             ..
         } => submit(
@@ -157,6 +185,9 @@ pub fn run(
             ManagementIntent::Create { name, file_limit },
             request_path(request)?,
         )?,
+        Command::CreateStatus { id, namespace } => {
+            client.selected_pool_create_status(library, namespace, logical, id)?
+        }
         Command::Set {
             selector,
             attribute,
@@ -266,7 +297,7 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn tape_selection_requires_explicit_preview() {
+    fn selected_creation_and_preview_flags_are_distinct() {
         let parse = |extra: &[&str]| {
             let args = [
                 "ltfsctl",
@@ -282,7 +313,10 @@ mod tests {
         };
         assert!(parse(&[]).is_ok());
         assert!(parse(&["--preview", "--tape", "NEW001L8", "--tape", "NEW002L8"]).is_ok());
-        assert!(parse(&["--tape", "NEW001L8"]).is_err());
+        assert!(parse(&["--tape", "NEW001L8"]).is_ok());
+        assert!(parse(&["--tape", "NEW001L8", "--confirm-format"]).is_ok());
+        assert!(parse(&["--confirm-format"]).is_err());
+        assert!(parse(&["--preview", "--tape", "NEW001L8", "--confirm-format"]).is_err());
         assert!(parse(&["--preview", "--tape", "NEW001L8", "--request", "plan.json"]).is_err());
     }
 

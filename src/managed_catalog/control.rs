@@ -41,6 +41,8 @@ pub use native_device::NativeDeviceTask;
 mod active_pools;
 #[path = "scoped_pools.rs"]
 mod scoped_pools;
+#[path = "selected_pool.rs"]
+mod selected_pool;
 pub use active_pools::ActivePoolCreation;
 #[path = "pool_roots.rs"]
 mod pool_roots;
@@ -977,7 +979,10 @@ impl ManagedCatalog {
         let mut items = Vec::new();
         for (key, value) in page.items {
             let pool = decode_pool(uuid_from(&key[prefix.len()..])?, &value)?;
-            if pool.library_serial == serial {
+            if pool.library_serial == serial
+                && !selected_pool::is_pending_at(&tr, route.route.namespace, serial, pool.id)
+                    .await?
+            {
                 require_pool_library(&tr, route.route.namespace, pool.id, serial).await?;
                 active_pools::require_indexes(&tr, route.route.namespace, &pool).await?;
                 items.push(pool);

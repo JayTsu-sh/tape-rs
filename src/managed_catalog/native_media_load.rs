@@ -223,6 +223,20 @@ pub(in super::super) fn clear_at(tr: &Transaction, import: &NativeMediaImport) {
     tr.clear(&key(import));
 }
 
+pub(super) async fn require_loaded_at(
+    tr: &Transaction,
+    import: &NativeMediaImport,
+    owner: u64,
+) -> Result<()> {
+    let (state, plan) = active_at(tr, import, owner).await?;
+    if state["abort"] == true
+        || !plan.is_some_and(|plan| plan.phase == NativeMediaLoadPhase::Loaded)
+    {
+        return Err(CatalogError::Incomplete);
+    }
+    Ok(())
+}
+
 impl ManagedCatalog {
     pub async fn native_media_load_progress(
         &self,
@@ -259,6 +273,14 @@ impl ManagedCatalog {
                         }
                         if state["abort"] == true {
                             return Err(CatalogError::PoolImporting);
+                        }
+                        if let Some(original) =
+                            selected_pool::original_tape_at(&tr, import.request()).await?
+                            && (plan.source != original.source || plan.home != Some(original.home))
+                        {
+                            return Err(CatalogError::Invalid(
+                                "磁带当前位置或 home 与创建池原预约不一致",
+                            ));
                         }
                         let record = Record {
                             version: 1,

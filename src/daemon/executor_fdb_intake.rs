@@ -191,9 +191,38 @@ pub(super) async fn apply(
     let result = intake_source(owner, permit, control, status, &intake).await;
     match result {
         Ok(()) => Ok(()),
-        Err(ReadError::Busy(_)) => Ok(()),
+        Err(ReadError::Busy(reason)) => {
+            if control
+                .catalog
+                .selected_intake_position(&intake, owner.round)
+                .await
+                .map_err(lost)?
+                .is_some()
+            {
+                control
+                    .catalog
+                    .note_selected_intake_wait(&intake, owner.round, &reason)
+                    .await
+                    .map_err(lost)?;
+            }
+            Ok(())
+        }
         Err(ReadError::Lost(reason)) => Err(ReadError::Lost(reason)),
         Err(ReadError::Failed(reason)) => {
+            if control
+                .catalog
+                .selected_intake_format(&intake, owner.round)
+                .await
+                .map_err(lost)?
+                .is_some_and(|(_, issued)| issued)
+            {
+                control
+                    .catalog
+                    .note_selected_intake_wait(&intake, owner.round, &reason)
+                    .await
+                    .map_err(lost)?;
+                return Ok(());
+            }
             match live(owner, permit, control, &intake).await {
                 Ok(_) => {}
                 Err(ReadError::Busy(_)) => return Ok(()),
@@ -214,6 +243,121 @@ pub(super) async fn apply(
                 .await
                 .map_err(lost)?;
             Ok(())
+        }
+    }
+}
+
+async fn selected_format_allowed(
+    owner: &Active,
+    control: &FdbOwnerControl,
+    intake: &NativeMediaImport,
+    drive_serial: &str,
+) -> std::result::Result<bool, ReadError> {
+    let policy = control
+        .catalog
+        .active_management_policy(
+            &control.serial,
+            control.route,
+            owner.round,
+            &[drive_serial.to_owned()],
+            &[intake.pool()],
+            &[intake.barcode().to_owned()],
+        )
+        .await
+        .map_err(lost)?;
+    Ok(
+        super::super::management::drive_allowed(&policy, drive_serial, 'm')
+            && fdb_loading::tape_allowed(&policy, intake.barcode()),
+    )
+}
+
+async fn prepare_selected_medium(
+    owner: &Active,
+    control: &FdbOwnerControl,
+    intake: &NativeMediaImport,
+    drive_serial: &str,
+    device: &dyn TapeTransport,
+) -> std::result::Result<Option<uuid::Uuid>, ReadError> {
+    use crate::ltfs::volume::{FormatProbe, probe_format};
+    if control
+        .catalog
+        .selected_intake_position(intake, owner.round)
+        .await
+        .map_err(lost)?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let planned = control
+        .catalog
+        .selected_intake_format(intake, owner.round)
+        .await
+        .map_err(lost)?;
+    let already_issued = planned
+        .filter(|(_, issued)| *issued)
+        .map(|(volume, _)| volume);
+    let format_error = |error: TapeError| {
+        if already_issued.is_some() && !ownership_lost(&error) {
+            ReadError::Busy(format!("原初始化结果未知: {error}"))
+        } else {
+            physical(error)
+        }
+    };
+    match probe_format(device).map_err(format_error)? {
+        FormatProbe::Ltfs => Ok(already_issued),
+        _ if already_issued.is_some() => Err(ReadError::Busy(
+            "原初始化结果未知，保留原卷 UUID 和预约".into(),
+        )),
+        FormatProbe::Foreign(reason) => Err(ReadError::Failed(format!(
+            "拒绝初始化有数据的非 LTFS 磁带: {reason}"
+        ))),
+        FormatProbe::Blank => {
+            let Some((volume, false)) = planned else {
+                return Err(ReadError::Failed(
+                    "空白磁带须在原创建请求中显式确认初始化".into(),
+                ));
+            };
+            if !selected_format_allowed(owner, control, intake, drive_serial).await? {
+                return Err(ReadError::Busy("当前磁带或驱动器未获初始化权限".into()));
+            }
+            if TapeDrive::new(device).write_protected().map_err(physical)? {
+                return Err(ReadError::Failed("空白磁带处于写保护状态".into()));
+            }
+            if !fdb_assign::all_partitions_blank(device).map_err(physical)? {
+                return Err(ReadError::Failed("磁带仍有非空分区，拒绝初始化".into()));
+            }
+            if !control
+                .catalog
+                .issue_selected_intake_format(intake, owner.round, volume)
+                .await
+                .map_err(lost)?
+            {
+                return Err(ReadError::Busy("原初始化已发出，等待卷身份读回".into()));
+            }
+            let options = crate::ltfs::mkltfs::MkltfsOptions {
+                volume_id: intake.barcode().chars().take(6).collect(),
+                volume_uuid: Some(volume),
+                ..Default::default()
+            };
+            let format = fdb_operation_guard::Guard::new(device, || {
+                let allowed = futures_executor::block_on(selected_format_allowed(
+                    owner,
+                    control,
+                    intake,
+                    drive_serial,
+                ))
+                .map_err(|error| TapeError::Catalog(format!("{error:?}")))?;
+                if !allowed {
+                    return Err(TapeError::Catalog("原初始化权限已失效".into()));
+                }
+                Ok(())
+            });
+            match crate::ltfs::mkltfs::mkltfs(&format, &options) {
+                Ok(actual) if actual == volume => Ok(Some(volume)),
+                Err(error) if ownership_lost(&error) => Err(lost(error)),
+                Err(error) => Err(ReadError::Busy(format!("原初始化结果未知: {error}"))),
+                Ok(_) => Err(ReadError::Busy("原初始化返回了不一致的卷 UUID".into())),
+            }
         }
     }
 }
@@ -243,7 +387,22 @@ async fn intake_source(
             Ok(())
         });
     let device = &checked as &dyn TapeTransport;
-    let label = crate::ltfs::volume::read_label_only(device).map_err(physical)?;
+    let formatted =
+        prepare_selected_medium(owner, control, intake, &owner.devices[drive].serial, device)
+            .await?;
+    let source_error = |error: TapeError| {
+        if formatted.is_some() && !ownership_lost(&error) {
+            ReadError::Busy(format!("原初始化未完成来源验证: {error}"))
+        } else {
+            physical(error)
+        }
+    };
+    let label = crate::ltfs::volume::read_label_only(device).map_err(source_error)?;
+    if formatted.is_some_and(|volume| volume != label.volume_uuid) {
+        return Err(ReadError::Busy(
+            "卷标签与原初始化 UUID 不符，保留预约核对".into(),
+        ));
+    }
     if intake
         .assigned_volume()
         .map_err(lost)?
@@ -268,8 +427,8 @@ async fn intake_source(
     budget.index_scratch.max_bytes = control.storage.index_bytes;
     budget.index_scratch.headroom_bytes = control.storage.headroom_bytes;
     let tape = TapeDrive::new(device);
-    let captured =
-        crate::ltfs::recovery::capture_index_source(&tape, &label, &budget).map_err(physical)?;
+    let captured = crate::ltfs::recovery::capture_index_source(&tape, &label, &budget)
+        .map_err(source_error)?;
     let identity = captured.identity().map_err(physical)?;
     let evidence = captured.scope();
     let expected = ExpectedIndex {
@@ -301,10 +460,9 @@ async fn intake_source(
     spool.verify_extent_cache(&cache).map_err(physical)?;
     let pool = control
         .catalog
-        .active_pool_for_route(&control.serial, control.route, intake.pool())
+        .native_media_pool(intake, owner.round)
         .await
-        .map_err(lost)?
-        .ok_or_else(|| ReadError::Failed("接入池已不存在".into()))?;
+        .map_err(lost)?;
     let root = spool
         .node_by_path("")
         .map_err(physical)?
@@ -399,8 +557,8 @@ async fn intake_source(
         .finish_native_media(intake, owner.round, &proof)
         .await
         .map_err(projection_error)?;
-    // No write, filemark, VCI/MAM update, close-tail or format occurred. The
-    // mounted identity becomes eligible for normal reads/writes only now.
+    // An existing LTFS source was read-only. For a new empty volume the
+    // original format identity was verified before publication.
     owner.fdb_pending_import.remove(intake.barcode());
     fdb_monitor::index_state(
         owner,

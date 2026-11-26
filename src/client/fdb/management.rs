@@ -56,6 +56,12 @@ pub enum ManagementIntent {
         name: String,
         file_limit: u64,
     },
+    CreateSelected {
+        name: String,
+        file_limit: u64,
+        tapes: Vec<String>,
+        confirm_format: bool,
+    },
     Set {
         selector: String,
         attribute: String,
@@ -90,6 +96,12 @@ pub(super) fn base(library: &str) -> Result<String> {
     Client::new(Vec::<String>::new()).with_library(library)?;
     Ok(format!("/libraries/{}/admin", encode_query(library)))
 }
+fn valid_tapes(tapes: &[String]) -> bool {
+    (1..=100).contains(&tapes.len())
+        && tapes.iter().all(|tape| super::queries::barcode(tape))
+        && tapes.iter().collect::<std::collections::HashSet<_>>().len() == tapes.len()
+}
+
 fn patch(attribute: &str, value: &str) -> Result<Value> {
     let value = match attribute {
         "name" if name(value) => json!(value),
@@ -165,6 +177,48 @@ pub(super) fn scope(value: &Value, library: &str, namespace: &str) -> Result<()>
     }
     Ok(())
 }
+fn check_selected_receipt(value: &Value, saved: &ManagementRequestFile) -> Result<()> {
+    scope(value, &saved.library, &saved.namespace)?;
+    verify_logical_scope(value, saved.logical_library)?;
+    let bad = || ClientError::Verification("指定磁带创建池回执与原请求不符".into());
+    let status = value["status"].as_str().ok_or_else(bad)?;
+    let rows = value["tapes"].as_array().ok_or_else(bad)?;
+    let requested = saved.request["tapes"].as_array().ok_or_else(bad)?;
+    if value["version"] != 1
+        || !matches!(status, "queued" | "running" | "blocked" | "succeeded")
+        || ["id", "name", "file_limit", "confirm_format"]
+            .iter()
+            .any(|key| value[*key] != saved.request[*key])
+        || rows.len() != requested.len()
+        || rows.iter().zip(requested).any(|(row, barcode)| {
+            row["barcode"] != *barcode
+                || ["source_address", "home_address"].iter().any(|key| {
+                    row[*key]
+                        .as_u64()
+                        .is_none_or(|addr| u16::try_from(addr).is_err())
+                })
+                || (status == "succeeded"
+                    && (row["status"] != "succeeded"
+                        || row["volume_uuid"]
+                            .as_str()
+                            .is_none_or(|id| uuid(id).is_err())))
+        })
+    {
+        return Err(bad());
+    }
+    if status == "succeeded" {
+        check_pool(&value["pool"], &saved.library)?;
+        for key in ["id", "name", "file_limit", "created_at_millis", "policy"] {
+            if value["pool"][key] != saved.request[key] {
+                return Err(bad());
+            }
+        }
+    } else if !value["pool"].is_null() {
+        return Err(bad());
+    }
+    Ok(())
+}
+
 fn unknown(checkpoint: &Path, error: ClientError) -> ClientError {
     ClientError::Indeterminate(format!(
         "{}；保留请求文件{}，按原身份恢复",
@@ -191,6 +245,7 @@ impl ManagementRequestFile {
                 || !matches!(
                     self.input,
                     ManagementIntent::Create { .. }
+                        | ManagementIntent::CreateSelected { .. }
                         | ManagementIntent::Set { .. }
                         | ManagementIntent::Delete { .. }
                 )
@@ -296,6 +351,11 @@ impl ManagementRequestFile {
             ManagementIntent::Create {
                 name: n,
                 file_limit,
+            }
+            | ManagementIntent::CreateSelected {
+                name: n,
+                file_limit,
+                ..
             } => {
                 if !name(n) || *file_limit == 0 {
                     return Err(invalid("池名称或file_limit无效"));
@@ -311,7 +371,20 @@ impl ManagementRequestFile {
                 {
                     return Err(invalid("池创建时间无效"));
                 }
-                json!({"version":1,"id":self.request["id"],"name":n,"file_limit":file_limit,"created_at_millis":self.request["created_at_millis"],"policy":defaults()})
+                let mut value = json!({"version":1,"id":self.request["id"],"name":n,"file_limit":file_limit,"created_at_millis":self.request["created_at_millis"],"policy":defaults()});
+                if let ManagementIntent::CreateSelected {
+                    tapes,
+                    confirm_format,
+                    ..
+                } = &self.input
+                {
+                    if !valid_tapes(tapes) {
+                        return Err(invalid("建池须提供 1 到 100 个合法且不重复的条码"));
+                    }
+                    value["tapes"] = json!(tapes);
+                    value["confirm_format"] = json!(confirm_format);
+                }
+                value
             }
             ManagementIntent::Set {
                 selector,
@@ -516,10 +589,7 @@ impl FdbClient {
         tapes: &[String],
     ) -> Result<Value> {
         uuid(namespace)?;
-        let valid = (1..=100).contains(&tapes.len())
-            && tapes.iter().all(|tape| super::queries::barcode(tape))
-            && tapes.iter().collect::<std::collections::HashSet<_>>().len() == tapes.len();
-        if !valid || file_limit == 0 {
+        if !valid_tapes(tapes) || file_limit == 0 {
             return Err(invalid(
                 "池文件上限须大于零，预检须提供 1 到 100 个合法且不重复的条码",
             ));
@@ -543,9 +613,11 @@ impl FdbClient {
             && rows.iter().zip(tapes).all(|(row, barcode)| {
                 row["barcode"] == barcode.as_str()
                     && match row["status"].as_str() {
-                        Some("eligible" | "assigned") => row["home_address"]
-                            .as_u64()
-                            .is_some_and(|address| u16::try_from(address).is_ok()),
+                        Some("eligible" | "assigned" | "reserved" | "home_conflict") => {
+                            row["home_address"]
+                                .as_u64()
+                                .is_some_and(|address| u16::try_from(address).is_ok())
+                        }
                         Some(
                             "not_observed" | "not_in_storage" | "cleaning" | "out_of_scope"
                             | "home_unknown" | "home_occupied",
@@ -612,6 +684,7 @@ impl FdbClient {
                 || !matches!(
                     input,
                     ManagementIntent::Create { .. }
+                        | ManagementIntent::CreateSelected { .. }
                         | ManagementIntent::Set { .. }
                         | ManagementIntent::Delete { .. }
                 )
@@ -641,6 +714,12 @@ impl FdbClient {
                 name: n,
                 file_limit,
             } if name(n) && *file_limit > 0 => {}
+            ManagementIntent::CreateSelected {
+                name: n,
+                file_limit,
+                tapes,
+                ..
+            } if name(n) && *file_limit > 0 && valid_tapes(tapes) => {}
             ManagementIntent::Set {
                 selector,
                 attribute,
@@ -693,12 +772,25 @@ impl FdbClient {
                 }
                 json!({"version":1,"library":library,"namespace":namespace,"epoch":context["window"]["accepting"],"operation":Uuid::new_v4().to_string(),"change":{"kind":"media-move","barcode":barcode,"destination":destination,"pool":assignment["pool"],"volume":assignment["volume"],"revision":assignment["revision"]}})
             }
-            ManagementIntent::Create { name, file_limit } => {
+            ManagementIntent::Create { name, file_limit }
+            | ManagementIntent::CreateSelected {
+                name, file_limit, ..
+            } => {
                 let time = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_err(|_| invalid("系统时间无效"))?
                     .as_millis();
-                json!({"version":1,"id":Uuid::new_v4().to_string(),"name":name,"file_limit":file_limit,"created_at_millis":time as u64,"policy":defaults()})
+                let mut value = json!({"version":1,"id":Uuid::new_v4().to_string(),"name":name,"file_limit":file_limit,"created_at_millis":time as u64,"policy":defaults()});
+                if let ManagementIntent::CreateSelected {
+                    tapes,
+                    confirm_format,
+                    ..
+                } = &input
+                {
+                    value["tapes"] = json!(tapes);
+                    value["confirm_format"] = json!(confirm_format);
+                }
+                value
             }
             ManagementIntent::Set { selector, .. } | ManagementIntent::Delete { selector } => {
                 let pool = self.pool_in_scope(library, &namespace, logical, selector)?;
@@ -774,6 +866,11 @@ impl FdbClient {
                 format!("{}/pools", base(&p.library)?),
                 vec![200, 201],
             ),
+            ManagementIntent::CreateSelected { .. } => (
+                "POST",
+                format!("{}/pools", base(&p.library)?),
+                vec![200, 202],
+            ),
             ManagementIntent::Set { .. } => (
                 "PATCH",
                 format!(
@@ -825,12 +922,43 @@ impl FdbClient {
                         )));
                     }
                 }
+            } else if matches!(p.input, ManagementIntent::CreateSelected { .. }) {
+                check_selected_receipt(&value, &p)?;
             } else {
                 check_task(&value, &p)?;
             }
             Ok(value)
         })();
         result.map_err(|e| unknown(checkpoint, e))
+    }
+
+    /// Query an original selected-tape creation without submitting a mutation.
+    pub fn selected_pool_create_status(
+        &self,
+        library: &str,
+        namespace: Uuid,
+        logical: Option<Uuid>,
+        id: Uuid,
+    ) -> Result<Value> {
+        if namespace.is_nil() || id.is_nil() {
+            return Err(invalid("原创建 UUID 和命名空间须非零"));
+        }
+        let route = format!("{}/pool-create/{id}", base(library)?);
+        let value = parsed(
+            self.retry_request(
+                "GET",
+                &route,
+                None,
+                &header_refs(&pool_headers(&namespace.to_string(), logical)?),
+            )?,
+            &[200],
+        )?;
+        scope(&value, library, &namespace.to_string())?;
+        verify_logical_scope(&value, logical)?;
+        if value["id"] != json!(id) || value["version"] != 1 {
+            return Err(ClientError::Verification("查询到的建池回执身份不符".into()));
+        }
+        Ok(value)
     }
 
     pub fn management_request_status(&self, checkpoint: &Path, cancel: bool) -> Result<Value> {
@@ -845,6 +973,19 @@ impl FdbClient {
                 p.logical_library,
                 p.request["id"].as_str().expect("validated id"),
             );
+        }
+        if matches!(p.input, ManagementIntent::CreateSelected { .. }) {
+            if cancel {
+                return Err(invalid("带磁带的建池请求须按原介质状态核对"));
+            }
+            let value = self.selected_pool_create_status(
+                &p.library,
+                uuid(&p.namespace)?,
+                p.logical_library,
+                uuid(p.request["id"].as_str().expect("validated id"))?,
+            )?;
+            check_selected_receipt(&value, &p)?;
+            return Ok(value);
         }
         let route = format!(
             "{}/tasks/{}/{}{}",

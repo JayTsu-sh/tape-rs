@@ -138,6 +138,36 @@ fn native_pool_discovery_uses_physical_scope_before_logical_activation() {
                 .unwrap()
         }).await.unwrap();
         assert_eq!(sdk, result);
+        observation["volumes"][0]["address"] = json!(1003);
+        observation["volumes"][0]["home_slot"] = json!(3);
+        observation["observed_at"] = json!(crate::ltfs::label::ltfs_time_now());
+        catalog.record_active_library_inventory(&serial, route, owner, &observation).await.unwrap();
+        let (status, moved) = run_preview(&["NEW001L8"]).await;
+        assert_eq!(status, 200, "{moved}");
+        assert_eq!(moved["tapes"][0]["home_address"], 1003);
+
+        // An unselected cartridge is already loaded from the apparently empty
+        // slot 1001. A second drive cannot use that slot as its home as well.
+        let mut conflicting = observation.clone();
+        conflicting["volumes"][0]["address"] = json!(1);
+        conflicting["volumes"][0]["element_type"] = json!(4);
+        conflicting["volumes"][0]["source_address"] = json!(1001);
+        conflicting["volumes"][0]["home_slot"] = Value::Null;
+        conflicting["volumes"].as_array_mut().unwrap().push(json!({
+            "barcode":"OTHER1L8","address":2,"element_type":4,"medium_type":1,"source_address":1001,"home_slot":null
+        }));
+        conflicting["drives"] = json!([
+            {"serial":"SIMDRV0000","address":1,"barcode":"NEW001L8"},
+            {"serial":"SIMDRV0001","address":2,"barcode":"OTHER1L8"}
+        ]);
+        conflicting["observed_at"] = json!(crate::ltfs::label::ltfs_time_now());
+        catalog.record_active_library_inventory(&serial, route, owner, &conflicting).await.unwrap();
+        let (status, blocked) = run_preview(&["NEW001L8"]).await;
+        assert_eq!(status, 200, "{blocked}");
+        assert_eq!(blocked["status"], "blocked");
+        assert_eq!(blocked["tapes"][0]["status"], "home_occupied");
+        observation["observed_at"] = json!(crate::ltfs::label::ltfs_time_now());
+        catalog.record_active_library_inventory(&serial, route, owner, &observation).await.unwrap();
         let (status, page) = request(&address, "GET", &path, Some(&ns.to_string()), b"").await;
         assert_eq!(status, 200, "{page}");
         assert_eq!(page["items"], json!([]));
@@ -146,6 +176,61 @@ fn native_pool_discovery_uses_physical_scope_before_logical_activation() {
             file_limit: 100, created_at_millis: 1, revision: 1, policy: Default::default(),
         };
         catalog.create_admin_pool(&serial, route, owner, None, &pool).await.unwrap();
+        observation["volumes"].as_array_mut().unwrap().push(json!({
+            "barcode":"SELECTL8","address":1001,"element_type":2,"medium_type":1,"source_address":null,"home_slot":1
+        }));
+        observation["observed_at"] = json!(crate::ltfs::label::ltfs_time_now());
+        catalog.record_active_library_inventory(&serial, route, owner, &observation).await.unwrap();
+        let candidate = |name: &str| crate::managed_catalog::PoolRecord {
+            id: Uuid::new_v4(), library_serial: serial.clone(), name: name.into(),
+            file_limit: 100, created_at_millis: 1, revision: 1, policy: Default::default(),
+        };
+        let first = candidate("selected-first");
+        let second = candidate("selected-second");
+        let tapes = vec!["SELECTL8".into()];
+        let rejected = catalog.admit_selected_pool(route, owner, None, &first,
+            &["SELECTL8".into(), "CLN001L1".into()], false).await.unwrap();
+        assert_eq!(rejected["status"], "blocked");
+        let (one, two) = tokio::join!(
+            catalog.admit_selected_pool(route, owner, None, &first, &tapes, false),
+            catalog.admit_selected_pool(route, owner, None, &second, &tapes, false),
+        );
+        let (one, two) = (one.unwrap(), two.unwrap());
+        let (accepted, rejected, saved) = if one["status"] == "queued" {
+            (one, two, first)
+        } else {
+            (two, one, second)
+        };
+        assert_eq!(accepted["status"], "queued");
+        assert_eq!(accepted["tapes"][0]["source_address"], 1001);
+        assert_eq!(rejected["status"], "blocked");
+        assert_eq!(rejected["tapes"][0]["status"], "reserved");
+        assert_eq!(catalog.admit_selected_pool(route, owner, None, &saved, &tapes, false)
+            .await.unwrap(), accepted);
+        assert_eq!(request(&address, "GET", &format!("{path}/{}", saved.id), Some(&ns.to_string()), b"").await.0, 404);
+        catalog.advance_selected_pool_create(&serial, route, owner).await.unwrap();
+        let started = catalog.selected_pool_create_status(&serial, route, None, saved.id).await.unwrap().unwrap();
+        let active = &started["active_tape"];
+        let operation = active["operation"].as_str().unwrap().parse().unwrap();
+        let epoch = active["epoch"].as_u64().unwrap();
+        assert_eq!(request(&address, "GET", &format!("{path}/{}", saved.id), Some(&ns.to_string()), b"").await.0, 404);
+        for medium in observation["volumes"].as_array_mut().unwrap() {
+            if medium["barcode"] == "SELECTL8" {
+                medium["address"] = json!(1003);
+                medium["home_slot"] = json!(3);
+            } else if medium["barcode"] == "NEW001L8" {
+                medium["address"] = json!(1001);
+                medium["home_slot"] = json!(1);
+            }
+        }
+        observation["observed_at"] = json!(crate::ltfs::label::ltfs_time_now());
+        catalog.record_active_library_inventory(&serial, route, owner, &observation).await.unwrap();
+        assert!(catalog.start_native_media(&serial, route, owner, epoch, operation).await.unwrap().is_none());
+        let paused = catalog.selected_pool_create_status(&serial, route, None, saved.id).await.unwrap().unwrap();
+        assert_eq!(paused["active_tape"]["status"], "queued");
+        assert!(paused["active_tape"]["checkpoint"]["detail"].as_str().unwrap().contains("SELECTL8"));
+        assert_eq!(paused["tapes"][0]["source_address"], 1001);
+        assert_eq!(paused["tapes"][0]["home_address"], 1001);
         let operation = Uuid::new_v4();
         let import = crate::managed_catalog::ManagementRequest::parse(json!({
             "version":1,"library":serial,"namespace":ns,"epoch":1,"operation":operation,
@@ -158,6 +243,7 @@ fn native_pool_discovery_uses_physical_scope_before_logical_activation() {
         assert_eq!(result["status"], "blocked");
         assert_eq!(result["name_available"], false);
         assert_eq!(result["tapes"][0]["status"], "assigned");
+
         server.abort();
     });
 }

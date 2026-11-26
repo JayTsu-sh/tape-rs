@@ -253,8 +253,21 @@ pub(super) async fn require_mechanical_locations(
     let expected = request.logical_library();
     let prefix = at(ns, serial, b'r');
     let mut keys = Vec::with_capacity(locations.len() + 1);
-    keys.extend(home.map(|address| slot_key(&prefix, b's', address)));
+    let own = selected_pool::original_tape_at(tr, request).await?;
+    let own_pool = own.and_then(|_| {
+        request.value()["change"]["pool"]
+            .as_str()
+            .and_then(|id| Uuid::parse_str(id).ok())
+    });
+    if let Some(home) = home {
+        selected_pool::require_home_available(tr, ns, serial, home, own_pool).await?;
+        keys.push(slot_key(&prefix, b's', home));
+    }
     for location in locations {
+        if location.kind == MoveLocationKind::Storage {
+            selected_pool::require_home_available(tr, ns, serial, location.address, own_pool)
+                .await?;
+        }
         keys.push(match location.kind {
             MoveLocationKind::Storage => slot_key(&prefix, b's', location.address),
             MoveLocationKind::ImportExport => slot_key(&prefix, b'i', location.address),
@@ -294,6 +307,9 @@ pub(super) async fn require_automatic_resource_claims(
     drive: &str,
     storage: Option<u16>,
 ) -> Result<()> {
+    if let Some(storage) = storage {
+        selected_pool::require_home_available(tr, ns, serial, storage, None).await?;
+    }
     let expected = pool_library_at(tr, ns, serial, pool).await?;
     if let Some(id) = expected {
         reconciliation::require_ready(tr, ns, serial, id).await?;
@@ -524,14 +540,6 @@ fn preview_tape_location(
             if !scope.storage_slots.contains(&home) {
                 return Err("out_of_scope");
             }
-            if observation["volumes"]
-                .as_array()
-                .expect("validated volumes")
-                .iter()
-                .any(|row| row["address"] == home)
-            {
-                return Err("home_occupied");
-            }
             home
         }
         _ => return Err("not_in_storage"),
@@ -542,6 +550,18 @@ fn preview_tape_location(
     let medium_type = medium["medium_type"].as_u64().map(|value| value as u8);
     if crate::changer::element::cleaning_source(medium_type, medium["barcode"].as_str()).is_some() {
         return Err("cleaning");
+    }
+    if observation["volumes"]
+        .as_array()
+        .expect("validated volumes")
+        .iter()
+        .any(|row| {
+            row["barcode"] != medium["barcode"]
+                && (row["address"] == home
+                    || (row["element_type"] == 4 && row["source_address"] == home))
+        })
+    {
+        return Err("home_occupied");
     }
     Ok(home)
 }
@@ -570,6 +590,113 @@ fn ensure_subset(
     Ok(())
 }
 
+pub(super) fn validate_pool_selection(tapes: &[String]) -> Result<()> {
+    if !(1..=100).contains(&tapes.len()) {
+        return Err(CatalogError::Invalid("条码数量须在 1..=100"));
+    }
+    let mut distinct = BTreeSet::new();
+    for tape in tapes {
+        validate_barcode(tape)?;
+        if !distinct.insert(tape) {
+            return Err(CatalogError::Invalid("创建池的条码不可重复"));
+        }
+    }
+    Ok(())
+}
+
+pub(super) async fn pool_selection_at(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    owner: u64,
+    logical: Option<Uuid>,
+    tapes: &[String],
+) -> Result<(Value, Vec<Value>)> {
+    require_business_scope_at(tr, ns, serial, logical).await?;
+    let inventory = Inventory::read(tr, ns, serial, owner).await?;
+    let physical = inventory
+        .resources
+        .as_ref()
+        .ok_or(CatalogError::Incomplete)?;
+    let observation = inventory
+        .observation
+        .as_ref()
+        .ok_or(CatalogError::Incomplete)?;
+    let logical_resources = if let Some(id) = logical {
+        reconciliation::require_ready(tr, ns, serial, id).await?;
+        let raw = tr
+            .get(&by_id(at(ns, serial, b'l'), id), false)
+            .await?
+            .ok_or(CatalogError::Corrupt("逻辑带库定义缺失"))?;
+        let resources = decode(id, &raw)?.resources;
+        ensure_subset(&resources, physical)?;
+        Some(resources)
+    } else {
+        None
+    };
+    let scope = logical_resources.as_ref().unwrap_or(physical);
+    let mut results = Vec::with_capacity(tapes.len());
+    let volumes = observation["volumes"]
+        .as_array()
+        .expect("validated volumes");
+    let candidates = tapes
+        .iter()
+        .map(|barcode| {
+            let medium = volumes
+                .iter()
+                .find(|row| row["barcode"] == barcode.as_str());
+            let location = medium
+                .ok_or("not_observed")
+                .and_then(|row| preview_tape_location(row, observation, scope));
+            (barcode, medium, location)
+        })
+        .collect::<Vec<_>>();
+    let homes = candidates
+        .iter()
+        .filter_map(|(_, _, location)| location.ok())
+        .collect::<Vec<_>>();
+    let mut claims = native_device::home_claims_in(tr, ns, serial, &homes).await?;
+    claims.extend(management::moves::home_claims_in(tr, ns, serial, &homes).await?);
+    for (barcode, medium, location) in candidates {
+        let status = match location {
+            Err(reason) => reason,
+            Ok(_)
+                if ManagedCatalog::verified_assignment(tr, serial, barcode)
+                    .await?
+                    .is_some() =>
+            {
+                "assigned"
+            }
+            Ok(home) => {
+                let move_home = management::moves::home_at(tr, ns, serial, barcode)
+                    .await?
+                    .and_then(|plan| plan.home_address);
+                let device_home =
+                    ManagedCatalog::native_device_home_at(tr, ns, serial, barcode, None).await?;
+                if [move_home, device_home]
+                    .into_iter()
+                    .flatten()
+                    .any(|address| address != home)
+                    || claims.iter().any(|(address, assigned)| {
+                        *address == home && assigned != barcode.as_bytes()
+                    })
+                {
+                    "home_conflict"
+                } else if selected_pool::reserved_at(tr, ns, serial, barcode, home).await? {
+                    "reserved"
+                } else {
+                    "eligible"
+                }
+            }
+        };
+        results.push(json!({
+            "barcode":barcode,"status":status,"home_address":location.ok(),
+            "source_address":medium.map(|row| &row["address"]),
+        }));
+    }
+    Ok((observation["observed_at"].clone(), results))
+}
+
 impl ManagedCatalog {
     /// Verify a proposed tape list against one read version of the current
     /// owner's inventory. The result neither reserves media nor proves format.
@@ -583,18 +710,10 @@ impl ManagedCatalog {
         tapes: &[String],
     ) -> Result<Value> {
         validate_pool_name(name)?;
-        if file_limit == 0 || !(1..=100).contains(&tapes.len()) {
-            return Err(CatalogError::Invalid(
-                "池文件上限须大于零，预检条码数量须在 1..=100",
-            ));
+        if file_limit == 0 {
+            return Err(CatalogError::Invalid("池文件上限须大于零"));
         }
-        let mut distinct = BTreeSet::new();
-        for tape in tapes {
-            validate_barcode(tape)?;
-            if !distinct.insert(tape) {
-                return Err(CatalogError::Invalid("创建池的条码不可重复"));
-            }
-        }
+        validate_pool_selection(tapes)?;
         let (_, owner) = self
             .active_library_owner(serial)
             .await?
@@ -602,61 +721,17 @@ impl ManagedCatalog {
             .ok_or(CatalogError::Incomplete)?;
         let tr = self.db.create_trx()?;
         let ns = routing::require_runtime_active_owner(&tr, serial, route, owner).await?;
-        require_business_scope_at(&tr, ns, serial, logical).await?;
-        let inventory = Inventory::read(&tr, ns, serial, owner).await?;
-        let physical = inventory
-            .resources
-            .as_ref()
-            .ok_or(CatalogError::Incomplete)?;
-        let observation = inventory
-            .observation
-            .as_ref()
-            .ok_or(CatalogError::Incomplete)?;
-        let logical_resources = if let Some(id) = logical {
-            reconciliation::require_ready(&tr, ns, serial, id).await?;
-            let raw = tr
-                .get(&by_id(at(ns, serial, b'l'), id), false)
-                .await?
-                .ok_or(CatalogError::Corrupt("逻辑带库定义缺失"))?;
-            let resources = decode(id, &raw)?.resources;
-            ensure_subset(&resources, physical)?;
-            Some(resources)
-        } else {
-            None
-        };
-        let scope = logical_resources.as_ref().unwrap_or(physical);
-        let name_available = tr.get(&pool_name_key(ns, name), false).await?.is_none();
-        let mut eligible = name_available;
-        let mut results = Vec::with_capacity(tapes.len());
-        let volumes = observation["volumes"]
-            .as_array()
-            .expect("validated volumes");
-        for barcode in tapes {
-            let medium = volumes
-                .iter()
-                .find(|row| row["barcode"] == barcode.as_str());
-            let location = medium
-                .ok_or("not_observed")
-                .and_then(|row| preview_tape_location(row, observation, scope));
-            let status = match location {
-                Err(reason) => reason,
-                Ok(_)
-                    if Self::verified_assignment(&tr, serial, barcode)
-                        .await?
-                        .is_some() =>
-                {
-                    "assigned"
-                }
-                Ok(_) => "eligible",
-            };
-            eligible &= status == "eligible";
-            results.push(json!({"barcode":barcode,"status":status,"home_address":location.ok()}));
-        }
-        Ok(
-            json!({"version":1,"library_serial":serial,"namespace":ns,"logical_library":logical,
+        let (observed_at, results) =
+            pool_selection_at(&tr, ns, serial, owner, logical, tapes).await?;
+        let name_available = tr.get(&pool_name_key(ns, name), false).await?.is_none()
+            && super::selected_pool::name_available_at(&tr, ns, name).await?;
+        let eligible = name_available && results.iter().all(|row| row["status"] == "eligible");
+        Ok(json!({
+            "version":1,"library_serial":serial,"namespace":ns,"logical_library":logical,
             "status":if eligible {"eligible"} else {"blocked"}, "name":name,"name_available":name_available,
-            "file_limit":file_limit,"inventory_observed_at":observation["observed_at"],"owner_epoch":owner,"tapes":results}),
-        )
+            "file_limit":file_limit,"inventory_observed_at":observed_at,"owner_epoch":owner,
+            "tapes":results,
+        }))
     }
 
     #[cfg(test)]
@@ -976,8 +1051,12 @@ async fn resources_idle(
     resources: &LogicalLibraryResources,
 ) -> Result<bool> {
     Ok(!inventory.has_occupied_resource(resources)
-        && !native_device::has_home_in(tr, ns, serial, &resources.storage_slots).await?
-        && !management::moves::has_home_in(tr, ns, serial, &resources.storage_slots).await?)
+        && native_device::home_claims_in(tr, ns, serial, &resources.storage_slots)
+            .await?
+            .is_empty()
+        && management::moves::home_claims_in(tr, ns, serial, &resources.storage_slots)
+            .await?
+            .is_empty())
 }
 
 async fn require_resources_available(
@@ -987,6 +1066,9 @@ async fn require_resources_available(
     logical: Uuid,
     resources: &[&LogicalLibraryResources],
 ) -> Result<()> {
+    if selected_pool::pending_in_scope(tr, ns, serial, logical).await? {
+        return Err(CatalogError::PoolBusy);
+    }
     management::require_logical_resources_available(tr, ns, serial, logical, resources).await?;
     let overlaps = |drive: &str, home: Option<u16>| {
         resources.iter().any(|part| {
