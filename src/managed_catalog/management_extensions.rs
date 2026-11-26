@@ -219,6 +219,7 @@ async fn apply_change(
         }
         "pool" => {
             let id = id(change, "id")?;
+            replicated_pools::require_independent_at(tr, namespace, id).await?;
             reclaim::require_pool_write_at(tr, namespace, id).await?;
             super::native_media::require_pool_readable(tr, namespace, id).await?;
             require_pool_library(tr, namespace, id, serial).await?;

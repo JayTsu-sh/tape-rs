@@ -130,6 +130,81 @@ pub(super) fn capture_empty_baseline(
     Ok(proof)
 }
 
+fn verified_content(
+    device: &dyn TapeTransport,
+    label: &crate::ltfs::label::LtfsLabel,
+    cache: &VolumeExtentCache,
+    entry: &crate::managed_catalog::StagedImportEntry,
+) -> Result<[u8; 32]> {
+    use crate::managed_catalog::{ContentDigest, StagedSourceData};
+    use sha2::{Digest, Sha256};
+
+    match entry.source_data.as_deref() {
+        Some(
+            [
+                StagedSourceData::Data {
+                    file_uid,
+                    length,
+                    content_digest,
+                    ..
+                },
+            ],
+        ) => {
+            let file = cache.required_file_by_uid(*file_uid)?;
+            if file.length != *length {
+                return Err(TapeError::Catalog("副本文件长度与卷索引不符".into()));
+            }
+            let mut sink = ReplicaDigest {
+                sha256: Sha256::new(),
+                md5: matches!(content_digest, ContentDigest::Md5(_)).then(md5::Md5::new),
+            };
+            let actual =
+                crate::ltfs::volume::read_cached_file_to_writer(device, label, &file, &mut sink)?;
+            let sha256: [u8; 32] = sink.sha256.finalize().into();
+            let matches_index = match content_digest {
+                ContentDigest::Sha256(expected) => *expected == sha256,
+                ContentDigest::Md5(expected) => sink
+                    .md5
+                    .is_some_and(|hash| hash.finalize().as_slice() == expected),
+                ContentDigest::Unknown => true,
+            };
+            if actual != *length || !matches_index {
+                return Err(TapeError::Catalog(
+                    "副本正文校验与 LTFS 文件长度或摘要不符".into(),
+                ));
+            }
+            Ok(sha256)
+        }
+        Some([StagedSourceData::NativeSymlink]) => entry
+            .current_attributes
+            .symlink()
+            .map(|target| Sha256::digest(target.as_bytes()).into())
+            .ok_or_else(|| TapeError::Catalog("副本符号链接缺少目标".into())),
+        Some([StagedSourceData::NoCopy]) => Ok(Sha256::digest([]).into()),
+        _ => Err(TapeError::Catalog("副本文件缺少已核验源索引".into())),
+    }
+}
+
+struct ReplicaDigest {
+    sha256: sha2::Sha256,
+    md5: Option<md5::Md5>,
+}
+
+impl std::io::Write for ReplicaDigest {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
+        self.sha256.update(buffer);
+        if let Some(hash) = &mut self.md5 {
+            hash.update(buffer);
+        }
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 pub(super) async fn apply(
     owner: &mut Active,
     permit: &Permission,
@@ -518,6 +593,11 @@ async fn intake_source(
             .map_err(projection_error)?;
     }
     let state = live(owner, permit, control, intake).await?;
+    let replicated = control
+        .catalog
+        .replicated_intake(intake, owner.round)
+        .await
+        .map_err(lost)?;
     let mut after = state["after"].as_str().map(str::to_owned);
     loop {
         live(owner, permit, control, intake).await?;
@@ -529,6 +609,14 @@ async fn intake_source(
             let entry = intake
                 .entry(&spool, candidate)
                 .map_err(|e| ReadError::Failed(e.to_string()))?;
+            if replicated && !entry.path.current().candidate.deleted {
+                let digest = verified_content(device, &label, &cache, &entry).map_err(physical)?;
+                control
+                    .catalog
+                    .record_replicated_intake(intake, owner.round, &proof, &entry, digest)
+                    .await
+                    .map_err(projection_error)?;
+            }
             control
                 .catalog
                 .project_native_media_entry(intake, owner.round, &entry, true)

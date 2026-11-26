@@ -389,7 +389,7 @@ pub(in crate::managed_catalog) async fn require_pool_without_reclaim_at(
     namespace: Uuid,
     pool: Uuid,
 ) -> Result<()> {
-    native_media::require_pool_readable(tr, namespace, pool).await?;
+    native_media::require_app_pool_readable(tr, namespace, pool).await?;
     if let Some(raw) = tr.get(&pool_key(namespace, pool), false).await? {
         let record = decode_pool(pool, &raw)?;
         native_device::require_library_available(tr, namespace, &record.library_serial).await?;

@@ -26,6 +26,8 @@ struct Selection {
     completed: Vec<Uuid>,
     child_epoch: Option<u64>,
     detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replicated: Option<Uuid>,
 }
 
 fn key_for(ns: Uuid, kind: u8) -> Vec<u8> {
@@ -155,13 +157,16 @@ fn saved_selection(raw: &[u8], pool_id: Uuid) -> Result<Selection> {
         || selection.owner_epoch == 0
         || selection.logical.is_some_and(|scope| scope.is_nil())
         || pool.library_serial != selection.serial
-        || logical_libraries::validate_pool_selection(&barcodes).is_err()
+        || (selection.replicated.is_none() || !barcodes.is_empty())
+            && logical_libraries::validate_pool_selection(&barcodes).is_err()
+        || selection.replicated.is_some_and(|id| id.is_nil())
         || selection.tapes.iter().any(|tape| tape.status != "eligible")
-        || selection
-            .inventory_observed_at
-            .as_str()
-            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-            .is_none()
+        || (!barcodes.is_empty()
+            && selection
+                .inventory_observed_at
+                .as_str()
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .is_none())
     {
         return Err(CatalogError::Corrupt("创建池介质预约身份或库存无效"));
     }
@@ -209,82 +214,141 @@ impl ManagedCatalog {
             return Err(CatalogError::Invalid("新池带库或初始修订号无效"));
         }
         let serial = pool.library_serial.as_str();
-        self.db.run(|tr, _| async move {
-            requests::retry_result(async {
-                let ns = routing::require_runtime_active_owner(&tr, serial, route, owner).await?;
-                let id = id_key(ns, pool.id);
-                if let Some(raw) = tr.get(&id, false).await? {
-                    let saved = saved_selection(&raw, pool.id)?;
-                    if saved.serial != serial || saved.logical != logical
-                        || saved.pool != encode_pool(pool) || saved.confirm_format != confirm_format
-                        || !saved.tapes.iter().map(|row| &row.barcode).eq(tapes)
-                    {
-                        return Err(CatalogError::IdempotencyMismatch);
-                    }
-                    if saved.completed.len() == saved.tapes.len() {
-                        return receipt(ns, pool, &saved);
-                    }
-                    for key in std::iter::once(name_key(ns, &pool.name)).chain(
-                        saved.tapes.iter().flat_map(|tape| [
-                            barcode_key(ns, serial, &tape.barcode),
-                            home_key(ns, serial, tape.home_address),
-                        ])
-                    ) {
-                        if tr.get(&key, false).await?.as_deref() != Some(pool.id.as_bytes().as_slice()) {
-                            return Err(CatalogError::Corrupt("创建池预约索引缺失或冲突"));
+        self.db
+            .run(|tr, _| async move {
+                requests::retry_result(
+                    async {
+                        let ns = routing::require_runtime_active_owner(&tr, serial, route, owner)
+                            .await?;
+                        let id = id_key(ns, pool.id);
+                        if let Some(raw) = tr.get(&id, false).await? {
+                            let saved = saved_selection(&raw, pool.id)?;
+                            if saved.replicated.is_some()
+                                || saved.serial != serial
+                                || saved.logical != logical
+                                || saved.pool != encode_pool(pool)
+                                || saved.confirm_format != confirm_format
+                                || !saved.tapes.iter().map(|row| &row.barcode).eq(tapes)
+                            {
+                                return Err(CatalogError::IdempotencyMismatch);
+                            }
+                            if saved.completed.len() == saved.tapes.len() {
+                                return receipt(ns, pool, &saved);
+                            }
+                            for key in std::iter::once(name_key(ns, &pool.name)).chain(
+                                saved.tapes.iter().flat_map(|tape| {
+                                    [
+                                        barcode_key(ns, serial, &tape.barcode),
+                                        home_key(ns, serial, tape.home_address),
+                                    ]
+                                }),
+                            ) {
+                                if tr.get(&key, false).await?.as_deref()
+                                    != Some(pool.id.as_bytes().as_slice())
+                                {
+                                    return Err(CatalogError::Corrupt("创建池预约索引缺失或冲突"));
+                                }
+                            }
+                            return receipt(ns, pool, &saved);
                         }
+                        admit_at(&tr, ns, owner, logical, pool, tapes, confirm_format, None).await
                     }
-                    return receipt(ns, pool, &saved);
-                }
-                management::moves::require_readable_at(&tr, ns, serial).await?;
-                management::require_selected_tapes_idle(&tr, ns, serial, tapes).await?;
-                let (observed_at, mut rows) = logical_libraries::pool_selection_at(
-                    &tr, ns, serial, owner, logical, tapes,
-                ).await?;
-                let name_available = name_available_at(&tr, ns, &pool.name).await?
-                    && tr.get(&pool_name_key(ns, &pool.name), false).await?.is_none();
-                let id_available = tr.get(&pool_key(ns, pool.id), false).await?.is_none()
-                    && retired_pool_revision_at(&tr, ns, pool.id).await?.is_none();
-                for row in &mut rows {
-                    if row["status"] == "eligible" && pool.policy.media_restriction != "none"
-                        && !row["barcode"].as_str().expect("validated barcode").ends_with(&pool.policy.media_restriction)
-                    {
-                        row["status"] = json!("media_restriction");
-                    }
-                }
-                if !name_available || !id_available || rows.iter().any(|row| row["status"] != "eligible") {
-                    return Ok(json!({
-                        "version":1,"library_serial":serial,"namespace":ns,"logical_library":logical,
-                        "id":pool.id,"name":pool.name,"file_limit":pool.file_limit,"status":"blocked",
-                        "id_available":id_available,"name_available":name_available,
-                        "confirm_format":confirm_format,"owner_epoch":owner,
-                        "inventory_observed_at":observed_at,"tapes":rows,
-                    }));
-                }
-                let selection = Selection {
-                    version: 1, serial: serial.into(), logical, pool: encode_pool(pool),
-                    confirm_format, owner_epoch: owner, inventory_observed_at: observed_at,
-                    completed: Vec::new(), child_epoch: None, detail: None,
-                    tapes: rows.into_iter().map(|row| serde_json::from_value(row)
-                        .map_err(|_| CatalogError::Corrupt("入池介质的源位置或 home 缺失")))
-                        .collect::<Result<_>>()?,
-                };
-                let raw = serde_json::to_vec(&selection).map_err(|e| CatalogError::Cache(e.to_string()))?;
-                let prefix = pending_prefix(ns, serial);
-                if read_page(&tr, &prefix, None, 100, false).await?.items.len() >= 100 {
-                    return Err(CatalogError::ManagementQueueFull);
-                }
-                tr.set(&id, &raw);
-                tr.set(&pending_key(ns, serial, pool.id), b"");
-                tr.set(&name_key(ns, &pool.name), pool.id.as_bytes());
-                for tape in &selection.tapes {
-                    tr.set(&barcode_key(ns, serial, &tape.barcode), pool.id.as_bytes());
-                    tr.set(&home_key(ns, serial, tape.home_address), pool.id.as_bytes());
-                }
-                receipt(ns, pool, &selection)
-            }.await)
-        }).await?
+                    .await
+                    .map_err(notifications::atomic_error),
+                )
+            })
+            .await?
     }
+}
+
+pub(super) async fn admit_at(
+    tr: &Transaction,
+    ns: Uuid,
+    owner: u64,
+    logical: Option<Uuid>,
+    pool: &PoolRecord,
+    tapes: &[String],
+    confirm_format: bool,
+    replicated: Option<Uuid>,
+) -> Result<Value> {
+    let serial = pool.library_serial.as_str();
+    management::moves::require_readable_at(tr, ns, serial).await?;
+    management::require_selected_tapes_idle(tr, ns, serial, tapes).await?;
+    let (observed_at, mut rows) = if tapes.is_empty() {
+        logical_libraries::require_business_scope_at(tr, ns, serial, logical).await?;
+        (Value::Null, Vec::new())
+    } else {
+        logical_libraries::pool_selection_at(tr, ns, serial, owner, logical, tapes).await?
+    };
+    let name_available = name_available_at(tr, ns, &pool.name).await?
+        && tr
+            .get(&pool_name_key(ns, &pool.name), false)
+            .await?
+            .is_none();
+    let id_available = id_available_at(tr, ns, pool.id).await?
+        && tr.get(&pool_key(ns, pool.id), false).await?.is_none()
+        && retired_pool_revision_at(tr, ns, pool.id).await?.is_none();
+    for row in &mut rows {
+        if row["status"] == "eligible"
+            && pool.policy.media_restriction != "none"
+            && !row["barcode"]
+                .as_str()
+                .expect("validated barcode")
+                .ends_with(&pool.policy.media_restriction)
+        {
+            row["status"] = json!("media_restriction");
+        }
+    }
+    if !name_available || !id_available || rows.iter().any(|row| row["status"] != "eligible") {
+        return Ok(json!({
+            "version":1,"library_serial":serial,"namespace":ns,"logical_library":logical,
+            "id":pool.id,"name":pool.name,"file_limit":pool.file_limit,"status":"blocked",
+            "id_available":id_available,"name_available":name_available,
+            "confirm_format":confirm_format,"owner_epoch":owner,
+            "inventory_observed_at":observed_at,"tapes":rows,
+        }));
+    }
+    let selection = Selection {
+        version: 1,
+        serial: serial.into(),
+        logical,
+        pool: encode_pool(pool),
+        confirm_format,
+        owner_epoch: owner,
+        inventory_observed_at: observed_at,
+        completed: Vec::new(),
+        child_epoch: None,
+        detail: None,
+        replicated,
+        tapes: rows
+            .into_iter()
+            .map(|row| {
+                serde_json::from_value(row)
+                    .map_err(|_| CatalogError::Corrupt("入池介质的源位置或 home 缺失"))
+            })
+            .collect::<Result<_>>()?,
+    };
+    let raw = serde_json::to_vec(&selection).map_err(|e| CatalogError::Cache(e.to_string()))?;
+    let prefix = pending_prefix(ns, serial);
+    if read_page(tr, &prefix, None, 100, false).await?.items.len() >= 100 {
+        return Err(CatalogError::ManagementQueueFull);
+    }
+    if replicated.is_some() {
+        if !matches!(
+            active_pools::create_pool_at(tr, ns, logical, true, true, pool).await?,
+            ActivePoolCreation::Created(_)
+        ) {
+            return Err(CatalogError::PoolBusy);
+        }
+    }
+    tr.set(&id_key(ns, pool.id), &raw);
+    tr.set(&pending_key(ns, serial, pool.id), b"");
+    tr.set(&name_key(ns, &pool.name), pool.id.as_bytes());
+    for tape in &selection.tapes {
+        tr.set(&barcode_key(ns, serial, &tape.barcode), pool.id.as_bytes());
+        tr.set(&home_key(ns, serial, tape.home_address), pool.id.as_bytes());
+    }
+    receipt(ns, pool, &selection)
 }
 
 pub(super) async fn is_pending_at(
@@ -339,7 +403,9 @@ pub(super) async fn pending_in_scope(
 pub(super) async fn require_published_at(tr: &Transaction, ns: Uuid, pool: Uuid) -> Result<()> {
     if let Some(raw) = tr.get(&id_key(ns, pool), false).await? {
         let saved = saved_selection(&raw, pool)?;
-        if saved.completed.len() != saved.tapes.len() {
+        if saved.completed.len() != saved.tapes.len()
+            || is_pending_at(tr, ns, &saved.serial, pool).await?
+        {
             return Err(CatalogError::PoolImporting);
         }
     }
@@ -351,6 +417,7 @@ pub(crate) struct OriginalSelection {
     pub source: u16,
     pub home: u16,
     pub format: Option<Uuid>,
+    pub replicated: Option<Uuid>,
 }
 
 pub(super) async fn original_tape_at(
@@ -392,6 +459,7 @@ pub(super) async fn original_tape_at(
         source: tape.source_address,
         home: tape.home_address,
         format: selection.confirm_format.then_some(request.operation()),
+        replicated: selection.replicated,
     }))
 }
 
@@ -414,6 +482,12 @@ async fn settle_or_enqueue_at(
         return Ok(false);
     }
     let index = selected.completed.len();
+    if index == selected.tapes.len() {
+        let parent = selected
+            .replicated
+            .ok_or(CatalogError::Corrupt("创建池队列仍包含已完成请求"))?;
+        return replicated_pools::try_publish_at(tr, parent).await;
+    }
     let tape = selected
         .tapes
         .get(index)
@@ -442,7 +516,12 @@ async fn settle_or_enqueue_at(
             _ => return Err(CatalogError::Corrupt("建池子任务状态无效")),
         }
     } else {
-        if index == 0 {
+        if let Some(parent) = selected.replicated
+            && replicated_pools::has_conflict(tr, parent).await?
+        {
+            return Ok(false);
+        }
+        if index == 0 && selected.replicated.is_none() {
             match active_pools::create_pool_at(tr, ns, selected.logical, true, true, &pool).await? {
                 ActivePoolCreation::Created(_) => {}
                 _ => return Err(CatalogError::Corrupt("已预约的新池目标不再可用")),
@@ -465,29 +544,89 @@ async fn settle_or_enqueue_at(
         management::enqueue_at(tr, serial, &request).await?;
         selected.child_epoch = Some(epoch);
     }
-    if selected.completed.len() == selected.tapes.len() {
-        tr.clear(&pending_key(ns, serial, pool_id));
-        tr.clear(&name_key(ns, &pool.name));
-        for tape in &selected.tapes {
-            tr.clear(&barcode_key(ns, serial, &tape.barcode));
-            tr.clear(&home_key(ns, serial, tape.home_address));
-        }
-        for tape in &selected.tapes {
-            notifications::tape_changed_at(
-                tr,
-                ns,
-                serial,
-                &tape.barcode,
-                "pool_creation_completed",
-            )
-            .await?;
-        }
-        namespace_visibility::publish(tr, ns);
+    let complete = selected.completed.len() == selected.tapes.len();
+    if complete && selected.replicated.is_none() {
+        release_at(tr, ns, &pool, &selected).await?;
     }
     let bytes =
         serde_json::to_vec(&selected).map_err(|error| CatalogError::Cache(error.to_string()))?;
     tr.set(&key, &bytes);
+    if complete && let Some(parent) = selected.replicated {
+        replicated_pools::try_publish_at(tr, parent).await?;
+    }
     Ok(true)
+}
+
+async fn release_at(
+    tr: &Transaction,
+    ns: Uuid,
+    pool: &PoolRecord,
+    selected: &Selection,
+) -> Result<()> {
+    let serial = selected.serial.as_str();
+    tr.clear(&pending_key(ns, serial, pool.id));
+    tr.clear(&name_key(ns, &pool.name));
+    for tape in &selected.tapes {
+        tr.clear(&barcode_key(ns, serial, &tape.barcode));
+        tr.clear(&home_key(ns, serial, tape.home_address));
+    }
+    for tape in &selected.tapes {
+        notifications::tape_changed_at(tr, ns, serial, &tape.barcode, "pool_creation_completed")
+            .await?;
+    }
+    namespace_visibility::publish(tr, ns);
+    Ok(())
+}
+
+pub(super) async fn release_replicated_at(
+    tr: &Transaction,
+    ns: Uuid,
+    pool: Uuid,
+    parent: Uuid,
+) -> Result<()> {
+    let selected = read_replicated(tr, ns, pool, parent).await?;
+    if selected.completed.len() != selected.tapes.len()
+        || !is_pending_at(tr, ns, &selected.serial, pool).await?
+    {
+        return Err(CatalogError::Corrupt("副本底层池发布状态不符"));
+    }
+    release_at(tr, ns, &decode_pool(pool, &selected.pool)?, &selected).await
+}
+
+async fn read_replicated(
+    tr: &Transaction,
+    ns: Uuid,
+    pool: Uuid,
+    parent: Uuid,
+) -> Result<Selection> {
+    let raw = tr
+        .get(&id_key(ns, pool), false)
+        .await?
+        .ok_or(CatalogError::Corrupt("副本底层池缺少原任务"))?;
+    let selected = saved_selection(&raw, pool)?;
+    if selected.replicated != Some(parent) {
+        return Err(CatalogError::Corrupt("副本底层池与原任务不符"));
+    }
+    Ok(selected)
+}
+
+pub(super) async fn replicated_ready_at(
+    tr: &Transaction,
+    ns: Uuid,
+    pool: Uuid,
+    parent: Uuid,
+) -> Result<bool> {
+    let selected = read_replicated(tr, ns, pool, parent).await?;
+    Ok(selected.completed.len() == selected.tapes.len())
+}
+
+pub(super) async fn replicated_status_at(
+    tr: &Transaction,
+    ns: Uuid,
+    pool: Uuid,
+    parent: Uuid,
+) -> Result<Value> {
+    status_at(tr, ns, pool, &read_replicated(tr, ns, pool, parent).await?).await
 }
 
 impl ManagedCatalog {
@@ -504,31 +643,13 @@ impl ManagedCatalog {
             return Ok(None);
         };
         let selection = saved_selection(&raw, pool_id)?;
-        if selection.serial != serial || selection.logical != logical {
+        if selection.replicated.is_some()
+            || selection.serial != serial
+            || selection.logical != logical
+        {
             return Ok(None);
         }
-        let pool = decode_pool(pool_id, &selection.pool)?;
-        let mut value = receipt(ns, &pool, &selection)?;
-        if let Some(epoch) = selection.child_epoch {
-            let tape = &selection.tapes[selection.completed.len()];
-            let (request, task) = management::task_for_identity(
-                &tr,
-                serial,
-                ns,
-                epoch,
-                child_operation(ns, pool_id, &tape.barcode),
-            )
-            .await?;
-            let checkpoint = native_media::selected_checkpoint_at(&tr, &request).await?;
-            let mut progress = native_media::task_progress(&tr, &task).await?;
-            if !checkpoint["format_volume"].is_null() && progress["phase"] == "source_pending" {
-                progress["phase"] = json!("format_result_pending");
-            }
-            value["active_tape"] = json!({"barcode":tape.barcode,"epoch":epoch,
-                "operation":task["operation"],"status":task["status"],"progress":progress,
-                "checkpoint":checkpoint});
-        }
-        Ok(Some(value))
+        status_at(&tr, ns, pool_id, &selection).await.map(Some)
     }
 
     pub(crate) async fn advance_selected_pool_create(
@@ -556,4 +677,34 @@ impl ManagedCatalog {
             })
             .await?
     }
+}
+
+async fn status_at(
+    tr: &Transaction,
+    ns: Uuid,
+    pool_id: Uuid,
+    selection: &Selection,
+) -> Result<Value> {
+    let pool = decode_pool(pool_id, &selection.pool)?;
+    let mut value = receipt(ns, &pool, selection)?;
+    if let Some(epoch) = selection.child_epoch {
+        let tape = &selection.tapes[selection.completed.len()];
+        let (request, task) = management::task_for_identity(
+            tr,
+            &selection.serial,
+            ns,
+            epoch,
+            child_operation(ns, pool_id, &tape.barcode),
+        )
+        .await?;
+        let checkpoint = native_media::selected_checkpoint_at(tr, &request).await?;
+        let mut progress = native_media::task_progress(tr, &task).await?;
+        if !checkpoint["format_volume"].is_null() && progress["phase"] == "source_pending" {
+            progress["phase"] = json!("format_result_pending");
+        }
+        value["active_tape"] = json!({"barcode":tape.barcode,"epoch":epoch,
+            "operation":task["operation"],"status":task["status"],"progress":progress,
+            "checkpoint":checkpoint});
+    }
+    Ok(value)
 }

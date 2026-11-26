@@ -676,3 +676,499 @@ fn selected_pool_imports_existing_contents_and_recovers_lost_format_result() {
     owner.stop();
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+#[ignore = "需要隔离 FDB_TEST_CLUSTER；两个模拟物理库与回环 HTTP"]
+fn replicated_pool_resumes_after_owner_change_and_conflict_with_body_proof() {
+    use crate::replicated_pool::{
+        CreateReplicatedPool, ReplicatedPoolMember, ResolveReplicatedPoolConflict,
+    };
+    let _ = env_logger::builder().is_test(true).try_init();
+    let _network = unsafe { foundationdb::boot() };
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(3)
+        .enable_all()
+        .build()
+        .unwrap();
+    let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+    let catalog = Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());
+    let initialize = |prefix| {
+        let namespace = Uuid::new_v4();
+        let serial = format!("{prefix}-{namespace}");
+        let challenge = Uuid::new_v4();
+        let barriers: Vec<_> = (1..=3).map(|id| json!({"version":1,"library_serial":serial,
+            "challenge":challenge,"node_id":id,"term":7,"leader":2,"role":if id==2 {"Leader"} else {"Follower"},
+            "members":{"1":"a:1","2":"b:2","3":"c:3"},"quiesce_index":89,"frozen_index":90,
+            "applied_index":92,"executor_absent":true,"catalog_pending":false,"shutting_down":false,"catalog_empty":true})).collect();
+        let route = rt
+            .block_on(catalog.initialize_native_library(
+                namespace,
+                &verify_native_barriers(&serial, challenge, &barriers).unwrap(),
+            ))
+            .unwrap();
+        rt.block_on(catalog.enable_library_handoff_offline(&serial, namespace))
+            .unwrap();
+        (serial, namespace, route)
+    };
+    let (serial_a, ns_a, route_a) = initialize("REPA");
+    let (serial_b, ns_b, route_b) = initialize("REPB");
+    let root = std::env::temp_dir().join(format!("tapers-replica-{ns_a}"));
+    let seed = |sim: &SimLibrary, slot, barcode, entries: &[(&str, &[u8])]| {
+        let src = SimLibrary::new(1, 1, 0);
+        src.insert_cartridge(SimCartridge::blank(barcode, 128 << 20), 0)
+            .unwrap();
+        src.load_into_drive(barcode, 0).unwrap();
+        let dev = src.drive(0);
+        let uuid = Uuid::new_v4();
+        crate::ltfs::mkltfs::mkltfs(
+            &dev,
+            &crate::ltfs::mkltfs::MkltfsOptions {
+                volume_uuid: Some(uuid),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut volume = crate::ltfs::volume::LtfsVolume::mount(&dev).unwrap();
+        // Exercise LTFS indexes without any content checksum xattr.
+        volume.set_hash_policy(crate::ltfs::volume::HashPolicy {
+            md5: false,
+            sha256: false,
+        });
+        for (path, body) in entries {
+            volume
+                .append_file(path, &mut std::io::Cursor::new(body))
+                .unwrap();
+        }
+        volume.commit().unwrap();
+        drop(volume);
+        TapeDrive::new(&dev).unload().unwrap();
+        sim.insert_cartridge(src.cartridge(barcode).unwrap(), slot)
+            .unwrap();
+        uuid
+    };
+    let a = SimLibrary::new(1, 5, 1);
+    let b = SimLibrary::new(1, 4, 1);
+    a.enable_changer_pr();
+    b.enable_changer_pr();
+    let uuid_a = seed(
+        &a,
+        0,
+        "REPA01L8",
+        &[("/collision", b"A-side"), ("/same", b"shared")],
+    );
+    seed(
+        &a,
+        1,
+        "REPA02L8",
+        &[("/same", b"shared"), ("/a-only", b"single")],
+    );
+    let uuid_b = seed(
+        &b,
+        0,
+        "REPB01L8",
+        &[("/collision", b"B-side"), ("/same", b"shared")],
+    );
+    b.insert_cartridge(SimCartridge::blank("REPB02L8", 128 << 20), 1)
+        .unwrap();
+
+    let log_a = Arc::new(Mutex::new(Vec::new()));
+    let log_b = Arc::new(Mutex::new(Vec::new()));
+    let provider =
+        |serial: &str, sim: &SimLibrary, log: &Arc<Mutex<Vec<u8>>>, round, permission| {
+            fdb_observations_fixture::Provider {
+                serial: serial.to_owned(),
+                changer: Arc::new(sim.changer_as(2)),
+                drive: Arc::new(sim.drive_as(0, 2)),
+                log: log.clone(),
+                revoke: Arc::new(AtomicBool::new(false)),
+                permission,
+                round,
+            }
+        };
+    let start_a = |round| {
+        start_owner(
+            &rt,
+            &root.join("a"),
+            &catalog,
+            &serial_a,
+            route_a,
+            round,
+            |permit| provider(&serial_a, &a, &log_a, round, permit),
+        )
+    };
+    let start_b = |round| {
+        start_owner(
+            &rt,
+            &root.join("b"),
+            &catalog,
+            &serial_b,
+            route_b,
+            round,
+            |permit| provider(&serial_b, &b, &log_b, round, permit),
+        )
+    };
+    let round_a = route_a.initial_owner_epoch;
+    let round_b = route_b.initial_owner_epoch;
+    let owner_a = start_a(round_a);
+    owner_a.take_over(round_a);
+    let owner_b = start_b(round_b);
+    owner_b.take_over(round_b);
+    for (owner, serial, prefix) in [(&owner_a, &serial_a, "a"), (&owner_b, &serial_b, "b")] {
+        run_management(
+            &owner.client,
+            serial,
+            ManagementIntent::LibraryRescan,
+            &root.join(format!("{prefix}-scan.json")),
+        );
+    }
+    owner_b.permit.close(round_b);
+    owner_b.stop();
+
+    let routes = [(serial_a.clone(), route_a), (serial_b.clone(), route_b)].into();
+    let router = fdb_http::owner_router(
+        catalog.clone(),
+        routes,
+        Default::default(),
+        Default::default(),
+    )
+    .unwrap();
+    let server = rt
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let address = server.local_addr().unwrap().to_string();
+    let http = rt.spawn(async move { axum::serve(server, router).await.unwrap() });
+    let client = FdbClient::new([address])
+        .unwrap()
+        .with_timeouts(Duration::ZERO, Duration::from_secs(10));
+    let member = |serial: &str, namespace, name: &str, tapes: &[&str], confirm_format| {
+        ReplicatedPoolMember {
+            library_serial: serial.to_owned(),
+            namespace,
+            pool_id: Uuid::new_v4(),
+            name: name.to_owned(),
+            logical_library: None,
+            tapes: tapes.iter().map(|barcode| (*barcode).to_owned()).collect(),
+            confirm_format,
+        }
+    };
+    let request = CreateReplicatedPool {
+        version: 1,
+        id: Uuid::new_v4(),
+        name: format!("archives-{ns_a}"),
+        created_at_millis: 1,
+        members: vec![
+            member(
+                &serial_a,
+                ns_a,
+                "archives-a",
+                &["REPA01L8", "REPA02L8"],
+                false,
+            ),
+            member(
+                &serial_b,
+                ns_b,
+                "archives-b",
+                &["REPB01L8", "REPB02L8"],
+                true,
+            ),
+        ],
+    };
+    let mut rejected = request.clone();
+    rejected.members[1].tapes[0] = "MISSING".into();
+    assert!(matches!(
+        client.create_replicated_pool(&rejected),
+        Err(ClientError::Rejected { status: 409, .. })
+    ));
+    assert!(matches!(
+        client.replicated_pool_status(request.id),
+        Err(ClientError::Rejected { status: 404, .. })
+    ));
+    assert_eq!(
+        client.create_replicated_pool(&request).unwrap()["id"],
+        json!(request.id)
+    );
+    rt.block_on(catalog.claim_active_owner_epoch(&serial_b, round_b + 1))
+        .unwrap();
+
+    let wait = |predicate: &dyn Fn(&Value) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(25);
+        loop {
+            let status = client.replicated_pool_status(request.id).unwrap();
+            if predicate(&status) {
+                return status;
+            }
+            assert!(Instant::now() < deadline, "原创建任务等待超时 {status}");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+    let paused = wait(&|status| status["members"][0]["status"] == "prepared");
+    assert_eq!(paused["status"], "waiting_library");
+    assert_eq!(paused["members"][1]["current_owner_epoch"], round_b + 1);
+    assert!(matches!(
+        client.replicated_pool_files(request.id, None, 20),
+        Err(ClientError::Rejected { status: 409, .. })
+    ));
+    assert!(matches!(
+        owner_a
+            .client
+            .release_library(&serial_a, ns_a, Uuid::new_v4()),
+        Err(ClientError::Rejected { status: 409, .. })
+    ));
+
+    let owner_b = start_b(round_b + 2);
+    owner_b.take_over(round_b + 2);
+    let blocked = wait(&|status| {
+        status["conflict"]["path"] == "/collision"
+            && status["members"][1]["tapes"][0]["status"] == "succeeded"
+    });
+    let conflict = &blocked["conflict"];
+    assert_eq!(blocked["status"], "blocked");
+    assert_eq!(conflict["sources"][0]["volume_uuid"], json!(uuid_a));
+    assert_eq!(conflict["sources"][1]["volume_uuid"], json!(uuid_b));
+    assert_eq!(conflict["sources"][1]["barcode"], "REPB01L8");
+    assert_eq!(conflict["sources"][1]["library_serial"], serial_b);
+    assert_eq!(
+        conflict["sources"][0]["size"],
+        conflict["sources"][1]["size"]
+    );
+    assert_ne!(
+        conflict["sources"][0]["sha256"],
+        conflict["sources"][1]["sha256"]
+    );
+    assert!(!log_b.lock().unwrap().contains(&cdb::opcode::FORMAT_MEDIUM));
+
+    let choice = ResolveReplicatedPoolConflict {
+        version: 1,
+        path: "/collision".into(),
+        volume_uuid: uuid_b,
+        revision: conflict["revision"].as_u64().unwrap(),
+    };
+    client
+        .resolve_replicated_pool_conflict(request.id, &choice)
+        .unwrap();
+    let completed = wait(&|status| status["status"] == "succeeded");
+    assert_eq!(completed, client.create_replicated_pool(&request).unwrap());
+    assert_eq!(
+        completed,
+        client
+            .resolve_replicated_pool_conflict(request.id, &choice)
+            .unwrap()
+    );
+    assert!(matches!(
+        client.resolve_replicated_pool_conflict(
+            request.id,
+            &ResolveReplicatedPoolConflict {
+                volume_uuid: uuid_a,
+                ..choice.clone()
+            }
+        ),
+        Err(ClientError::Rejected { status: 409, .. })
+    ));
+    assert_eq!(
+        log_b
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|code| **code == cdb::opcode::FORMAT_MEDIUM)
+            .count(),
+        1
+    );
+    assert!(!log_a.lock().unwrap().contains(&cdb::opcode::WRITE_6));
+
+    let file_page = client.replicated_pool_files(request.id, None, 2).unwrap();
+    let items = file_page["items"].as_array().unwrap();
+    assert_eq!(items[0]["path"], "/a-only");
+    assert_eq!(items[0]["replica_count"], 1);
+    assert_eq!(items[1]["path"], "/collision");
+    assert_eq!(
+        items[1]["sha256"],
+        format!("{:x}", Sha256::digest(b"B-side"))
+    );
+    assert_eq!(items[1]["replica_count"], 1);
+    let last_page = client
+        .replicated_pool_files(request.id, file_page["next"].as_str(), 2)
+        .unwrap();
+    assert_eq!(last_page["items"][0]["path"], "/same");
+    assert_eq!(last_page["items"][0]["replica_count"], 2);
+
+    let member_a = &request.members[0];
+    let attempt = root.join("delete-member.json");
+    owner_a
+        .client
+        .prepare_management(
+            &serial_a,
+            ManagementIntent::Delete {
+                selector: member_a.name.clone(),
+            },
+        )
+        .unwrap()
+        .save_new(&attempt)
+        .unwrap();
+    assert!(owner_a.client.submit_management(&attempt).is_err());
+    assert!(
+        owner_a
+            .client
+            .stat(&serial_a, member_a.pool_id, "/same")
+            .is_err()
+    );
+
+    let mut duplicate = request.clone();
+    duplicate.id = Uuid::new_v4();
+    duplicate.name = "should-reject-existing-member".into();
+    assert!(client.create_replicated_pool(&duplicate).is_err());
+    for (index, barcode) in ["REPA01L8", "REPA02L8"].iter().enumerate() {
+        if a.loaded_barcode(0).as_deref() == Some(*barcode) {
+            run_management(
+                &owner_a.client,
+                &serial_a,
+                ManagementIntent::TapeMove {
+                    barcode: (*barcode).into(),
+                    destination: "homeslot".into(),
+                    pool_selector: Some(member_a.name.clone()),
+                },
+                &root.join(format!("replica-home-{index}.json")),
+            );
+        }
+    }
+    let release = Uuid::new_v4();
+    owner_a
+        .client
+        .release_library(&serial_a, ns_a, release)
+        .unwrap();
+    wait_phase(&owner_a.client, &serial_a, ns_a, release, "released");
+    owner_a.stop();
+    let logical = Uuid::new_v4();
+    let offline = provider(
+        &serial_a,
+        &a,
+        &log_a,
+        round_a,
+        Arc::new(Permission::default()),
+    );
+    let activate = |proof| {
+        rt.block_on(activate_logical_library_offline(
+            &catalog, &serial_a, ns_a, logical, release, proof, &offline,
+        ))
+        .unwrap()
+    };
+    let plan = activate(None);
+    assert_eq!(plan["pools"][0]["id"], json!(member_a.pool_id));
+    let activation = activate(Some(plan["plan_sha256"].as_str().unwrap()));
+    assert_eq!(activation["logical_library"]["id"], json!(logical));
+    let owner_a = start_a(round_a + 1);
+    let acquire = Uuid::new_v4();
+    owner_a
+        .client
+        .acquire_library(&serial_a, ns_a, acquire, release)
+        .unwrap();
+    owner_a.take_over(round_a + 1);
+    wait_phase(&owner_a.client, &serial_a, ns_a, acquire, "online");
+    assert_eq!(client.create_replicated_pool(&request).unwrap(), completed);
+    let migrated = client.replicated_pool_status(request.id).unwrap();
+    assert_eq!(migrated["id"], json!(request.id));
+    assert_eq!(migrated["members"][0]["pool_id"], json!(member_a.pool_id));
+    assert_eq!(migrated["members"][0]["namespace"], json!(ns_a));
+    assert!(migrated["members"][0]["original_logical_library"].is_null());
+    assert_eq!(migrated["members"][0]["logical_library"], json!(logical));
+    assert_eq!(
+        client.replicated_pool_files(request.id, None, 2).unwrap(),
+        file_page
+    );
+    run_management(
+        &owner_a.client,
+        &serial_a,
+        ManagementIntent::LibraryRescan,
+        &root.join("after-activation.json"),
+    );
+
+    let resources: LogicalLibraryResources =
+        serde_json::from_value(activation["logical_library"]["resources"].clone()).unwrap();
+    let slot = *resources.storage_slots.last().unwrap();
+    let mut default_resources = resources;
+    default_resources
+        .storage_slots
+        .retain(|address| *address != slot);
+    owner_a
+        .client
+        .change_logical_library(
+            &serial_a,
+            ns_a,
+            logical,
+            ChangeLogicalLibrary {
+                version: 1,
+                operation: Uuid::new_v4(),
+                revision: 1,
+                replacement: Some(ReplaceLogicalLibrary {
+                    name: "default".into(),
+                    resources: default_resources,
+                }),
+            },
+        )
+        .unwrap();
+    let second_logical = Uuid::new_v4();
+    owner_a
+        .client
+        .create_logical_library(
+            &serial_a,
+            ns_a,
+            &CreateLogicalLibrary {
+                version: 1,
+                id: second_logical,
+                name: "secondary".into(),
+                resources: LogicalLibraryResources {
+                    drives: vec![],
+                    storage_slots: vec![slot],
+                    ie_slots: vec![],
+                },
+            },
+        )
+        .unwrap();
+
+    let empty = |serial, ns, name, scope| ReplicatedPoolMember {
+        logical_library: scope,
+        ..member(serial, ns, name, &[], false)
+    };
+    let layouts = [
+        vec![
+            empty(&serial_a, ns_a, "same-first", Some(logical)),
+            empty(&serial_a, ns_a, "same-second", Some(logical)),
+        ],
+        vec![
+            empty(&serial_a, ns_a, "logical-first", Some(logical)),
+            empty(&serial_a, ns_a, "logical-second", Some(second_logical)),
+        ],
+        vec![
+            empty(&serial_a, ns_a, "mixed-first", Some(logical)),
+            empty(&serial_b, ns_b, "mixed-second", None),
+        ],
+    ];
+    for (index, members) in layouts.into_iter().enumerate() {
+        let id = Uuid::new_v4();
+        client
+            .create_replicated_pool(&CreateReplicatedPool {
+                version: 1,
+                id,
+                name: format!("layout-{index}-{id}"),
+                created_at_millis: 1,
+                members,
+            })
+            .unwrap();
+        let cutoff = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = client.replicated_pool_status(id).unwrap();
+            if status["status"] == "succeeded" {
+                assert_eq!(
+                    status["failure_domains"].as_array().unwrap().len(),
+                    if index == 2 { 2 } else { 1 }
+                );
+                break;
+            }
+            assert!(Instant::now() < cutoff, "布局未完成 {status}");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    owner_a.stop();
+    owner_b.stop();
+    http.abort();
+    std::fs::remove_dir_all(root).unwrap();
+}

@@ -174,6 +174,14 @@ pub(crate) async fn require_pool_readable(tr: &Transaction, ns: Uuid, pool: Uuid
     native_device::require_pool_available(tr, ns, pool).await?;
     Ok(())
 }
+pub(crate) async fn require_app_pool_readable(
+    tr: &Transaction,
+    ns: Uuid,
+    pool: Uuid,
+) -> Result<()> {
+    require_pool_readable(tr, ns, pool).await?;
+    replicated_pools::require_independent_at(tr, ns, pool).await
+}
 fn encode(value: &Value) -> Vec<u8> {
     value.to_string().into_bytes()
 }
@@ -880,8 +888,18 @@ impl ManagedCatalog {
             if !matches!(task["status"].as_str(),Some("queued"|"running")){return Ok(None);}
             let selected = selected_pool::original_tape_at(&tr, &request).await?;
             let ns = route.route.namespace;
+            let member = Uuid::parse_str(request.value()["change"]["pool"].as_str()
+                .expect("validated pool")).expect("validated UUID");
+            if selected.and_then(|original| original.replicated).is_none() {
+                replicated_pools::require_independent_at(&tr, ns, member).await?;
+            }
             logical_libraries::mechanical_resources_at(&tr, ns, serial, &request).await?;
             if task["status"] == "queued" && let Some(original) = selected {
+                if let Some(parent) = original.replicated
+                    && replicated_pools::has_conflict(&tr, parent).await?
+                {
+                    return Ok(None);
+                }
                 let barcode = request.value()["change"]["barcode"].as_str().expect("validated barcode");
                 let (_, rows) = logical_libraries::pool_selection_at(&tr, ns, serial, owner,
                     request.logical_library(), &[barcode.to_owned()]).await?;
@@ -932,6 +950,125 @@ impl ManagedCatalog {
             notifications::tape_changed_at(&tr, import.request.namespace(), serial, import.barcode(), "import_started").await?;
             Ok(Some(import))
         }.await.map_err(notifications::atomic_error))}).await?
+    }
+
+    /// The selected-pool appointment binds the source to the original parent.
+    pub(crate) async fn replicated_intake(
+        &self,
+        import: &NativeMediaImport,
+        owner: u64,
+    ) -> Result<bool> {
+        let tr = self.db.create_trx()?;
+        if replicated_pools::parent_at(&tr, import.request.namespace(), import.pool())
+            .await?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        state(&tr, import, owner).await?;
+        selected_pool::original_tape_at(&tr, &import.request)
+            .await?
+            .and_then(|original| original.replicated)
+            .map(|_| true)
+            .ok_or(CatalogError::Corrupt("副本底层池导入缺少原预约"))
+    }
+
+    pub(crate) async fn record_replicated_intake(
+        &self,
+        import: &NativeMediaImport,
+        owner: u64,
+        proof: &NativeMediaSource,
+        entry: &StagedImportEntry,
+        body_sha256: [u8; 32],
+    ) -> Result<()> {
+        use replicated_pools::files::{Content, Kind, Source};
+        let current = entry.path.current();
+        let candidate = &current.candidate;
+        let (kind, length, uid, data_path) = match entry.source_data.as_deref() {
+            Some(
+                [
+                    StagedSourceData::Data {
+                        length,
+                        file_uid,
+                        data_path,
+                        ..
+                    },
+                ],
+            ) => (Kind::File, *length, *file_uid, data_path.as_deref()),
+            Some([StagedSourceData::NativeSymlink]) => (
+                Kind::Symlink,
+                entry
+                    .current_attributes
+                    .symlink()
+                    .map_or(0, |target| target.len() as u64),
+                entry.source_file_uids[0],
+                None,
+            ),
+            Some([StagedSourceData::NoCopy])
+                if candidate.kind == NodeKind::Directory && !candidate.deleted =>
+            {
+                (Kind::Directory, 0, entry.source_file_uids[0], None)
+            }
+            _ => return Err(CatalogError::Corrupt("副本来源缺少文件证明")),
+        };
+        let ns = import.request.namespace();
+        let identity = proof.index();
+        if entry.path.pool_id != import.pool()
+            || current.barcode != import.barcode()
+            || current.generation != identity.generation
+            || current.volume_id != identity.volume_uuid
+        {
+            return Err(CatalogError::Corrupt("副本来源与当前卷身份不一致"));
+        }
+        let evidence = Source {
+            library_serial: import.serial().to_owned(),
+            namespace: ns,
+            pool_id: import.pool(),
+            barcode: import.barcode().to_owned(),
+            volume_uuid: identity.volume_uuid,
+            generation: identity.generation,
+            index_sha256: identity.sha256,
+            operation: import.request.operation(),
+            file_uid: uid,
+            physical_path: data_path.unwrap_or(&candidate.physical_path).to_owned(),
+            tape_version: candidate.version,
+            content: Content {
+                kind,
+                sha256: body_sha256,
+                length,
+            },
+        };
+        self.db
+            .run(|tr, _| {
+                let evidence = evidence.clone();
+                async move {
+                    requests::retry_result(
+                        async {
+                            let value = state(&tr, import, owner).await?;
+                            if value["abort"] == true || value["phase"] != "materialize" {
+                                return Err(CatalogError::PoolImporting);
+                            }
+                            if source(&value["source"])?.as_ref() != Some(proof) {
+                                return Err(CatalogError::Corrupt("副本导入的原索引证明已变更"));
+                            }
+                            let parent = selected_pool::original_tape_at(&tr, &import.request)
+                                .await?
+                                .and_then(|original| original.replicated)
+                                .ok_or(CatalogError::Corrupt("副本来源缺少原预约"))?;
+                            replicated_pools::files::record_at(
+                                &tr,
+                                parent,
+                                &candidate.logical_path,
+                                evidence,
+                            )
+                            .await
+                        }
+                        .await
+                        .map_err(notifications::atomic_error),
+                    )
+                }
+            })
+            .await?
     }
 
     pub(crate) async fn selected_intake_position(

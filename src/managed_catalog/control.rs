@@ -39,6 +39,8 @@ pub use native_device::NativeDeviceTask;
 
 #[path = "active_pools.rs"]
 mod active_pools;
+#[path = "replicated_pools.rs"]
+mod replicated_pools;
 #[path = "scoped_pools.rs"]
 mod scoped_pools;
 #[path = "selected_pool.rs"]

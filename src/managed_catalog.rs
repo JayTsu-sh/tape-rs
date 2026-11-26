@@ -210,6 +210,8 @@ pub enum CatalogError {
     Incomplete,
     #[error("池或带库正在执行互斥操作")]
     PoolBusy,
+    #[error("多副本池的底层池或磁带准入失败")]
+    ReplicatedSelectionBlocked(serde_json::Value),
     #[error("逻辑带库库存待核对: {0}")]
     LogicalInventoryBlocked(String),
     #[error("带库存在未结清操作: {0:?}")]

@@ -1911,3 +1911,84 @@ async fn logical_library_creation(
         Uuid::parse_str(second_pool["pool"]["id"].as_str().unwrap()).unwrap(),
     )
 }
+
+#[tokio::test]
+#[ignore = "需要隔离 FDB_TEST_CLUSTER；回环 HTTP 和目录，不访问设备"]
+async fn replicated_pool_publishes_two_physical_members_together_and_replays() {
+    let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+    let _network = unsafe { foundationdb::boot() };
+    let catalog = Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());
+    let mut routes = BTreeMap::new();
+    let mut members = Vec::new();
+    for index in 0..2 {
+        let ns = Uuid::new_v4();
+        let serial = format!("REPLICA-{ns}");
+        let challenge = Uuid::new_v4();
+        let replies = (1..=3)
+            .map(|id| {
+                json!({
+                    "version":1,"library_serial":serial,"challenge":challenge,"node_id":id,
+                    "term":7,"leader":2,"role":if id==2{"Leader"}else{"Follower"},
+                    "members":{"1":"a:1","2":"b:2","3":"c:3"},"quiesce_index":89,"frozen_index":90,
+                    "applied_index":92,"executor_absent":true,"catalog_pending":false,
+                    "shutting_down":false,"catalog_empty":true,
+                })
+            })
+            .collect::<Vec<_>>();
+        let proof =
+            crate::managed_catalog::verify_native_barriers(&serial, challenge, &replies).unwrap();
+        let route = catalog.initialize_native_library(ns, &proof).await.unwrap();
+        members.push(json!({"library_serial":serial,"namespace":ns,
+            "pool_id":Uuid::new_v4(),"name":format!("member-{index}")}));
+        routes.insert(serial, route);
+    }
+    let ctx = Arc::new(Context {
+        catalog: catalog.clone(),
+        routes: routes.clone(),
+        owner: Some(OwnerRuntime {
+            libraries: BTreeMap::new(),
+            peers: HashMap::new(),
+            requests: Arc::new(Semaphore::new(1)),
+        }),
+        upload_budget: None,
+        notify_streams: Arc::new(Semaphore::new(1)),
+        notify_requests: Arc::new(Semaphore::new(1)),
+        admin_requests: Arc::new(Semaphore::new(32)),
+    });
+    let (address, server) = serve(ctx).await;
+    let id = Uuid::new_v4();
+    let mut input = json!({"version":1,"id":id,"name":format!("replica-{id}"),"created_at_millis":1,"members":members});
+    let base = "/admin/replicated-pools";
+    let status = format!("{base}/{id}");
+    let (code, result) = request(&address, "POST", base, None, input.to_string().as_bytes()).await;
+    assert_eq!(code, 202, "{result}");
+    assert_eq!(result["id"], json!(id));
+    for member in &members {
+        let serial = member["library_serial"].as_str().unwrap();
+        let ns = member["namespace"].as_str().unwrap();
+        let pool = member["pool_id"].as_str().unwrap();
+        let path = format!("/libraries/{serial}/admin/pools/{pool}");
+        assert_eq!(request(&address, "GET", &path, Some(ns), b"").await.0, 404);
+    }
+    let (serial, route) = routes.first_key_value().unwrap();
+    catalog
+        .advance_selected_pool_create(serial, *route, route.initial_owner_epoch)
+        .await
+        .unwrap();
+    let (code, saved) = request(&address, "GET", &status, None, b"").await;
+    assert_eq!(code, 200, "{saved}");
+    assert_eq!(saved["status"], "succeeded");
+    assert_eq!(saved["failure_domains"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        request(&address, "POST", base, None, input.to_string().as_bytes()).await,
+        (200, saved)
+    );
+    input["name"] = json!("different");
+    assert_eq!(
+        request(&address, "POST", base, None, input.to_string().as_bytes())
+            .await
+            .0,
+        409
+    );
+    server.abort();
+}

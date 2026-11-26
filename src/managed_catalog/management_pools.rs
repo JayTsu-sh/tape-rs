@@ -25,6 +25,7 @@ pub(super) async fn require_scope(
     change: &Value,
 ) -> Result<Option<Uuid>> {
     let id = pool_id(change);
+    replicated_pools::require_independent_at(tr, ns, id).await?;
     let logical = change["logical_library"]
         .as_str()
         .map(|raw| Uuid::parse_str(raw).expect("validated logical library UUID"));

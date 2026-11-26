@@ -913,6 +913,9 @@ impl ManagedCatalog {
                                     .await?;
                             }
                             if let Some(pool) = task.pool() {
+                                if exclusion.is_some() {
+                                    replicated_pools::require_independent_at(&tr, ns, pool).await?;
+                                }
                                 reclaim::require_pool_write_at(&tr, ns, pool).await?;
                                 native_media::require_pool_readable(&tr, ns, pool).await?;
                             } else {

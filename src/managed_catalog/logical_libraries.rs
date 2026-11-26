@@ -604,6 +604,15 @@ pub(super) fn validate_pool_selection(tapes: &[String]) -> Result<()> {
     Ok(())
 }
 
+pub(super) async fn pool_creation_inventory_status(
+    tr: &Transaction,
+    ns: Uuid,
+    serial: &str,
+    owner: u64,
+) -> Result<&'static str> {
+    Ok(Inventory::read(tr, ns, serial, owner).await?.status)
+}
+
 pub(super) async fn pool_selection_at(
     tr: &Transaction,
     ns: Uuid,

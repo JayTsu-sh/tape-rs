@@ -130,7 +130,7 @@ pub(super) async fn baseline_for_epoch_at(
             .ok_or(CatalogError::Incomplete)?,
     )?;
     active_pools::require_indexes(tr, namespace, &pool).await?;
-    control::native_media::require_pool_readable(tr, namespace, spec.pool).await?;
+    control::native_media::require_app_pool_readable(tr, namespace, spec.pool).await?;
     let components = lookup::path_components(&catalog_path)?;
     let (&name, parents) = components.split_last().expect("nonroot pool path");
     let parent =

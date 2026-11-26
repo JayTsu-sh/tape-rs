@@ -31,6 +31,8 @@ mod notify;
 
 #[path = "fdb_http_pools.rs"]
 mod pools;
+#[path = "fdb_http_replicated_pools.rs"]
+mod replicated_pools;
 
 #[path = "fdb_http_prepare.rs"]
 mod prepare;
@@ -417,6 +419,22 @@ async fn children(
 
 fn metadata_router(ctx: Arc<Context>) -> Router {
     Router::new()
+        .route(
+            "/admin/replicated-pools",
+            axum::routing::post(replicated_pools::create),
+        )
+        .route(
+            "/admin/replicated-pools/{id}",
+            get(replicated_pools::status),
+        )
+        .route(
+            "/admin/replicated-pools/{id}/files",
+            get(replicated_pools::files),
+        )
+        .route(
+            "/admin/replicated-pools/{id}/resolve",
+            axum::routing::post(replicated_pools::resolve),
+        )
         .route("/admin/libraries", get(queries::libraries))
         .route("/libraries/{serial}/admin/library", get(queries::library))
         .route("/libraries/{serial}/admin/drives", get(queries::drives))

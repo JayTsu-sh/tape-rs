@@ -257,7 +257,7 @@ pub(super) async fn baseline_at(
             .ok_or(CatalogError::Incomplete)?,
     )?;
     active_pools::require_indexes(tr, namespace, &pool).await?;
-    control::native_media::require_pool_readable(tr, namespace, spec.pool).await?;
+    control::native_media::require_app_pool_readable(tr, namespace, spec.pool).await?;
     let from = lookup::path_components(&from)?;
     let to = lookup::path_components(&to)?;
     let (from_name, from_ancestors) = from.split_last().expect("nonroot source");

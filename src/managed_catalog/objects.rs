@@ -116,7 +116,7 @@ impl ManagedCatalog {
         let namespace =
             routing::require_expected_active_namespace(&tr, serial, Some(route)).await?;
         control::require_pool_library(&tr, namespace, query.pool, serial).await?;
-        control::native_media::require_pool_readable(&tr, namespace, query.pool).await?;
+        control::native_media::require_app_pool_readable(&tr, namespace, query.pool).await?;
         let pool_root = query.pool.to_string();
         let parent = match lookup::resolve_active_path_at_mode(
             &tr,

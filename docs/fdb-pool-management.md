@@ -73,3 +73,52 @@ HTTP 路由以 `/libraries/SERIAL/admin` 为前缀：
 实际停止新FDB集群两个原进程后，原集群读取超时、后台管理请求返回依赖故障，CLI预算耗尽仍保留原身份。恢复原unit及数据后，原请求成功收敛且只增加一次修订；故障前已提交任务全文不变，新FDB恢复healthy/double/三进程，旧FDB在故障期间及恢复后的健康检查均通过。
 
 软件检查包括387项全特性单元测试、完整默认测试、全目标全特性检查、严格Clippy及显式隔离FDB集成测试。实测不涉及格式化、MOVE或文件写带；计划停机、回执故障和FDB失去多数派的结果不代替断电、介质故障或S3/FUSE写入验收。详细阶段证据位于维护主机 `/work/tmp/tape-fdb-pool-api-physical-20261105/`。
+
+## 多副本池
+
+使用 `pool replicated`。创建请求逐个指定底层池的物理库、FDB 命名空间、池 UUID 与名称。已启用逻辑带库的成员填写 `logical_library`，其余填 null。参与的物理库须在同一 FDB 里，并配置在接收请求的管理服务上。一次可提交 2 至 16 个底层池，共最多 100 盘磁带。省略某个成员的 `tapes` 可创建空底层池。
+
+第一次提交前将完整请求保存到文件。下面是同一逻辑带库内的两个底层池。请将 UUID、带库序列号、时间及条码替换为实际的请求标识和设备范围。
+
+```json
+{
+  "version": 1,
+  "id": "a88dc978-9f9e-47f9-80bc-33483264418c",
+  "name": "archive",
+  "created_at_millis": 1795680000000,
+  "members": [
+    {
+      "library_serial": "SERIAL",
+      "namespace": "71077f97-c7ce-411d-9c58-38cee2c8c30a",
+      "logical_library": "aea064af-fefa-4207-81a1-718288755d62",
+      "pool_id": "2d5910f6-8e68-475b-9040-a5313b0f1c89",
+      "name": "archive-a",
+      "tapes": ["ABC001L8"]
+    },
+    {
+      "library_serial": "SERIAL",
+      "namespace": "71077f97-c7ce-411d-9c58-38cee2c8c30a",
+      "logical_library": "aea064af-fefa-4207-81a1-718288755d62",
+      "pool_id": "29382d7b-c6bc-41e4-8a3a-758eb0fcae7d",
+      "name": "archive-b",
+      "tapes": ["ABC002L8"],
+      "confirm_format": true
+    }
+  ]
+}
+```
+
+```bash
+ltfsctl -e NODE:7411 pool replicated create --request replica.json
+ltfsctl -e NODE:7411 pool replicated show POOL_UUID
+ltfsctl -e NODE:7411 pool replicated files POOL_UUID --limit 100
+ltfsctl -e NODE:7411 pool replicated resolve POOL_UUID --path /报告.pdf --revision REVISION --volume VOLUME_UUID
+```
+
+创建受理后保留同一请求文件和 UUID。底层池及磁带在全部准备完成后共同发布，管理详情按物理库列出故障范围。成员有库存或 owner 待核对时显示 `waiting_library`，已发出的初始化待确认时显示 `result_unknown`。成员的旧请求范围保存在 `original_logical_library`，查询中的 `logical_library` 反映底层池当前的带库范围。
+
+已有 LTFS 文件逐个读回验证，卷和文件内容保留。文件清单分页给出正文 SHA-256 和按底层池计数的 `replica_count`，创建期间不会补写历史副本。指定 `confirm_format: true` 的成员只可初始化经实读核实的空白磁带。已有 LTFS 卷上的池标记须缺失或与对应底层池相符。
+
+同路径内容冲突时，详情的 `conflict` 给出路径、修订号和两盘来源。管理员选定保留卷后提交该路径和原修订号，原任务继续。另一盘的原文件仍保存在原卷。底层池文件写入和独立删除受保护，当前多副本池提供管理入口。
+
+HTTP 使用 `POST /admin/replicated-pools` 提交请求，`GET /admin/replicated-pools/{id}` 查询原任务。导入文件使用 `GET /admin/replicated-pools/{id}/files?limit=100`，下一页的 `after` 是上一页 `next` 路径的无填充 Base64URL。冲突通过 `POST /admin/replicated-pools/{id}/resolve` 提交 `version`、`path`、`revision` 和 `volume_uuid`。

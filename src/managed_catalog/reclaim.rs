@@ -285,6 +285,7 @@ async fn require_metadata_copy_idle_at(tr: &Transaction, ns: Uuid, pool: Uuid) -
 async fn require_parent_pool_at(tr: &Transaction, reservation: &ReclaimReservation) -> Result<()> {
     let ns = reservation.namespace();
     let pool = reservation.spec().pool();
+    replicated_pools::require_independent_at(tr, ns, pool).await?;
     native_media::require_pool_readable(tr, ns, pool).await?;
     if node_tasks::held_task_at(tr, ns, pool).await?.is_some() {
         return Err(CatalogError::PoolBusy);

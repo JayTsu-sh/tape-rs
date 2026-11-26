@@ -606,6 +606,20 @@ impl ManagedCatalog {
                         if let Some(barcode) = change["barcode"].as_str() {
                             selected_pool::require_tape_available(&tr, ns, serial, barcode).await?;
                         }
+                        if matches!(
+                            change["kind"].as_str(),
+                            Some(
+                                "media-assign"
+                                    | "media-unassign"
+                                    | "media-import"
+                                    | "media-reclaim"
+                            )
+                        ) && let Some(pool) = change["pool"]
+                            .as_str()
+                            .and_then(|id| Uuid::parse_str(id).ok())
+                        {
+                            replicated_pools::require_independent_at(&tr, ns, pool).await?;
+                        }
                         if matches!(change["kind"].as_str(), Some("pool" | "pool-delete")) {
                             pools::require_scope(&tr, ns, serial, change).await?;
                         }
