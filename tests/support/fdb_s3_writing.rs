@@ -167,7 +167,10 @@ fn s3_put_overwrite_metadata_and_delete_use_fdb_and_media_commits() {
         .unwrap();
     let f = rt.block_on(fixture(&cluster));
     let owner = Owner::start_mode(&f, 12, json!({}), true);
-    let context = super::active_pools::context(&owner, 71, 12);
+    let mut context = super::active_pools::context(&owner, 71, 12);
+    // The first nested PUT waits for two parent directory commits and the file commit.
+    // Leave room for all three within the forwarding and test client's 15-second budget.
+    Arc::get_mut(&mut context).unwrap().wait_timeout = Duration::from_secs(12);
     let server = ReadHttpServer::start(s3::fdb_router(
         f.catalog.clone(),
         BTreeMap::from([(f.serial.clone(), f.route)]),
