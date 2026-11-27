@@ -669,6 +669,7 @@ fn batch_owner(f: &Fixture, round: u64, full_trace: Trace) -> Owner {
     let trace = Arc::new(Mutex::new(Vec::new()));
     let fail_vci = Arc::new(AtomicBool::new(false));
     let fail_read = Arc::new(AtomicBool::new(false));
+    let fail_write = Arc::new(AtomicBool::new(false));
     let fail_load = Arc::new(AtomicBool::new(false));
     let fail_load_before = Arc::new(AtomicBool::new(false));
     let provider = Provider {
@@ -678,6 +679,7 @@ fn batch_owner(f: &Fixture, round: u64, full_trace: Trace) -> Owner {
         permission: permission.clone(),
         fail_vci: fail_vci.clone(),
         fail_read: fail_read.clone(),
+        fail_write: fail_write.clone(),
         fail_load: fail_load.clone(),
         fail_load_before: fail_load_before.clone(),
     };
@@ -756,6 +758,7 @@ fn batch_owner(f: &Fixture, round: u64, full_trace: Trace) -> Owner {
         status: http_status,
         fail_vci,
         fail_read,
+        fail_write,
         fail_load,
         fail_load_before,
     }

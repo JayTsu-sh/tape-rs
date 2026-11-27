@@ -866,6 +866,12 @@ impl<'a> LtfsVolume<'a> {
         &self.index
     }
 
+    /// Index staged by the current fenced write before the commit barrier.
+    #[cfg(feature = "fdb")]
+    pub(crate) fn staged_index(&self) -> &LtfsIndex {
+        &self.working
+    }
+
     /// S4 index identity from the last successful sync or a verified mount.
     /// A failed/indeterminate commit never advances this published identity.
     pub fn committed_index_construct(&self) -> CommittedIndexConstruct {

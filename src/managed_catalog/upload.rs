@@ -138,11 +138,22 @@ pub(super) async fn prepare_upload_at(
     {
         return Err(CatalogError::Incomplete);
     }
-    let parent =
+    let parent = if let Some(plan) =
+        s3_upload::parents::get_at(tr, namespace, spec.operation_id).await?
+    {
+        if !plan.matches_spec(spec) || !plan.baseline(tr, namespace).await? {
+            return Err(CatalogError::Invalid("S3 原父目录计划已改变"));
+        }
+        if tr.get(&plan.claim(namespace)?, false).await?.is_some() {
+            return Err(CatalogError::Incomplete);
+        }
+        plan.parent()?
+    } else {
         match lookup::resolve_active_path_at_mode(tr, namespace, parents.to_vec(), false).await? {
             Some(ResolvedPath::Directory { id, .. }) => id,
             _ => return Err(CatalogError::Invalid("上传父目录不存在或不是目录")),
-        };
+        }
+    };
     for claim in [
         reservation::path_key_for(namespace, parent, name),
         active_batch::path_claim_key_for(namespace, parent, name),

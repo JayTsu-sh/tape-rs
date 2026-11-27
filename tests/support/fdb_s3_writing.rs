@@ -168,8 +168,8 @@ fn s3_put_overwrite_metadata_and_delete_use_fdb_and_media_commits() {
     let f = rt.block_on(fixture(&cluster));
     let owner = Owner::start_mode(&f, 12, json!({}), true);
     let mut context = super::active_pools::context(&owner, 71, 12);
-    // The first nested PUT waits for two parent directory commits and the file commit.
-    // Leave room for all three within the forwarding and test client's 15-second budget.
+    // Allow for simulator scheduling within the forwarding and client's
+    // 15-second budget. The volume generation below checks commit count.
     Arc::get_mut(&mut context).unwrap().wait_timeout = Duration::from_secs(12);
     let server = ReadHttpServer::start(s3::fdb_router(
         f.catalog.clone(),
@@ -233,10 +233,29 @@ fn s3_put_overwrite_metadata_and_delete_use_fdb_and_media_commits() {
         before,
         "CRC32 mismatch must precede parent creation"
     );
+    let generation = || {
+        rt.block_on(
+            f.catalog
+                .active_loaded_volume_head(&f.serial, BARCODES[0], f.route, 12),
+        )
+        .unwrap()
+        .unwrap()
+        .index
+        .generation
+    };
+    let before_generation = generation();
     let put=entry.request_body("PUT",&path,Some("Content-Length: 3\r\nContent-MD5: kAFQmDzST7DWlj99KOF/cg==\r\nx-amz-sdk-checksum-algorithm: CRC32\r\nx-amz-checksum-crc32: NSRBwg==\r\nContent-Type: text/plain\r\nCache-Control: max-age=60\r\nx-amz-meta-origin: s3-test\r\nIf-None-Match: *\r\n"),b"abc");
     assert_eq!(put.0, 200, "{}", String::from_utf8_lossy(&put.2));
+    assert_eq!(
+        generation(),
+        before_generation + 1,
+        "the first nested PUT must commit its parents and file in one LTFS generation"
+    );
     assert!(writes() > before);
     assert!(put.1.contains("x-amz-checksum-crc32: nsrbwg=="));
+    let listed = entry.request("GET", &format!("/{bucket}?list-type=2&prefix=new/"), None);
+    assert_eq!(listed.0, 200);
+    assert!(String::from_utf8_lossy(&listed.2).contains("<Key>new/dir/object</Key>"));
     let head = entry.request("HEAD", &path, None);
     assert_eq!(head.0, 200);
     assert!(head.1.contains("content-length: 3"));
@@ -384,4 +403,144 @@ fn s3_put_overwrite_metadata_and_delete_use_fdb_and_media_commits() {
     drop(server);
     drop(owner);
     fs::remove_dir_all(f.root).unwrap();
+}
+
+#[test]
+#[ignore = "需要隔离 FDB_TEST_CLUSTER；普通 S3 隐含目录提交后接管，仅访问模拟磁带"]
+fn s3_nested_put_recovers_unobserved_s4_without_publishing_partial_paths() {
+    interrupted_nested_put(true);
+}
+
+#[test]
+#[ignore = "需要隔离 FDB_TEST_CLUSTER；普通 S3 错误后接管并释放原目录预约，仅访问模拟磁带"]
+fn s3_nested_put_aborts_unwritten_attempt_and_releases_parent_path() {
+    interrupted_nested_put(false);
+}
+
+fn interrupted_nested_put(committed_to_tape: bool) {
+    let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+    let _network = unsafe { foundationdb::boot() };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let f = rt.block_on(Box::pin(fixture(&cluster)));
+    let bucket = s3::bucket_name(&f.serial, &f.pools[0].to_string());
+    let path = format!("/{bucket}/interrupted/parent/one");
+    let body = b"nested S3 original body";
+    let start = |owner: &Owner, epoch| {
+        let mut context = super::active_pools::context(owner, 71, epoch);
+        Arc::get_mut(&mut context).unwrap().wait_timeout = Duration::from_secs(12);
+        ReadHttpServer::start(s3::fdb_router(
+            f.catalog.clone(),
+            BTreeMap::from([(f.serial.clone(), f.route)]),
+            BTreeMap::from([(f.serial.clone(), context.clone())]),
+            context,
+            HashMap::new(),
+            true,
+        ))
+    };
+    let resolve = |path: &str| {
+        rt.block_on(
+            f.catalog
+                .resolve_active_path(&f.serial, format!("/{}{path}", f.pools[0]).as_bytes()),
+        )
+        .unwrap()
+    };
+    let owner = Owner::start_mode(&f, 12, json!({}), true);
+    let old = rt
+        .block_on(
+            f.catalog
+                .active_loaded_volume_head(&f.serial, BARCODES[0], f.route, 12),
+        )
+        .unwrap()
+        .unwrap();
+    let server = start(&owner, 12);
+    if committed_to_tape {
+        owner.fail_vci.store(true, Ordering::SeqCst);
+    } else {
+        owner.fail_write.store(true, Ordering::SeqCst);
+    }
+    let response = server.request_body(
+        "PUT",
+        &path,
+        Some(&format!("Content-Length: {}\r\n", body.len())),
+        body,
+    );
+    assert_eq!(response.0, 503, "{}", String::from_utf8_lossy(&response.2));
+    assert!(!owner.fail_vci.load(Ordering::SeqCst));
+    for path in [
+        "/interrupted",
+        "/interrupted/parent",
+        "/interrupted/parent/one",
+    ] {
+        assert!(resolve(path).is_none(), "{path} must remain invisible");
+    }
+    assert_eq!(
+        rt.block_on(
+            f.catalog
+                .observed_active_volume_index(&f.serial, old.volume_id)
+        )
+        .unwrap(),
+        old.index
+    );
+    drop(server);
+    drop(owner);
+    f.library.power_cut();
+
+    let successor = Owner::start_mode(&f, 13, json!({}), true);
+    let server = start(&successor, 13);
+    let recovered_generation = rt
+        .block_on(
+            f.catalog
+                .observed_active_volume_index(&f.serial, old.volume_id),
+        )
+        .unwrap()
+        .generation;
+    if committed_to_tape {
+        assert_eq!(recovered_generation, old.index.generation + 1);
+    } else {
+        assert!(resolve("/interrupted").is_none());
+        let response = server.request_body(
+            "PUT",
+            &path,
+            Some(&format!("Content-Length: {}\r\n", body.len())),
+            body,
+        );
+        assert_eq!(response.0, 200, "{}", String::from_utf8_lossy(&response.2));
+        assert_eq!(
+            rt.block_on(
+                f.catalog
+                    .observed_active_volume_index(&f.serial, old.volume_id)
+            )
+            .unwrap()
+            .generation,
+            recovered_generation + 1,
+        );
+    }
+    for path in ["/interrupted", "/interrupted/parent"] {
+        assert!(matches!(
+            resolve(path),
+            Some(ResolvedPath::Directory { .. })
+        ));
+    }
+    let get = server.request("GET", &path, None);
+    assert_eq!(get.0, 200);
+    assert_eq!(get.2, body);
+    let mut copies = 0;
+    assert!(f.library.with_cartridge_mut(BARCODES[0], |cartridge| {
+        copies = cartridge
+            .partitions
+            .iter()
+            .flat_map(|p| &p.objects)
+            .filter(|object| matches!(object, LogicalObject::Record(record) if record == body))
+            .count();
+    }));
+    assert_eq!(
+        copies, 1,
+        "takeover must not append the original body again"
+    );
+    drop(server);
+    drop(successor);
+    fs::remove_dir_all(&f.root).unwrap();
 }

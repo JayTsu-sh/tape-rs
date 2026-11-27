@@ -211,38 +211,6 @@ async fn wait_mutation(
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
-async fn parents(s: &FdbS3, serial: &str, pool: Uuid, path: &str, round: u64) -> S3Result<()> {
-    let mut prefix = String::new();
-    let parts = path.trim_start_matches('/').split('/').collect::<Vec<_>>();
-    for part in &parts[..parts.len() - 1] {
-        prefix.push('/');
-        prefix.push_str(part);
-        match resolve(s, serial, pool, &prefix).await? {
-            Some(ResolvedPath::Directory { .. }) => continue,
-            Some(_) => return Err(conflict()),
-            None => {}
-        }
-        if let Err(error) = mutation(
-            s,
-            serial,
-            pool,
-            &prefix,
-            round,
-            NodeMutation::CreateDirectory,
-            None,
-        )
-        .await
-            && !matches!(
-                resolve(s, serial, pool, &prefix).await?,
-                Some(ResolvedPath::Directory { .. })
-            )
-        {
-            return Err(error);
-        }
-    }
-    Ok(())
-}
-
 struct UploadHeaders {
     length: u64,
     md5: Option<Vec<u8>>,
@@ -433,7 +401,6 @@ async fn put(
         checksum,
         saved,
     } = stage(&s.libraries[serial], s.storage, req).await?;
-    parents(s, serial, pool, path, round).await?;
     check_owner(s, serial, round).await?;
     let spec = ActiveUploadSpec {
         pool_id: pool,
@@ -443,49 +410,78 @@ async fn put(
         size: length,
         digest: ContentDigest::Sha256(digest),
     };
-    let library = s.libraries[serial].clone();
-    let intent: ActiveFileIntent = tokio::task::spawn_blocking(move || {
-        let (reply, received) = std::sync::mpsc::channel();
-        library
-            .exec
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .send(ExecRequest::FdbPrepare {
-                spec: Box::new(spec),
-                barcode: None,
-                reply,
-            })
-            .map_err(|_| ReadError::Busy("设备线程已停止".into()))?;
-        received
-            .recv()
-            .map_err(|_| ReadError::Busy("准备回执已断开".into()))?
-    })
-    .await
-    .map_err(|err| unavailable(err.to_string()))?
-    .map_err(|err| match err {
-        ReadError::Failed(_) => conflict(),
-        err => unavailable(err.to_string()),
-    })?;
-    if original.is_some_and(|(id, _)| id != intent.file_id) {
-        return Err(conflict());
+    let operation = spec.operation_id;
+    let plan_parents = original.is_none() && path.trim_start_matches('/').contains('/');
+    if plan_parents {
+        s.catalog
+            .plan_s3_upload_parents(s.routes[serial], serial, round, &spec)
+            .await
+            .map_err(|error| match error.domain() {
+                CatalogError::Invalid(_) => conflict(),
+                _ => catalog_error(error),
+            })?;
     }
-    let request = intent.request();
-    let metadata = FileMetadata::replacement(vec![
-        Xattr {
-            key: XATTR_MD5.into(),
-            value: md5,
-            base64: false,
-        },
-        Xattr {
-            key: HEADERS_XATTR.into(),
-            value: STANDARD.encode(serde_json::to_vec(&saved).expect("string map")),
-            base64: true,
-        },
-    ]);
-    s.catalog
-        .remember_s3_upload_metadata(s.routes[serial], round, &request, &metadata)
+    let library = s.libraries[serial].clone();
+    let prepared = async {
+        let intent: ActiveFileIntent = tokio::task::spawn_blocking(move || {
+            let (reply, received) = std::sync::mpsc::channel();
+            library
+                .exec
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .send(ExecRequest::FdbPrepare {
+                    spec: Box::new(spec),
+                    barcode: None,
+                    reply,
+                })
+                .map_err(|_| ReadError::Busy("设备线程已停止".into()))?;
+            received
+                .recv()
+                .map_err(|_| ReadError::Busy("准备回执已断开".into()))?
+        })
         .await
-        .map_err(catalog_error)?;
+        .map_err(|err| unavailable(err.to_string()))?
+        .map_err(|err| match err {
+            ReadError::Failed(_) => conflict(),
+            err => unavailable(err.to_string()),
+        })?;
+        if original.is_some_and(|(id, _)| id != intent.file_id) {
+            return Err(conflict());
+        }
+        let request = intent.request();
+        let metadata = FileMetadata::replacement(vec![
+            Xattr {
+                key: XATTR_MD5.into(),
+                value: md5,
+                base64: false,
+            },
+            Xattr {
+                key: HEADERS_XATTR.into(),
+                value: STANDARD.encode(serde_json::to_vec(&saved).expect("string map")),
+                base64: true,
+            },
+        ]);
+        s.catalog
+            .remember_s3_upload_metadata(s.routes[serial], round, &request, &metadata)
+            .await
+            .map_err(catalog_error)?;
+        Ok((intent, request))
+    }
+    .await;
+    let (intent, request) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if plan_parents
+                && let Err(cleanup) = s
+                    .catalog
+                    .discard_unsubmitted_s3_parents(s.routes[serial], serial, round, operation)
+                    .await
+            {
+                log::warn!("清理未送交写入线程的 S3 目录计划 {operation}：{cleanup}");
+            }
+            return Err(error);
+        }
+    };
     let library = s.libraries[serial].clone();
     let file_id = intent.file_id;
     let version = tokio::task::spawn_blocking(move || {

@@ -620,6 +620,9 @@ impl ManagedCatalog {
                                 None
                             };
                             let release = maintenance::release(&tr, r.namespace, permit).await?;
+                            if s3_upload::parents::release_claim(&tr, &r).await? {
+                                s3_upload::parents::forget_plan(&tr, &r);
+                            }
                             if let Some(reserved) = &reserved {
                                 reservation::clear(&tr, reserved);
                             }

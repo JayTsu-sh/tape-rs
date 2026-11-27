@@ -5,6 +5,8 @@ use crate::ltfs::volume::FileMetadata;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub(super) mod parents;
+
 const LIMIT: usize = 32_000;
 
 #[derive(Serialize, Deserialize)]
