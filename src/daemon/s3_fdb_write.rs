@@ -5,7 +5,91 @@ use crate::managed_catalog::{
     NodeMutationTaskKind, NodeMutationTaskState,
 };
 use http_body_util::BodyExt;
+use std::sync::{Mutex, Weak};
 use tokio::io::AsyncWriteExt;
+
+type PrefixKey = (Uuid, Uuid, String);
+
+#[derive(Default)]
+pub(super) struct ParentWrites {
+    prefixes: Mutex<HashMap<PrefixKey, Weak<ParentWritesInPrefix>>>,
+}
+
+// Only queued S3 requests retain their observed IDs. The FDB reservation
+// remains authoritative for device admission and recovery across owner loss.
+#[derive(Default)]
+struct ParentWritesInPrefix {
+    turn: tokio::sync::Mutex<()>,
+    participants: Mutex<Vec<Weak<ParentWrite>>>,
+}
+
+struct ParentWrite {
+    parent: String,
+    published: Mutex<BTreeMap<String, Uuid>>,
+}
+
+impl ParentWrites {
+    fn join(
+        &self,
+        namespace: Uuid,
+        pool: Uuid,
+        parent: &str,
+    ) -> (Arc<ParentWritesInPrefix>, Arc<ParentWrite>) {
+        let first = parent
+            .trim_start_matches('/')
+            .split('/')
+            .next()
+            .expect("first component");
+        let key = (namespace, pool, first.to_owned());
+        let prefix = {
+            let mut prefixes = self.prefixes.lock().unwrap_or_else(|e| e.into_inner());
+            prefixes.retain(|_, prefix| prefix.strong_count() != 0);
+            let entry = prefixes.entry(key).or_default();
+            entry.upgrade().unwrap_or_else(|| {
+                let prefix = Arc::new(ParentWritesInPrefix::default());
+                *entry = Arc::downgrade(&prefix);
+                prefix
+            })
+        };
+        let write = Arc::new(ParentWrite {
+            parent: parent.to_owned(),
+            published: Mutex::new(BTreeMap::new()),
+        });
+        {
+            let mut participants = prefix
+                .participants
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            participants.retain(|write| write.strong_count() != 0);
+            participants.push(Arc::downgrade(&write));
+        }
+        (prefix, write)
+    }
+}
+
+impl ParentWritesInPrefix {
+    fn published(&self, directories: Vec<(String, Uuid)>) {
+        for write in self
+            .participants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(Weak::upgrade)
+        {
+            let mut pins = write.published.lock().unwrap_or_else(|e| e.into_inner());
+            for (path, id) in &directories {
+                if write.parent == *path
+                    || write
+                        .parent
+                        .strip_prefix(path)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+                {
+                    pins.entry(path.clone()).or_insert(*id);
+                }
+            }
+        }
+    }
+}
 
 fn invalid(reason: &str) -> S3Error {
     S3Error::new(400, "InvalidArgument", reason)
@@ -390,9 +474,26 @@ async fn put(
     round: u64,
     req: Request,
 ) -> S3Result<Response> {
+    let deadline = tokio::time::Instant::now() + s.libraries[serial].wait_timeout;
     let before = resolve(s, serial, pool, path).await?;
     let original = file_version(before.as_ref(), serial, pool)?;
-    conditions(req.headers(), s.routes[serial].route.namespace, original)?;
+    let route = s.routes[serial];
+    conditions(req.headers(), route.route.namespace, original)?;
+    let if_absent = req.headers().contains_key(header::IF_NONE_MATCH);
+    let parent = path.rsplit_once('/').expect("absolute path").0;
+    // Register before reading the ancestry, so another PUT publishing during
+    // body intake can hand off the exact directory IDs to this request.
+    let nested = if original.is_none() && !parent.is_empty() {
+        let (prefix, waiting) = s.parent_writes.join(route.route.namespace, pool, parent);
+        let anchor = s
+            .catalog
+            .s3_upload_parent_anchor(route, serial, round, pool, parent)
+            .await
+            .map_err(catalog_error)?;
+        Some((prefix, waiting, anchor))
+    } else {
+        None
+    };
     let StagedUpload {
         file,
         length,
@@ -401,6 +502,21 @@ async fn put(
         checksum,
         saved,
     } = stage(&s.libraries[serial], s.storage, req).await?;
+    let _turn = match &nested {
+        Some((prefix, _, (path, _))) if path != parent => Some(
+            tokio::time::timeout_at(deadline, prefix.turn.lock())
+                .await
+                .map_err(|_| S3Error::new(504, "RequestTimeout", "等待共享父目录发布超时"))?,
+        ),
+        _ => None,
+    };
+    if _turn.is_some() && tokio::time::Instant::now() >= deadline {
+        return Err(S3Error::new(
+            504,
+            "RequestTimeout",
+            "等待共享父目录发布超时",
+        ));
+    }
     check_owner(s, serial, round).await?;
     let spec = ActiveUploadSpec {
         pool_id: pool,
@@ -411,18 +527,33 @@ async fn put(
         digest: ContentDigest::Sha256(digest),
     };
     let operation = spec.operation_id;
-    let plan_parents = original.is_none() && path.trim_start_matches('/').contains('/');
-    if plan_parents {
-        s.catalog
-            .plan_s3_upload_parents(s.routes[serial], serial, round, &spec)
+    let plan = if let Some((_, waiting, anchor)) = &nested {
+        let mut pins = waiting
+            .published
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        pins.insert(anchor.0.clone(), anchor.1);
+        let plan = s
+            .catalog
+            .plan_s3_upload_parents(route, serial, round, &spec, &pins)
             .await
             .map_err(|error| match error.domain() {
                 CatalogError::Invalid(_) => conflict(),
                 _ => catalog_error(error),
             })?;
-    }
+        Some(plan)
+    } else {
+        None
+    };
+    let planned_parent = plan.as_ref().map(|(parent, _)| *parent);
+    let created_parents = plan.as_ref().is_some_and(|(_, dirs)| !dirs.is_empty());
     let library = s.libraries[serial].clone();
     let prepared = async {
+        if planned_parent.is_some() && if_absent && resolve(s, serial, pool, path).await?.is_some()
+        {
+            return Err(precondition());
+        }
         let intent: ActiveFileIntent = tokio::task::spawn_blocking(move || {
             let (reply, received) = std::sync::mpsc::channel();
             library
@@ -445,7 +576,9 @@ async fn put(
             ReadError::Failed(_) => conflict(),
             err => unavailable(err.to_string()),
         })?;
-        if original.is_some_and(|(id, _)| id != intent.file_id) {
+        if original.is_some_and(|(id, _)| id != intent.file_id)
+            || planned_parent.is_some_and(|parent| parent != intent.parent)
+        {
             return Err(conflict());
         }
         let request = intent.request();
@@ -471,7 +604,7 @@ async fn put(
     let (intent, request) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
-            if plan_parents
+            if created_parents
                 && let Err(cleanup) = s
                     .catalog
                     .discard_unsubmitted_s3_parents(s.routes[serial], serial, round, operation)
@@ -508,6 +641,9 @@ async fn put(
             intent.namespace, intent.request_epoch, intent.operation_id
         ))
     })?;
+    if let Some(((prefix, _, _), (_, dirs))) = nested.as_ref().zip(plan) {
+        prefix.published(dirs);
+    }
     check_owner(s, serial, round).await?;
     let mut response = xml_response(200, "", true);
     response.headers_mut().insert(

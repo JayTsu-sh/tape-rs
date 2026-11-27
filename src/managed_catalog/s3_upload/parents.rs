@@ -205,7 +205,89 @@ pub(in crate::managed_catalog) async fn for_receipt(
     Ok(Some(plan))
 }
 
+async fn ancestor_at(
+    tr: &Transaction,
+    ns: Uuid,
+    pool: Uuid,
+    path: &str,
+    pins: &std::collections::BTreeMap<String, Uuid>,
+) -> Result<(Uuid, u64, usize)> {
+    let catalog_path = pool_catalog_path(
+        pool,
+        if path.is_empty() {
+            b"/"
+        } else {
+            path.as_bytes()
+        },
+    )?;
+    let components = lookup::path_components(&catalog_path)?;
+    let Some(ResolvedPath::Directory {
+        mut id,
+        mut version,
+        ..
+    }) = lookup::resolve_path_at_mode(tr, ns, vec![components[0]], false, false).await?
+    else {
+        return Err(CatalogError::Invalid("S3 池根目录不存在"));
+    };
+    let check = |len, id| {
+        if pins
+            .get(&path[..len])
+            .is_none_or(|expected| *expected == id)
+        {
+            Ok(())
+        } else {
+            Err(CatalogError::Invalid("S3 原祖先目录身份已改变"))
+        }
+    };
+    let mut len = 0;
+    check(len, id)?;
+    for component in &components[1..] {
+        let Some(child) = tr.get(&child_key(ns, id, component), false).await? else {
+            if pins.keys().any(|pin| pin.len() > len) {
+                return Err(CatalogError::Invalid("S3 原祖先目录已消失"));
+            }
+            if requests::prefix_has_rows(tr, &unavailable_volume_prefix(ns)).await? {
+                return Err(CatalogError::Incomplete);
+            }
+            break;
+        };
+        let child = uuid_from(&child)?;
+        let node = tr
+            .get(&node_key(ns, child), false)
+            .await?
+            .ok_or(CatalogError::Corrupt("目录项指向缺失 inode"))?;
+        let node = decode_node(&node)?;
+        if child.is_nil() || node.parent != id || node.name != *component {
+            return Err(CatalogError::Corrupt("目录项与 inode 不一致"));
+        }
+        if node.kind != NodeKind::Directory {
+            return Err(CatalogError::Invalid("S3 父路径不是目录"));
+        }
+        id = child;
+        version = node
+            .directory_version
+            .ok_or(CatalogError::Corrupt("目录属性版本缺失"))?;
+        len += component.len() + 1;
+        check(len, id)?;
+    }
+    Ok((id, version, len))
+}
+
 impl ManagedCatalog {
+    pub(crate) async fn s3_upload_parent_anchor(
+        &self,
+        route: ActiveLibraryRoute,
+        serial: &str,
+        round: u64,
+        pool: Uuid,
+        parent: &str,
+    ) -> Result<(String, Uuid)> {
+        let tr = self.db.create_trx()?;
+        let ns = routing::require_runtime_active_owner(&tr, serial, route, round).await?;
+        let (id, _, len) = ancestor_at(&tr, ns, pool, parent, &Default::default()).await?;
+        Ok((parent[..len].to_owned(), id))
+    }
+
     /// Record a private plan before the existing file-prepare RPC. No public
     /// directory or device side effect is produced here.
     pub(crate) async fn plan_s3_upload_parents(
@@ -214,104 +296,74 @@ impl ManagedCatalog {
         serial: &str,
         round: u64,
         spec: &ActiveUploadSpec,
-    ) -> Result<()> {
-        let catalog_path = pool_catalog_path(spec.pool_id, &spec.path)?;
-        let components = lookup::path_components(&catalog_path)?;
-        let (name, parents) = components
-            .split_last()
+        pins: &std::collections::BTreeMap<String, Uuid>,
+    ) -> Result<(Uuid, Vec<(String, Uuid)>)> {
+        pool_catalog_path(spec.pool_id, &spec.path)?;
+        let path = std::str::from_utf8(&spec.path)
+            .map_err(|_| CatalogError::Invalid("S3 路径不是 UTF-8"))?;
+        let (parent, name) = path
+            .rsplit_once('/')
             .ok_or(CatalogError::Invalid("S3 对象缺少名称"))?;
-        let name =
-            std::str::from_utf8(name).map_err(|_| CatalogError::Invalid("S3 路径不是 UTF-8"))?;
         let ContentDigest::Sha256(sha256) = spec.digest else {
             return Err(CatalogError::Invalid("S3 PUT 缺少 SHA-256"));
         };
         self.db
-            .run(|tr, _| {
-                let parents = &parents;
-                async move {
-                    requests::retry_result(
-                        async {
-                            let ns =
-                                routing::require_runtime_active_owner(&tr, serial, route, round)
-                                    .await?;
-                            control::require_pool_writable_at(&tr, ns, spec.pool_id).await?;
-                            let key = plan_key(ns, spec.operation_id);
-                            if let Some(saved) = get_at(&tr, ns, spec.operation_id).await? {
-                                if !saved.matches_spec(spec) {
-                                    return Err(CatalogError::IdempotencyMismatch);
-                                }
-                                return Ok(());
+            .run(|tr, _| async move {
+                requests::retry_result(
+                    async {
+                        let ns = routing::require_runtime_active_owner(&tr, serial, route, round)
+                            .await?;
+                        control::require_pool_writable_at(&tr, ns, spec.pool_id).await?;
+                        let (base, base_version, len) =
+                            ancestor_at(&tr, ns, spec.pool_id, parent, pins).await?;
+                        let key = plan_key(ns, spec.operation_id);
+                        if let Some(saved) = get_at(&tr, ns, spec.operation_id).await? {
+                            if !saved.matches_spec(spec) {
+                                return Err(CatalogError::IdempotencyMismatch);
                             }
-                            if matches!(
-                                lookup::resolve_path_at_mode(
-                                    &tr,
-                                    ns,
-                                    parents.to_vec(),
-                                    false,
-                                    false
-                                )
-                                .await?,
-                                Some(ResolvedPath::Directory { .. })
-                            ) {
-                                return Ok(());
-                            }
-                            let mut base = Uuid::nil();
-                            let mut base_version = 0;
-                            let mut base_path = String::new();
-                            let mut dirs = Vec::new();
-                            for (offset, component) in parents.iter().enumerate() {
-                                let component = std::str::from_utf8(component)
-                                    .map_err(|_| CatalogError::Invalid("S3 路径不是 UTF-8"))?;
-                                if dirs.is_empty() {
-                                    match lookup::resolve_path_at_mode(
-                                        &tr,
-                                        ns,
-                                        parents[..=offset].to_vec(),
-                                        false,
-                                        false,
-                                    )
-                                    .await?
-                                    {
-                                        Some(ResolvedPath::Directory { id, version, .. }) => {
-                                            base = id;
-                                            base_version = version;
-                                            if offset > 0 {
-                                                base_path.push('/');
-                                                base_path.push_str(component);
-                                            }
-                                            continue;
-                                        }
-                                        None if offset > 0 && spec.expected_version.is_none() => {}
-                                        _ => {
-                                            return Err(CatalogError::Invalid("S3 父路径不是目录"));
-                                        }
-                                    }
-                                }
-                                dirs.push((component.to_owned(), Uuid::new_v4()));
-                            }
-                            if !dirs.is_empty() {
-                                if base_version == u64::MAX {
-                                    return Err(CatalogError::Invalid("S3 祖先目录版本溢出"));
-                                }
-                                let plan = Parents {
-                                    version: 1,
-                                    operation: spec.operation_id,
-                                    pool: spec.pool_id,
-                                    base,
-                                    base_version,
-                                    base_path,
-                                    dirs,
-                                    name: name.to_owned(),
-                                    size: spec.size,
-                                    sha256,
-                                };
-                                tr.set(&key, &encode_record(&plan)?);
-                            }
-                            Ok(())
+                            return Ok((
+                                saved.parent()?,
+                                saved
+                                    .directory_paths()
+                                    .zip(saved.dirs.iter().map(|(_, id)| *id))
+                                    .collect(),
+                            ));
                         }
-                        .await,
-                    )
-                }
+                        if len == parent.len() {
+                            return Ok((base, Vec::new()));
+                        }
+                        if spec.expected_version.is_some() || base_version == u64::MAX {
+                            return Err(CatalogError::Invalid("S3 无法规划缺失的父目录"));
+                        }
+                        let dirs = parent[len + 1..]
+                            .split('/')
+                            .map(|part| (part.to_owned(), Uuid::new_v4()))
+                            .collect();
+                        let plan = Parents {
+                            version: 1,
+                            operation: spec.operation_id,
+                            pool: spec.pool_id,
+                            base,
+                            base_version,
+                            base_path: parent[..len].to_owned(),
+                            dirs,
+                            name: name.to_owned(),
+                            size: spec.size,
+                            sha256,
+                        };
+                        if tr.get(&plan.claim(ns)?, false).await?.is_some() {
+                            return Err(CatalogError::Incomplete);
+                        }
+                        tr.set(&key, &encode_record(&plan)?);
+                        Ok((
+                            plan.parent()?,
+                            plan.directory_paths()
+                                .zip(plan.dirs.iter().map(|(_, id)| *id))
+                                .collect(),
+                        ))
+                    }
+                    .await,
+                )
             })
             .await?
     }
