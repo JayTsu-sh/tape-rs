@@ -231,6 +231,15 @@ fn native_pool_discovery_uses_physical_scope_before_logical_activation() {
         assert!(paused["active_tape"]["checkpoint"]["detail"].as_str().unwrap().contains("SELECTL8"));
         assert_eq!(paused["tapes"][0]["source_address"], 1001);
         assert_eq!(paused["tapes"][0]["home_address"], 1001);
+        let cancelled = catalog.cancel_management(&serial, route, owner, epoch, operation).await.unwrap();
+        assert_eq!(cancelled["status"], "cancelled");
+        catalog.advance_selected_pool_create(&serial, route, owner).await.unwrap();
+        let terminal = catalog.selected_pool_create_status(&serial, route, None, saved.id).await.unwrap().unwrap();
+        assert_eq!(terminal["status"], "cancelled");
+        assert_eq!(terminal["active_tape"]["operation"], json!(operation));
+        assert_eq!(catalog.admit_selected_pool(route, owner, None, &saved, &tapes, false).await.unwrap(), terminal);
+        let replacement = candidate("replacement");
+        assert_eq!(catalog.admit_selected_pool(route, owner, None, &replacement, &tapes, false).await.unwrap()["status"], "queued");
         let operation = Uuid::new_v4();
         let import = crate::managed_catalog::ManagementRequest::parse(json!({
             "version":1,"library":serial,"namespace":ns,"epoch":1,"operation":operation,

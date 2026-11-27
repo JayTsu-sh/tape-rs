@@ -679,12 +679,10 @@ fn selected_pool_imports_existing_contents_and_recovers_lost_format_result() {
         child["operation"].as_str().unwrap().parse().unwrap(),
     )
     .unwrap();
-    assert!(
-        owner
-            .client
-            .cancel_management_task_by_id(&child_id)
-            .is_err()
-    );
+    assert!(matches!(
+        owner.client.cancel_management_task_by_id(&child_id),
+        Err(ClientError::Rejected { body, .. }) if body.contains("须先核实原卷身份")
+    ));
     assert!(matches!(
         owner.client.release_library(&serial, ns, Uuid::new_v4()),
         Err(ClientError::Rejected { status: 409, .. })

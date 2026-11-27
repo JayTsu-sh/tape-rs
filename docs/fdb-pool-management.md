@@ -31,6 +31,8 @@ ltfsctl -e NODE:7411 --library SERIAL pool create-status POOL_UUID --namespace N
 
 介质任务明确失败或取消且设备操作已结清时，建池返回 `failed` 或 `cancelled`。原回执仍可查询，已确认结清的预约会释放。已完成导入的卷保留归属，并在原回执中列出。建池失败时，部分准备的池不会发布给应用。
 
+管理员可使用 `active_tape` 中的代次和操作 UUID 取消原介质任务。初始化已发出时，任务会保留预约并等待原卷身份核实。
+
 写命令在第一次提交前以独占创建、0600、文件和父目录 fsync 保存请求文件。重复执行同一命令和相同参数时使用同一文件，沿用原 namespace、池 UUID、修订号、任务 epoch/operation；不会重新解析池名或更新修订号。不同参数、损坏或不完整文件直接拒绝，不覆盖、不修复。文件只保存请求身份，不缓存任务状态。保留这些文件供超时、断网和接管后恢复；不要为了重试而删除文件或改用新文件。
 
 策略字段是 `name`、`file_limit`、`media_restriction`、`mount_limit`、`low_space_warning_enabled`、`low_space_warning_threshold`、`no_space_warning_enabled`。开关使用 true/false；数值阈值为 0..32767；file_limit 必须大于零；介质限制沿用 L5/L6/L7/L8/L9/M8 和支持的 IBM 介质代码，none 表示不限制。表格的 UUID、修订号、文件上限列使用固定宽度；可变宽度中文名称放在末列，控制字符转义，避免换行破坏表格。

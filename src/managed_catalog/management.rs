@@ -672,9 +672,10 @@ impl ManagedCatalog {
                             .await?
                             .ok_or(CatalogError::Invalid("管理请求不存在"))?;
                         if matches!(value["status"].as_str(), Some("queued" | "running"))
-                            && let Some(barcode) = value["request"]["change"]["barcode"].as_str()
+                            && value["request"]["change"]["barcode"].is_string()
                         {
-                            selected_pool::require_tape_available(&tr, ns, serial, barcode).await?;
+                            let request = ManagementRequest::parse(value["request"].clone())?;
+                            selected_pool::original_tape_at(&tr, &request).await?;
                         }
                         if value["status"] == "running"
                             && value["request"]["change"]["kind"] == "media-reclaim"
