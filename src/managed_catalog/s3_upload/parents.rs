@@ -72,7 +72,7 @@ impl Parents {
             .ok_or(CatalogError::Corrupt("S3 隐含目录清单为空"))
     }
 
-    fn parent_path(&self) -> String {
+    pub(in crate::managed_catalog) fn parent_path(&self) -> String {
         let mut path = self.base_path.clone();
         for (name, _) in &self.dirs {
             path.push('/');
@@ -118,6 +118,15 @@ impl Parents {
         tr: &Transaction,
         ns: Uuid,
     ) -> Result<bool> {
+        Ok(self.validated_base_version(tr, ns).await? == Some(self.base_version))
+    }
+
+    /// Find the current version while the original ancestor and missing path agree.
+    pub(in crate::managed_catalog) async fn validated_base_version(
+        &self,
+        tr: &Transaction,
+        ns: Uuid,
+    ) -> Result<Option<u64>> {
         let path = pool_catalog_path(
             self.pool,
             if self.base_path.is_empty() {
@@ -129,10 +138,11 @@ impl Parents {
         let existing =
             lookup::resolve_path_at_mode(tr, ns, lookup::path_components(&path)?, false, false)
                 .await?;
-        if !matches!(existing, Some(ResolvedPath::Directory { id, version, .. })
-            if id == self.base && version == self.base_version)
-        {
-            return Ok(false);
+        let Some(ResolvedPath::Directory { id, version, .. }) = existing else {
+            return Ok(None);
+        };
+        if id != self.base || version < self.base_version || version == u64::MAX {
+            return Ok(None);
         }
         let mut parent = self.base;
         for (name, id) in &self.dirs {
@@ -152,11 +162,25 @@ impl Parents {
                     .await?
                     .is_some()
             {
-                return Ok(false);
+                return Ok(None);
             }
             parent = *id;
         }
-        Ok(true)
+        Ok(Some(version))
+    }
+
+    /// Pin the validated revision in the same transaction as the first reservation.
+    pub(in crate::managed_catalog) fn pin_base_version(
+        mut self,
+        tr: &Transaction,
+        ns: Uuid,
+        version: u64,
+    ) -> Result<()> {
+        if self.base_version != version {
+            self.base_version = version;
+            tr.set(&plan_key(ns, self.operation), &encode_record(&self)?);
+        }
+        Ok(())
     }
 
     fn directory_paths(&self) -> impl Iterator<Item = String> + '_ {

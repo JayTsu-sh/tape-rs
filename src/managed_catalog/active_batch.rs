@@ -909,6 +909,14 @@ pub(super) async fn target_matches_baseline(
             return Ok(false);
         }
     }
+    file_matches_baseline(tr, receipt).await
+}
+
+/// Check the file target after the caller has validated its parent.
+pub(super) async fn file_matches_baseline(
+    tr: &Transaction,
+    receipt: &CommitReceipt,
+) -> Result<bool> {
     let child = tr
         .get(
             &child_key(receipt.namespace, receipt.parent, &receipt.name),

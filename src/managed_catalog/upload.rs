@@ -141,7 +141,7 @@ pub(super) async fn prepare_upload_at(
     let parent = if let Some(plan) =
         s3_upload::parents::get_at(tr, namespace, spec.operation_id).await?
     {
-        if !plan.matches_spec(spec) || !plan.baseline(tr, namespace).await? {
+        if !plan.matches_spec(spec) || plan.validated_base_version(tr, namespace).await?.is_none() {
             return Err(CatalogError::Invalid("S3 原父目录计划已改变"));
         }
         if tr.get(&plan.claim(namespace)?, false).await?.is_some() {

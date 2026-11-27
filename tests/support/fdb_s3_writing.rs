@@ -647,6 +647,74 @@ fn put_small(server: &ReadHttpServer, path: &str, body: &[u8]) -> (u16, String, 
     )
 }
 
+#[test]
+#[ignore = "需要隔离 FDB_TEST_CLUSTER；普通 S3 不同前缀并发首写，仅访问模拟磁带"]
+fn s3_concurrent_first_puts_to_different_prefixes_both_commit() {
+    let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+    let _network = unsafe { foundationdb::boot() };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let f = rt.block_on(Box::pin(fixture(&cluster)));
+    let owner = Owner::start_mode(&f, 12, json!({}), true);
+    let mut context = super::active_pools::context(&owner, 71, 12);
+    let config = Arc::get_mut(&mut context).unwrap();
+    config.wait_timeout = Duration::from_secs(30);
+    let (bridge, requests) = channel::<ExecRequest>();
+    let forward = std::mem::replace(config.exec.get_mut().unwrap(), bridge);
+    let actor = forward.clone();
+    let (held, writes) = channel();
+    let proxy = std::thread::spawn(move || {
+        while let Ok(request) = requests.recv() {
+            if matches!(request, ExecRequest::FdbWrite { .. }) {
+                held.send(request).unwrap();
+            } else {
+                actor.send(request).unwrap();
+            }
+        }
+    });
+    let server = ReadHttpServer::start(s3::fdb_router(
+        f.catalog.clone(),
+        BTreeMap::from([(f.serial.clone(), f.route)]),
+        BTreeMap::from([(f.serial.clone(), context.clone())]),
+        context,
+        HashMap::new(),
+        true,
+    ));
+    let bucket = s3::bucket_name(&f.serial, &f.pools[0].to_string());
+    let first_path = format!("/{bucket}/new-first/file");
+    let second_path = format!("/{bucket}/new-second/file");
+    let responses = std::thread::scope(|scope| {
+        let first = scope.spawn(|| put_small(&server, &first_path, b"a"));
+        let first_write = writes.recv_timeout(Duration::from_secs(5)).unwrap();
+        let second = scope.spawn(|| put_small(&server, &second_path, b"b"));
+        // Both PUTs have finished preparation before either can reserve tape.
+        let second_write = writes.recv_timeout(Duration::from_secs(5)).unwrap();
+        forward.send(first_write).unwrap();
+        let first_response = first.join().unwrap();
+        forward.send(second_write).unwrap();
+        (first_response, second.join().unwrap())
+    });
+    for (response, path, body) in [
+        (&responses.0, &first_path, b"a"),
+        (&responses.1, &second_path, b"b"),
+    ] {
+        assert_eq!(
+            response.0,
+            200,
+            "{path}: {}",
+            String::from_utf8_lossy(&response.2)
+        );
+        let read = server.request("GET", path, None);
+        assert_eq!((read.0, read.2.as_slice()), (200, body.as_slice()));
+    }
+    drop(server);
+    proxy.join().unwrap();
+    drop(owner);
+    fs::remove_dir_all(f.root).unwrap();
+}
+
 fn pause_put(server: &ReadHttpServer, path: &str) -> BufReader<std::net::TcpStream> {
     let stream = std::net::TcpStream::connect(&server.address).unwrap();
     stream
