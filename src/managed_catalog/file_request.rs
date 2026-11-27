@@ -3,7 +3,7 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ActiveFileRequest {
     pub namespace: Uuid,
     pub parent: Uuid,

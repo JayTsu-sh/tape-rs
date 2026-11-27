@@ -1329,8 +1329,15 @@ mod inventory_cli_tests {
         let id = "11111111-1111-4111-8111-111111111111";
         for command in ["release", "acquire", "unload", "load"] {
             let mut args = vec![
-                "ltfsctl", "-e", "localhost:1", "library", command, "--namespace", id,
-                "--operation", id,
+                "ltfsctl",
+                "-e",
+                "localhost:1",
+                "library",
+                command,
+                "--namespace",
+                id,
+                "--operation",
+                id,
             ];
             if matches!(command, "acquire" | "load") {
                 args.extend(["--release", id]);

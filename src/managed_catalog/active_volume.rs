@@ -411,9 +411,9 @@ pub(super) async fn observed_batch_at(
     Ok(
         match observed_history_at(tr, serial, volume, generation).await? {
             Some((IndexKind::FileBatch(id), index)) => {
-                active_batch::require_stored_checkpoint_at(tr,id,index,None).await?;
-                Some((id,index))
-            },
+                active_batch::require_stored_checkpoint_at(tr, id, index, None).await?;
+                Some((id, index))
+            }
             _ => None,
         },
     )
@@ -439,9 +439,9 @@ pub(super) async fn observed_completed_batch_at(
     }
     Ok(match kind {
         IndexKind::FileBatch(id) => {
-            active_batch::require_stored_checkpoint_at(tr,id,index,None).await?;
-            Some((id,index))
-        },
+            active_batch::require_stored_checkpoint_at(tr, id, index, None).await?;
+            Some((id, index))
+        }
         _ => None,
     })
 }
@@ -959,7 +959,13 @@ impl ManagedCatalog {
                                     ));
                                 }
                                 if saved_previous == previous && saved_current == current {
-                                    active_batch::require_stored_checkpoint_at(&tr,batch_id,current,Some(file_count)).await?;
+                                    active_batch::require_stored_checkpoint_at(
+                                        &tr,
+                                        batch_id,
+                                        current,
+                                        Some(file_count),
+                                    )
+                                    .await?;
                                     if tr
                                         .get(&file_count_key(volume, current.generation), false)
                                         .await?
@@ -1002,7 +1008,7 @@ impl ManagedCatalog {
                                 &tr,
                                 placement.namespace,
                                 volume,
-                                (current,file_count),
+                                (current, file_count),
                                 batch_id,
                                 owner_epoch,
                                 scan.id,

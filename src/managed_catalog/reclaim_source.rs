@@ -8,21 +8,23 @@ use std::io::Write;
 
 const PAGE: usize = 32;
 const MAX_ROW: usize = 48_000;
-#[path = "reclaim_source_ledger.rs"]
-mod ledger;
 #[path = "reclaim_group_only.rs"]
 pub(in crate::managed_catalog::control::reclaim) mod group_only;
+#[path = "reclaim_source_ledger.rs"]
+mod ledger;
 pub(crate) use group_only::{ReclaimGroupOnlyDraft, ReclaimGroupOnlyQualification};
 pub(super) use ledger::clear_reserved_at;
 #[path = "reclaim_source_coverage.rs"]
 mod coverage;
-#[cfg(test)]
-pub(in crate::managed_catalog) use coverage::group_coverage_test_key;
 pub use coverage::ReclaimCoverageProgress;
 pub(super) use coverage::completed_at as copy_coverage_complete_at;
-pub(in crate::managed_catalog) use coverage::{put_group_at, group_bundle_at, group_bundle_identity_at, require_group_absent_at};
-pub(super) use coverage::{GroupRootEvidence, group_root_bundle_at};
+#[cfg(test)]
+pub(in crate::managed_catalog) use coverage::group_coverage_test_key;
 pub(super) use coverage::require_complete_at as require_complete_coverage_at;
+pub(super) use coverage::{GroupRootEvidence, group_root_bundle_at};
+pub(in crate::managed_catalog) use coverage::{
+    group_bundle_at, group_bundle_identity_at, put_group_at, require_group_absent_at,
+};
 #[path = "reclaim_source_read.rs"]
 mod read;
 pub use read::{ReclaimReadSource, ReclaimSourceRead};
@@ -51,8 +53,8 @@ pub use metadata_observation::{
 };
 #[path = "reclaim_metadata_write.rs"]
 mod metadata_write;
-pub(super) use metadata_write::require_idle_at as require_metadata_idle_at;
 pub(super) use metadata_write::isolation_checkpoint_at;
+pub(super) use metadata_write::require_idle_at as require_metadata_idle_at;
 pub use metadata_write::{
     ReclaimMetadataAdmission, ReclaimMetadataCheckpointEvidence, ReclaimMetadataDonorContext,
     ReclaimMetadataDonorEvidence, ReclaimMetadataPublication, ReclaimMetadataRecoveryEvidence,
@@ -102,17 +104,26 @@ struct Object {
 pub struct ReclaimSourceNode(Object);
 
 pub(in crate::managed_catalog) async fn sealed_entry_node_at(
-    tr: &Transaction, parent: &ReclaimReservation, entry: &IndexEntry,
+    tr: &Transaction,
+    parent: &ReclaimReservation,
+    entry: &IndexEntry,
 ) -> Result<ReclaimSourceNode> {
     ledger::require_complete_at(tr, parent).await?;
     let object = Object::capture(entry.clone())?;
-    if tr.get(&ledger::object_key(parent, object.uid), false).await?.as_deref()
+    if tr
+        .get(&ledger::object_key(parent, object.uid), false)
+        .await?
+        .as_deref()
         != Some(object.encode()?.as_slice())
-    { return Err(CatalogError::Corrupt("分组原生节点与原完整Re清单不同")); }
+    {
+        return Err(CatalogError::Corrupt("分组原生节点与原完整Re清单不同"));
+    }
     Ok(ReclaimSourceNode(object))
 }
 
-pub(in crate::managed_catalog) fn native_file_md5(node: &crate::ltfs::index::FileNode) -> Result<Option<[u8; 16]>> {
+pub(in crate::managed_catalog) fn native_file_md5(
+    node: &crate::ltfs::index::FileNode,
+) -> Result<Option<[u8; 16]>> {
     read::expected_md5(node)
 }
 

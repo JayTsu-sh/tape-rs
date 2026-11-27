@@ -161,7 +161,7 @@ ctl pool create archive -l LIBRARY_SERIAL --file-limit 200000 \
   --request /var/lib/tape-client/create-pool-fixed.json
 ```
 
-`NAME` 是库内唯一名称。UUID 自动生成并保存到原请求文件；`--file-limit` 默认 200000。创建前固定并持久保存 UUID、namespace 和参数，成功创建逻辑池不会自动导入或格式化任何磁带。
+`NAME` 是库内唯一名称。UUID 自动生成并保存到原请求文件；`--file-limit` 默认 200000。创建前固定并持久保存 UUID、namespace 和参数。重复指定 `--tape BARCODE` 可随池接入磁带。已有 LTFS 文件由原卷导入，确认为空白的卷在提供 `--confirm-format` 后初始化。用 `--preview` 查询名称和介质库存，用 `pool create-status UUID --namespace NAMESPACE` 查询原任务。
 
 ### pool list / show
 

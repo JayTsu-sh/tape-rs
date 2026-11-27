@@ -436,7 +436,7 @@ async fn require_pool_path_at(
         return Err(CatalogError::Invalid("池 UUID 路径格式不规范"));
     }
     control::require_pool_library(tr, namespace, pool, serial).await?;
-    control::native_media::require_pool_readable(tr, namespace, pool).await?;
+    control::native_media::require_app_pool_readable(tr, namespace, pool).await?;
     Ok(pool)
 }
 

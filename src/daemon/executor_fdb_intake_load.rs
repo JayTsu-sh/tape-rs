@@ -12,15 +12,28 @@ fn original_drive(owner: &Active, serial: &str) -> std::result::Result<usize, Re
         .position(|d| d.kind == DeviceKind::Drive && d.serial == serial)
         .ok_or_else(|| lost("原导入驱动器已不在当前配置中"))
 }
-fn target_at(inventory: &Inventory, plan: &Plan, barcode: &str, drive: usize) -> bool {
+fn target_at(
+    inventory: &Inventory,
+    plan: &Plan,
+    barcode: &str,
+    drive: usize,
+    pin_home: bool,
+) -> bool {
     inventory.drives.iter().any(|slot| {
         slot.dev == drive
             && slot.addr == plan.destination
-            && slot
-                .loaded
-                .as_ref()
-                .is_some_and(|(loaded, _)| loaded == barcode)
+            && slot.loaded.as_ref().is_some_and(|(loaded, home)| {
+                loaded == barcode
+                    && (!pin_home
+                        || home.is_none_or(|actual| {
+                            plan.home.is_none_or(|expected| actual == expected)
+                        }))
+            })
     }) && (plan.source == plan.destination || inventory.empty_slots.contains(&plan.source))
+        && (!pin_home
+            || plan
+                .home
+                .is_none_or(|home| inventory.empty_slots.contains(&home)))
 }
 fn eviction_done(inventory: &Inventory, eviction: &NativeMediaEvictionPlan, drive: usize) -> bool {
     inventory.slots.get(&eviction.barcode) == Some(&eviction.home)
@@ -51,6 +64,33 @@ async fn choose(
         )
         .await
         .map_err(lost)?;
+    let original = control
+        .catalog
+        .selected_intake_position(import, owner.round)
+        .await
+        .map_err(lost)?;
+    if let Some((source, home)) = original {
+        let observed = inventory
+            .drives
+            .iter()
+            .find_map(|slot| {
+                let (loaded, observed_home) = slot.loaded.as_ref()?;
+                (loaded == barcode).then_some((slot.addr, *observed_home))
+            })
+            .or_else(|| {
+                inventory
+                    .slots
+                    .get(barcode)
+                    .map(|address| (*address, Some(*address)))
+            });
+        if observed != Some((source, Some(home)))
+            || (source != home && !inventory.empty_slots.contains(&home))
+        {
+            return Err(ReadError::Busy(format!(
+                "磁带 {barcode} 当前位置或 home 与原预约不符，等待核对"
+            )));
+        }
+    }
     let management = policy(owner, control, &[pool], Some(barcode)).await?;
     if !tape_allowed(&management, barcode) || inventory.cleaning.contains(barcode) {
         return Err(ReadError::Busy("导入磁带离线、在黑名单中或为清洗带".into()));
@@ -259,6 +299,12 @@ pub(super) async fn select(
         }
     };
     let drive = original_drive(owner, &progress.plan.drive_serial)?;
+    let pin_home = control
+        .catalog
+        .selected_intake_position(intake, owner.round)
+        .await
+        .map_err(lost)?
+        .is_some();
     let scope = IoScope::Target(target);
     if let Some(eviction) = progress.plan.eviction.as_ref()
         && progress.phase == Phase::Planned
@@ -324,7 +370,7 @@ pub(super) async fn select(
     if matches!(progress.phase, Phase::Planned | Phase::Evicted) {
         let before = checked_inventory(owner, permit, control, scope)?;
         if progress.plan.source == progress.plan.destination {
-            if !target_at(&before, &progress.plan, intake.barcode(), drive) {
+            if !target_at(&before, &progress.plan, intake.barcode(), drive, pin_home) {
                 return Err(lost("原驱动器的导入条码或地址改变"));
             }
         } else {
@@ -357,6 +403,7 @@ pub(super) async fn select(
                 &progress.plan,
                 intake.barcode(),
                 drive,
+                pin_home,
             ) {
                 return Err(lost("原导入 MOVE 结果尚未确认"));
             }
@@ -374,6 +421,7 @@ pub(super) async fn select(
             &progress.plan,
             intake.barcode(),
             drive,
+            pin_home,
         ) {
             return Err(lost("原 MOVE 结果未知；只观察原地址，不重发命令"));
         }
@@ -389,6 +437,7 @@ pub(super) async fn select(
         &progress.plan,
         intake.barcode(),
         drive,
+        pin_home,
     ) {
         return Err(lost("原导入条码、驱动器或地址改变"));
     }
@@ -466,6 +515,7 @@ pub(crate) async fn settle_cancelled(
                 &plan,
                 intake.barcode(),
                 original_drive(owner, &plan.drive_serial)?,
+                false,
             ) {
                 return Err(lost("取消等待原 MOVE 结果；保留机械占用"));
             }
@@ -482,6 +532,7 @@ pub(crate) async fn settle_cancelled(
                 &plan,
                 intake.barcode(),
                 drive,
+                false,
             ) || !drive_io(owner, permit, control, scope, drive, |device| {
                 TapeDrive::new(device).test_unit_ready()
             })? {

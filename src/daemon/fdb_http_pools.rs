@@ -101,6 +101,7 @@ pub(super) fn failure(error: CatalogError) -> Response {
     let domain = error.domain();
     let (status, kind) = match domain {
         CatalogError::Invalid(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
+        CatalogError::IdempotencyMismatch => (StatusCode::CONFLICT, "request_conflict"),
         CatalogError::ManagementQueueFull => (StatusCode::TOO_MANY_REQUESTS, "queue_full"),
         CatalogError::Corrupt(_) | CatalogError::Cache(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "catalog_corrupt")
@@ -452,7 +453,65 @@ struct NewPool {
     file_limit: u64,
     created_at_millis: u64,
     policy: NewPolicy,
+    #[serde(default)]
+    tapes: Vec<String>,
+    #[serde(default)]
+    confirm_format: bool,
 }
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviewCreate {
+    version: u8,
+    name: String,
+    file_limit: u64,
+    tapes: Vec<String>,
+}
+
+pub(super) async fn preview_create(
+    State(ctx): State<Arc<Context>>,
+    Path(serial): Path<String>,
+    request: Request,
+) -> Response {
+    let _permit = match budget(&ctx) {
+        Ok(permit) => permit,
+        Err(response) => return *response,
+    };
+    let expected = match route(&ctx, &serial) {
+        Ok(route) => route,
+        Err(response) => return *response,
+    };
+    if let Err(response) = namespace(request.headers(), expected) {
+        return *response;
+    }
+    let logical = match logical_scope(request.headers()) {
+        Ok(logical) => logical,
+        Err(response) => return *response,
+    };
+    let input: PreviewCreate = match body_with_limit(request, 16 * 1024).await {
+        Ok(input) => input,
+        Err(response) => return *response,
+    };
+    if input.version != 1 {
+        return invalid("池创建预检请求版本无效");
+    }
+    match ctx
+        .catalog
+        .preview_pool_create(
+            &serial,
+            expected,
+            logical,
+            &input.name,
+            input.file_limit,
+            &input.tapes,
+        )
+        .await
+    {
+        Ok(preview) => reply(StatusCode::OK, preview),
+        Err(error) => failure(error),
+    }
+}
+
 pub(super) async fn create(
     State(ctx): State<Arc<Context>>,
     Path(serial): Path<String>,
@@ -478,7 +537,7 @@ pub(super) async fn create(
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let input: NewPool = match body(request).await {
+    let input: NewPool = match body_with_limit(request, 16 * 1024).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
@@ -509,6 +568,40 @@ pub(super) async fn create(
     }
     if !live(&owner, expected) {
         return unavailable("请求读取期间owner许可已失效，未开始创建");
+    }
+    if !input.tapes.is_empty() {
+        let result = permitted(
+            &owner,
+            expected,
+            ctx.catalog.admit_selected_pool(
+                expected,
+                owner.round,
+                logical,
+                &pool,
+                &input.tapes,
+                input.confirm_format,
+            ),
+        )
+        .await;
+        return match result {
+            Ok(value) => reply(
+                if value.get("id_available").is_some() {
+                    StatusCode::CONFLICT
+                } else if matches!(
+                    value["status"].as_str(),
+                    Some("succeeded" | "blocked" | "failed" | "cancelled")
+                ) {
+                    StatusCode::OK
+                } else {
+                    StatusCode::ACCEPTED
+                },
+                value,
+            ),
+            Err(response) => *response,
+        };
+    }
+    if input.confirm_format {
+        return invalid("只有指定磁带的创建请求可以确认初始化");
     }
     let result = permitted(
         &owner,
@@ -553,6 +646,46 @@ pub(super) async fn create(
             }
         }
         Err(response) => *response,
+    }
+}
+
+pub(super) async fn create_status(
+    State(ctx): State<Arc<Context>>,
+    Path((serial, id)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    let _permit = match budget(&ctx) {
+        Ok(permit) => permit,
+        Err(response) => return *response,
+    };
+    let expected = match route(&ctx, &serial) {
+        Ok(route) => route,
+        Err(response) => return *response,
+    };
+    if let Err(response) = namespace(request.headers(), expected) {
+        return *response;
+    }
+    let logical = match logical_scope(request.headers()) {
+        Ok(logical) => logical,
+        Err(response) => return *response,
+    };
+    let id = match canonical_id(&id) {
+        Ok(id) => id,
+        Err(response) => return *response,
+    };
+    match ctx
+        .catalog
+        .selected_pool_create_status(&serial, expected, logical, id)
+        .await
+    {
+        Ok(Some(value)) => reply(StatusCode::OK, value),
+        Ok(None) => reply(
+            StatusCode::NOT_FOUND,
+            json!({
+                "error":"pool_creation_not_found","detail":"指定带库范围内没有该建池请求"
+            }),
+        ),
+        Err(error) => failure(error),
     }
 }
 

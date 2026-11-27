@@ -10,17 +10,19 @@ pub(crate) use group_attempt::OriginalAttemptObservation;
 
 #[path = "reclaim_index_augmentation.rs"]
 mod index_augmentation;
+pub(in crate::managed_catalog) use index_augmentation::isolation;
 pub(in crate::managed_catalog) use index_augmentation::require_checkpoint_at as require_index_checkpoint_at;
 pub(in crate::managed_catalog) use index_augmentation::require_publication_at as require_index_publication_at;
-pub(in crate::managed_catalog) use index_augmentation::isolation;
 pub(crate) use index_augmentation::{
-    OriginalObservationPermit, ReclaimExecutionGate,
-    OriginalCheckpointContext, OriginalCheckpointPublication,
-    ReclaimGroupExecution, ReclaimGroupMemberReadContext, ReclaimGroupObservation,
-    ReclaimIndexAugmentation, ReclaimIndexIntent,
+    OriginalCheckpointContext, OriginalCheckpointPublication, OriginalObservationPermit,
+    ReclaimExecutionGate, ReclaimGroupExecution, ReclaimGroupMemberReadContext,
+    ReclaimGroupObservation, ReclaimIndexAugmentation, ReclaimIndexIntent,
 };
 
-pub(in crate::managed_catalog) use index_augmentation::{GroupFileReference, group_member_coverage_at, group_member_coverage_in_at, GroupCoverageMode, GroupRetirementPins};
+pub(in crate::managed_catalog) use index_augmentation::{
+    GroupCoverageMode, GroupFileReference, GroupRetirementPins, group_member_coverage_at,
+    group_member_coverage_in_at,
+};
 
 #[path = "reclaim_group_layout.rs"]
 mod group_layout;
@@ -71,8 +73,12 @@ impl ReclaimCopyGroupLimits {
             bytes: bytes.min(MAX_BYTES),
         })
     }
-    pub(crate) fn members(self) -> u8 { self.members }
-    pub(crate) fn bytes(self) -> u64 { self.bytes }
+    pub(crate) fn members(self) -> u8 {
+        self.members
+    }
+    pub(crate) fn bytes(self) -> u64 {
+        self.bytes
+    }
     fn validate(self) -> Result<()> {
         if self.members == 0
             || self.members > MAX_MEMBERS
@@ -223,7 +229,12 @@ impl Header {
         match (self.phase, self.execution_epoch) {
             (Phase::Selecting | Phase::Prepared, None) if self.current_attempt.is_none() => {}
             (Phase::Admitted | Phase::Settling | Phase::Closed, Some(epoch))
-                if epoch > 0 && epoch <= self.owner && self.current_attempt.as_deref().is_some_and(|id| parse_uuid(id).is_ok()) => {}
+                if epoch > 0
+                    && epoch <= self.owner
+                    && self
+                        .current_attempt
+                        .as_deref()
+                        .is_some_and(|id| parse_uuid(id).is_ok()) => {}
             _ => return Err(CatalogError::Corrupt("回收组执行代次或未知阶段无效")),
         }
         if matches!(self.phase, Phase::Settling | Phase::Closed) && self.commit.is_none() {
@@ -569,7 +580,7 @@ async fn load_at(
     if group.header.version == 3 {
         index_augmentation::extend_expected_at(tr, parent, &group, &mut expected).await?;
     }
-    group_attempt::extend_expected_at(tr,parent,&group,&mut expected).await?;
+    group_attempt::extend_expected_at(tr, parent, &group, &mut expected).await?;
     if all.next.is_some()
         || all.items.len() != expected.len()
         || all.items.iter().any(|(key, _)| !expected.contains(key))
@@ -775,7 +786,6 @@ fn save_header(
     Ok(())
 }
 
-
 /// A prepared group has no physical attempt yet. Once admitted, advance its
 /// live owner only through the original attempt validator, in this transaction.
 async fn adopt_group_owner_at(
@@ -812,10 +822,18 @@ impl ManagedCatalog {
                     requests::retry_result(
                         async {
                             parent_at(&tr, parent, owner).await?;
-                            source::group_only::require_ready_at(&tr,parent,owner,Some((limits.bytes(),u64::MAX))).await?;
+                            source::group_only::require_ready_at(
+                                &tr,
+                                parent,
+                                owner,
+                                Some((limits.bytes(), u64::MAX)),
+                            )
+                            .await?;
                             source::group_only::require_selector_at(&tr, parent, limits, choice)
                                 .await?;
-                            let id=source::group_only::planned_group_at(&tr,parent).await?.unwrap_or(id);
+                            let id = source::group_only::planned_group_at(&tr, parent)
+                                .await?
+                                .unwrap_or(id);
                             let mut group = load_at(&tr, parent, owner).await?;
                             if let Some(current) = &mut group {
                                 if current.header.owner != owner {
@@ -1634,7 +1652,8 @@ impl ManagedCatalog {
         id: Uuid,
         previous: ActiveIndexIdentity,
     ) -> Result<ReclaimCopyGroupAdmission> {
-        let result = self.db
+        let result = self
+            .db
             .run(|tr, _| {
                 Box::pin(async move {
                     requests::retry_result(
@@ -1645,7 +1664,8 @@ impl ManagedCatalog {
                             if group.id() != id {
                                 return Err(CatalogError::Invalid("准入须复用原组和batch"));
                             }
-                            source::group_only::require_admission_at(&tr,parent,owner,&group).await?;
+                            source::group_only::require_admission_at(&tr, parent, owner, &group)
+                                .await?;
                             for member in &group.members {
                                 original_child_at(&tr, parent, owner, member).await?;
                             }
@@ -1653,7 +1673,7 @@ impl ManagedCatalog {
                                 index_augmentation::require_intent_at(&tr, parent, &group).await?;
                             }
                             if matches!(group.header.phase, Phase::Admitted | Phase::Settling) {
-                                group_attempt::adopt_at(&tr,parent,&mut group,owner).await?;
+                                group_attempt::adopt_at(&tr, parent, &mut group, owner).await?;
                                 save_header(&tr, parent, &group)?;
                                 return Ok(ReclaimCopyGroupAdmission {
                                     group,
@@ -1677,7 +1697,7 @@ impl ManagedCatalog {
                             group.header.owner = owner;
                             group.header.execution_epoch = Some(owner);
                             group.header.current_attempt = Some(group.id().to_string());
-                            group_attempt::create_at(&tr,parent,&group).await?;
+                            group_attempt::create_at(&tr, parent, &group).await?;
                             save_header(&tr, parent, &group)?;
                             Ok(ReclaimCopyGroupAdmission {
                                 group,
@@ -1691,7 +1711,10 @@ impl ManagedCatalog {
             })
             .await?;
         #[cfg(test)]
-        if result.as_ref().is_ok_and(|admission| !admission.needs_observation()) {
+        if result
+            .as_ref()
+            .is_ok_and(|admission| !admission.needs_observation())
+        {
             group_attempt::creation_fault::after_admission_commit(parent)?;
         }
         result

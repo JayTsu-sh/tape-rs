@@ -1,7 +1,7 @@
 //! Prepare metadata changes before the first mutation. Task result, notification,
 //! and pool indexes commit together; device work belongs to another actor.
 use super::super::logical_libraries::{
-    pool_binding_key, pool_library_at, pool_membership_key, require_library_at,
+    pool_binding_key, pool_library_at, pool_membership_key, require_business_scope_at,
 };
 use super::*;
 
@@ -25,18 +25,15 @@ pub(super) async fn require_scope(
     change: &Value,
 ) -> Result<Option<Uuid>> {
     let id = pool_id(change);
+    replicated_pools::require_independent_at(tr, ns, id).await?;
     let logical = change["logical_library"]
         .as_str()
         .map(|raw| Uuid::parse_str(raw).expect("validated logical library UUID"));
     if pool_library_at(tr, ns, serial, id).await? != logical {
         return Err(CatalogError::Invalid("池不属于请求的逻辑带库范围"));
     }
-    if let Some(logical) = logical {
-        require_library_at(tr, ns, serial, logical).await?;
-        require_pool_library(tr, ns, id, serial).await?;
-    } else {
-        super::super::logical_libraries::require_explicit_scope_at(tr, serial).await?;
-    }
+    require_business_scope_at(tr, ns, serial, logical).await?;
+    require_pool_library(tr, ns, id, serial).await?;
     Ok(logical)
 }
 fn next_revision(change: &Value) -> Result<u64> {

@@ -79,7 +79,7 @@ async fn request_scoped(
 
 #[test]
 #[ignore = "需要显式隔离FDB_TEST_CLUSTER；仅回环HTTP，不访问设备"]
-fn native_pool_discovery_rejects_before_logical_activation() {
+fn native_pool_discovery_uses_physical_scope_before_logical_activation() {
     let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
     let _network = unsafe { foundationdb::boot() };
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
@@ -91,16 +91,168 @@ fn native_pool_discovery_rejects_before_logical_activation() {
         let proof = crate::managed_catalog::verify_native_barriers(&serial, challenge, &replies).unwrap();
         let route = catalog.initialize_native_library(ns, &proof).await.unwrap();
         let ctx = Arc::new(Context {
-            catalog, routes: BTreeMap::from([(serial.clone(), route)]), owner: None,
+            catalog: catalog.clone(), routes: BTreeMap::from([(serial.clone(), route)]), owner: None,
             upload_budget: None, notify_streams: Arc::new(Semaphore::new(1)),
             notify_requests: Arc::new(Semaphore::new(1)), admin_requests: Arc::new(Semaphore::new(32)),
         });
         let (address, server) = serve(ctx).await;
         let path = format!("/libraries/{serial}/admin/pools");
-        for logical in [None, Some(Uuid::new_v4())] {
-            let (status, _) = request_scoped(&address, "GET", &path, Some(&ns.to_string()), logical, b"").await;
-            assert_eq!(status, 400);
+        let (status, page) = request(&address, "GET", &path, Some(&ns.to_string()), b"").await;
+        assert_eq!(status, 200, "{page}");
+        assert_eq!(page["items"], json!([]));
+        assert_eq!(request_scoped(&address, "GET", &path, Some(&ns.to_string()), Some(Uuid::new_v4()), b"").await.0, 400);
+        let preview = format!("/libraries/{serial}/admin/pool-create/preview");
+        let body = |tapes: &[&str]| json!({"version":1,"name":"archive","file_limit":100,"tapes":tapes}).to_string();
+        let run_preview = async |tapes: &[&str]| request(&address, "POST", &preview, Some(&ns.to_string()), body(tapes).as_bytes()).await;
+        assert_eq!(run_preview(&["NEW001L8"]).await.0, 503);
+        let owner = route.initial_owner_epoch;
+        let mut observation = json!({"library_serial":serial,"owner":2,"round":owner,
+            "observed_at":(chrono::Utc::now()-chrono::TimeDelta::minutes(3)).to_rfc3339(),
+            "volumes":[
+                {"barcode":"NEW001L8","address":1001,"element_type":2,"medium_type":1,"source_address":null,"home_slot":1},
+                {"barcode":"CLN001L1","address":1002,"element_type":2,"medium_type":2,"source_address":null,"home_slot":2},
+                {"barcode":"IE0001L8","address":101,"element_type":3,"medium_type":1,"source_address":null,"home_slot":null}],
+            "drives":[{"serial":"SIMDRV0000","address":1,"barcode":null}],
+            "num_of_slots":3,"num_of_ieslots":1,"slot_layout":{"storage_start":1001,"ie_start":101},
+            "scsi_vendor_id":"SIM","scsi_product_id":"SIM-CHANGER","scsi_firmware_revision":"0001"});
+        catalog.record_active_library_inventory(&serial, route, owner, &observation).await.unwrap();
+        assert_eq!(run_preview(&["NEW001L8"]).await.0, 503);
+        observation["observed_at"] = json!(crate::ltfs::label::ltfs_time_now());
+        catalog.record_active_library_inventory(&serial, route, owner, &observation).await.unwrap();
+        assert_eq!(run_preview(&["NEW001L8", "NEW001L8"]).await.0, 400);
+        let (status, result) = run_preview(&["NEW001L8", "CLN001L1", "MISSING", "IE0001L8"]).await;
+        assert_eq!(status, 200, "{result}");
+        assert_eq!(result["status"], "blocked");
+        assert_eq!(result["tapes"][0]["status"], "eligible");
+        assert_eq!(result["tapes"][1]["status"], "cleaning");
+        assert_eq!(result["tapes"][2]["status"], "not_observed");
+        assert_eq!(result["tapes"][3]["status"], "not_in_storage");
+        let (status, result) = run_preview(&["NEW001L8"]).await;
+        assert_eq!(status, 200, "{result}");
+        assert_eq!(result["status"], "eligible");
+        let sdk_address = address.clone();
+        let sdk_serial = serial.clone();
+        let sdk = tokio::task::spawn_blocking(move || {
+            crate::client::fdb::FdbClient::new([sdk_address]).unwrap()
+                .preview_pool_create(&sdk_serial, &ns.to_string(), None, "archive", 100, &["NEW001L8".to_owned()])
+                .unwrap()
+        }).await.unwrap();
+        assert_eq!(sdk, result);
+        observation["volumes"][0]["address"] = json!(1003);
+        observation["volumes"][0]["home_slot"] = json!(3);
+        observation["observed_at"] = json!(crate::ltfs::label::ltfs_time_now());
+        catalog.record_active_library_inventory(&serial, route, owner, &observation).await.unwrap();
+        let (status, moved) = run_preview(&["NEW001L8"]).await;
+        assert_eq!(status, 200, "{moved}");
+        assert_eq!(moved["tapes"][0]["home_address"], 1003);
+
+        // An unselected cartridge is already loaded from the apparently empty
+        // slot 1001. A second drive cannot use that slot as its home as well.
+        let mut conflicting = observation.clone();
+        conflicting["volumes"][0]["address"] = json!(1);
+        conflicting["volumes"][0]["element_type"] = json!(4);
+        conflicting["volumes"][0]["source_address"] = json!(1001);
+        conflicting["volumes"][0]["home_slot"] = Value::Null;
+        conflicting["volumes"].as_array_mut().unwrap().push(json!({
+            "barcode":"OTHER1L8","address":2,"element_type":4,"medium_type":1,"source_address":1001,"home_slot":null
+        }));
+        conflicting["drives"] = json!([
+            {"serial":"SIMDRV0000","address":1,"barcode":"NEW001L8"},
+            {"serial":"SIMDRV0001","address":2,"barcode":"OTHER1L8"}
+        ]);
+        conflicting["observed_at"] = json!(crate::ltfs::label::ltfs_time_now());
+        catalog.record_active_library_inventory(&serial, route, owner, &conflicting).await.unwrap();
+        let (status, blocked) = run_preview(&["NEW001L8"]).await;
+        assert_eq!(status, 200, "{blocked}");
+        assert_eq!(blocked["status"], "blocked");
+        assert_eq!(blocked["tapes"][0]["status"], "home_occupied");
+        observation["observed_at"] = json!(crate::ltfs::label::ltfs_time_now());
+        catalog.record_active_library_inventory(&serial, route, owner, &observation).await.unwrap();
+        let (status, page) = request(&address, "GET", &path, Some(&ns.to_string()), b"").await;
+        assert_eq!(status, 200, "{page}");
+        assert_eq!(page["items"], json!([]));
+        let pool = crate::managed_catalog::PoolRecord {
+            id: Uuid::new_v4(), library_serial: serial.clone(), name: "archive".into(),
+            file_limit: 100, created_at_millis: 1, revision: 1, policy: Default::default(),
+        };
+        catalog.create_admin_pool(&serial, route, owner, None, &pool).await.unwrap();
+        observation["volumes"].as_array_mut().unwrap().push(json!({
+            "barcode":"SELECTL8","address":1001,"element_type":2,"medium_type":1,"source_address":null,"home_slot":1
+        }));
+        observation["observed_at"] = json!(crate::ltfs::label::ltfs_time_now());
+        catalog.record_active_library_inventory(&serial, route, owner, &observation).await.unwrap();
+        let candidate = |name: &str| crate::managed_catalog::PoolRecord {
+            id: Uuid::new_v4(), library_serial: serial.clone(), name: name.into(),
+            file_limit: 100, created_at_millis: 1, revision: 1, policy: Default::default(),
+        };
+        let first = candidate("selected-first");
+        let second = candidate("selected-second");
+        let tapes = vec!["SELECTL8".into()];
+        let rejected = catalog.admit_selected_pool(route, owner, None, &first,
+            &["SELECTL8".into(), "CLN001L1".into()], false).await.unwrap();
+        assert_eq!(rejected["status"], "blocked");
+        let (one, two) = tokio::join!(
+            catalog.admit_selected_pool(route, owner, None, &first, &tapes, false),
+            catalog.admit_selected_pool(route, owner, None, &second, &tapes, false),
+        );
+        let (one, two) = (one.unwrap(), two.unwrap());
+        let (accepted, rejected, saved) = if one["status"] == "queued" {
+            (one, two, first)
+        } else {
+            (two, one, second)
+        };
+        assert_eq!(accepted["status"], "queued");
+        assert_eq!(accepted["tapes"][0]["source_address"], 1001);
+        assert_eq!(rejected["status"], "blocked");
+        assert_eq!(rejected["tapes"][0]["status"], "reserved");
+        assert_eq!(catalog.admit_selected_pool(route, owner, None, &saved, &tapes, false)
+            .await.unwrap(), accepted);
+        assert_eq!(request(&address, "GET", &format!("{path}/{}", saved.id), Some(&ns.to_string()), b"").await.0, 404);
+        catalog.advance_selected_pool_create(&serial, route, owner).await.unwrap();
+        let started = catalog.selected_pool_create_status(&serial, route, None, saved.id).await.unwrap().unwrap();
+        let active = &started["active_tape"];
+        let operation = active["operation"].as_str().unwrap().parse().unwrap();
+        let epoch = active["epoch"].as_u64().unwrap();
+        assert_eq!(request(&address, "GET", &format!("{path}/{}", saved.id), Some(&ns.to_string()), b"").await.0, 404);
+        for medium in observation["volumes"].as_array_mut().unwrap() {
+            if medium["barcode"] == "SELECTL8" {
+                medium["address"] = json!(1003);
+                medium["home_slot"] = json!(3);
+            } else if medium["barcode"] == "NEW001L8" {
+                medium["address"] = json!(1001);
+                medium["home_slot"] = json!(1);
+            }
         }
+        observation["observed_at"] = json!(crate::ltfs::label::ltfs_time_now());
+        catalog.record_active_library_inventory(&serial, route, owner, &observation).await.unwrap();
+        assert!(catalog.start_native_media(&serial, route, owner, epoch, operation).await.unwrap().is_none());
+        let paused = catalog.selected_pool_create_status(&serial, route, None, saved.id).await.unwrap().unwrap();
+        assert_eq!(paused["active_tape"]["status"], "queued");
+        assert!(paused["active_tape"]["checkpoint"]["detail"].as_str().unwrap().contains("SELECTL8"));
+        assert_eq!(paused["tapes"][0]["source_address"], 1001);
+        assert_eq!(paused["tapes"][0]["home_address"], 1001);
+        let cancelled = catalog.cancel_management(&serial, route, owner, epoch, operation).await.unwrap();
+        assert_eq!(cancelled["status"], "cancelled");
+        catalog.advance_selected_pool_create(&serial, route, owner).await.unwrap();
+        let terminal = catalog.selected_pool_create_status(&serial, route, None, saved.id).await.unwrap().unwrap();
+        assert_eq!(terminal["status"], "cancelled");
+        assert_eq!(terminal["active_tape"]["operation"], json!(operation));
+        assert_eq!(catalog.admit_selected_pool(route, owner, None, &saved, &tapes, false).await.unwrap(), terminal);
+        let replacement = candidate("replacement");
+        assert_eq!(catalog.admit_selected_pool(route, owner, None, &replacement, &tapes, false).await.unwrap()["status"], "queued");
+        let operation = Uuid::new_v4();
+        let import = crate::managed_catalog::ManagementRequest::parse(json!({
+            "version":1,"library":serial,"namespace":ns,"epoch":1,"operation":operation,
+            "change":{"kind":"media-import","pool":pool.id,"barcode":"NEW001L8","volume":null,"path":"/","merge_tapes":true}
+        })).unwrap();
+        catalog.admit_management(&serial, route, owner, &import).await.unwrap();
+        assert!(catalog.start_native_media(&serial, route, owner, 1, operation).await.unwrap().is_some());
+        let (status, result) = run_preview(&["NEW001L8"]).await;
+        assert_eq!(status, 200, "{result}");
+        assert_eq!(result["status"], "blocked");
+        assert_eq!(result["name_available"], false);
+        assert_eq!(result["tapes"][0]["status"], "assigned");
+
         server.abort();
     });
 }
@@ -154,7 +306,8 @@ async fn run_pool_api(cluster: &str) {
         b"",
     )
     .await;
-    assert_eq!(code, 400, "{list}");
+    assert_eq!(code, 200, "{list}");
+    assert_eq!(list["items"], json!([]));
     assert_eq!(
         request(&a, "GET", &format!("{root}/pools"), None, b"")
             .await
@@ -245,10 +398,122 @@ async fn run_pool_api(cluster: &str) {
         ..(*readonly).clone()
     });
     let (b, tb) = serve(owner.clone()).await;
+    let physical_pool = Uuid::new_v4();
+    let body = json!({"version":1,"id":physical_pool,"name":"physical-pool","file_limit":100,
+        "created_at_millis":1_793_405_000_123_u64,"policy":{"media_restriction":"none","mount_limit":0,
+        "low_space_warning_enabled":true,"low_space_warning_threshold":0,"no_space_warning_enabled":true}})
+        .to_string();
+    let pools_path = format!("{root}/pools");
+    for expected in [201, 200] {
+        let (code, receipt) =
+            request(&b, "POST", &pools_path, Some(&namespace), body.as_bytes()).await;
+        assert_eq!(code, expected, "{receipt}");
+        assert_eq!(receipt["pool"]["id"], json!(physical_pool));
+    }
+    let (code, page) = request(&a, "GET", &pools_path, Some(&namespace), b"").await;
+    assert_eq!(code, 200, "{page}");
+    assert_eq!(page["items"][0]["id"], json!(physical_pool));
+    let (code, details) = request(
+        &a,
+        "GET",
+        &format!("{pools_path}/physical-pool"),
+        Some(&namespace),
+        b"",
+    )
+    .await;
+    assert_eq!(code, 200, "{details}");
+    assert_eq!(details["pool"]["id"], json!(physical_pool));
+    let address = a.clone();
+    let library = serial.clone();
+    tokio::task::spawn_blocking(move || {
+        let client = crate::client::fdb::FdbClient::new([address.as_str()]).unwrap();
+        let directory = client.stat(&library, physical_pool, "/").unwrap().unwrap();
+        assert_eq!(directory["kind"], "directory");
+        let scoped = client.with_logical_library(Uuid::new_v4()).unwrap();
+        assert!(scoped.stat(&library, physical_pool, "/").unwrap().is_none());
+    })
+    .await
+    .unwrap();
+    let pool_path = format!("{pools_path}/{physical_pool}");
+    let mut physical_cursor = None;
+    for (method, change) in [
+        (
+            "PATCH",
+            json!({"kind":"pool","id":physical_pool,"revision":1,"patch":{"file_limit":101}}),
+        ),
+        (
+            "DELETE",
+            json!({"kind":"pool-delete","id":physical_pool,"revision":2}),
+        ),
+    ] {
+        let operation = Uuid::new_v4();
+        let intent = json!({"version":1,"library":serial,"namespace":namespace,"epoch":1,
+            "operation":operation,"change":change});
+        let (code, task) = request(
+            &b,
+            method,
+            &pool_path,
+            Some(&namespace),
+            intent.to_string().as_bytes(),
+        )
+        .await;
+        assert_eq!(code, 202, "{task}");
+        pools::poll(&owner, &serial, &mut physical_cursor)
+            .await
+            .unwrap();
+        let (code, finished) = request(
+            &a,
+            "GET",
+            &format!("{root}/tasks/1/{operation}"),
+            Some(&namespace),
+            b"",
+        )
+        .await;
+        assert_eq!(code, 200, "{finished}");
+        assert_eq!(finished["status"], "succeeded", "{finished}");
+    }
+    assert_eq!(
+        request(&a, "GET", &pool_path, Some(&namespace), b"")
+            .await
+            .0,
+        404
+    );
+    let (code, receipt) = request(&b, "POST", &pools_path, Some(&namespace), body.as_bytes()).await;
+    assert_eq!(code, 200, "{receipt}");
+    assert_eq!(receipt["pool"]["revision"], 1);
+    assert_eq!(
+        request(&a, "GET", &pool_path, Some(&namespace), b"")
+            .await
+            .0,
+        404
+    );
     catalog
         .enable_logical_business_fixture(&serial)
         .await
         .unwrap();
+    let (code, receipt) = request(&b, "POST", &pools_path, Some(&namespace), body.as_bytes()).await;
+    assert_eq!(code, 200, "{receipt}");
+    assert_eq!(receipt["pool"]["id"], json!(physical_pool));
+    let mut new_pool: Value = serde_json::from_str(&body).unwrap();
+    new_pool["id"] = json!(Uuid::new_v4());
+    assert_eq!(
+        request(
+            &b,
+            "POST",
+            &pools_path,
+            Some(&namespace),
+            new_pool.to_string().as_bytes()
+        )
+        .await
+        .0,
+        400
+    );
+    assert_eq!(
+        request(&a, "GET", &pools_path, Some(&namespace), b"")
+            .await
+            .0,
+        400
+    );
     let (logical, assignment_pool) =
         logical_library_creation(&catalog, &serial, route, &b, &namespace).await;
     let scoped =
@@ -1095,6 +1360,35 @@ async fn logical_library_creation(
     );
     assert_eq!(listed["inventory"]["status"], "current");
 
+    let mut with_tapes = observation.clone();
+    with_tapes["volumes"] = json!([
+        {"barcode":"LOCAL1L8","address":1001,"element_type":2,"medium_type":1,"source_address":null,"home_slot":1},
+        {"barcode":"OTHER1L8","address":1002,"element_type":2,"medium_type":1,"source_address":null,"home_slot":2},
+    ]);
+    catalog
+        .record_active_library_inventory(serial, route, epoch, &with_tapes)
+        .await
+        .unwrap();
+    let preview = format!("/libraries/{serial}/admin/pool-create/preview");
+    let proposal = json!({"version":1,"name":"scope-preview","file_limit":100,"tapes":["LOCAL1L8","OTHER1L8"]}).to_string();
+    let (code, result) = request_scoped(
+        address,
+        "POST",
+        &preview,
+        Some(namespace),
+        Some(id),
+        proposal.as_bytes(),
+    )
+    .await;
+    assert_eq!(code, 200, "{result}");
+    assert_eq!(result["status"], "blocked");
+    assert_eq!(result["tapes"][0]["status"], "eligible");
+    assert_eq!(result["tapes"][1]["status"], "out_of_scope");
+    catalog
+        .record_active_library_inventory(serial, route, epoch, &observation)
+        .await
+        .unwrap();
+
     // Exercise the same public operation through the blocking Rust SDK.
     let endpoint = address.to_owned();
     let scoped_serial = serial.to_owned();
@@ -1625,4 +1919,85 @@ async fn logical_library_creation(
         id,
         Uuid::parse_str(second_pool["pool"]["id"].as_str().unwrap()).unwrap(),
     )
+}
+
+#[tokio::test]
+#[ignore = "需要隔离 FDB_TEST_CLUSTER；回环 HTTP 和目录，不访问设备"]
+async fn replicated_pool_publishes_two_physical_members_together_and_replays() {
+    let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+    let _network = unsafe { foundationdb::boot() };
+    let catalog = Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());
+    let mut routes = BTreeMap::new();
+    let mut members = Vec::new();
+    for index in 0..2 {
+        let ns = Uuid::new_v4();
+        let serial = format!("REPLICA-{ns}");
+        let challenge = Uuid::new_v4();
+        let replies = (1..=3)
+            .map(|id| {
+                json!({
+                    "version":1,"library_serial":serial,"challenge":challenge,"node_id":id,
+                    "term":7,"leader":2,"role":if id==2{"Leader"}else{"Follower"},
+                    "members":{"1":"a:1","2":"b:2","3":"c:3"},"quiesce_index":89,"frozen_index":90,
+                    "applied_index":92,"executor_absent":true,"catalog_pending":false,
+                    "shutting_down":false,"catalog_empty":true,
+                })
+            })
+            .collect::<Vec<_>>();
+        let proof =
+            crate::managed_catalog::verify_native_barriers(&serial, challenge, &replies).unwrap();
+        let route = catalog.initialize_native_library(ns, &proof).await.unwrap();
+        members.push(json!({"library_serial":serial,"namespace":ns,
+            "pool_id":Uuid::new_v4(),"name":format!("member-{index}")}));
+        routes.insert(serial, route);
+    }
+    let ctx = Arc::new(Context {
+        catalog: catalog.clone(),
+        routes: routes.clone(),
+        owner: Some(OwnerRuntime {
+            libraries: BTreeMap::new(),
+            peers: HashMap::new(),
+            requests: Arc::new(Semaphore::new(1)),
+        }),
+        upload_budget: None,
+        notify_streams: Arc::new(Semaphore::new(1)),
+        notify_requests: Arc::new(Semaphore::new(1)),
+        admin_requests: Arc::new(Semaphore::new(32)),
+    });
+    let (address, server) = serve(ctx).await;
+    let id = Uuid::new_v4();
+    let mut input = json!({"version":1,"id":id,"name":format!("replica-{id}"),"created_at_millis":1,"members":members});
+    let base = "/admin/replicated-pools";
+    let status = format!("{base}/{id}");
+    let (code, result) = request(&address, "POST", base, None, input.to_string().as_bytes()).await;
+    assert_eq!(code, 202, "{result}");
+    assert_eq!(result["id"], json!(id));
+    for member in &members {
+        let serial = member["library_serial"].as_str().unwrap();
+        let ns = member["namespace"].as_str().unwrap();
+        let pool = member["pool_id"].as_str().unwrap();
+        let path = format!("/libraries/{serial}/admin/pools/{pool}");
+        assert_eq!(request(&address, "GET", &path, Some(ns), b"").await.0, 404);
+    }
+    let (serial, route) = routes.first_key_value().unwrap();
+    catalog
+        .advance_selected_pool_create(serial, *route, route.initial_owner_epoch)
+        .await
+        .unwrap();
+    let (code, saved) = request(&address, "GET", &status, None, b"").await;
+    assert_eq!(code, 200, "{saved}");
+    assert_eq!(saved["status"], "succeeded");
+    assert_eq!(saved["failure_domains"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        request(&address, "POST", base, None, input.to_string().as_bytes()).await,
+        (200, saved)
+    );
+    input["name"] = json!("different");
+    assert_eq!(
+        request(&address, "POST", base, None, input.to_string().as_bytes())
+            .await
+            .0,
+        409
+    );
+    server.abort();
 }

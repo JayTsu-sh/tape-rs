@@ -56,6 +56,8 @@ pub const XATTRS: &[&str] = &[
 /// 对 ltfsd 的访问。`ClientBackend` 是实际实现；测试用内存实现。
 mod fdb;
 pub use fdb::FdbBackend;
+mod replicated;
+pub use replicated::{ReplicaUploadReceipt, ReplicatedBackend};
 
 #[derive(Debug, Clone, Default)]
 pub struct DirectoryListing {
@@ -83,6 +85,7 @@ impl UploadTarget {
 pub enum UploadOutcome {
     Native { committed: bool },
     Fdb(crate::client::fdb::CommittedUpload),
+    Replicated(ReplicaUploadReceipt),
 }
 
 /// 同一份本地内容的上传状态；原日志租约随共享缓存存活。
@@ -757,24 +760,7 @@ impl<B: Backend> TapeFs<B> {
                 {
                     return Err(libc::EIO);
                 }
-                let mut inodes = lock(&self.inodes);
-                if inodes
-                    .by_fdb_identity
-                    .get(&(namespace, inode))
-                    .is_some_and(|ino| *ino != data.ino)
-                {
-                    return Err(libc::ESTALE);
-                }
-                let record = inodes.by_ino.get_mut(&data.ino).ok_or(libc::ESTALE)?;
-                if record
-                    .fdb_identity
-                    .is_some_and(|id| id != (namespace, inode))
-                {
-                    return Err(libc::ESTALE);
-                }
-                record.fdb_identity = Some((namespace, inode));
-                inodes.by_fdb_identity.insert((namespace, inode), data.ino);
-                drop(inodes);
+                self.bind_upload_inode(data.ino, namespace, inode)?;
                 let attributes = &details["attributes"];
                 *lock(&data.source) = Some(crate::client::FileStat {
                     length: details["size"].as_u64().ok_or(libc::EIO)?,
@@ -795,9 +781,52 @@ impl<B: Backend> TapeFs<B> {
                 *lock(&data.content) = Some((length, digest));
                 Ok(true)
             }
+            (UploadTarget::Fdb(_), UploadOutcome::Replicated(receipt)) => {
+                let committed = replicated::committed_stat(&receipt);
+                let FileVersion::Fdb {
+                    namespace, inode, ..
+                } = committed.version
+                else {
+                    return Err(libc::EIO);
+                };
+                if receipt.input.path != path
+                    || committed.length != length
+                    || committed.sha256 != digest
+                    || state.location.map(|(_, _, id)| id) != Some(receipt.input.operation)
+                {
+                    return Err(libc::EIO);
+                }
+                self.bind_upload_inode(data.ino, namespace, inode)?;
+                let version = committed.version;
+                *lock(&data.source) = Some(committed);
+                *state = UploadState::new(UploadTarget::Fdb(UploadCondition::Replace(version)));
+                *lock(&data.content) = Some((length, digest));
+                Ok(true)
+            }
             // 原生的暂存/布尔结果不能确认一次 FDB 操作。
             _ => Err(libc::EIO),
         }
+    }
+
+    fn bind_upload_inode(&self, ino: u64, namespace: uuid::Uuid, inode: uuid::Uuid) -> Res<()> {
+        let mut inodes = lock(&self.inodes);
+        if inodes
+            .by_fdb_identity
+            .get(&(namespace, inode))
+            .is_some_and(|existing| *existing != ino)
+        {
+            return Err(libc::ESTALE);
+        }
+        let record = inodes.by_ino.get_mut(&ino).ok_or(libc::ESTALE)?;
+        if record
+            .fdb_identity
+            .is_some_and(|id| id != (namespace, inode))
+        {
+            return Err(libc::ESTALE);
+        }
+        record.fdb_identity = Some((namespace, inode));
+        inodes.by_fdb_identity.insert((namespace, inode), ino);
+        Ok(())
     }
 
     fn handle(&self, fh: u64) -> Res<Arc<Mutex<Handle>>> {

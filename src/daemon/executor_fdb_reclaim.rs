@@ -3,19 +3,21 @@
 use super::*;
 #[path = "executor_fdb_reclaim_driver.rs"]
 mod driver;
-pub(super) use driver::advance;
 pub(super) use driver::PreparedReclaimFormatSource;
-#[cfg(test)]
-pub(super) use driver::probe_original_for_test;
+pub(super) use driver::advance;
 #[cfg(test)]
 pub(super) use driver::arm_original_probe_seal_for_test;
 #[cfg(test)]
-pub(super) use driver::{arm_original_checkpoint_s4_stop_for_test, OriginalS4StopFacts};
+pub(super) use driver::probe_original_for_test;
+pub(in crate::daemon) use driver::{
+    FreshReclaimGroupIo, ObserveReclaimGroupIo, OriginalAttemptProbeIo,
+};
+#[cfg(test)]
+pub(super) use driver::{OriginalS4StopFacts, arm_original_checkpoint_s4_stop_for_test};
 #[cfg(test)]
 pub(super) use driver::{
     ReadbackSealMode, arm_readback_seal_for_test, observe_group_read_for_test,
 };
-pub(in crate::daemon) use driver::{OriginalAttemptProbeIo, FreshReclaimGroupIo, ObserveReclaimGroupIo};
 
 /// Claim and classify every parent using FDB only. A protected original task
 /// keeps generic recovery away from its media, even if it is not the first

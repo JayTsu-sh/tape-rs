@@ -31,6 +31,20 @@ impl ManagedCatalog {
         control::require_pool_writable_at(&tr, namespace, pool).await
     }
 
+    pub(crate) async fn check_active_upload_spec_gate(
+        &self,
+        serial: &str,
+        route: ActiveLibraryRoute,
+        owner: u64,
+        spec: &ActiveUploadSpec,
+    ) -> Result<()> {
+        let tr = self.db.create_trx()?;
+        let ns = routing::require_runtime_active_owner(&tr, serial, route, owner).await?;
+        logical_libraries::require_business_pool_at(&tr, ns, serial, spec.pool_id).await?;
+        logical_libraries::require_pool_inventory_ready_at(&tr, ns, serial, spec.pool_id).await?;
+        require_upload_pool_at(&tr, ns, spec).await
+    }
+
     pub async fn prepare_active_upload(
         &self,
         serial: &str,
@@ -44,10 +58,19 @@ impl ManagedCatalog {
         let namespace =
             routing::require_runtime_active_owner(&tr, serial, route, owner_epoch).await?;
         logical_libraries::require_business_pool_at(&tr, namespace, serial, spec.pool_id).await?;
-        control::require_pool_writable_at(&tr, namespace, spec.pool_id).await?;
+        require_upload_pool_at(&tr, namespace, spec).await?;
         logical_libraries::require_pool_inventory_ready_at(&tr, namespace, serial, spec.pool_id)
             .await?;
         prepare_upload_at(&tr, namespace, serial, owner_epoch, barcode, spec).await
+    }
+}
+
+async fn require_upload_pool_at(tr: &Transaction, ns: Uuid, spec: &ActiveUploadSpec) -> Result<()> {
+    if control::replicated_pools::archive::authorize_spec(tr, ns, spec).await? {
+        control::require_pool_mutation_barriers_at(tr, ns, spec.pool_id).await?;
+        control::reclaim::require_pool_write_at(tr, ns, spec.pool_id).await
+    } else {
+        control::require_pool_writable_at(tr, ns, spec.pool_id).await
     }
 }
 

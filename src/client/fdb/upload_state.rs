@@ -37,7 +37,7 @@ pub(super) fn parent(path: &Path) -> Result<(File, &OsStr)> {
     ))
 }
 
-pub(super) fn open_file(
+pub(crate) fn open_file(
     directory: &File,
     name: &OsStr,
     flags: OFlag,
@@ -183,6 +183,26 @@ fn save_new_in(
     destination: &OsStr,
     source: &Path,
 ) -> Result<()> {
+    let mut original = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(source)?;
+    save_body_in(
+        parent,
+        destination,
+        ".fdb-upload",
+        &upload_intent::encode(request, None),
+        |payload| stream_original(&mut original, payload, request),
+    )
+}
+
+pub(crate) fn save_body_in(
+    parent: File,
+    destination: &OsStr,
+    draft_prefix: &str,
+    bytes: &[u8],
+    copy: impl FnOnce(&mut File) -> Result<()>,
+) -> Result<()> {
     match fstatat(
         Some(parent.as_raw_fd()),
         destination,
@@ -196,15 +216,10 @@ fn save_new_in(
         Err(nix::errno::Errno::ENOENT) => {}
         Err(error) => return Err(std::io::Error::from(error).into()),
     }
-    let mut original = OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NONBLOCK)
-        .open(source)?;
-    let bytes = upload_intent::encode(request, None);
     if bytes.len() > HEADER_LIMIT {
         return Err(invalid("上传请求超过字节上限"));
     }
-    let name = OsString::from(format!(".fdb-upload-{}", Uuid::new_v4()));
+    let name = OsString::from(format!("{draft_prefix}-{}", Uuid::new_v4()));
     mkdirat(Some(parent.as_raw_fd()), name.as_os_str(), Mode::S_IRWXU)
         .map_err(std::io::Error::from)?;
     let directory = (|| {
@@ -239,7 +254,7 @@ fn save_new_in(
         OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL,
         Mode::S_IRUSR | Mode::S_IWUSR,
     )?;
-    header.write_all(&bytes)?;
+    header.write_all(bytes)?;
     header.sync_all()?;
     // A crash during a large copy leaves the original identity available.
     // The preparation lock and payload verification still prevent admission.
@@ -250,7 +265,7 @@ fn save_new_in(
         OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL,
         Mode::S_IRUSR | Mode::S_IWUSR,
     )?;
-    stream_original(&mut original, &mut payload, request)?;
+    copy(&mut payload)?;
     payload.sync_all()?;
     draft.directory.sync_all()?;
     publish(&draft.parent, &draft.name, destination).map_err(|error| {

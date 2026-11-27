@@ -219,6 +219,7 @@ async fn apply_change(
         }
         "pool" => {
             let id = id(change, "id")?;
+            replicated_pools::require_independent_at(tr, namespace, id).await?;
             reclaim::require_pool_write_at(tr, namespace, id).await?;
             super::native_media::require_pool_readable(tr, namespace, id).await?;
             require_pool_library(tr, namespace, id, serial).await?;
@@ -235,6 +236,11 @@ async fn apply_change(
             apply_pool_patch(&mut pool, &change["patch"]);
             pool.revision = revision(change)?;
             validate_pool(&pool)?;
+            if old_name != pool.name
+                && !selected_pool::name_available_at(tr, namespace, &pool.name).await?
+            {
+                return Err(CatalogError::Invalid("目标名称已由原建池请求预约"));
+            }
             let name = pool_name_key(namespace, &pool.name);
             if old_name != pool.name
                 && let Some(existing) = tr.get(&name, false).await?

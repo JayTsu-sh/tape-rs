@@ -130,6 +130,81 @@ pub(super) fn capture_empty_baseline(
     Ok(proof)
 }
 
+fn verified_content(
+    device: &dyn TapeTransport,
+    label: &crate::ltfs::label::LtfsLabel,
+    cache: &VolumeExtentCache,
+    entry: &crate::managed_catalog::StagedImportEntry,
+) -> Result<[u8; 32]> {
+    use crate::managed_catalog::{ContentDigest, StagedSourceData};
+    use sha2::{Digest, Sha256};
+
+    match entry.source_data.as_deref() {
+        Some(
+            [
+                StagedSourceData::Data {
+                    file_uid,
+                    length,
+                    content_digest,
+                    ..
+                },
+            ],
+        ) => {
+            let file = cache.required_file_by_uid(*file_uid)?;
+            if file.length != *length {
+                return Err(TapeError::Catalog("副本文件长度与卷索引不符".into()));
+            }
+            let mut sink = ReplicaDigest {
+                sha256: Sha256::new(),
+                md5: matches!(content_digest, ContentDigest::Md5(_)).then(md5::Md5::new),
+            };
+            let actual =
+                crate::ltfs::volume::read_cached_file_to_writer(device, label, &file, &mut sink)?;
+            let sha256: [u8; 32] = sink.sha256.finalize().into();
+            let matches_index = match content_digest {
+                ContentDigest::Sha256(expected) => *expected == sha256,
+                ContentDigest::Md5(expected) => sink
+                    .md5
+                    .is_some_and(|hash| hash.finalize().as_slice() == expected),
+                ContentDigest::Unknown => true,
+            };
+            if actual != *length || !matches_index {
+                return Err(TapeError::Catalog(
+                    "副本正文校验与 LTFS 文件长度或摘要不符".into(),
+                ));
+            }
+            Ok(sha256)
+        }
+        Some([StagedSourceData::NativeSymlink]) => entry
+            .current_attributes
+            .symlink()
+            .map(|target| Sha256::digest(target.as_bytes()).into())
+            .ok_or_else(|| TapeError::Catalog("副本符号链接缺少目标".into())),
+        Some([StagedSourceData::NoCopy]) => Ok(Sha256::digest([]).into()),
+        _ => Err(TapeError::Catalog("副本文件缺少已核验源索引".into())),
+    }
+}
+
+struct ReplicaDigest {
+    sha256: sha2::Sha256,
+    md5: Option<md5::Md5>,
+}
+
+impl std::io::Write for ReplicaDigest {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
+        self.sha256.update(buffer);
+        if let Some(hash) = &mut self.md5 {
+            hash.update(buffer);
+        }
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 pub(super) async fn apply(
     owner: &mut Active,
     permit: &Permission,
@@ -191,9 +266,38 @@ pub(super) async fn apply(
     let result = intake_source(owner, permit, control, status, &intake).await;
     match result {
         Ok(()) => Ok(()),
-        Err(ReadError::Busy(_)) => Ok(()),
+        Err(ReadError::Busy(reason)) => {
+            if control
+                .catalog
+                .selected_intake_position(&intake, owner.round)
+                .await
+                .map_err(lost)?
+                .is_some()
+            {
+                control
+                    .catalog
+                    .note_selected_intake_wait(&intake, owner.round, &reason)
+                    .await
+                    .map_err(lost)?;
+            }
+            Ok(())
+        }
         Err(ReadError::Lost(reason)) => Err(ReadError::Lost(reason)),
         Err(ReadError::Failed(reason)) => {
+            if control
+                .catalog
+                .selected_intake_format(&intake, owner.round)
+                .await
+                .map_err(lost)?
+                .is_some_and(|(_, issued)| issued)
+            {
+                control
+                    .catalog
+                    .note_selected_intake_wait(&intake, owner.round, &reason)
+                    .await
+                    .map_err(lost)?;
+                return Ok(());
+            }
             match live(owner, permit, control, &intake).await {
                 Ok(_) => {}
                 Err(ReadError::Busy(_)) => return Ok(()),
@@ -214,6 +318,121 @@ pub(super) async fn apply(
                 .await
                 .map_err(lost)?;
             Ok(())
+        }
+    }
+}
+
+async fn selected_format_allowed(
+    owner: &Active,
+    control: &FdbOwnerControl,
+    intake: &NativeMediaImport,
+    drive_serial: &str,
+) -> std::result::Result<bool, ReadError> {
+    let policy = control
+        .catalog
+        .active_management_policy(
+            &control.serial,
+            control.route,
+            owner.round,
+            &[drive_serial.to_owned()],
+            &[intake.pool()],
+            &[intake.barcode().to_owned()],
+        )
+        .await
+        .map_err(lost)?;
+    Ok(
+        super::super::management::drive_allowed(&policy, drive_serial, 'm')
+            && fdb_loading::tape_allowed(&policy, intake.barcode()),
+    )
+}
+
+async fn prepare_selected_medium(
+    owner: &Active,
+    control: &FdbOwnerControl,
+    intake: &NativeMediaImport,
+    drive_serial: &str,
+    device: &dyn TapeTransport,
+) -> std::result::Result<Option<uuid::Uuid>, ReadError> {
+    use crate::ltfs::volume::{FormatProbe, probe_format};
+    if control
+        .catalog
+        .selected_intake_position(intake, owner.round)
+        .await
+        .map_err(lost)?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let planned = control
+        .catalog
+        .selected_intake_format(intake, owner.round)
+        .await
+        .map_err(lost)?;
+    let already_issued = planned
+        .filter(|(_, issued)| *issued)
+        .map(|(volume, _)| volume);
+    let format_error = |error: TapeError| {
+        if already_issued.is_some() && !ownership_lost(&error) {
+            ReadError::Busy(format!("原初始化结果未知: {error}"))
+        } else {
+            physical(error)
+        }
+    };
+    match probe_format(device).map_err(format_error)? {
+        FormatProbe::Ltfs => Ok(already_issued),
+        _ if already_issued.is_some() => Err(ReadError::Busy(
+            "原初始化结果未知，保留原卷 UUID 和预约".into(),
+        )),
+        FormatProbe::Foreign(reason) => Err(ReadError::Failed(format!(
+            "拒绝初始化有数据的非 LTFS 磁带: {reason}"
+        ))),
+        FormatProbe::Blank => {
+            let Some((volume, false)) = planned else {
+                return Err(ReadError::Failed(
+                    "空白磁带须在原创建请求中显式确认初始化".into(),
+                ));
+            };
+            if !selected_format_allowed(owner, control, intake, drive_serial).await? {
+                return Err(ReadError::Busy("当前磁带或驱动器未获初始化权限".into()));
+            }
+            if TapeDrive::new(device).write_protected().map_err(physical)? {
+                return Err(ReadError::Failed("空白磁带处于写保护状态".into()));
+            }
+            if !fdb_assign::all_partitions_blank(device).map_err(physical)? {
+                return Err(ReadError::Failed("磁带仍有非空分区，拒绝初始化".into()));
+            }
+            if !control
+                .catalog
+                .issue_selected_intake_format(intake, owner.round, volume)
+                .await
+                .map_err(lost)?
+            {
+                return Err(ReadError::Busy("原初始化已发出，等待卷身份读回".into()));
+            }
+            let options = crate::ltfs::mkltfs::MkltfsOptions {
+                volume_id: intake.barcode().chars().take(6).collect(),
+                volume_uuid: Some(volume),
+                ..Default::default()
+            };
+            let format = fdb_operation_guard::Guard::new(device, || {
+                let allowed = futures_executor::block_on(selected_format_allowed(
+                    owner,
+                    control,
+                    intake,
+                    drive_serial,
+                ))
+                .map_err(|error| TapeError::Catalog(format!("{error:?}")))?;
+                if !allowed {
+                    return Err(TapeError::Catalog("原初始化权限已失效".into()));
+                }
+                Ok(())
+            });
+            match crate::ltfs::mkltfs::mkltfs(&format, &options) {
+                Ok(actual) if actual == volume => Ok(Some(volume)),
+                Err(error) if ownership_lost(&error) => Err(lost(error)),
+                Err(error) => Err(ReadError::Busy(format!("原初始化结果未知: {error}"))),
+                Ok(_) => Err(ReadError::Busy("原初始化返回了不一致的卷 UUID".into())),
+            }
         }
     }
 }
@@ -243,7 +462,22 @@ async fn intake_source(
             Ok(())
         });
     let device = &checked as &dyn TapeTransport;
-    let label = crate::ltfs::volume::read_label_only(device).map_err(physical)?;
+    let formatted =
+        prepare_selected_medium(owner, control, intake, &owner.devices[drive].serial, device)
+            .await?;
+    let source_error = |error: TapeError| {
+        if formatted.is_some() && !ownership_lost(&error) {
+            ReadError::Busy(format!("原初始化未完成来源验证: {error}"))
+        } else {
+            physical(error)
+        }
+    };
+    let label = crate::ltfs::volume::read_label_only(device).map_err(source_error)?;
+    if formatted.is_some_and(|volume| volume != label.volume_uuid) {
+        return Err(ReadError::Busy(
+            "卷标签与原初始化 UUID 不符，保留预约核对".into(),
+        ));
+    }
     if intake
         .assigned_volume()
         .map_err(lost)?
@@ -268,8 +502,8 @@ async fn intake_source(
     budget.index_scratch.max_bytes = control.storage.index_bytes;
     budget.index_scratch.headroom_bytes = control.storage.headroom_bytes;
     let tape = TapeDrive::new(device);
-    let captured =
-        crate::ltfs::recovery::capture_index_source(&tape, &label, &budget).map_err(physical)?;
+    let captured = crate::ltfs::recovery::capture_index_source(&tape, &label, &budget)
+        .map_err(source_error)?;
     let identity = captured.identity().map_err(physical)?;
     let evidence = captured.scope();
     let expected = ExpectedIndex {
@@ -301,10 +535,9 @@ async fn intake_source(
     spool.verify_extent_cache(&cache).map_err(physical)?;
     let pool = control
         .catalog
-        .active_pool_for_route(&control.serial, control.route, intake.pool())
+        .native_media_pool(intake, owner.round)
         .await
-        .map_err(lost)?
-        .ok_or_else(|| ReadError::Failed("接入池已不存在".into()))?;
+        .map_err(lost)?;
     let root = spool
         .node_by_path("")
         .map_err(physical)?
@@ -360,6 +593,11 @@ async fn intake_source(
             .map_err(projection_error)?;
     }
     let state = live(owner, permit, control, intake).await?;
+    let replicated = control
+        .catalog
+        .replicated_intake(intake, owner.round)
+        .await
+        .map_err(lost)?;
     let mut after = state["after"].as_str().map(str::to_owned);
     loop {
         live(owner, permit, control, intake).await?;
@@ -371,6 +609,14 @@ async fn intake_source(
             let entry = intake
                 .entry(&spool, candidate)
                 .map_err(|e| ReadError::Failed(e.to_string()))?;
+            if replicated && !entry.path.current().candidate.deleted {
+                let digest = verified_content(device, &label, &cache, &entry).map_err(physical)?;
+                control
+                    .catalog
+                    .record_replicated_intake(intake, owner.round, &proof, &entry, digest)
+                    .await
+                    .map_err(projection_error)?;
+            }
             control
                 .catalog
                 .project_native_media_entry(intake, owner.round, &entry, true)
@@ -399,8 +645,8 @@ async fn intake_source(
         .finish_native_media(intake, owner.round, &proof)
         .await
         .map_err(projection_error)?;
-    // No write, filemark, VCI/MAM update, close-tail or format occurred. The
-    // mounted identity becomes eligible for normal reads/writes only now.
+    // An existing LTFS source was read-only. For a new empty volume the
+    // original format identity was verified before publication.
     owner.fdb_pending_import.remove(intake.barcode());
     fdb_monitor::index_state(
         owner,

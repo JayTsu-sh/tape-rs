@@ -280,10 +280,12 @@ fn validate_device_change(change: &Value) -> Result<()> {
                 | "media-reclaim"
         ) && change.get("logical_library").is_some();
         v.len() == fields.len() + usize::from(group_only) + usize::from(scoped)
-            && v.keys().all(|k| fields.contains(&k.as_str()) || group_only && k == "mode"
-                || scoped && k == "logical_library")
-    })
-    {
+            && v.keys().all(|k| {
+                fields.contains(&k.as_str())
+                    || group_only && k == "mode"
+                    || scoped && k == "logical_library"
+            })
+    }) {
         return Err(invalid("设备管理请求字段无效"));
     }
     if change.get("logical_library").is_some() {

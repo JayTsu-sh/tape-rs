@@ -43,12 +43,13 @@ mod control;
 pub use control::management::handoff::{LibraryHandoff, LibraryHandoffPhase};
 pub use control::notifications::tape_inventory_state;
 pub(crate) use control::reclaim::{
-    OriginalObservationPermit, ReclaimExecutionGate,
-    ReclaimGroupOnlyDraft, ReclaimGroupOnlyQualification,
-    OriginalAttemptObservation, OriginalCheckpointContext, OriginalCheckpointPublication,
-    DestinationHistoryContext, ReclaimCopyGroup, ReclaimCopyGroupAdmission, ReclaimCopyGroupChoice,
-    ReclaimCopyGroupLimits, ReclaimCopyGroupSelection, RetainedLedgerAuthority,
-    ReclaimGroupExecution, ReclaimGroupObservation, ReclaimGroupMemberReadContext, ReclaimIndexAugmentation, ReclaimIndexIntent,
+    DestinationHistoryContext, OriginalAttemptObservation, OriginalCheckpointContext,
+    OriginalCheckpointPublication, OriginalObservationPermit, ReclaimCopyGroup,
+    ReclaimCopyGroupAdmission, ReclaimCopyGroupChoice, ReclaimCopyGroupLimits,
+    ReclaimCopyGroupSelection, ReclaimExecutionGate, ReclaimGroupExecution,
+    ReclaimGroupMemberReadContext, ReclaimGroupObservation, ReclaimGroupOnlyDraft,
+    ReclaimGroupOnlyQualification, ReclaimIndexAugmentation, ReclaimIndexIntent,
+    RetainedLedgerAuthority,
 };
 use control::tape_monitor;
 pub use tape_monitor::{
@@ -100,6 +101,7 @@ mod staged_import;
 mod staged_sources;
 pub use body_layouts::{PhysicalPlanProvenance, PlanExtents, VerifiedPhysicalPlan};
 pub use cleanup::PurgeProgress;
+pub use control::ReplicaRead;
 pub use control::{
     ActivePoolCreation, AssignExecution, AssignPhase, AssignPlan, AutomaticMediaAction,
     AutomaticMediaCommand, AutomaticMediaPlan, ControlOutcome, ManagementRequest, MoveExecution,
@@ -139,6 +141,7 @@ pub use control::{
     ReclaimSourceRead, ReclaimSpec, ReclaimWalk, TapeAssignment, VolumePlacement,
 };
 pub(crate) use control::{LogicalLibraryChange, LogicalLibraryCreation};
+pub(crate) use control::{ReplicaFile, ReplicaObjectMetadata, ReplicaUpload};
 pub use cutover::{
     FrozenSnapshotIdentity, VerifiedNodeExport, inspect_frozen_snapshot, verify_node_export,
 };
@@ -209,6 +212,8 @@ pub enum CatalogError {
     Incomplete,
     #[error("池或带库正在执行互斥操作")]
     PoolBusy,
+    #[error("多副本池的底层池或磁带准入失败")]
+    ReplicatedSelectionBlocked(serde_json::Value),
     #[error("逻辑带库库存待核对: {0}")]
     LogicalInventoryBlocked(String),
     #[error("带库存在未结清操作: {0:?}")]
@@ -259,7 +264,7 @@ pub fn pool_catalog_path(pool: Uuid, path: &[u8]) -> Result<Vec<u8>> {
 
 /// Preferred checksum carried by the LTFS index. `Unknown` does not prove
 /// that the file's content has been verified.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ContentDigest {
     Unknown,
     Md5([u8; 16]),

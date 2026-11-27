@@ -2,25 +2,29 @@
 //! independent migration/initialization receipts. No state is reconstructed
 //! from a newer logical path after a takeover.
 use super::*;
-#[path = "executor_fdb_reclaim_qualification.rs"]
-mod qualification;
-#[path = "executor_fdb_reclaim_copy.rs"]
-mod copying;
 #[path = "executor_fdb_reclaim_checkpoint.rs"]
 mod checkpoint;
+#[path = "executor_fdb_reclaim_copy.rs"]
+mod copying;
 #[path = "executor_fdb_reclaim_parallel.rs"]
 mod parallel;
-#[cfg(test)]
-pub(in crate::daemon::executor) use checkpoint::probe_original as probe_original_for_test;
+#[path = "executor_fdb_reclaim_qualification.rs"]
+mod qualification;
 #[cfg(test)]
 pub(in crate::daemon::executor) use checkpoint::arm_original_probe_seal_for_test;
 #[cfg(test)]
-pub(in crate::daemon::executor) use checkpoint::{arm_original_checkpoint_s4_stop_for_test, OriginalS4StopFacts};
+pub(in crate::daemon::executor) use checkpoint::probe_original as probe_original_for_test;
+pub(in crate::daemon) use checkpoint::{
+    FreshReclaimGroupIo, ObserveReclaimGroupIo, OriginalAttemptProbeIo,
+};
+#[cfg(test)]
+pub(in crate::daemon::executor) use checkpoint::{
+    OriginalS4StopFacts, arm_original_checkpoint_s4_stop_for_test,
+};
 #[cfg(test)]
 pub(in crate::daemon::executor) use checkpoint::{
     ReadbackSealMode, arm_readback_seal_for_test, observe_group_read_for_test,
 };
-pub(in crate::daemon) use checkpoint::{OriginalAttemptProbeIo, FreshReclaimGroupIo, ObserveReclaimGroupIo};
 #[path = "executor_fdb_reclaim_metadata.rs"]
 mod metadata;
 #[path = "executor_fdb_reclaim_upload_recovery.rs"]
@@ -939,9 +943,22 @@ fn advance_existing_format_or_obsolete<'a>(
     Box<impl std::future::Future<Output = std::result::Result<PreCopyOutcome, ReadError>> + 'a>,
 > {
     Box::pin(async move {
-        if !control.catalog.reclaim_group_only_precopy_ready(parent,owner.round).await.map_err(parent_error)? {
-            if control.catalog.reclaim_format_plan(parent,owner.round).await.map_err(parent_error)?.is_some() {
-                return Err(lost("group-only源format检查点缺少原Ready资格，禁止恢复格式化"));
+        if !control
+            .catalog
+            .reclaim_group_only_precopy_ready(parent, owner.round)
+            .await
+            .map_err(parent_error)?
+        {
+            if control
+                .catalog
+                .reclaim_format_plan(parent, owner.round)
+                .await
+                .map_err(parent_error)?
+                .is_some()
+            {
+                return Err(lost(
+                    "group-only源format检查点缺少原Ready资格，禁止恢复格式化",
+                ));
             }
             return Ok(PreCopyOutcome::ContinueCopy);
         }
@@ -1049,8 +1066,15 @@ pub(in crate::daemon::executor) fn advance<'a>(
                 .await
                 .map_err(parent_error)?
                 .ok_or_else(|| lost("原父任务与异步回执不同"))?;
-            if let Some(reason)=control.catalog.reclaim_group_only_status(parent,owner.round).await.map_err(parent_error)? {
-                return Err(lost(format!("UnsupportedGroupOnly：未执行迁移，原请求保留：{reason}")));
+            if let Some(reason) = control
+                .catalog
+                .reclaim_group_only_status(parent, owner.round)
+                .await
+                .map_err(parent_error)?
+            {
+                return Err(lost(format!(
+                    "UnsupportedGroupOnly：未执行迁移，原请求保留：{reason}"
+                )));
             }
             match control
                 .catalog
@@ -1240,7 +1264,7 @@ pub(in crate::daemon::executor) fn advance<'a>(
                 .map_err(parent_error)?;
             observe_copy_progress(owner, control, parent, &progress).await?;
             if progress.complete() {
-                qualification::prepare(owner,control,parent,&inventory).await?;
+                qualification::prepare(owner, control, parent, &inventory).await?;
                 copying::step(
                     owner,
                     permit,

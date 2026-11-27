@@ -31,6 +31,10 @@ mod notify;
 
 #[path = "fdb_http_pools.rs"]
 mod pools;
+#[path = "fdb_http_replica_files.rs"]
+pub(super) mod replica_files;
+#[path = "fdb_http_replicated_pools.rs"]
+mod replicated_pools;
 
 #[path = "fdb_http_prepare.rs"]
 mod prepare;
@@ -55,7 +59,7 @@ mod objects;
 mod renames;
 
 #[derive(Clone)]
-struct Context {
+pub(super) struct Context {
     catalog: Arc<ManagedCatalog>,
     routes: BTreeMap<String, ActiveLibraryRoute>,
     owner: Option<OwnerRuntime>,
@@ -259,6 +263,10 @@ async fn require_file_pool_scope(
     let logical = pools::logical_scope(headers)?;
     let pool = uuid::Uuid::parse_str(pool).expect("content scope validates UUID");
     check_file_pool_scope(ctx, serial, route, pool, logical).await?;
+    ctx.catalog
+        .require_independent_file_pool(route.route.namespace, pool)
+        .await
+        .map_err(|error| Box::new(catalog_error(error)))?;
     Ok(logical)
 }
 
@@ -417,6 +425,22 @@ async fn children(
 
 fn metadata_router(ctx: Arc<Context>) -> Router {
     Router::new()
+        .route(
+            "/admin/replicated-pools",
+            axum::routing::post(replicated_pools::create),
+        )
+        .route(
+            "/admin/replicated-pools/{id}",
+            get(replicated_pools::status),
+        )
+        .route(
+            "/admin/replicated-pools/{id}/files",
+            get(replicated_pools::files),
+        )
+        .route(
+            "/admin/replicated-pools/{id}/resolve",
+            axum::routing::post(replicated_pools::resolve),
+        )
         .route("/admin/libraries", get(queries::libraries))
         .route("/libraries/{serial}/admin/library", get(queries::library))
         .route("/libraries/{serial}/admin/drives", get(queries::drives))
@@ -475,6 +499,14 @@ fn metadata_router(ctx: Arc<Context>) -> Router {
         .route(
             "/libraries/{serial}/admin/pools",
             get(pools::list).post(pools::create),
+        )
+        .route(
+            "/libraries/{serial}/admin/pool-create/preview",
+            axum::routing::post(pools::preview_create),
+        )
+        .route(
+            "/libraries/{serial}/admin/pool-create/{id}",
+            get(pools::create_status),
         )
         .route(
             "/libraries/{serial}/admin/pools/{selector}",
@@ -631,14 +663,14 @@ pub fn writer_router(
     owner_router_inner(catalog, routes, libraries, peers, Some(budget))
 }
 
-fn owner_router_inner(
+pub(super) fn owner_context(
     catalog: Arc<ManagedCatalog>,
     routes: BTreeMap<String, ActiveLibraryRoute>,
     libraries: BTreeMap<String, Arc<HttpContext>>,
     peers: HashMap<u64, String>,
     upload_budget: Option<super::fdb_read::ReadStorageBudget>,
-) -> std::io::Result<Router> {
-    let ctx = Arc::new(Context {
+) -> Arc<Context> {
+    Arc::new(Context {
         catalog,
         routes,
         upload_budget,
@@ -650,18 +682,30 @@ fn owner_router_inner(
             peers,
             requests: Arc::new(Semaphore::new(32)),
         }),
-    });
+    })
+}
+
+fn owner_router_inner(
+    catalog: Arc<ManagedCatalog>,
+    routes: BTreeMap<String, ActiveLibraryRoute>,
+    libraries: BTreeMap<String, Arc<HttpContext>>,
+    peers: HashMap<u64, String>,
+    upload_budget: Option<super::fdb_read::ReadStorageBudget>,
+) -> std::io::Result<Router> {
+    let ctx = owner_context(catalog, routes, libraries, peers, upload_budget);
     pools::start_worker(&ctx)?;
     let files = if upload_budget.is_some() {
         get(content).put(upload::write)
     } else {
         get(content)
     };
-    let router = metadata_router(ctx.clone()).merge(
-        Router::new()
-            .route("/v1/fdb/files/{serial}", files)
-            .with_state(ctx.clone()),
-    );
+    let router = metadata_router(ctx.clone())
+        .merge(replica_files::router(ctx.clone()))
+        .merge(
+            Router::new()
+                .route("/v1/fdb/files/{serial}", files)
+                .with_state(ctx.clone()),
+        );
     if upload_budget.is_some() {
         Ok(router.merge(
             Router::new()

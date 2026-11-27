@@ -41,7 +41,7 @@ pub(super) async fn prepare(
     }
     control
         .catalog
-        .check_active_pool_gate(&control.serial, control.route, owner.round, spec.pool_id)
+        .check_active_upload_spec_gate(&control.serial, control.route, owner.round, spec)
         .await
         .map_err(|error| match error.domain() {
             CatalogError::PoolBusy

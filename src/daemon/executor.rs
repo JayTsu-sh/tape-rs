@@ -216,6 +216,11 @@ pub enum ExecRequest {
         file: std::fs::File,
         reply: Sender<std::result::Result<u64, ReadError>>,
     },
+    #[cfg(feature = "fdb")]
+    FdbReplicaRead {
+        selection: Box<crate::managed_catalog::ReplicaRead>,
+        reply: Sender<std::result::Result<std::fs::File, ReadError>>,
+    },
     /// 已解析的池/驱动作用域，内部请求只能是 Read、ReadTo 或 Sync。
     Scoped {
         pool: String,
@@ -392,7 +397,9 @@ mod fdb_nodes;
 #[path = "executor_fdb_reclaim.rs"]
 mod fdb_reclaim;
 #[cfg(feature = "fdb")]
-pub(in crate::daemon) use fdb_reclaim::{OriginalAttemptProbeIo, FreshReclaimGroupIo, ObserveReclaimGroupIo};
+pub(in crate::daemon) use fdb_reclaim::{
+    FreshReclaimGroupIo, ObserveReclaimGroupIo, OriginalAttemptProbeIo,
+};
 #[cfg(all(test, feature = "fdb"))]
 #[path = "executor_fdb_reclaim_spool_test_hook.rs"]
 mod fdb_reclaim_spool_test_hook;
@@ -617,6 +624,10 @@ pub fn run(
                 let _ = reply.send(Err(ReadError::Failed(
                     "旧目录执行器禁止准备 FDB 上传".into(),
                 )));
+            }
+            #[cfg(feature = "fdb")]
+            Ok(ExecRequest::FdbReplicaRead { reply, .. }) => {
+                let _ = reply.send(Err(ReadError::Failed("副本读取需要 FDB 执行器".into())));
             }
             Ok(ExecRequest::Scoped { .. }) => unreachable!("HTTP 不生成嵌套作用域"),
             Ok(ExecRequest::AttachPermission {
@@ -1073,6 +1084,23 @@ fn run_fdb_owner_inner(
                     .active_library_mechanical_task(&control.serial, control.route, round)
                     .await
                     .map_err(|e| ReadError::Lost(e.to_string()))?;
+                if pending.is_none() {
+                    match control
+                        .catalog
+                        .advance_selected_pool_create(&control.serial, control.route, round)
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(error)
+                            if matches!(
+                                error.domain(),
+                                crate::managed_catalog::CatalogError::PoolBusy
+                                    | crate::managed_catalog::CatalogError::PoolImporting
+                                    | crate::managed_catalog::CatalogError::ManagementQueueFull
+                            ) => {}
+                        Err(error) => return Err(ReadError::Lost(error.to_string())),
+                    }
+                }
                 let native_pending = pending.as_ref().is_some_and(|task| {
                     matches!(
                         task["request"]["change"]["kind"].as_str(),
@@ -2368,6 +2396,32 @@ fn run_fdb_owner_inner(
                 }
                 let _ = reply.send(result);
             }
+            ExecRequest::FdbReplicaRead { selection, reply } => {
+                let result = match active.as_mut().filter(|owner| owner.serving) {
+                    Some(owner) => runtime.block_on(read_fdb_selected(
+                        owner,
+                        permission.as_deref(),
+                        &control,
+                        &status,
+                        fdb_loading::ReadSelection::Replica(&selection),
+                        Some(selection.pool),
+                    )),
+                    None => Err(ReadError::Busy("FDB owner 当前不在服务".into())),
+                };
+                if let Err(ReadError::Lost(reason)) = &result {
+                    files.close_all(reason);
+                    if let Some(owner) = active.take() {
+                        if let Some(permit) = permission.as_ref() {
+                            permit.close(owner.round);
+                        }
+                        let _ = tx.send(ExecEvent::Lost {
+                            round: owner.round,
+                            reason: reason.clone(),
+                        });
+                    }
+                }
+                let _ = reply.send(result);
+            }
             ExecRequest::FdbPrepare {
                 spec,
                 barcode,
@@ -2502,23 +2556,37 @@ async fn read_fdb(
     path: &str,
     pool: Option<&str>,
 ) -> std::result::Result<std::fs::File, ReadError> {
+    let pool = pool
+        .map(uuid::Uuid::parse_str)
+        .transpose()
+        .map_err(|_| ReadError::Failed("FDB 池作用域必须是 UUID".into()))?;
+    read_fdb_selected(
+        owner,
+        permission,
+        control,
+        status,
+        fdb_loading::ReadSelection::Path(path),
+        pool,
+    )
+    .await
+}
+
+#[cfg(feature = "fdb")]
+async fn read_fdb_selected(
+    owner: &mut Active,
+    permission: Option<&Permission>,
+    control: &FdbOwnerControl,
+    status: &SharedStatus,
+    selection: fdb_loading::ReadSelection<'_>,
+    pool: Option<uuid::Uuid>,
+) -> std::result::Result<std::fs::File, ReadError> {
     owner.write_session = None;
     let mut read_session = owner.fdb_read_session.take();
     let lost = |error: TapeError| ReadError::Lost(format!("FDB owner 读取失败: {error}"));
     let permit = permission.ok_or_else(|| ReadError::Lost("FDB owner 缺少多数派许可".into()))?;
     let _activity = permit.begin_device_activity(owner.round).map_err(lost)?;
-    let pool = pool
-        .map(uuid::Uuid::parse_str)
-        .transpose()
-        .map_err(|_| ReadError::Failed("FDB 池作用域必须是 UUID".into()))?;
-    let source = control
-        .catalog
-        .resolve_active_read_source_for_owner(
-            &control.serial,
-            path.as_bytes(),
-            control.route,
-            owner.round,
-        )
+    let source = selection
+        .resolve(control, owner.round)
         .await
         .map_err(|error| {
             let reason = format!("FDB 读取来源不可用: {error}");
@@ -2526,12 +2594,23 @@ async fn read_fdb(
                 error.domain(),
                 crate::managed_catalog::CatalogError::PoolImporting
                     | crate::managed_catalog::CatalogError::PoolBusy
-            ) {
+            ) || matches!(selection, fdb_loading::ReadSelection::Replica(_))
+                && matches!(
+                    error.domain(),
+                    crate::managed_catalog::CatalogError::LogicalInventoryBlocked(_)
+                        | crate::managed_catalog::CatalogError::MediaUnavailable
+                )
+            {
                 ReadError::Busy(reason)
             } else if matches!(
                 error.domain(),
                 crate::managed_catalog::CatalogError::Invalid(_)
-            ) {
+            ) || matches!(selection, fdb_loading::ReadSelection::Replica(_))
+                && matches!(
+                    error.domain(),
+                    crate::managed_catalog::CatalogError::Corrupt(_)
+                )
+            {
                 ReadError::Failed(reason)
             } else {
                 ReadError::Lost(reason)
@@ -2541,7 +2620,14 @@ async fn read_fdb(
     if pool.is_some_and(|pool| pool != source.placement().pool_id) {
         return Err(ReadError::Failed("FDB 文件不属于请求的池".into()));
     }
-    let drive = fdb_loading::select(owner, permit, control, status, path, &source).await?;
+    let drive = match selection {
+        fdb_loading::ReadSelection::Path(path) => {
+            fdb_loading::select(owner, permit, control, status, path, &source).await?
+        }
+        fdb_loading::ReadSelection::Replica(replica) => {
+            fdb_loading::select_replica(owner, permit, control, status, replica, &source).await?
+        }
+    };
     let tracked = fdb_monitor::Tracked::new(owner.devices[drive].dev.as_ref(), "read");
     let reader = super::fdb_read::ActiveMediaReader {
         catalog: &control.catalog,
@@ -2552,15 +2638,28 @@ async fn read_fdb(
         permission: permit,
         storage: control.storage,
     };
-    let result = reader
-        .read_with_session(
-            path.as_bytes(),
-            pool,
-            &owner.files.extent_cache_dir(),
-            owner.files.spool_dir(),
-            &mut read_session,
-        )
-        .await;
+    let result = match selection {
+        fdb_loading::ReadSelection::Path(path) => {
+            reader
+                .read_with_session(
+                    path.as_bytes(),
+                    pool,
+                    &owner.files.extent_cache_dir(),
+                    owner.files.spool_dir(),
+                    &mut read_session,
+                )
+                .await
+        }
+        fdb_loading::ReadSelection::Replica(replica) => {
+            reader
+                .read_replica(
+                    replica,
+                    &owner.files.extent_cache_dir(),
+                    owner.files.spool_dir(),
+                )
+                .await
+        }
+    };
     if result.is_err() {
         fdb_monitor::io_error(
             owner,
@@ -2582,6 +2681,7 @@ async fn read_fdb(
                 TapeError::MediaUnavailable { barcode } => {
                     ReadError::Busy(format!("磁带 {barcode} 离线或在黑名单中"))
                 }
+                error @ TapeError::ReadIntegrity(_) => ReadError::Failed(error.to_string()),
                 error => lost(error),
             },
         )?

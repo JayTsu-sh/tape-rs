@@ -137,17 +137,82 @@ pub(super) fn volume_claim_key(volume: Uuid) -> Vec<u8> {
     k.extend_from_slice(volume.as_bytes());
     k
 }
+fn selected_checkpoint_key(request: &ManagementRequest, kind: u8) -> Vec<u8> {
+    selected_operation_key(request.namespace(), request.operation(), kind)
+}
+
+fn selected_operation_key(ns: Uuid, operation: Uuid, kind: u8) -> Vec<u8> {
+    let mut key = management::prefix(ns, b'C');
+    key.push(kind);
+    key.extend_from_slice(operation.as_bytes());
+    key
+}
+
+pub(super) async fn selected_format_issued_at(
+    tr: &Transaction,
+    ns: Uuid,
+    operation: Uuid,
+) -> Result<bool> {
+    Ok(tr
+        .get(&selected_operation_key(ns, operation, b'f'), false)
+        .await?
+        .is_some())
+}
+
+pub(super) async fn selected_checkpoint_at(
+    tr: &Transaction,
+    request: &ManagementRequest,
+) -> Result<Value> {
+    let detail = tr
+        .get(&selected_checkpoint_key(request, b'e'), false)
+        .await?
+        .map(|raw| String::from_utf8(raw.to_vec()))
+        .transpose()
+        .map_err(|_| CatalogError::Corrupt("建池磁带诊断的编码无效"))?;
+    let issued = selected_format_issued_at(tr, request.namespace(), request.operation()).await?;
+    Ok(json!({"detail":detail,"format_volume":issued.then_some(request.operation())}))
+}
+
 fn pool_gate(ns: Uuid, pool: Uuid) -> Vec<u8> {
     let mut k = management::prefix(ns, b'i');
     k.extend_from_slice(pool.as_bytes());
     k
 }
 pub(crate) async fn require_pool_readable(tr: &Transaction, ns: Uuid, pool: Uuid) -> Result<()> {
+    selected_pool::require_published_at(tr, ns, pool).await?;
     if tr.get(&pool_gate(ns, pool), false).await?.is_some() {
         return Err(CatalogError::PoolImporting);
     }
     native_device::require_pool_available(tr, ns, pool).await?;
     Ok(())
+}
+pub(crate) async fn require_app_pool_readable(
+    tr: &Transaction,
+    ns: Uuid,
+    pool: Uuid,
+) -> Result<()> {
+    require_pool_readable(tr, ns, pool).await?;
+    replicated_pools::require_independent_at(tr, ns, pool).await
+}
+pub(super) async fn replica_origin_target_at(
+    tr: &Transaction,
+    source: &replicated_pools::files::Source,
+    path: &str,
+) -> Result<String> {
+    let scan = tr
+        .get(&ready_volume_key(source.volume_uuid), false)
+        .await?
+        .map(|raw| decode_ready_volume(&raw).map(|(scan, _)| scan.id))
+        .transpose()?;
+    refresh::replica_origin_at(
+        tr,
+        source.namespace,
+        source.volume_uuid,
+        scan,
+        source.file_uid,
+        path,
+    )
+    .await
 }
 fn encode(value: &Value) -> Vec<u8> {
     value.to_string().into_bytes()
@@ -417,6 +482,9 @@ pub(super) async fn request_abort(
     validate_state(&value)?;
     if value["epoch"] != epoch || value["operation"] != operation.to_string() {
         return Err(CatalogError::Corrupt("取消介质任务身份不符"));
+    }
+    if selected_format_issued_at(tr, ns, operation).await? {
+        return Err(CatalogError::Invalid("原初始化已发出，须先核实原卷身份"));
     }
     value["abort"] = json!(true);
     value["phase"] = json!("rollback");
@@ -853,7 +921,37 @@ impl ManagedCatalog {
             let (request,mut task)=management::task_for_identity(&tr,serial,route.route.namespace,epoch,operation).await?;
             if !matches!(request.value()["change"]["kind"].as_str(),Some("media-import")){return Err(CatalogError::Invalid("不是原生介质任务"));}
             if !matches!(task["status"].as_str(),Some("queued"|"running")){return Ok(None);}
-            logical_libraries::mechanical_resources_at(&tr,route.route.namespace,serial,&request).await?;
+            let selected = selected_pool::original_tape_at(&tr, &request).await?;
+            let ns = route.route.namespace;
+            let member = Uuid::parse_str(request.value()["change"]["pool"].as_str()
+                .expect("validated pool")).expect("validated UUID");
+            if selected.and_then(|original| original.replicated).is_none() {
+                replicated_pools::require_independent_at(&tr, ns, member).await?;
+            }
+            logical_libraries::mechanical_resources_at(&tr, ns, serial, &request).await?;
+            if task["status"] == "queued" && let Some(original) = selected {
+                if let Some(parent) = original.replicated {
+                    if replicated_pools::creation_failed_at(&tr, parent).await? {
+                        return Err(CatalogError::Invalid("多副本池的其他成员创建失败"));
+                    }
+                    if replicated_pools::has_conflict(&tr, parent).await? {
+                        return Ok(None);
+                    }
+                }
+                let barcode = request.value()["change"]["barcode"].as_str().expect("validated barcode");
+                let (_, rows) = logical_libraries::pool_selection_at(&tr, ns, serial, owner,
+                    request.logical_library(), &[barcode.to_owned()]).await?;
+                let row = &rows[0];
+                let note = selected_checkpoint_key(&request, b'e');
+                if row["status"] != "reserved" || row["source_address"] != original.source
+                    || row["home_address"] != original.home
+                {
+                    let reason = format!("磁带 {barcode} 库存与原预约不符，等待核对: {row}");
+                    tr.set(&note, reason.as_bytes());
+                    return Ok(None);
+                }
+                tr.clear(&note);
+            }
             let mut import=NativeMediaImport{request,route,refresh:None};
             if task["status"]=="queued" {
                 let pool=decode_pool(import.pool(),&tr.get(&pool_key(route.route.namespace,import.pool()),false).await?.ok_or(CatalogError::Invalid("目标池不存在"))?)?;
@@ -890,6 +988,253 @@ impl ManagedCatalog {
             notifications::tape_changed_at(&tr, import.request.namespace(), serial, import.barcode(), "import_started").await?;
             Ok(Some(import))
         }.await.map_err(notifications::atomic_error))}).await?
+    }
+
+    /// The selected-pool appointment binds the source to the original parent.
+    pub(crate) async fn replicated_intake(
+        &self,
+        import: &NativeMediaImport,
+        owner: u64,
+    ) -> Result<bool> {
+        let tr = self.db.create_trx()?;
+        if replicated_pools::parent_at(&tr, import.request.namespace(), import.pool())
+            .await?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        state(&tr, import, owner).await?;
+        selected_pool::original_tape_at(&tr, &import.request)
+            .await?
+            .and_then(|original| original.replicated)
+            .map(|_| true)
+            .ok_or(CatalogError::Corrupt("副本底层池导入缺少原预约"))
+    }
+
+    pub(crate) async fn record_replicated_intake(
+        &self,
+        import: &NativeMediaImport,
+        owner: u64,
+        proof: &NativeMediaSource,
+        entry: &StagedImportEntry,
+        body_sha256: [u8; 32],
+    ) -> Result<()> {
+        use replicated_pools::files::{Content, Kind, Source};
+        let current = entry.path.current();
+        let candidate = &current.candidate;
+        let mut symlink = None;
+        let (kind, length, uid, data_path) = match entry.source_data.as_deref() {
+            Some(
+                [
+                    StagedSourceData::Data {
+                        length,
+                        file_uid,
+                        data_path,
+                        ..
+                    },
+                ],
+            ) => (Kind::File, *length, *file_uid, data_path.as_deref()),
+            Some([StagedSourceData::NativeSymlink]) => {
+                let target = entry
+                    .current_attributes
+                    .symlink()
+                    .ok_or(CatalogError::Corrupt("副本符号链接缺少目标"))?;
+                if <[u8; 32]>::from(Sha256::digest(target.as_bytes())) != body_sha256 {
+                    return Err(CatalogError::Corrupt("副本符号链接目标与原证明不符"));
+                }
+                symlink = Some(target.to_owned());
+                (
+                    Kind::Symlink,
+                    target.len() as u64,
+                    entry.source_file_uids[0],
+                    None,
+                )
+            }
+            Some([StagedSourceData::NoCopy])
+                if candidate.kind == NodeKind::Directory && !candidate.deleted =>
+            {
+                (Kind::Directory, 0, entry.source_file_uids[0], None)
+            }
+            _ => return Err(CatalogError::Corrupt("副本来源缺少文件证明")),
+        };
+        let ns = import.request.namespace();
+        let identity = proof.index();
+        if entry.path.pool_id != import.pool()
+            || current.barcode != import.barcode()
+            || current.generation != identity.generation
+            || current.volume_id != identity.volume_uuid
+        {
+            return Err(CatalogError::Corrupt("副本来源与当前卷身份不一致"));
+        }
+        let evidence = Source {
+            library_serial: import.serial().to_owned(),
+            namespace: ns,
+            pool_id: import.pool(),
+            barcode: import.barcode().to_owned(),
+            volume_uuid: identity.volume_uuid,
+            generation: identity.generation,
+            index_sha256: identity.sha256,
+            operation: import.request.operation(),
+            file_uid: uid,
+            physical_path: data_path.unwrap_or(&candidate.physical_path).to_owned(),
+            tape_version: candidate.version,
+            content: Content {
+                kind,
+                sha256: body_sha256,
+                length,
+            },
+            symlink,
+        };
+        self.db
+            .run(|tr, _| {
+                let evidence = evidence.clone();
+                async move {
+                    requests::retry_result(
+                        async {
+                            let value = state(&tr, import, owner).await?;
+                            if value["abort"] == true || value["phase"] != "materialize" {
+                                return Err(CatalogError::PoolImporting);
+                            }
+                            if source(&value["source"])?.as_ref() != Some(proof) {
+                                return Err(CatalogError::Corrupt("副本导入的原索引证明已变更"));
+                            }
+                            let parent = selected_pool::original_tape_at(&tr, &import.request)
+                                .await?
+                                .and_then(|original| original.replicated)
+                                .ok_or(CatalogError::Corrupt("副本来源缺少原预约"))?;
+                            replicated_pools::files::record_at(
+                                &tr,
+                                parent,
+                                &candidate.logical_path,
+                                evidence,
+                            )
+                            .await
+                        }
+                        .await
+                        .map_err(notifications::atomic_error),
+                    )
+                }
+            })
+            .await?
+    }
+
+    pub(crate) async fn selected_intake_position(
+        &self,
+        import: &NativeMediaImport,
+        owner: u64,
+    ) -> Result<Option<(u16, u16)>> {
+        let tr = self.db.create_trx()?;
+        state(&tr, import, owner).await?;
+        Ok(selected_pool::original_tape_at(&tr, &import.request)
+            .await?
+            .map(|original| (original.source, original.home)))
+    }
+
+    pub(crate) async fn selected_intake_format(
+        &self,
+        import: &NativeMediaImport,
+        owner: u64,
+    ) -> Result<Option<(Uuid, bool)>> {
+        let tr = self.db.create_trx()?;
+        state(&tr, import, owner).await?;
+        let Some(original) = selected_pool::original_tape_at(&tr, &import.request).await? else {
+            return Ok(None);
+        };
+        let Some(volume) = original.format else {
+            return Ok(None);
+        };
+        let issued = tr
+            .get(&selected_checkpoint_key(&import.request, b'f'), false)
+            .await?
+            .is_some();
+        Ok(Some((volume, issued)))
+    }
+
+    /// Called after a read-only proof of blank media. Only the transaction
+    /// carrying this invocation's nonce may send the first formatting command.
+    pub(crate) async fn issue_selected_intake_format(
+        &self,
+        import: &NativeMediaImport,
+        owner: u64,
+        volume: Uuid,
+    ) -> Result<bool> {
+        let nonce = Uuid::new_v4();
+        self.db
+            .run(|tr, _| async move {
+                requests::retry_result(
+                    async {
+                        load::require_loaded_at(&tr, import, owner).await?;
+                        if selected_pool::original_tape_at(&tr, &import.request)
+                            .await?
+                            .and_then(|original| original.format)
+                            != Some(volume)
+                        {
+                            return Err(CatalogError::Invalid("原建池请求未确认初始化此磁带"));
+                        }
+                        let key = selected_checkpoint_key(&import.request, b'f');
+                        if let Some(raw) = tr.get(&key, false).await? {
+                            return Ok(uuid_from(&raw)? == nonce);
+                        }
+                        if tr.get(&placement_key(volume), false).await?.is_some()
+                            || tr.get(&volume_claim_key(volume), false).await?.is_some()
+                        {
+                            return Err(CatalogError::Invalid("初始化原卷 UUID 已被占用"));
+                        }
+                        tr.set(&key, nonce.as_bytes());
+                        Ok(true)
+                    }
+                    .await,
+                )
+            })
+            .await?
+    }
+
+    pub(crate) async fn note_selected_intake_wait(
+        &self,
+        import: &NativeMediaImport,
+        owner: u64,
+        reason: &str,
+    ) -> Result<()> {
+        let reason: String = reason.chars().take(500).collect();
+        self.db
+            .run(|tr, _| {
+                let reason = &reason;
+                async move {
+                    requests::retry_result(
+                        async {
+                            state(&tr, import, owner).await?;
+                            if selected_pool::original_tape_at(&tr, &import.request)
+                                .await?
+                                .is_some()
+                            {
+                                let key = selected_checkpoint_key(&import.request, b'e');
+                                if tr.get(&key, false).await?.as_deref() != Some(reason.as_bytes())
+                                {
+                                    tr.set(&key, reason.as_bytes());
+                                }
+                            }
+                            Ok(())
+                        }
+                        .await,
+                    )
+                }
+            })
+            .await?
+    }
+
+    pub(crate) async fn native_media_pool(
+        &self,
+        import: &NativeMediaImport,
+        owner: u64,
+    ) -> Result<PoolRecord> {
+        let tr = self.db.create_trx()?;
+        state(&tr, import, owner).await?;
+        let ns = import.request.namespace();
+        let raw = tr
+            .get(&pool_key(ns, import.pool()), false)
+            .await?
+            .ok_or(CatalogError::Corrupt("接入任务缺少原目标池"))?;
+        decode_pool(import.pool(), &raw)
     }
 
     pub async fn native_media_status(
@@ -1075,6 +1420,15 @@ impl ManagedCatalog {
                         if value["abort"] == true {
                             return Ok(());
                         }
+                        if selected_format_issued_at(
+                            &tr,
+                            import.request.namespace(),
+                            import.request.operation(),
+                        )
+                        .await?
+                        {
+                            return Err(CatalogError::Invalid("原初始化已发出，须先核实原卷身份"));
+                        }
                         value["abort"] = json!(true);
                         value["phase"] = json!("rollback");
                         if let Some(error) = error {
@@ -1112,6 +1466,15 @@ impl ManagedCatalog {
                             management::read_task(&tr, import.serial(), &import.request).await?;
                         if matches!(saved["status"].as_str(), Some("failed" | "cancelled")) {
                             return Ok(true);
+                        }
+                        if selected_format_issued_at(
+                            &tr,
+                            import.request.namespace(),
+                            import.request.operation(),
+                        )
+                        .await?
+                        {
+                            return Err(CatalogError::Invalid("原初始化已发出，须先核实原卷身份"));
                         }
                         let value = state(&tr, import, owner).await?;
                         load::require_settled_at(&tr, import).await?;

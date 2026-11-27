@@ -80,7 +80,9 @@ async fn checked_pool(
     serial: &str,
     saved: PoolRecord,
 ) -> Result<Option<PoolRecord>> {
-    if saved.library_serial != serial {
+    if saved.library_serial != serial
+        || selected_pool::is_unpublished_at(tr, namespace, saved.id).await?
+    {
         return Ok(None);
     }
     require_pool_library(tr, namespace, saved.id, serial).await?;
@@ -144,7 +146,7 @@ impl ManagedCatalog {
         epoch: u64,
         pool: &PoolRecord,
     ) -> Result<ActivePoolCreation> {
-        self.publish_active_pool(serial, route, epoch, None, pool)
+        self.publish_active_pool(serial, route, epoch, None, false, pool)
             .await
     }
 
@@ -156,8 +158,7 @@ impl ManagedCatalog {
         logical: Option<Uuid>,
         pool: &PoolRecord,
     ) -> Result<ActivePoolCreation> {
-        let logical = logical.ok_or(CatalogError::Invalid("创建池须指定逻辑带库 UUID"))?;
-        self.publish_active_pool(serial, route, epoch, Some(logical), pool)
+        self.publish_active_pool(serial, route, epoch, logical, true, pool)
             .await
     }
 
@@ -167,10 +168,14 @@ impl ManagedCatalog {
         route: ActiveLibraryRoute,
         epoch: u64,
         logical: Option<Uuid>,
+        admin: bool,
         pool: &PoolRecord,
     ) -> Result<ActivePoolCreation> {
         validate_pool(pool)?;
-        if pool.library_serial != serial || pool.revision != 1 {
+        if pool.library_serial != serial
+            || pool.revision != 1
+            || logical.is_some_and(|id| id.is_nil())
+        {
             return Err(CatalogError::Invalid("新池带库或初始修订号无效"));
         }
         self.db
@@ -180,138 +185,187 @@ impl ManagedCatalog {
                         let namespace =
                             routing::require_runtime_active_owner(&tr, serial, route, epoch)
                                 .await?;
-                        if let Some(logical) = logical {
-                            logical_libraries::require_business_route_at(&tr, serial).await?;
-                            let receipt =
-                                pool_create_receipt_key(namespace, serial, logical, pool.id);
-                            if let Some(raw) = tr.get(&receipt, false).await? {
-                                let original = decode_pool(pool.id, &raw)?;
-                                return Ok(if original == *pool {
-                                    ActivePoolCreation::AlreadyExists(original)
-                                } else {
-                                    ActivePoolCreation::IdConflict
-                                });
-                            }
-                            require_library_at(&tr, namespace, serial, logical).await?;
-                        } else {
-                            logical_libraries::require_explicit_scope_at(&tr, serial).await?;
-                        }
-                        let record = pool_key(namespace, pool.id);
-                        native_device::require_pool_metadata_available(
-                            &tr, namespace, serial, pool.id,
-                        )
-                        .await?;
-                        let named = pool_name_key(namespace, &pool.name);
-                        if retired_pool_revision_at(&tr, namespace, pool.id)
-                            .await?
-                            .is_some()
-                        {
-                            if tr.get(&record, false).await?.is_some() {
-                                return Err(CatalogError::Corrupt("退役池仍存在主记录"));
-                            }
-                            return Ok(ActivePoolCreation::Retired);
-                        }
-                        if let Some(raw) = tr.get(&record, false).await? {
-                            let saved = decode_pool(pool.id, &raw)?;
-                            if saved.library_serial != serial {
-                                return Ok(ActivePoolCreation::IdConflict);
-                            }
-                            if logical.is_some()
-                                || pool_library_at(&tr, namespace, serial, pool.id)
-                                    .await?
-                                    .is_some()
-                            {
-                                return Ok(ActivePoolCreation::IdConflict);
-                            }
-                            require_pool_library(&tr, namespace, saved.id, serial).await?;
-                            require_indexes(&tr, namespace, &saved).await?;
-                            return Ok(
-                                if saved.name == pool.name
-                                    && saved.file_limit == pool.file_limit
-                                    && saved.policy == pool.policy
-                                {
-                                    ActivePoolCreation::AlreadyExists(saved)
-                                } else {
-                                    ActivePoolCreation::IdConflict
-                                },
-                            );
-                        }
-                        if let Some(raw) = tr.get(&named, false).await? {
-                            let owner = uuid_from(&raw)?;
-                            if owner == pool.id {
-                                return Err(CatalogError::Corrupt("池名称索引缺少主记录"));
-                            }
-                            let raw = tr
-                                .get(&pool_key(namespace, owner), false)
-                                .await?
-                                .ok_or(CatalogError::Corrupt("池名称索引孤立"))?;
-                            if decode_pool(owner, &raw)?.name != pool.name {
-                                return Err(CatalogError::Corrupt("池名称索引指向不同名称"));
-                            }
-                            return Ok(ActivePoolCreation::NameConflict);
-                        }
-                        let root = root_id(namespace, pool.id);
-                        let child =
-                            child_key(namespace, Uuid::nil(), pool.id.to_string().as_bytes());
-                        let inode = node_key(namespace, root);
-                        for key in [&child, &inode] {
-                            if tr.get(key, false).await?.is_some() {
-                                return Err(CatalogError::Corrupt("新池存在孤立索引或虚拟根"));
-                            }
-                        }
-                        if requests::prefix_has_rows(&tr, &child_prefix(namespace, root)).await? {
-                            return Err(CatalogError::Corrupt("新池根仍有孤立子项，拒绝补写"));
-                        }
-                        require_no_file_claims(&tr, namespace, pool.id).await?;
-                        let raw = tr
-                            .get(&node_key(namespace, Uuid::nil()), false)
-                            .await?
-                            .ok_or(CatalogError::Incomplete)?;
-                        let parent = decode_node(&raw)?;
-                        if parent.kind != NodeKind::Directory
-                            || !parent.parent.is_nil()
-                            || !parent.name.is_empty()
-                        {
-                            return Err(CatalogError::Corrupt("命名空间根目录无效"));
-                        }
-                        let root_metadata = initial_pool_root(pool)?;
-                        let root_node = encode_node(&root_metadata);
-                        object_metadata::ensure_at(
-                            &tr,
-                            namespace,
-                            root_metadata
-                                .attributes
-                                .as_ref()
-                                .expect("initial root has metadata"),
-                        )
-                        .await?;
-                        let encoded = encode_pool(pool);
-                        if let Some(logical) = logical {
-                            let binding = pool_binding_key(namespace, serial, pool.id);
-                            let member = pool_membership_key(namespace, serial, logical, pool.id);
-                            if tr.get(&binding, false).await?.is_some()
-                                || tr.get(&member, false).await?.is_some()
-                            {
-                                return Err(CatalogError::Corrupt("新池存在孤立的逻辑带库归属"));
-                            }
-                            tr.set(&binding, logical.as_bytes());
-                            tr.set(&member, b"");
-                            tr.set(
-                                &pool_create_receipt_key(namespace, serial, logical, pool.id),
-                                &encoded,
-                            );
-                        }
-                        tr.set(&record, &encoded);
-                        tr.set(&named, pool.id.as_bytes());
-                        tr.set(&child, root.as_bytes());
-                        tr.set(&inode, &root_node);
-                        Ok(ActivePoolCreation::Created(pool.clone()))
+                        create_pool_at(&tr, namespace, logical, admin, false, pool).await
                     }
                     .await,
                 )
             })
             .await?
     }
+}
+
+/// Materialize pool metadata and its root inside the caller's transaction.
+pub(super) async fn create_pool_at(
+    tr: &Transaction,
+    namespace: Uuid,
+    logical: Option<Uuid>,
+    admin: bool,
+    selected: bool,
+    pool: &PoolRecord,
+) -> Result<ActivePoolCreation> {
+    let serial = pool.library_serial.as_str();
+    let receipt =
+        (admin && !selected).then(|| pool_create_receipt_key(namespace, serial, logical, pool.id));
+    if let Some(receipt) = &receipt
+        && let Some(raw) = tr.get(receipt, false).await?
+    {
+        let original = decode_pool(pool.id, &raw)?;
+        return Ok(if original == *pool {
+            ActivePoolCreation::AlreadyExists(original)
+        } else {
+            ActivePoolCreation::IdConflict
+        });
+    }
+    if let Some(logical) = logical {
+        logical_libraries::require_business_route_at(tr, serial).await?;
+        require_library_at(tr, namespace, serial, logical).await?;
+    } else {
+        logical_libraries::require_explicit_scope_at(tr, serial).await?;
+    }
+    if !selected && !selected_pool::id_available_at(tr, namespace, pool.id).await? {
+        return Ok(ActivePoolCreation::IdConflict);
+    }
+    if !selected && !selected_pool::name_available_at(tr, namespace, &pool.name).await? {
+        return Ok(ActivePoolCreation::NameConflict);
+    }
+    let record = pool_key(namespace, pool.id);
+    if selected {
+        native_device::require_pool_available(tr, namespace, pool.id).await?;
+        reclaim::require_pool_write_at(tr, namespace, pool.id).await?;
+    } else {
+        native_device::require_pool_metadata_available(tr, namespace, serial, pool.id).await?;
+    }
+    let named = pool_name_key(namespace, &pool.name);
+    if retired_pool_revision_at(tr, namespace, pool.id)
+        .await?
+        .is_some()
+    {
+        if tr.get(&record, false).await?.is_some() {
+            return Err(CatalogError::Corrupt("退役池仍存在主记录"));
+        }
+        return Ok(ActivePoolCreation::Retired);
+    }
+    if let Some(raw) = tr.get(&record, false).await? {
+        let saved = decode_pool(pool.id, &raw)?;
+        if saved.library_serial != serial {
+            return Ok(ActivePoolCreation::IdConflict);
+        }
+        if admin
+            || pool_library_at(tr, namespace, serial, pool.id)
+                .await?
+                .is_some()
+        {
+            return Ok(ActivePoolCreation::IdConflict);
+        }
+        require_pool_library(tr, namespace, saved.id, serial).await?;
+        require_indexes(tr, namespace, &saved).await?;
+        return Ok(
+            if saved.name == pool.name
+                && saved.file_limit == pool.file_limit
+                && saved.policy == pool.policy
+            {
+                ActivePoolCreation::AlreadyExists(saved)
+            } else {
+                ActivePoolCreation::IdConflict
+            },
+        );
+    }
+    if let Some(raw) = tr.get(&named, false).await? {
+        let owner = uuid_from(&raw)?;
+        if owner == pool.id {
+            return Err(CatalogError::Corrupt("池名称索引缺少主记录"));
+        }
+        let raw = tr
+            .get(&pool_key(namespace, owner), false)
+            .await?
+            .ok_or(CatalogError::Corrupt("池名称索引孤立"))?;
+        if decode_pool(owner, &raw)?.name != pool.name {
+            return Err(CatalogError::Corrupt("池名称索引指向不同名称"));
+        }
+        return Ok(ActivePoolCreation::NameConflict);
+    }
+    let root = root_id(namespace, pool.id);
+    let child = child_key(namespace, Uuid::nil(), pool.id.to_string().as_bytes());
+    let inode = node_key(namespace, root);
+    for key in [&child, &inode] {
+        if tr.get(key, false).await?.is_some() {
+            return Err(CatalogError::Corrupt("新池存在孤立索引或虚拟根"));
+        }
+    }
+    if requests::prefix_has_rows(tr, &child_prefix(namespace, root)).await? {
+        return Err(CatalogError::Corrupt("新池根仍有孤立子项，拒绝补写"));
+    }
+    require_no_file_claims(tr, namespace, pool.id).await?;
+    let raw = tr
+        .get(&node_key(namespace, Uuid::nil()), false)
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+    let parent = decode_node(&raw)?;
+    if parent.kind != NodeKind::Directory || !parent.parent.is_nil() || !parent.name.is_empty() {
+        return Err(CatalogError::Corrupt("命名空间根目录无效"));
+    }
+    let root_metadata = initial_pool_root(pool)?;
+    let root_node = encode_node(&root_metadata);
+    object_metadata::ensure_at(
+        tr,
+        namespace,
+        root_metadata
+            .attributes
+            .as_ref()
+            .expect("initial root has metadata"),
+    )
+    .await?;
+    let encoded = encode_pool(pool);
+    if let Some(logical) = logical {
+        let binding = pool_binding_key(namespace, serial, pool.id);
+        let member = pool_membership_key(namespace, serial, logical, pool.id);
+        if tr.get(&binding, false).await?.is_some() || tr.get(&member, false).await?.is_some() {
+            return Err(CatalogError::Corrupt("新池存在孤立的逻辑带库归属"));
+        }
+        tr.set(&binding, logical.as_bytes());
+        tr.set(&member, b"");
+    }
+    if let Some(receipt) = receipt {
+        tr.set(&receipt, &encoded);
+    }
+    tr.set(&record, &encoded);
+    tr.set(&named, pool.id.as_bytes());
+    tr.set(&child, root.as_bytes());
+    tr.set(&inode, &root_node);
+    Ok(ActivePoolCreation::Created(pool.clone()))
+}
+
+pub(super) async fn discard_empty_selection_at(
+    tr: &Transaction,
+    ns: Uuid,
+    logical: Option<Uuid>,
+    pool: &PoolRecord,
+) -> Result<()> {
+    let key = pool_key(ns, pool.id);
+    let Some(raw) = tr.get(&key, false).await? else {
+        return Ok(());
+    };
+    let serial = &pool.library_serial;
+    let root = root_id(ns, pool.id);
+    if decode_pool(pool.id, &raw)? != *pool
+        || pool_library_at(tr, ns, serial, pool.id).await? != logical
+        || requests::prefix_has_rows(tr, &child_prefix(ns, root)).await?
+        || requests::prefix_has_rows(tr, &pool_assignment_prefix(ns, pool.id)).await?
+    {
+        return Err(CatalogError::Corrupt(
+            "无法移除仍有目录或磁带归属的未发布池",
+        ));
+    }
+    require_indexes(tr, ns, pool).await?;
+    tr.clear(&key);
+    tr.clear(&pool_name_key(ns, &pool.name));
+    tr.clear(&child_key(ns, Uuid::nil(), pool.id.to_string().as_bytes()));
+    tr.clear(&node_key(ns, root));
+    if let Some(logical) = logical {
+        tr.clear(&pool_binding_key(ns, serial, pool.id));
+        tr.clear(&pool_membership_key(ns, serial, logical, pool.id));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

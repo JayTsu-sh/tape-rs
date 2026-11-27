@@ -10,7 +10,7 @@ ltfsctl -e HOST:7401 -l LIBRARY logical-library create archive-a \
 ltfsctl -e HOST:7401 -l LIBRARY logical-library show archive-a --namespace NAMESPACE_UUID
 ```
 
-首次创建前生成并保存 UUID 与选择的全部资源。新增或移除资源需要当前完整库存证明资源为空，且没有未结清动作或 home 引用。可以重复使用 `--drive`、`--storage-slot` 和 `--ie-slot` 指定同类资源。创建响应丢失时，按原 UUID 查询，或用相同 UUID 和完整参数重试。重复分配和篡改原请求都会返回冲突。创建只登记共享目录中的资源归属。
+物理库必须先完成[离线启用](#首次启用已有物理带库)，才能在线新增逻辑库。创建前生成并保存 UUID 与选择的全部资源。新增或移除资源需要当前完整库存证明资源为空，且没有未结清动作或 home 引用。可以重复使用 `--drive`、`--storage-slot` 和 `--ie-slot` 指定同类资源。创建响应丢失时，按原 UUID 查询，或用相同 UUID 和完整参数重试。重复分配和篡改原请求都会返回冲突。创建只登记共享目录中的资源归属。
 
 HTTP 使用 `/libraries/{serial}/admin/logical-libraries` 的 `GET` 和 `POST`。详情使用 `GET /libraries/{serial}/admin/logical-libraries/{selector}`，选择器为名称或 UUID。所有请求携带 `x-tapers-catalog-namespace`。`POST` 的 JSON 包含 `version`、`id`、`name` 和 `resources`，资源对象包含 `drives`、`storage_slots` 和 `ie_slots` 三个数组。首次成功返回 201，重试成功返回 200。Rust 客户端提供 `FdbClient::create_logical_library`、`list_logical_libraries` 和 `logical_library`。
 
@@ -70,7 +70,7 @@ S3 通过 `ListBuckets` 查找逻辑带库下的 pool 名称。应用也可用 R
 
 ## 首次启用已有物理带库
 
-未启用的物理带库只开放管理和监控。首次切换前，在原版本结清已有的业务请求及未知设备动作，然后进入维护窗口。启用后的 pool、文件及介质业务都使用显式逻辑库范围。
+未启用逻辑库时，普通 pool、文件和介质业务使用物理库范围。首次切换前，在原版本结清已有的业务请求及未知设备动作，然后进入维护窗口。启用后的 pool、文件及介质业务都使用显式逻辑库范围。
 
 在维护窗口停发新的业务，确认全部任务结清。完成整库交还并保存回执 UUID。停止所有能够访问该物理库的执行器，确认此前发出的设备命令已经结清。候选版本要在所有节点准备完毕。离线命令要求原设备组的 PR 注册与持有者均已清空，并加载当前完整库存。
 

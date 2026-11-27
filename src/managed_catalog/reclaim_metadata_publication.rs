@@ -344,36 +344,76 @@ pub(in crate::managed_catalog::control::reclaim) struct DirectoryHistoryLink {
     destination_path: String,
 }
 impl DirectoryHistoryLink {
-    pub(in crate::managed_catalog::control::reclaim) fn previous(&self) -> ActiveIndexIdentity { self.previous }
-    pub(in crate::managed_catalog::control::reclaim) fn current(&self) -> ActiveIndexIdentity { self.current }
-    pub(in crate::managed_catalog::control::reclaim) fn physical_files(&self) -> u64 { self.physical_files }
-    pub(in crate::managed_catalog::control::reclaim) fn source(&self) -> &ReclaimSourceNode { &self.source }
-    pub(in crate::managed_catalog::control::reclaim) fn destination_path(&self) -> &str { &self.destination_path }
+    pub(in crate::managed_catalog::control::reclaim) fn previous(&self) -> ActiveIndexIdentity {
+        self.previous
+    }
+    pub(in crate::managed_catalog::control::reclaim) fn current(&self) -> ActiveIndexIdentity {
+        self.current
+    }
+    pub(in crate::managed_catalog::control::reclaim) fn physical_files(&self) -> u64 {
+        self.physical_files
+    }
+    pub(in crate::managed_catalog::control::reclaim) fn source(&self) -> &ReclaimSourceNode {
+        &self.source
+    }
+    pub(in crate::managed_catalog::control::reclaim) fn destination_path(&self) -> &str {
+        &self.destination_path
+    }
 }
 
 pub(in crate::managed_catalog::control::reclaim) async fn require_directory_history_link_at(
-    tr: &Transaction, parent: &ReclaimReservation, owner: u64,
-    attempt: Uuid, current: ActiveIndexIdentity,
+    tr: &Transaction,
+    parent: &ReclaimReservation,
+    owner: u64,
+    attempt: Uuid,
+    current: ActiveIndexIdentity,
 ) -> Result<DirectoryHistoryLink> {
-    if record_at(tr,parent,owner).await?["owner_epoch"]!=owner {return Err(CatalogError::OwnerFenced);}
-    let published=at(tr,parent.namespace(),current).await?.ok_or(CatalogError::Incomplete)?;
-    if published.id()!=attempt || published.observation().current()!=current {return Err(CatalogError::Corrupt("group-only目录历史不是原发布"));}
-    let uid=published.plan().source_uid();
-    let task=Box::pin(load_id_at(tr,parent,uid,attempt)).await?.ok_or(CatalogError::Incomplete)?;
-    if !task.completed() || task.owner()>owner || published.observed_owner()>owner {return Err(CatalogError::OwnerFenced);}
-    let checked=Box::pin(require_task_at(tr,parent,&task)).await?;
-    let plan=checked.plan();
-    let seal=ledger::require_complete_at(tr,parent).await?;
-    if plan.0.parent!=parent.fingerprint() || plan.0.inventory!=seal.summary.digest
-        || plan.0.source_index!=seal.summary.head || !plan.is_node_metadata()
-        || plan.0.source.kind!=ReclaimSourceNodeKind::Directory || plan.0.expected.kind!=ReclaimSourceNodeKind::Directory
-        || tr.get(&ledger::object_key(parent,uid),false).await?.as_deref()!=Some(plan.0.source.encode()?.as_slice()) {
-        return Err(CatalogError::Corrupt("group-only目录历史来源或完整封存节点不同"));
+    if record_at(tr, parent, owner).await?["owner_epoch"] != owner {
+        return Err(CatalogError::OwnerFenced);
     }
-    let previous:ActiveIndexIdentity=plan.previous_source()?.head().into();
-    if previous.volume_uuid!=current.volume_uuid || previous.generation.checked_add(1)!=Some(current.generation) {
+    let published = at(tr, parent.namespace(), current)
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+    if published.id() != attempt || published.observation().current() != current {
+        return Err(CatalogError::Corrupt("group-only目录历史不是原发布"));
+    }
+    let uid = published.plan().source_uid();
+    let task = Box::pin(load_id_at(tr, parent, uid, attempt))
+        .await?
+        .ok_or(CatalogError::Incomplete)?;
+    if !task.completed() || task.owner() > owner || published.observed_owner() > owner {
+        return Err(CatalogError::OwnerFenced);
+    }
+    let checked = Box::pin(require_task_at(tr, parent, &task)).await?;
+    let plan = checked.plan();
+    let seal = ledger::require_complete_at(tr, parent).await?;
+    if plan.0.parent != parent.fingerprint()
+        || plan.0.inventory != seal.summary.digest
+        || plan.0.source_index != seal.summary.head
+        || !plan.is_node_metadata()
+        || plan.0.source.kind != ReclaimSourceNodeKind::Directory
+        || plan.0.expected.kind != ReclaimSourceNodeKind::Directory
+        || tr
+            .get(&ledger::object_key(parent, uid), false)
+            .await?
+            .as_deref()
+            != Some(plan.0.source.encode()?.as_slice())
+    {
+        return Err(CatalogError::Corrupt(
+            "group-only目录历史来源或完整封存节点不同",
+        ));
+    }
+    let previous: ActiveIndexIdentity = plan.previous_source()?.head().into();
+    if previous.volume_uuid != current.volume_uuid
+        || previous.generation.checked_add(1) != Some(current.generation)
+    {
         return Err(CatalogError::Invalid("group-only目录历史跳过原前驱"));
     }
-    Ok(DirectoryHistoryLink{previous,current,physical_files:checked.observation().physical_files(),
-        source:ReclaimSourceNode(plan.0.source.clone()),destination_path:plan.path().to_owned()})
+    Ok(DirectoryHistoryLink {
+        previous,
+        current,
+        physical_files: checked.observation().physical_files(),
+        source: ReclaimSourceNode(plan.0.source.clone()),
+        destination_path: plan.path().to_owned(),
+    })
 }

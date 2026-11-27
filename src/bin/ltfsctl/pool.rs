@@ -10,14 +10,34 @@ use uuid::Uuid;
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// 原子创建池及其根目录；不分配或格式化磁带
+    /// 创建多副本池、处理导入冲突及归档文件
+    Replicated {
+        #[command(subcommand)]
+        cmd: ReplicatedCommand,
+    },
+    /// 创建空池或指定磁带的普通池
     Create {
         name: String,
         #[arg(long, default_value_t = 200_000)]
         file_limit: u64,
+        /// 只读检查池名称和磁带清单
+        #[arg(long, requires = "tapes", conflicts_with = "request")]
+        preview: bool,
+        /// 指定磁带条码，可重复指定
+        #[arg(long = "tape")]
+        tapes: Vec<String>,
+        /// 允许初始化经验证的空白磁带
+        #[arg(long, requires = "tapes", conflicts_with = "preview")]
+        confirm_format: bool,
         /// 首次调用前保存请求身份；重试须用相同文件和参数
         #[arg(long)]
         request: Option<PathBuf>,
+    },
+    /// 按原 UUID 查询指定磁带的建池任务
+    CreateStatus {
+        id: Uuid,
+        #[arg(long)]
+        namespace: Uuid,
     },
     /// 列出当前带库的全部FDB池
     List {
@@ -43,6 +63,147 @@ pub enum Command {
     },
 }
 
+#[derive(Subcommand)]
+pub enum ReplicatedCommand {
+    /// 从包含原 UUID、底层池范围和条码的 JSON 文件提交创建
+    Create {
+        #[arg(long)]
+        request: PathBuf,
+    },
+    /// 按 UUID 查看原任务、底层池和物理故障范围
+    Show { id: Uuid },
+    /// 分页查看已发布路径及各文件的实际副本数
+    Files {
+        id: Uuid,
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// 处理同路径内容冲突，选定原卷的版本
+    Resolve {
+        id: Uuid,
+        #[arg(long)]
+        path: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        volume: Uuid,
+    },
+    /// 从原请求文件归档或恢复。省略 source 时从已提交副本恢复
+    Archive {
+        id: Uuid,
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        source: Option<PathBuf>,
+    },
+    /// 按原 UUID 查询归档与各成员提交证明
+    ArchiveStatus { id: Uuid, operation: Uuid },
+    /// 请求取消原归档并保留已确认的成员提交
+    ArchiveCancel { id: Uuid, operation: Uuid },
+    /// 查看当前已发布文件版本
+    Stat { id: Uuid, path: String },
+    /// 验证并下载文件，可固定一个底层池冷读
+    Get {
+        id: Uuid,
+        path: String,
+        output: PathBuf,
+        #[arg(long)]
+        member: Option<Uuid>,
+    },
+}
+
+fn run_replicated(
+    client: &FdbClient,
+    command: ReplicatedCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use tape_rs::replicated_pool::{
+        CreateReplicatedPool, ReplicatedArchive, ResolveReplicatedPoolConflict,
+    };
+
+    let value = match command {
+        ReplicatedCommand::Create { request } => {
+            let input: CreateReplicatedPool = read_request(&request)?;
+            client.create_replicated_pool(&input)?
+        }
+        ReplicatedCommand::Show { id } => client.replicated_pool_status(id)?,
+        ReplicatedCommand::Files { id, after, limit } => {
+            client.replicated_pool_files(id, after.as_deref(), limit)?
+        }
+        ReplicatedCommand::Resolve {
+            id,
+            path,
+            revision,
+            volume,
+        } => client.resolve_replicated_pool_conflict(
+            id,
+            &ResolveReplicatedPoolConflict {
+                version: 1,
+                path,
+                revision,
+                volume_uuid: volume,
+            },
+        )?,
+        ReplicatedCommand::Archive {
+            id,
+            request,
+            source,
+        } => {
+            let input: ReplicatedArchive = read_request(&request)?;
+            client.archive_replicated(id, &input, source.as_deref())?
+        }
+        ReplicatedCommand::ArchiveStatus { id, operation } => {
+            client.replicated_archive_status(id, operation)?
+        }
+        ReplicatedCommand::ArchiveCancel { id, operation } => {
+            client.cancel_replicated_archive(id, operation)?
+        }
+        ReplicatedCommand::Stat { id, path } => client
+            .replicated_file_stat(id, &path)?
+            .ok_or(tape_rs::client::ClientError::NotFound)?,
+        ReplicatedCommand::Get {
+            id,
+            path,
+            output,
+            member,
+        } => {
+            let size = client.download_replicated_new(id, &path, member, &output)?;
+            json!({"path":path,"size":size,"output":output})
+        }
+    };
+    print(value)
+}
+
+fn read_request<T: serde::de::DeserializeOwned>(
+    request: &std::path::Path,
+) -> Result<T, Box<dyn std::error::Error>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(request)?;
+    if !file.metadata()?.is_file() {
+        return Err("多副本请求须保存在普通文件中".into());
+    }
+    file.sync_all()?;
+    std::fs::File::open(
+        request
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new(".")),
+    )?
+    .sync_all()?;
+    let mut bytes = Vec::new();
+    file.take(16 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 16 * 1024 {
+        return Err("多副本请求超过 16 KiB".into());
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 pub(super) fn library<'a>(
     library: Option<&'a str>,
     pool: Option<&str>,
@@ -55,19 +216,19 @@ pub(super) fn library<'a>(
 pub(super) fn submit(
     client: &FdbClient,
     library: &str,
-    logical: Uuid,
+    logical: Option<Uuid>,
     input: ManagementIntent,
     path: PathBuf,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     match ManagementRequestFile::load(&path) {
         Ok(saved) => {
-            if !saved.matches_pool_scope(library, Some(logical), &input) {
+            if !saved.matches_pool_scope(library, logical, &input) {
                 return Err("请求文件的物理库、逻辑库或参数不同；禁止覆盖原请求".into());
             }
         }
         Err(tape_rs::client::ClientError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             client
-                .prepare_pool_management(library, Some(logical), input)?
+                .prepare_pool_management(library, logical, input)?
                 .save_new(&path)?;
         }
         Err(e) => return Err(e.into()),
@@ -80,7 +241,7 @@ pub(super) fn submit(
 fn items(
     client: &FdbClient,
     library: &str,
-    logical: Uuid,
+    logical: Option<Uuid>,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let context = client.management_context(library)?;
     let ns = context["namespace"].as_str().ok_or("缺少目录命名空间")?;
@@ -88,7 +249,7 @@ fn items(
     let mut seen = std::collections::HashSet::new();
     let mut items = Vec::new();
     loop {
-        let page = client.pool_page_in_scope(library, ns, Some(logical), after.as_deref())?;
+        let page = client.pool_page_in_scope(library, ns, logical, after.as_deref())?;
         items.extend(page["items"].as_array().ok_or("分页清单无效")?.clone());
         after = page["next"].as_str().map(str::to_owned);
         if let Some(cursor) = &after {
@@ -123,15 +284,53 @@ pub fn run(
     logical: Option<Uuid>,
     command: Command,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if let Command::Replicated { cmd } = command {
+        if serial.is_some() || pool.is_some() || logical.is_some() {
+            return Err("多副本池使用请求中的各底层池范围，请移除全局带库或池选择".into());
+        }
+        return run_replicated(client, cmd);
+    }
     let library = library(serial, pool)?;
-    let logical = logical
-        .filter(|id| !id.is_nil())
-        .ok_or("池管理必须通过 --logical-library 指定逻辑带库 UUID")?;
+    if logical.is_some_and(|id| id.is_nil()) {
+        return Err("逻辑带库 UUID 不能为零".into());
+    }
     let result = match command {
+        Command::Replicated { .. } => unreachable!("多副本池已分派"),
+        Command::Create {
+            name,
+            file_limit,
+            preview: true,
+            tapes,
+            ..
+        } => {
+            let context = client.management_context(library)?;
+            let namespace = context["namespace"].as_str().ok_or("缺少目录命名空间")?;
+            client.preview_pool_create(library, namespace, logical, &name, file_limit, &tapes)?
+        }
+        Command::Create {
+            name,
+            file_limit,
+            tapes,
+            confirm_format,
+            request,
+            ..
+        } if !tapes.is_empty() => submit(
+            client,
+            library,
+            logical,
+            ManagementIntent::CreateSelected {
+                name,
+                file_limit,
+                tapes,
+                confirm_format,
+            },
+            request_path(request)?,
+        )?,
         Command::Create {
             name,
             file_limit,
             request,
+            ..
         } => submit(
             client,
             library,
@@ -139,6 +338,9 @@ pub fn run(
             ManagementIntent::Create { name, file_limit },
             request_path(request)?,
         )?,
+        Command::CreateStatus { id, namespace } => {
+            client.selected_pool_create_status(library, namespace, logical, id)?
+        }
         Command::Set {
             selector,
             attribute,
@@ -167,7 +369,7 @@ pub fn run(
             client.pool_in_scope(
                 library,
                 context["namespace"].as_str().ok_or("缺少命名空间")?,
-                Some(logical),
+                logical,
                 &selector,
             )?
         }
@@ -245,6 +447,32 @@ pub(super) fn selected(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn selected_creation_and_preview_flags_are_distinct() {
+        let parse = |extra: &[&str]| {
+            let args = [
+                "ltfsctl",
+                "-e",
+                "localhost:1",
+                "pool",
+                "--library",
+                "LIB",
+                "create",
+                "archive",
+            ];
+            crate::Args::try_parse_from(args.into_iter().chain(extra.iter().copied()))
+        };
+        assert!(parse(&[]).is_ok());
+        assert!(parse(&["--preview", "--tape", "NEW001L8", "--tape", "NEW002L8"]).is_ok());
+        assert!(parse(&["--tape", "NEW001L8"]).is_ok());
+        assert!(parse(&["--tape", "NEW001L8", "--confirm-format"]).is_ok());
+        assert!(parse(&["--confirm-format"]).is_err());
+        assert!(parse(&["--preview", "--tape", "NEW001L8", "--confirm-format"]).is_err());
+        assert!(parse(&["--preview", "--tape", "NEW001L8", "--request", "plan.json"]).is_err());
+    }
+
     #[test]
     fn names_cannot_break_table_rows_and_unicode_name_is_last() {
         assert_eq!(display_name("中文\n\t\u{1b}"), "中文\\n\\t\\u{1b}");

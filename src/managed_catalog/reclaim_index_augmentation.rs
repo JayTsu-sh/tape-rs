@@ -614,9 +614,19 @@ impl ReclaimIndexAugmentation {
     }
 }
 
-pub(super) async fn actual_for_attempt_at(tr:&Transaction,parent:&ReclaimReservation,group:&ReclaimCopyGroup)->Result<Option<ReclaimIndexAugmentation>> {
-    if tr.get(&key(parent,b'a',Some(group.id()),None),false).await?.is_none(){return Ok(None);}
-    require_actual_at(tr,parent,group).await.map(Some)
+pub(super) async fn actual_for_attempt_at(
+    tr: &Transaction,
+    parent: &ReclaimReservation,
+    group: &ReclaimCopyGroup,
+) -> Result<Option<ReclaimIndexAugmentation>> {
+    if tr
+        .get(&key(parent, b'a', Some(group.id()), None), false)
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    require_actual_at(tr, parent, group).await.map(Some)
 }
 async fn require_actual_at(
     tr: &Transaction,
@@ -794,7 +804,7 @@ async fn evidence_group_at(
     if group.id() != id {
         return Err(CatalogError::Corrupt("回收物理证明组身份改变"));
     }
-    group_attempt::require_group_at(tr,parent,&group).await?;
+    group_attempt::require_group_at(tr, parent, &group).await?;
     if group.header.phase == Phase::Closed {
         group_close::require_closed_evidence_at(tr, parent, &group).await?;
     }
@@ -835,7 +845,8 @@ pub(super) async fn audit_row_at(
 #[path = "reclaim_group_settlement.rs"]
 mod group_settlement;
 pub(in crate::managed_catalog) use group_settlement::{
-    GroupFileReference, group_member_coverage_at, group_member_coverage_in_at, GroupCoverageMode, GroupRetirementPins,
+    GroupCoverageMode, GroupFileReference, GroupRetirementPins, group_member_coverage_at,
+    group_member_coverage_in_at,
 };
 
 /// Header protocol 3 calls this unconditionally. A missing route, intent,
@@ -1493,7 +1504,7 @@ impl ReclaimGroupExecution {
         tr: &Transaction,
         intents: &[ActiveFileIntent],
     ) -> Result<ReclaimCopyGroup> {
-        source::group_only::require_seal_at(tr,&self.parent).await?;
+        source::group_only::require_seal_at(tr, &self.parent).await?;
         isolation::require_fresh_at(tr, &self.parent).await?;
         let current = load_at(tr, &self.parent, self.execution_epoch)
             .await?
@@ -1813,8 +1824,11 @@ impl ReclaimIndexIntent {
         }
         Ok(())
     }
-    pub(super) fn attempt_base(&self)->Result<(IndexSourceIdentity,u64)> {
-        Ok((IndexSourceIdentity::from_bytes(&self.intent.previous_source).map_err(cache)?,self.intent.previous_dp_eod))
+    pub(super) fn attempt_base(&self) -> Result<(IndexSourceIdentity, u64)> {
+        Ok((
+            IndexSourceIdentity::from_bytes(&self.intent.previous_source).map_err(cache)?,
+            self.intent.previous_dp_eod,
+        ))
     }
     pub(crate) fn archive_paths(&self) -> impl Iterator<Item = &str> {
         self.members.iter().map(|member| member.archive.as_str())
@@ -2174,7 +2188,7 @@ impl ManagedCatalog {
 }
 
 #[cfg(test)]
-#[path="reclaim_full_dp_policy_tests.rs"]
+#[path = "reclaim_full_dp_policy_tests.rs"]
 mod full_dp_policy_tests;
 
 /// Exact original physical group history, without calling qualification back.
@@ -2200,7 +2214,15 @@ pub(in crate::managed_catalog::control::reclaim) async fn group_only_history_lin
     {
         return Err(CatalogError::Invalid("group-only历史不是原唯一组"));
     }
-    require_checkpoint_at(tr,parent.namespace(),group.batch_id(),route.manifest,index,Some(plan.target_file_count())).await?;
+    require_checkpoint_at(
+        tr,
+        parent.namespace(),
+        group.batch_id(),
+        route.manifest,
+        index,
+        Some(plan.target_file_count()),
+    )
+    .await?;
     let root = if let Some(root) = &plan.intent.intent.root {
         Some(source::sealed_entry_node_at(tr, parent, &root.source).await?)
     } else {

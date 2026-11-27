@@ -122,20 +122,21 @@ fn home_key(ns: Uuid, serial: &str, barcode: &str) -> Vec<u8> {
     append_component(&mut out, barcode.as_bytes());
     out
 }
-pub(super) async fn has_home_in(
+pub(super) async fn home_claims_in(
     tr: &Transaction,
     ns: Uuid,
     serial: &str,
     slots: &[u16],
-) -> Result<bool> {
+) -> Result<Vec<(u16, Vec<u8>)>> {
     if slots.is_empty() {
-        return Ok(false);
+        return Ok(Vec::new());
     }
     let prefix = home_prefix(ns, serial);
+    let mut claims = Vec::new();
     let mut after = None;
     loop {
         let page = read_page(tr, &prefix, after.as_deref(), 100, false).await?;
-        for (_, raw) in page.items {
+        for (key, raw) in page.items {
             let value: Value = serde_json::from_slice(&raw)
                 .map_err(|_| CatalogError::Corrupt("持久 home 编码"))?;
             if value["library"] != serial
@@ -149,12 +150,12 @@ pub(super) async fn has_home_in(
                 .and_then(|v| u16::try_from(v).ok())
                 .ok_or(CatalogError::Corrupt("持久 home 地址无效"))?;
             if slots.contains(&address) {
-                return Ok(true);
+                claims.push((address, decode_name(&key[prefix.len()..])?));
             }
         }
         after = page.next;
         if after.is_none() {
-            return Ok(false);
+            return Ok(claims);
         }
     }
 }
@@ -912,6 +913,9 @@ impl ManagedCatalog {
                                     .await?;
                             }
                             if let Some(pool) = task.pool() {
+                                if exclusion.is_some() {
+                                    replicated_pools::require_independent_at(&tr, ns, pool).await?;
+                                }
                                 reclaim::require_pool_write_at(&tr, ns, pool).await?;
                                 native_media::require_pool_readable(&tr, ns, pool).await?;
                             } else {

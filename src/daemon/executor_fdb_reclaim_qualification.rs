@@ -46,12 +46,7 @@ pub(super) fn prepare<'a>(
             .map_err(parent_error)?;
             let selected = control
                 .catalog
-                .resolve_active_read_source_for_owner(
-                    &control.serial,
-                    &full,
-                    control.route,
-                    owner.round,
-                )
+                .resolve_reclaim_file_source(parent, owner.round, &full)
                 .await
                 .map_err(parent_error)?
                 .ok_or_else(|| lost("group-only原逻辑文件丢失"))?;

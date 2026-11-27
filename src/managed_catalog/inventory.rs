@@ -152,6 +152,14 @@ pub(super) async fn inventory_entry(
     if assignment.namespace != ns {
         return Err(CatalogError::Corrupt("磁带库存与 Active namespace 不符"));
     }
+    if selected_pool::is_pending_at(tr, ns, serial, assignment.pool_id).await? {
+        let monitor = tape_monitor::read_at(tr, ns, serial, barcode)
+            .await?
+            .map(|r| r.to_json());
+        return Ok(Some(
+            serde_json::json!({"barcode":barcode,"assignment":null,"pool":null,"monitor":monitor}),
+        ));
+    }
     let raw = tr
         .get(&pool_key(ns, assignment.pool_id), false)
         .await?

@@ -19,6 +19,7 @@ async fn media_assign_journal_pins_format_intent_and_atomic_membership() {
         .await
         .unwrap();
     let owner = route.initial_owner_epoch;
+    c.enable_logical_business_fixture(&serial).await.unwrap();
 
     let pool = PoolRecord {
         id: Uuid::new_v4(),

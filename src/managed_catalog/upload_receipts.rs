@@ -293,6 +293,40 @@ impl ManagedCatalog {
     }
 }
 
+/// The archive journal needs immutable commit evidence without hydrating attributes.
+pub(super) async fn replica_commit_at(
+    tr: &Transaction,
+    intent: &ActiveFileRequest,
+) -> Result<Option<(CommitReceipt, String)>> {
+    let ns = intent.namespace;
+    let epoch = intent.request_epoch;
+    let operation = intent.operation_id;
+    let Some(terminal) = tr.get(&op_key(ns, epoch, operation), false).await? else {
+        return Ok(None);
+    };
+    match requests::reservation_terminal_result(&terminal, &intent.fingerprint())? {
+        PublishOutcome::AlreadyApplied(1) => {}
+        PublishOutcome::RequestCancelled => return Ok(None),
+        _ => return Err(CatalogError::IdempotencyMismatch),
+    }
+    let raw = tr
+        .get(&record_key(ns, epoch, operation), false)
+        .await?
+        .ok_or(CatalogError::Corrupt("副本写入终态缺少原回执"))?;
+    let (record, receipt) = Record::decode(&raw, ns, epoch, operation)?;
+    if receipt_fingerprint(&receipt) != terminal[1..33]
+        || receipt.expected_version.is_some()
+        || receipt.pool_id != intent.pool_id
+        || receipt.library_serial != intent.library_serial
+        || receipt.file_id != intent.file_id
+        || receipt.size != intent.expected_size
+        || receipt.content_digest != intent.expected_digest
+    {
+        return Err(CatalogError::Corrupt("底层池原提交证明与请求不符"));
+    }
+    Ok(Some((receipt, record.barcode)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

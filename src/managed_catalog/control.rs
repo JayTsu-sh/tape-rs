@@ -39,8 +39,15 @@ pub use native_device::NativeDeviceTask;
 
 #[path = "active_pools.rs"]
 mod active_pools;
+#[path = "replicated_pools.rs"]
+pub(super) mod replicated_pools;
+pub(crate) use replicated_pools::archive::{ReplicaObjectMetadata, ReplicaUpload};
+pub(crate) use replicated_pools::files::ReplicaFile;
+pub use replicated_pools::files::ReplicaRead;
 #[path = "scoped_pools.rs"]
 mod scoped_pools;
+#[path = "selected_pool.rs"]
+mod selected_pool;
 pub use active_pools::ActivePoolCreation;
 #[path = "pool_roots.rs"]
 mod pool_roots;
@@ -109,7 +116,9 @@ pub use node_tasks::{
     NodeMutationTask, NodeMutationTaskKind, NodeMutationTaskOutcome, NodeMutationTaskState,
     NodeMutationTaskStatus,
 };
-pub(super) use node_tasks::{node_hold_prefix, require_pool_writable_at};
+pub(super) use node_tasks::{
+    node_hold_prefix, require_pool_mutation_barriers_at, require_pool_writable_at,
+};
 #[path = "node_attempts.rs"]
 pub(super) mod node_attempts;
 #[path = "node_claims.rs"]
@@ -977,7 +986,9 @@ impl ManagedCatalog {
         let mut items = Vec::new();
         for (key, value) in page.items {
             let pool = decode_pool(uuid_from(&key[prefix.len()..])?, &value)?;
-            if pool.library_serial == serial {
+            if pool.library_serial == serial
+                && !selected_pool::is_unpublished_at(&tr, route.route.namespace, pool.id).await?
+            {
                 require_pool_library(&tr, route.route.namespace, pool.id, serial).await?;
                 active_pools::require_indexes(&tr, route.route.namespace, &pool).await?;
                 items.push(pool);

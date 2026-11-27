@@ -9,6 +9,8 @@ use uuid::Uuid;
 
 #[path = "s3_fdb_rename.rs"]
 mod rename;
+#[path = "s3_fdb_replica.rs"]
+mod replica;
 #[path = "s3_fdb_write.rs"]
 mod write;
 
@@ -24,6 +26,7 @@ struct FdbS3 {
     peers: HashMap<u64, String>,
     requests: Arc<Semaphore>,
     storage: super::super::fdb_read::ReadStorageBudget,
+    replica: Arc<super::super::fdb_http::Context>,
 }
 
 pub fn router(
@@ -34,6 +37,14 @@ pub fn router(
     peers: HashMap<u64, String>,
     writable: bool,
 ) -> Router {
+    let storage = Default::default();
+    let replica = super::super::fdb_http::owner_context(
+        catalog.clone(),
+        routes.clone(),
+        libraries.clone(),
+        HashMap::new(),
+        writable.then_some(storage),
+    );
     Router::new().fallback(dispatch).with_state(FdbS3 {
         writable,
         catalog,
@@ -42,7 +53,8 @@ pub fn router(
         gateway,
         peers,
         requests: Arc::new(Semaphore::new(8)),
-        storage: Default::default(),
+        storage,
+        replica,
     })
 }
 #[allow(clippy::too_many_arguments)]
@@ -53,9 +65,17 @@ pub fn serve(
     libraries: BTreeMap<String, Arc<HttpContext>>,
     gateway: Arc<HttpContext>,
     peers: HashMap<u64, String>,
+    native_peers: HashMap<u64, String>,
     writable: bool,
     storage: super::super::fdb_read::ReadStorageBudget,
 ) -> std::io::Result<()> {
+    let replica = super::super::fdb_http::owner_context(
+        catalog.clone(),
+        routes.clone(),
+        libraries.clone(),
+        native_peers,
+        writable.then_some(storage),
+    );
     http::serve_s3_router(
         listen,
         Router::new().fallback(dispatch).with_state(FdbS3 {
@@ -67,6 +87,7 @@ pub fn serve(
             peers,
             requests: Arc::new(Semaphore::new(8)),
             storage,
+            replica,
         }),
     )
 }
@@ -82,7 +103,7 @@ fn catalog_error(error: CatalogError) -> S3Error {
 
 #[derive(Clone)]
 struct Bucket {
-    serial: String,
+    serial: Option<String>,
     pool: Uuid,
     logical_library: Option<Uuid>,
     created_at_millis: u64,
@@ -101,18 +122,18 @@ async fn buckets(s: &FdbS3) -> S3Result<BTreeMap<String, Bucket>> {
             if all.len() + page.items.len() > 4096 {
                 return Err(unavailable("S3 bucket 列表超过本入口上限"));
             }
-            let logical = s
+            let scopes = s
                 .catalog
-                .active_pool_logical_libraries(serial, *route, &page.items)
+                .active_pool_business_scopes(serial, *route, page.items)
                 .await
                 .map_err(catalog_error)?;
-            for (pool, logical_library) in page.items.into_iter().zip(logical) {
-                let Some(logical) = logical_library else {
-                    continue;
+            for (pool, logical_library) in scopes {
+                let name = match logical_library {
+                    Some(logical) => logical_bucket_name(serial, logical, pool.id),
+                    None => bucket_name(serial, &pool.id.to_string()),
                 };
-                let name = logical_bucket_name(serial, logical, pool.id);
                 let bucket = Bucket {
-                    serial: serial.clone(),
+                    serial: Some(serial.clone()),
                     pool: pool.id,
                     logical_library,
                     created_at_millis: pool.created_at_millis,
@@ -125,6 +146,32 @@ async fn buckets(s: &FdbS3) -> S3Result<BTreeMap<String, Bucket>> {
             if after.is_none() {
                 break;
             }
+        }
+    }
+    let mut after = None;
+    loop {
+        let page = s
+            .catalog
+            .replicated_buckets(&s.routes, after.as_deref())
+            .await
+            .map_err(catalog_error)?;
+        if all.len() + page.items.len() > 4096 {
+            return Err(unavailable("S3 bucket 列表超过本入口上限"));
+        }
+        for (pool, created_at_millis) in page.items {
+            let bucket = Bucket {
+                serial: None,
+                pool,
+                logical_library: None,
+                created_at_millis,
+            };
+            if all.insert(format!("replica-{pool}"), bucket).is_some() {
+                return Err(unavailable("S3 bucket 身份冲突"));
+            }
+        }
+        after = page.next;
+        if after.is_none() {
+            break;
         }
     }
     check_routes(s).await?;
@@ -243,6 +290,20 @@ async fn dispatch_inner(s: FdbS3, req: Request) -> S3Result<Response> {
         .clone()
         .try_acquire_owned()
         .map_err(|_| S3Error::new(503, "SlowDown", "S3 并发请求已达上限"))?;
+    if let Some(id) = bucket.strip_prefix("replica-")
+        && let Ok(pool) = Uuid::parse_str(id)
+        && pool.to_string() == id
+    {
+        if !s
+            .catalog
+            .replica_bucket_exists(pool, &s.routes)
+            .await
+            .map_err(catalog_error)?
+        {
+            return Err(S3Error::new(404, "NoSuchBucket", "指定 bucket 不存在"));
+        }
+        return replica::dispatch(&s, pool, &bucket, &key, &q, req, permit).await;
+    }
     let all = buckets(&s).await?;
     let scope = if bucket.is_empty() {
         None
@@ -253,11 +314,18 @@ async fn dispatch_inner(s: FdbS3, req: Request) -> S3Result<Response> {
                 .ok_or_else(|| S3Error::new(404, "NoSuchBucket", "指定 bucket 不存在"))?,
         )
     };
+    if req.headers().contains_key(replica::OPERATION) {
+        return Err(S3Error::new(
+            400,
+            "InvalidArgument",
+            "归档操作 UUID 需要多副本池",
+        ));
+    }
     let ctx = match &scope {
         None => s.gateway.clone(),
         Some(bucket) => s
             .libraries
-            .get(&bucket.serial)
+            .get(bucket.serial.as_ref().expect("ordinary bucket"))
             .cloned()
             .ok_or_else(|| unavailable("目标带库未配置"))?,
     };
@@ -265,11 +333,12 @@ async fn dispatch_inner(s: FdbS3, req: Request) -> S3Result<Response> {
         let target = scope
             .as_ref()
             .ok_or_else(|| S3Error::new(400, "InvalidArgument", "RenameObject 缺少 bucket"))?;
+        let serial = target.serial.as_deref().expect("ordinary bucket");
         Some(rename::input(
             &req,
             &bucket,
-            &target.serial,
-            s.routes[&target.serial],
+            serial,
+            s.routes[serial],
             target.pool,
         )?)
     } else {
@@ -322,7 +391,7 @@ async fn dispatch_inner(s: FdbS3, req: Request) -> S3Result<Response> {
     }
     let round = owner.round;
     if let Some(Bucket {
-        serial,
+        serial: Some(serial),
         pool,
         logical_library,
         ..
@@ -365,7 +434,7 @@ async fn dispatch_inner(s: FdbS3, req: Request) -> S3Result<Response> {
                 }
                 xml_response(200, &format!("<LocationConstraint xmlns=\"{NS}\"/>"), false)
             } else {
-                list(&s, &serial, pool, &bucket, &q).await?
+                list(&s, Some(&serial), pool, &bucket, &q).await?
             }
         } else {
             if q.keys().any(|k| k != "x-id") {
@@ -458,7 +527,7 @@ fn cursor(
 }
 async fn list(
     s: &FdbS3,
-    serial: &str,
+    serial: Option<&str>,
     pool: Uuid,
     bucket: &str,
     q: &BTreeMap<String, String>,
@@ -515,7 +584,7 @@ async fn list(
             ));
         }
     };
-    let namespace = s.routes[serial].route.namespace;
+    let namespace = serial.map_or(pool, |serial| s.routes[serial].route.namespace);
     let start = q
         .get(if v2 { "start-after" } else { "marker" })
         .map(String::as_str)
@@ -536,21 +605,22 @@ async fn list(
             "列举参数含非法 XML 字符，请使用 encoding-type=url",
         ));
     }
-    let page = s
-        .catalog
-        .list_active_objects_for_route(
-            serial,
-            s.routes[serial],
-            ObjectListRequest {
-                pool,
-                prefix,
-                delimiter,
-                max_keys: max,
-                start_after: &after,
-            },
-        )
-        .await
-        .map_err(catalog_error)?;
+    let query = ObjectListRequest {
+        pool,
+        prefix,
+        delimiter,
+        max_keys: max,
+        start_after: &after,
+    };
+    let page = match serial {
+        Some(serial) => {
+            s.catalog
+                .list_active_objects_for_route(serial, s.routes[serial], query)
+                .await
+        }
+        None => s.catalog.list_replica_objects(&s.routes, query).await,
+    }
+    .map_err(catalog_error)?;
     let esc = |v: &str| {
         xml(&if encoded {
             crate::client::encode_query(v)
