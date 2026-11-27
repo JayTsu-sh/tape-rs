@@ -29,6 +29,8 @@ ltfsctl -e NODE:7411 --library SERIAL pool create-status POOL_UUID --namespace N
 
 创建或查询逻辑带库下的池时，两条命令都传入原 `--logical-library`。超时后用原请求文件和原参数继续，或按回执中的 UUID 与 namespace 查询。回执的 `active_tape` 包括原介质子任务及其检查点。位置或初始化结果待核对时，任务保留原条码、卷 UUID 和预约。
 
+介质任务明确失败或取消且设备操作已结清时，建池返回 `failed` 或 `cancelled`。原回执仍可查询，已确认结清的预约会释放。已完成导入的卷保留归属，并在原回执中列出。建池失败时，部分准备的池不会发布给应用。
+
 写命令在第一次提交前以独占创建、0600、文件和父目录 fsync 保存请求文件。重复执行同一命令和相同参数时使用同一文件，沿用原 namespace、池 UUID、修订号、任务 epoch/operation；不会重新解析池名或更新修订号。不同参数、损坏或不完整文件直接拒绝，不覆盖、不修复。文件只保存请求身份，不缓存任务状态。保留这些文件供超时、断网和接管后恢复；不要为了重试而删除文件或改用新文件。
 
 策略字段是 `name`、`file_limit`、`media_restriction`、`mount_limit`、`low_space_warning_enabled`、`low_space_warning_threshold`、`no_space_warning_enabled`。开关使用 true/false；数值阈值为 0..32767；file_limit 必须大于零；介质限制沿用 L5/L6/L7/L8/L9/M8 和支持的 IBM 介质代码，none 表示不限制。表格的 UUID、修订号、文件上限列使用固定宽度；可变宽度中文名称放在末列，控制字符转义，避免换行破坏表格。
@@ -117,6 +119,8 @@ ltfsctl -e NODE:7411 pool replicated resolve POOL_UUID --path /报告.pdf --revi
 
 创建受理后保留同一请求文件和 UUID。底层池及磁带在全部准备完成后共同发布，管理详情按物理库列出故障范围。成员有库存或 owner 待核对时显示 `waiting_library`，已发出的初始化待确认时显示 `result_unknown`。成员的旧请求范围保存在 `original_logical_library`，查询中的 `logical_library` 反映底层池当前的带库范围。
 
+任一成员明确失败或取消时停止发起后续介质任务，各成员结清原任务后释放已确认安全的预约。父池详情保留原成员回执及已完成卷的身份。
+
 已有 LTFS 文件逐个读回验证，卷和文件内容保留。文件清单分页给出正文 SHA-256 和按底层池计数的 `replica_count`，创建期间不会补写历史副本。指定 `confirm_format: true` 的成员只可初始化经实读核实的空白磁带。已有 LTFS 卷上的池标记须缺失或与对应底层池相符。
 
 同路径内容冲突时，详情的 `conflict` 给出路径、修订号和两盘来源。管理员选定保留卷后提交该路径和原修订号，原任务继续。另一盘的原文件仍保存在原卷。目录与文件占用同一路径时，保留目录及其中的文件。底层池的独立文件写入和删除受保护。应用通过多副本池的文件接口访问已发布版本。
@@ -152,6 +156,8 @@ HTTP 使用 `POST /v1/fdb/replicated-pools/{id}/archives` 受理 JSON。每个�
 
 读文件使用 `GET /v1/fdb/replicated-pools/{id}/file?path=BASE64URL`。可传 `version` 固定发布版本，传 `member` 固定验收成员。`GET /v1/fdb/replicated-pools/{id}/stat?path=BASE64URL` 返回 `file_version`、长度、摘要和副本数。`path` 使用 UTF-8 字节的无填充 Base64URL。Rust SDK 在 `FdbClient` 暴露同样的归档、查询、取消和下载操作。
 
+已导入的符号链接在 `stat` 的 `symlink` 字段返回校验后的原目标，FUSE 可读取该链接。
+
 ### S3 和 FUSE
 
 启用 `ltfsd --fdb-s3 --s3-listen 0.0.0.0:PORT --s3-port PORT` 后，`ListBuckets` 会列出已发布的多副本池。bucket 名为 `replica-POOL_UUID`，使用父池 UUID。S3 支持列举、HEAD、GET 和单次 PUT。可在池根目录或已导入的目录内创建文件。
@@ -167,3 +173,5 @@ tape-fuse -e NODE:7411 --replicated-pool POOL_UUID --cache-dir CACHE MOUNTPOINT
 S3 覆盖可用 `If-Match` 固定原对象的 ETag。PUT 前生成并保存 `X-Tapers-Operation` UUID，保留原路径、正文、条件头及对象元数据。收到 503、504 或连接中断时，可用原 UUID 查询 `ltfsctl pool replicated archive-status`，或提交完全相同的 PUT 继续。源正文丢失时，可通过原生归档接口从已验证的成员恢复。
 
 FUSE 默认只读。添加 `--fdb-journal-dir JOURNAL` 启用常规文件创建和覆盖。日志目录由单次挂载独占，权限须为 0700。文件关闭或 `fsync` 成功表示所有底层池均已确认。挂载中断后用同一日志目录恢复原 UUID 和正文。归档等待期间，其他客户端仍可从可用副本读取上一个已发布版本。多副本入口当前支持归档和读取，删除、重命名及目录修改返回不支持。
+
+已确认取消的 FUSE 原归档会在日志目录中记录 `cancelled`，保留原请求文件与正文。后续重新挂载时跳过这条原归档。

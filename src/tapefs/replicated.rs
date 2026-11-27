@@ -18,6 +18,7 @@ use uuid::Uuid;
 const DRAFT: &str = ".fdb-replica";
 const BODY: &str = "payload";
 const COMMITTED: &str = "committed";
+const CANCELLED: &str = "cancelled";
 
 pub struct ReplicatedBackend {
     client: FdbClient,
@@ -43,6 +44,7 @@ struct Journal {
     record: Record,
     dir: File,
     committed: bool,
+    cancelled: bool,
 }
 
 fn malformed() -> ClientError {
@@ -107,18 +109,26 @@ impl Journal {
         if record.version != 1 || record.pool != pool || record.input.operation != operation {
             return Err(malformed());
         }
-        let committed = match open_file(&dir, OsStr::new(COMMITTED), OFlag::O_RDONLY, Mode::empty())
-        {
-            Ok(marker) if marker.metadata()?.is_file() && marker.metadata()?.len() == 0 => true,
-            Ok(_) => return Err(malformed()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
-            Err(err) => return Err(err.into()),
-        };
+        let committed = Self::has_marker(&dir, COMMITTED)?;
+        let cancelled = Self::has_marker(&dir, CANCELLED)?;
+        if committed && cancelled {
+            return Err(malformed());
+        }
         Ok(Self {
             record,
             dir,
             committed,
+            cancelled,
         })
+    }
+
+    fn has_marker(dir: &File, name: &str) -> crate::client::Result<bool> {
+        match open_file(dir, OsStr::new(name), OFlag::O_RDONLY, Mode::empty()) {
+            Ok(marker) if marker.metadata()?.is_file() && marker.metadata()?.len() == 0 => Ok(true),
+            Ok(_) => Err(malformed()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err.into()),
+        }
     }
 
     fn payload(&self) -> PathBuf {
@@ -126,7 +136,7 @@ impl Journal {
     }
 
     fn verify_payload(&self) -> crate::client::Result<()> {
-        if !self.committed {
+        if !self.committed && !self.cancelled {
             let mut file = open_file(&self.dir, OsStr::new(BODY), OFlag::O_RDONLY, Mode::empty())?;
             if body(&mut file, std::io::sink(), self.record.input.size)? != self.record.input.sha256
             {
@@ -162,15 +172,20 @@ impl Journal {
         )
     }
 
-    fn commit(&self) -> crate::client::Result<()> {
+    fn mark(&self, name: &str) -> crate::client::Result<()> {
         open_file(
             &self.dir,
-            OsStr::new(COMMITTED),
+            OsStr::new(name),
             OFlag::O_WRONLY | OFlag::O_CREAT,
             Mode::S_IRUSR | Mode::S_IWUSR,
         )?
         .sync_all()?;
         self.dir.sync_all()?;
+        Ok(())
+    }
+
+    fn commit(&self) -> crate::client::Result<()> {
+        self.mark(COMMITTED)?;
         match unlinkat(Some(self.dir.as_raw_fd()), BODY, UnlinkatFlags::NoRemoveDir) {
             Ok(()) => self.dir.sync_all()?,
             Err(nix::errno::Errno::ENOENT) => {}
@@ -210,11 +225,11 @@ impl ReplicatedBackend {
             }
             for entry in store.entries()? {
                 if let Some(saved) = backend.entry(store, entry?)? {
-                    if !saved.committed {
-                        backend.resume(&saved)?;
-                    } else {
+                    if saved.committed {
                         // Complete cleanup after an interrupted marker publication.
                         saved.commit()?;
+                    } else if !saved.cancelled {
+                        backend.resume(&saved)?;
                     }
                 }
             }
@@ -244,19 +259,27 @@ impl ReplicatedBackend {
         Journal::open(store, self.pool, id).map(Some)
     }
 
-    fn resume(&self, journal: &Journal) -> crate::client::Result<ReplicaUploadReceipt> {
+    fn resume(&self, journal: &Journal) -> crate::client::Result<Option<ReplicaUploadReceipt>> {
+        if journal.cancelled {
+            return Ok(None);
+        }
         let input = &journal.record.input;
         let path = (!journal.committed).then(|| journal.payload());
         let job = self
             .client
             .archive_replicated(self.pool, input, path.as_deref())?;
+        if job["status"] == "cancelled" && !journal.committed {
+            // The client checked the original identity and immutable input.
+            // Preserve the cancelled payload for recovery by its owner.
+            journal.mark(CANCELLED)?;
+            log::info!(
+                "多副本池 {} 的原归档 {} 已取消，保留日志正文",
+                self.pool,
+                input.operation
+            );
+            return Ok(None);
+        }
         if job["status"] != "committed" {
-            if matches!(job["status"].as_str(), Some("cancelling" | "cancelled")) {
-                return Err(ClientError::Rejected {
-                    status: 409,
-                    body: job.to_string(),
-                });
-            }
             return Err(ClientError::Rejected {
                 status: 503,
                 body: format!("原归档 {} 等待副本", input.operation),
@@ -269,11 +292,11 @@ impl ReplicatedBackend {
             return Err(ClientError::Verification("多副本缺少成员提交回执".into()));
         }
         journal.commit()?;
-        Ok(ReplicaUploadReceipt {
+        Ok(Some(ReplicaUploadReceipt {
             pool: self.pool,
             input: input.clone(),
             modified: job["modified"].as_i64(),
-        })
+        }))
     }
 
     fn previous(&self, path: &str, target: UploadTarget) -> Res<Option<u64>> {
@@ -353,18 +376,28 @@ impl Backend for ReplicatedBackend {
         let kind = info["kind"].as_str().ok_or(libc::EIO)?;
         let length = info["size"].as_u64().ok_or(libc::EIO)?;
         let number = info["file_version"].as_u64().ok_or(libc::EIO)?;
+        let mut current = file_stat(
+            self.pool,
+            path,
+            number,
+            length,
+            info["sha256"].as_str().unwrap_or("").into(),
+            kind,
+            info["modified"].as_i64(),
+        );
+        if kind == "symlink" {
+            let target = info["symlink"].as_str().ok_or(libc::EIO)?;
+            if target.len() as u64 != length
+                || format!("{:x}", Sha256::digest(target.as_bytes())) != current.sha256
+            {
+                return Err(libc::EIO);
+            }
+            current.metadata["symlink"] = json!(target);
+        }
         Ok(Some(PathStat {
             state: "committed".into(),
             length,
-            current: Some(file_stat(
-                self.pool,
-                path,
-                number,
-                length,
-                info["sha256"].as_str().unwrap_or("").into(),
-                kind,
-                info["modified"].as_i64(),
-            )),
+            current: Some(current),
         }))
     }
 
@@ -476,8 +509,9 @@ impl Backend for ReplicatedBackend {
         // An earlier parent fsync may have reported a local error after rename.
         store.directory().sync_all().map_err(io_errno)?;
         self.resume(&journal)
+            .map_err(|err| errno_of(&err))?
             .map(UploadOutcome::Replicated)
-            .map_err(|err| errno_of(&err))
+            .ok_or(libc::ECANCELED)
     }
 
     fn delete(&self, _path: &str) -> Res<()> {

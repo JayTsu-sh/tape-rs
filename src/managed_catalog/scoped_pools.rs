@@ -9,7 +9,7 @@ async fn read_pool(
     logical: Option<Uuid>,
     id: Uuid,
 ) -> Result<Option<PoolRecord>> {
-    if selected_pool::is_pending_at(tr, ns, serial, id).await? {
+    if selected_pool::is_unpublished_at(tr, ns, id).await? {
         return Ok(None);
     }
     let Some(raw) = tr.get(&pool_key(ns, id), false).await? else {
@@ -76,7 +76,7 @@ impl ManagedCatalog {
         let mut items = Vec::with_capacity(page.items.len());
         for (key, raw) in page.items {
             let id = uuid_from(&key[prefix.len()..])?;
-            if selected_pool::is_pending_at(&tr, ns, serial, id).await? {
+            if selected_pool::is_unpublished_at(&tr, ns, id).await? {
                 continue;
             }
             let pool = read_pool(&tr, ns, serial, logical, id).await?;

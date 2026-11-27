@@ -551,6 +551,77 @@ mod tests {
     }
 
     #[test]
+    fn replicated_mount_recovers_only_a_confirmed_cancellation() {
+        use crate::replicated_pool::ReplicatedArchive;
+        use crate::tapefs::ReplicatedBackend;
+        use sha2::{Digest, Sha256};
+
+        let pool = Uuid::new_v4();
+        let prefix = format!("/v1/fdb/replicated-pools/{pool}");
+        let root = json!({"id":pool,"path":"/","kind":"directory","file_version":1,"size":0});
+        let body = "原归档正文".as_bytes();
+        for status in ["cancelling", "wrong-original", "cancelled"] {
+            let input = ReplicatedArchive {
+                operation: Uuid::new_v4(),
+                path: "/pending".into(),
+                previous: None,
+                size: body.len() as u64,
+                sha256: Sha256::digest(body).into(),
+            };
+            let dir = std::env::temp_dir().join(format!("tapers-cancel-{}", input.operation));
+            let original = dir.join(input.operation.to_string());
+            for path in [&dir, &original] {
+                std::fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+            }
+            std::fs::write(original.join("payload"), body).unwrap();
+            std::fs::write(
+                original.join("request.json"),
+                json!({"version":1,"pool":pool,"input":input}).to_string(),
+            )
+            .unwrap();
+            let response = json!({
+                "id":pool,"operation":input.operation,
+                "status":if status == "cancelling" {"cancelling"} else {"cancelled"},
+                "path":if status == "wrong-original" {"/different"} else {&input.path},
+                "file_version":1,"size":input.size,"sha256":format!("{:x}", Sha256::digest(body)),
+                "members":[{"pool_id":Uuid::new_v4(),"commit":null},{"pool_id":Uuid::new_v4(),"commit":null}],
+            });
+            let root_get = (format!("GET {prefix}/stat?path=Lw"), root.clone());
+            let (client, thread) = server(vec![
+                root_get.clone(),
+                (format!("POST {prefix}/archives"), response),
+            ]);
+            let mounted = ReplicatedBackend::new(client, pool, Some(&dir));
+            thread.join().unwrap();
+            assert_eq!(std::fs::read(original.join("payload")).unwrap(), body);
+            assert!(!original.join("committed").exists());
+            if status == "cancelled" {
+                drop(mounted.unwrap());
+                assert!(original.join("cancelled").is_file());
+                // Another mount skips the original and serves an unrelated path.
+                let unrelated = format!(
+                    "GET {prefix}/stat?path={}",
+                    URL_SAFE_NO_PAD.encode("/unrelated")
+                );
+                let (client, thread) = server(vec![
+                    root_get,
+                    (
+                        unrelated,
+                        json!({"id":pool,"path":"/unrelated","kind":"file","file_version":1,"size":0}),
+                    ),
+                ]);
+                let mounted = ReplicatedBackend::new(client, pool, Some(&dir)).unwrap();
+                assert!(mounted.stat("/unrelated").unwrap().is_some());
+                thread.join().unwrap();
+            } else {
+                assert!(mounted.is_err());
+                assert!(!original.join("cancelled").exists());
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
     fn stat_refuses_attributes_from_another_node_version_kind_or_namespace() {
         let namespace = Uuid::new_v4();
         let pool = Uuid::new_v4();

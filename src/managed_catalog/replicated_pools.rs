@@ -20,6 +20,8 @@ const MAX_TAPES: usize = 100;
 struct Creation {
     input: CreateReplicatedPool,
     published: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    failed: bool,
 }
 
 fn domain(kind: u8) -> Vec<u8> {
@@ -33,6 +35,12 @@ fn task_key(id: Uuid, kind: u8) -> Vec<u8> {
     let mut out = domain(kind);
     out.extend_from_slice(id.as_bytes());
     out
+}
+
+fn name_key(name: &str) -> Vec<u8> {
+    let mut key = domain(b'n');
+    append_component(&mut key, name.as_bytes());
+    key
 }
 
 fn ownership_key(ns: Uuid, member: Uuid) -> Vec<u8> {
@@ -106,7 +114,10 @@ async fn read_at(tr: &Transaction, id: Uuid) -> Result<Option<Creation>> {
         return Ok(None);
     };
     let creation: Creation = decode(&raw)?;
-    if creation.input.id != id || validate(&creation.input).is_err() {
+    if creation.input.id != id
+        || validate(&creation.input).is_err()
+        || creation.failed && creation.published
+    {
         return Err(CatalogError::Corrupt("多副本池记录与原请求身份不符"));
     }
     Ok(Some(creation))
@@ -194,11 +205,39 @@ pub(super) async fn has_conflict(tr: &Transaction, id: Uuid) -> Result<bool> {
     requests::prefix_has_rows(tr, &task_key(id, b'c')).await
 }
 
+pub(super) async fn creation_failed_at(tr: &Transaction, id: Uuid) -> Result<bool> {
+    Ok(read_at(tr, id)
+        .await?
+        .ok_or(CatalogError::Corrupt("多副本池原任务缺失"))?
+        .failed)
+}
+
+pub(super) async fn fail_creation_at(tr: &Transaction, id: Uuid) -> Result<()> {
+    let mut creation = read_at(tr, id)
+        .await?
+        .ok_or(CatalogError::Corrupt("多副本池原任务缺失"))?;
+    if creation.published {
+        return Err(CatalogError::Corrupt(
+            "已发布的多副本池仍有失败的创建子任务",
+        ));
+    }
+    if !creation.failed {
+        let key = name_key(&creation.input.name);
+        if tr.get(&key, false).await?.as_deref() != Some(id.as_bytes().as_slice()) {
+            return Err(CatalogError::Corrupt("多副本池名称索引与原任务不符"));
+        }
+        tr.clear(&key);
+        creation.failed = true;
+        tr.set(&task_key(id, b'i'), &encode(&creation)?);
+    }
+    Ok(())
+}
+
 pub(super) async fn try_publish_at(tr: &Transaction, id: Uuid) -> Result<bool> {
     let mut creation = read_at(tr, id)
         .await?
         .ok_or(CatalogError::Corrupt("多副本池原任务缺失"))?;
-    if creation.published || has_conflict(tr, id).await? {
+    if creation.published || creation.failed || has_conflict(tr, id).await? {
         return Ok(false);
     }
     for member in &creation.input.members {
@@ -242,7 +281,12 @@ async fn view_at(tr: &Transaction, creation: &Creation, current_scope: bool) -> 
                 .await?
             );
         }
-        if !creation.published && !matches!(row["status"].as_str(), Some("succeeded" | "blocked")) {
+        if !creation.published
+            && !matches!(
+                row["status"].as_str(),
+                Some("succeeded" | "blocked" | "failed" | "cancelled")
+            )
+        {
             let owner = owner_at(tr, &member.library_serial).await?;
             row["current_owner_epoch"] = json!(owner);
             row["inventory_status"] = json!(
@@ -268,13 +312,23 @@ async fn view_at(tr: &Transaction, creation: &Creation, current_scope: bool) -> 
     let conflict = files::conflict_at(tr, input.id).await?;
     let status = if creation.published {
         "succeeded"
-    } else if conflict.is_some() || members.iter().any(|row| row["status"] == "blocked") {
-        "blocked"
+    } else if creation.failed
+        && members
+            .iter()
+            .all(|row| matches!(row["status"].as_str(), Some("failed" | "cancelled")))
+    {
+        if members.iter().any(|row| row["status"] == "failed") {
+            "failed"
+        } else {
+            "cancelled"
+        }
     } else if members
         .iter()
         .any(|row| row["active_tape"]["progress"]["phase"] == "format_result_pending")
     {
         "result_unknown"
+    } else if conflict.is_some() || members.iter().any(|row| row["status"] == "blocked") {
+        "blocked"
     } else if members.iter().any(|row| {
         row["inventory_status"]
             .as_str()
@@ -314,8 +368,7 @@ impl ManagedCatalog {
                             }
                             return view_at(&tr, &saved, false).await;
                         }
-                        let mut name = domain(b'n');
-                        append_component(&mut name, input.name.as_bytes());
+                        let name = name_key(&input.name);
                         if tr.get(&name, false).await?.is_some() {
                             return Err(CatalogError::Invalid("多副本池名称已存在"));
                         }
@@ -351,6 +404,7 @@ impl ManagedCatalog {
                         let creation = Creation {
                             input: input.clone(),
                             published: false,
+                            failed: false,
                         };
                         tr.set(&name, input.id.as_bytes());
                         tr.set(&task_key(input.id, b'i'), &encode(&creation)?);
@@ -408,6 +462,9 @@ impl ManagedCatalog {
                             return Ok(None);
                         };
                         require_configured(&creation.input, routes)?;
+                        if creation.failed {
+                            return Err(CatalogError::Invalid("原多副本池创建已失败"));
+                        }
                         if choice.version != 1
                             || choice.volume_uuid.is_nil()
                             || choice.revision == 0

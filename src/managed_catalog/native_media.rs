@@ -138,10 +138,25 @@ pub(super) fn volume_claim_key(volume: Uuid) -> Vec<u8> {
     k
 }
 fn selected_checkpoint_key(request: &ManagementRequest, kind: u8) -> Vec<u8> {
-    let mut key = management::prefix(request.namespace(), b'C');
+    selected_operation_key(request.namespace(), request.operation(), kind)
+}
+
+fn selected_operation_key(ns: Uuid, operation: Uuid, kind: u8) -> Vec<u8> {
+    let mut key = management::prefix(ns, b'C');
     key.push(kind);
-    key.extend_from_slice(request.operation().as_bytes());
+    key.extend_from_slice(operation.as_bytes());
     key
+}
+
+pub(super) async fn selected_format_issued_at(
+    tr: &Transaction,
+    ns: Uuid,
+    operation: Uuid,
+) -> Result<bool> {
+    Ok(tr
+        .get(&selected_operation_key(ns, operation, b'f'), false)
+        .await?
+        .is_some())
 }
 
 pub(super) async fn selected_checkpoint_at(
@@ -154,10 +169,7 @@ pub(super) async fn selected_checkpoint_at(
         .map(|raw| String::from_utf8(raw.to_vec()))
         .transpose()
         .map_err(|_| CatalogError::Corrupt("建池磁带诊断的编码无效"))?;
-    let issued = tr
-        .get(&selected_checkpoint_key(request, b'f'), false)
-        .await?
-        .is_some();
+    let issued = selected_format_issued_at(tr, request.namespace(), request.operation()).await?;
     Ok(json!({"detail":detail,"format_volume":issued.then_some(request.operation())}))
 }
 
@@ -470,6 +482,9 @@ pub(super) async fn request_abort(
     validate_state(&value)?;
     if value["epoch"] != epoch || value["operation"] != operation.to_string() {
         return Err(CatalogError::Corrupt("取消介质任务身份不符"));
+    }
+    if selected_format_issued_at(tr, ns, operation).await? {
+        return Err(CatalogError::Invalid("原初始化已发出，须先核实原卷身份"));
     }
     value["abort"] = json!(true);
     value["phase"] = json!("rollback");
@@ -915,10 +930,13 @@ impl ManagedCatalog {
             }
             logical_libraries::mechanical_resources_at(&tr, ns, serial, &request).await?;
             if task["status"] == "queued" && let Some(original) = selected {
-                if let Some(parent) = original.replicated
-                    && replicated_pools::has_conflict(&tr, parent).await?
-                {
-                    return Ok(None);
+                if let Some(parent) = original.replicated {
+                    if replicated_pools::creation_failed_at(&tr, parent).await? {
+                        return Err(CatalogError::Invalid("多副本池的其他成员创建失败"));
+                    }
+                    if replicated_pools::has_conflict(&tr, parent).await? {
+                        return Ok(None);
+                    }
                 }
                 let barcode = request.value()["change"]["barcode"].as_str().expect("validated barcode");
                 let (_, rows) = logical_libraries::pool_selection_at(&tr, ns, serial, owner,
@@ -1004,6 +1022,7 @@ impl ManagedCatalog {
         use replicated_pools::files::{Content, Kind, Source};
         let current = entry.path.current();
         let candidate = &current.candidate;
+        let mut symlink = None;
         let (kind, length, uid, data_path) = match entry.source_data.as_deref() {
             Some(
                 [
@@ -1015,15 +1034,22 @@ impl ManagedCatalog {
                     },
                 ],
             ) => (Kind::File, *length, *file_uid, data_path.as_deref()),
-            Some([StagedSourceData::NativeSymlink]) => (
-                Kind::Symlink,
-                entry
+            Some([StagedSourceData::NativeSymlink]) => {
+                let target = entry
                     .current_attributes
                     .symlink()
-                    .map_or(0, |target| target.len() as u64),
-                entry.source_file_uids[0],
-                None,
-            ),
+                    .ok_or(CatalogError::Corrupt("副本符号链接缺少目标"))?;
+                if <[u8; 32]>::from(Sha256::digest(target.as_bytes())) != body_sha256 {
+                    return Err(CatalogError::Corrupt("副本符号链接目标与原证明不符"));
+                }
+                symlink = Some(target.to_owned());
+                (
+                    Kind::Symlink,
+                    target.len() as u64,
+                    entry.source_file_uids[0],
+                    None,
+                )
+            }
             Some([StagedSourceData::NoCopy])
                 if candidate.kind == NodeKind::Directory && !candidate.deleted =>
             {
@@ -1057,6 +1083,7 @@ impl ManagedCatalog {
                 sha256: body_sha256,
                 length,
             },
+            symlink,
         };
         self.db
             .run(|tr, _| {
@@ -1393,6 +1420,15 @@ impl ManagedCatalog {
                         if value["abort"] == true {
                             return Ok(());
                         }
+                        if selected_format_issued_at(
+                            &tr,
+                            import.request.namespace(),
+                            import.request.operation(),
+                        )
+                        .await?
+                        {
+                            return Err(CatalogError::Invalid("原初始化已发出，须先核实原卷身份"));
+                        }
                         value["abort"] = json!(true);
                         value["phase"] = json!("rollback");
                         if let Some(error) = error {
@@ -1430,6 +1466,15 @@ impl ManagedCatalog {
                             management::read_task(&tr, import.serial(), &import.request).await?;
                         if matches!(saved["status"].as_str(), Some("failed" | "cancelled")) {
                             return Ok(true);
+                        }
+                        if selected_format_issued_at(
+                            &tr,
+                            import.request.namespace(),
+                            import.request.operation(),
+                        )
+                        .await?
+                        {
+                            return Err(CatalogError::Invalid("原初始化已发出，须先核实原卷身份"));
                         }
                         let value = state(&tr, import, owner).await?;
                         load::require_settled_at(&tr, import).await?;

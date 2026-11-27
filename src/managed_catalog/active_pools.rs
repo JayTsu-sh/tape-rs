@@ -81,7 +81,7 @@ async fn checked_pool(
     saved: PoolRecord,
 ) -> Result<Option<PoolRecord>> {
     if saved.library_serial != serial
-        || selected_pool::is_pending_at(tr, namespace, serial, saved.id).await?
+        || selected_pool::is_unpublished_at(tr, namespace, saved.id).await?
     {
         return Ok(None);
     }
@@ -333,6 +333,39 @@ pub(super) async fn create_pool_at(
     tr.set(&child, root.as_bytes());
     tr.set(&inode, &root_node);
     Ok(ActivePoolCreation::Created(pool.clone()))
+}
+
+pub(super) async fn discard_empty_selection_at(
+    tr: &Transaction,
+    ns: Uuid,
+    logical: Option<Uuid>,
+    pool: &PoolRecord,
+) -> Result<()> {
+    let key = pool_key(ns, pool.id);
+    let Some(raw) = tr.get(&key, false).await? else {
+        return Ok(());
+    };
+    let serial = &pool.library_serial;
+    let root = root_id(ns, pool.id);
+    if decode_pool(pool.id, &raw)? != *pool
+        || pool_library_at(tr, ns, serial, pool.id).await? != logical
+        || requests::prefix_has_rows(tr, &child_prefix(ns, root)).await?
+        || requests::prefix_has_rows(tr, &pool_assignment_prefix(ns, pool.id)).await?
+    {
+        return Err(CatalogError::Corrupt(
+            "无法移除仍有目录或磁带归属的未发布池",
+        ));
+    }
+    require_indexes(tr, ns, pool).await?;
+    tr.clear(&key);
+    tr.clear(&pool_name_key(ns, &pool.name));
+    tr.clear(&child_key(ns, Uuid::nil(), pool.id.to_string().as_bytes()));
+    tr.clear(&node_key(ns, root));
+    if let Some(logical) = logical {
+        tr.clear(&pool_binding_key(ns, serial, pool.id));
+        tr.clear(&pool_membership_key(ns, serial, logical, pool.id));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

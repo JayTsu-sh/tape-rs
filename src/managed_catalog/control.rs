@@ -987,8 +987,7 @@ impl ManagedCatalog {
         for (key, value) in page.items {
             let pool = decode_pool(uuid_from(&key[prefix.len()..])?, &value)?;
             if pool.library_serial == serial
-                && !selected_pool::is_pending_at(&tr, route.route.namespace, serial, pool.id)
-                    .await?
+                && !selected_pool::is_unpublished_at(&tr, route.route.namespace, pool.id).await?
             {
                 require_pool_library(&tr, route.route.namespace, pool.id, serial).await?;
                 active_pools::require_indexes(&tr, route.route.namespace, &pool).await?;

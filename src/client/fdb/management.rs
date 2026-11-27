@@ -185,7 +185,10 @@ fn check_selected_receipt(value: &Value, saved: &ManagementRequestFile) -> Resul
     let rows = value["tapes"].as_array().ok_or_else(bad)?;
     let requested = saved.request["tapes"].as_array().ok_or_else(bad)?;
     if value["version"] != 1
-        || !matches!(status, "queued" | "running" | "blocked" | "succeeded")
+        || !matches!(
+            status,
+            "queued" | "running" | "blocked" | "succeeded" | "failed" | "cancelled"
+        )
         || ["id", "name", "file_limit", "confirm_format"]
             .iter()
             .any(|key| value[*key] != saved.request[*key])

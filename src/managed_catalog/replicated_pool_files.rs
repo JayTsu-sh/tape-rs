@@ -33,6 +33,50 @@ pub(in crate::managed_catalog) struct Source {
     pub physical_path: String,
     pub tape_version: (u64, u64),
     pub content: Content,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symlink: Option<String>,
+}
+
+impl Source {
+    fn matches_symlink(&self, target: &str) -> bool {
+        self.content.kind == Kind::Symlink
+            && self.content.length == target.len() as u64
+            && self.content.sha256 == <[u8; 32]>::from(Sha256::digest(target.as_bytes()))
+    }
+
+    async fn legacy_symlink_at(&self, tr: &Transaction, path: &str) -> Result<Option<String>> {
+        let projected = match native_media::replica_origin_target_at(tr, self, path).await {
+            Ok(path) => path,
+            Err(CatalogError::MediaUnavailable) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let path = pool_catalog_path(self.pool_id, projected.as_bytes())?;
+        let resolved =
+            lookup::resolve_active_path_at(tr, self.namespace, lookup::path_components(&path)?)
+                .await?;
+        match resolved {
+            Some(ResolvedPath::File {
+                id,
+                attributes: Some(attributes),
+                copy,
+                placement,
+                ..
+            }) if id
+                == import_materialize::import_inode(self.namespace, self.pool_id, &projected)
+                && placement.pool_id == self.pool_id
+                && copy
+                    .media
+                    .as_ref()
+                    .is_some_and(|media| media.native_symlink) =>
+            {
+                Ok(attributes
+                    .symlink()
+                    .filter(|target| self.matches_symlink(target))
+                    .map(str::to_owned))
+            }
+            _ => Ok(None),
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -110,8 +154,16 @@ pub(in crate::managed_catalog::control) async fn record_at(
     }
     let source_key = keyed_source(id, path, source.volume_uuid);
     if let Some(raw) = tr.get(&source_key, false).await? {
-        if decode::<(String, Source)>(&raw)? != (path.to_owned(), source) {
+        let (saved_path, mut saved): (String, Source) = decode(&raw)?;
+        let backfill = saved.symlink.is_none() && source.symlink.is_some();
+        if backfill {
+            saved.symlink.clone_from(&source.symlink);
+        }
+        if saved_path != path || saved != source {
             return Err(CatalogError::Corrupt("同一导入来源的正文证明发生变化"));
+        }
+        if backfill {
+            tr.set(&source_key, &encode(&(&saved_path, &saved))?);
         }
         return Ok(());
     }
@@ -456,6 +508,8 @@ impl ManagedCatalog {
         let page = read_page(&tr, &prefix, None, super::MAX_TAPES, false).await?;
         let mut copies = Vec::new();
         let mut pools = BTreeSet::new();
+        let mut symlink = None;
+        let mut legacy_symlinks = Vec::new();
         if page.next.is_some() {
             return Err(CatalogError::Corrupt("导入副本集合超过原磁带清单上限"));
         }
@@ -476,14 +530,31 @@ impl ManagedCatalog {
                         size: content.length,
                         digest: content.sha256,
                     });
+                } else if content.kind == Kind::Symlink {
+                    match &source.symlink {
+                        Some(target) if source.matches_symlink(target) => {
+                            symlink.get_or_insert_with(|| target.clone());
+                        }
+                        Some(_) => {
+                            return Err(CatalogError::Corrupt("导入符号链接目标与原证明不符"));
+                        }
+                        None => legacy_symlinks.push(source),
+                    }
                 }
             }
         }
-        Ok(Some(ReplicaFile {
-            info: json!({"path":path,"kind":content.kind,"file_version":1,"size":content.length,
-                "sha256":hex(&content.sha256),"replica_count":pools.len(),"pool_ids":pools}),
-            copies,
-        }))
+        let mut info = json!({"path":path,"kind":content.kind,"file_version":1,"size":content.length,
+            "sha256":hex(&content.sha256),"replica_count":pools.len(),"pool_ids":pools});
+        if content.kind == Kind::Symlink {
+            for source in legacy_symlinks {
+                if symlink.is_some() {
+                    break;
+                }
+                symlink = source.legacy_symlink_at(&tr, path).await?;
+            }
+            info["symlink"] = json!(symlink.ok_or(CatalogError::MediaUnavailable)?);
+        }
+        Ok(Some(ReplicaFile { info, copies }))
     }
 
     pub(crate) async fn replica_recovery_file(

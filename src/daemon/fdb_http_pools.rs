@@ -587,7 +587,10 @@ pub(super) async fn create(
             Ok(value) => reply(
                 if value.get("id_available").is_some() {
                     StatusCode::CONFLICT
-                } else if matches!(value["status"].as_str(), Some("succeeded" | "blocked")) {
+                } else if matches!(
+                    value["status"].as_str(),
+                    Some("succeeded" | "blocked" | "failed" | "cancelled")
+                ) {
                     StatusCode::OK
                 } else {
                     StatusCode::ACCEPTED

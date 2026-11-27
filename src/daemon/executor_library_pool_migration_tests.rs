@@ -671,6 +671,24 @@ fn selected_pool_imports_existing_contents_and_recovers_lost_format_result() {
         "format_result_pending"
     );
     assert_eq!(retained["status"], "running");
+    let child = &retained["active_tape"];
+    let child_id = crate::management_task_id::ManagementTaskId::new(
+        ns,
+        &serial,
+        child["epoch"].as_u64().unwrap(),
+        child["operation"].as_str().unwrap().parse().unwrap(),
+    )
+    .unwrap();
+    assert!(
+        owner
+            .client
+            .cancel_management_task_by_id(&child_id)
+            .is_err()
+    );
+    assert!(matches!(
+        owner.client.release_library(&serial, ns, Uuid::new_v4()),
+        Err(ClientError::Rejected { status: 409, .. })
+    ));
     assert_eq!(
         log.lock()
             .unwrap()
@@ -679,6 +697,213 @@ fn selected_pool_imports_existing_contents_and_recovers_lost_format_result() {
             .count(),
         2
     );
+    owner.stop();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "独立 FDB 和模拟实带环境"]
+fn failed_selected_pool_releases_tape_and_library_claims() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let _network = unsafe { foundationdb::boot() };
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+    let catalog = Arc::new(ManagedCatalog::open(Some(&cluster)).unwrap());
+    let ns = Uuid::new_v4();
+    let serial = format!("FAILEDSELECT-{ns}");
+    let challenge = Uuid::new_v4();
+    let barriers: Vec<_> = (1..=3).map(|id| json!({"version":1,"library_serial":serial,
+        "challenge":challenge,"node_id":id,"term":7,"leader":2,"role":if id==2 {"Leader"} else {"Follower"},
+        "members":{"1":"a:1","2":"b:2","3":"c:3"},"quiesce_index":89,"frozen_index":90,
+        "applied_index":92,"executor_absent":true,"catalog_pending":false,"shutting_down":false,"catalog_empty":true})).collect();
+    let route = rt
+        .block_on(catalog.initialize_native_library(
+            ns,
+            &verify_native_barriers(&serial, challenge, &barriers).unwrap(),
+        ))
+        .unwrap();
+    rt.block_on(catalog.enable_library_handoff_offline(&serial, ns))
+        .unwrap();
+    let round = route.initial_owner_epoch;
+
+    let blank = "FAIL01L8";
+    let sim = SimLibrary::new(1, 2, 1);
+    sim.enable_changer_pr();
+    sim.insert_cartridge(SimCartridge::blank(blank, 128 << 20), 0)
+        .unwrap();
+    let root = std::env::temp_dir().join(format!("tapers-selected-pool-{ns}"));
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let drive = Arc::new(sim.drive_as(0, 2));
+    let start = |round| {
+        start_owner(&rt, &root, &catalog, &serial, route, round, |permission| {
+            fdb_observations_fixture::Provider {
+                serial: serial.clone(),
+                changer: Arc::new(sim.changer_as(2)),
+                drive: drive.clone(),
+                log: log.clone(),
+                revoke: Arc::new(AtomicBool::new(false)),
+                permission,
+                round,
+            }
+        })
+    };
+    let owner = start(round);
+    owner.take_over(round);
+    let client = &owner.client;
+    run_management(
+        client,
+        &serial,
+        ManagementIntent::LibraryRescan,
+        &root.join("rescan.json"),
+    );
+    let request = root.join("decline-format.json");
+    client
+        .prepare_management(
+            &serial,
+            ManagementIntent::CreateSelected {
+                name: "decline-format".into(),
+                file_limit: 100,
+                tapes: vec![blank.into()],
+                confirm_format: false,
+            },
+        )
+        .unwrap()
+        .save_new(&request)
+        .unwrap();
+    let admitted = client.submit_management(&request).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let failed = loop {
+        let task = client.management_request_status(&request, false).unwrap();
+        if task["active_tape"]["status"] == "failed" && task["detail"].is_string() {
+            break task;
+        }
+        assert!(Instant::now() < deadline, "没有出现明确子任务失败 {task}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(failed["status"], "failed", "{failed}");
+    assert_eq!(client.submit_management(&request).unwrap(), failed);
+    assert!(matches!(
+        client.pool(&serial, &ns.to_string(), "decline-format"),
+        Err(ClientError::Rejected { status: 404, .. })
+    ));
+    run_management(
+        client,
+        &serial,
+        ManagementIntent::TapeMove {
+            barcode: blank.into(),
+            destination: "homeslot".into(),
+            pool_selector: None,
+        },
+        &root.join("return-blank.json"),
+    );
+
+    // The same tape, name and home can be selected by a fresh operation.
+    // The other tape succeeds first, and its established placement survives.
+    let formatted = "KEEP01L8";
+    let seed = SimLibrary::new(1, 1, 0);
+    seed.insert_cartridge(SimCartridge::blank(formatted, 128 << 20), 0)
+        .unwrap();
+    seed.load_into_drive(formatted, 0).unwrap();
+    let formatted_volume =
+        crate::ltfs::mkltfs::mkltfs(&seed.drive(0), &Default::default()).unwrap();
+    TapeDrive::new(&seed.drive(0)).unload().unwrap();
+    sim.insert_cartridge(seed.cartridge(formatted).unwrap(), 1)
+        .unwrap();
+    use crate::replicated_pool::{CreateReplicatedPool, ReplicatedPoolMember};
+    let replicated = CreateReplicatedPool {
+        version: 1,
+        id: Uuid::new_v4(),
+        name: format!("decline-replicated-{ns}"),
+        created_at_millis: 1_793_405_000_123,
+        members: vec![
+            ReplicatedPoolMember {
+                pool_id: Uuid::new_v4(),
+                name: "decline-format".into(),
+                library_serial: serial.clone(),
+                namespace: ns,
+                logical_library: None,
+                tapes: vec![formatted.into(), blank.into()],
+                confirm_format: false,
+            },
+            ReplicatedPoolMember {
+                pool_id: Uuid::new_v4(),
+                name: "empty-sibling".into(),
+                library_serial: serial.clone(),
+                namespace: ns,
+                logical_library: None,
+                tapes: Vec::new(),
+                confirm_format: false,
+            },
+        ],
+    };
+    run_management(
+        client,
+        &serial,
+        ManagementIntent::LibraryRescan,
+        &root.join("rescan-again.json"),
+    );
+    client.create_replicated_pool(&replicated).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let failed = loop {
+        let task = client.replicated_pool_status(replicated.id).unwrap();
+        if task["status"] == "failed" {
+            break task;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "多副本池及底层池未完成清理 {task}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(failed["members"][0]["status"], "failed", "{failed}");
+    assert_eq!(
+        failed["members"][0]["tapes"][0]["volume_uuid"],
+        json!(formatted_volume)
+    );
+    assert_eq!(failed["members"][1]["status"], "cancelled", "{failed}");
+    assert_eq!(client.create_replicated_pool(&replicated).unwrap(), failed);
+    let placement = rt
+        .block_on(catalog.volume_placement(formatted_volume))
+        .unwrap()
+        .unwrap();
+    assert_eq!(placement.pool_id, replicated.members[0].pool_id);
+    assert!(
+        rt.block_on(catalog.tape_assignment(&serial, blank))
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        client.pool(&serial, &ns.to_string(), "decline-format"),
+        Err(ClientError::Rejected { status: 404, .. })
+    ));
+    assert!(matches!(
+        client.pool(&serial, &ns.to_string(), "empty-sibling"),
+        Err(ClientError::Rejected { status: 404, .. })
+    ));
+    assert!(!log.lock().unwrap().contains(&cdb::opcode::FORMAT_MEDIUM));
+    let release = Uuid::new_v4();
+    let result = client.release_library(&serial, ns, release);
+    assert!(
+        result.is_ok(),
+        "已明确失败且未格式化的建池 {} 阻塞交还: {result:?}",
+        admitted["id"]
+    );
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        let receipt = client
+            .library_handoff_status(&serial, ns, release)
+            .unwrap()
+            .unwrap();
+        if receipt["phase"] == "released" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "原交还任务未结清 {receipt}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
     owner.stop();
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -744,6 +969,9 @@ fn replicated_pool_resumes_after_owner_change_and_conflict_with_body_proof() {
             volume
                 .append_file(path, &mut std::io::Cursor::new(body))
                 .unwrap();
+        }
+        if barcode == "REPA02L8" {
+            volume.add_symlink("/zz-link", "../子目录/a-only").unwrap();
         }
         volume.commit().unwrap();
         drop(volume);
@@ -1396,6 +1624,19 @@ fn verify_replica_archive(
     );
     let tree = mount.lookup(crate::tapefs::ROOT_INO, "tree").unwrap();
     assert_eq!(mount.readdir(tree.ino).unwrap()[0].0, "child");
+    let imported = client
+        .replicated_file_stat(parent, "/zz-link")
+        .unwrap()
+        .unwrap();
+    assert_eq!(imported["kind"], "symlink", "{imported}");
+    assert_eq!(imported["symlink"], "../子目录/a-only", "{imported}");
+    let attr = mount
+        .lookup(crate::tapefs::ROOT_INO, "zz-link")
+        .unwrap_or_else(|err| panic!("已导入符号链接 {imported} 的 FUSE lookup 返回 errno {err}"));
+    assert_eq!(
+        mount.readlink(attr.ino).unwrap(),
+        "../子目录/a-only".as_bytes()
+    );
     drop(mount);
     download("/collision", Some(b), b"B-side");
     let path = "/zz-archive";
