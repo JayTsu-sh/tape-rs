@@ -405,6 +405,70 @@ impl ManagedCatalog {
             .is_some())
     }
 
+    /// The write actor rejected this request. Discard its private metadata
+    /// only after proving that this owner never admitted the original attempt.
+    pub(crate) async fn discard_rejected_s3_parents(
+        &self,
+        route: ActiveLibraryRoute,
+        round: u64,
+        intent: &ActiveFileIntent,
+    ) -> Result<bool> {
+        let request = intent.request();
+        let receipt = reservation::receipt_stub(intent);
+        self.db
+            .run(|tr, _| {
+                let request = &request;
+                let receipt = &receipt;
+                async move {
+                    requests::retry_result(
+                        async {
+                            let ns = routing::require_runtime_active_owner(
+                                &tr,
+                                &request.library_serial,
+                                route,
+                                round,
+                            )
+                            .await?;
+                            if ns != request.namespace || round != intent.owner_epoch {
+                                return Err(CatalogError::OwnerFenced);
+                            }
+                            let Some(plan) = for_receipt(&tr, receipt).await? else {
+                                return Ok(false);
+                            };
+                            let window = requests::window(&tr, ns).await?;
+                            let claim = claim_value(request.request_epoch, request.operation_id);
+                            if !(window.first_retained..=window.accepting)
+                                .contains(&request.request_epoch)
+                                || reservation::active_file_attempt_at(&tr, request)
+                                    .await?
+                                    .is_some()
+                                || tr
+                                    .get(
+                                        &op_key(ns, request.request_epoch, request.operation_id),
+                                        false,
+                                    )
+                                    .await?
+                                    .is_some()
+                                || tr.get(&plan.claim(ns)?, false).await?.as_deref()
+                                    == Some(claim.as_slice())
+                            {
+                                return Ok(false);
+                            }
+                            let metadata_key = super::key(request);
+                            if let Some(raw) = tr.get(&metadata_key, false).await? {
+                                super::decode(&raw, request)?;
+                                tr.clear(&metadata_key);
+                            }
+                            forget_plan(&tr, receipt);
+                            Ok(true)
+                        }
+                        .await,
+                    )
+                }
+            })
+            .await?
+    }
+
     pub(crate) async fn check_s3_volume_parents(
         &self,
         intent: &ActiveFileIntent,

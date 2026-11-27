@@ -817,7 +817,7 @@ fn s3_shared_parent_wait_is_released_after_known_failure_and_is_pool_local() {
                     if reject && intent.name == b"first" =>
                 {
                     reject = false;
-                    held.send(reply).unwrap();
+                    held.send((intent, reply)).unwrap();
                 }
                 request => forward.send(request).unwrap(),
             }
@@ -835,9 +835,9 @@ fn s3_shared_parent_wait_is_released_after_known_failure_and_is_pool_local() {
     let unrelated = s3::bucket_name(&f.serial, &f.pools[1].to_string());
     let first = format!("/{bucket}/shared/first");
     let second = format!("/{bucket}/shared/second");
-    std::thread::scope(|scope| {
+    let rejected = std::thread::scope(|scope| {
         let leader = scope.spawn(|| put_small(&server, &first, b"a"));
-        let reject = admitted.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (request, reject) = admitted.recv_timeout(Duration::from_secs(5)).unwrap();
         let mut paused = pause_put(&server, &second);
         paused.get_mut().write_all(b"b").unwrap();
         let independent = put_small(&server, &format!("/{unrelated}/shared/outside"), b"u");
@@ -851,12 +851,28 @@ fn s3_shared_parent_wait_is_released_after_known_failure_and_is_pool_local() {
         reject
             .send(Err(ReadError::Failed("内核准入前的明确拒绝".into())))
             .unwrap();
-        assert_eq!(leader.join().unwrap().0, 503);
+        let rejected = leader.join().unwrap();
+        assert_eq!(rejected.0, 503);
+        assert!(String::from_utf8_lossy(&rejected.2).contains("写带前已拒绝"));
         let mut status = String::new();
         paused.read_line(&mut status).unwrap();
         assert!(status.starts_with("HTTP/1.1 200 "), "{status}");
+        request
     });
     assert_eq!(server.request("GET", &second, None).2, b"b");
+    let spec = tape_rs::managed_catalog::ActiveUploadSpec {
+        pool_id: f.pools[0],
+        path: b"/shared/first".to_vec(),
+        operation_id: rejected.operation_id,
+        expected_version: rejected.expected_version,
+        size: rejected.expected_size,
+        digest: rejected.expected_digest,
+    };
+    rt.block_on(
+        f.catalog
+            .prepare_active_upload(&f.serial, f.route, 12, BARCODES[0], &spec),
+    )
+    .expect("未取得物理预约的明确拒绝应清理私有目录计划");
     assert_eq!(put_small(&server, &first, b"a").0, 200);
     assert_eq!(server.request("GET", &first, None).2, b"a");
     drop(server);

@@ -617,7 +617,7 @@ async fn put(
     };
     let library = s.libraries[serial].clone();
     let file_id = intent.file_id;
-    let version = tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let (reply, received) = std::sync::mpsc::channel();
         library
             .exec
@@ -631,16 +631,31 @@ async fn put(
             .map_err(|_| ReadError::Busy("设备线程已停止".into()))?;
         received
             .recv()
-            .map_err(|_| ReadError::Busy("写入回执已断开".into()))?
+            .map_err(|_| ReadError::Lost("写入回执已断开".into()))?
     })
     .await
-    .map_err(|err| unavailable(err.to_string()))?
-    .map_err(|err| {
-        unavailable(format!(
-            "原上传 {}:{}:{} 结果未确认：{err}",
-            intent.namespace, intent.request_epoch, intent.operation_id
-        ))
-    })?;
+    .map_err(|err| unavailable(err.to_string()))?;
+    let version = match result {
+        Ok(version) => version,
+        Err(err) => {
+            let mut outcome = "结果未确认";
+            if created_parents && matches!(err, ReadError::Failed(_) | ReadError::Busy(_)) {
+                match s
+                    .catalog
+                    .discard_rejected_s3_parents(route, round, &intent)
+                    .await
+                {
+                    Ok(true) => outcome = "写带前已拒绝",
+                    Ok(false) => {}
+                    Err(cleanup) => log::warn!("清理已拒绝的 S3 目录计划 {operation}：{cleanup}"),
+                }
+            }
+            return Err(unavailable(format!(
+                "原上传 {}:{}:{} {outcome}：{err}",
+                intent.namespace, intent.request_epoch, intent.operation_id
+            )));
+        }
+    };
     if let Some(((prefix, _, _), (_, dirs))) = nested.as_ref().zip(plan) {
         prefix.published(dirs);
     }
