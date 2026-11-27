@@ -25,6 +25,7 @@ struct FdbS3 {
     gateway: Arc<HttpContext>,
     peers: HashMap<u64, String>,
     requests: Arc<Semaphore>,
+    parent_writes: Arc<write::ParentWrites>,
     storage: super::super::fdb_read::ReadStorageBudget,
     replica: Arc<super::super::fdb_http::Context>,
 }
@@ -53,6 +54,7 @@ pub fn router(
         gateway,
         peers,
         requests: Arc::new(Semaphore::new(8)),
+        parent_writes: Default::default(),
         storage,
         replica,
     })
@@ -86,6 +88,7 @@ pub fn serve(
             gateway,
             peers,
             requests: Arc::new(Semaphore::new(8)),
+            parent_writes: Default::default(),
             storage,
             replica,
         }),

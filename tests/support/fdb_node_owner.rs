@@ -3,7 +3,7 @@ use tape_rs::managed_catalog::{
     ActiveUploadSpec, NodeMutation, NodeMutationSpec, NodeMutationTask, NodeMutationTaskState,
 };
 
-async fn queue(
+pub(super) async fn queue(
     f: &Fixture,
     owner: u64,
     path: &str,
@@ -44,7 +44,7 @@ async fn queue_in(
         .unwrap()
 }
 
-fn terminal(
+pub(super) fn terminal(
     f: &Fixture,
     rt: &tokio::runtime::Runtime,
     task: &NodeMutationTask,

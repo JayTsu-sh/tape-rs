@@ -605,6 +605,10 @@ pub async fn recover_sealed_active_media_batch<'a>(
                     "封存批次收据与已提交介质文件不一致".into(),
                 ));
             }
+            catalog
+                .verify_s3_parent_evidence(&receipt, batch.batch_id, volume.index())
+                .await
+                .map_err(|error| catalog_error("恢复原 S3 隐含目录的提交证明", error))?;
             physical_paths.insert(prepared.receipt.file_id, path.clone());
             expected_delta.push((path, prepared.receipt.ltfs_file_uid));
             files.push(prepared);
@@ -750,6 +754,10 @@ pub async fn resume_observed_active_media_batch<'a>(
             if prepared.receipt != receipt {
                 return Err(TapeError::Catalog("恢复发布文件与介质收据不一致".into()));
             }
+            catalog
+                .verify_s3_parent_evidence(&receipt, status.batch_id, volume.index())
+                .await
+                .map_err(|error| catalog_error("恢复已观察 S3 隐含目录证明", error))?;
             physical_paths.insert(prepared.receipt.file_id, path);
             files.push(prepared);
         }
@@ -1543,6 +1551,20 @@ pub async fn commit_active_media_batch<'a>(
         return Err(TapeError::NotReady("目标卷已达到池文件数上限".into()));
     }
 
+    for upload in uploads {
+        if catalog
+            .has_s3_upload_parents(&upload.intent.request())
+            .await
+            .map_err(|error| catalog_error("查询 S3 隐含目录计划", error))?
+            && uploads.len() != 1
+        {
+            return Err(TapeError::Catalog("S3 隐含目录批次必须绑定一个对象".into()));
+        }
+        catalog
+            .check_s3_volume_parents(&upload.intent, volume.index())
+            .await
+            .map_err(|error| catalog_error("核对 S3 隐含目录的卷基线", error))?;
+    }
     let replacements =
         capture_replacement_metadata(catalog, route, uploads, max_attributes_bytes).await?;
     let mut files = Vec::with_capacity(uploads.len());
@@ -1575,12 +1597,24 @@ pub async fn commit_active_media_batch<'a>(
     }
 
     let receipts: Vec<CommitReceipt> = files.iter().map(|file| file.receipt.clone()).collect();
+    let parent_evidence = if let [receipt] = receipts.as_slice() {
+        catalog
+            .capture_s3_parent_evidence(receipt, batch_id, volume.staged_index())
+            .await
+            .map_err(|error| catalog_error("捕获 S3 隐含目录的索引证明", error))?
+    } else {
+        None
+    };
+    let staged = if let Some(evidence) = &parent_evidence {
+        catalog
+            .stage_active_batch_with_s3_parents(batch_id, &receipts[0], evidence)
+            .await
+    } else {
+        catalog.stage_active_batch(batch_id, &receipts).await
+    };
     expect_outcome(
         "封存写入批次",
-        catalog
-            .stage_active_batch(batch_id, &receipts)
-            .await
-            .map_err(|error| catalog_error("封存写入批次", error))?,
+        staged.map_err(|error| catalog_error("封存写入批次", error))?,
         &[
             ActiveBatchOutcome::Staged,
             ActiveBatchOutcome::AlreadyStaged,
@@ -1588,6 +1622,12 @@ pub async fn commit_active_media_batch<'a>(
     )?;
     volume.sync_batch()?;
     let current = ActiveIndexIdentity::from(volume.verified_committed_index_construct()?);
+    if let [receipt] = receipts.as_slice() {
+        catalog
+            .verify_s3_parent_evidence(receipt, batch_id, volume.index())
+            .await
+            .map_err(|error| catalog_error("核对 S3 隐含目录实际提交", error))?;
+    }
     #[cfg(feature = "hardware-fault-tests")]
     if let Some(gate) = test_gate {
         gate.after_s4(current)?;

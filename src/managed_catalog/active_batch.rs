@@ -185,6 +185,7 @@ pub struct ActiveSealedBatchPage {
 enum Protocol {
     Single = 2,
     ReclaimGroup = 3,
+    S3Parents = 4,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,13 +217,14 @@ impl Header {
     }
 
     fn decode(value: &[u8]) -> Result<Self> {
-        if value.len() != HEADER_LEN || !matches!(value[0], 2 | 3) || value[1] > 2 {
+        if value.len() != HEADER_LEN || !matches!(value[0], 2..=4) || value[1] > 2 {
             return Err(CatalogError::Corrupt("活动批次头版本或长度"));
         }
         let header = Self {
             protocol: match value[0] {
                 2 => Protocol::Single,
                 3 => Protocol::ReclaimGroup,
+                4 => Protocol::S3Parents,
                 _ => unreachable!("validated protocol"),
             },
             batch_id: uuid_from(&value[2..18])?,
@@ -244,6 +246,7 @@ impl Header {
             || header.scan_id.is_nil()
             || header.owner_epoch == 0
             || !(1..=MAX_BATCH_ITEMS as u32).contains(&header.items)
+            || (header.protocol == Protocol::S3Parents && header.items != 1)
             || usize::from(header.pages) != (header.items as usize).div_ceil(PAGE_ITEMS)
         {
             return Err(CatalogError::Corrupt("活动批次头身份或分页"));
@@ -891,15 +894,29 @@ pub(super) async fn target_matches_baseline(
     tr: &Transaction,
     receipt: &CommitReceipt,
 ) -> Result<bool> {
-    let Some(parent) = tr
+    let parent = tr
         .get(&node_key(receipt.namespace, receipt.parent), false)
-        .await?
-    else {
-        return Ok(false);
-    };
-    if decode_node(&parent)?.kind != NodeKind::Directory {
-        return Ok(false);
+        .await?;
+    if let Some(parent) = parent {
+        if decode_node(&parent)?.kind != NodeKind::Directory {
+            return Ok(false);
+        }
+    } else {
+        let Some(plan) = s3_upload::parents::for_receipt(tr, receipt).await? else {
+            return Ok(false);
+        };
+        if !plan.baseline(tr, receipt.namespace).await? {
+            return Ok(false);
+        }
     }
+    file_matches_baseline(tr, receipt).await
+}
+
+/// Check the file target after the caller has validated its parent.
+pub(super) async fn file_matches_baseline(
+    tr: &Transaction,
+    receipt: &CommitReceipt,
+) -> Result<bool> {
     let child = tr
         .get(
             &child_key(receipt.namespace, receipt.parent, &receipt.name),
@@ -1922,6 +1939,12 @@ impl ManagedCatalog {
                                     } else {
                                         ActivePublicationOutcome::BatchConflict
                                     });
+                                }
+                                if header.protocol == Protocol::S3Parents {
+                                    s3_upload::parents::publish_at(
+                                        &tr, namespace, volume, generation, batch_id,
+                                    )
+                                    .await?;
                                 }
                                 tr.set(&key, &expected);
                                 namespace_visibility::publish(&tr, namespace);
@@ -3032,6 +3055,12 @@ impl ManagedCatalog {
                                         ));
                                     }
                                 }
+                                if header.protocol == Protocol::S3Parents {
+                                    s3_upload::parents::finish_at(
+                                        &tr, namespace, volume, generation, batch_id,
+                                    )
+                                    .await?;
+                                }
                                 tr.set(&done_key, &compacted_batch_value(header, &publication));
                                 tr.clear(&publication_key(volume, generation));
                                 tr.clear(&prepared_batch_key(volume, generation));
@@ -4041,6 +4070,22 @@ impl ManagedCatalog {
             batch_id,
             receipts,
             control::reclaim::ReclaimProtocolContext::Single,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn stage_active_batch_with_s3_parents(
+        &self,
+        batch_id: Uuid,
+        receipt: &CommitReceipt,
+        evidence: &[u8],
+    ) -> Result<ActiveBatchOutcome> {
+        self.stage_active_batch_in(
+            batch_id,
+            std::slice::from_ref(receipt),
+            control::reclaim::ReclaimProtocolContext::Single,
+            Some(evidence),
         )
         .await
     }
@@ -4056,6 +4101,7 @@ impl ManagedCatalog {
             scope.batch_id(),
             receipts,
             control::reclaim::ReclaimProtocolContext::Group(scope),
+            None,
         )
         .await
     }
@@ -4065,6 +4111,7 @@ impl ManagedCatalog {
         batch_id: Uuid,
         receipts: &[CommitReceipt],
         context: control::reclaim::ReclaimProtocolContext<'_>,
+        parent_evidence: Option<&[u8]>,
     ) -> Result<ActiveBatchOutcome> {
         if batch_id.is_nil() || !(1..=MAX_BATCH_ITEMS).contains(&receipts.len()) {
             return Err(CatalogError::Invalid("活动批次 ID 或文件数量无效"));
@@ -4107,6 +4154,9 @@ impl ManagedCatalog {
             .collect::<Vec<_>>();
         let header = Header {
             protocol: match context {
+                control::reclaim::ReclaimProtocolContext::Single if parent_evidence.is_some() => {
+                    Protocol::S3Parents
+                }
                 control::reclaim::ReclaimProtocolContext::Single => Protocol::Single,
                 control::reclaim::ReclaimProtocolContext::Group(_) => Protocol::ReclaimGroup,
             },
@@ -4197,6 +4247,15 @@ impl ManagedCatalog {
                                         header.digest,
                                     )
                                     .await?;
+                            }
+                            if let Some(evidence) = parent_evidence {
+                                s3_upload::parents::bind_evidence(
+                                    &tr,
+                                    &representative,
+                                    batch_id,
+                                    evidence,
+                                )
+                                .await?;
                             }
                             tr.set(&header_key, &header.encode());
                             Ok(ActiveBatchOutcome::Staged)
@@ -4333,7 +4392,12 @@ impl ManagedCatalog {
                                     } else if reservation::claim_conflicts(&tr, receipt).await? {
                                         return Ok(ActiveBatchOutcome::BatchConflict);
                                     }
-                                    if !target_matches_baseline(&tr, receipt).await? {
+                                    if (header.protocol == Protocol::S3Parents)
+                                        != s3_upload::parents::for_receipt(&tr, receipt)
+                                            .await?
+                                            .is_some()
+                                        || !target_matches_baseline(&tr, receipt).await?
+                                    {
                                         return Ok(ActiveBatchOutcome::RequestConflict);
                                     }
                                     let locator =
@@ -4651,6 +4715,7 @@ impl ManagedCatalog {
                                         let reverse =
                                             TargetLocator::from_receipt(batch_id, &receipt)
                                                 .encode_reverse();
+                                        s3_upload::parents::release_claim(&tr, &receipt).await?;
                                         claims.extend([
                                             (request_claim, batch_id.as_bytes().to_vec(), 0),
                                             (path_claim_key(&receipt), locator.to_vec(), 1),
@@ -4741,6 +4806,9 @@ impl ManagedCatalog {
                                 }
                             }
                             tr.clear(&header_key);
+                            if header.protocol == Protocol::S3Parents {
+                                s3_upload::parents::clear_evidence(&tr, volume, generation);
+                            }
                             Ok(ActiveBatchOutcome::Aborted)
                         }
                         .await,

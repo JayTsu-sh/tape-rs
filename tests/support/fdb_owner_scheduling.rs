@@ -782,6 +782,7 @@ struct Provider {
     permission: Arc<Permission>,
     fail_vci: Arc<AtomicBool>,
     fail_read: Arc<AtomicBool>,
+    fail_write: Arc<AtomicBool>,
     fail_load: Arc<AtomicBool>,
     fail_load_before: Arc<AtomicBool>,
 }
@@ -791,6 +792,7 @@ struct FailVci {
     inner: Box<dyn TapeTransport + Send>,
     fail: Arc<AtomicBool>,
     fail_read: Arc<AtomicBool>,
+    fail_write: Arc<AtomicBool>,
     fail_load: Arc<AtomicBool>,
     fail_load_before: Arc<AtomicBool>,
 }
@@ -842,6 +844,9 @@ impl TapeTransport for FailVci {
         bytes: &[u8],
         timeout: u32,
     ) -> tape_rs::error::Result<tape_rs::scsi::device::ScsiResult> {
+        if cdb[0] == 0x0a && self.fail_write.swap(false, Ordering::SeqCst) {
+            return Err(tape_rs::error::TapeError::ScsiHost(3));
+        }
         if cdb[0] == 0x8d && self.fail.swap(false, Ordering::SeqCst) {
             return Err(std::io::Error::other("模拟 S4 后 VCI 写入结果丢失").into());
         }
@@ -878,6 +883,7 @@ impl DeviceProvider for Provider {
                     inner,
                     fail: self.fail_vci.clone(),
                     fail_read: self.fail_read.clone(),
+                    fail_write: self.fail_write.clone(),
                     fail_load: self.fail_load.clone(),
                     fail_load_before: self.fail_load_before.clone(),
                 }),
@@ -958,6 +964,7 @@ struct Owner {
     status: SharedStatus,
     fail_vci: Arc<AtomicBool>,
     fail_read: Arc<AtomicBool>,
+    fail_write: Arc<AtomicBool>,
     fail_load: Arc<AtomicBool>,
     fail_load_before: Arc<AtomicBool>,
 }
@@ -1022,6 +1029,7 @@ impl Owner {
         let trace = Arc::new(Mutex::new(Vec::new()));
         let fail_vci = Arc::new(AtomicBool::new(false));
         let fail_read = Arc::new(AtomicBool::new(false));
+        let fail_write = Arc::new(AtomicBool::new(false));
         let fail_load = Arc::new(AtomicBool::new(false));
         let fail_load_before = Arc::new(AtomicBool::new(false));
         let provider = Provider {
@@ -1031,6 +1039,7 @@ impl Owner {
             permission: permission.clone(),
             fail_vci: fail_vci.clone(),
             fail_read: fail_read.clone(),
+            fail_write: fail_write.clone(),
             fail_load: fail_load.clone(),
             fail_load_before: fail_load_before.clone(),
         };
@@ -1104,6 +1113,7 @@ impl Owner {
             status: http_status,
             fail_vci,
             fail_read,
+            fail_write,
             fail_load,
             fail_load_before,
         }

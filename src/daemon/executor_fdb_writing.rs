@@ -419,7 +419,11 @@ async fn prepare_write(
                         "上传原路径、父目录或版本条件已改变".into(),
                     ));
                 }
-                batchable = true;
+                batchable = !control
+                    .catalog
+                    .has_s3_upload_parents(request)
+                    .await
+                    .map_err(lost)?;
                 selected
             }
         }

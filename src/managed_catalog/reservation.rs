@@ -117,8 +117,12 @@ fn same_attempt(left: &ActiveFileIntent, right: &ActiveFileIntent) -> bool {
 }
 
 pub(super) fn encode(intent: &ActiveFileIntent, permit: u16) -> Vec<u8> {
+    encode_version(intent, permit, 2)
+}
+
+fn encode_version(intent: &ActiveFileIntent, permit: u16, version: u64) -> Vec<u8> {
     let payload = serde_json::json!({
-        "version": 2, "permit": permit,
+        "version": version, "permit": permit,
         "barcode": intent.barcode_constraint,
         "parent": intent.parent.to_string(),
         "parent_path": std::str::from_utf8(&intent.parent_path).expect("validated UTF-8 path"),
@@ -164,7 +168,8 @@ pub(super) fn decode(
             .and_then(|value| value.as_u64())
             .ok_or_else(corrupt)
     };
-    if number("version")? != 2 {
+    let version = number("version")?;
+    if !matches!(version, 2 | 3) {
         return Err(corrupt());
     }
     let previous = match v.get("previous") {
@@ -222,13 +227,13 @@ pub(super) fn decode(
     };
     validate_active_file_intent(&intent).map_err(|_| corrupt())?;
     let permit = u16::try_from(number("permit")?).map_err(|_| corrupt())?;
-    if permit >= 64 || encode(&intent, permit) != bytes {
+    if permit >= 64 || encode_version(&intent, permit, version) != bytes {
         return Err(corrupt());
     }
     Ok((intent, permit))
 }
 
-fn receipt_stub(intent: &ActiveFileIntent) -> CommitReceipt {
+pub(super) fn receipt_stub(intent: &ActiveFileIntent) -> CommitReceipt {
     let mut receipt = CommitReceipt {
         namespace: intent.namespace,
         parent: intent.parent,
@@ -313,10 +318,17 @@ pub(super) async fn parent_matches_at(tr: &Transaction, intent: &ActiveFileInten
         None => intent.parent_path.clone(),
     };
     let components = lookup::path_components(&path)?;
-    Ok(matches!(
-        lookup::resolve_path_at(tr, intent.namespace, components, false).await?,
-        Some(lookup::ResolvedPath::Directory { id, .. }) if id == intent.parent
-    ))
+    match lookup::resolve_path_at(tr, intent.namespace, components, false).await? {
+        Some(lookup::ResolvedPath::Directory { id, .. }) => Ok(id == intent.parent),
+        None => {
+            let Some(plan) = s3_upload::parents::for_receipt(tr, &receipt_stub(intent)).await?
+            else {
+                return Ok(false);
+            };
+            plan.baseline(tr, intent.namespace).await
+        }
+        _ => Ok(false),
+    }
 }
 
 pub(super) fn matches_receipt(intent: &ActiveFileIntent, receipt: &CommitReceipt) -> bool {
@@ -771,7 +783,26 @@ impl ManagedCatalog {
                                     return Ok(PublishOutcome::PlacementMismatch);
                                 }
                             }
-                            if !parent_matches_at(&tr, &intent).await? {
+                            let key = reservation_key(&intent);
+                            let existing = tr.get(&key, false).await?;
+                            let pending_parents = if existing.is_none()
+                                && let Some(plan) =
+                                    s3_upload::parents::for_receipt(&tr, &stub).await?
+                            {
+                                if plan.parent_path().as_bytes() != intent.parent_path {
+                                    return Ok(PublishOutcome::MissingParent);
+                                }
+                                let Some(version) =
+                                    plan.validated_base_version(&tr, intent.namespace).await?
+                                else {
+                                    return Ok(PublishOutcome::MissingParent);
+                                };
+                                Some((plan, version))
+                            } else {
+                                None
+                            };
+                            if pending_parents.is_none() && !parent_matches_at(&tr, &intent).await?
+                            {
                                 return Ok(PublishOutcome::MissingParent);
                             }
                             let Some(current) =
@@ -795,8 +826,7 @@ impl ManagedCatalog {
                             {
                                 return Ok(PublishOutcome::BatchClaimed);
                             }
-                            let key = reservation_key(&intent);
-                            if let Some(existing) = tr.get(&key, false).await? {
+                            if let Some(existing) = existing {
                                 let (saved, permit) = decode(
                                     &existing,
                                     intent.namespace,
@@ -838,7 +868,12 @@ impl ManagedCatalog {
                             if tr.get(&requests::intent_key(&stub), false).await?.is_some() {
                                 return Ok(PublishOutcome::OperationConflict);
                             }
-                            if !active_batch::target_matches_baseline(&tr, &stub).await? {
+                            let target_matches = if pending_parents.is_some() {
+                                active_batch::file_matches_baseline(&tr, &stub).await?
+                            } else {
+                                active_batch::target_matches_baseline(&tr, &stub).await?
+                            };
+                            if !target_matches {
                                 return Ok(PublishOutcome::VersionConflict);
                             }
                             for claim in [path_key(&intent), file_key(&intent)] {
@@ -889,7 +924,18 @@ impl ManagedCatalog {
                                     permit
                                 }
                             };
-                            tr.set(&key, &encode(&intent, permit));
+                            let version = if let Some((plan, base_version)) = pending_parents {
+                                let claim = plan.claim(intent.namespace)?;
+                                if tr.get(&claim, false).await?.is_some() {
+                                    return Err(CatalogError::PoolBusy);
+                                }
+                                plan.pin_base_version(&tr, intent.namespace, base_version)?;
+                                tr.set(&claim, &claim_value(&intent));
+                                3
+                            } else {
+                                2
+                            };
+                            tr.set(&key, &encode_version(&intent, permit, version));
                             tr.set(&volume_key(&intent), intent.namespace.as_bytes());
                             for claim in [path_key(&intent), file_key(&intent)] {
                                 tr.set(&claim, &claim_value(&intent));
@@ -987,7 +1033,15 @@ impl ManagedCatalog {
                             }
                             let key = requests::intent_key(&receipt);
                             let reverse_key = upgraded_key(&intent);
-                            let reverse_value = encode(&intent, permit);
+                            let version = if s3_upload::parents::for_receipt(&tr, &receipt)
+                                .await?
+                                .is_some()
+                            {
+                                3
+                            } else {
+                                2
+                            };
+                            let reverse_value = encode_version(&intent, permit, version);
                             if let Some(old) = tr.get(&key, false).await? {
                                 if tr.get(&reverse_key, false).await?.as_deref()
                                     != Some(reverse_value.as_slice())
@@ -1187,6 +1241,9 @@ impl ManagedCatalog {
                             if upgraded.is_some() {
                                 tr.clear(&requests::intent_key(&stub));
                                 tr.clear(&upgraded_key(&intent));
+                            }
+                            if s3_upload::parents::release_claim(&tr, &stub).await? {
+                                s3_upload::parents::forget_plan(&tr, &stub);
                             }
                             if reserved.is_some() {
                                 clear(&tr, &intent);

@@ -1,7 +1,11 @@
 //! Real FDB/TCP, simulated media; every content operation goes through S3.
 use super::*;
 use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader};
 use tape_rs::daemon::s3;
+use tape_rs::managed_catalog::{
+    NodeMutation, NodeMutationTaskState, NodeRenameRevision, NodeRenameSpec, pool_catalog_path,
+};
 
 #[test]
 #[ignore = "需要隔离 FDB_TEST_CLUSTER；并发 S3 TCP 合批与模拟磁带，不访问真实设备"]
@@ -167,7 +171,10 @@ fn s3_put_overwrite_metadata_and_delete_use_fdb_and_media_commits() {
         .unwrap();
     let f = rt.block_on(fixture(&cluster));
     let owner = Owner::start_mode(&f, 12, json!({}), true);
-    let context = super::active_pools::context(&owner, 71, 12);
+    let mut context = super::active_pools::context(&owner, 71, 12);
+    // Allow for simulator scheduling within the forwarding and client's
+    // 15-second budget. The volume generation below checks commit count.
+    Arc::get_mut(&mut context).unwrap().wait_timeout = Duration::from_secs(12);
     let server = ReadHttpServer::start(s3::fdb_router(
         f.catalog.clone(),
         BTreeMap::from([(f.serial.clone(), f.route)]),
@@ -230,10 +237,29 @@ fn s3_put_overwrite_metadata_and_delete_use_fdb_and_media_commits() {
         before,
         "CRC32 mismatch must precede parent creation"
     );
+    let generation = || {
+        rt.block_on(
+            f.catalog
+                .active_loaded_volume_head(&f.serial, BARCODES[0], f.route, 12),
+        )
+        .unwrap()
+        .unwrap()
+        .index
+        .generation
+    };
+    let before_generation = generation();
     let put=entry.request_body("PUT",&path,Some("Content-Length: 3\r\nContent-MD5: kAFQmDzST7DWlj99KOF/cg==\r\nx-amz-sdk-checksum-algorithm: CRC32\r\nx-amz-checksum-crc32: NSRBwg==\r\nContent-Type: text/plain\r\nCache-Control: max-age=60\r\nx-amz-meta-origin: s3-test\r\nIf-None-Match: *\r\n"),b"abc");
     assert_eq!(put.0, 200, "{}", String::from_utf8_lossy(&put.2));
+    assert_eq!(
+        generation(),
+        before_generation + 1,
+        "the first nested PUT must commit its parents and file in one LTFS generation"
+    );
     assert!(writes() > before);
     assert!(put.1.contains("x-amz-checksum-crc32: nsrbwg=="));
+    let listed = entry.request("GET", &format!("/{bucket}?list-type=2&prefix=new/"), None);
+    assert_eq!(listed.0, 200);
+    assert!(String::from_utf8_lossy(&listed.2).contains("<Key>new/dir/object</Key>"));
     let head = entry.request("HEAD", &path, None);
     assert_eq!(head.0, 200);
     assert!(head.1.contains("content-length: 3"));
@@ -379,6 +405,546 @@ fn s3_put_overwrite_metadata_and_delete_use_fdb_and_media_commits() {
     drop(readonly);
     drop(entry);
     drop(server);
+    drop(owner);
+    fs::remove_dir_all(f.root).unwrap();
+}
+
+#[test]
+#[ignore = "需要隔离 FDB_TEST_CLUSTER；普通 S3 隐含目录提交后接管，仅访问模拟磁带"]
+fn s3_nested_put_recovers_unobserved_s4_without_publishing_partial_paths() {
+    interrupted_nested_put(true);
+}
+
+#[test]
+#[ignore = "需要隔离 FDB_TEST_CLUSTER；普通 S3 错误后接管并释放原目录预约，仅访问模拟磁带"]
+fn s3_nested_put_aborts_unwritten_attempt_and_releases_parent_path() {
+    interrupted_nested_put(false);
+}
+
+fn interrupted_nested_put(committed_to_tape: bool) {
+    let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+    let _network = unsafe { foundationdb::boot() };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let f = rt.block_on(Box::pin(fixture(&cluster)));
+    let bucket = s3::bucket_name(&f.serial, &f.pools[0].to_string());
+    let path = format!("/{bucket}/interrupted/parent/one");
+    let sibling = format!("/{bucket}/interrupted/parent/two");
+    let body = b"nested S3 original body";
+    let start = |owner: &Owner, epoch| {
+        let mut context = super::active_pools::context(owner, 71, epoch);
+        Arc::get_mut(&mut context).unwrap().wait_timeout = Duration::from_secs(12);
+        ReadHttpServer::start(s3::fdb_router(
+            f.catalog.clone(),
+            BTreeMap::from([(f.serial.clone(), f.route)]),
+            BTreeMap::from([(f.serial.clone(), context.clone())]),
+            context,
+            HashMap::new(),
+            true,
+        ))
+    };
+    let resolve = |path: &str| {
+        rt.block_on(
+            f.catalog
+                .resolve_active_path(&f.serial, format!("/{}{path}", f.pools[0]).as_bytes()),
+        )
+        .unwrap()
+    };
+    let owner = Owner::start_mode(&f, 12, json!({}), true);
+    let old = rt
+        .block_on(
+            f.catalog
+                .active_loaded_volume_head(&f.serial, BARCODES[0], f.route, 12),
+        )
+        .unwrap()
+        .unwrap();
+    let server = start(&owner, 12);
+    if committed_to_tape {
+        owner.fail_vci.store(true, Ordering::SeqCst);
+    } else {
+        owner.fail_write.store(true, Ordering::SeqCst);
+    }
+    let response = server.request_body(
+        "PUT",
+        &path,
+        Some(&format!("Content-Length: {}\r\n", body.len())),
+        body,
+    );
+    assert_eq!(response.0, 503, "{}", String::from_utf8_lossy(&response.2));
+    assert!(!owner.fail_vci.load(Ordering::SeqCst));
+    for path in [
+        "/interrupted",
+        "/interrupted/parent",
+        "/interrupted/parent/one",
+    ] {
+        assert!(resolve(path).is_none(), "{path} must remain invisible");
+    }
+    assert_eq!(
+        rt.block_on(
+            f.catalog
+                .observed_active_volume_index(&f.serial, old.volume_id)
+        )
+        .unwrap(),
+        old.index
+    );
+    assert_eq!(put_small(&server, &sibling, b"pending").0, 503);
+    assert!(resolve("/interrupted/parent/two").is_none());
+    drop(server);
+    drop(owner);
+    f.library.power_cut();
+
+    let successor = Owner::start_mode(&f, 13, json!({}), true);
+    let server = start(&successor, 13);
+    let recovered_generation = rt
+        .block_on(
+            f.catalog
+                .observed_active_volume_index(&f.serial, old.volume_id),
+        )
+        .unwrap()
+        .generation;
+    if committed_to_tape {
+        assert_eq!(recovered_generation, old.index.generation + 1);
+    } else {
+        assert!(resolve("/interrupted").is_none());
+        assert_eq!(put_small(&server, &sibling, b"new").0, 200);
+        let response = server.request_body(
+            "PUT",
+            &path,
+            Some(&format!("Content-Length: {}\r\n", body.len())),
+            body,
+        );
+        assert_eq!(response.0, 200, "{}", String::from_utf8_lossy(&response.2));
+        assert_eq!(
+            rt.block_on(
+                f.catalog
+                    .observed_active_volume_index(&f.serial, old.volume_id)
+            )
+            .unwrap()
+            .generation,
+            recovered_generation + 2,
+        );
+    }
+    if committed_to_tape {
+        assert_eq!(put_small(&server, &sibling, b"new").0, 200);
+    }
+    assert_eq!(server.request("GET", &sibling, None).2, b"new");
+    for path in ["/interrupted", "/interrupted/parent"] {
+        assert!(matches!(
+            resolve(path),
+            Some(ResolvedPath::Directory { .. })
+        ));
+    }
+    let get = server.request("GET", &path, None);
+    assert_eq!(get.0, 200);
+    assert_eq!(get.2, body);
+    let mut copies = 0;
+    assert!(f.library.with_cartridge_mut(BARCODES[0], |cartridge| {
+        copies = cartridge
+            .partitions
+            .iter()
+            .flat_map(|p| &p.objects)
+            .filter(|object| matches!(object, LogicalObject::Record(record) if record == body))
+            .count();
+    }));
+    assert_eq!(
+        copies, 1,
+        "takeover must not append the original body again"
+    );
+    drop(server);
+    drop(successor);
+    fs::remove_dir_all(&f.root).unwrap();
+}
+
+#[test]
+#[ignore = "需要隔离 FDB_TEST_CLUSTER；普通 S3 并发创建隐含目录，仅访问模拟磁带"]
+fn s3_concurrent_first_puts_reuse_the_published_prefix() {
+    let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+    let _network = unsafe { foundationdb::boot() };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let f = rt.block_on(Box::pin(fixture(&cluster)));
+    let owner = Owner::start_mode(&f, 12, json!({}), true);
+    let mut context = super::active_pools::context(&owner, 71, 12);
+    Arc::get_mut(&mut context).unwrap().wait_timeout = Duration::from_secs(12);
+    let server = ReadHttpServer::start(s3::fdb_router(
+        f.catalog.clone(),
+        BTreeMap::from([(f.serial.clone(), f.route)]),
+        BTreeMap::from([(f.serial.clone(), context.clone())]),
+        context,
+        HashMap::new(),
+        true,
+    ));
+    let bucket = s3::bucket_name(&f.serial, &f.pools[0].to_string());
+    let barrier = std::sync::Barrier::new(2);
+    let paths = ["/shared/parents/one", "/shared/parents/two"];
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                let (server, bucket, barrier) = (&server, &bucket, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    server.request_body(
+                        "PUT",
+                        &format!("/{bucket}{path}"),
+                        Some(&format!(
+                            "Content-Length: {}\r\nIf-None-Match: *\r\n",
+                            path.len()
+                        )),
+                        path.as_bytes(),
+                    )
+                })
+            })
+            .collect();
+        for (path, handle) in paths.iter().zip(handles) {
+            let response = handle.join().unwrap();
+            assert_eq!(
+                response.0,
+                200,
+                "{path}: {}",
+                String::from_utf8_lossy(&response.2)
+            );
+        }
+    });
+    for path in paths {
+        let response = server.request("GET", &format!("/{bucket}{path}"), None);
+        assert_eq!((response.0, response.2.as_slice()), (200, path.as_bytes()));
+    }
+    let listing = server.request(
+        "GET",
+        &format!("/{bucket}?list-type=2&prefix=shared/"),
+        None,
+    );
+    assert_eq!(listing.0, 200);
+    assert!(String::from_utf8_lossy(&listing.2).contains("<Key>shared/parents/one</Key>"));
+    assert!(String::from_utf8_lossy(&listing.2).contains("<Key>shared/parents/two</Key>"));
+
+    let path = format!("/{bucket}/another/conditional");
+    let paused = pause_put(&server, &path);
+    let winner = put_small(&server, &path, b"a");
+    assert_eq!(winner.0, 200, "{}", String::from_utf8_lossy(&winner.2));
+    assert_eq!(complete_put(paused, b'b'), 412);
+    assert_eq!(server.request("GET", &path, None).2, b"a");
+    assert_eq!(put_small(&server, &path, b"b").0, 412);
+    drop(server);
+    drop(owner);
+    fs::remove_dir_all(f.root).unwrap();
+}
+
+fn put_small(server: &ReadHttpServer, path: &str, body: &[u8]) -> (u16, String, Vec<u8>) {
+    server.request_body(
+        "PUT",
+        path,
+        Some(&format!(
+            "Content-Length: {}\r\nIf-None-Match: *\r\n",
+            body.len()
+        )),
+        body,
+    )
+}
+
+#[test]
+#[ignore = "需要隔离 FDB_TEST_CLUSTER；普通 S3 不同前缀并发首写，仅访问模拟磁带"]
+fn s3_concurrent_first_puts_to_different_prefixes_both_commit() {
+    let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+    let _network = unsafe { foundationdb::boot() };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let f = rt.block_on(Box::pin(fixture(&cluster)));
+    let owner = Owner::start_mode(&f, 12, json!({}), true);
+    let mut context = super::active_pools::context(&owner, 71, 12);
+    let config = Arc::get_mut(&mut context).unwrap();
+    config.wait_timeout = Duration::from_secs(30);
+    let (bridge, requests) = channel::<ExecRequest>();
+    let forward = std::mem::replace(config.exec.get_mut().unwrap(), bridge);
+    let actor = forward.clone();
+    let (held, writes) = channel();
+    let proxy = std::thread::spawn(move || {
+        while let Ok(request) = requests.recv() {
+            if matches!(request, ExecRequest::FdbWrite { .. }) {
+                held.send(request).unwrap();
+            } else {
+                actor.send(request).unwrap();
+            }
+        }
+    });
+    let server = ReadHttpServer::start(s3::fdb_router(
+        f.catalog.clone(),
+        BTreeMap::from([(f.serial.clone(), f.route)]),
+        BTreeMap::from([(f.serial.clone(), context.clone())]),
+        context,
+        HashMap::new(),
+        true,
+    ));
+    let bucket = s3::bucket_name(&f.serial, &f.pools[0].to_string());
+    let first_path = format!("/{bucket}/new-first/file");
+    let second_path = format!("/{bucket}/new-second/file");
+    let responses = std::thread::scope(|scope| {
+        let first = scope.spawn(|| put_small(&server, &first_path, b"a"));
+        let first_write = writes.recv_timeout(Duration::from_secs(5)).unwrap();
+        let second = scope.spawn(|| put_small(&server, &second_path, b"b"));
+        // Both PUTs have finished preparation before either can reserve tape.
+        let second_write = writes.recv_timeout(Duration::from_secs(5)).unwrap();
+        forward.send(first_write).unwrap();
+        let first_response = first.join().unwrap();
+        forward.send(second_write).unwrap();
+        (first_response, second.join().unwrap())
+    });
+    for (response, path, body) in [
+        (&responses.0, &first_path, b"a"),
+        (&responses.1, &second_path, b"b"),
+    ] {
+        assert_eq!(
+            response.0,
+            200,
+            "{path}: {}",
+            String::from_utf8_lossy(&response.2)
+        );
+        let read = server.request("GET", path, None);
+        assert_eq!((read.0, read.2.as_slice()), (200, body.as_slice()));
+    }
+    drop(server);
+    proxy.join().unwrap();
+    drop(owner);
+    fs::remove_dir_all(f.root).unwrap();
+}
+
+fn pause_put(server: &ReadHttpServer, path: &str) -> BufReader<std::net::TcpStream> {
+    let stream = std::net::TcpStream::connect(&server.address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let mut stream = BufReader::new(stream);
+    write!(
+        stream.get_mut(),
+        "PUT {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\nContent-Length: 1\r\nIf-None-Match: *\r\nExpect: 100-continue\r\n\r\n"
+    ).unwrap();
+    let mut status = String::new();
+    stream.read_line(&mut status).unwrap();
+    assert!(status.starts_with("HTTP/1.1 100 "), "{status}");
+    stream.read_line(&mut String::new()).unwrap();
+    stream
+}
+
+fn complete_put(mut stream: BufReader<std::net::TcpStream>, body: u8) -> u16 {
+    stream.get_mut().write_all(&[body]).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 "), "{response}");
+    response.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+#[test]
+#[ignore = "需要隔离 FDB_TEST_CLUSTER；验证 S3 正文等待期间的目录身份，仅使用模拟磁带"]
+fn s3_waiting_first_put_preserves_shared_directory_identity() {
+    let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+    let _network = unsafe { foundationdb::boot() };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let f = rt.block_on(fixture(&cluster));
+    let owner = Owner::start_mode(&f, 12, json!({}), true);
+    let mut context = super::active_pools::context(&owner, 71, 12);
+    Arc::get_mut(&mut context).unwrap().wait_timeout = Duration::from_secs(30);
+    let server = ReadHttpServer::start(s3::fdb_router(
+        f.catalog.clone(),
+        BTreeMap::from([(f.serial.clone(), f.route)]),
+        BTreeMap::from([(f.serial.clone(), context.clone())]),
+        context,
+        HashMap::new(),
+        true,
+    ));
+    let bucket = s3::bucket_name(&f.serial, &f.pools[0].to_string());
+    let directory = |path: &str| {
+        let path = pool_catalog_path(f.pools[0], path.as_bytes()).unwrap();
+        match rt
+            .block_on(
+                f.catalog
+                    .resolve_active_metadata_for_route(&f.serial, &path, f.route),
+            )
+            .unwrap()
+        {
+            Some(ResolvedPath::Directory { id, version, .. }) => (id, version),
+            other => panic!("expected a directory: {other:?}"),
+        }
+    };
+    let mutate = |path, version, mutation| {
+        let task = rt.block_on(super::nodes::queue(&f, 12, path, version, mutation));
+        assert_eq!(
+            super::nodes::terminal(&f, &rt, &task).state,
+            NodeMutationTaskState::Completed
+        );
+    };
+
+    let path = format!("/{bucket}/mkdir/child");
+    let paused = pause_put(&server, &path);
+    mutate("/mkdir", None, NodeMutation::CreateDirectory);
+    let original = directory("/mkdir").0;
+    assert_eq!(complete_put(paused, b'm'), 200);
+    assert_eq!(directory("/mkdir").0, original);
+    assert_eq!(server.request("GET", &path, None).2, b"m");
+
+    mutate("/rename", None, NodeMutation::CreateDirectory);
+    let path = format!("/{bucket}/rename/new/child");
+    let paused = pause_put(&server, &path);
+    let revision = |path| {
+        let (inode, version) = directory(path);
+        NodeRenameRevision {
+            namespace: f.route.route.namespace,
+            inode,
+            version,
+        }
+    };
+    let source = revision("/rename");
+    let root = revision("/");
+    let task = rt.block_on(async {
+        let spec = NodeRenameSpec {
+            pool: f.pools[0],
+            operation: Uuid::new_v4(),
+            from: "/rename".into(),
+            to: "/moved".into(),
+            source,
+            source_parent: root,
+            destination_parent: root,
+            target: None,
+            no_replace: true,
+        };
+        let request = f
+            .catalog
+            .prepare_node_rename_request(
+                &f.serial,
+                f.route,
+                12,
+                &spec,
+                "2026-11-01T00:40:00.000000000Z",
+            )
+            .await
+            .unwrap();
+        f.catalog
+            .queue_node_rename_request(f.route, 12, &request, 4 << 20)
+            .await
+            .unwrap()
+    });
+    assert_eq!(
+        super::nodes::terminal(&f, &rt, &task).state,
+        NodeMutationTaskState::Completed
+    );
+    assert_eq!(directory("/moved").0, source.inode);
+    mutate("/rename", None, NodeMutation::CreateDirectory);
+    assert_eq!(complete_put(paused, b'n'), 409);
+    assert_eq!(server.request("GET", &path, None).0, 404);
+
+    let path = format!("/{bucket}/rebuild/follower");
+    let leader = format!("/{bucket}/rebuild/leader");
+    let paused = pause_put(&server, &path);
+    assert_eq!(put_small(&server, &leader, b"l").0, 200);
+    assert_eq!(server.request("DELETE", &leader, None).0, 204);
+    let (original, version) = directory("/rebuild");
+    mutate("/rebuild", Some(version), NodeMutation::RemoveDirectory);
+    mutate("/rebuild", None, NodeMutation::CreateDirectory);
+    assert_ne!(directory("/rebuild").0, original);
+    assert_eq!(complete_put(paused, b'f'), 409);
+    assert_eq!(server.request("GET", &path, None).0, 404);
+    assert_eq!(put_small(&server, &path, b"r").0, 200);
+    assert_eq!(server.request("GET", &path, None).2, b"r");
+
+    drop(server);
+    drop(owner);
+    fs::remove_dir_all(f.root).unwrap();
+}
+
+#[test]
+#[ignore = "需要隔离 FDB_TEST_CLUSTER；注入明确未执行的设备线程拒绝，仅使用模拟磁带"]
+fn s3_shared_parent_wait_is_released_after_known_failure_and_is_pool_local() {
+    let cluster = std::env::var("FDB_TEST_CLUSTER").unwrap();
+    let _network = unsafe { foundationdb::boot() };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let f = rt.block_on(fixture(&cluster));
+    let owner = Owner::start_mode(&f, 12, json!({}), true);
+    let mut context = super::active_pools::context(&owner, 71, 12);
+    let config = Arc::get_mut(&mut context).unwrap();
+    config.wait_timeout = Duration::from_secs(12);
+    let (bridge, requests) = channel();
+    let forward = std::mem::replace(config.exec.get_mut().unwrap(), bridge);
+    let (held, admitted) = channel();
+    let proxy = std::thread::spawn(move || {
+        let mut reject = true;
+        while let Ok(request) = requests.recv() {
+            match request {
+                ExecRequest::FdbWrite { intent, reply, .. }
+                    if reject && intent.name == b"first" =>
+                {
+                    reject = false;
+                    held.send((intent, reply)).unwrap();
+                }
+                request => forward.send(request).unwrap(),
+            }
+        }
+    });
+    let server = ReadHttpServer::start(s3::fdb_router(
+        f.catalog.clone(),
+        BTreeMap::from([(f.serial.clone(), f.route)]),
+        BTreeMap::from([(f.serial.clone(), context.clone())]),
+        context,
+        HashMap::new(),
+        true,
+    ));
+    let bucket = s3::bucket_name(&f.serial, &f.pools[0].to_string());
+    let unrelated = s3::bucket_name(&f.serial, &f.pools[1].to_string());
+    let first = format!("/{bucket}/shared/first");
+    let second = format!("/{bucket}/shared/second");
+    let rejected = std::thread::scope(|scope| {
+        let leader = scope.spawn(|| put_small(&server, &first, b"a"));
+        let (request, reject) = admitted.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut paused = pause_put(&server, &second);
+        paused.get_mut().write_all(b"b").unwrap();
+        let independent = put_small(&server, &format!("/{unrelated}/shared/outside"), b"u");
+        assert_eq!(
+            independent.0,
+            200,
+            "{}",
+            String::from_utf8_lossy(&independent.2)
+        );
+        assert_eq!(server.request("GET", &second, None).0, 404);
+        reject
+            .send(Err(ReadError::Failed("内核准入前的明确拒绝".into())))
+            .unwrap();
+        let rejected = leader.join().unwrap();
+        assert_eq!(rejected.0, 503);
+        assert!(String::from_utf8_lossy(&rejected.2).contains("写带前已拒绝"));
+        let mut status = String::new();
+        paused.read_line(&mut status).unwrap();
+        assert!(status.starts_with("HTTP/1.1 200 "), "{status}");
+        request
+    });
+    assert_eq!(server.request("GET", &second, None).2, b"b");
+    let spec = tape_rs::managed_catalog::ActiveUploadSpec {
+        pool_id: f.pools[0],
+        path: b"/shared/first".to_vec(),
+        operation_id: rejected.operation_id,
+        expected_version: rejected.expected_version,
+        size: rejected.expected_size,
+        digest: rejected.expected_digest,
+    };
+    rt.block_on(
+        f.catalog
+            .prepare_active_upload(&f.serial, f.route, 12, BARCODES[0], &spec),
+    )
+    .expect("未取得物理预约的明确拒绝应清理私有目录计划");
+    assert_eq!(put_small(&server, &first, b"a").0, 200);
+    assert_eq!(server.request("GET", &first, None).2, b"a");
+    drop(server);
+    proxy.join().unwrap();
     drop(owner);
     fs::remove_dir_all(f.root).unwrap();
 }
